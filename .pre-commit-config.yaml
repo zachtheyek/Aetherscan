@@ -1,5 +1,5 @@
-# NOTE: run pre-commit install inside repo to activate pre-commit hooks
-# NOTE: manually run pre-commit hooks on all files with: pre-commit run --all-files
+# Note, run `pre-commit install` inside repo to activate pre-commit hooks
+# Note, manually run pre-commit hooks on all files with: `pre-commit run --all-files`
 repos:
   # Ruff - fast Python linter and formatter
   - repo: https://github.com/astral-sh/ruff-pre-commit
