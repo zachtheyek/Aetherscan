@@ -19,11 +19,9 @@ from queue import Empty, Queue
 from typing import Any
 
 from config import Config
+from manager import register_db
 
 logger = logging.getLogger(__name__)
-
-# Global singleton database instance
-_DB = None
 
 
 def get_system_metadata() -> str:
@@ -71,10 +69,41 @@ class Database:
     - Eliminates concurrent write issues and SQLITE_BUSY errors
     """
 
+    _instance = None  # Stores singleton instance
+    _lock = threading.Lock()  # Ensures thread safety on object initialization
+
+    # __new__ allocates the object in memory (constructor at the object-creation level)
+    # __init__ initializes the object's attributes after it's created
+    # since __new__ is called before __init__ every time we instantiate a class,
+    # by overriding __new__, we can short-circuit object creation entirely, and control whether a
+    # new instance is created, or just return the existing instance
+    def __new__(cls, config: Config):
+        # Double-checked locking pattern:
+        # First check if _instance is None, without lock (for performance)
+        if cls._instance is None:
+            # If None, acquire the lock to serialize the initialization path,
+            # preventing race conditions (2 threads violating singleton semantics)
+            with cls._lock:
+                # Check if _instance is None again inside the lock
+                # (since multiple threads can be calling simultaneously)
+                if cls._instance is None:
+                    # If still None, only then we construct the singleton instance
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False  # Mark as not initialized (for __init__)
+        # Return the same instance for all subsequent constructor calls
+        return cls._instance
+
     def __init__(self, config: Config):
         """
         Initialize database
         """
+        # Note, __init__ is triggered every time the class's constructor is called,
+        # even if __new__ returned the existing singleton instance
+        # Hence, we use the _initialized flag to make sure __init__ only runs once
+        if self._initialized:
+            return
+
+        self._initialized = True
         self.config = config
 
         self.db_path = os.path.join(self.config.output_path, "db", "aetherscan.db")
@@ -99,6 +128,24 @@ class Database:
             logger.info(f"  {name}: {value}")
         logger.info(f"Write interval: {self.write_interval} seconds")
         logger.info(f"Max buffer size: {self.write_buffer_max_size} records")
+
+    @classmethod
+    def _reset(cls):
+        """
+        Teardown hook for thread-safe singleton
+        Resets the db instance to None
+
+        WARNING: Only use for testing or cleanup after shutdown.
+        Calling this while the database is active will cause issues.
+        Should only be called after stop() has completed.
+        """
+        # Acquire lock to prevent race conditions
+        with cls._lock:
+            # Discard the singleton instance by removing the global reference
+            # Guarantees the next constructor call will produce a fresh instance
+            # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
+            cls._instance = None
+            logger.info("Database singleton instance reset")
 
     def _init_database(self):
         """Create database tables if they don't exist"""
@@ -215,7 +262,6 @@ class Database:
     def start(self):
         """Start the background writer thread"""
         if self.writer_thread is not None and self.writer_thread.is_alive():
-            logger.warning("Writer thread already running")
             return
 
         self.stop_event.clear()
@@ -603,33 +649,31 @@ def init_db(config: Config) -> Database:
     """
     Initialize global database instance (call once at startup)
     """
-    global _DB
+    db = Database(config)
+    db.start()
 
-    if _DB is not None:
-        logger.warning("Database instance already initialized")
-        return _DB
+    register_db(db)
 
-    _DB = Database(config)
-    _DB.start()
-
-    return _DB
+    return db
 
 
 def get_db() -> Database | None:
     """Get the global database instance"""
-    if _DB is None:
+    db = Database._instance
+
+    if db is None:
         logger.warning("No database instance initialized")
 
-    return _DB
+    return db
 
 
 def shutdown_db() -> None:
     """Shutdown the global database instance (call on exit)"""
-    global _DB
+    db = Database._instance
 
-    if _DB is None:
+    if db is None:
         logger.warning("No database instance initialized")
         return
 
-    _DB.stop()
-    _DB = None
+    db.stop()
+    Database._reset()
