@@ -499,6 +499,7 @@ class ResourceManager:
         self.stats.shared_memories_active -= 1
         self.stats.shared_memories_cleaned += 1
 
+    # TODO: delete this block since we're managing pools & shared memory individually?
     # # NOTE: data generators are separate from pools & shared memory? do we need to do this for other classes as well? (preprocessors, etc.)
     # def register_data_generator(self, generator):
     #     """Register a DataGenerator for cleanup tracking"""
