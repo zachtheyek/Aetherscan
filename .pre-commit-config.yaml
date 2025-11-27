@@ -7,7 +7,7 @@ repos:
     hooks:
       # Run linter
       - id: ruff
-        args: [--fix]  # Autofix issues when possible
+        args: [--fix] # Autofix issues when possible
         types_or: [python, pyi]
       # Run formatter
       - id: ruff-format
@@ -19,7 +19,7 @@ repos:
     hooks:
       # Block commits with large binaries (>1 Mb)
       - id: check-added-large-files
-        args: ['--maxkb=1000']
+        args: ["--maxkb=1000"]
       # Check for filenames that differ only by case (e.g. Main.py vs main.py)
       - id: check-case-conflict
       # Check for unresolved merge conflicts (e.g. "<<<<<<< HEAD" markers)
@@ -35,11 +35,11 @@ repos:
       # Check for private keys (vulnerability)
       - id: detect-private-key
       # TODO: uncomment after configuring repo branch protection rules
-      # Blocks commits directly to master to main branch
+      # Blocks commits directly to master branch
       # - id: no-commit-to-branch
       #   args: ['--branch', 'master']
 
-  # Gitleaks - scan for secrets and credentials
+  # Scan for sensitive data (secrets, credentials, etc.)
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.29.0
     hooks:
