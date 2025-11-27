@@ -1,5 +1,6 @@
 """
-Random Forest classifier for Aetherscan Pipeline
+Random Forest classifier implementation for Aetherscan Pipeline
+Receives concatenated latents grouped by their original 6-observation cadence pattern
 """
 
 from __future__ import annotations
