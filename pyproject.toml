@@ -21,7 +21,7 @@ target-version = "py310"   # Target Python version
 line-length = 100          # Set maximum line length
 
 # Exclude directories from linting
-exclude = [
+exclude = [  # TODO: partially sync with .gitignore
     ".claude",
     ".git",
     ".ipynb_checkpoints",
@@ -54,7 +54,6 @@ ignore = [
     "PLR2004",  # Ignore warnings for magic number comparisons
 
     # NOTE: temporary ignores
-    "PLW0603",  # Discourage using global statements to update global variables
     "PLR0911",  # Function has too many return statements (>6)
     "PLR0912",  # Function has too many branches (if/elif/else, loops, etc.) (>12)
     "PLR0915",  # Function has too many statements (>50)
@@ -68,9 +67,12 @@ unfixable = []
 
 [tool.ruff.lint.isort]
 # Declare first-party imports (for sorting order)
-known-first-party = [
+known-first-party = [  # TODO: sync with internal modules
     "db",
+    "logger",
+    "manager",
     "models",
+    "monitor",
     "utils",
 ]
 
