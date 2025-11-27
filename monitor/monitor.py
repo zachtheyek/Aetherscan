@@ -1,6 +1,7 @@
 """
 Resource monitor for Aetherscan Pipeline
-Runs as background thread & records system metrics (CPU, RAM, GPU) to database
+Runs as background thread & records system metrics (CPU, RAM, GPU) to database writer queue
+Saves resource utilization plot on exit
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import contextlib
 import gc
 import logging
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -23,17 +25,111 @@ matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
 from config import Config
 from db import get_db
+from manager import register_monitor
 
 logger = logging.getLogger(__name__)
 
-# Global singleton resource monitor instance
-_RESOURCE_MONITOR = None
+
+def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
+    """
+    Get total CPU and RAM usage for a process and all child processes.
+    This captures multiprocessing workers spawned by Pool() calls.
+
+    Args:
+        process: psutil.Process object of the main process to track
+
+    Returns:
+        Dictionary containing:
+        - cpu_percent: CPU usage as percentage of total system CPU (0-100)
+        - ram_percent: RAM usage as percentage of total system RAM (0-100)
+        - ram_bytes: Total RAM usage in bytes (RSS)
+        - ram_gb: Total RAM usage in gigabytes
+    """
+    try:
+        # Get all processes in tree (main + children)
+        processes = [process]
+        with contextlib.suppress(psutil.NoSuchProcess):
+            processes.extend(process.children(recursive=True))
+
+        # Aggregate CPU and RAM usage across all processes
+        total_cpu = 0.0
+        total_ram_bytes = 0
+
+        for proc in processes:
+            try:
+                # CPU: Get percentage (can be >100% for multi-core usage)
+                cpu = proc.cpu_percent(interval=0.0)  # Non-blocking
+                total_cpu += cpu
+
+                # RAM: Get RSS (Resident Set Size)
+                mem_info = proc.memory_info()
+                total_ram_bytes += mem_info.rss
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Process may have died between children() and cpu_percent() or memory_info() calls
+                continue
+
+        # Convert CPU to percentage of total system CPU
+        num_cores = psutil.cpu_count() or 0
+        cpu_percent = total_cpu / num_cores if num_cores > 0 else 0.0
+
+        # Convert RAM to percentage of total system RAM
+        total_system_ram = psutil.virtual_memory().total
+        ram_percent = (total_ram_bytes / total_system_ram) * 100
+
+        return {
+            "cpu_percent": cpu_percent,
+            "ram_percent": ram_percent,
+            "ram_bytes": total_ram_bytes,
+            "ram_gb": total_ram_bytes / 1e9,
+        }
+
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+        logger.warning(f"Error getting process tree stats for PID {process.pid}: {e}")
+        return {
+            "cpu_percent": 0.0,
+            "ram_percent": 0.0,
+            "ram_bytes": 0,
+            "ram_gb": 0.0,
+        }
 
 
 class ResourceMonitor:
     """Background thread to monitor system resources"""
 
+    _instance = None  # Stores singleton instance
+    _lock = threading.Lock()  # Ensures thread safety on object initialization
+
+    # __new__ allocates the object in memory (constructor at the object-creation level)
+    # __init__ initializes the object's attributes after it's created
+    # since __new__ is called before __init__ every time we instantiate a class,
+    # by overriding __new__, we can short-circuit object creation entirely, and control whether a
+    # new instance is created, or just return the existing instance
+    def __new__(cls, config: Config, tag: str | None):
+        # Double-checked locking pattern:
+        # First check if _instance is None, without lock (for performance)
+        if cls._instance is None:
+            # If None, acquire the lock to serialize the initialization path,
+            # preventing race conditions (2 threads violating singleton semantics)
+            with cls._lock:
+                # Check if _instance is None again inside the lock
+                # (since multiple threads can be calling simultaneously)
+                if cls._instance is None:
+                    # If still None, only then we construct the singleton instance
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False  # Mark as not initialized (for __init__)
+        # Return the same instance for all subsequent constructor calls
+        return cls._instance
+
     def __init__(self, config: Config, tag: str | None):
+        """Initialize monitor"""
+        # Note, __init__ is triggered every time the class's constructor is called,
+        # even if __new__ returned the existing singleton instance
+        # Hence, we use the _initialized flag to make sure __init__ only runs once
+        if self._initialized:
+            return
+
+        self._initialized = True
         self.config = config
         self.tag = tag
 
@@ -68,6 +164,24 @@ class ResourceMonitor:
                 logger.info(f"  {name}")
         logger.info(f"Monitor interval: {self.monitor_interval} seconds")
 
+    @classmethod
+    def _reset(cls):
+        """
+        Teardown hook for thread-safe singleton
+        Resets the monitor instance to None
+
+        WARNING: Only use for testing or cleanup after shutdown.
+        Calling this while the monitor is active will cause issues.
+        Should only be called after stop() has completed.
+        """
+        # Acquire lock to prevent race conditions
+        with cls._lock:
+            # Discard the singleton instance by removing the global reference
+            # Guarantees the next constructor call will produce a fresh instance
+            # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
+            cls._instance = None
+            logger.info("Monitor singleton instance reset")
+
     def _detect_gpus(self):
         """Detect available GPUs"""
         try:
@@ -77,8 +191,6 @@ class ResourceMonitor:
             # Try to get GPU names using nvidia-smi if available
             if self.num_gpus > 0:
                 try:
-                    import subprocess
-
                     result = subprocess.run(
                         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                         check=False,
@@ -102,10 +214,58 @@ class ResourceMonitor:
             self.num_gpus = 0
             self.gpu_names = []
 
+    def _get_process_tree_stats(self):
+        """
+        Get total CPU and RAM usage for main process and all child processes.
+
+        Returns:
+            tuple: (cpu_percent_total, ram_percent)
+        """
+        stats = get_process_tree_stats(self.process)
+        return stats["cpu_percent"], stats["ram_percent"]
+
+    def _get_gpu_stats(self):
+        """Get GPU usage and memory statistics"""
+        gpu_utils = []
+        gpu_mems = []
+
+        if self.num_gpus > 0:
+            try:
+                # Get GPU utilization
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.get_gpu_timeout,
+                )
+
+                if result.returncode == 0:
+                    for line in result.stdout.strip().split("\n"):
+                        parts = line.split(",")
+                        util = float(parts[0].strip())
+                        mem_used = float(parts[1].strip())
+                        mem_total = float(parts[2].strip())
+                        mem_percent = (mem_used / mem_total) * 100 if mem_total > 0 else 0
+
+                        gpu_utils.append(util)
+                        gpu_mems.append(mem_percent)
+                else:
+                    gpu_utils = [0.0] * self.num_gpus
+                    gpu_mems = [0.0] * self.num_gpus
+            except Exception:
+                gpu_utils = [0.0] * self.num_gpus
+                gpu_mems = [0.0] * self.num_gpus
+
+        return gpu_utils, gpu_mems
+
     def start(self):
         """Start monitoring in background thread"""
         if self.monitor_thread is not None and self.monitor_thread.is_alive():
-            logger.warning("Monitoring thread already running")
             return
 
         self.stop_event.clear()
@@ -212,96 +372,9 @@ class ResourceMonitor:
                 self.stop_event.wait(self.monitor_retry_delay)
 
         # Save plot on shutdown
-        self.save_plot()
+        self._save_plot()
 
-    def _get_process_tree_stats(self):
-        """
-        Get total CPU and RAM usage for main process and all child processes.
-        This captures multiprocessing workers spawned by Pool() calls.
-
-        Returns:
-            tuple: (cpu_percent_total, ram_percent)
-        """
-        try:
-            # Get all processes in tree (main + children)
-            processes = [self.process]
-            with contextlib.suppress(psutil.NoSuchProcess):
-                processes.extend(self.process.children(recursive=True))
-
-            # Aggregate CPU and RAM usage across all processes
-            total_cpu = 0.0
-            total_ram_bytes = 0
-
-            for proc in processes:
-                try:
-                    # CPU: Get percentage (can be >100% for multi-core usage)
-                    cpu = proc.cpu_percent(interval=0.0)  # Non-blocking
-                    total_cpu += cpu
-
-                    # RAM: Get RSS (Resident Set Size)
-                    mem_info = proc.memory_info()
-                    total_ram_bytes += mem_info.rss
-
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    # Process may have died between children() and cpu_percent() or memory_info() calls
-                    continue
-
-            # Convert CPU to percentage of total system CPU
-            num_cores = psutil.cpu_count() or 0
-            cpu_percent = total_cpu / num_cores if num_cores > 0 else 0.0
-
-            # Convert RAM to percentage of total system RAM
-            total_system_ram = psutil.virtual_memory().total
-            ram_percent = (total_ram_bytes / total_system_ram) * 100
-
-            return cpu_percent, ram_percent
-
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            logger.warning(f"Error getting process tree stats: {e}")
-            return 0.0, 0.0
-
-    def _get_gpu_stats(self):
-        """Get GPU usage and memory statistics"""
-        gpu_utils = []
-        gpu_mems = []
-
-        if self.num_gpus > 0:
-            try:
-                import subprocess
-
-                # Get GPU utilization
-                result = subprocess.run(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=utilization.gpu,memory.used,memory.total",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.get_gpu_timeout,
-                )
-
-                if result.returncode == 0:
-                    for line in result.stdout.strip().split("\n"):
-                        parts = line.split(",")
-                        util = float(parts[0].strip())
-                        mem_used = float(parts[1].strip())
-                        mem_total = float(parts[2].strip())
-                        mem_percent = (mem_used / mem_total) * 100 if mem_total > 0 else 0
-
-                        gpu_utils.append(util)
-                        gpu_mems.append(mem_percent)
-                else:
-                    gpu_utils = [0.0] * self.num_gpus
-                    gpu_mems = [0.0] * self.num_gpus
-            except Exception:
-                gpu_utils = [0.0] * self.num_gpus
-                gpu_mems = [0.0] * self.num_gpus
-
-        return gpu_utils, gpu_mems
-
-    def save_plot(self):
+    def _save_plot(self):
         """Generate and save resource utilization plot from database"""
         current_time = time.time()
 
@@ -531,33 +604,31 @@ def init_monitor(config: Config, tag: str | None) -> ResourceMonitor:
     """
     Initialize global monitor instance (call once at startup)
     """
-    global _RESOURCE_MONITOR
+    monitor = ResourceMonitor(config, tag)
+    monitor.start()
 
-    if _RESOURCE_MONITOR is not None:
-        logger.warning("Monitor instance already initialized")
-        return _RESOURCE_MONITOR
+    register_monitor(monitor)
 
-    _RESOURCE_MONITOR = ResourceMonitor(config, tag)
-    _RESOURCE_MONITOR.start()
-
-    return _RESOURCE_MONITOR
+    return monitor
 
 
 def get_monitor() -> ResourceMonitor | None:
     """Get the global monitor instance"""
-    if _RESOURCE_MONITOR is None:
+    monitor = ResourceMonitor._instance
+
+    if monitor is None:
         logger.warning("No monitor instance initialized")
 
-    return _RESOURCE_MONITOR
+    return monitor
 
 
 def shutdown_monitor():
     """Shutdown the global monitor instance (call on exit)"""
-    global _RESOURCE_MONITOR
+    monitor = ResourceMonitor._instance
 
-    if _RESOURCE_MONITOR is None:
+    if monitor is None:
         logger.warning("No monitor instance initialized")
         return
 
-    _RESOURCE_MONITOR.stop()
-    _RESOURCE_MONITOR = None
+    monitor.stop()
+    ResourceMonitor._reset()
