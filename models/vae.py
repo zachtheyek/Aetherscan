@@ -1,6 +1,8 @@
 # TODO: replace hard-coded values with config values
 """
 Beta-VAE model implementation for Aetherscan Pipeline
+Uses custom clustering loss components to implicitly differentiate SETI signals from RFI in the
+model's learned latent space
 """
 
 from __future__ import annotations
