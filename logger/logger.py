@@ -1,7 +1,7 @@
 """
 Logger for Aetherscan Pipeline
-Uses thread-safe queue-based logging to avoid deadlocks and corrupted outputs from
-multiple worker processes
+Runs as background thread & uses thread-safe queue-based logging to avoid deadlocks and corrupted
+outputs from concurrent writes (e.g. from worker processes)
 """
 
 from __future__ import annotations
@@ -9,15 +9,15 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from logging.handlers import QueueHandler, QueueListener
 from multiprocessing import Queue
 
 import tensorflow as tf
 
-logger = logging.getLogger(__name__)
+from manager import register_logger
 
-# Global singleton logger instance
-_LOGGER = None
+logger = logging.getLogger(__name__)
 
 
 class StreamToLogger:
@@ -54,6 +54,30 @@ class Logger:
     - Eliminates concurrent write issues and corrupted outputs
     """
 
+    _instance = None  # Stores singleton instance
+    _lock = threading.Lock()  # Ensures thread safety on object initialization
+
+    # __new__ allocates the object in memory (constructor at the object-creation level)
+    # __init__ initializes the object's attributes after it's created
+    # since __new__ is called before __init__ every time we instantiate a class,
+    # by overriding __new__, we can short-circuit object creation entirely, and control whether a
+    # new instance is created, or just return the existing instance
+    def __new__(cls, log_filepath: str):
+        # Double-checked locking pattern:
+        # First check if _instance is None, without lock (for performance)
+        if cls._instance is None:
+            # If None, acquire the lock to serialize the initialization path,
+            # preventing race conditions (2 threads violating singleton semantics)
+            with cls._lock:
+                # Check if _instance is None again inside the lock
+                # (since multiple threads can be calling simultaneously)
+                if cls._instance is None:
+                    # If still None, only then we construct the singleton instance
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False  # Mark as not initialized (for __init__)
+        # Return the same instance for all subsequent constructor calls
+        return cls._instance
+
     def __init__(self, log_filepath: str):
         """
         Initialize logger
@@ -61,6 +85,13 @@ class Logger:
         Args:
             log_filepath: Path to log file
         """
+        # Note, __init__ is triggered every time the class's constructor is called,
+        # even if __new__ returned the existing singleton instance
+        # Hence, we use the _initialized flag to make sure __init__ only runs once
+        if self._initialized:
+            return
+
+        self._initialized = True
         self.log_filepath = log_filepath
 
         # Create queue for worker processes (no size limit)
@@ -114,11 +145,30 @@ class Logger:
 
         logger.info(f"Logger initialized at: {log_filepath}")
 
+    @classmethod
+    def _reset(cls):
+        """
+        Teardown hook for thread-safe singleton
+        Resets the logger instance to None
+
+        WARNING: Only use for testing or cleanup after shutdown.
+        Calling this while the logger is active will cause issues.
+        Should only be called after stop() has completed.
+        """
+        # Acquire lock to prevent race conditions
+        with cls._lock:
+            # Discard the singleton instance by removing the global reference
+            # Guarantees the next constructor call will produce a fresh instance
+            # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
+            cls._instance = None
+            # Note, can't log here after tear down
+
     def stop(self):
         """Stop the queue listener thread"""
         if self.log_listener is not None:
             self.log_listener.stop()
-            logger.info("Logger stopped")
+            # Note, can't log after this point -- listener thread has stopped
+            # All subsequent logs will get queued but never logged
 
 
 def init_logger(log_filepath: str) -> Logger:
@@ -131,15 +181,11 @@ def init_logger(log_filepath: str) -> Logger:
     Returns:
         Logger instance
     """
-    global _LOGGER
+    logger_instance = Logger(log_filepath)
 
-    if _LOGGER is not None:
-        logger.warning("Logger instance already initialized")
-        return _LOGGER
+    register_logger(logger_instance)
 
-    _LOGGER = Logger(log_filepath)
-
-    return _LOGGER
+    return logger_instance
 
 
 def init_worker_logging():
@@ -152,7 +198,9 @@ def init_worker_logging():
     Args:
         log_queue: Queue for sending log messages to main process (optional)
     """
-    if _LOGGER is None:
+    logger_instance = Logger._instance
+
+    if logger_instance is None:
         logger.warning(
             "No logger instance initialized - disabling worker logging to avoid conflicts"
         )
@@ -160,7 +208,7 @@ def init_worker_logging():
         logging.getLogger().addHandler(logging.NullHandler())
         return
 
-    log_queue = _LOGGER.log_queue
+    log_queue = logger_instance.log_queue
 
     # Reset stdout/stderr to avoid inherited StreamToLogger from parent
     sys.stdout = sys.__stdout__
@@ -175,19 +223,21 @@ def init_worker_logging():
 
 def get_logger() -> Logger | None:
     """Get the global logger instance"""
-    if _LOGGER is None:
+    logger_instance = Logger._instance
+
+    if logger_instance is None:
         logger.warning("No logger instance initialized")
 
-    return _LOGGER
+    return logger_instance
 
 
 def shutdown_logger():
     """Shutdown the global logger instance (call on exit)"""
-    global _LOGGER
+    logger_instance = Logger._instance
 
-    if _LOGGER is None:
+    if logger_instance is None:
         logger.warning("No logger instance initialized")
         return
 
-    _LOGGER.stop()
-    _LOGGER = None
+    logger_instance.stop()
+    Logger._reset()
