@@ -23,6 +23,14 @@ class DBConfig:
 
 
 @dataclass
+class ManagerConfig:
+    """Resource manager configuration"""
+
+    pool_terminate_timeout: float = 2.0  # seconds
+    # multiprocessing_chunksize: int = 4
+
+
+@dataclass
 class MonitorConfig:
     """Resource monitor configuration"""
 
@@ -144,6 +152,7 @@ class Config:
 
     def __init__(self):
         self.db = DBConfig()
+        self.manager = ManagerConfig()
         self.monitor = MonitorConfig()
         self.beta_vae = BetaVAEConfig()
         self.rf = RandomForestConfig()
@@ -188,6 +197,9 @@ class Config:
                 "write_interval": self.db.write_interval,
                 "write_buffer_max_size": self.db.write_buffer_max_size,
                 "write_retry_delay": self.db.write_retry_delay,
+            },
+            "manager": {
+                "pool_terminate_timeout": self.manager.pool_terminate_timeout,
             },
             "monitor": {
                 "get_gpu_timeout": self.monitor.get_gpu_timeout,
