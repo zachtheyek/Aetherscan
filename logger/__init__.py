@@ -3,7 +3,6 @@ Logger package for Aetherscan pipeline
 """
 
 from .logger import (
-    get_log_queue,
     get_logger,
     init_logger,
     init_worker_logging,
@@ -11,7 +10,6 @@ from .logger import (
 )
 
 __all__ = [
-    "get_log_queue",
     "get_logger",
     "init_logger",
     "init_worker_logging",
