@@ -6,6 +6,3 @@ outputs/
 
 # Local development environment
 environment_nocuda.yml
-
-# Linter cache
-.ruff_cache
