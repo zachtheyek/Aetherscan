@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-
-# import weakref
 import logging
 import os
 import signal
@@ -23,9 +21,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 import psutil
 
-from config import Config
+from config import get_config
 from db import shutdown_db
-from logger import shutdown_logger
+from logger import get_logger, shutdown_logger
 from monitor import get_process_tree_stats, shutdown_monitor
 
 logger = logging.getLogger(__name__)
@@ -175,7 +173,7 @@ class ResourceManager:
     # since __new__ is called before __init__ every time we instantiate a class,
     # by overriding __new__, we can short-circuit object creation entirely, and control whether a
     # new instance is created, or just return the existing instance
-    def __new__(cls, config: Config):
+    def __new__(cls):
         # Double-checked locking pattern:
         # First check if _instance is None, without lock (for performance)
         if cls._instance is None:
@@ -191,7 +189,8 @@ class ResourceManager:
         # Return the same instance for all subsequent constructor calls
         return cls._instance
 
-    def __init__(self, config: Config):
+    def __init__(self):
+        """Initialize manager"""
         # Note, __init__ is triggered every time the class's constructor is called,
         # even if __new__ returned the existing singleton instance
         # Hence, we use the _initialized flag to make sure __init__ only runs once
@@ -199,11 +198,15 @@ class ResourceManager:
             return
 
         self._initialized = True
-        self.config = config
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
         self._main_process_pid = os.getpid()
         self._cleanup_executed = False
         self._cleanup_lock = threading.Lock()
 
+        # NOTE: should these be strong or weak references? import weakref ...
         # Track resources
         self._pools: list[ManagedPool] = []
         self._shared_memories: list[ManagedSharedMemory] = []
@@ -223,16 +226,15 @@ class ResourceManager:
         logger.info(f"  Pools active: {self.stats.pools_active}")
         logger.info(f"  Shared memories active: {self.stats.shared_memories_active}")
 
-    # TODO: define stop() method? alternatively, do we need _reset() and shutdown_manager()?
     @classmethod
     def _reset(cls):
         """
         Teardown hook for thread-safe singleton
         Resets the manager instance to None
 
-        WARNING: Only use for testing or cleanup after shutdown.
+        WARNING: Only use for testing or restarting the application
         Calling this while the manager is active will cause issues.
-        Should only be called after stop() has completed.
+        Do NOT call this method unless you know what you're doing
         """
         # Acquire lock to prevent race conditions
         with cls._lock:
@@ -241,6 +243,9 @@ class ResourceManager:
             # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
             cls._instance = None
             logger.info("Manager singleton instance reset")
+            logger.info(
+                "Note that resource cleanup has not been triggered, and will still run as expected on exit."
+            )
 
     def _register_cleanup_handlers(self):
         """Register atexit and signal handlers for cleanup"""
@@ -569,11 +574,11 @@ class ResourceManager:
         return self.stats
 
 
-def init_manager(config: Config) -> ResourceManager:
+def init_manager() -> ResourceManager:
     """
     Initialize global manager instance (call once at startup)
     """
-    manager = ResourceManager(config)
+    manager = ResourceManager()
     return manager
 
 
@@ -599,7 +604,7 @@ def register_db(db):
     logger.info("Registered database")
 
 
-def register_logger(logger):
+def register_logger():
     """Register logger instance to resource manager"""
     manager = ResourceManager._instance
 
@@ -607,7 +612,15 @@ def register_logger(logger):
         logger.warning("Cannot register logger, no manager instance initialized")
         return
 
-    manager.set_logger(logger)
+    # Note, unlike other modules, due to dependency chains,
+    # register_logger() is not baked into init_logger()
+    # Hence, we need to get the logger instance separately with get_logger()
+    logger_instance = get_logger()
+    if logger_instance is None:
+        logger.warning("Cannot register logger, no logger instance initialized")
+        return
+
+    manager.set_logger(logger_instance)
     logger.info("Registered logger")
 
 
@@ -623,16 +636,14 @@ def register_monitor(monitor):
     logger.info("Registered monitor")
 
 
-def shutdown_manager() -> None:
-    """
-    Shutdown the global manager instance
-    """
-    manager = ResourceManager._instance
-
-    if manager is None:
-        logger.warning("No manager instance initialized")
-        return
-
-    # TODO: define stop() method? alternatively, do we need _reset() and shutdown_manager() at all?
-    # manager.stop()
-    manager._reset()
+# def shutdown_manager() -> None:
+#     """
+#     Shutdown the global manager instance
+#     """
+#     manager = ResourceManager._instance
+#
+#     if manager is None:
+#         logger.warning("No manager instance initialized")
+#         return
+#
+#     manager._reset()
