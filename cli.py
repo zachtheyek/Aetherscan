@@ -349,7 +349,7 @@ def _add_train_arguments(subparsers):
         "--load-tag",
         type=str,
         default=None,
-        help="Model tag for checkpoint loading. Accepted formats: final_vX, round_XX, test_vX, YYYYMMDD_HHMMSS. If round_XX format used, and --start-round not specified, training will resume from round proceeding loaded checkpoint (i.e., XX + 1)",
+        help="Model tag for checkpoint loading. Accepted formats: final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX. If round_XX format used, and --start-round not specified, training will resume from round proceeding loaded checkpoint (i.e., XX + 1)",
     )
     train_parser.add_argument(
         "--start-round",

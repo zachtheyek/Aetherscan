@@ -207,13 +207,20 @@ def get_latest_tag(checkpoints_dir: str) -> str:
                 return (2, round_num)
             except (ValueError, IndexError):
                 return (3, tag_str)
-        # Handle timestamp format YYYYMMDD_HHMMSS lowest priority
+        # Handle timestamp format YYYYMMDD_HHMMSS tertiary priority
         elif re.match(r"\d{8}_\d{6}", tag_str):
             try:
                 timestamp = datetime.strptime(tag_str, "%Y%m%d_%H%M%S")
                 return (4, timestamp)
             except ValueError:
                 return (5, tag_str)
+        # Handle test_vX format with lowest priority
+        if tag_str.startswith("test_"):
+            try:
+                test_ver = int(tag_str.split("_v")[1])
+                return (6, test_ver)
+            except (ValueError, IndexError):
+                return (7, tag_str)
         # Fallback for all other formats
         else:
             return (99, tag_str)
@@ -224,7 +231,7 @@ def get_latest_tag(checkpoints_dir: str) -> str:
 
     if highest_priority == 99:
         raise FileNotFoundError(
-            "No valid model tags found (e.g. final_vX, round_XX, YYYYMMDD_HHMMSS)"
+            "No valid model tags found (e.g. final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX)"
         )
 
     filtered_tags = [t for t in valid_tags if sort_key(t)[0] == highest_priority]
