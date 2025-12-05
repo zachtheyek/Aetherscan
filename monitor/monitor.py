@@ -13,7 +13,6 @@ import os
 import subprocess
 import threading
 import time
-from datetime import datetime
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -23,7 +22,7 @@ import tensorflow as tf
 
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
-from config import Config
+from config import get_config
 from db import get_db
 from manager import register_monitor
 
@@ -105,7 +104,7 @@ class ResourceMonitor:
     # since __new__ is called before __init__ every time we instantiate a class,
     # by overriding __new__, we can short-circuit object creation entirely, and control whether a
     # new instance is created, or just return the existing instance
-    def __new__(cls, config: Config, tag: str | None):
+    def __new__(cls):
         # Double-checked locking pattern:
         # First check if _instance is None, without lock (for performance)
         if cls._instance is None:
@@ -121,7 +120,7 @@ class ResourceMonitor:
         # Return the same instance for all subsequent constructor calls
         return cls._instance
 
-    def __init__(self, config: Config, tag: str | None):
+    def __init__(self):
         """Initialize monitor"""
         # Note, __init__ is triggered every time the class's constructor is called,
         # even if __new__ returned the existing singleton instance
@@ -130,9 +129,12 @@ class ResourceMonitor:
             return
 
         self._initialized = True
-        self.config = config
-        self.tag = tag
 
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
+        self.tag = self.config.checkpoint.save_tag
         self.get_gpu_timeout = self.config.monitor.get_gpu_timeout
         self.stop_monitor_timeout = self.config.monitor.stop_monitor_timeout
         self.monitor_interval = self.config.monitor.monitor_interval
@@ -442,10 +444,6 @@ class ResourceMonitor:
         del timestamps_dict, values_dict
         gc.collect()
 
-        # # Ensure output directory exists
-        # if os.path.dirname(output_path):
-        #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
         # Create figure with 3 subplots
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
         fig.suptitle("Aetherscan Pipeline: Resource Utilization", fontsize=16, fontweight="bold")
@@ -586,12 +584,10 @@ class ResourceMonitor:
         plt.tight_layout()
 
         # Save plot
-        if self.tag is None:
-            self.tag = datetime.now().strftime("%Y%m%d_%H%M%S")  # Set datetime on save, not on init
-
         output_path = os.path.join(
             self.config.output_path, "plots", f"resource_utilization_{self.tag}.png"
         )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)  # Create dir if it doesn't exist
 
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
 
@@ -600,11 +596,11 @@ class ResourceMonitor:
         logger.info(f"Resource utilization plot saved to: {output_path}")
 
 
-def init_monitor(config: Config, tag: str | None) -> ResourceMonitor:
+def init_monitor() -> ResourceMonitor:
     """
     Initialize global monitor instance (call once at startup)
     """
-    monitor = ResourceMonitor(config, tag)
+    monitor = ResourceMonitor()
     monitor.start()
 
     register_monitor(monitor)
