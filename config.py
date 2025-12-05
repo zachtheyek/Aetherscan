@@ -1,6 +1,6 @@
 # TODO: make sure config params are used where possible, and remove unaccessed config params
-# TODO: make sure pipeline uses the same singleton config param instance (not separate instances)
-# TODO: double check to_dict
+
+# Note, we avoid logging anything in config.py to prevent coupling with the logger module
 """
 Configuration module for Aetherscan Pipeline
 """
@@ -8,7 +8,9 @@ Configuration module for Aetherscan Pipeline
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass
@@ -38,6 +40,13 @@ class MonitorConfig:
     stop_monitor_timeout: float = 10.0  # seconds
     monitor_interval: float = 1.0  # seconds
     monitor_retry_delay: float = 1.0  # seconds
+
+
+@dataclass
+class LoggerConfig:
+    """Logger configuration"""
+
+    # NOTE: come back to this later
 
 
 @dataclass
@@ -83,19 +92,12 @@ class DataConfig:
     max_chunks_per_file: int = 25  # Maximum chunks to load from a single file
 
     # Data files
-    train_files: list[str] | None = None
-    test_files: list[str] | None = None
-
-    def __post_init__(self):
-        """Set default file lists"""
-        if self.train_files is None:
-            self.train_files = [
-                "real_filtered_LARGE_HIP110750.npy",
-                "real_filtered_LARGE_HIP13402.npy",
-                "real_filtered_LARGE_HIP8497.npy",
-            ]
-        if self.test_files is None:
-            self.test_files = ["real_filtered_LARGE_testHIP83043.npy"]
+    train_files: list[str] = [
+        "real_filtered_LARGE_HIP110750.npy",
+        "real_filtered_LARGE_HIP13402.npy",
+        "real_filtered_LARGE_HIP8497.npy",
+    ]
+    test_files: list[str] = ["real_filtered_LARGE_test_HIP15638.npy"]
 
 
 @dataclass
@@ -147,27 +149,98 @@ class InferenceConfig:
     # overlap search
 
 
+@dataclass
+class CheckpointConfig:
+    """Checkpoint configuration"""
+
+    load_dir: str | None = None
+    load_tag: str | None = None
+    start_round: int = 1
+    save_tag: str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def infer_start_round(self):
+        """Infer start_round from load_tag"""
+        if self.load_tag and self.load_tag.startswith("round_"):
+            self.start_round = (
+                int(self.load_tag.split("_", 1)[1]) + 1
+            )  # Start from the round proceeding model checkpoint (round_XX + 1)
+
+
 class Config:
     """Main configuration class"""
 
+    _instance = None  # Stores singleton instance
+    _lock = threading.Lock()  # Ensures thread safety on object initialization
+
+    # __new__ allocates the object in memory (constructor at the object-creation level)
+    # __init__ initializes the object's attributes after it's created
+    # since __new__ is called before __init__ every time we instantiate a class,
+    # by overriding __new__, we can short-circuit object creation entirely, and control whether a
+    # new instance is created, or just return the existing instance
+    def __new__(cls):
+        # Double-checked locking pattern:
+        # First check if _instance is None, without lock (for performance)
+        if cls._instance is None:
+            # If None, acquire the lock to serialize the initialization path,
+            # preventing race conditions (2 threads violating singleton semantics)
+            with cls._lock:
+                # Check if _instance is None again inside the lock
+                # (since multiple threads can be calling simultaneously)
+                if cls._instance is None:
+                    # If still None, only then we construct the singleton instance
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False  # Mark as not initialized (for __init__)
+        # Return the same instance for all subsequent constructor calls
+        return cls._instance
+
     def __init__(self):
+        """Initialize configuration"""
+        # Note, __init__ is triggered every time the class's constructor is called,
+        # even if __new__ returned the existing singleton instance
+        # Hence, we use the _initialized flag to make sure __init__ only runs once
+        if self._initialized:
+            return
+
+        self._initialized = True
+
         self.db = DBConfig()
         self.manager = ManagerConfig()
         self.monitor = MonitorConfig()
+        self.logger = LoggerConfig()
         self.beta_vae = BetaVAEConfig()
         self.rf = RandomForestConfig()
         self.data = DataConfig()
         self.training = TrainingConfig()
         self.inference = InferenceConfig()
+        self.checkpoint = CheckpointConfig()
 
         # Paths
-        self.data_path = os.environ.get("SETI_DATA_PATH", "/datax/scratch/zachy/data/aetherscan")
+        self.data_path = os.environ.get(
+            "AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan"
+        )
         self.model_path = os.environ.get(
-            "SETI_MODEL_PATH", "/datax/scratch/zachy/models/aetherscan"
+            "AETHERSCAN_MODEL_PATH", "/datax/scratch/zachy/models/aetherscan"
         )
         self.output_path = os.environ.get(
-            "SETI_OUTPUT_PATH", "/datax/scratch/zachy/outputs/aetherscan"
+            "AETHERSCAN_OUTPUT_PATH", "/datax/scratch/zachy/outputs/aetherscan"
         )
+
+    @classmethod
+    def _reset(cls):
+        """
+        Teardown hook for thread-safe singleton
+        Resets the config instance to None
+
+        WARNING: Only use for testing or restarting the application
+        Calling this while the config is active will cause issues.
+        Do NOT call this method unless you know what you're doing
+        """
+        # Acquire lock to prevent race conditions
+        with cls._lock:
+            # Discard the singleton instance by removing the global reference
+            # Guarantees the next constructor call will produce a fresh instance
+            # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
+            cls._instance = None
 
     def get_training_file_path(self, filename: str) -> str:
         """Get full path for training data file"""
@@ -191,6 +264,11 @@ class Config:
     def to_dict(self) -> dict:
         """Convert config to dictionary for serialization"""
         return {
+            "paths": {
+                "data_path": self.data_path,
+                "model_path": self.model_path,
+                "output_path": self.output_path,
+            },
             "db": {
                 "get_connection_timeout": self.db.get_connection_timeout,
                 "stop_writer_timeout": self.db.stop_writer_timeout,
@@ -206,6 +284,9 @@ class Config:
                 "stop_monitor_timeout": self.monitor.stop_monitor_timeout,
                 "monitor_interval": self.monitor.monitor_interval,
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
+            },
+            "logger": {
+                # NOTE: come back to this later
             },
             "beta_vae": {
                 "latent_dim": self.beta_vae.latent_dim,
@@ -264,9 +345,39 @@ class Config:
                 "batch_size": self.inference.batch_size,
                 "max_drift_rate": self.inference.max_drift_rate,
             },
-            "paths": {
-                "data_path": self.data_path,
-                "model_path": self.model_path,
-                "output_path": self.output_path,
+            "checkpoint": {
+                "load_dir": self.checkpoint.load_dir,
+                "load_tag": self.checkpoint.load_tag,
+                "start_round": self.checkpoint.start_round,
+                "save_tag": self.checkpoint.save_tag,
             },
         }
+
+
+def init_config() -> Config:
+    """
+    Initialize global config instance (call once at startup)
+    """
+    config = Config()
+    return config
+
+
+# NOTE: suppress None return type for now to reduce pyright errors
+# def get_config() -> Config | None:
+def get_config() -> Config:
+    """
+    Get the global config instance
+    """
+    return Config._instance
+
+
+# def shutdown_config() -> None:
+#     """
+#     Shutdown the global config instance
+#     """
+#     config = Config._instance
+#
+#     if config is None:
+#         return
+#
+#     Config._reset()
