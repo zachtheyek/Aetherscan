@@ -1,3 +1,4 @@
+# TODO: refactor to expose public APIs for creating & destroying RandomForestModel instances
 """
 Random Forest classifier implementation for Aetherscan Pipeline
 Receives concatenated latents grouped by their original 6-observation cadence pattern
@@ -11,6 +12,8 @@ import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import shuffle
+
+from config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +51,19 @@ def prepare_latent_features(latent_vectors: np.ndarray, num_observations: int = 
 class RandomForestModel:
     """Random Forest classifier for SETI signal detection"""
 
-    def __init__(self, config):
-        self.config = config
+    def __init__(self):
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
         self.model = RandomForestClassifier(
-            n_estimators=config.rf.n_estimators,
-            bootstrap=config.rf.bootstrap,
-            max_features=config.rf.max_features,
-            n_jobs=config.rf.n_jobs,
-            random_state=config.rf.seed,
+            n_estimators=self.config.rf.n_estimators,
+            bootstrap=self.config.rf.bootstrap,
+            max_features=self.config.rf.max_features,
+            n_jobs=self.config.rf.n_jobs,
+            random_state=self.config.rf.seed,
         )
+
         self.is_trained = False
 
     def prepare_training_data(

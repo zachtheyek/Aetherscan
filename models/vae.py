@@ -1,3 +1,4 @@
+# TODO: refactor to expose public APIs for creating & destroying BetaVAE instances
 # TODO: replace hard-coded values with config values
 """
 Beta-VAE model implementation for Aetherscan Pipeline
@@ -14,6 +15,8 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.initializers import Constant, GlorotNormal, HeNormal, Zeros
 from tensorflow.keras.regularizers import l1, l2
+
+from config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ class BetaVAE(keras.Model):
     Beta-VAE model with custom loss functions for SETI
     """
 
-    def __init__(self, encoder, decoder, alpha=10, beta=1.5, **kwargs):
+    def __init__(self, encoder, decoder, alpha=10.0, beta=1.5, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
@@ -577,10 +580,14 @@ def build_decoder(
     return decoder
 
 
-def create_beta_vae_model(config):
+def create_beta_vae_model():
     """Create and compile Beta-VAE model with author's exact settings"""
 
     logger.info("Creating Beta-VAE model...")
+
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
 
     encoder = build_encoder(
         latent_dim=config.beta_vae.latent_dim,
