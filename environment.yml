@@ -1,4 +1,5 @@
 # TODO: update to match current pipeline imports
+# TODO: rebuild conda environment after updating
 name: aetherscan
 channels:
   - conda-forge
@@ -21,9 +22,6 @@ dependencies:
   - scipy=1.11.*
   - nvidia::cuda-runtime=12.2.*
   - cudnn=8.9.*
-  # - jupyterlab
-  # - ipykernel
-  # - nb_conda_kernels
   - pip
   - pip:
       - tensorflow==2.16.*
