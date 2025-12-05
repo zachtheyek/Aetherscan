@@ -1,3 +1,7 @@
+# TODO:
+# add slack integration
+# find a way to customize separate logging level for slack vs console/file
+# also find a way to log plots in slack (but not in console/file)
 """
 Logger for Aetherscan Pipeline
 Runs as background thread & uses thread-safe queue-based logging to avoid deadlocks and corrupted
@@ -15,7 +19,7 @@ from multiprocessing import Queue
 
 import tensorflow as tf
 
-from manager import register_logger
+from config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +66,7 @@ class Logger:
     # since __new__ is called before __init__ every time we instantiate a class,
     # by overriding __new__, we can short-circuit object creation entirely, and control whether a
     # new instance is created, or just return the existing instance
-    def __new__(cls, log_filepath: str):
+    def __new__(cls):
         # Double-checked locking pattern:
         # First check if _instance is None, without lock (for performance)
         if cls._instance is None:
@@ -78,13 +82,8 @@ class Logger:
         # Return the same instance for all subsequent constructor calls
         return cls._instance
 
-    def __init__(self, log_filepath: str):
-        """
-        Initialize logger
-
-        Args:
-            log_filepath: Path to log file
-        """
+    def __init__(self):
+        """Initialize logger"""
         # Note, __init__ is triggered every time the class's constructor is called,
         # even if __new__ returned the existing singleton instance
         # Hence, we use the _initialized flag to make sure __init__ only runs once
@@ -92,7 +91,13 @@ class Logger:
             return
 
         self._initialized = True
-        self.log_filepath = log_filepath
+
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
+        self.log_path = os.path.join(self.config.output_path, "aetherscan.log")
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)  # Create dir if it doesn't exist
 
         # Create queue for worker processes (no size limit)
         self.log_queue = Queue(-1)
@@ -106,7 +111,7 @@ class Logger:
         formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
 
         # Setup file handler (only used by main process via listener)
-        file_handler = logging.FileHandler(log_filepath, mode="w")
+        file_handler = logging.FileHandler(self.log_path, mode="w")
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(formatter)
 
@@ -143,7 +148,7 @@ class Logger:
         sys.stdout = StreamToLogger(logging.getLogger("STDOUT"), logging.INFO)
         sys.stderr = StreamToLogger(logging.getLogger("STDERR"), logging.ERROR)
 
-        logger.info(f"Logger initialized at: {log_filepath}")
+        logger.info(f"Logger initialized at: {self.log_path}")
 
     @classmethod
     def _reset(cls):
@@ -171,19 +176,14 @@ class Logger:
             # All subsequent logs will get queued but never logged
 
 
-def init_logger(log_filepath: str) -> Logger:
+def init_logger() -> Logger:
     """
     Initialize global logger instance (call once at startup)
-
-    Args:
-        log_filepath: Path to log file
-
-    Returns:
-        Logger instance
     """
-    logger_instance = Logger(log_filepath)
+    logger_instance = Logger()
 
-    register_logger(logger_instance)
+    # Note, unlike other modules, due to dependency chains,
+    # we wait to call register_logger() inside main.py:main()
 
     return logger_instance
 
