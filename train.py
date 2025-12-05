@@ -1,5 +1,6 @@
 """
-Training pipeline for Aetherscan models
+Training orchestration for Aetherscan Pipeline
+...
 """
 
 from __future__ import annotations
@@ -20,14 +21,14 @@ from matplotlib.gridspec import GridSpec
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
-from config import Config
+from config import get_config
 from data_generation import DataGenerator
-from models import RandomForestModel, create_beta_vae_model
+from models import RandomForestModel, Sampling, create_beta_vae_model
+from preprocessing import DataPreprocessor
 
 logger = logging.getLogger(__name__)
 
 
-# NOTE: move this to main.py so directories are setup at the start of train_command()?
 def handle_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
     """
     Archive and clean up a directory
@@ -35,7 +36,7 @@ def handle_directory(base_dir: str, target_dirs: list[str] | None = None, round_
     Args:
         base_dir: Base directory to archive/clean
         target_dirs: List of subdirectory names to include in archiving (e.g., ['train', 'validation'])
-                    If None, only files are considered (directories are ignored)
+                     If None, only files are considered (directories are ignored)
         round_num: Training round number (1 for fresh run, >1 for resume)
     """
     # Create base directory if it doesn't exist
@@ -234,50 +235,7 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
-def calculate_curriculum_snr(round_idx: int, total_rounds: int, config: Config) -> tuple[int, int]:
-    """
-    Calculate SNR parameters for curriculum learning
-
-    Args:
-        round_idx: Current training round (0-indexed)
-        total_rounds: Total number of training rounds
-        config: Configuration object
-
-    Returns:
-        (snr_base, snr_range) tuple
-    """
-    # Edge case: use initial snr range if only training for 1 round
-    if total_rounds == 1:
-        return config.training.snr_base, config.training.initial_snr_range
-
-    # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
-    progress = round_idx / (total_rounds - 1)
-
-    if config.training.curriculum_schedule == "linear":
-        # Linear progression from wide to narrow SNR range
-        current_range = config.training.initial_snr_range - progress * (
-            config.training.initial_snr_range - config.training.final_snr_range
-        )
-    elif config.training.curriculum_schedule == "exponential":
-        # Exponential decay - start easy, then get hard quickly
-        current_range = config.training.final_snr_range + (
-            config.training.initial_snr_range - config.training.final_snr_range
-        ) * np.exp(config.training.exponential_decay_rate * progress)
-    elif config.training.curriculum_schedule == "step":
-        # Step function - easy for first part, hard for second part
-        # TODO: add mechanism for more step changes
-        if round_idx < config.training.step_easy_rounds:
-            current_range = config.training.initial_snr_range
-        else:
-            current_range = config.training.final_snr_range
-    else:
-        raise ValueError(
-            f"'{config.training.curriculum_schedule} is invalid. Accepted values: 'linear', 'exponential', 'step'"
-        )
-
-    return config.training.snr_base, int(current_range)
-
-
+# NOTE: come back to this later
 def prepare_distributed_dataset(
     data: dict,
     n_samples: int,
@@ -531,33 +489,47 @@ def check_encoder_trained(encoder, threshold=0.2):
 class TrainingPipeline:
     """Training pipeline"""
 
-    def __init__(self, config, background_data: np.ndarray, strategy=None, start_round=1):
+    def __init__(self, strategy=None):
         """
         Initialize training pipeline
 
         Args:
-            config: Configuration object
-            background_data: Preprocessed background observations
             strategy: TensorFlow distribution strategy
-            start_round: Round number to start training from
         """
-        self.config = config
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
+        # Set distributed strategy
         self.strategy = strategy or tf.distribute.get_strategy()
 
-        # Store background data
-        self.background_data = background_data.astype(np.float32)
-        logger.info(f"Background data shape: {background_data.shape}")
+        # Initialize preprocessor
+        self.preprocessor = DataPreprocessor()
 
+        # NOTE: come back to this (how to persist this in shared memory while closing pools)
+        # Load background data
+        self.background_data = self.preprocessor.load_background_data().astype(np.float32)
+        logger.info(f"Background data shape: {self.background_data.shape}")
+
+        # NOTE: wtf does this comment mean?
         # Initialize components with log queue for multiprocessing safety
-        self.data_generator = DataGenerator(config, background_data)
+        self.data_generator = DataGenerator(self.background_data)
 
         # Create VAE model & optimizer inside distributed context
         with self.strategy.scope():
-            self.vae = create_beta_vae_model(config)
+            self.vae = create_beta_vae_model()
             self._build_optimizer()
 
         self.rf_model = None
 
+        # Load models from checkpoints if provided
+        if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
+            logger.info("Resuming from checkpoint")
+            self.load_models(
+                tag=self.config.checkpoint.load_tag, dir=self.config.checkpoint.load_dir
+            )
+
+        # NOTE: replace this with db writes? (search for all self.history instances)
         # Training history
         self.history = {
             "loss": [],
@@ -574,12 +546,13 @@ class TrainingPipeline:
         }
 
         # Setup directories
-        self.setup_directories(start_round)
+        self._setup_directories()
 
+        # NOTE: should we just replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
         # Setup TensorBoard logging
-        self.setup_tensorboard_logging(start_round)
+        self._setup_tensorboard_logging()
 
-    # NOTE: when does this run?
+    # NOTE: is this still needed? when does this run? replace with close() instead?
     def __del__(self):
         """Cleanup TensorBoard writers and data generator"""
         if hasattr(self, "train_writer"):
@@ -621,9 +594,11 @@ class TrainingPipeline:
 
         logger.info("Optimizer built successfully within strategy scope")
 
-    def setup_directories(self, start_round=1):
+    def _setup_directories(self):
         """Create necessary directories"""
         logger.info("Setting up directories")
+
+        start_round = self.config.checkpoint.start_round
 
         model_checkpoints_dir = os.path.join(self.config.model_path, "checkpoints")
         handle_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
@@ -633,19 +608,19 @@ class TrainingPipeline:
 
         logger.info("Setup directories complete")
 
-    def setup_tensorboard_logging(self, start_round=1):
+    def _setup_tensorboard_logging(self):
         """Setup TensorBoard logging"""
         logger.info("Setting up TensorBoard logging")
+
+        start_round = self.config.checkpoint.start_round
 
         logs_dir = os.path.join(self.config.output_path, "logs")
         handle_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
 
+        self.global_step = (start_round - 1) * self.config.training.epochs_per_round
         if start_round == 1:
-            self.global_step = 0
             logger.info("Starting fresh TensorBoard logs")
-
         else:
-            self.global_step = (start_round - 1) * self.config.training.epochs_per_round
             logger.info(
                 f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})"
             )
@@ -660,7 +635,60 @@ class TrainingPipeline:
         logger.info(f"TensorBoard logs directory: {logs_dir}")
         logger.info(f"Initial global_step: {self.global_step}")
 
-    def update_learning_rate(self, val_losses):
+    def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
+        """
+        Calculate SNR parameters for curriculum learning
+
+        Args:
+            round_idx: Current training round (0-indexed)
+            total_rounds: Total number of training rounds
+
+        Returns:
+            (snr_base, snr_range) tuple
+        """
+        total_rounds = self.config.training.num_training_rounds
+        snr_base = self.config.training.snr_base
+        initial_snr_range = self.config.training.initial_snr_range
+        final_snr_range = self.config.training.final_snr_range
+        schedule = self.config.training.curriculum_schedule
+        decay_rate = self.config.training.exponential_decay_rate
+        easy_rounds = self.config.training.step_easy_rounds
+        hard_rounds = self.config.training.step_hard_rounds
+
+        # Edge case: use initial snr range if only training for 1 round
+        if total_rounds == 1:
+            return snr_base, initial_snr_range
+
+        # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
+        progress = round_idx / (total_rounds - 1)
+
+        if schedule == "linear":
+            # Linear progression from wide to narrow SNR range
+            current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
+        elif schedule == "exponential":
+            # Exponential decay - start easy, then get hard quickly
+            current_range = final_snr_range + (initial_snr_range - final_snr_range) * np.exp(
+                decay_rate * progress
+            )
+        elif schedule == "step":
+            # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
+            # Step function - easy for first part, hard for second part
+            if round_idx < easy_rounds:
+                current_range = initial_snr_range
+            elif round_idx - easy_rounds < hard_rounds:
+                current_range = final_snr_range
+            else:
+                raise RuntimeError(
+                    f"round_idx ({round_idx}) exceeded easy_rounds + hard_rounds ({easy_rounds} + {hard_rounds})"
+                )
+        else:
+            raise ValueError(
+                f"'{schedule} is invalid. Accepted values: 'linear', 'exponential', 'step'"
+            )
+
+        return snr_base, int(current_range)
+
+    def _update_learning_rate(self, val_losses):
         """
         Robust adaptive learning rate with multiple safeguards
 
@@ -703,20 +731,23 @@ class TrainingPipeline:
 
         return current_lr
 
-    def train_beta_vae(self, start_round=1):
+    def train_beta_vae(self):
         """
         Train beta-VAE with curriculum learning
         """
         n_rounds = self.config.training.num_training_rounds
         epochs = self.config.training.epochs_per_round
+        start_round = self.config.checkpoint.start_round
 
-        if start_round > 1:
+        if start_round > n_rounds:
+            return  # Return early if beta-VAE already trained (can occur from fault tolerance)
+        elif start_round > 1:
             logger.info(f"Resuming training from round {start_round}/{n_rounds}")
         else:
             logger.info(f"Starting training for {n_rounds} rounds")
 
         for round_idx in range(start_round - 1, n_rounds):
-            snr_base, snr_range = calculate_curriculum_snr(round_idx, n_rounds, self.config)
+            snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
 
             logger.info(f"{'=' * 50}")
             logger.info(f"ROUND {round_idx + 1}/{n_rounds}")
@@ -748,7 +779,7 @@ class TrainingPipeline:
         )
 
         # Generate training data
-        train_data = self.data_generator.generate_train_batch(
+        train_data = self.data_generator.generate_batch(
             self.config.training.num_samples_beta_vae, snr_base, snr_range
         )
 
@@ -882,7 +913,7 @@ class TrainingPipeline:
             self.global_step += 1
 
             # Adaptive learning rate
-            self.update_learning_rate(val_losses)
+            self._update_learning_rate(val_losses)
 
             # Log resources at end of epoch
             logger.info(f"Epoch {epoch + 1}/{epochs} End")
@@ -893,7 +924,7 @@ class TrainingPipeline:
 
         # Force TensorFlow to release internal references to datasets/iterators
         # This prevents generator closures from accumulating in memory between rounds
-        tf.keras.backend.clear_session()
+        tf.keras.backend.clear_session()  # NOTE: what does this do? still needed after ResourceManager?
         logger.info("Cleared TensorFlow session state")
 
         # Save checkpoint
@@ -904,7 +935,7 @@ class TrainingPipeline:
 
     def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1):
         """
-        Perform a single training epoch with gradient accumulation (if accumulation_steps > 1)
+        Perform a single training epoch with gradient accumulation
         """
         epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
@@ -1164,7 +1195,7 @@ class TrainingPipeline:
 
         # Initialize RF model
         if self.rf_model is None:
-            self.rf_model = RandomForestModel(self.config)
+            self.rf_model = RandomForestModel()
 
         elif self.rf_model.is_trained:
             logger.info("Random Forest classifier already trained. Exiting training loop.")
@@ -1207,7 +1238,7 @@ class TrainingPipeline:
             # Generate training data
             logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
 
-            rf_data = self.data_generator.generate_train_batch(n_samples, snr_base, snr_range)
+            rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
             # Prepare distributed dataset for inference
             results = prepare_distributed_dataset(
@@ -1392,7 +1423,7 @@ class TrainingPipeline:
 
         # Save plot
         if tag is None:
-            tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tag = self.config.checkpoint.save_tag
 
         if dir is not None:
             save_path = os.path.join(
@@ -1403,6 +1434,8 @@ class TrainingPipeline:
                 self.config.output_path, "plots", f"beta_vae_training_progress_{tag}.png"
             )
 
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)  # Create dir if it doesn't exist
+
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
         plt.close()
@@ -1410,7 +1443,7 @@ class TrainingPipeline:
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
         if tag is None:
-            tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tag = self.config.checkpoint.save_tag
 
         if dir is not None:
             encoder_path = os.path.join(self.config.model_path, dir, f"vae_encoder_{tag}.keras")
@@ -1420,6 +1453,10 @@ class TrainingPipeline:
             encoder_path = os.path.join(self.config.model_path, f"vae_encoder_{tag}.keras")
             decoder_path = os.path.join(self.config.model_path, f"vae_decoder_{tag}.keras")
             rf_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+
+        os.makedirs(
+            os.path.dirname(encoder_path), exist_ok=True
+        )  # Create dir if it doesn't exist (encoder_path, decoder_path, rf_path all share parent dir)
 
         # Save VAE encoder (main model for inference)
         self.vae.encoder.save(encoder_path)
@@ -1437,6 +1474,7 @@ class TrainingPipeline:
     def load_models(self, tag: str | None = None, dir: str | None = None):
         """Load model weights"""
         if tag is None:
+            # NOTE: should we use a more sensible default?
             logger.info("No tag specified. Defaulting to 'final'")
             tag = "final"
         original_tag = tag
@@ -1474,9 +1512,6 @@ class TrainingPipeline:
 
             logger.info(f"Loading models from {base_dir} with tag '{tag}'")
 
-            # Import Sampling layer for custom_objects (required for model loading)
-            from models import Sampling
-
             # Load encoder & decoder
             checkpoint_encoder = tf.keras.models.load_model(
                 encoder_path, custom_objects={"Sampling": Sampling}
@@ -1495,7 +1530,7 @@ class TrainingPipeline:
             if os.path.exists(rf_path):
                 # Initialize RF model if it doesn't exist yet
                 if self.rf_model is None:
-                    self.rf_model = RandomForestModel(self.config)
+                    self.rf_model = RandomForestModel()
 
                 self.rf_model.load(rf_path)
                 logger.info("Random Forest loaded successfully")
@@ -1512,44 +1547,30 @@ class TrainingPipeline:
             raise
 
 
-def train_full_pipeline(
-    config,
-    background_data: np.ndarray,
-    strategy=None,
-    tag=None,
-    dir=None,
-    start_round=1,
-    final_tag=None,
-) -> TrainingPipeline:
+def train_full_pipeline(strategy=None) -> TrainingPipeline:
     """
-    Train complete Aetherscan pipeline
+    Complete Aetherscan training pipeline run
+
     Args:
-        config: Configuration object
-        background_data: Preprocessed background observations
         strategy: TensorFlow distribution strategy
 
     Returns:
         Trained pipeline object
     """
     # Create pipeline
-    pipeline = TrainingPipeline(config, background_data, strategy, start_round)
+    pipeline = TrainingPipeline(strategy)
 
-    # Resume from checkpoint if provided
-    if tag:
-        logger.info("Resuming from checkpoint")
-        pipeline.load_models(tag=tag, dir=dir)
-
-    # Run iterative training
-    pipeline.train_beta_vae(start_round=start_round)
+    # Train beta-VAE
+    pipeline.train_beta_vae()
 
     # Train Random Forest
     pipeline.train_random_forest()
 
     # Save final models
-    pipeline.save_models(tag=final_tag)
+    pipeline.save_models()
 
     # Final plot
-    pipeline.plot_beta_vae_training_progress(tag=final_tag)
+    pipeline.plot_beta_vae_training_progress()
 
     logger.info("Training complete!")
 
