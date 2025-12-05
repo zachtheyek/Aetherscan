@@ -73,7 +73,6 @@ known-first-party = [  # TODO: sync with internal modules
     "manager",
     "models",
     "monitor",
-    "utils",
 ]
 
 [tool.ruff.format]
