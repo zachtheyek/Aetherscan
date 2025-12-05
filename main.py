@@ -90,6 +90,7 @@ def train_command():
     logger.info(f"  Model path: {config.model_path}")
     logger.info(f"  Output path: {config.output_path}")
 
+    # NOTE: should we move this to main()?
     # Setup GPU strategy
     strategy = setup_gpu_strategy()
 
