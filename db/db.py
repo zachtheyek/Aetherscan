@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from queue import Empty, Queue
 from typing import Any
 
-from config import Config
+from config import get_config
 from manager import register_db
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class Database:
     # since __new__ is called before __init__ every time we instantiate a class,
     # by overriding __new__, we can short-circuit object creation entirely, and control whether a
     # new instance is created, or just return the existing instance
-    def __new__(cls, config: Config):
+    def __new__(cls):
         # Double-checked locking pattern:
         # First check if _instance is None, without lock (for performance)
         if cls._instance is None:
@@ -93,10 +93,8 @@ class Database:
         # Return the same instance for all subsequent constructor calls
         return cls._instance
 
-    def __init__(self, config: Config):
-        """
-        Initialize database
-        """
+    def __init__(self):
+        """Initialize database"""
         # Note, __init__ is triggered every time the class's constructor is called,
         # even if __new__ returned the existing singleton instance
         # Hence, we use the _initialized flag to make sure __init__ only runs once
@@ -104,7 +102,10 @@ class Database:
             return
 
         self._initialized = True
-        self.config = config
+
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
 
         self.db_path = os.path.join(self.config.output_path, "db", "aetherscan.db")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)  # Create dir if it doesn't exist
@@ -645,11 +646,11 @@ class Database:
             return stats
 
 
-def init_db(config: Config) -> Database:
+def init_db() -> Database:
     """
     Initialize global database instance (call once at startup)
     """
-    db = Database(config)
+    db = Database()
     db.start()
 
     register_db(db)
