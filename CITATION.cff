@@ -5,11 +5,17 @@ authors:
     given-names: "Zach"
     orcid: "https://orcid.org/0000-0002-2532-4883"
   -  # TODO: insert more authors here
-title: "Aetherscan"
+title: "Aetherscan: Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale"
 version: 0.1.0  # TODO: sync version with pyproject.toml
-date-released: 2026-01-01  # TODO: update to match v1 released date
-url: "https://github.com/zachtheyek/Aetherscan"  # NOTE: this should be the project url if any
+date-released: 2026-01-01  # TODO: update to match v1 release date
+url: "https://github.com/zachtheyek/Aetherscan"  # NOTE: this should be the project url, if any
 repository-code: "https://github.com/zachtheyek/Aetherscan"
 keywords:
-  - "SETI"  # TODO: add keywords here
+  - "SETI"
+  - "Technosignatures"
+  - "Radio Astronomy"
+  - "Signal Processing"
+  - "Machine Learning"
+  - "Deep Learning"
+  - "Data Methods"
 license: BSD-3-Clause
