@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Yek"
+    given-names: "Zach"
+    orcid: "https://orcid.org/0000-0002-2532-4883"
+  -  # TODO: insert more authors here
+title: "Aetherscan"
+version: 0.1.0  # TODO: sync version with pyproject.toml
+date-released: 2026-01-01  # TODO: update to match v1 released date
+url: "https://github.com/zachtheyek/Aetherscan"  # NOTE: this should be the project url if any
+repository-code: "https://github.com/zachtheyek/Aetherscan"
+keywords:
+  - "SETI"  # TODO: add keywords here
+license: BSD-3-Clause
