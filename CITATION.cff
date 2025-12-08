@@ -4,11 +4,11 @@ authors:
   - family-names: "Yek"
     given-names: "Zach"
     orcid: "https://orcid.org/0000-0002-2532-4883"
-  -  # TODO: insert more authors here
+  -  # TODO: insert more authors here (sync with pyproject.toml)
 title: "Aetherscan: Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale"
-version: 0.1.0  # TODO: sync version with pyproject.toml
+version: 0.1.0  # TODO: sync with pyproject.toml
 date-released: 2026-01-01  # TODO: update to match v1 release date
-url: "https://github.com/zachtheyek/Aetherscan"  # NOTE: this should be the project url, if any
+url: "https://github.com/zachtheyek/Aetherscan"
 repository-code: "https://github.com/zachtheyek/Aetherscan"
 keywords:
   - "SETI"
