@@ -2,7 +2,7 @@
 
 - setup environment with conda, uv, docker, or podman
 - download pre-commit hooks
-- point to CONTRIBUTING.md
+- point to CONTRIBUTING.md, LICENSE, and CITATION.cff
 
 ---
 
