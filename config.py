@@ -11,6 +11,7 @@ import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from multiprocessing import cpu_count
 
 
 @dataclass
@@ -28,6 +29,7 @@ class DBConfig:
 class ManagerConfig:
     """Resource manager configuration"""
 
+    n_processes: int = cpu_count()  # use all available cores
     pool_terminate_timeout: float = 2.0  # seconds
     # multiprocessing_chunksize: int = 4
 
@@ -277,6 +279,7 @@ class Config:
                 "write_retry_delay": self.db.write_retry_delay,
             },
             "manager": {
+                "n_processes": self.manager.n_processes,
                 "pool_terminate_timeout": self.manager.pool_terminate_timeout,
             },
             "monitor": {
