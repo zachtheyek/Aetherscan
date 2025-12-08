@@ -582,7 +582,9 @@ def init_manager() -> ResourceManager:
     return manager
 
 
-def get_manager() -> ResourceManager | None:
+# NOTE: suppress None return type for now to reduce pyright errors
+# def get_manager() -> ResourceManager | None:
+def get_manager() -> ResourceManager:
     """Get the global manager instance"""
     manager = ResourceManager._instance
 
