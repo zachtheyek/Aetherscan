@@ -5,12 +5,12 @@ description = "Breakthrough Listen's first end-to-end production-grade DL pipeli
 authors = [
     { name = "Zach Yek", email = "xiaoxiyek1.5@gmail.com" }
 ]
+requires-python = ">=3.10"
 dependencies = [
     # TODO: sync with environment.yml files
 ]
-readme = "README.md"
-requires-python = ">=3.10"
 license = { text = "BSD-3-Clause" }  # TODO: decide what license to use
+readme = "README.md"
 
 [project.optional-dependencies]
 dev = ["ruff"]  # Python linter
