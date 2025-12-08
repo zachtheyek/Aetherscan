@@ -2,7 +2,10 @@
 
 - setup environment with conda, uv, docker, or podman
 - download pre-commit hooks
-- point to CONTRIBUTING.md, LICENSE, and CITATION.cff
+- point to `CONTRIBUTING.md`, `LICENSE`, and `CITATION.cff`
+- add docs to `docs/`?
+- move code to `src/`?
+- upload to `PyPI`?
 
 ---
 
