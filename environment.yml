@@ -1,4 +1,4 @@
-# TODO: update to match current pipeline imports
+# TODO: update to match current pipeline imports (ruff)
 # TODO: rebuild conda environment after updating
 name: aetherscan
 channels:
