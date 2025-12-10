@@ -84,6 +84,7 @@ ignore = [
     "PLR2004",  # Ignore warnings for magic number comparisons
 
     # NOTE: temporary ignores
+    "N999",     # Ignore invalid module name errors
     "PLR0911",  # Function has too many return statements (>6)
     "PLR0912",  # Function has too many branches (if/elif/else, loops, etc.) (>12)
     "PLR0915",  # Function has too many statements (>50)
