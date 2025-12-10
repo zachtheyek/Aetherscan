@@ -1,4 +1,5 @@
 # TODO: Add build backend (use uv)
+# TODO: How to release as package on PyPI & display on GitHub? How to tag new releases on GitHub?
 
 [project]
 name = "aetherscan"

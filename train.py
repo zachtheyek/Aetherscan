@@ -513,6 +513,8 @@ class TrainingPipeline:
         # Initialize preprocessor
         self.preprocessor = DataPreprocessor()
 
+        # NOTE: fix preprocessing.py -> merge to master -> rerun on blpc2 -> add db writes
+        # NOTE: should this be in train_command() instead to avoid reloading on retries?
         # Load background data
         self.background_data = self.preprocessor.load_background_data().astype(np.float32)
         logger.info(f"Background data shape: {self.background_data.shape}")
