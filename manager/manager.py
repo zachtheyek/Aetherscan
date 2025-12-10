@@ -504,59 +504,6 @@ class ResourceManager:
         self.stats.shared_memories_active -= 1
         self.stats.shared_memories_cleaned += 1
 
-    # TODO: delete this block since we're managing pools & shared memory individually?
-    # # NOTE: data generators are separate from pools & shared memory? do we need to do this for other classes as well? (preprocessors, etc.)
-    # def register_data_generator(self, generator):
-    #     """Register a DataGenerator for cleanup tracking"""
-    #     # Note, in Python, you can have strong and weak references to objects
-    #     # Strong references keep the object alive, and prevent garbage collection until both
-    #     # references are deleted
-    #     # Weak references don't prevent the object from being garbage collected, and simply
-    #     # return the original object if it's still alive, or None if it's already been collected
-    #     # We use weak references here to avoid circular dependencies
-    #     self._data_generators.append(weakref.ref(generator))
-    #     self.stats.data_generators_active += 1
-    #     logger.info("Registered DataGenerator")
-    #     logger.info(f"  Current total active: {self.stats.data_generators_active}")
-    #
-    # def cleanup_data_generators(self):
-    #     """Clean up all registered data generators"""
-    #     alive_generators = []
-    #
-    #     for gen_ref in self._data_generators:
-    #         gen = gen_ref()  # Get actual object from weak reference
-    #         if gen is not None:
-    #             try:
-    #                 gen.close()
-    #                 self.stats.data_generators_active -= 1
-    #                 self.stats.data_generators_closed += 1
-    #                 logger.info("Closed DataGenerator")
-    #             except Exception as e:
-    #                 logger.warning(f"Error closing DataGenerator: {e}")
-    #                 alive_generators.append(gen_ref)
-    #
-    #     # NOTE: what's the point of keeping alive generators? what does an alive generator represent?
-    #     # Keep only generators that couldn't be closed
-    #     self._data_generators = alive_generators
-    #     self.stats.data_generators_active = len(alive_generators)
-    #
-    # # NOTE: come back to this later
-    # def reset_data_generator_pools(self):
-    #     """Reset pools in all DataGenerators (between training rounds)"""
-    #     reset_count = 0
-    #
-    #     for gen_ref in self._data_generators:
-    #         gen = gen_ref()
-    #         if gen is not None and hasattr(gen, "reset_pool"):
-    #             try:
-    #                 gen.reset_pool()
-    #                 reset_count += 1
-    #             except Exception as e:
-    #                 logger.warning(f"Error resetting DataGenerator pool: {e}")
-    #
-    #     logger.info(f"Reset {reset_count} DataGenerator pools")
-    #     return reset_count
-
     def set_db(self, db):
         """Set database"""
         self._db = db
