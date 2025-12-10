@@ -4,6 +4,7 @@ Entry point for Aetherscan Pipeline
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -128,6 +129,9 @@ def train_command():
                 )
 
                 try:
+                    # Collect garbage
+                    gc.collect()
+
                     # Find the latest checkpoint & determine where to resume from
                     config.checkpoint.load_dir = "checkpoints"
                     config.checkpoint.load_tag = get_latest_tag(
