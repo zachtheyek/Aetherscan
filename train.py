@@ -513,13 +513,11 @@ class TrainingPipeline:
         # Initialize preprocessor
         self.preprocessor = DataPreprocessor()
 
-        # NOTE: come back to this (how to persist this in shared memory while closing pools)
         # Load background data
         self.background_data = self.preprocessor.load_background_data().astype(np.float32)
         logger.info(f"Background data shape: {self.background_data.shape}")
 
-        # NOTE: wtf does this comment mean?
-        # Initialize components with log queue for multiprocessing safety
+        # Initialize data generator
         self.data_generator = DataGenerator(self.background_data)
 
         # Create VAE model & optimizer inside distributed context
@@ -929,10 +927,14 @@ class TrainingPipeline:
         del train_dataset, val_dataset, data
         gc.collect()
 
+        # TEST: does memory still accumulate without clear_session()?
         # Force TensorFlow to release internal references to datasets/iterators
         # This prevents generator closures from accumulating in memory between rounds
-        tf.keras.backend.clear_session()  # NOTE: what does this do? still needed after ResourceManager?
-        logger.info("Cleared TensorFlow session state")
+        # tf.keras.backend.clear_session()
+        # logger.info("Cleared TensorFlow session state")
+
+        # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
+        self.data_generator.reset_managed_pool()
 
         # Save checkpoint
         self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
@@ -1342,9 +1344,14 @@ class TrainingPipeline:
             del true_latents, false_latents
             gc.collect()
 
-            # Force TensorFlow to release internal references
-            tf.keras.backend.clear_session()
-            logger.info("Cleared TensorFlow session state")
+            # TEST: does memory still accumulate without clear_session()?
+            # Force TensorFlow to release internal references to datasets/iterators
+            # This prevents generator closures from accumulating in memory between rounds
+            # tf.keras.backend.clear_session()
+            # logger.info("Cleared TensorFlow session state")
+
+            # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
+            self.data_generator.reset_managed_pool()
 
             logger.info("Random Forest training complete")
 
