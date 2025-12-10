@@ -414,56 +414,6 @@ class ResourceManager:
         self.stats.pools_active -= 1
         self.stats.pools_closed += 1
 
-    # NOTE:
-    # We might need to reset pools between training rounds
-    # since workers can accumulate memory through:
-    # # memory fragmentation in long-lived processes
-    # # python's reference counting leaking in workers
-    # # caches / global state accumulating in workers
-    # However, if workers properly release memory after each task, then resets are unnecessary
-    # We should try training without reseting first,
-    # not least to test whether cleanup runs properly on exit
-    # If so, and memory still accumulates between rounds, then try adding pool resets
-    # As well, we only need to reset pools and not shared memory because:
-    # # shared memory is just passive data storage that doesn't change between rounds
-    # # recreating shared memory would just waste resources copying the same data around
-    # def reset_all_pools(self):
-    #     """
-    #     Reset all managed pools
-    #     Useful between training rounds for preventing memory accumulation from stateful processes
-    #     Returns new pools with same configuration
-    #     """
-    #     logger.info("Resetting all active pools to clear worker memory...")
-    #
-    #     pools_to_recreate = []
-    #
-    #     # Collect pool info before closing
-    #     for managed in self._pools:
-    #         if not managed.closed:
-    #             pools_to_recreate.append(
-    #                 {"name": f"{managed.name}_reset", "process_count": managed.process_count}
-    #             )
-    #             self._close_managed_pool(managed)
-    #
-    #     # Clear old pool references
-    #     self._pools.clear()
-    #
-    #     # Force garbage collection to free memory
-    #     gc.collect()
-    #
-    #     # Recreate pools
-    #     new_pools = []
-    #     for pool_info in pools_to_recreate:
-    #         # NOTE: doesn't this lose context without initializer and initargs?
-    #         # NOTE: doesn't the "_reset" in pool_info["name"] compound over many rounds?
-    #         new_pool = self.create_pool(
-    #             n_processes=pool_info["process_count"], name=pool_info["name"]
-    #         )
-    #         new_pools.append(new_pool)
-    #
-    #     logger.info(f"Reset {len(new_pools)} pools")
-    #     return new_pools
-
     def create_shared_memory(self, size: int, name: str = "unnamed") -> SharedMemory:
         """
         Create and register a managed shared memory
