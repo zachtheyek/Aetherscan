@@ -1,22 +1,30 @@
 """
 Synthetic data generation for Aetherscan Pipeline
+Handles signal injection & log-normalization
+Uses multiprocessing and shared memory to process backgrounds in parallel
 """
 
 from __future__ import annotations
 
 import gc
 import logging
+import os
 import random
-from multiprocessing import Pool, cpu_count, shared_memory
+from multiprocessing import Pool, cpu_count
+from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
 import setigen as stg
 from astropy import units as u
 
+from config import get_config
 from logger import init_worker_logging
+from manager import get_manager
 
 logger = logging.getLogger(__name__)
 
+# NOTE: find a way to avoid using global refs (store under manager.py maybe?)
+# NOTE: is there any room to use asyncio & load all chunks simultaneously?
 # Global variables to store shared memory reference for multiprocessing workers
 # This avoids duplicating large arrays across worker processes
 _GLOBAL_SHM = None
@@ -42,8 +50,6 @@ def _init_worker(shm_name, shape, dtype):
     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
 
-    import os
-
     # Initialize worker logging
     init_worker_logging()
 
@@ -52,7 +58,7 @@ def _init_worker(shm_name, shape, dtype):
     np.random.seed(os.getpid())
 
     # Attach to existing shared memory block
-    _GLOBAL_SHM = shared_memory.SharedMemory(name=shm_name)
+    _GLOBAL_SHM = SharedMemory(name=shm_name)
 
     # Create numpy array view of shared memory (no copy!)
     _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
@@ -297,7 +303,7 @@ def create_true_double(
     # Select a random SNR from the given range
     snr = random.random() * snr_range + snr_base
 
-    # NOTE: small but nonzero probability for infinite/long-running loops
+    # NOTE: small but nonzero probability for "infinite" (long-running) loops
     # Retry signal injection until we get valid non-intersecting signals
     while True:
         # Inject RFI
@@ -425,7 +431,7 @@ def batch_create_cadence(
         ):
             cadence[i, :, :, :] = result
     else:
-        # Sequential execution (backwards compatibility)
+        # Fallback to sequential execution
         for i in range(samples):
             cadence[i, :, :, :] = function(
                 plate,
@@ -446,21 +452,29 @@ class DataGenerator:
 
     def __init__(
         self,
-        config,
         background_plates: np.ndarray,
-        n_processes: int | None = None,
     ):
         """
         Initialize generator
 
         Args:
-            config: Configuration object
             background_plates: Array of background observations
-                              Shape: (n_backgrounds, 6, 16, 512) after preprocessing
-            n_processes: Number of parallel processes for signal injection (defaults to cpu_count())
+                               Shape: (n_backgrounds, 6, 16, 512) after preprocessing
         """
-        self.config = config
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
 
+        self.manager = get_manager()
+
+        # Load background plates into shared memory
+        self._load_backgrounds(background_plates)
+
+        # Setup persistent process pool for efficient parallel execution
+        self._setup_managed_pool()
+
+    def _load_backgrounds(self, background_plates: np.ndarray):
+        """Load background plates into shared memory"""
         # Sanity check: verify no NaN or Inf values in background plates
         if np.isnan(background_plates).any():
             raise ValueError("background_plates contains NaN values")
@@ -472,8 +486,7 @@ class DataGenerator:
         self._background_dtype = background_plates.dtype
 
         # Sanity check: verify downsampling working as expected
-        width_bin_downsampled = config.data.width_bin // config.data.downsample_factor
-
+        width_bin_downsampled = self.config.data.width_bin // self.config.data.downsample_factor
         if self._background_shape[3] != width_bin_downsampled:
             raise ValueError(
                 f"Expected {width_bin_downsampled} channels. Got {self._background_shape[3]} instead"
@@ -483,86 +496,102 @@ class DataGenerator:
         self.freq_resolution = self.config.data.freq_resolution
         self.time_resolution = self.config.data.time_resolution
 
-        # Set number of processes for multiprocessing
-        self.n_processes = n_processes if n_processes is not None else cpu_count()
+        self.n_processes = self.config.manager.n_processes
 
-        # Create persistent process pool for efficient parallel execution
-        # Use shared memory to avoid duplicating background data across workers
+        # Setup shared memory to avoid duplicating background data across workers
         if self.n_processes > 1:
             # Create shared memory block for background data
             nbytes = background_plates.nbytes
-            self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
+            self.shm = self.manager.create_shared_memory(
+                size=nbytes,
+                name=f"DataGen_backgrounds_{id(self)}",  # NOTE: come back to this later
+            )
 
             # Copy background data into shared memory
             shared_array = np.ndarray(
-                self._background_shape, dtype=self._background_dtype, buffer=self.shm.buf
+                self._background_shape,
+                dtype=self._background_dtype,
+                buffer=self.shm.buf,  # NOTE: what is self.shm.buf?
             )
             shared_array[:] = background_plates[:]
             self.backgrounds = shared_array
-
-            # Create pool with shared memory reference and log queue
-            self.pool = Pool(
-                processes=self.n_processes,
-                initializer=_init_worker,
-                initargs=(
-                    self.shm.name,
-                    self._background_shape,
-                    self._background_dtype,
-                ),
-            )
-
-            logger.info(
-                f"Created multiprocessing pool with {self.n_processes} workers using shared memory"
-            )
-            logger.info(f"Shared memory size: {nbytes / 1e9:.2f} GB (shared across all workers)")
         else:
             self.shm = None
-            self.pool = None
             self.backgrounds = background_plates
-            logger.info("Running in sequential mode (n_processes=1)")
 
         logger.info(f"DataGenerator initialized with {self.n_backgrounds} background plates")
-        logger.info(f"Background shape: {self._background_shape}")
+        logger.info(f"  Background shape: {self._background_shape}")
+        logger.info(f"  Background dtype: {self._background_dtype}")
 
-    def close(self):
-        """Explicitly close the multiprocessing pool and shared memory"""
-        # Close pool first
+    def _setup_managed_pool(self):
+        """
+        Setup managed multiprocessing pool with shared memory
+
+        Creates a persistent worker pool that shares access to background data via
+        shared memory, avoiding costly data serialization for each worker process.
+
+        Note:
+            The pool is managed by the ResourceManager and should be closed via
+            _free_managed_pool() or close() to properly release resources.
+        """
+        # NOTE: should we guarantee that only 1 shm & 1 pool can exist at any time?
+        # If shared memory exists, then create pool using shared memory reference
+        if self.shm:
+            self.pool = self.manager.create_pool(
+                n_processes=self.n_processes,
+                name=f"DataGen_pool_{id(self)}",  # NOTE: come back to this later
+                initializer=_init_worker,
+                initargs=(self.shm.name, self._background_shape, self._background_dtype),
+            )
+        # Else run in sequential mode (no pool)
+        else:
+            self.pool = None
+            logger.info("DataGenerator running in sequential mode (n_processes=1)")
+
+    def _free_managed_pool(self):
+        """Close multiprocessing pool"""
+        if hasattr(self, "pool") and self.pool is not None:
+            self.manager.close_pool(self.pool)
+            self.pool = None
+
+    def reset_managed_pool(self):
+        """
+        Reset multiprocessing pool
+
+        Should be called between training rounds, since workers can accumulate memory through
+        memory fragmentation in long-lived processes, python's reference counter leaking in workers,
+        and caches / global state accumulating in workers.
+        """
         if hasattr(self, "pool") and self.pool is not None:
             try:
-                self.pool.close()
-                self.pool.join()
-            except Exception:
-                # Ignore errors during cleanup (e.g., if called during interpreter shutdown)
-                pass
-            finally:
-                self.pool = None
-
-        # Clean up shared memory
-        if hasattr(self, "shm") and self.shm is not None:
-            try:
-                self.shm.close()
-                self.shm.unlink()  # Delete shared memory block
-                logger.info("Shared memory cleaned up successfully")
+                self._free_managed_pool()
+                gc.collect()  # Garbage collect between resets
+                self._setup_managed_pool()
             except Exception as e:
-                # Log but don't raise - might already be cleaned up
-                logger.warning(f"Error cleaning up shared memory: {e}")
-            finally:
-                self.shm = None
+                logger.warning(f"Error resetting DataGenerator pool: {e}")
 
-    # NOTE: when does this run?
-    def __del__(self):
-        """Clean up multiprocessing pool and shared memory on deletion"""
-        from contextlib import suppress
+    def _free_managed_shared_memory(self):
+        """Close shared memory"""
+        if hasattr(self, "shm") and self.shm is not None:
+            self.manager.close_shared_memory(self.shm)
+            self.shm = None
 
-        # Close pool and shared memory, but ignore all errors during interpreter shutdown
-        with suppress(Exception):
-            self.close()
+    def close(self):
+        """Free managed resources & close DataGenerator"""
+        self._free_managed_pool()
+        self._free_managed_shared_memory()
+        logger.info("DataGenerator closed")
 
-    def generate_train_batch(
+    # NOTE: write separate generate_test_batch method for evaluate.py?
+    # NOTE: no data generation needed during inference?
+    # NOTE: replace generate_train_batch with generate_test_batch in train_random_forest?
+    # NOTE: or just rename to generate_X_batch (come up with better name)?
+    # NOTE: generate_batch okay?
+    def generate_batch(
         self, n_samples: int, snr_base: int, snr_range: int
     ) -> dict[str, np.ndarray]:
         """
-        Generate training batch using chunking & multiprocessing
+        Generate batch using chunking & multiprocessing
 
         main: collapsed cadences
           - total: n_samples
