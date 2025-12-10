@@ -372,15 +372,3 @@ def get_config() -> Config:
     Get the global config instance
     """
     return Config._instance
-
-
-# def shutdown_config() -> None:
-#     """
-#     Shutdown the global config instance
-#     """
-#     config = Config._instance
-#
-#     if config is None:
-#         return
-#
-#     Config._reset()
