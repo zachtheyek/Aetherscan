@@ -8,7 +8,6 @@ from .manager import (
     register_db,
     register_logger,
     register_monitor,
-    shutdown_manager,
 )
 
 __all__ = [
@@ -17,5 +16,4 @@ __all__ = [
     "register_db",
     "register_logger",
     "register_monitor",
-    "shutdown_manager",
 ]

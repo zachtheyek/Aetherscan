@@ -533,16 +533,3 @@ def register_monitor(monitor):
 
     manager.set_monitor(monitor)
     logger.info("Registered monitor")
-
-
-# def shutdown_manager() -> None:
-#     """
-#     Shutdown the global manager instance
-#     """
-#     manager = ResourceManager._instance
-#
-#     if manager is None:
-#         logger.warning("No manager instance initialized")
-#         return
-#
-#     manager._reset()
