@@ -94,7 +94,11 @@ def train_command():
     logger.info(f"  Output path: {config.output_path}")
 
     # Setup GPU strategy
-    strategy = setup_gpu_strategy()
+    try:
+        strategy = setup_gpu_strategy()
+    except Exception as e:
+        logger.error(f"Failed to setup GPU strategy: {e}")
+        sys.exit(1)
 
     # Initialize preprocessor & load background data
     # Note, we load this in train_command() to avoid reloading backgrounds on training pipeline retries
@@ -102,8 +106,12 @@ def train_command():
     # Should be fine since backgrounds currently only take up low ~10^1 Gb in RAM
     # However, if we decide to trade off reduced memory pressure for slower startup times in future,
     # then we should consider moving this into TrainingPipeline proper
-    preprocessor = DataPreprocessor()
-    background_data = preprocessor.load_background_data().astype(np.float32)
+    try:
+        preprocessor = DataPreprocessor()
+        background_data = preprocessor.load_background_data().astype(np.float32)
+    except Exception as e:
+        logger.error(f"Failed to load backgrounds: {e}")
+        sys.exit(1)
 
     # Train models with fault tolerance
     logger.info("Starting training pipeline...")
