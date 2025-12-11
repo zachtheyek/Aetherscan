@@ -11,6 +11,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import tensorflow as tf
 
 from cli import apply_args_to_config, setup_argument_parser, validate_args
@@ -19,6 +20,7 @@ from db import init_db
 from logger import init_logger
 from manager import init_manager, register_logger
 from monitor import init_monitor
+from preprocessing import DataPreprocessor
 from train import get_latest_tag, train_full_pipeline
 
 logger = logging.getLogger(__name__)
@@ -91,9 +93,17 @@ def train_command():
     logger.info(f"  Model path: {config.model_path}")
     logger.info(f"  Output path: {config.output_path}")
 
-    # NOTE: should we move this to main()?
     # Setup GPU strategy
     strategy = setup_gpu_strategy()
+
+    # Initialize preprocessor & load background data
+    # Note, we load this in train_command() to avoid reloading backgrounds on training pipeline retries
+    # This gives us faster startup times at the expense of holding onto more memory during training
+    # Should be fine since backgrounds currently only take up low ~10^1 Gb in RAM
+    # However, if we decide to trade off reduced memory pressure for slower startup times in future,
+    # then we should consider moving this into TrainingPipeline proper
+    preprocessor = DataPreprocessor()
+    background_data = preprocessor.load_background_data().astype(np.float32)
 
     # Train models with fault tolerance
     logger.info("Starting training pipeline...")
@@ -109,7 +119,7 @@ def train_command():
                 logger.info(f"Retrying training from round {config.checkpoint.start_round}")
 
             # Reinitialize training pipeline on each attempt so no corrupted state is persisted
-            train_full_pipeline(strategy=strategy)
+            train_full_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded
 

@@ -24,7 +24,6 @@ from tensorflow.keras.layers import Conv2D, Dense
 from config import get_config
 from data_generation import DataGenerator
 from models import RandomForestModel, Sampling, create_beta_vae_model
-from preprocessing import DataPreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -496,31 +495,23 @@ def check_encoder_trained(encoder, threshold=0.2):
 class TrainingPipeline:
     """Training pipeline"""
 
-    def __init__(self, strategy=None):
+    def __init__(self, background_data, strategy=None):
         """
         Initialize training pipeline
 
         Args:
+            background_data: Array of background observations
             strategy: TensorFlow distribution strategy
         """
         self.config = get_config()
         if self.config is None:
             raise ValueError("get_config() returned None")
 
+        # Initialize data generator
+        self.data_generator = DataGenerator(background_data)
+
         # Set distributed strategy
         self.strategy = strategy or tf.distribute.get_strategy()
-
-        # Initialize preprocessor
-        self.preprocessor = DataPreprocessor()
-
-        # NOTE: fix preprocessing.py -> merge to master -> rerun on blpc2 -> add db writes
-        # NOTE: should this be in train_command() instead to avoid reloading on retries?
-        # Load background data
-        self.background_data = self.preprocessor.load_background_data().astype(np.float32)
-        logger.info(f"Background data shape: {self.background_data.shape}")
-
-        # Initialize data generator
-        self.data_generator = DataGenerator(self.background_data)
 
         # Create VAE model & optimizer inside distributed context
         with self.strategy.scope():
@@ -1563,18 +1554,19 @@ class TrainingPipeline:
             raise
 
 
-def train_full_pipeline(strategy=None) -> TrainingPipeline:
+def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingPipeline:
     """
     Complete Aetherscan training pipeline run
 
     Args:
+        background_data: Array of background observations
         strategy: TensorFlow distribution strategy
 
     Returns:
         Trained pipeline object
     """
     # Create pipeline
-    pipeline = TrainingPipeline(strategy)
+    pipeline = TrainingPipeline(background_data, strategy)
 
     # Train beta-VAE
     pipeline.train_beta_vae()
