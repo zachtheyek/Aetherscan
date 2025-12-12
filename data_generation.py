@@ -36,7 +36,7 @@ _GLOBAL_DTYPE = None
 def _init_worker(shm_name, shape, dtype):
     """
     Initialize worker process with shared memory reference and queue-based logging
-    This avoids copying data to each worker, saving memory
+    This avoids serialization overhead between workers
 
     Args:
         shm_name: Name of the shared memory block
@@ -46,7 +46,7 @@ def _init_worker(shm_name, shape, dtype):
     Note:
         Worker cleanup is automatic - when the pool terminates, the OS reclaims
         all worker process resources including shared memory file descriptors.
-        Only the main process needs to unlink() the shared memory block.
+        Cleanup is handled by the main process
     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
 
