@@ -241,7 +241,6 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
-# NOTE: come back to this later
 def prepare_distributed_dataset(
     data: dict,
     n_samples: int,

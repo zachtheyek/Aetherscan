@@ -377,6 +377,8 @@ def batch_create_cadence(
     inject: bool | None = None,
     dynamic_range: float | None = None,
     pool: Pool | None = None,
+    n_processes: int | None = cpu_count(),
+    chunks_per_worker: int | None = 4,
 ) -> np.ndarray:
     """
     Batch wrapper for creating multiple cadences using multiprocessing
@@ -393,6 +395,8 @@ def batch_create_cadence(
         inject: Whether to inject signals (for create_false)
         dynamic_range: Dynamic range for signal injection (for create_true_double)
         pool: Pre-initialized multiprocessing Pool (if None, runs sequentially)
+        n_processes: Number of processes in multiprocessing Pool (1 if running sequentially)
+        chunks_per_worker: Used to calculate optimal chunksize for load balancing
 
     Returns:
         Array of shape (samples, 6, 16, width_bin) containing generated cadences
@@ -418,13 +422,11 @@ def batch_create_cadence(
         ]
 
         # Calculate optimal chunksize for load balancing
-        # Aim for ~4 chunks per worker to balance overhead vs parallelism
         try:
             n_workers = pool._processes
         except AttributeError:
-            # NOTE: use config value instead of cpu_count()?
-            n_workers = cpu_count()
-        chunksize = max(1, samples // (n_workers * 4))
+            n_workers = n_processes
+        chunksize = max(1, samples // (n_workers * chunks_per_worker))
 
         # Use pool to generate cadences in parallel
         for i, result in enumerate(
@@ -497,7 +499,9 @@ class DataGenerator:
         self.freq_resolution = self.config.data.freq_resolution
         self.time_resolution = self.config.data.time_resolution
 
+        # Get multiprocessing params from config
         self.n_processes = self.config.manager.n_processes
+        self.chunks_per_worker = self.config.manager.chunks_per_worker
 
         # Setup shared memory to avoid duplicating background data across workers
         if self.n_processes > 1:
@@ -640,6 +644,8 @@ class DataGenerator:
                 time_resolution=self.time_resolution,
                 inject=False,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             # RFI only
@@ -654,6 +660,8 @@ class DataGenerator:
                 time_resolution=self.time_resolution,
                 inject=True,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             # ETI only
@@ -667,6 +675,8 @@ class DataGenerator:
                 freq_resolution=self.freq_resolution,
                 time_resolution=self.time_resolution,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             # ETI + RFI
@@ -681,6 +691,8 @@ class DataGenerator:
                 time_resolution=self.time_resolution,
                 dynamic_range=1,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             # Concatenate for main training data (collapsed cadences)
@@ -707,6 +719,8 @@ class DataGenerator:
                 time_resolution=self.time_resolution,
                 inject=False,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             half_false_with_rfi = batch_create_cadence(
@@ -720,6 +734,8 @@ class DataGenerator:
                 time_resolution=self.time_resolution,
                 inject=True,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             half_true_single = batch_create_cadence(
@@ -732,6 +748,8 @@ class DataGenerator:
                 freq_resolution=self.freq_resolution,
                 time_resolution=self.time_resolution,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             half_true_double = batch_create_cadence(
@@ -745,6 +763,8 @@ class DataGenerator:
                 time_resolution=self.time_resolution,
                 dynamic_range=1,
                 pool=self.pool,
+                n_processes=self.n_processes,
+                chunks_per_worker=self.chunks_per_worker,
             )
 
             chunk_false = np.concatenate([half_false_no_signal, half_false_with_rfi], axis=0)
