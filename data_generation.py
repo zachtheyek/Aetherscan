@@ -354,6 +354,14 @@ def _single_cadence_wrapper(args):
         dynamic_range,
     ) = args
     return function(
+        # NOTE:
+        # is _GLOBAL_BACKGROUNDS a reference to the shared memory, or the entire data array itself?
+        # is this method of doing things slower due to pickling costs?
+        # should we move the index selection into _single_cadence_wrapper so only one background plate is sent at a time?
+        # how can we benchmark this?
+        # # # Select random background from plate
+        # # background_index = int(plate.shape[0] * random.random())
+        # # base = plate[background_index, :, :, :]
         _GLOBAL_BACKGROUNDS,
         snr_base=snr_base,
         snr_range=snr_range,
@@ -426,11 +434,14 @@ def batch_create_cadence(
             n_workers = pool._processes
         except AttributeError:
             n_workers = n_processes
+        # NOTE: should we use separate chunks_per_worker? how to benchmark?
         chunksize = max(1, samples // (n_workers * chunks_per_worker))
 
         # Use pool to generate cadences in parallel
         for i, result in enumerate(
-            pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            # NOTE: does return order matter?
+            # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):
             cadence[i, :, :, :] = result
     else:
