@@ -416,6 +416,8 @@ class ResourceManager:
     def _close_managed_pool(self, managed: ManagedPool):
         """Internal method to close a ManagedPool"""
         managed.close()
+        # Remove from tracking list to allow garbage collection of Pool object and its file descriptors
+        self._pools.remove(managed)
         self.stats.pools_active -= 1
         self.stats.pools_closed += 1
 
@@ -456,6 +458,8 @@ class ResourceManager:
     def _close_managed_shared_memory(self, managed: ManagedSharedMemory):
         """Internal method to close a ManagedSharedMemory"""
         managed.close()
+        # Remove from tracking list to allow garbage collection of SharedMemory object and its file descriptors
+        self._shared_memories.remove(managed)
         self.stats.shared_memories_active -= 1
         self.stats.shared_memories_cleaned += 1
 
