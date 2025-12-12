@@ -23,7 +23,6 @@ import tensorflow as tf
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
 from config import get_config
-from manager import register_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -604,6 +603,9 @@ def init_monitor() -> ResourceMonitor:
     """
     monitor = ResourceMonitor()
     monitor.start()
+
+    # Late import to avoid circular dependency (manager imports from monitor)
+    from manager import register_monitor  # noqa: PLC0415
 
     register_monitor(monitor)
 
