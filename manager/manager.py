@@ -22,9 +22,8 @@ from multiprocessing.shared_memory import SharedMemory
 import psutil
 
 from config import get_config
-from db import shutdown_db
-from logger import get_logger, shutdown_logger
-from monitor import get_process_tree_stats, shutdown_monitor
+from logger import get_logger
+from monitor import get_process_tree_stats
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +326,9 @@ class ResourceManager:
         if self._monitor:
             logger.info("Shutting down monitor...")
             try:
+                # Late import to avoid circular dependency (monitor imports from manager)
+                from monitor import shutdown_monitor  # noqa: PLC0415
+
                 shutdown_monitor()
             except Exception as e:
                 with contextlib.suppress(Exception):
@@ -336,6 +338,9 @@ class ResourceManager:
         if self._db:
             logger.info("Shutting down database...")
             try:
+                # Late import to avoid circular dependency (db imports from manager)
+                from db import shutdown_db  # noqa: PLC0415
+
                 shutdown_db()
             except Exception as e:
                 with contextlib.suppress(Exception):
@@ -359,6 +364,9 @@ class ResourceManager:
         # Shutdown logger
         if self._logger:
             with contextlib.suppress(Exception):
+                # Late import to avoid circular dependency (logger imports from manager)
+                from logger import shutdown_logger  # noqa: PLC0415
+
                 shutdown_logger()
                 # Note, we can't log after stopping the listener thread, so no final message here
 
