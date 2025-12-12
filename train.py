@@ -1232,7 +1232,9 @@ class TrainingPipeline:
         try:
             n_samples = self.config.training.num_samples_rf
             snr_base = self.config.training.snr_base
-            snr_range = self.config.training.initial_snr_range
+            snr_range = (
+                self.config.training.initial_snr_range
+            )  # NOTE: should we use initial_snr_range or final_snr_range?
 
             latent_dim = self.config.beta_vae.latent_dim
             num_observations = self.config.data.num_observations
