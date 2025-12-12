@@ -917,7 +917,7 @@ class TrainingPipeline:
             logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
         # Clear intermediate data
-        del train_dataset, val_dataset, data
+        del data, train_dataset, val_dataset
         gc.collect()
 
         # TEST: does memory still accumulate without clear_session()?
@@ -926,7 +926,8 @@ class TrainingPipeline:
         # tf.keras.backend.clear_session()
         # logger.info("Cleared TensorFlow session state")
 
-        # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
+        # Reset multiprocessing pools in DataGenerator after each round
+        # to further avoid memory accumulation
         self.data_generator.reset_managed_pool()
 
         # Save checkpoint
