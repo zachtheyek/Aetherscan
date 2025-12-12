@@ -103,12 +103,13 @@ def train_command():
     # Initialize preprocessor & load background data
     # Note, we load this in train_command() to avoid reloading backgrounds on training pipeline retries
     # This gives us faster startup times at the expense of holding onto more memory during training
-    # Should be fine since backgrounds currently only take up low ~10^1 Gb in RAM
+    # Should be fine since backgrounds only take up low ~10^1 Gb in RAM (benchmarked: Dec '25)
     # However, if we decide to trade off reduced memory pressure for slower startup times in future,
     # then we should consider moving this into TrainingPipeline proper
     try:
         preprocessor = DataPreprocessor()
         background_data = preprocessor.load_background_data().astype(np.float32)
+        # NOTE: close preprocessing pools and/or shared memory?
     except Exception as e:
         logger.error(f"Failed to load backgrounds: {e}")
         sys.exit(1)

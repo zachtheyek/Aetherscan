@@ -518,6 +518,7 @@ class TrainingPipeline:
             self.vae = create_beta_vae_model()
             self._build_optimizer()
 
+        # Initialize RF model as None
         self.rf_model = None
 
         # Load models from checkpoints if provided
