@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 # NOTE: find a way to avoid using global refs (store under manager.py maybe?)
 # NOTE: is there any room to use asyncio & load all chunks simultaneously?
-# Global variables to store shared memory reference for multiprocessing workers
-# This avoids duplicating large arrays across worker processes
+# Global variables to store background data for multiprocessing workers
+# This avoids serialization overhead when passing data between workers
 _GLOBAL_SHM = None
 _GLOBAL_BACKGROUNDS = None
 _GLOBAL_SHAPE = None
@@ -422,6 +422,7 @@ def batch_create_cadence(
         try:
             n_workers = pool._processes
         except AttributeError:
+            # NOTE: use config value instead of cpu_count()?
             n_workers = cpu_count()
         chunksize = max(1, samples // (n_workers * 4))
 
