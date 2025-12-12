@@ -23,7 +23,6 @@ import tensorflow as tf
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
 from config import get_config
-from db import get_db
 from manager import register_monitor
 
 logger = logging.getLogger(__name__)
@@ -150,6 +149,9 @@ class ResourceMonitor:
         self._detect_gpus()
 
         # Get database instance
+        # Late import to avoid circular dependency (db imports from manager)
+        from db import get_db  # noqa: PLC0415
+
         self.db = get_db()
         if self.db is None:
             raise RuntimeError(
