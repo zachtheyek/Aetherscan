@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing import cpu_count
 
@@ -94,12 +94,22 @@ class DataConfig:
     max_chunks_per_file: int = 25  # Maximum chunks to load from a single file
 
     # Data files
-    train_files: list[str] = [
-        "real_filtered_LARGE_HIP110750.npy",
-        "real_filtered_LARGE_HIP13402.npy",
-        "real_filtered_LARGE_HIP8497.npy",
-    ]
-    test_files: list[str] = ["real_filtered_LARGE_test_HIP15638.npy"]
+    # Note, Python dataclasses don't allow mutable objects (e.g. lists) to be used as defaults,
+    # since Python will create that object once when the class is defined, rather than each time
+    # a new object of that class is instantiated. This means that all instances of that class
+    # would share the same mutable object in memory (i.e. if we modified train_files in one
+    # instance, it would affect all other instances -- a dangerous bug).
+    # The default_factory parameter takes a callable (lambda function) that's called each time a
+    # new instance is created, ensuring each instance gets its own independent list, preventing
+    # the shared-state bug. Note that once created, the list behaves identical to any other list
+    train_files: list[str] = field(
+        default_factory=lambda: [
+            "real_filtered_LARGE_HIP110750.npy",
+            "real_filtered_LARGE_HIP13402.npy",
+            "real_filtered_LARGE_HIP8497.npy",
+        ]
+    )
+    test_files: list[str] = field(default_factory=lambda: ["real_filtered_LARGE_test_HIP15638.npy"])
 
 
 @dataclass
