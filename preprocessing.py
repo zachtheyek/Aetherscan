@@ -187,6 +187,8 @@ class DataPreprocessor:
             n_chunks = min(max_chunks, (raw_data.shape[0] + chunk_size - 1) // chunk_size)
 
             for chunk_idx in range(n_chunks):
+                logger.info(f"Processing chunk {chunk_idx}/{n_chunks}")
+
                 chunk_start = chunk_idx * chunk_size
                 chunk_end = min((chunk_idx + 1) * chunk_size, raw_data.shape[0])
 
