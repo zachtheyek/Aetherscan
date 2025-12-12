@@ -39,7 +39,7 @@ def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
         Dictionary containing:
         - cpu_percent: CPU usage as percentage of total system CPU (0-100)
         - ram_percent: RAM usage as percentage of total system RAM (0-100)
-        - ram_bytes: Total RAM usage in bytes (RSS)
+        - ram_bytes: Total RAM usage in bytes (PSS - Proportional Set Size)
         - ram_gb: Total RAM usage in gigabytes
     """
     try:
@@ -58,9 +58,13 @@ def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
                 cpu = proc.cpu_percent(interval=0.0)  # Non-blocking
                 total_cpu += cpu
 
-                # RAM: Get RSS (Resident Set Size)
-                mem_info = proc.memory_info()
-                total_ram_bytes += mem_info.rss
+                # RAM: Get PSS (Proportional Set Size)
+                # Use PSS instead of RSS to avoid double-counting shared memory across processes.
+                # RSS counts shared pages once per process, so summing RSS across a process tree
+                # can exceed system total RAM. PSS divides shared pages by # of sharing processes,
+                # making it additive and accurate when summing across multiple processes.
+                mem_info = proc.memory_full_info()
+                total_ram_bytes += mem_info.pss
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 # Process may have died between children() and cpu_percent() or memory_info() calls
