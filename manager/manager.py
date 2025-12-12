@@ -59,7 +59,7 @@ class ManagedPool:
             logger.info(f"Assuming pool '{self.name}' is gone and no remaining workers alive")
             return False  # pool already destroyed or internal state corrupted
 
-    def close(self, timeout):
+    def close(self):
         """Close the pool with terminate-or-fail policy"""
         if self.closed:
             return
@@ -73,15 +73,12 @@ class ManagedPool:
             # Which stops accepting new jobs, but lets running processes finish current job queue
             # Don't use both! Better to "terminate or fail". Inconsistent states are worse than leaks
             self.pool.terminate()  # Trigger termination
-            self.pool.join(timeout=timeout)  # Wait & close
+            self.pool.join()  # Wait & close
 
-            # Sanity check since pool.join() fails silently if timeout expires
-            # before worker processes finish exiting
-            # If you notice persistent errors/resource leaks, increase the timeout, or leave it
-            # blank to ensure the program waits indefinitely for the pool to properly close
+            # Sanity check to make sure pool.join() didn't fail silently
             if self._check_alive():
                 raise RuntimeError(
-                    f"Pool '{self.name}' still has running workers after termination timeout"
+                    f"Pool '{self.name}' still has running workers after termination"
                 )
 
             self.closed = True
@@ -418,7 +415,7 @@ class ResourceManager:
 
     def _close_managed_pool(self, managed: ManagedPool):
         """Internal method to close a ManagedPool"""
-        managed.close(timeout=self.config.manager.pool_terminate_timeout)
+        managed.close()
         self.stats.pools_active -= 1
         self.stats.pools_closed += 1
 

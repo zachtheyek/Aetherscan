@@ -31,7 +31,6 @@ class ManagerConfig:
 
     n_processes: int = cpu_count()  # use all available cores
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    pool_terminate_timeout: float = 2.0  # seconds
 
 
 @dataclass
@@ -291,7 +290,6 @@ class Config:
             "manager": {
                 "n_processes": self.manager.n_processes,
                 "chunks_per_worker": self.manager.chunks_per_worker,
-                "pool_terminate_timeout": self.manager.pool_terminate_timeout,
             },
             "monitor": {
                 "get_gpu_timeout": self.monitor.get_gpu_timeout,
