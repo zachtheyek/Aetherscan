@@ -607,10 +607,6 @@ class DataGenerator:
         max_chunk_size = self.config.training.signal_injection_chunk_size
         n_chunks = max(1, (n_samples + max_chunk_size - 1) // max_chunk_size)
 
-        # # Sanity check
-        # if max_chunk_size % 4 != 0:
-        #     raise ValueError("Max signal injection chunk size must be a multiple of 4 for balanced class generation")
-
         logger.info(f"Generating {n_samples} samples in {n_chunks} chunks of max {max_chunk_size}")
 
         # Pre-allocate output arrays
