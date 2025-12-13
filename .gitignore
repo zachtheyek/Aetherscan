@@ -1,16 +1,8 @@
-# Forward-search paper (Ma et. al. 2023)
+# Forward-search paper
 2301.12670v1.pdf
 
-# Outputs & logs
+# Outputs
 outputs/
-*.log
 
-# Artifacts
-**/__pycache__/
-.ipynb_checkpoints/
-
-# Virtual environment
-venv/
-
-# Claude settings
-.claude/
+# Local development environment
+environment_nocuda.yml

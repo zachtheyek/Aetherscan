@@ -1,0 +1,74 @@
+name: Pre-commit Hooks
+
+# Run on every push and PR, to any branch, or via manual trigger
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      # Pull repo contents into GitHub Actions runner
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install the correct Python version
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # Cache reusable pip components (wheels/tarballs) between workflow runs
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          # Cache directory
+          path: ~/.cache/pip
+          # Unique id for cache (invalidates when dependencies change, as defined in pyproject.toml)
+          key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
+
+      # Cache ruff outputs to skip unchanged files between workflow runs
+      - name: Cache Ruff
+        uses: actions/cache@v3
+        with:
+          # Cache directory (must match cache_dir in pyproject.toml)
+          path: .ruff_cache
+          # Unique id for cache (invalidates when dependencies change, as defined in pyproject.toml)
+          key: ruff-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
+
+      # Run pre-commit hooks defined in .pre-commit-config.yaml
+      # Includes linter, formatter, secrets scanning, and other safety checks
+      # Guarantees consistency between local development & remote validation
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
+
+      # NOTE: replace previous pre-commit step with following if you wish to see linter & formatter errors inline during PR reviews
+      # NOTE: re-runs ruff checks even if they passed, and might show "no errors" in output annotations if another pre-commit hook failed
+      # # Run pre-commit hooks defined in .pre-commit-config.yaml
+      # # Includes linter, formatter, and other safety checks
+      # # Guarantees consistency between local development & remote validation
+      # - name: Run pre-commit
+      #   uses: pre-commit/action@v3.0.1
+      #   continue-on-error: true
+      #   id: pre-commit
+      #
+      # # Annotate ruff linter errors if any exist
+      # - name: Annotate Ruff linter errors
+      #   if: ${{ steps.pre-commit.outcome == 'failure' }}
+      #   continue-on-error: true
+      #   run: ruff check . --output-format=github
+      #
+      # # Show ruff formatter diff if any exist
+      # - name: Show Ruff format diff
+      #   if: ${{ steps.pre-commit.outcome == 'failure' }}
+      #   continue-on-error: true
+      #   run: ruff format --check --diff .
+      #
+      # # Fail the workflow if pre-commit failed
+      # - name: Fail if pre-commit failed
+      #   if: ${{ steps.pre-commit.outcome == 'failure' }}
+      #   run: exit 1

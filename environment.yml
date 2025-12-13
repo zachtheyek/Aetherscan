@@ -1,5 +1,6 @@
-# TODO: update to match current pipeline imports
-name: etherscan
+# TODO: update to match current pipeline imports (ruff)
+# TODO: rebuild conda environment after updating
+name: aetherscan
 channels:
   - conda-forge
   - defaults
@@ -16,18 +17,12 @@ dependencies:
   - scikit-image=0.21.*
   - pytest=7.4.*
   - tensorboard=2.13.*
-  - tqdm=4.65.*
   - psutil=5.9.*
   - h5py=3.9.*
   - scipy=1.11.*
   - nvidia::cuda-runtime=12.2.*
   - cudnn=8.9.*
-  - jupyterlab
-  - ipykernel
-  - nb_conda_kernels
   - pip
   - pip:
-    - tensorflow==2.16.*
-    - setigen
-    - blimpy
-    - pyyaml
+      - tensorflow==2.16.*
+      - setigen

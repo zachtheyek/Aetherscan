@@ -1,0 +1,115 @@
+# TODO: Add build backend (use uv)
+# TODO: How to release as package on PyPI & display on GitHub? How to tag new releases on GitHub?
+
+[project]
+name = "aetherscan"
+version = "0.1.0"  # TODO: update on v1 release, then sync version & release date with CITATION.cff
+authors = [
+    { name = "Zach Yek", email = "xiaoxiyek1.5@gmail.com" },
+]
+maintainers = [
+    { name = "Zach Yek", email = "xiaoxiyek1.5@gmail.com" },
+]
+description = "Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # TODO: sync with environment.yml files (include for uv)
+]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+keywords = [
+    "SETI",
+    "Technosignatures",
+    "Radio Astronomy",
+    "Signal Processing",
+    "Machine Learning",
+    "Deep Learning",
+    "Data Methods",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",  # TODO: update development status on v1 release
+    "Programming Language :: Python :: 3.10",  # TODO: test on later python versions?
+    "Operating System :: Unix",
+    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",  # TODO: test on later cuda versions?
+    "License :: OSI Approved :: BSD License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Natural Language :: English",
+]
+
+[project.urls]
+Homepage = "https://github.com/zachtheyek/Aetherscan"
+Issues = "https://github.com/zachtheyek/Aetherscan/issues"
+
+[project.optional-dependencies]
+dev = ["ruff"]  # Python linter
+
+[tool.ruff]
+# Configure linter
+target-version = "py310"   # Target Python version
+line-length = 100          # Set maximum line length
+
+# Exclude directories from linting
+exclude = [  # TODO: partially sync with .gitignore
+    ".claude",
+    ".git",
+    ".ipynb_checkpoints",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "outputs",
+]
+
+[tool.ruff.lint]
+# Enable specific linting rules
+select = [
+    "E",    # Standard PEP 8 formatting errors (indentation, whitespace, etc.)
+    "W",    # Standard PEP 8 formatting warnings (indentation, whitespace, etc.)
+    "F",    # Detects unused imports, variables, etc.
+    "I",    # Checks import order consistency
+    "N",    # Enforces naming conventions (functions_names vs FunctionNames, etc.)
+    "UP",   # Suggests modern syntax upgrades (f-strings, type hints, etc.)
+    "B",    # Find common bugs and design patterns
+    "C4",   # Simplifies inefficient comprehensions (list, set, dict)
+    "SIM",  # Simplifies control flow (if/else, return, etc.)
+    "PL",   # Logical and stylistic checks
+]
+
+# Ignore specific linting rules
+ignore = [
+    "E501",     # Defer line wrapping to formatter
+    "F841",     # Allow unused variables
+    "PLR0913",  # Allow functions with many params
+    "PLR2004",  # Ignore warnings for magic number comparisons
+
+    # NOTE: temporary ignores
+    "N999",     # Invalid module name (remove once Aetherscan -> aetherscan)
+    "PLW0603",  # Discourage updating state with global variables (find a way to fix)
+    "PLR0911",  # Function has too many return statements (>6)
+    "PLR0912",  # Function has too many branches (if/elif/else, loops, etc.) (>12)
+    "PLR0915",  # Function has too many statements (>50)
+]
+
+fixable = ["ALL"]  # Allow autofix for all enabled rules when possible
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+
+[tool.ruff.lint.isort]
+# Declare first-party imports (for sorting order)
+known-first-party = [  # TODO: sync with internal modules
+    "db",
+    "logger",
+    "manager",
+    "models",
+    "monitor",
+]
+
+[tool.ruff.format]
+# Configure formatter
+quote-style = "double"  # Use double quotes for strings
+indent-style = "space"  # Indent with spaces
+line-ending = "auto"    # Use system-default line endings

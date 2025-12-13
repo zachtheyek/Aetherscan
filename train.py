@@ -1,78 +1,41 @@
 """
-Training pipeline for Ether-Scan models
+Training orchestration for Aetherscan Pipeline
+...
 """
 
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras.initializers import HeNormal, GlorotNormal
-from tensorflow.keras.layers import Conv2D, Dense
-from typing import List, Dict, Tuple, Optional
+from __future__ import annotations
+
+import gc
+import glob
 import logging
 import os
-import shutil
-import glob
 import re
+import shutil
 from datetime import datetime
-import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
-from matplotlib.gridspec import GridSpec
-import gc
-import psutil
-import subprocess
 
-from config import TrainingConfig
+import matplotlib.lines as mlines
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from matplotlib.gridspec import GridSpec
+from tensorflow.keras.initializers import GlorotNormal, HeNormal
+from tensorflow.keras.layers import Conv2D, Dense
+
+from config import get_config
 from data_generation import DataGenerator
-from models.vae import create_vae_model
-from models.random_forest import RandomForestModel
+from models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
 
 
-def log_system_resources():
-    """
-    Log system resource usage
-    Note: only used for debugging, func calls commented out in prod
-    """
-    # CPU usage
-    cpu_percent = psutil.cpu_percent(interval=1)
-
-    # Memory usage
-    memory = psutil.virtual_memory()
-    memory_used_gb = memory.used / 1e9
-    memory_total_gb = memory.total / 1e9
-
-    # GPU usage (if available)
-    gpu_info = []
-    try:
-        # Try nvidia-smi for GPU info
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total',
-                               '--format=csv,noheader,nounits'],
-                              capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            for i, line in enumerate(lines):
-                parts = line.split(', ')
-                if len(parts) == 3:
-                    gpu_util, mem_used, mem_total = parts
-                    gpu_info.append(f"GPU{i}: {gpu_util}% util ({mem_used}MB/{mem_total}MB)")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        gpu_info = ["GPU info unavailable"]
-
-    resource_str = (f"Resources -- CPU: {cpu_percent:.1f}%, "
-                   f"RAM: {memory_used_gb:.1f}/{memory_total_gb:.1f}GB ({memory.percent:.1f}%), "
-                   f"{', '.join(gpu_info)}")
-
-    return resource_str
-
-
-def handle_directory(base_dir: str, target_dirs: Optional[List[str]] = None, round_num: int = 1):
+def handle_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
     """
     Archive and clean up a directory
 
     Args:
         base_dir: Base directory to archive/clean
         target_dirs: List of subdirectory names to include in archiving (e.g., ['train', 'validation'])
-                    If None, only files are considered (directories are ignored)
+                     If None, only files are considered (directories are ignored)
         round_num: Training round number (1 for fresh run, >1 for resume)
     """
     # Create base directory if it doesn't exist
@@ -108,8 +71,8 @@ def handle_directory(base_dir: str, target_dirs: Optional[List[str]] = None, rou
         return
 
     # Otherwise, archive and clean up
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    archive_dir = os.path.join(base_dir, 'archive', timestamp)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = os.path.join(base_dir, "archive", timestamp)
     os.makedirs(archive_dir, exist_ok=True)
 
     if round_num == 1:
@@ -118,7 +81,7 @@ def handle_directory(base_dir: str, target_dirs: Optional[List[str]] = None, rou
 
         items_moved = 0
         for item in os.listdir(base_dir):
-            if item == 'archive':  # Don't move the archive directory itself
+            if item == "archive":  # Don't move the archive directory itself
                 continue
 
             item_path = os.path.join(base_dir, item)
@@ -145,7 +108,7 @@ def handle_directory(base_dir: str, target_dirs: Optional[List[str]] = None, rou
 
         items_copied = 0
         for item in os.listdir(base_dir):
-            if item == 'archive':  # Don't copy the archive directory itself
+            if item == "archive":  # Don't copy the archive directory itself
                 continue
 
             item_path = os.path.join(base_dir, item)
@@ -170,11 +133,11 @@ def handle_directory(base_dir: str, target_dirs: Optional[List[str]] = None, rou
 
         # Delete files matching "round_X" where X >= round_num
         logger.info(f"Deleting the following items from {base_dir}:")
-        pattern = re.compile(r'round_(\d+)')
+        pattern = re.compile(r"round_(\d+)")
         deleted_files = []
 
         for item in os.listdir(base_dir):
-            if item == 'archive':  # Don't touch the archive directory
+            if item == "archive":  # Don't touch the archive directory
                 continue
 
             item_path = os.path.join(base_dir, item)
@@ -206,7 +169,7 @@ def get_latest_tag(checkpoints_dir: str) -> str:
         raise FileNotFoundError(f"Directory doesn't exist: {checkpoints_dir}")
 
     # Find all encoder files
-    encoder_pattern = os.path.join(checkpoints_dir, 'vae_encoder_*.keras')
+    encoder_pattern = os.path.join(checkpoints_dir, "vae_encoder_*.keras")
     encoder_files = glob.glob(encoder_pattern)
 
     if not encoder_files:
@@ -216,11 +179,11 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     valid_tags = []
     for file in encoder_files:
         basename = os.path.basename(file)
-        match = re.search(r'vae_encoder_(.+)\.keras', basename)
+        match = re.search(r"vae_encoder_(.+)\.keras", basename)
         if match:
             tag = match.group(1)
             # Verify decoder exists
-            decoder_file = os.path.join(checkpoints_dir, f'vae_decoder_{tag}.keras')
+            decoder_file = os.path.join(checkpoints_dir, f"vae_decoder_{tag}.keras")
             if os.path.exists(decoder_file):
                 valid_tags.append(tag)
 
@@ -232,24 +195,31 @@ def get_latest_tag(checkpoints_dir: str) -> str:
         # Handle final_vX format with highest priority
         if tag_str.startswith("final_"):
             try:
-                final_ver = int(tag_str.split('_v')[1])
+                final_ver = int(tag_str.split("_v")[1])
                 return (0, final_ver)
-            except:
+            except (ValueError, IndexError):
                 return (1, tag_str)
         # Handle round_XX format with secondary priority
-        elif tag_str.startswith('round_'):
+        elif tag_str.startswith("round_"):
             try:
-                round_num = int(tag_str.split('_')[1])
+                round_num = int(tag_str.split("_")[1])
                 return (2, round_num)
-            except:
+            except (ValueError, IndexError):
                 return (3, tag_str)
-        # Handle timestamp format YYYYMMDD_HHMMSS lowest priority
-        elif re.match(r'\d{8}_\d{6}', tag_str):
+        # Handle timestamp format YYYYMMDD_HHMMSS tertiary priority
+        elif re.match(r"\d{8}_\d{6}", tag_str):
             try:
-                timestamp = datetime.strptime(tag_str, '%Y%m%d_%H%M%S')
+                timestamp = datetime.strptime(tag_str, "%Y%m%d_%H%M%S")
                 return (4, timestamp)
-            except:
+            except ValueError:
                 return (5, tag_str)
+        # Handle test_vX format with lowest priority
+        if tag_str.startswith("test_"):
+            try:
+                test_ver = int(tag_str.split("_v")[1])
+                return (6, test_ver)
+            except (ValueError, IndexError):
+                return (7, tag_str)
         # Fallback for all other formats
         else:
             return (99, tag_str)
@@ -260,7 +230,7 @@ def get_latest_tag(checkpoints_dir: str) -> str:
 
     if highest_priority == 99:
         raise FileNotFoundError(
-            f"No valid model tags found (e.g. final_vX, round_XX, YYYYMMDD_HHMMSS)"
+            "No valid model tags found (e.g. final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX)"
         )
 
     filtered_tags = [t for t in valid_tags if sort_key(t)[0] == highest_priority]
@@ -271,48 +241,17 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
-def calculate_curriculum_snr(round_idx: int, total_rounds: int, config: TrainingConfig) -> Tuple[int, int]:
-    """
-    Calculate SNR parameters for curriculum learning
-
-    Args:
-        round_idx: Current training round (0-indexed)
-        total_rounds: Total number of training rounds
-        config: Training configuration
-
-    Returns:
-        (snr_base, snr_range) tuple
-    """
-    # Edge case: use initial snr range if only training for 1 round
-    if total_rounds == 1:
-        return config.snr_base, config.initial_snr_range
-
-    # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
-    progress = round_idx / (total_rounds - 1)
-
-    if config.curriculum_schedule == "linear":
-        # Linear progression from wide to narrow SNR range
-        current_range = config.initial_snr_range - progress * (config.initial_snr_range - config.final_snr_range)
-    elif config.curriculum_schedule == "exponential":
-        # Exponential decay - start easy, then get hard quickly
-        current_range = config.final_snr_range + (config.initial_snr_range - config.final_snr_range) * np.exp(config.exponential_decay_rate * progress)
-    elif config.curriculum_schedule == "step":
-        # Step function - easy for first part, hard for second part
-        # TODO: add mechanism for more step changes
-        if round_idx < config.step_easy_rounds:
-            current_range = config.initial_snr_range
-        else:
-            current_range = config.final_snr_range
-    else:
-        raise ValueError(f"'{config.curriculum_schedule} is invalid. Accepted values: 'linear', 'exponential', 'step'")
-
-    return config.snr_base, int(current_range)
-
-
-def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Optional[float],
-                                per_replica_batch_size: int, global_batch_size: Optional[int],
-                                per_replica_val_batch_size: Optional[int], num_replicas: int,
-                                strategy: tf.distribute.Strategy, shuffle: bool = True) -> Dict:
+def prepare_distributed_dataset(
+    data: dict,
+    n_samples: int,
+    train_val_split: float | None,
+    per_replica_batch_size: int,
+    global_batch_size: int | None,
+    per_replica_val_batch_size: int | None,
+    num_replicas: int,
+    strategy: tf.distribute.Strategy,
+    shuffle: bool = True,
+) -> dict:
     """
     Prepare distributed datasets for training or inference
 
@@ -338,7 +277,9 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
     if train_val_split is not None:
         # Training case: split into train and val
         if global_batch_size is None or per_replica_val_batch_size is None:
-            raise ValueError("global_batch_size and per_replica_val_batch_size are required when train_val_split is provided")
+            raise ValueError(
+                "global_batch_size and per_replica_val_batch_size are required when train_val_split is provided"
+            )
 
         # Split & trim to fit train/val batch size
         n_train = int(n_samples * train_val_split)
@@ -347,18 +288,20 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
         n_train_trimmed = (n_train // global_batch_size) * global_batch_size
         n_val_trimmed = (n_val // per_replica_val_batch_size) * per_replica_val_batch_size
 
-        logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
+        logger.info(
+            f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}"
+        )
 
         # Prepare data
-        train_concat = data['concatenated'][:n_train_trimmed]
-        train_true = data['true'][:n_train_trimmed]
-        train_false = data['false'][:n_train_trimmed]
+        train_concat = data["concatenated"][:n_train_trimmed]
+        train_true = data["true"][:n_train_trimmed]
+        train_false = data["false"][:n_train_trimmed]
 
         val_start = n_train
         val_end = val_start + n_val_trimmed
-        val_concat = data['concatenated'][val_start:val_end]
-        val_true = data['true'][val_start:val_end]
-        val_false = data['false'][val_start:val_end]
+        val_concat = data["concatenated"][val_start:val_end]
+        val_true = data["true"][val_start:val_end]
+        val_false = data["false"][val_start:val_end]
 
         # Create generator functions for memory-efficient data loading
         def train_generator():
@@ -382,25 +325,31 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
             (
                 tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
                 tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
             ),
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
         )
 
         # Create datasets using generators to reduce GPU memory pressure
         # Data is kept on CPU & transferred to GPU in batches on-demand
-        logger.info(f"Creating infinite datasets from generators with per replica batch size - "
-                    f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}")
+        logger.info(
+            f"Creating infinite datasets from generators with per replica batch size - "
+            f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}"
+        )
 
-        train_dataset = tf.data.Dataset.from_generator(
-            train_generator,
-            output_signature=output_signature
-        ).batch(per_replica_batch_size).repeat().prefetch(tf.data.AUTOTUNE)
+        train_dataset = (
+            tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
+            .batch(per_replica_batch_size)
+            .repeat()
+            .prefetch(tf.data.AUTOTUNE)
+        )
 
-        val_dataset = tf.data.Dataset.from_generator(
-            val_generator,
-            output_signature=output_signature
-        ).batch(per_replica_val_batch_size).repeat().prefetch(tf.data.AUTOTUNE)
+        val_dataset = (
+            tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
+            .batch(per_replica_val_batch_size)
+            .repeat()
+            .prefetch(tf.data.AUTOTUNE)
+        )
 
         # Distribute datasets across GPUs
         logger.info(f"Distributing datasets across {num_replicas} GPUs")
@@ -414,13 +363,13 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
         val_steps = n_val_trimmed // (per_replica_val_batch_size * num_replicas)
 
         return {
-            'train_dataset': train_dataset,
-            'val_dataset': val_dataset,
-            'n_train_trimmed': n_train_trimmed,
-            'n_val_trimmed': n_val_trimmed,
-            'train_steps': train_steps,
-            'accumulation_steps': accumulation_steps,
-            'val_steps': val_steps
+            "train_dataset": train_dataset,
+            "val_dataset": val_dataset,
+            "n_train_trimmed": n_train_trimmed,
+            "n_val_trimmed": n_val_trimmed,
+            "train_steps": train_steps,
+            "accumulation_steps": accumulation_steps,
+            "val_steps": val_steps,
         }
 
     else:
@@ -431,9 +380,9 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
         logger.info(f"Data alignment: {n_samples}→{n_trimmed}")
 
         # Prepare data
-        concat = data['concatenated'][:n_trimmed]
-        true = data['true'][:n_trimmed]
-        false = data['false'][:n_trimmed]
+        concat = data["concatenated"][:n_trimmed]
+        true = data["true"][:n_trimmed]
+        false = data["false"][:n_trimmed]
 
         # Create generator function for memory-efficient data loading
         def data_generator():
@@ -450,19 +399,23 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
             (
                 tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
                 tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
             ),
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
         )
 
         # Create dataset using generator to reduce GPU memory pressure
         # Data is kept on CPU & transferred to GPU in batches on-demand
-        logger.info(f"Creating infinite dataset from generator with per replica batch size: {per_replica_batch_size}")
+        logger.info(
+            f"Creating infinite dataset from generator with per replica batch size: {per_replica_batch_size}"
+        )
 
-        dataset = tf.data.Dataset.from_generator(
-            data_generator,
-            output_signature=output_signature
-        ).batch(per_replica_batch_size).repeat().prefetch(tf.data.AUTOTUNE)
+        dataset = (
+            tf.data.Dataset.from_generator(data_generator, output_signature=output_signature)
+            .batch(per_replica_batch_size)
+            .repeat()
+            .prefetch(tf.data.AUTOTUNE)
+        )
 
         # Distribute dataset across GPUs
         logger.info(f"Distributing dataset across {num_replicas} GPUs")
@@ -473,9 +426,9 @@ def prepare_distributed_dataset(data: Dict, n_samples: int, train_val_split: Opt
         steps = n_trimmed // batch_size
 
         return {
-            'dataset': dataset,
-            'n_trimmed': n_trimmed,
-            'steps': steps,
+            "dataset": dataset,
+            "n_trimmed": n_trimmed,
+            "steps": steps,
         }
 
 
@@ -509,7 +462,7 @@ def check_encoder_trained(encoder, threshold=0.2):
     """
     trained_layers = []
     for layer in encoder.layers:
-        if isinstance(layer, (Conv2D, Dense)):
+        if isinstance(layer, Conv2D | Dense):
             weights = layer.get_weights()
             if not weights:
                 continue  # skip layers without weights
@@ -522,7 +475,9 @@ def check_encoder_trained(encoder, threshold=0.2):
 
             relative_dev = abs(actual_std - expected_std) / expected_std
 
-            logger.info(f"{layer.name}: actual std={actual_std:.5f}, expected std={expected_std:.5f}, deviation={relative_dev:.2%}")
+            logger.info(
+                f"{layer.name}: actual std={actual_std:.5f}, expected std={expected_std:.5f}, deviation={relative_dev:.2%}"
+            )
 
             if relative_dev > threshold:
                 trained_layers.append(layer.name)
@@ -539,59 +494,70 @@ def check_encoder_trained(encoder, threshold=0.2):
 class TrainingPipeline:
     """Training pipeline"""
 
-    def __init__(self, config, background_data: np.ndarray, strategy=None, start_round=1):
+    def __init__(self, background_data, strategy=None):
         """
         Initialize training pipeline
 
         Args:
-            config: Configuration object
-            background_data: Preprocessed background observations
+            background_data: Array of background observations
+            strategy: TensorFlow distribution strategy
         """
-        self.config = config
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
+        # Initialize data generator
+        self.data_generator = DataGenerator(background_data)
+
+        # Set distributed strategy
         self.strategy = strategy or tf.distribute.get_strategy()
-
-        # Store background data
-        self.background_data = background_data.astype(np.float32)
-        logger.info(f"Background data shape: {background_data.shape}")
-
-        # Initialize components
-        self.data_generator = DataGenerator(config, background_data)
 
         # Create VAE model & optimizer inside distributed context
         with self.strategy.scope():
-            self.vae = create_vae_model(config)
+            self.vae = create_beta_vae_model()
             self._build_optimizer()
 
+        # Initialize RF model as None
         self.rf_model = None
 
+        # Load models from checkpoints if provided
+        if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
+            logger.info("Resuming from checkpoint")
+            self.load_models(
+                tag=self.config.checkpoint.load_tag, dir=self.config.checkpoint.load_dir
+            )
+
+        # NOTE: replace this with db writes? (search for all self.history instances)
         # Training history
         self.history = {
-            'loss': [],
-            'reconstruction_loss': [],
-            'kl_loss': [],
-            'true_loss': [],
-            'false_loss': [],
-            'val_loss': [],
-            'val_reconstruction_loss': [], 
-            'val_kl_loss': [], 
-            'val_true_loss': [],
-            'val_false_loss': [],
-            'learning_rate': []
+            "loss": [],
+            "reconstruction_loss": [],
+            "kl_loss": [],
+            "true_loss": [],
+            "false_loss": [],
+            "val_loss": [],
+            "val_reconstruction_loss": [],
+            "val_kl_loss": [],
+            "val_true_loss": [],
+            "val_false_loss": [],
+            "learning_rate": [],
         }
 
         # Setup directories
-        self.setup_directories(start_round)
+        self._setup_directories()
 
+        # NOTE: should we just replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
         # Setup TensorBoard logging
-        self.setup_tensorboard_logging(start_round)
+        self._setup_tensorboard_logging()
 
+    # NOTE: is this still needed? when does this run? replace with close() instead?
     def __del__(self):
         """Cleanup TensorBoard writers and data generator"""
-        if hasattr(self, 'train_writer'):
+        if hasattr(self, "train_writer"):
             self.train_writer.close()
-        if hasattr(self, 'val_writer'):
+        if hasattr(self, "val_writer"):
             self.val_writer.close()
-        if hasattr(self, 'data_generator'):
+        if hasattr(self, "data_generator"):
             self.data_generator.close()
 
     def _build_optimizer(self):
@@ -605,7 +571,9 @@ class TrainingPipeline:
         time_bins = self.config.data.time_bins
         width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
-        dummy_data = tf.zeros((dummy_batch_size, num_observations, time_bins, width_bin), dtype=tf.float32)
+        dummy_data = tf.zeros(
+            (dummy_batch_size, num_observations, time_bins, width_bin), dtype=tf.float32
+        )
 
         # Perform one forward pass to build the model
         _ = self.vae(dummy_data, training=False)
@@ -616,42 +584,48 @@ class TrainingPipeline:
         # Apply dummy gradients to build optimizer variables
         @tf.function
         def apply_dummy_grads():
-            self.vae.optimizer.apply_gradients(zip(dummy_grads, self.vae.trainable_variables))
+            self.vae.optimizer.apply_gradients(
+                zip(dummy_grads, self.vae.trainable_variables, strict=False)
+            )
 
         self.strategy.run(apply_dummy_grads)
 
         logger.info("Optimizer built successfully within strategy scope")
 
-    def setup_directories(self, start_round=1):
+    def _setup_directories(self):
         """Create necessary directories"""
         logger.info("Setting up directories")
 
-        model_checkpoints_dir = os.path.join(self.config.model_path, 'checkpoints')
+        start_round = self.config.checkpoint.start_round
+
+        model_checkpoints_dir = os.path.join(self.config.model_path, "checkpoints")
         handle_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
 
-        plot_checkpoints_dir = os.path.join(self.config.output_path, 'plots', 'checkpoints')
+        plot_checkpoints_dir = os.path.join(self.config.output_path, "plots", "checkpoints")
         handle_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
 
-        logger.info(f"Setup directories complete")
+        logger.info("Setup directories complete")
 
-    def setup_tensorboard_logging(self, start_round=1):
+    def _setup_tensorboard_logging(self):
         """Setup TensorBoard logging"""
         logger.info("Setting up TensorBoard logging")
 
-        logs_dir = os.path.join(self.config.output_path, 'logs')
-        handle_directory(logs_dir, target_dirs=['train', 'validation'], round_num=start_round)
+        start_round = self.config.checkpoint.start_round
 
+        logs_dir = os.path.join(self.config.output_path, "logs")
+        handle_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
+
+        self.global_step = (start_round - 1) * self.config.training.epochs_per_round
         if start_round == 1:
-            self.global_step = 0
             logger.info("Starting fresh TensorBoard logs")
-
         else:
-            self.global_step = (start_round - 1) * self.config.training.epochs_per_round  
-            logger.info(f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})")
+            logger.info(
+                f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})"
+            )
 
         # Create TensorBoard writers
-        train_log_dir = os.path.join(logs_dir, 'train')
-        val_log_dir = os.path.join(logs_dir, 'validation')
+        train_log_dir = os.path.join(logs_dir, "train")
+        val_log_dir = os.path.join(logs_dir, "validation")
 
         self.train_writer = tf.summary.create_file_writer(train_log_dir)
         self.val_writer = tf.summary.create_file_writer(val_log_dir)
@@ -659,186 +633,275 @@ class TrainingPipeline:
         logger.info(f"TensorBoard logs directory: {logs_dir}")
         logger.info(f"Initial global_step: {self.global_step}")
 
-    def update_learning_rate(self, val_losses):
+    def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
+        """
+        Calculate SNR parameters for curriculum learning
+
+        Args:
+            round_idx: Current training round (0-indexed)
+            total_rounds: Total number of training rounds
+
+        Returns:
+            (snr_base, snr_range) tuple
+        """
+        total_rounds = self.config.training.num_training_rounds
+        snr_base = self.config.training.snr_base
+        initial_snr_range = self.config.training.initial_snr_range
+        final_snr_range = self.config.training.final_snr_range
+        schedule = self.config.training.curriculum_schedule
+        decay_rate = self.config.training.exponential_decay_rate
+        easy_rounds = self.config.training.step_easy_rounds
+        hard_rounds = self.config.training.step_hard_rounds
+
+        # Edge case: use initial snr range if only training for 1 round
+        if total_rounds == 1:
+            return snr_base, initial_snr_range
+
+        # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
+        progress = round_idx / (total_rounds - 1)
+
+        if schedule == "linear":
+            # Linear progression from wide to narrow SNR range
+            current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
+        elif schedule == "exponential":
+            # Exponential decay - start easy, then get hard quickly
+            current_range = final_snr_range + (initial_snr_range - final_snr_range) * np.exp(
+                decay_rate * progress
+            )
+        elif schedule == "step":
+            # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
+            # Step function - easy for first part, hard for second part
+            if round_idx < easy_rounds:
+                current_range = initial_snr_range
+            elif round_idx - easy_rounds < hard_rounds:
+                current_range = final_snr_range
+            else:
+                raise RuntimeError(
+                    f"round_idx ({round_idx}) exceeded easy_rounds + hard_rounds ({easy_rounds} + {hard_rounds})"
+                )
+        else:
+            raise ValueError(
+                f"'{schedule} is invalid. Accepted values: 'linear', 'exponential', 'step'"
+            )
+
+        return snr_base, int(current_range)
+
+    def _update_learning_rate(self, val_losses):
         """
         Robust adaptive learning rate with multiple safeguards
 
-        Note the following soft constraint: 
+        Note the following soft constraint:
         min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
-          => LR can only reach min_learning_rate during round if above expression is > 0 
+          => LR can only reach min_learning_rate during round if above expression is > 0
           => else LR will reset at start of new round before reaching min_learning_rate
         """
 
         current_lr = self.vae.optimizer.learning_rate.numpy()
         if current_lr <= self.config.training.min_learning_rate:
             return current_lr
-        
+
         # Use validation loss for better generalization
-        if not hasattr(self, 'best_val_loss'):
-            self.best_val_loss = float('inf')
+        if not hasattr(self, "best_val_loss"):
+            self.best_val_loss = float("inf")
             self.patience_counter = 0
-        
-        current_val_loss = float(val_losses['total'])
-        
+
+        current_val_loss = float(val_losses["total"])
+
         # Check if validation loss improved
         if current_val_loss < self.best_val_loss * (1 - self.config.training.min_pct_improvement):
             self.best_val_loss = current_val_loss
             self.patience_counter = 0
         else:
             self.patience_counter += 1
-        
+
         # Reduce LR if no meaningful improvement for consecutive epochs
         if self.patience_counter >= self.config.training.patience_threshold:
-            new_lr = max(current_lr * (1 - self.config.training.reduction_factor), self.config.training.min_learning_rate)
-            
+            new_lr = max(
+                current_lr * (1 - self.config.training.reduction_factor),
+                self.config.training.min_learning_rate,
+            )
+
             self.vae.optimizer.learning_rate.assign(new_lr)
             self.patience_counter = 0  # Reset counter
-            
+
             logger.info(f"Reduced learning rate: {current_lr:.2e} -> {new_lr:.2e}")
             return new_lr
-        
+
         return current_lr
 
-    def train_beta_vae(self, start_round=1):
+    def train_beta_vae(self):
         """
         Train beta-VAE with curriculum learning
         """
         n_rounds = self.config.training.num_training_rounds
         epochs = self.config.training.epochs_per_round
+        start_round = self.config.checkpoint.start_round
 
-        if start_round > 1:
+        if start_round > n_rounds:
+            return  # Return early if beta-VAE already trained (can occur from fault tolerance)
+        elif start_round > 1:
             logger.info(f"Resuming training from round {start_round}/{n_rounds}")
         else:
             logger.info(f"Starting training for {n_rounds} rounds")
-        
-        for round_idx in range(start_round-1, n_rounds):
-            snr_base, snr_range = calculate_curriculum_snr(round_idx, n_rounds, self.config.training)
 
-            logger.info(f"{'='*50}")
+        for round_idx in range(start_round - 1, n_rounds):
+            snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
+
+            logger.info(f"{'=' * 50}")
             logger.info(f"ROUND {round_idx + 1}/{n_rounds}")
-            logger.info(f"SNR range: {snr_base}-{snr_base+snr_range}")
-            logger.info(f"{'='*50}")
+            logger.info(f"SNR range: {snr_base}-{snr_base + snr_range}")
+            logger.info(f"{'=' * 50}")
 
             # Reset learning rate & adaptive state before new curriculum stage
             original_lr = self.config.training.base_learning_rate
             current_lr = self.vae.optimizer.learning_rate.numpy()
             self.vae.optimizer.learning_rate.assign(original_lr)
-            
-            if hasattr(self, 'best_val_loss'):
-                delattr(self, 'best_val_loss')
-            if hasattr(self, 'patience_counter'):
-                delattr(self, 'patience_counter')
+
+            if hasattr(self, "best_val_loss"):
+                delattr(self, "best_val_loss")
+            if hasattr(self, "patience_counter"):
+                delattr(self, "patience_counter")
 
             logger.info(f"Curriculum LR reset: {current_lr:.2e} → {original_lr:.2e}")
-            
+
             self.train_round(
-                round_idx=round_idx,
-                epochs=epochs,
-                snr_base=snr_base,
-                snr_range=snr_range
+                round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
             )
-            
+
     def train_round(self, round_idx: int, epochs: int, snr_base: int, snr_range: int):
         """
         Perform a single training round
         """
-        logger.info(f"Training round {round_idx + 1} - Epochs: {epochs}, SNR: {snr_base}-{snr_base+snr_range}")
-
-        # Generate training data 
-        train_data = self.data_generator.generate_train_batch(
-            self.config.training.num_samples_beta_vae, 
-            snr_base, 
-            snr_range
+        logger.info(
+            f"Training round {round_idx + 1} - Epochs: {epochs}, SNR: {snr_base}-{snr_base + snr_range}"
         )
 
-        # Distribute training data 
+        # Generate training data
+        train_data = self.data_generator.generate_batch(
+            self.config.training.num_samples_beta_vae, snr_base, snr_range
+        )
+
+        # Distribute training data
         data = prepare_distributed_dataset(
-                data=train_data,
-                n_samples=self.config.training.num_samples_beta_vae,
-                train_val_split=self.config.training.train_val_split,
-                per_replica_batch_size=self.config.training.per_replica_batch_size,
-                global_batch_size=self.config.training.global_batch_size,
-                per_replica_val_batch_size=self.config.training.per_replica_val_batch_size,
-                num_replicas=self.strategy.num_replicas_in_sync,
-                strategy=self.strategy,
-                shuffle=True
+            data=train_data,
+            n_samples=self.config.training.num_samples_beta_vae,
+            train_val_split=self.config.training.train_val_split,
+            per_replica_batch_size=self.config.training.per_replica_batch_size,
+            global_batch_size=self.config.training.global_batch_size,
+            per_replica_val_batch_size=self.config.training.per_replica_val_batch_size,
+            num_replicas=self.strategy.num_replicas_in_sync,
+            strategy=self.strategy,
+            shuffle=True,
         )
 
-        train_dataset = data['train_dataset']
-        val_dataset = data['val_dataset']
-        n_train_trimmed = data['n_train_trimmed']
-        n_val_trimmed = data['n_val_trimmed']
-        steps_per_epoch = data['train_steps']
-        accumulation_steps = data['accumulation_steps']
-        val_steps = data['val_steps'] 
-        
+        train_dataset = data["train_dataset"]
+        val_dataset = data["val_dataset"]
+        n_train_trimmed = data["n_train_trimmed"]
+        n_val_trimmed = data["n_val_trimmed"]
+        steps_per_epoch = data["train_steps"]
+        accumulation_steps = data["accumulation_steps"]
+        val_steps = data["val_steps"]
+
         del train_data
         gc.collect()
 
         # Sanity check: verify step sizes are valid
         if accumulation_steps < 1:
-            raise ValueError(f"Accumulation steps < 1: global_batch_size ({self.config.training.global_batch_size}) must be >= per_replica_batch_size * num_replicas ({self.config.training.per_replica_batch_size * self.strategy.num_replicas_in_sync})")
+            raise ValueError(
+                f"Accumulation steps < 1: global_batch_size ({self.config.training.global_batch_size}) must be >= per_replica_batch_size * num_replicas ({self.config.training.per_replica_batch_size * self.strategy.num_replicas_in_sync})"
+            )
         if steps_per_epoch < 1:
-            raise ValueError(f"Steps per epoch < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({self.config.training.global_batch_size})")
+            raise ValueError(
+                f"Steps per epoch < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({self.config.training.global_batch_size})"
+            )
         if val_steps < 1:
-            raise ValueError(f"Validation steps < 1: n_val_trimmed ({n_val_trimmed}) must be >= per_replica_val_batch_size * num_replicas ({self.config.training.per_replica_val_batch_size * self.strategy.num_replicas_in_sync})")
+            raise ValueError(
+                f"Validation steps < 1: n_val_trimmed ({n_val_trimmed}) must be >= per_replica_val_batch_size * num_replicas ({self.config.training.per_replica_val_batch_size * self.strategy.num_replicas_in_sync})"
+            )
 
-        logger.info(f"Initializing training loop with {steps_per_epoch} train steps, {val_steps} val steps")
+        logger.info(
+            f"Initializing training loop with {steps_per_epoch} train steps, {val_steps} val steps"
+        )
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
-        
+
         for epoch in range(epochs):
             # Log resources at start of epoch
-            logger.info(f"{'-'*30}")
+            logger.info(f"{'-' * 30}")
             logger.info(f"Epoch {epoch + 1}/{epochs} Start")
-            # logger.info(f"{log_system_resources()}")
 
             # Training
             epoch_losses = self._train_epoch(train_dataset, steps_per_epoch, accumulation_steps)
 
-            # Validation 
+            # Validation
             val_losses = self._validate_epoch(val_dataset, val_steps)
 
             # Log results
             logger.info(f"Epoch {epoch + 1} Complete")
-            logger.info(f"Train -- Total: {epoch_losses['total']:.4f}, "
-                       f"Recon: {epoch_losses['reconstruction']:.4f}, "
-                       f"KL: {epoch_losses['kl']:.4f}, "
-                       f"True: {epoch_losses['true']:.4f}, "
-                       f"False: {epoch_losses['false']:.4f}, ")
-            logger.info(f"Val -- Total: {val_losses['total']:.4f}, "
-                       f"Recon: {val_losses['reconstruction']:.4f}, "
-                       f"KL: {val_losses['kl']:.4f}, "
-                       f"True: {val_losses['true']:.4f}, "
-                       f"False: {val_losses['false']:.4f}")
+            logger.info(
+                f"Train -- Total: {epoch_losses['total']:.4f}, "
+                f"Recon: {epoch_losses['reconstruction']:.4f}, "
+                f"KL: {epoch_losses['kl']:.4f}, "
+                f"True: {epoch_losses['true']:.4f}, "
+                f"False: {epoch_losses['false']:.4f}, "
+            )
+            logger.info(
+                f"Val -- Total: {val_losses['total']:.4f}, "
+                f"Recon: {val_losses['reconstruction']:.4f}, "
+                f"KL: {val_losses['kl']:.4f}, "
+                f"True: {val_losses['true']:.4f}, "
+                f"False: {val_losses['false']:.4f}"
+            )
 
-            # Update history 
-            for key, train_key in [('loss', 'total'), ('reconstruction_loss', 'reconstruction'), 
-                                   ('kl_loss', 'kl'), ('true_loss', 'true'), ('false_loss', 'false')]:
+            # Update history
+            for key, train_key in [
+                ("loss", "total"),
+                ("reconstruction_loss", "reconstruction"),
+                ("kl_loss", "kl"),
+                ("true_loss", "true"),
+                ("false_loss", "false"),
+            ]:
                 if key not in self.history:
                     self.history[key] = []
                 self.history[key].append(float(epoch_losses[train_key]))
-            for key, val_key in [('val_loss', 'total'), ('val_reconstruction_loss', 'reconstruction'),
-                                 ('val_kl_loss', 'kl'), ('val_true_loss', 'true'), ('val_false_loss', 'false')]:
+            for key, val_key in [
+                ("val_loss", "total"),
+                ("val_reconstruction_loss", "reconstruction"),
+                ("val_kl_loss", "kl"),
+                ("val_true_loss", "true"),
+                ("val_false_loss", "false"),
+            ]:
                 if key not in self.history:
                     self.history[key] = []
                 self.history[key].append(float(val_losses[val_key]))
-            self.history['learning_rate'].append(float(self.vae.optimizer.learning_rate.numpy()))
+            self.history["learning_rate"].append(float(self.vae.optimizer.learning_rate.numpy()))
 
             # TensorBoard logging
             with self.train_writer.as_default():
-                tf.summary.scalar('total_loss', epoch_losses['total'], step=self.global_step)
-                tf.summary.scalar('reconstruction_loss', epoch_losses['reconstruction'], step=self.global_step)
-                tf.summary.scalar('kl_loss', epoch_losses['kl'], step=self.global_step)
-                tf.summary.scalar('true_loss', epoch_losses['true'], step=self.global_step)
-                tf.summary.scalar('false_loss', epoch_losses['false'], step=self.global_step)
-                tf.summary.scalar('learning_rate', self.vae.optimizer.learning_rate.numpy(), step=self.global_step)
+                tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
+                tf.summary.scalar(
+                    "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
+                )
+                tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
+                tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
+                tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
+                tf.summary.scalar(
+                    "learning_rate", self.vae.optimizer.learning_rate.numpy(), step=self.global_step
+                )
 
             with self.val_writer.as_default():
-                tf.summary.scalar('validation_total_loss', val_losses['total'], step=self.global_step)
-                tf.summary.scalar('validation_reconstruction_loss', val_losses['reconstruction'], step=self.global_step)
-                tf.summary.scalar('validation_kl_loss', val_losses['kl'], step=self.global_step)
-                tf.summary.scalar('validation_true_loss', val_losses['true'], step=self.global_step)
-                tf.summary.scalar('validation_false_loss', val_losses['false'], step=self.global_step)
+                tf.summary.scalar(
+                    "validation_total_loss", val_losses["total"], step=self.global_step
+                )
+                tf.summary.scalar(
+                    "validation_reconstruction_loss",
+                    val_losses["reconstruction"],
+                    step=self.global_step,
+                )
+                tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
+                tf.summary.scalar("validation_true_loss", val_losses["true"], step=self.global_step)
+                tf.summary.scalar(
+                    "validation_false_loss", val_losses["false"], step=self.global_step
+                )
 
             # Flush writers to ensure data is written
             self.train_writer.flush()
@@ -846,55 +909,47 @@ class TrainingPipeline:
 
             # Increment global step
             self.global_step += 1
-            
-            # Adaptive learning rate
-            self.update_learning_rate(val_losses)
 
-            # Log resources at end of epoch  
+            # Adaptive learning rate
+            self._update_learning_rate(val_losses)
+
+            # Log resources at end of epoch
             logger.info(f"Epoch {epoch + 1}/{epochs} End")
-            # logger.info(f"{log_system_resources()}")
 
         # Clear intermediate data
-        del train_dataset, val_dataset, data
+        del data, train_dataset, val_dataset
         gc.collect()
 
+        # TEST: does memory still accumulate without clear_session()?
         # Force TensorFlow to release internal references to datasets/iterators
         # This prevents generator closures from accumulating in memory between rounds
-        tf.keras.backend.clear_session()
-        logger.info("Cleared TensorFlow session state")
+        # tf.keras.backend.clear_session()
+        # logger.info("Cleared TensorFlow session state")
+
+        # Reset multiprocessing pools in DataGenerator after each round
+        # to further avoid memory accumulation
+        self.data_generator.reset_managed_pool()
 
         # Save checkpoint
-        self.save_models(
-            tag=f"round_{round_idx+1:02d}",
-            dir="checkpoints"
-        )
+        self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
         # Plot progress
-        self.plot_beta_vae_training_progress(
-            tag=f"round_{round_idx+1:02d}",
-            dir="checkpoints"
-        )
-        
+        self.plot_beta_vae_training_progress(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+
     def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1):
         """
-        Perform a single training epoch with gradient accumulation (if accumulation_steps > 1)
+        Perform a single training epoch with gradient accumulation
         """
-        epoch_losses = {
-            'total': 0.0,
-            'reconstruction': 0.0,
-            'kl': 0.0,
-            'true': 0.0,
-            'false': 0.0
-        }
+        epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
-        
+
         for step in range(steps_per_epoch):
             step_losses = {
-                'total': 0.0,
-                'reconstruction': 0.0,
-                'kl': 0.0,
-                'true': 0.0,
-                'false': 0.0
+                "total": 0.0,
+                "reconstruction": 0.0,
+                "kl": 0.0,
+                "true": 0.0,
+                "false": 0.0,
             }
 
             # Initialize accumulated gradients
@@ -911,8 +966,10 @@ class TrainingPipeline:
 
                     # Sanity check: verify gradients are valid before accumulating
                     if micro_grads is None or all(g is None for g in micro_grads):
-                        logger.warning(f"Step {step+1}, sub-step {sub_step+1}: "
-                                       f"All gradients are None, skipping this micro-batch")
+                        logger.warning(
+                            f"Step {step + 1}, sub-step {sub_step + 1}: "
+                            f"All gradients are None, skipping this micro-batch"
+                        )
                         continue
 
                     # Accumulate gradients over sub-steps
@@ -920,62 +977,69 @@ class TrainingPipeline:
                         accumulated_gradients = micro_grads
                     else:
                         accumulated_gradients = [
-                            ag + g if ag is not None and g is not None else ag or g 
-                            for ag, g in zip(accumulated_gradients, micro_grads)
+                            ag + g if ag is not None and g is not None else ag or g
+                            for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
                         ]
 
                     successful_accumulations += 1
 
                     # Accumulate losses over sub-steps
-                    for key in step_losses: 
+                    for key in step_losses:
                         step_losses[key] += micro_losses[key]
 
-                except StopIteration:  # Empty dataset 
-                    logger.error(f"Dataset exhausted at step {step+1}, sub-step {sub_step+1}")
-                    raise 
+                except StopIteration:  # Empty dataset
+                    logger.error(f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}")
+                    raise
 
                 except Exception as e:
-                    logger.error(f"Error during gradient computation at step {step+1}, sub-step {sub_step+1}: {e}")
-                    raise 
+                    logger.error(
+                        f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
+                    )
+                    raise
 
-            # Sanity check: verify that gradient accumulation was successful 
-            if accumulated_gradients is None or successful_accumulations == 0: 
-                logger.error(f"Step {step+1}: No valid gradients accumulated!")
-                raise RuntimeError(f"Failed to accumulate gradients at step {step+1}")
+            # Sanity check: verify that gradient accumulation was successful
+            if accumulated_gradients is None or successful_accumulations == 0:
+                logger.error(f"Step {step + 1}: No valid gradients accumulated!")
+                raise RuntimeError(f"Failed to accumulate gradients at step {step + 1}")
 
-            # Average accumulated gradients over sub-steps 
+            # Average accumulated gradients over sub-steps
             accumulated_gradients = [
-                g / successful_accumulations if g is not None else None 
+                g / successful_accumulations if g is not None else None
                 for g in accumulated_gradients
             ]
 
-            # Sanity check: verify no NaN/Inf in gradients 
-            has_nan_or_inf = False 
+            # Sanity check: verify no NaN/Inf in gradients
+            has_nan_or_inf = False
             for g in accumulated_gradients:
-                if g is not None and (tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))):
-                    has_nan_or_inf = True 
+                if g is not None and (
+                    tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
+                ):
+                    has_nan_or_inf = True
                     break
 
             if has_nan_or_inf:
-                logger.error(f"Step {step+1}: NaN or Inf detected in gradients!")
-                raise RuntimeError(f"NaN/Inf gradients at step {step+1}")
+                logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
+                raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
-            # Apply accumulated gradients 
+            # Apply accumulated gradients
             self._apply_gradients(accumulated_gradients)
 
-            for key in step_losses:
+            for key, loss in step_losses.items():
                 # Average step losses over sub-steps
-                step_losses[key] /= successful_accumulations
-                epoch_losses[key] += step_losses[key]
+                avg_loss = loss / successful_accumulations
+                step_losses[key] = avg_loss
+                epoch_losses[key] += avg_loss
 
             # Log progress every 10 steps
             if (step + 1) % 10 == 0 or (step + 1) == steps_per_epoch:
-                logger.info(f"Step {step+1}/{steps_per_epoch}, "
-                           f"Total: {step_losses['total']:.4f}, "
-                           f"Recon: {step_losses['reconstruction']:.4f}, "
-                           f"KL: {step_losses['kl']:.4f}, "
-                           f"True: {step_losses['true']:.4f}, "
-                           f"False: {step_losses['false']:.4f}")
+                logger.info(
+                    f"Step {step + 1}/{steps_per_epoch}, "
+                    f"Total: {step_losses['total']:.4f}, "
+                    f"Recon: {step_losses['reconstruction']:.4f}, "
+                    f"KL: {step_losses['kl']:.4f}, "
+                    f"True: {step_losses['true']:.4f}, "
+                    f"False: {step_losses['false']:.4f}"
+                )
 
         # Average epoch losses over training steps
         for key in epoch_losses:
@@ -983,23 +1047,17 @@ class TrainingPipeline:
 
         del iterator
         gc.collect()
-            
+
         return epoch_losses
-    
+
     def _validate_epoch(self, dataset, steps):
         """
         Perform a single validation epoch
         """
-        val_losses = {
-            'total': 0.0,
-            'reconstruction': 0.0,
-            'kl': 0.0,
-            'true': 0.0,
-            'false': 0.0
-        }
+        val_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
-        
-        for step in range(steps):
+
+        for _step in range(steps):
             batch = next(iterator)
             step_losses = self._distributed_val_step(batch)
 
@@ -1031,61 +1089,63 @@ class TrainingPipeline:
             false_data = x[2]
 
             with tf.GradientTape() as tape:
-                # Compute losses 
-                losses = self.vae.compute_total_loss(main_data, true_data, false_data, y, training=True)
+                # Compute losses
+                losses = self.vae.compute_total_loss(
+                    main_data, true_data, false_data, y, training=True
+                )
 
-                # Scale loss by num_replicas for gradient averaging 
-                scaled_loss = losses['total_loss'] / tf.cast(num_replicas, tf.float32)
+                # Scale loss by num_replicas for gradient averaging
+                scaled_loss = losses["total_loss"] / tf.cast(num_replicas, tf.float32)
 
             # Compute gradients
             gradients = tape.gradient(scaled_loss, self.vae.trainable_variables)
 
             return gradients, losses
 
-        # Run training step on all replicas 
+        # Run training step on all replicas
         per_replica_grads, per_replica_losses = self.strategy.run(step_fn, args=(batch_data,))
 
-        # Reduce gradients across replicas 
+        # Reduce gradients across replicas
         reduced_grads = []
         for grad in per_replica_grads:
             if grad is not None:
-                reduced_grad = self.strategy.reduce(
-                    tf.distribute.ReduceOp.MEAN, grad, axis=None
-                )
+                reduced_grad = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, grad, axis=None)
                 reduced_grads.append(reduced_grad)
             else:
                 reduced_grads.append(None)
 
         # Reduce losses across replicas
         reduced_losses = {
-            'total': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['total_loss'], axis=None
+            "total": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["total_loss"], axis=None
             ),
-            'reconstruction': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['reconstruction_loss'], axis=None
+            "reconstruction": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["reconstruction_loss"], axis=None
             ),
-            'kl': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['kl_loss'], axis=None
+            "kl": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_loss"], axis=None
             ),
-            'true': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['true_loss'], axis=None
+            "true": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["true_loss"], axis=None
             ),
-            'false': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['false_loss'], axis=None
-            )
+            "false": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
+            ),
         }
 
         return reduced_grads, reduced_losses
 
-    @tf.function 
+    @tf.function
     def _apply_gradients(self, gradients):
         """
         Clip & apply gradients
         """
         # Clip gradients for additional stability
         clipped_gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-        # Apply gradients 
-        self.vae.optimizer.apply_gradients(zip(clipped_gradients, self.vae.trainable_variables))
+        # Apply gradients
+        self.vae.optimizer.apply_gradients(
+            zip(clipped_gradients, self.vae.trainable_variables, strict=False)
+        )
 
     @tf.function
     def _distributed_val_step(self, batch_data):
@@ -1093,6 +1153,7 @@ class TrainingPipeline:
         Perform a single distributed validation step
         Returns reduced losses
         """
+
         def step_fn(data):
             """Per-replica validation step"""
             x, y = data
@@ -1100,31 +1161,33 @@ class TrainingPipeline:
             true_data = x[1]
             false_data = x[2]
 
-            # Compute losses 
-            losses = self.vae.compute_total_loss(main_data, true_data, false_data, y, training=False)
+            # Compute losses
+            losses = self.vae.compute_total_loss(
+                main_data, true_data, false_data, y, training=False
+            )
 
             return losses
 
-        # Run validation step on all replicas 
+        # Run validation step on all replicas
         per_replica_losses = self.strategy.run(step_fn, args=(batch_data,))
 
         # Reduce losses across replicas
         reduced_losses = {
-            'total': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['total_loss'], axis=None
+            "total": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["total_loss"], axis=None
             ),
-            'reconstruction': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['reconstruction_loss'], axis=None
+            "reconstruction": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["reconstruction_loss"], axis=None
             ),
-            'kl': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['kl_loss'], axis=None
+            "kl": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_loss"], axis=None
             ),
-            'true': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['true_loss'], axis=None
+            "true": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["true_loss"], axis=None
             ),
-            'false': self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses['false_loss'], axis=None
-            )
+            "false": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
+            ),
         }
 
         return reduced_losses
@@ -1133,42 +1196,44 @@ class TrainingPipeline:
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
 
-        # Initialize RF model 
+        # Initialize RF model
         if self.rf_model is None:
-            self.rf_model = RandomForestModel(self.config)
+            self.rf_model = RandomForestModel()
 
         elif self.rf_model.is_trained:
             logger.info("Random Forest classifier already trained. Exiting training loop.")
             return
 
-        # Load encoder weights if untrained 
+        # Load encoder weights if untrained
         logger.info("Checking if encoder weights appear trained")
 
         try:
             if not check_encoder_trained(self.vae.encoder, threshold=0.2):
                 try:
-                    logger.info(f"Loading latest pre-trained encoder weights")
+                    logger.info("Loading latest pre-trained encoder weights")
                     self.load_models()
 
-                except Exception as e: 
+                except Exception as e:
                     logger.warning(f"Failed to load pre-trained encoder weights: {e}")
 
-                    try: 
-                        logger.info(f"Loading latest checkpointed weights instead")
+                    try:
+                        logger.info("Loading latest checkpointed weights instead")
                         self.load_models(dir="checkpoints")
-                    
-                    except Exception as e: 
+
+                    except Exception as e:
                         logger.warning(f"Failed to load latest checkpointed weights: {e}")
                         logger.warning("Proceeding with current encoder weights")
 
-        except Exception as e: 
+        except Exception as e:
             logger.warning(f"Could not verify encoder weights status: {e}")
-            logger.warning(f"Proceeding with current encoder weights")
+            logger.warning("Proceeding with current encoder weights")
 
         try:
             n_samples = self.config.training.num_samples_rf
             snr_base = self.config.training.snr_base
-            snr_range = self.config.training.initial_snr_range
+            snr_range = (
+                self.config.training.initial_snr_range
+            )  # NOTE: should we use initial_snr_range or final_snr_range?
 
             latent_dim = self.config.beta_vae.latent_dim
             num_observations = self.config.data.num_observations
@@ -1176,9 +1241,9 @@ class TrainingPipeline:
             width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
             # Generate training data
-            logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base+snr_range}")
+            logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
 
-            rf_data = self.data_generator.generate_train_batch(n_samples, snr_base, snr_range)
+            rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
             # Prepare distributed dataset for inference
             results = prepare_distributed_dataset(
@@ -1190,12 +1255,12 @@ class TrainingPipeline:
                 per_replica_val_batch_size=None,
                 num_replicas=self.strategy.num_replicas_in_sync,
                 strategy=self.strategy,
-                shuffle=False  # Deterministic latent generation
+                shuffle=False,  # Deterministic latent generation
             )
 
-            dataset = results['dataset']
-            n_trimmed = results['n_trimmed']
-            steps = results['steps']
+            dataset = results["dataset"]
+            n_trimmed = results["n_trimmed"]
+            steps = results["steps"]
 
             del rf_data
             gc.collect()
@@ -1210,6 +1275,7 @@ class TrainingPipeline:
             @tf.function
             def distributed_encode(batch_data):
                 """Encode batch data using distributed strategy"""
+
                 def encode_fn(data):
                     """Per-replica encoding step"""
                     x, _ = data
@@ -1228,7 +1294,9 @@ class TrainingPipeline:
                     return true_z, false_z
 
                 # Run encoding on all replicas
-                per_replica_true, per_replica_false = self.strategy.run(encode_fn, args=(batch_data,))
+                per_replica_true, per_replica_false = self.strategy.run(
+                    encode_fn, args=(batch_data,)
+                )
 
                 return per_replica_true, per_replica_false
 
@@ -1252,8 +1320,8 @@ class TrainingPipeline:
                 false_batch_np = np.concatenate([f.numpy() for f in false_results], axis=0)
 
                 batch_latent_size = true_batch_np.shape[0]
-                true_latents[current_idx:current_idx + batch_latent_size] = true_batch_np
-                false_latents[current_idx:current_idx + batch_latent_size] = false_batch_np
+                true_latents[current_idx : current_idx + batch_latent_size] = true_batch_np
+                false_latents[current_idx : current_idx + batch_latent_size] = false_batch_np
 
                 current_idx += batch_latent_size
 
@@ -1272,122 +1340,151 @@ class TrainingPipeline:
             del true_latents, false_latents
             gc.collect()
 
-            # Force TensorFlow to release internal references
-            tf.keras.backend.clear_session()
-            logger.info("Cleared TensorFlow session state")
+            # TEST: does memory still accumulate without clear_session()?
+            # Force TensorFlow to release internal references to datasets/iterators
+            # This prevents generator closures from accumulating in memory between rounds
+            # tf.keras.backend.clear_session()
+            # logger.info("Cleared TensorFlow session state")
+
+            # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
+            self.data_generator.reset_managed_pool()
 
             logger.info("Random Forest training complete")
 
         except Exception as e:
             logger.error(f"Random Forest training failed: {e}")
             raise
-    
-    def plot_beta_vae_training_progress(self, tag: Optional[str] = None, dir: Optional[str] = None):
+
+    def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         fig = plt.figure(figsize=(25, 12))
         gs = GridSpec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
-        
+
         # Top subplot spanning full width - Total Loss
         ax_top = fig.add_subplot(gs[0, :])
-        
+
         # Bottom subplots - Individual losses
         ax_recon = fig.add_subplot(gs[1, 0])
-        ax_kl = fig.add_subplot(gs[1, 1]) 
+        ax_kl = fig.add_subplot(gs[1, 1])
         ax_true = fig.add_subplot(gs[1, 2])
         ax_false = fig.add_subplot(gs[1, 3])
-        
-        fig.suptitle(f"Beta-VAE Training Progress", fontsize=16)
-        
-        epochs = range(1, len(self.history.get('loss', [])) + 1)
-        
+
+        fig.suptitle("Beta-VAE Training Progress", fontsize=16)
+
+        epochs = range(1, len(self.history.get("loss", [])) + 1)
+
         # Helper function to plot dual y-axis
         def plot_dual_axis(ax, title, train_key, val_key):
             # Create secondary y-axis for learning rate
             ax2 = ax.twinx()
-            
+
             # Plot train and validation on left y-axis
             if train_key in self.history and self.history[train_key]:
-                ax.plot(epochs, self.history[train_key], color='blue', label='train', linewidth=2)
+                ax.plot(epochs, self.history[train_key], color="blue", label="train", linewidth=2)
             if val_key in self.history and self.history[val_key]:
-                ax.plot(epochs, self.history[val_key], color='orange', label='val', linewidth=2)
-                
-            # Plot learning rate on right y-axis  
-            if 'learning_rate' in self.history and self.history['learning_rate']:
-                ax2.plot(epochs, self.history['learning_rate'], color='grey', 
-                        label='learning rate', linewidth=1, alpha=0.7, linestyle='--')
-            
+                ax.plot(epochs, self.history[val_key], color="orange", label="val", linewidth=2)
+
+            # Plot learning rate on right y-axis
+            if "learning_rate" in self.history and self.history["learning_rate"]:
+                ax2.plot(
+                    epochs,
+                    self.history["learning_rate"],
+                    color="grey",
+                    label="learning rate",
+                    linewidth=1,
+                    alpha=0.7,
+                    linestyle="--",
+                )
+
             ax.set_title(title)
-            ax.set_xlabel('epoch')
+            ax.set_xlabel("epoch")
             ax.grid(True, alpha=0.3)
-            
-            ax2.tick_params(axis='y', labelcolor='grey')
-        
+
+            ax2.tick_params(axis="y", labelcolor="grey")
+
         # Top subplot - Total Loss
-        plot_dual_axis(ax_top, 'Total Loss', 'loss', 'val_loss')
-        
+        plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
+
         # Bottom subplots
-        plot_dual_axis(ax_recon, 'Reconstruction Loss', 'reconstruction_loss', 'val_reconstruction_loss')
-        plot_dual_axis(ax_kl, 'KL Divergence', 'kl_loss', 'val_kl_loss') 
-        plot_dual_axis(ax_true, 'True Loss', 'true_loss', 'val_true_loss')
-        plot_dual_axis(ax_false, 'False Loss', 'false_loss', 'val_false_loss')
+        plot_dual_axis(
+            ax_recon, "Reconstruction Loss", "reconstruction_loss", "val_reconstruction_loss"
+        )
+        plot_dual_axis(ax_kl, "KL Divergence", "kl_loss", "val_kl_loss")
+        plot_dual_axis(ax_true, "True Loss", "true_loss", "val_true_loss")
+        plot_dual_axis(ax_false, "False Loss", "false_loss", "val_false_loss")
 
         # Create shared legend at top right of figure
-        train_line = mlines.Line2D([], [], color='blue', linewidth=2, label='Train')
-        val_line = mlines.Line2D([], [], color='orange', linewidth=2, label='Validation') 
-        lr_line = mlines.Line2D([], [], color='grey', linewidth=1, linestyle='--', alpha=0.7, label='Learning Rate')
-        
-        fig.legend(handles=[train_line, val_line, lr_line], 
-                  loc='upper right', 
-                  bbox_to_anchor=(0.98, 0.98),
-                  frameon=True,
-                  fancybox=True,
-                  shadow=True)
-        
+        train_line = mlines.Line2D([], [], color="blue", linewidth=2, label="Train")
+        val_line = mlines.Line2D([], [], color="orange", linewidth=2, label="Validation")
+        lr_line = mlines.Line2D(
+            [], [], color="grey", linewidth=1, linestyle="--", alpha=0.7, label="Learning Rate"
+        )
+
+        fig.legend(
+            handles=[train_line, val_line, lr_line],
+            loc="upper right",
+            bbox_to_anchor=(0.98, 0.98),
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
         plt.tight_layout()
 
         # Save plot
         if tag is None:
-            tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+            tag = self.config.checkpoint.save_tag
 
-        if dir is not None: 
-            save_path = os.path.join(self.config.output_path, 'plots', dir, f'beta_vae_training_progress_{tag}.png')
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"beta_vae_training_progress_{tag}.png"
+            )
         else:
-            save_path = os.path.join(self.config.output_path, 'plots', f'beta_vae_training_progress_{tag}.png')
-        
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"beta_vae_training_progress_{tag}.png"
+            )
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)  # Create dir if it doesn't exist
+
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
         plt.close()
-    
-    def save_models(self, tag: Optional[str] = None, dir: Optional[str] = None):
+
+    def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
         if tag is None:
-            tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+            tag = self.config.checkpoint.save_tag
 
-        if dir is not None: 
-            encoder_path = os.path.join(self.config.model_path, dir, f'vae_encoder_{tag}.keras')
-            decoder_path = os.path.join(self.config.model_path, dir, f'vae_decoder_{tag}.keras')
-            rf_path = os.path.join(self.config.model_path, dir, f'random_forest_{tag}.joblib')
+        if dir is not None:
+            encoder_path = os.path.join(self.config.model_path, dir, f"vae_encoder_{tag}.keras")
+            decoder_path = os.path.join(self.config.model_path, dir, f"vae_decoder_{tag}.keras")
+            rf_path = os.path.join(self.config.model_path, dir, f"random_forest_{tag}.joblib")
         else:
-            encoder_path = os.path.join(self.config.model_path, f'vae_encoder_{tag}.keras')
-            decoder_path = os.path.join(self.config.model_path, f'vae_decoder_{tag}.keras')
-            rf_path = os.path.join(self.config.model_path, f'random_forest_{tag}.joblib')
+            encoder_path = os.path.join(self.config.model_path, f"vae_encoder_{tag}.keras")
+            decoder_path = os.path.join(self.config.model_path, f"vae_decoder_{tag}.keras")
+            rf_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+
+        os.makedirs(
+            os.path.dirname(encoder_path), exist_ok=True
+        )  # Create dir if it doesn't exist (encoder_path, decoder_path, rf_path all share parent dir)
 
         # Save VAE encoder (main model for inference)
         self.vae.encoder.save(encoder_path)
         logger.info(f"Saved VAE encoder to {encoder_path}")
-        
+
         # Save decoder
         self.vae.decoder.save(decoder_path)
         logger.info(f"Saved VAE decoder to {decoder_path}")
-        
+
         # Save Random Forest
         if self.rf_model is not None:
             self.rf_model.save(rf_path)
             logger.info(f"Saved Random Forest to {rf_path}")
 
-    def load_models(self, tag: Optional[str] = None, dir: Optional[str] = None):
+    def load_models(self, tag: str | None = None, dir: str | None = None):
         """Load model weights"""
         if tag is None:
+            # NOTE: should we use a more sensible default?
             logger.info("No tag specified. Defaulting to 'final'")
             tag = "final"
         original_tag = tag
@@ -1395,104 +1492,97 @@ class TrainingPipeline:
         # Construct filepaths
         if dir is not None:
             base_dir = os.path.join(self.config.model_path, dir)
-            encoder_path = os.path.join(base_dir, f'vae_encoder_{tag}.keras')
-            decoder_path = os.path.join(base_dir, f'vae_decoder_{tag}.keras')
-            rf_path = os.path.join(base_dir, f'random_forest_{tag}.joblib')
+            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
+            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
         else:
             base_dir = self.config.model_path
-            encoder_path = os.path.join(base_dir, f'vae_encoder_{tag}.keras')
-            decoder_path = os.path.join(base_dir, f'vae_decoder_{tag}.keras')
-            rf_path = os.path.join(base_dir, f'random_forest_{tag}.joblib')
+            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
+            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
         # Check if the specified path exists
         if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
-            logger.warning(f"No models tagged as '{original_tag}' in {base_dir}, looking for latest tag instead...")
+            logger.warning(
+                f"No models tagged as '{original_tag}' in {base_dir}, looking for latest tag instead..."
+            )
 
             tag = get_latest_tag(base_dir)
             logger.info(f"Tag '{original_tag}' not found. Loading latest model with tag: '{tag}'")
-            
+
             # Reconstruct paths with new tag
-            encoder_path = os.path.join(base_dir, f'vae_encoder_{tag}.keras')
-            decoder_path = os.path.join(base_dir, f'vae_decoder_{tag}.keras')
-            rf_path = os.path.join(base_dir, f'random_forest_{tag}.joblib')
+            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
+            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
         # Load the models
         try:
             if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
                 raise FileNotFoundError("Models not found")
-            
+
             logger.info(f"Loading models from {base_dir} with tag '{tag}'")
 
-            # Import Sampling layer for custom_objects (required for model loading)
-            from models.vae import Sampling
-            
             # Load encoder & decoder
             checkpoint_encoder = tf.keras.models.load_model(
-                encoder_path,
-                custom_objects={'Sampling': Sampling}
+                encoder_path, custom_objects={"Sampling": Sampling}
             )
             checkpoint_decoder = tf.keras.models.load_model(
-                decoder_path,
-                custom_objects={'Sampling': Sampling}
+                decoder_path, custom_objects={"Sampling": Sampling}
             )
-            
+
             # Transfer weights
             self.vae.encoder.set_weights(checkpoint_encoder.get_weights())
             self.vae.decoder.set_weights(checkpoint_decoder.get_weights())
-            
+
             logger.info("VAE loaded successfully")
 
             # Load Random Forest if it exists
             if os.path.exists(rf_path):
                 # Initialize RF model if it doesn't exist yet
                 if self.rf_model is None:
-                    self.rf_model = RandomForestModel(self.config)
-                
+                    self.rf_model = RandomForestModel()
+
                 self.rf_model.load(rf_path)
                 logger.info("Random Forest loaded successfully")
             else:
-                logger.info(f"Random Forest not found at {rf_path} - this is normal if RF hasn't been trained yet")
-            
+                logger.info(
+                    f"Random Forest not found at {rf_path} - this is normal if RF hasn't been trained yet"
+                )
+
             logger.info(f"Successfully loaded models from {base_dir} with tag '{tag}'")
             return tag  # Return the actually loaded tag for reference
-            
+
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
             raise
 
-def train_full_pipeline(config, background_data: np.ndarray, strategy=None, 
-                        tag=None, dir=None, start_round=1, final_tag=None) -> TrainingPipeline:
+
+def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingPipeline:
     """
-    Train complete Ether-Scan pipeline
-    
+    Complete Aetherscan training pipeline run
+
     Args:
-        config: Configuration object
-        background_data: Preprocessed background observations
+        background_data: Array of background observations
         strategy: TensorFlow distribution strategy
-        
+
     Returns:
         Trained pipeline object
     """
     # Create pipeline
-    pipeline = TrainingPipeline(config, background_data, strategy, start_round)
+    pipeline = TrainingPipeline(background_data, strategy)
 
-    # Resume from checkpoint if provided
-    if tag:
-        logger.info(f"Resuming from checkpoint")
-        pipeline.load_models(tag=tag, dir=dir)
-    
-    # Run iterative training
-    pipeline.train_beta_vae(start_round=start_round)
-    
+    # Train beta-VAE
+    pipeline.train_beta_vae()
+
     # Train Random Forest
     pipeline.train_random_forest()
-    
+
     # Save final models
-    pipeline.save_models(tag=final_tag)
-    
+    pipeline.save_models()
+
     # Final plot
-    pipeline.plot_beta_vae_training_progress(tag=final_tag)
-    
+    pipeline.plot_beta_vae_training_progress()
+
     logger.info("Training complete!")
-    
+
     return pipeline

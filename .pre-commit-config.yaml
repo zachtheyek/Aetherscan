@@ -1,0 +1,46 @@
+# Note, run `pre-commit install` inside repo to activate pre-commit hooks
+# Note, manually run pre-commit hooks on all files with: `pre-commit run --all-files`
+repos:
+  # Ruff - fast Python linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.4
+    hooks:
+      # Run linter
+      - id: ruff
+        args: [--fix] # Autofix issues when possible
+        types_or: [python, pyi]
+      # Run formatter
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # Additional general-purpose safety hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Block commits with large binaries (>1 Mb)
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      # Check for filenames that differ only by case (e.g. Main.py vs main.py)
+      - id: check-case-conflict
+      # Check for unresolved merge conflicts (e.g. "<<<<<<< HEAD" markers)
+      - id: check-merge-conflict
+      # Check YAML syntax
+      - id: check-yaml
+      # Check TOML syntax
+      - id: check-toml
+      # Ensure files end with a newline (POSIX style)
+      - id: end-of-file-fixer
+      # Trim trailing whitespace
+      - id: trailing-whitespace
+      # Check for private keys (vulnerability)
+      - id: detect-private-key
+      # TODO: uncomment after configuring repo branch protection rules
+      # Blocks commits directly to master branch
+      # - id: no-commit-to-branch
+      #   args: ['--branch', 'master']
+
+  # Scan for sensitive data (secrets, credentials, etc.)
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.29.0
+    hooks:
+      - id: gitleaks

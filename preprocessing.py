@@ -1,206 +1,305 @@
 """
-Data preprocessing module for Ether-Scan Pipeline
+Data preprocessing for Aetherscan Pipeline
+Handles background data loading & downsampling  # TODO: update once preprocessing.py complete
+Uses multiprocessing and shared memory to process data in parallel
 """
 
-import numpy as np
-# from numba import jit, prange
-# from typing import Tuple, List, Dict
+from __future__ import annotations
+
+import gc
 import logging
+import os
+from multiprocessing.shared_memory import SharedMemory
+
+import numpy as np
+from skimage.transform import downscale_local_mean
+
+from config import get_config
+from logger import init_worker_logging
+from manager import get_manager
 
 logger = logging.getLogger(__name__)
 
-# NOTE: come back to this later (start here)
-# NOTE: preprocess_cadence() is used in inference.py, everything else unused? 
-# NOTE: maybe repurpose preprocess.py to do bandpass removal & energy detection? 
+# NOTE: find a way to avoid using global refs (store under manager.py maybe?)
+# NOTE: is there any room to use asyncio & load all chunks simultaneously?
+# Global variable to store chunk data for multiprocessing workers
+# This avoids serialization overhead when passing data between workers
+_GLOBAL_SHM = None
+_GLOBAL_CHUNK_DATA = None
+_GLOBAL_SHAPE = None
+_GLOBAL_DTYPE = None
 
-# @jit(nopython=True, parallel=True)
-# def shaping_data_dynamic(data: np.ndarray, width_bin: int = 4096) -> np.ndarray:
-#     """
-#     Reshape raw observation data into snippets
-#
-#     Args:
-#         data: Raw observation data (time_bins, polarization, frequency_channels)
-#         width_bin: Number of frequency bins per snippet (4096 as per paper)
-#
-#     Returns:
-#         Reshaped data (num_snippets, time_bins, freq_bins, 1)
-#     """
-#     # Handle both single and dual polarization
-#     if len(data.shape) == 3:
-#         time_bins, n_pol, total_freq = data.shape
-#         # Use first polarization only
-#         data_to_use = data[:, 0, :]
-#     else:
-#         # Single polarization case
-#         time_bins, total_freq = data.shape
-#         data_to_use = data
-#
-#     samples = total_freq // width_bin
-#     new_data = np.zeros((samples, time_bins, width_bin, 1))
-#
-#     for i in prange(samples):
-#         new_data[i, :, :, 0] = data_to_use[:, i*width_bin:(i+1)*width_bin]
-#
-#     return new_data
-#
-# @jit(nopython=True, parallel=True)
-# def combine_cadence(A1, A2, A3, B, C, D) -> np.ndarray:
-#     """
-#     FIXED: No normalization here since it's done before injection
-#     """
-#     samples = A1.shape[0]
-#     time_bins = A1.shape[1]
-#     freq_bins = A1.shape[2]
-#
-#     data = np.zeros((samples, 6, time_bins, freq_bins, 1))
-#
-#     for i in prange(samples):
-#         # Just combine - no normalization needed
-#         data[i, 0, :, :, :] = A1[i, :, :, :]
-#         data[i, 1, :, :, :] = B[i, :, :, :]
-#         data[i, 2, :, :, :] = A2[i, :, :, :]
-#         data[i, 3, :, :, :] = C[i, :, :, :]
-#         data[i, 4, :, :, :] = A3[i, :, :, :]
-#         data[i, 5, :, :, :] = D[i, :, :, :]
-#
-#     return data
-#
-# def resize_par(data: np.ndarray, factor: int) -> np.ndarray:
-#     """
-#     Resize data in parallel
-#     Used before feeding to neural network
-#
-#     Args:
-#         data: Input data (batch, 6, time, freq)
-#         factor: Downsampling factor (8 in paper)
-#
-#     Returns:
-#         Downsampled data
-#     """
-#     batch, n_obs, time, freq = data.shape
-#     test = np.zeros((batch, n_obs, time, freq // factor))
-#
-#     for i in range(6):
-#         test[:, i, :, :] = downscale_local_mean(data[:, i, :, :], (1, 1, factor))
-#
-#     return test
-#
-# @jit(nopython=True, parallel=True)
-# def combine_for_nn(data: np.ndarray) -> np.ndarray:
-#     """
-#     Combine batch and observation dimensions for neural network input
-#
-#     Args:
-#         data: Input (batch, 6, time, freq, 1)
-#
-#     Returns:
-#         Combined (batch*6, time, freq, 1)
-#     """
-#     batch = data.shape[0]
-#     n_obs = data.shape[1]
-#     new_data = np.zeros((batch * n_obs, data.shape[2], data.shape[3], data.shape[4]))
-#
-#     for i in prange(batch):
-#         new_data[i*n_obs:(i+1)*n_obs, :, :, :] = data[i, :, :, :, :]
-#
-#     return new_data
-#
-# class DataPreprocessor:
-#     """Main preprocessing class"""
-#
-#     def __init__(self, config):
-#         self.config = config
-#         self.width_bin = config.data.width_bin
-#         self.downsample_factor = config.data.downsample_factor
-#         self.final_freq_bins = self.width_bin // self.downsample_factor 
-#
-#     def process_single_observation(self, obs_data: np.ndarray) -> np.ndarray:
-#         """
-#         Process a single raw observation WITHOUT normalization
-#         Normalization happens after cadence combination
-#
-#         Args:
-#             obs_data: Raw observation (16, total_freq) or (16, 2, total_freq)
-#
-#         Returns:
-#             Downsampled snippets (n_snippets, 16, 512)
-#         """
-#         # Shape into snippets
-#         snippets = shaping_data_dynamic(obs_data, self.width_bin)
-#
-#         # Downsample
-#         downsampled = downscale_local_mean(
-#             snippets, 
-#             (1, 1, self.downsample_factor, 1)
-#         )
-#
-#         return downsampled
-#
-#     def preprocess_cadence(self, observations: List[np.ndarray], 
-#                            use_overlap: bool = False) -> np.ndarray:
-#         """
-#         Preprocess a full cadence
-#
-#         Args:
-#             observations: List of 6 observation arrays
-#             use_overlap: Whether to use overlapping windows (for inference only)
-#
-#         Returns:
-#             Preprocessed cadence data (num_snippets, 6, 16, 512)
-#         """
-#         if len(observations) != 6:
-#             raise ValueError(f"Expected 6 observations, got {len(observations)}")
-#
-#         # Process each observation (downsample but don't normalize yet)
-#         processed_obs = []
-#         for obs in observations:
-#             processed = self.process_single_observation(obs)
-#             processed_obs.append(processed)
-#
-#         # Get ON and OFF observations
-#         A1, B, A2, C, A3, D = processed_obs
-#
-#         # Combine and normalize using author's exact function
-#         cadence_data = combine_cadence(A1, A2, A3, B, C, D)
-#
-#         # Remove channel dimension for compatibility
-#         cadence_data = cadence_data[:, :, :, :, 0]
-#
-#         return cadence_data
-#
-#     def prepare_for_vae(self, cadence_data: np.ndarray) -> np.ndarray:
-#         """
-#         Prepare cadence data for VAE input
-#         Model expects (batch*6, 16, 512, 1)
-#
-#         Args:
-#             cadence_data: Cadence data (batch, 6, 16, 512)
-#
-#         Returns:
-#             VAE-ready data (batch*6, 16, 512, 1)
-#         """
-#         # Add channel dimension
-#         if len(cadence_data.shape) == 4:
-#             cadence_data = cadence_data[..., np.newaxis]
-#
-#         # Combine batch and observation dimensions
-#         return combine_for_nn(cadence_data)
-#
-#     def prepare_batch_for_training(self, data_dict: Dict[str, np.ndarray]) -> Tuple:
-#         """
-#         Prepare training batch in format expected by VAE
-#         NO additional normalization - already done in combine_cadence
-#
-#         Args:
-#             data_dict: Dictionary with 'concatenated', 'true', 'false' keys
-#
-#         Returns:
-#             ((concatenated, true, false), target) tuple for training
-#         """
-#         concatenated = data_dict['concatenated'].astype(np.float32)
-#         true_data = data_dict['true'].astype(np.float32)
-#         false_data = data_dict['false'].astype(np.float32)
-#
-#         # Data is already normalized from data generation
-#         # Just return in the format expected by the model
-#         return (concatenated, true_data, false_data), concatenated
+
+def _init_worker(shm_name, shape, dtype):
+    """
+    Initialize worker process with shared memory reference and queue-based logging
+    This avoids serialization overhead between workers
+
+    Args:
+        shm_name: Name of the shared memory block
+        shape: Shape of the background array
+        dtype: Data type of the background array
+
+    Note:
+        Worker cleanup is automatic - when the pool terminates, the OS reclaims
+        all worker process resources including shared memory file descriptors.
+        Cleanup is handled by the main process
+    """
+    global _GLOBAL_SHM, _GLOBAL_CHUNK_DATA, _GLOBAL_SHAPE, _GLOBAL_DTYPE
+
+    # Initialize worker logging
+    init_worker_logging()
+
+    # Attach to existing shared memory block
+    _GLOBAL_SHM = SharedMemory(name=shm_name)
+
+    # Create numpy array view of shared memory (no copy!)
+    _GLOBAL_CHUNK_DATA = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
+    _GLOBAL_SHAPE = shape
+    _GLOBAL_DTYPE = dtype
+
+
+# NOTE: come back to this later
+def _downsample_worker(args):
+    """
+    Worker function to downsample a single cadence in parallel
+    Uses global chunk data to avoid serialization overhead
+
+    Args:
+        args: Tuple of (cadence_idx, downsample_factor, final_width)
+
+    Returns:
+        Downsampled cadence of shape (6, 16, final_width) or None if invalid
+    """
+    cadence_idx, downsample_factor, final_width = args
+
+    # Get cadence from global chunk data
+    if _GLOBAL_CHUNK_DATA is not None:
+        cadence = _GLOBAL_CHUNK_DATA[cadence_idx]
+
+        # Skip invalid cadences
+        if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+            return None
+
+        # Downsample each observation separately
+        downsampled_cadence = np.zeros((6, 16, final_width), dtype=np.float32)
+
+        for obs_idx in range(6):
+            downsampled_cadence[obs_idx] = downscale_local_mean(
+                cadence[obs_idx], (1, downsample_factor)
+            ).astype(np.float32)
+
+        return downsampled_cadence
+
+    else:
+        logger.warning("No global chunk data available")
+        return None
+
+
+class DataPreprocessor:
+    """Data preprocessor"""
+
+    def __init__(self):
+        """
+        Initialize preprocessor
+        """
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
+
+        self.manager = get_manager()
+
+    # NOTE: come back to this later
+    def close(self):
+        """Explicitly close the multiprocessing pool and shared memory"""
+        # if hasattr(self, "pool") and self.pool is not None:
+        #     self.manager.close_pool(self.pool)
+        #     self.pool = None
+        #
+        # if hasattr(self, "shm") and self.shm is not None:
+        #     self.manager.close_shared_memory(self.shm)
+        #     self.shm = None
+
+        logger.info("DataPreprocessor closed")
+
+    # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
+    def load_background_data(self) -> np.ndarray:
+        """
+        Load & downsample background plates using parallel processing
+
+        Returns:
+            Array of background plates with shape (n_backgrounds, 6, 16, width_bin_downsampled)
+        """
+        logger.info(f"Loading background data from {self.config.data_path}")
+
+        # Use config values
+        num_target_backgrounds = self.config.data.num_target_backgrounds
+        downsample_factor = self.config.data.downsample_factor
+        final_width = self.config.data.width_bin // downsample_factor
+
+        chunk_size = self.config.data.background_load_chunk_size
+        max_chunks = self.config.data.max_chunks_per_file
+        n_processes = self.config.manager.n_processes
+        chunks_per_worker = self.config.manager.chunks_per_worker
+
+        logger.info(f"Target backgrounds: {num_target_backgrounds}")
+        logger.info(f"Processing chunks of: {chunk_size}")
+        logger.info(f"Final resolution: {final_width}")
+
+        all_backgrounds = []  # NOTE: preallocate this as ndarray?
+
+        for filename in self.config.data.train_files:
+            filepath = self.config.get_training_file_path(filename)
+
+            if not os.path.exists(filepath):
+                logger.warning(f"File not found: {filepath}")
+                continue
+
+            logger.info(f"Processing {filename}...")
+
+            try:
+                # Use read-only memory mapping to avoid loading full file into memory
+                # That is, insted of loading the whole file from disk to memory synchronously
+                # The OS' virtual memory manager establishes a virtual address space pointer
+                # from the file's location on disk to the virtual memory of the Python process
+                # This allows us to lazy load the data on-demand page-by-page using page fault
+                # Benefits of this approach include: reduced startup latency,
+                # efficient memory usage (since the memory allocated for the mapped array does not
+                # count towards the Python process' heap memory usage, allowing us to raise the
+                # ceiling up to our OS' virtual memory limits, which is typically constrained by
+                # free disk space and our system's address space, rather than physical RAM),
+                # and optimized access patterns (spatial locality since data is loaded in pages,
+                # and shared memory for multiprocess/multithreaded programs)
+                raw_data = np.load(filepath, mmap_mode="r")
+
+            except Exception as e:
+                logger.error(f"Error loading {filename}: {e}")
+                continue
+
+            # Apply subset parameters if specified in config
+            start, end = self.config.get_file_subset(filename)
+            if start is not None or end is not None:
+                raw_data = raw_data[start:end]
+
+            logger.info(f"  Raw data shape: {raw_data.shape}")
+
+            # Divide background into equal chunks, then cutoff if exceeds max_chunks
+            n_chunks = min(max_chunks, (raw_data.shape[0] + chunk_size - 1) // chunk_size)
+
+            for chunk_idx in range(n_chunks):
+                logger.info(f"Processing filename: chunk {chunk_idx + 1}/{n_chunks}")
+
+                chunk_start = chunk_idx * chunk_size
+                chunk_end = min((chunk_idx + 1) * chunk_size, raw_data.shape[0])
+
+                # Load chunk into memory
+                chunk_data = np.array(raw_data[chunk_start:chunk_end])
+
+                # NOTE: is this access pattern the most efficient (least pickling)? see comments in _single_cadence_wrapper() from data_generation.py for more details
+                # Prepare arguments (just indices, not data - data is in global state)
+                n_cadences = min(chunk_data.shape[0], num_target_backgrounds - len(all_backgrounds))
+                args_list = [
+                    (
+                        i,
+                        downsample_factor,
+                        final_width,
+                    )  # Just pass the chunk index, not the full cadence data
+                    for i in range(n_cadences)
+                ]
+
+                if n_processes > 1:
+                    # Create shared memory block for chunk data
+                    chunk_shm = self.manager.create_shared_memory(
+                        size=chunk_data.nbytes,
+                        name=f"DataPreproc_{filename}_chunk_{chunk_idx}",  # NOTE: come back to this later
+                    )
+
+                    # Copy chunk data into shared memory
+                    shared_chunk = np.ndarray(
+                        chunk_data.shape,
+                        dtype=chunk_data.dtype,
+                        buffer=chunk_shm.buf,  # NOTE: what is self.shm.buf?
+                    )
+                    shared_chunk[:] = chunk_data[:]
+
+                    # Create pool using shared memory reference
+                    chunk_pool = self.manager.create_pool(
+                        n_processes=n_processes,
+                        name=f"DataPreproc_{filename}_chunk_{chunk_idx}",  # NOTE: come back to this later
+                        initializer=_init_worker,
+                        initargs=(chunk_shm.name, chunk_data.shape, chunk_data.dtype),
+                    )
+
+                    # Calculate optimal chunksize for load balancing
+                    try:
+                        n_workers = chunk_pool._processes
+                    except AttributeError:
+                        n_workers = n_processes
+                    # NOTE: should we use separate chunks_per_worker? how to benchmark?
+                    chunksize = max(1, n_cadences // (n_workers * chunks_per_worker))
+                    # NOTE: does return order matter?
+                    # results = chunk_pool.map(_downsample_worker, args_list, chunksize=chunksize)
+                    results = chunk_pool.imap_unordered(
+                        _downsample_worker, args_list, chunksize=chunksize
+                    )
+
+                else:
+                    # Sequential processing
+                    logger.info("DataPreprocessor running in sequential mode (n_processes=1)")
+
+                    chunk_shm = None
+                    chunk_pool = None
+
+                    # Set global variable manually since no initializer ran
+                    global _GLOBAL_CHUNK_DATA
+                    shared_chunk = chunk_data
+                    _GLOBAL_CHUNK_DATA = shared_chunk
+
+                    results = [_downsample_worker(args) for args in args_list]
+
+                # NOTE: is there a more efficient/elegant way to do this (e.g. with list comprehension/slicing)?
+                # Collect valid results (filter out None from invalid cadences)
+                for result in results:
+                    if result is not None:
+                        all_backgrounds.append(result)
+                        if len(all_backgrounds) >= num_target_backgrounds:
+                            break
+
+                # Clear chunk data & shared resources
+                del chunk_data, shared_chunk
+                if chunk_shm:
+                    self.manager.close_shared_memory(chunk_shm)
+                    chunk_shm = None
+                if chunk_pool:
+                    self.manager.close_pool(chunk_pool)
+                    chunk_pool = None
+                del chunk_shm, chunk_pool
+                gc.collect()
+
+            # Clear raw_data reference
+            del raw_data
+            gc.collect()
+
+        if len(all_backgrounds) == 0:
+            raise ValueError("No background data loaded successfully")
+
+        # Stack all_backgrounds together
+        background_array = np.array(all_backgrounds, dtype=np.float32)
+
+        # Clear all_backgrounds reference
+        del all_backgrounds
+        gc.collect()
+
+        # Sanity check: print descriptive stats
+        min_val = np.min(background_array)
+        max_val = np.max(background_array)
+        mean_val = np.mean(background_array)
+
+        logger.info(f"Total background cadences loaded: {background_array.shape[0]}")
+        logger.info(f"Background array shape: {background_array.shape}")
+        logger.info(f"Background value range: [{min_val:.6f}, {max_val:.6f}]")
+        logger.info(f"Background mean: {mean_val:.6f}")
+        logger.info(f"Memory usage: {background_array.nbytes / 1e9:.2f} GB")
+        logger.info(f"Background data ready at {background_array.shape[3]} resolution")
+
+        return background_array
