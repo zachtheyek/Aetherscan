@@ -1,8 +1,11 @@
 name: Claude Code Review
 
+# Run on every new PR (@claude does not need to be mentioned to trigger workflow)
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened]
+    # Optional: 'synchronize' allows workflow to also trigger when new commits are pushed to an existing PR (we prefer to trigger manually with @claude)
+    # types: [opened, synchronize]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
