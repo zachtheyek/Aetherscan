@@ -1,3 +1,4 @@
+# BUG: cleanup doesn't run properly (on ctrl-c or sys.exit())
 """
 Resource manager for Aetherscan Pipeline
 Centralizes orchestration of all system resources -- including multiprocessing pools, shared memory,
