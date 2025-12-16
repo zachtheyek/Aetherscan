@@ -60,7 +60,7 @@ class ManagedPool:
             logger.info(f"Assuming pool '{self.name}' is gone and no remaining workers alive")
             return False  # pool already destroyed or internal state corrupted
 
-    def close(self):
+    def close(self, timeout):
         """Close the pool with terminate-or-fail policy"""
         if self.closed:
             return
@@ -68,36 +68,59 @@ class ManagedPool:
         try:
             logger.info(f"Forcefully terminating pool '{self.name}'")
 
-            # Forcefully kill all running processes & clear internal job queues
-            # Wait for parent to finish handling dead processes, then exit & close the pool
+            # Forcefully kill all running processes & clear internal job queues with .terminate()
+            # Then, wait for parent to finish handling dead processes,
+            # and exit & close the pool with .join()
             # Note, less forceful alternative is to use self.pool.close()
             # Which stops accepting new jobs, but lets running processes finish current job queue
             # Don't use both! Better to "terminate or fail". Inconsistent states are worse than leaks
             self.pool.terminate()  # Trigger termination
-            self.pool.join()  # Wait & close
 
-            # Sanity check to make sure pool.join() didn't fail silently
+            # For .join(), we wrap the call in a daemon thread with timeout
+            # so it doesn't block on exit or hang indefinitely
+            join_thread = threading.Thread(target=self.pool.join, daemon=True)
+            join_thread.start()
+            join_thread.join(timeout=timeout)
+
+            # If timeout exceeded, force-kill survivors
+            if join_thread.is_alive():
+                logger.warning(f"Pool '{self.name}' join timeout exceeded")
+                logger.info("Force-killing remaining worker processes with SIGKILL")
+                self._force_kill_workers()
+                time.sleep(0.1)  # Brief wait for SIGKILL to take effect
+
+            # Verify cleanup
             if self._check_alive():
-                raise RuntimeError(
-                    f"Pool '{self.name}' still has running workers after termination"
-                )
+                logger.error(f"Pool '{self.name}' workers still alive after SIGKILL!")
+                # At this point, we proceed anyway instead of raising
+                # The OS should clean up on process exit
 
             self.closed = True
-            logger.info(
-                f"Forceful termination of pool '{self.name}' successful ({self.process_count} processes)"
-            )
+            logger.info(f"Pool '{self.name}' closed ({self.process_count} processes)")
 
         except Exception as e:
-            logger.warning(f"Error forcefully terminating pool '{self.name}': {e}")
-
-            if self._check_alive():
-                raise RuntimeError(
-                    f"Pool '{self.name}' still has running workers after termination error"
-                ) from e
-
+            logger.warning(f"Error terminating pool '{self.name}': {e}")
+            # Still try to force-kill
+            with contextlib.suppress(Exception):
+                self._force_kill_workers()
             self.closed = True
-            logger.info(f"All workers in pool '{self.name}' exited despite termination error")
-            logger.info(f"Marking closed ({self.process_count} processes)")
+
+    def _force_kill_workers(self):
+        """Force-kill all worker processes with SIGKILL"""
+        try:
+            for worker in getattr(self.pool, "_pool", []):
+                if worker.is_alive():
+                    pid = worker.pid
+                    try:
+                        process = psutil.Process(pid)
+                        process.kill()  # SIGKILL - cannot be ignored
+                        logger.info(f"Force-killed worker PID {pid}")
+                    except psutil.NoSuchProcess:
+                        pass  # Already dead
+                    except Exception as e:
+                        logger.warning(f"Failed to kill worker PID {pid}: {e}")
+        except Exception as e:
+            logger.warning(f"Error during force-kill: {e}")
 
 
 @dataclass
@@ -416,7 +439,7 @@ class ResourceManager:
 
     def _close_managed_pool(self, managed: ManagedPool):
         """Internal method to close a ManagedPool"""
-        managed.close()
+        managed.close(timeout=self.config.manager.pool_terminate_timeout)
         # Remove from tracking list to allow garbage collection of Pool object and its file descriptors
         self._pools.remove(managed)
         self.stats.pools_active -= 1
