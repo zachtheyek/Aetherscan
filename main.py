@@ -162,7 +162,7 @@ def train_command():
                         raise ValueError("No valid checkpoints loaded")
 
                     logger.info(
-                        f"Loaded latest checkpoint from round {config.checkpoint.start_round - 1}"
+                        f"Found latest checkpoint from round {config.checkpoint.start_round - 1}"
                     )
                     logger.info(f"Waiting {retry_delay} seconds before retry...")
 
@@ -171,6 +171,9 @@ def train_command():
                     logger.error(f"Recovery failed: {recovery_error}")
                     logger.info(
                         f"Restarting training from round {config.checkpoint.start_round} in {retry_delay} seconds..."
+                    )
+                    config.checkpoint.load_dir = (
+                        None  # Reset to prevent TrainingPipeline() from loading phantom checkpoints
                     )
 
                 finally:
