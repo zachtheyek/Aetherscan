@@ -2,6 +2,7 @@
 # add slack integration
 # find a way to customize separate logging level for slack vs console/file
 # also find a way to log plots in slack (but not in console/file)
+# TODO: add tag to file log & archive old logs
 """
 Logger for Aetherscan Pipeline
 Runs as background thread & uses thread-safe queue-based logging to avoid deadlocks and corrupted
