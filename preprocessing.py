@@ -208,6 +208,7 @@ class DataPreprocessor:
                     for i in range(n_cadences)
                 ]
 
+                # NOTE: do we need to create & destroy the pool every chunk? or just the shared memory & pass new references in? is there a differenc?
                 if n_processes > 1:
                     # Create shared memory block for chunk data
                     chunk_shm = self.manager.create_shared_memory(

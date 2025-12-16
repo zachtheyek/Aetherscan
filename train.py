@@ -557,8 +557,8 @@ class TrainingPipeline:
             self.train_writer.close()
         if hasattr(self, "val_writer"):
             self.val_writer.close()
-        if hasattr(self, "data_generator"):
-            self.data_generator.close()
+        # if hasattr(self, "data_generator"):
+        #     self.data_generator.close()
 
     def _build_optimizer(self):
         """
