@@ -31,7 +31,7 @@ class ManagerConfig:
 
     n_processes: int = cpu_count()  # use all available cores
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    pool_terminate_timeout: float = 2.0  # seconds
+    pool_terminate_timeout: float = 5.0  # seconds
 
 
 @dataclass
