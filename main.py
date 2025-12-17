@@ -121,6 +121,8 @@ def train_command():
     retry_delay = config.training.retry_delay
 
     for attempt in range(max_retries):
+        pipeline = None
+
         try:
             logger.info(f"Training attempt: {attempt + 1}/{max_retries}")
 
@@ -128,7 +130,7 @@ def train_command():
                 logger.info(f"Retrying training from round {config.checkpoint.start_round}")
 
             # Reinitialize training pipeline on each attempt so no corrupted state is persisted
-            train_full_pipeline(background_data=background_data, strategy=strategy)
+            pipeline = train_full_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded
 
@@ -149,6 +151,8 @@ def train_command():
 
                 try:
                     # Collect garbage
+                    if pipeline:
+                        del pipeline
                     gc.collect()
 
                     # Find the latest checkpoint & determine where to resume from
