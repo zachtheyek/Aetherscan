@@ -1,3 +1,4 @@
+# TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup
 """
 Resource monitor for Aetherscan Pipeline
 Runs as background thread & records system metrics (CPU, RAM, GPU) to database writer queue
