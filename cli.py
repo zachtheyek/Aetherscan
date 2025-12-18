@@ -597,7 +597,7 @@ def validate_args(args: argparse.Namespace) -> None:
     # max_retries >= 0
     # retry_delay >= 0
     # start_round < num_training_rounds
-    # do directories specified have to exist? or we assume we'll create them on the fly and handle errors in-flight?
+    # do directories specified have to exist? or we assume we'll create them on the fly and handle errors in-flight? (currently train_command, TrainingPipeline(), and load_models() all attempt to handle errors on the fly. is this optimal behavior?)
     #
     # Template for adding more checks:
     # if hasattr(args, "some_param") and args.some_param is not None:
