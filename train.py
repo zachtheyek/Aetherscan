@@ -520,35 +520,48 @@ class TrainingPipeline:
         # Initialize RF model as None
         self.rf_model = None
 
-        # Load models from checkpoints if provided
-        if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
-            logger.info("Resuming from checkpoint")
-            self.load_models(
-                tag=self.config.checkpoint.load_tag, dir=self.config.checkpoint.load_dir
-            )
+        try:
+            # Load models from checkpoints if provided
+            if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
+                logger.info("Resuming from checkpoint")
+                self.load_models(
+                    tag=self.config.checkpoint.load_tag, dir=self.config.checkpoint.load_dir
+                )
 
-        # NOTE: replace this with db writes? (search for all self.history instances)
-        # Training history
-        self.history = {
-            "loss": [],
-            "reconstruction_loss": [],
-            "kl_loss": [],
-            "true_loss": [],
-            "false_loss": [],
-            "val_loss": [],
-            "val_reconstruction_loss": [],
-            "val_kl_loss": [],
-            "val_true_loss": [],
-            "val_false_loss": [],
-            "learning_rate": [],
-        }
+        except Exception as e:
+            logger.error(f"Error loading models from checkpoint: {e}")
 
-        # Setup directories
-        self._setup_directories()
+            logger.info("Resetting config.checkpoint to start training from scratch")
+            self.config.checkpoint.load_dir = None
+            self.config.checkpoint.load_tag = None
+            self.config.checkpoint.start_round = 1
 
-        # NOTE: should we just replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
-        # Setup TensorBoard logging
-        self._setup_tensorboard_logging()
+        finally:
+            # Regardless whether checkpoints were loaded or not, we finish the directory setup
+            # since fault tolerance expects a clean directory structure
+
+            # NOTE: replace this with db writes? (search for all self.history instances)
+            # Training history
+            self.history = {
+                "loss": [],
+                "reconstruction_loss": [],
+                "kl_loss": [],
+                "true_loss": [],
+                "false_loss": [],
+                "val_loss": [],
+                "val_reconstruction_loss": [],
+                "val_kl_loss": [],
+                "val_true_loss": [],
+                "val_false_loss": [],
+                "learning_rate": [],
+            }
+
+            # Setup directories
+            self._setup_directories()
+
+            # NOTE: should we just replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
+            # Setup TensorBoard logging
+            self._setup_tensorboard_logging()
 
     # NOTE: is this still needed? when does this run? replace with close() instead?
     def __del__(self):
@@ -1481,6 +1494,7 @@ class TrainingPipeline:
             self.rf_model.save(rf_path)
             logger.info(f"Saved Random Forest to {rf_path}")
 
+    # TODO: update docstring to properly describe load_models() behavior
     def load_models(self, tag: str | None = None, dir: str | None = None):
         """Load model weights"""
         if tag is None:
@@ -1501,13 +1515,14 @@ class TrainingPipeline:
             decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
             rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
-        # Check if the specified path exists
         if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
-            logger.warning(
-                f"No models tagged as '{original_tag}' in {base_dir}, looking for latest tag instead..."
-            )
+            # If the specified path doesn't exist, try to find the latest tag from base_dir
+            logger.warning(f"No models tagged as '{original_tag}' in {base_dir}")
+            logger.warning(f"Looking for latest tag in {base_dir} instead")
 
-            tag = get_latest_tag(base_dir)
+            tag = get_latest_tag(
+                base_dir
+            )  # get_latest_tag() will raise an error if no valid tags exist in base_dir
             logger.info(f"Tag '{original_tag}' not found. Loading latest model with tag: '{tag}'")
 
             # Reconstruct paths with new tag
@@ -1515,11 +1530,12 @@ class TrainingPipeline:
             decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
             rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
-        # Load the models
-        try:
+            # Sanity check: if paths still don't exist, raise an error
             if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
                 raise FileNotFoundError("Models not found")
 
+        # Load the models
+        try:
             logger.info(f"Loading models from {base_dir} with tag '{tag}'")
 
             # Load encoder & decoder
@@ -1550,7 +1566,6 @@ class TrainingPipeline:
                 )
 
             logger.info(f"Successfully loaded models from {base_dir} with tag '{tag}'")
-            return tag  # Return the actually loaded tag for reference
 
         except Exception as e:
             logger.error(f"Failed to load models: {e}")

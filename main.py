@@ -128,6 +128,8 @@ def train_command():
 
             if attempt > 0:
                 logger.info(f"Retrying training from round {config.checkpoint.start_round}")
+            else:
+                logger.info(f"Starting training from round {config.checkpoint.start_round}")
 
             # Reinitialize training pipeline on each attempt so no corrupted state is persisted
             pipeline = train_full_pipeline(background_data=background_data, strategy=strategy)
@@ -149,20 +151,25 @@ def train_command():
                     f"Attempting to recover from failure: attempt {attempt + 2}/{max_retries}"
                 )
 
-                try:
-                    # Collect garbage
-                    if pipeline:
-                        del pipeline
-                    gc.collect()
+                # Collect garbage
+                if pipeline:
+                    del pipeline
+                gc.collect()
 
+                # Save original checkpoint values in case of failure recovery
+                original_dir = config.checkpoint.load_dir
+                original_tag = config.checkpoint.load_tag
+                original_round = config.checkpoint.start_round
+
+                try:
                     # Find the latest checkpoint & determine where to resume from
                     config.checkpoint.load_dir = "checkpoints"
                     config.checkpoint.load_tag = get_latest_tag(
                         os.path.join(config.model_path, config.checkpoint.load_dir)
                     )
-                    config.checkpoint.infer_start_round()
-
-                    if not config.checkpoint.load_tag.startswith("round_"):
+                    if config.checkpoint.load_tag.startswith("round_"):
+                        config.checkpoint.infer_start_round()
+                    else:
                         raise ValueError("No valid checkpoints loaded")
 
                     logger.info(
@@ -171,13 +178,14 @@ def train_command():
                     logger.info(f"Waiting {retry_delay} seconds before retry...")
 
                 except Exception as recovery_error:
-                    # If no checkpoints loaded, restart from last valid start_round
+                    # If no checkpoints loaded, restart from last valid point
+                    config.checkpoint.load_dir = original_dir
+                    config.checkpoint.load_tag = original_tag
+                    config.checkpoint.start_round = original_round
+
                     logger.error(f"Recovery failed: {recovery_error}")
                     logger.info(
                         f"Restarting training from round {config.checkpoint.start_round} in {retry_delay} seconds..."
-                    )
-                    config.checkpoint.load_dir = (
-                        None  # Reset to prevent TrainingPipeline() from loading phantom checkpoints
                     )
 
                 finally:
