@@ -163,6 +163,10 @@ def new_cadence(
     # Extract the modified data (with signal injection) from the setigen Frame
     modified_data = frame.data.copy()
 
+    # Cleanup
+    del frame, signal
+    gc.collect()
+
     # Return the modified data array, slope (in pixel coordinates), and y-intercept
     return modified_data, slope_pixel, y_intercept
 
