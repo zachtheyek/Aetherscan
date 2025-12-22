@@ -88,6 +88,7 @@ class DataConfig:
 
     num_target_backgrounds: int = 15000  # Number of background cadences to load
     # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
+    # TODO: experiment with larger chunk sizes
     background_load_chunk_size: int = (
         200  # Maximum cadences to process at once during background loading
     )
@@ -125,6 +126,7 @@ class TrainingConfig:
     global_batch_size: int = 2048  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096
 
+    # TODO: experiment with larger chunk sizes
     signal_injection_chunk_size: int = (
         1000  # Maximum cadences to process at once during data generation
     )
