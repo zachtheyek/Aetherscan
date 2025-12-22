@@ -286,6 +286,8 @@ class ResourceManager:
 
         with contextlib.suppress(Exception):
             logger.info(f"Received signal {signum}, initiating cleanup...")
+
+        self._cleanup_all()
         # Properly terminate with sys.exit() after handling the signal inside main process
         # Note, sys.exit() triggers the following cleanup handlers (in order):
         # 1. finally blocks in active try/except statements
@@ -293,7 +295,6 @@ class ResourceManager:
         # 3. atexit registered functions
         # sys.exit(0): exit with successful termination status
         # sys.exit(1): exit with failed termination status
-        self._cleanup_all()
         sys.exit(0)
 
     def _cleanup_all(self):
