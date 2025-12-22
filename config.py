@@ -30,9 +30,8 @@ class ManagerConfig:
     """Resource manager configuration"""
 
     n_processes: int = cpu_count()  # use all available cores
-    # TEST: experiment with larger chunk sizes
-    # chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    chunks_per_worker: int = 8  # for balancing overhead vs parallelism
+    # TODO: experiment with larger chunk sizes
+    chunks_per_worker: int = 4  # for balancing overhead vs parallelism
     pool_terminate_timeout: float = 5.0  # seconds
 
 
