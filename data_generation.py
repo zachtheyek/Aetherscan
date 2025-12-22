@@ -10,6 +10,7 @@ import gc
 import logging
 import os
 import random
+import signal
 from multiprocessing import Pool, cpu_count
 from multiprocessing.shared_memory import SharedMemory
 
@@ -49,6 +50,11 @@ def _init_worker(shm_name, shape, dtype):
         Cleanup is handled by the main process
     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
+
+    # Ignore SIGINT (Ctrl+C) in workers - let parent handle cleanup coordination
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Restore default SIGTERM behavior so pool.terminate() from parent doesn't hang
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     # Initialize worker logging
     init_worker_logging()

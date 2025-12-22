@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import signal
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
@@ -47,6 +48,11 @@ def _init_worker(shm_name, shape, dtype):
         Cleanup is handled by the main process
     """
     global _GLOBAL_SHM, _GLOBAL_CHUNK_DATA, _GLOBAL_SHAPE, _GLOBAL_DTYPE
+
+    # Ignore SIGINT (Ctrl+C) in workers - let parent handle cleanup coordination
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Restore default SIGTERM behavior so pool.terminate() from parent doesn't hang
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     # Initialize worker logging
     init_worker_logging()
