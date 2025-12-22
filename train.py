@@ -241,6 +241,7 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
+# NOTE: should we split the if-else branches into 2 separate functions?
 def prepare_distributed_dataset(
     data: dict,
     n_samples: int,
@@ -303,21 +304,55 @@ def prepare_distributed_dataset(
         val_true = data["true"][val_start:val_end]
         val_false = data["false"][val_start:val_end]
 
+        # Create data holder objects to be paired with generators
+        # Allows for explicit dereferencing of large arrays using DataHolder.clear()
+        class DataHolder:
+            def __init__(self, concat, true, false):
+                self._cleared = False
+                self.concat = concat
+                self.true = true
+                self.false = false
+
+            def clear(self):
+                if self._cleared:
+                    return
+                self._cleared = True
+                self.concat = None
+                self.true = None
+                self.false = None
+
+        train_holder = DataHolder(train_concat, train_true, train_false)
+        val_holder = DataHolder(val_concat, val_true, val_false)
+
         # Create generator functions for memory-efficient data loading
         def train_generator():
             while True:  # Make generators infinite to reset state between epochs
-                indices = np.arange(len(train_concat))
+                if train_holder._cleared:
+                    return  # Exit if data already cleared
+                indices = np.arange(len(train_holder.concat))
                 if shuffle:
                     # Perform global shuffle on each epoch so each pass through the data is unique
                     np.random.shuffle(indices)
                 for idx in indices:
-                    yield (train_concat[idx], train_true[idx], train_false[idx]), train_concat[idx]
+                    if train_holder._cleared:
+                        return  # Exit if data already cleared
+                    yield (
+                        (train_holder.concat[idx], train_holder.true[idx], train_holder.false[idx]),
+                        train_holder.concat[idx],
+                    )
 
         def val_generator():
             while True:  # Make generators infinite to reset state between epochs
+                if val_holder._cleared:
+                    return  # Exit if data already cleared
                 # Maintain order on each epoch since no gradients are calculated during validation
-                for idx in range(len(val_concat)):
-                    yield (val_concat[idx], val_true[idx], val_false[idx]), val_concat[idx]
+                for idx in range(len(val_holder.concat)):
+                    if val_holder._cleared:
+                        return  # Exit if data already cleared
+                    yield (
+                        (val_holder.concat[idx], val_holder.true[idx], val_holder.false[idx]),
+                        val_holder.concat[idx],
+                    )
 
         # Determine dataset output signature
         sample_shape = train_concat.shape[1:]
@@ -370,6 +405,8 @@ def prepare_distributed_dataset(
             "train_steps": train_steps,
             "accumulation_steps": accumulation_steps,
             "val_steps": val_steps,
+            "_train_holder": train_holder,
+            "_val_holder": val_holder,
         }
 
     else:
@@ -384,14 +421,40 @@ def prepare_distributed_dataset(
         true = data["true"][:n_trimmed]
         false = data["false"][:n_trimmed]
 
+        # Create data holder objects to be paired with generators
+        # Allows for explicit dereferencing of large arrays using DataHolder.clear()
+        class DataHolder:
+            def __init__(self, concat, true, false):
+                self._cleared = False
+                self.concat = concat
+                self.true = true
+                self.false = false
+
+            def clear(self):
+                if self._cleared:
+                    return
+                self._cleared = True
+                self.concat = None
+                self.true = None
+                self.false = None
+
+        holder = DataHolder(concat, true, false)
+
         # Create generator function for memory-efficient data loading
         def data_generator():
             while True:  # Make generator infinite to reset state between passes
-                indices = np.arange(len(concat))
+                if holder._cleared:
+                    return  # Exit if data already cleared
+                indices = np.arange(len(holder.concat))
                 if shuffle:
                     np.random.shuffle(indices)
                 for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
+                    if holder._cleared:
+                        return  # Exit if data already cleared
+                    yield (
+                        (holder.concat[idx], holder.true[idx], holder.false[idx]),
+                        holder.concat[idx],
+                    )
 
         # Determine dataset output signature
         sample_shape = concat.shape[1:]
@@ -429,6 +492,7 @@ def prepare_distributed_dataset(
             "dataset": dataset,
             "n_trimmed": n_trimmed,
             "steps": steps,
+            "_holder": holder,
         }
 
 
@@ -807,6 +871,9 @@ class TrainingPipeline:
             shuffle=True,
         )
 
+        del train_data
+        gc.collect()
+
         train_dataset = data["train_dataset"]
         val_dataset = data["val_dataset"]
         n_train_trimmed = data["n_train_trimmed"]
@@ -814,8 +881,10 @@ class TrainingPipeline:
         steps_per_epoch = data["train_steps"]
         accumulation_steps = data["accumulation_steps"]
         val_steps = data["val_steps"]
+        train_holder = data["_train_holder"]
+        val_holder = data["_val_holder"]
 
-        del train_data
+        del data
         gc.collect()
 
         # Sanity check: verify step sizes are valid
@@ -930,7 +999,10 @@ class TrainingPipeline:
             logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
         # Clear intermediate data
-        del data, train_dataset, val_dataset
+        train_holder.clear()
+        val_holder.clear()
+
+        del train_dataset, val_dataset
         gc.collect()
 
         # TEST: does memory still accumulate without clear_session()?
@@ -1271,11 +1343,15 @@ class TrainingPipeline:
                 shuffle=False,  # Deterministic latent generation
             )
 
+            del rf_data
+            gc.collect()
+
             dataset = results["dataset"]
             n_trimmed = results["n_trimmed"]
             steps = results["steps"]
+            holder = results["_holder"]
 
-            del rf_data
+            del results
             gc.collect()
 
             logger.info(f"Generating latents for {n_trimmed} samples using distributed inference")
@@ -1342,15 +1418,17 @@ class TrainingPipeline:
                 if (step + 1) % 10 == 0 or (step + 1) == steps:
                     logger.info(f"Generated latents for step {step + 1}/{steps}")
 
-            # Clear intermediate data
-            del iterator, dataset, results
+                del per_replica_true, true_results, true_batch_np
+                del per_replica_false, false_results, false_batch_np
+                gc.collect()
+
+            del iterator
             gc.collect()
 
-            # Train Random Forest classifier
-            self.rf_model.train(true_latents, false_latents)
+            # Clear intermediate data
+            holder.clear()
 
-            # Clean up
-            del true_latents, false_latents
+            del dataset
             gc.collect()
 
             # TEST: does memory still accumulate without clear_session()?
@@ -1361,6 +1439,13 @@ class TrainingPipeline:
 
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
+
+            # Train Random Forest classifier
+            self.rf_model.train(true_latents, false_latents)
+
+            # Clean up
+            del true_latents, false_latents
+            gc.collect()
 
             logger.info("Random Forest training complete")
 
