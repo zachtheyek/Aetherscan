@@ -87,20 +87,23 @@ class ManagedPool:
                 logger.warning(f"Pool '{self.name}' join timeout exceeded")
                 logger.info("Force-killing remaining worker processes with SIGKILL")
                 self._force_kill_workers()
-                time.sleep(0.1)  # Brief wait for SIGKILL to take effect
+                time.sleep(0.2)  # Brief wait for SIGKILL to take effect
 
             # Verify cleanup
             if self._check_alive():
                 logger.error(f"Pool '{self.name}' workers still alive after SIGKILL!")
                 # At this point, we proceed anyway instead of raising
                 # The OS should clean up on process exit
+                # NOTE: is it safe to just ignore workers that survive SIGKILL? will self.closed = True lead to issues down the line?
 
             self.closed = True
             logger.info(f"Pool '{self.name}' closed ({self.process_count} processes)")
 
         except Exception as e:
             logger.warning(f"Error terminating pool '{self.name}': {e}")
-            # Still try to force-kill
+            # Still try to force-kill on error
+            # If it fails, let the OS handle on process exit
+            # NOTE: is it safe to just ignore workers that survive SIGKILL? will self.closed = True lead to issues down the line?
             with contextlib.suppress(Exception):
                 self._force_kill_workers()
             self.closed = True
