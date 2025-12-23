@@ -610,6 +610,7 @@ class TrainingPipeline:
             self._setup_tensorboard_logging()
 
     # NOTE: is this still needed? when does this run? replace with close() instead?
+    # NOTE: maybe we use close() in try-except-finally within train_full_pipeline() to free resources?
     def __del__(self):
         """Cleanup TensorBoard writers and data generator"""
         if hasattr(self, "train_writer"):
