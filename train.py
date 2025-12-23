@@ -275,6 +275,24 @@ def prepare_distributed_dataset(
             {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps, accumulation_steps, val_steps}
             Train/val distributed datasets, number of samples in each, number of steps for each (including accumulation sub-steps)
     """
+
+    # Create data holder objects (to be paired with generators)
+    # Allows for explicit dereferencing of large arrays using DataHolder.clear()
+    class DataHolder:
+        def __init__(self, concat, true, false):
+            self._cleared = False
+            self.concat = concat
+            self.true = true
+            self.false = false
+
+        def clear(self):
+            if self._cleared:
+                return
+            self._cleared = True
+            self.concat = None
+            self.true = None
+            self.false = None
+
     if train_val_split is not None:
         # Training case: split into train and val
         if global_batch_size is None or per_replica_val_batch_size is None:
@@ -297,31 +315,13 @@ def prepare_distributed_dataset(
         train_concat = data["concatenated"][:n_train_trimmed]
         train_true = data["true"][:n_train_trimmed]
         train_false = data["false"][:n_train_trimmed]
+        train_holder = DataHolder(train_concat, train_true, train_false)
 
         val_start = n_train
         val_end = val_start + n_val_trimmed
         val_concat = data["concatenated"][val_start:val_end]
         val_true = data["true"][val_start:val_end]
         val_false = data["false"][val_start:val_end]
-
-        # Create data holder objects to be paired with generators
-        # Allows for explicit dereferencing of large arrays using DataHolder.clear()
-        class DataHolder:
-            def __init__(self, concat, true, false):
-                self._cleared = False
-                self.concat = concat
-                self.true = true
-                self.false = false
-
-            def clear(self):
-                if self._cleared:
-                    return
-                self._cleared = True
-                self.concat = None
-                self.true = None
-                self.false = None
-
-        train_holder = DataHolder(train_concat, train_true, train_false)
         val_holder = DataHolder(val_concat, val_true, val_false)
 
         # Create generator functions for memory-efficient data loading
@@ -420,24 +420,6 @@ def prepare_distributed_dataset(
         concat = data["concatenated"][:n_trimmed]
         true = data["true"][:n_trimmed]
         false = data["false"][:n_trimmed]
-
-        # Create data holder objects to be paired with generators
-        # Allows for explicit dereferencing of large arrays using DataHolder.clear()
-        class DataHolder:
-            def __init__(self, concat, true, false):
-                self._cleared = False
-                self.concat = concat
-                self.true = true
-                self.false = false
-
-            def clear(self):
-                if self._cleared:
-                    return
-                self._cleared = True
-                self.concat = None
-                self.true = None
-                self.false = None
-
         holder = DataHolder(concat, true, false)
 
         # Create generator function for memory-efficient data loading
@@ -1001,15 +983,14 @@ class TrainingPipeline:
         # Clear intermediate data
         train_holder.clear()
         val_holder.clear()
-
         del train_dataset, val_dataset
-        gc.collect()
 
-        # TEST: does memory still accumulate without clear_session()?
         # Force TensorFlow to release internal references to datasets/iterators
         # This prevents generator closures from accumulating in memory between rounds
         tf.keras.backend.clear_session()
         logger.info("Cleared TensorFlow session state")
+
+        gc.collect()
 
         # Reset multiprocessing pools in DataGenerator after each round
         # to further avoid memory accumulation
@@ -1427,15 +1408,14 @@ class TrainingPipeline:
 
             # Clear intermediate data
             holder.clear()
-
             del dataset
-            gc.collect()
 
-            # TEST: does memory still accumulate without clear_session()?
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
+
+            gc.collect()
 
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()

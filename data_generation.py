@@ -163,7 +163,7 @@ def new_cadence(
     # Extract the modified data (with signal injection) from the setigen Frame
     modified_data = frame.data.copy()
 
-    # Cleanup
+    # Cleanup intermediate data
     del frame, signal
     gc.collect()
 
