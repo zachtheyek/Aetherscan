@@ -1077,15 +1077,39 @@ class TrainingPipeline:
 
             # Sanity check: verify no NaN/Inf in gradients
             has_nan_or_inf = False
-            for g in accumulated_gradients:
+            problematic_vars = []
+            # DEBUG: Enhanced gradient checking to identify which variable has NaN/Inf
+            for i, (g, var) in enumerate(
+                zip(accumulated_gradients, self.vae.trainable_variables, strict=False)
+            ):
                 if g is not None and (
                     tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
                 ):
                     has_nan_or_inf = True
-                    break
+                    problematic_vars.append((i, var.name, g))
+
+            # Old code (commented out):
+            # for g in accumulated_gradients:
+            #     if g is not None and (
+            #         tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
+            #     ):
+            #         has_nan_or_inf = True
+            #         break
 
             if has_nan_or_inf:
                 logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
+                # DEBUG: Log loss values and problematic variables
+                logger.error(
+                    f"Current losses - Total: {step_losses['total']:.4f}, "
+                    f"Recon: {step_losses['reconstruction']:.4f}, "
+                    f"KL: {step_losses['kl']:.4f}, "
+                    f"True: {step_losses['true']:.4f}, "
+                    f"False: {step_losses['false']:.4f}"
+                )
+                for idx, var_name, grad in problematic_vars:
+                    has_nan = tf.reduce_any(tf.math.is_nan(grad)).numpy()
+                    has_inf = tf.reduce_any(tf.math.is_inf(grad)).numpy()
+                    logger.error(f"  Variable #{idx} '{var_name}': NaN={has_nan}, Inf={has_inf}")
                 raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
             # Apply accumulated gradients
