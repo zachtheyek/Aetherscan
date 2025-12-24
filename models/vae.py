@@ -333,11 +333,6 @@ def build_encoder(
 
     encoder_inputs = keras.Input(shape=(16, 512, 1), name="encoder_input")
 
-    # DEBUG: Check encoder input
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Encoder: input data"), name="debug_input"
-    )(encoder_inputs)
-
     # Convolutional layers with regularization
     x = layers.Conv2D(
         16,
@@ -458,10 +453,6 @@ def build_encoder(
 
     # Flatten and dense layers
     x = layers.Flatten()(x)
-    # DEBUG: Check after flatten
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Encoder: after Flatten"), name="debug_flatten"
-    )(x)
 
     x = layers.Dense(
         dense_size,
@@ -471,11 +462,6 @@ def build_encoder(
         activity_regularizer=l1(0.001),
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
-    )(x)
-    # DEBUG: Check after first dense layer
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Encoder: after first Dense layer"),
-        name="debug_dense1",
     )(x)
 
     # Latent space
@@ -488,10 +474,6 @@ def build_encoder(
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
     )(x)
-    # DEBUG: Check z_mean output
-    z_mean = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Encoder: z_mean output"), name="debug_z_mean"
-    )(z_mean)
 
     z_log_var = layers.Dense(
         latent_dim,
@@ -504,11 +486,6 @@ def build_encoder(
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
     )(x)
-    # DEBUG: Check z_log_var output
-    z_log_var = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Encoder: z_log_var output"),
-        name="debug_z_log_var",
-    )(z_log_var)
 
     # Sampling
     z = Sampling()([z_mean, z_log_var])
@@ -525,52 +502,34 @@ def build_decoder(
 
     latent_inputs = keras.Input(shape=(latent_dim,), name="decoder_input")
 
-    # DEBUG: Check decoder input (latent vector)
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Decoder: input (latent)"),
-        name="debug_decoder_input",
-    )(latent_inputs)
-
     # Dense layers with regularization
+    # NOTE: Regularization temporarily reduced to debug NaN issues
     x = layers.Dense(
         dense_size,
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
-    )(x)
-    # DEBUG: Check after first dense layer
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Decoder: after first Dense layer"),
-        name="debug_decoder_dense1",
-    )(x)
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),     # DISABLED for debugging
+        # bias_regularizer=l2(0.01),       # DISABLED for debugging
+    )(latent_inputs)
 
     # Reshape to start transposed convolutions
+    # NOTE: This large layer (8192 units) with heavy regularization was likely causing NaN
     x = layers.Dense(
         1 * 32 * 256,
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
-    )(x)
-    # DEBUG: Check after second dense layer
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Decoder: after second Dense layer (pre-reshape)"),
-        name="debug_decoder_dense2",
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),     # DISABLED for debugging
+        # bias_regularizer=l2(0.01),       # DISABLED for debugging
     )(x)
 
     x = layers.Reshape((1, 32, 256))(x)
-    # DEBUG: Check after reshape
-    x = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Decoder: after Reshape"),
-        name="debug_decoder_reshape",
-    )(x)
 
     # Transposed convolutions (exact reverse of encoder)
+    # NOTE: Regularization temporarily reduced to debug NaN issues
     x = layers.Conv2DTranspose(
         256,
         kernel_size,
@@ -579,9 +538,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),     # DISABLED for debugging
+        # bias_regularizer=l2(0.01),       # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -592,9 +551,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -605,9 +564,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -618,9 +577,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -631,9 +590,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -644,9 +603,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -657,9 +616,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -670,9 +629,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -683,9 +642,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     # Output layer with sigmoid activation
@@ -697,11 +656,6 @@ def build_decoder(
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
     )(x)
-    # DEBUG: Check final decoder output
-    decoder_outputs = layers.Lambda(
-        lambda t: tf.debugging.check_numerics(t, "Decoder: final output"),
-        name="debug_decoder_output",
-    )(decoder_outputs)
 
     decoder = keras.Model(latent_inputs, decoder_outputs, name="decoder")
 
