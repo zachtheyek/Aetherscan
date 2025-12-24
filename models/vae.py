@@ -333,6 +333,11 @@ def build_encoder(
 
     encoder_inputs = keras.Input(shape=(16, 512, 1), name="encoder_input")
 
+    # DEBUG: Check encoder input
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Encoder: input data"), name="debug_input"
+    )(encoder_inputs)
+
     # Convolutional layers with regularization
     x = layers.Conv2D(
         16,
@@ -453,6 +458,10 @@ def build_encoder(
 
     # Flatten and dense layers
     x = layers.Flatten()(x)
+    # DEBUG: Check after flatten
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Encoder: after Flatten"), name="debug_flatten"
+    )(x)
 
     x = layers.Dense(
         dense_size,
@@ -462,6 +471,11 @@ def build_encoder(
         activity_regularizer=l1(0.001),
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
+    )(x)
+    # DEBUG: Check after first dense layer
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Encoder: after first Dense layer"),
+        name="debug_dense1",
     )(x)
 
     # Latent space
@@ -474,6 +488,10 @@ def build_encoder(
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
     )(x)
+    # DEBUG: Check z_mean output
+    z_mean = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Encoder: z_mean output"), name="debug_z_mean"
+    )(z_mean)
 
     z_log_var = layers.Dense(
         latent_dim,
@@ -486,6 +504,11 @@ def build_encoder(
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
     )(x)
+    # DEBUG: Check z_log_var output
+    z_log_var = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Encoder: z_log_var output"),
+        name="debug_z_log_var",
+    )(z_log_var)
 
     # Sampling
     z = Sampling()([z_mean, z_log_var])
