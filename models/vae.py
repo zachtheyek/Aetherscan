@@ -525,6 +525,12 @@ def build_decoder(
 
     latent_inputs = keras.Input(shape=(latent_dim,), name="decoder_input")
 
+    # DEBUG: Check decoder input (latent vector)
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Decoder: input (latent)"),
+        name="debug_decoder_input",
+    )(latent_inputs)
+
     # Dense layers with regularization
     x = layers.Dense(
         dense_size,
@@ -534,7 +540,12 @@ def build_decoder(
         activity_regularizer=l1(0.001),
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
-    )(latent_inputs)
+    )(x)
+    # DEBUG: Check after first dense layer
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Decoder: after first Dense layer"),
+        name="debug_decoder_dense1",
+    )(x)
 
     # Reshape to start transposed convolutions
     x = layers.Dense(
@@ -546,8 +557,18 @@ def build_decoder(
         kernel_regularizer=l2(0.01),
         bias_regularizer=l2(0.01),
     )(x)
+    # DEBUG: Check after second dense layer
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Decoder: after second Dense layer (pre-reshape)"),
+        name="debug_decoder_dense2",
+    )(x)
 
     x = layers.Reshape((1, 32, 256))(x)
+    # DEBUG: Check after reshape
+    x = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Decoder: after Reshape"),
+        name="debug_decoder_reshape",
+    )(x)
 
     # Transposed convolutions (exact reverse of encoder)
     x = layers.Conv2DTranspose(
@@ -676,6 +697,11 @@ def build_decoder(
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
     )(x)
+    # DEBUG: Check final decoder output
+    decoder_outputs = layers.Lambda(
+        lambda t: tf.debugging.check_numerics(t, "Decoder: final output"),
+        name="debug_decoder_output",
+    )(decoder_outputs)
 
     decoder = keras.Model(latent_inputs, decoder_outputs, name="decoder")
 
