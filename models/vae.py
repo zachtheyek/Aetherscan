@@ -14,6 +14,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.initializers import Constant, GlorotNormal, HeNormal, Zeros
+from tensorflow.keras.regularizers import l1, l2
 
 from config import get_config
 
@@ -93,20 +94,7 @@ class BetaVAE(keras.Model):
         """
         Distance between ON-OFF (to be maximized)
         """
-        # return tf.reduce_mean(1.0 / (tf.reduce_sum(tf.square(a - b), axis=1) + 1e-8))
-
-        # DEBUG: Break down computation to check for NaN/Inf
-        squared_diff = tf.square(a - b)
-        sum_squared = tf.reduce_sum(squared_diff, axis=1)
-        denominator = sum_squared + 1e-8
-
-        tf.debugging.check_numerics(sum_squared, "loss_diff: sum_squared contains NaN/Inf")
-        tf.debugging.check_numerics(denominator, "loss_diff: denominator contains NaN/Inf")
-
-        result = tf.reduce_mean(1.0 / denominator)
-        tf.debugging.check_numerics(result, "loss_diff: result contains NaN/Inf")
-
-        return result
+        return tf.reduce_mean(1.0 / (tf.reduce_sum(tf.square(a - b), axis=1) + 1e-8))
 
     @tf.function
     def compute_clustering_loss_true(self, true_data: tf.Tensor) -> tf.Tensor:
@@ -118,11 +106,6 @@ class BetaVAE(keras.Model):
         # Process all observations at once for efficiency
         all_obs = tf.reshape(true_data, (batch_size * 6, 16, 512, 1))
         _, _, all_latents = self.encoder(all_obs, training=True)
-
-        # DEBUG: Check latents from encoder
-        tf.debugging.check_numerics(
-            all_latents, "compute_clustering_loss_true: all_latents contains NaN/Inf"
-        )
 
         # Reshape back to (batch, 6, latent_dim)
         latent_dim = tf.shape(all_latents)[1]
@@ -148,11 +131,6 @@ class BetaVAE(keras.Model):
         difference += self.loss_diff(a3, c)
         difference += self.loss_diff(a3, d)
 
-        # DEBUG: Check difference accumulation
-        tf.debugging.check_numerics(
-            difference, "compute_clustering_loss_true: difference contains NaN/Inf"
-        )
-
         # Same terms (ON-ON and OFF-OFF should be minimized, so use loss_same)
         same = 0.0
         same += self.loss_same(a1, a2)
@@ -168,14 +146,7 @@ class BetaVAE(keras.Model):
         same += self.loss_same(d, b)
         same += self.loss_same(d, c)
 
-        # DEBUG: Check same accumulation
-        tf.debugging.check_numerics(same, "compute_clustering_loss_true: same contains NaN/Inf")
-
         similarity = same + difference
-        tf.debugging.check_numerics(
-            similarity, "compute_clustering_loss_true: similarity contains NaN/Inf"
-        )
-
         return similarity
 
     @tf.function
@@ -188,11 +159,6 @@ class BetaVAE(keras.Model):
         # Process all observations at once for efficiency
         all_obs = tf.reshape(false_data, (batch_size * 6, 16, 512, 1))
         _, _, all_latents = self.encoder(all_obs, training=True)
-
-        # DEBUG: Check latents from encoder
-        tf.debugging.check_numerics(
-            all_latents, "compute_clustering_loss_false: all_latents contains NaN/Inf"
-        )
 
         # Reshape back to (batch, 6, latent_dim)
         latent_dim = tf.shape(all_latents)[1]
@@ -219,11 +185,6 @@ class BetaVAE(keras.Model):
         difference += self.loss_same(a3, c)
         difference += self.loss_same(a3, d)
 
-        # DEBUG: Check difference accumulation
-        tf.debugging.check_numerics(
-            difference, "compute_clustering_loss_false: difference contains NaN/Inf"
-        )
-
         same = 0.0
         same += self.loss_same(a1, a2)
         same += self.loss_same(a1, a3)
@@ -238,14 +199,7 @@ class BetaVAE(keras.Model):
         same += self.loss_same(d, b)
         same += self.loss_same(d, c)
 
-        # DEBUG: Check same accumulation
-        tf.debugging.check_numerics(same, "compute_clustering_loss_false: same contains NaN/Inf")
-
         similarity = same + difference
-        tf.debugging.check_numerics(
-            similarity, "compute_clustering_loss_false: similarity contains NaN/Inf"
-        )
-
         return similarity
 
     @tf.function
@@ -256,18 +210,8 @@ class BetaVAE(keras.Model):
         # Perform forward pass through Beta-VAE
         reconstruction, z_mean, z_log_var, z = self.call(main_data, training=training)
 
-        # DEBUG: Check latent variables for NaN/Inf
-        tf.debugging.check_numerics(z_mean, "compute_total_loss: z_mean contains NaN/Inf")
-        tf.debugging.check_numerics(z_log_var, "compute_total_loss: z_log_var contains NaN/Inf")
-        tf.debugging.check_numerics(z, "compute_total_loss: z (sampled latent) contains NaN/Inf")
-
         # Ensure reconstruction shape matches target for loss computation
         reconstruction = tf.reshape(reconstruction, tf.shape(target_data))
-
-        # DEBUG: Check reconstruction for NaN/Inf
-        tf.debugging.check_numerics(
-            reconstruction, "compute_total_loss: reconstruction contains NaN/Inf"
-        )
 
         # Compute reconstruction loss
         reconstruction_loss = tf.reduce_mean(
@@ -281,40 +225,18 @@ class BetaVAE(keras.Model):
             )
         )
 
-        # DEBUG: Check reconstruction loss for NaN/Inf
-        tf.debugging.check_numerics(
-            reconstruction_loss, "compute_total_loss: reconstruction_loss contains NaN/Inf"
-        )
-
         # Compute KL loss
         kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
         kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1))
 
-        # DEBUG: Check KL loss for NaN/Inf
-        tf.debugging.check_numerics(kl_loss, "compute_total_loss: kl_loss contains NaN/Inf")
-
         # Compute clustering losses
         false_loss = self.compute_clustering_loss_false(false_data)
-
-        # DEBUG: Check false loss for NaN/Inf
-        tf.debugging.check_numerics(
-            false_loss, "compute_total_loss: false_loss (clustering) contains NaN/Inf"
-        )
-
         true_loss = self.compute_clustering_loss_true(true_data)
-
-        # DEBUG: Check true loss for NaN/Inf
-        tf.debugging.check_numerics(
-            true_loss, "compute_total_loss: true_loss (clustering) contains NaN/Inf"
-        )
 
         # Compute total loss
         total_loss = (
             reconstruction_loss + self.beta * kl_loss + self.alpha * (true_loss + false_loss)
         )
-
-        # DEBUG: Check total loss for NaN/Inf
-        tf.debugging.check_numerics(total_loss, "compute_total_loss: total_loss contains NaN/Inf")
 
         return {
             "total_loss": total_loss,
@@ -341,9 +263,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(encoder_inputs)
 
     x = layers.Conv2D(
@@ -354,9 +276,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -367,9 +289,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -380,9 +302,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -393,9 +315,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -406,9 +328,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -419,9 +341,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -432,9 +354,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2D(
@@ -445,9 +367,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     # Flatten and dense layers
@@ -458,9 +380,9 @@ def build_encoder(
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     # Latent space
@@ -469,9 +391,9 @@ def build_encoder(
         name="z_mean",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     z_log_var = layers.Dense(
@@ -481,9 +403,9 @@ def build_encoder(
         bias_initializer=Constant(
             -3.0
         ),  # Use negative bias initialization to tighten initial posterior
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     # Sampling
@@ -502,33 +424,30 @@ def build_decoder(
     latent_inputs = keras.Input(shape=(latent_dim,), name="decoder_input")
 
     # Dense layers with regularization
-    # NOTE: Regularization temporarily reduced to debug NaN issues
     x = layers.Dense(
         dense_size,
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),     # DISABLED for debugging
-        # bias_regularizer=l2(0.01),       # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(latent_inputs)
 
     # Reshape to start transposed convolutions
-    # NOTE: This large layer (8192 units) with heavy regularization was likely causing NaN
     x = layers.Dense(
         1 * 32 * 256,
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),     # DISABLED for debugging
-        # bias_regularizer=l2(0.01),       # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Reshape((1, 32, 256))(x)
 
     # Transposed convolutions (exact reverse of encoder)
-    # NOTE: Regularization temporarily reduced to debug NaN issues
     x = layers.Conv2DTranspose(
         256,
         kernel_size,
@@ -537,9 +456,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),     # DISABLED for debugging
-        # bias_regularizer=l2(0.01),       # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -550,9 +469,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -563,9 +482,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -576,9 +495,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -589,9 +508,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -602,9 +521,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -615,9 +534,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -628,9 +547,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     x = layers.Conv2DTranspose(
@@ -641,9 +560,9 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        # activity_regularizer=l1(0.001),  # DISABLED for debugging
-        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
-        # bias_regularizer=l2(0.01),  # DISABLED for debugging
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
     )(x)
 
     # Output layer with sigmoid activation
