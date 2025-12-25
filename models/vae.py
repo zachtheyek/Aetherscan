@@ -14,7 +14,6 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.initializers import Constant, GlorotNormal, HeNormal, Zeros
-from tensorflow.keras.regularizers import l1, l2
 
 from config import get_config
 
@@ -342,9 +341,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(encoder_inputs)
 
     x = layers.Conv2D(
@@ -355,9 +354,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -368,9 +367,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -381,9 +380,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -394,9 +393,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -407,9 +406,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -420,9 +419,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -433,9 +432,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     x = layers.Conv2D(
@@ -446,9 +445,9 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     # Flatten and dense layers
@@ -459,9 +458,9 @@ def build_encoder(
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     # Latent space
@@ -470,9 +469,9 @@ def build_encoder(
         name="z_mean",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     z_log_var = layers.Dense(
@@ -482,9 +481,9 @@ def build_encoder(
         bias_initializer=Constant(
             -3.0
         ),  # Use negative bias initialization to tighten initial posterior
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
+        # activity_regularizer=l1(0.001),  # DISABLED for debugging
+        # kernel_regularizer=l2(0.01),  # DISABLED for debugging
+        # bias_regularizer=l2(0.01),  # DISABLED for debugging
     )(x)
 
     # Sampling
