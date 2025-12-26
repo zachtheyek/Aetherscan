@@ -274,7 +274,7 @@ class ResourceManager:
     def _register_cleanup_handlers(self):
         """Register atexit and signal handlers for cleanup"""
         # Register cleanup handler to fire on system exit
-        atexit.register(self._cleanup_all)
+        atexit.register(self.cleanup_all)
 
         # Register signal handlers to fire on interruptions and terminations
         signal.signal(signal.SIGINT, self._signal_handler)  # Ctrl+C
@@ -291,7 +291,7 @@ class ResourceManager:
         with contextlib.suppress(Exception):
             logger.info(f"Received signal {signum}, initiating cleanup...")
 
-        self._cleanup_all()
+        self.cleanup_all()
         # Properly terminate with sys.exit() after handling the signal inside main process
         # Note, sys.exit() triggers the following cleanup handlers (in order):
         # 1. finally blocks in active try/except statements
@@ -301,7 +301,7 @@ class ResourceManager:
         # sys.exit(1): exit with failed termination status
         sys.exit(0)
 
-    def _cleanup_all(self):
+    def cleanup_all(self):
         """
         Unified cleanup of all resources.
         Strict order:
