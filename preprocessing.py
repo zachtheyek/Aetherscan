@@ -52,7 +52,7 @@ def _init_worker(shm_name, shape, dtype):
     # Ignore SIGINT (Ctrl+C) in workers - let parent handle cleanup coordination
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # Restore default SIGTERM behavior so pool.terminate() from parent doesn't hang
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     # Initialize worker logging
     init_worker_logging()
