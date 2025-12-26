@@ -1290,6 +1290,7 @@ class TrainingPipeline:
             logger.info("Random Forest classifier already trained. Exiting training loop.")
             return
 
+        # NOTE: edge case where if save-tag was already used in the past, train_random_forest() will load previous model weights to train RF, since pipeline.save_models() happens after pipeline.train_random_forest(). add a check to validate_args() to make sure save-tag is distinct?
         # Load encoder weights if untrained
         logger.info("Checking if encoder weights appear trained")
 
