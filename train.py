@@ -889,119 +889,130 @@ class TrainingPipeline:
         )
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
 
-        for epoch in range(epochs):
-            # Log resources at start of epoch
-            logger.info(f"{'-' * 30}")
-            logger.info(f"Epoch {epoch + 1}/{epochs} Start")
+        try:
+            for epoch in range(epochs):
+                # Log resources at start of epoch
+                logger.info(f"{'-' * 30}")
+                logger.info(f"Epoch {epoch + 1}/{epochs} Start")
 
-            # Training
-            epoch_losses = self._train_epoch(train_dataset, steps_per_epoch, accumulation_steps)
+                # Training
+                epoch_losses = self._train_epoch(train_dataset, steps_per_epoch, accumulation_steps)
 
-            # Validation
-            val_losses = self._validate_epoch(val_dataset, val_steps)
+                # Validation
+                val_losses = self._validate_epoch(val_dataset, val_steps)
 
-            # Log results
-            logger.info(f"Epoch {epoch + 1} Complete")
-            logger.info(
-                f"Train -- Total: {epoch_losses['total']:.4f}, "
-                f"Recon: {epoch_losses['reconstruction']:.4f}, "
-                f"KL: {epoch_losses['kl']:.4f}, "
-                f"True: {epoch_losses['true']:.4f}, "
-                f"False: {epoch_losses['false']:.4f}, "
+                # Log results
+                logger.info(f"Epoch {epoch + 1} Complete")
+                logger.info(
+                    f"Train -- Total: {epoch_losses['total']:.4f}, "
+                    f"Recon: {epoch_losses['reconstruction']:.4f}, "
+                    f"KL: {epoch_losses['kl']:.4f}, "
+                    f"True: {epoch_losses['true']:.4f}, "
+                    f"False: {epoch_losses['false']:.4f}, "
+                )
+                logger.info(
+                    f"Val -- Total: {val_losses['total']:.4f}, "
+                    f"Recon: {val_losses['reconstruction']:.4f}, "
+                    f"KL: {val_losses['kl']:.4f}, "
+                    f"True: {val_losses['true']:.4f}, "
+                    f"False: {val_losses['false']:.4f}"
+                )
+
+                # Update history
+                for key, train_key in [
+                    ("loss", "total"),
+                    ("reconstruction_loss", "reconstruction"),
+                    ("kl_loss", "kl"),
+                    ("true_loss", "true"),
+                    ("false_loss", "false"),
+                ]:
+                    if key not in self.history:
+                        self.history[key] = []
+                    self.history[key].append(float(epoch_losses[train_key]))
+                for key, val_key in [
+                    ("val_loss", "total"),
+                    ("val_reconstruction_loss", "reconstruction"),
+                    ("val_kl_loss", "kl"),
+                    ("val_true_loss", "true"),
+                    ("val_false_loss", "false"),
+                ]:
+                    if key not in self.history:
+                        self.history[key] = []
+                    self.history[key].append(float(val_losses[val_key]))
+                self.history["learning_rate"].append(
+                    float(self.vae.optimizer.learning_rate.numpy())
+                )
+
+                # TensorBoard logging
+                with self.train_writer.as_default():
+                    tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
+                    tf.summary.scalar(
+                        "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
+                    )
+                    tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
+                    tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
+                    tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
+                    tf.summary.scalar(
+                        "learning_rate",
+                        self.vae.optimizer.learning_rate.numpy(),
+                        step=self.global_step,
+                    )
+
+                with self.val_writer.as_default():
+                    tf.summary.scalar(
+                        "validation_total_loss", val_losses["total"], step=self.global_step
+                    )
+                    tf.summary.scalar(
+                        "validation_reconstruction_loss",
+                        val_losses["reconstruction"],
+                        step=self.global_step,
+                    )
+                    tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
+                    tf.summary.scalar(
+                        "validation_true_loss", val_losses["true"], step=self.global_step
+                    )
+                    tf.summary.scalar(
+                        "validation_false_loss", val_losses["false"], step=self.global_step
+                    )
+
+                # Flush writers to ensure data is written
+                self.train_writer.flush()
+                self.val_writer.flush()
+
+                # Increment global step
+                self.global_step += 1
+
+                # Adaptive learning rate
+                self._update_learning_rate(val_losses)
+
+                # Log resources at end of epoch
+                logger.info(f"Epoch {epoch + 1}/{epochs} End")
+
+            # Save checkpoint
+            self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+
+            # Plot progress
+            self.plot_beta_vae_training_progress(
+                tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
-            logger.info(
-                f"Val -- Total: {val_losses['total']:.4f}, "
-                f"Recon: {val_losses['reconstruction']:.4f}, "
-                f"KL: {val_losses['kl']:.4f}, "
-                f"True: {val_losses['true']:.4f}, "
-                f"False: {val_losses['false']:.4f}"
-            )
 
-            # Update history
-            for key, train_key in [
-                ("loss", "total"),
-                ("reconstruction_loss", "reconstruction"),
-                ("kl_loss", "kl"),
-                ("true_loss", "true"),
-                ("false_loss", "false"),
-            ]:
-                if key not in self.history:
-                    self.history[key] = []
-                self.history[key].append(float(epoch_losses[train_key]))
-            for key, val_key in [
-                ("val_loss", "total"),
-                ("val_reconstruction_loss", "reconstruction"),
-                ("val_kl_loss", "kl"),
-                ("val_true_loss", "true"),
-                ("val_false_loss", "false"),
-            ]:
-                if key not in self.history:
-                    self.history[key] = []
-                self.history[key].append(float(val_losses[val_key]))
-            self.history["learning_rate"].append(float(self.vae.optimizer.learning_rate.numpy()))
+        # Run cleanup regardless if round finishes successfully or not
+        finally:
+            # Clear intermediate data
+            train_holder.clear()
+            val_holder.clear()
+            del train_dataset, val_dataset
 
-            # TensorBoard logging
-            with self.train_writer.as_default():
-                tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
-                tf.summary.scalar(
-                    "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
-                )
-                tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
-                tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
-                tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
-                tf.summary.scalar(
-                    "learning_rate", self.vae.optimizer.learning_rate.numpy(), step=self.global_step
-                )
+            # Force TensorFlow to release internal references to datasets/iterators
+            # This prevents generator closures from accumulating in memory between rounds
+            tf.keras.backend.clear_session()
+            logger.info("Cleared TensorFlow session state")
 
-            with self.val_writer.as_default():
-                tf.summary.scalar(
-                    "validation_total_loss", val_losses["total"], step=self.global_step
-                )
-                tf.summary.scalar(
-                    "validation_reconstruction_loss",
-                    val_losses["reconstruction"],
-                    step=self.global_step,
-                )
-                tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
-                tf.summary.scalar("validation_true_loss", val_losses["true"], step=self.global_step)
-                tf.summary.scalar(
-                    "validation_false_loss", val_losses["false"], step=self.global_step
-                )
+            # Reset multiprocessing pools in DataGenerator after each round
+            # to further avoid memory accumulation
+            self.data_generator.reset_managed_pool()
 
-            # Flush writers to ensure data is written
-            self.train_writer.flush()
-            self.val_writer.flush()
-
-            # Increment global step
-            self.global_step += 1
-
-            # Adaptive learning rate
-            self._update_learning_rate(val_losses)
-
-            # Log resources at end of epoch
-            logger.info(f"Epoch {epoch + 1}/{epochs} End")
-
-        # Clear intermediate data
-        train_holder.clear()
-        val_holder.clear()
-        del train_dataset, val_dataset
-
-        # Force TensorFlow to release internal references to datasets/iterators
-        # This prevents generator closures from accumulating in memory between rounds
-        tf.keras.backend.clear_session()
-        logger.info("Cleared TensorFlow session state")
-
-        gc.collect()
-
-        # Reset multiprocessing pools in DataGenerator after each round
-        # to further avoid memory accumulation
-        self.data_generator.reset_managed_pool()
-
-        # Save checkpoint
-        self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
-
-        # Plot progress
-        self.plot_beta_vae_training_progress(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+            gc.collect()
 
     def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1):
         """
@@ -1010,112 +1021,117 @@ class TrainingPipeline:
         epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
 
-        for step in range(steps_per_epoch):
-            step_losses = {
-                "total": 0.0,
-                "reconstruction": 0.0,
-                "kl": 0.0,
-                "true": 0.0,
-                "false": 0.0,
-            }
+        try:
+            for step in range(steps_per_epoch):
+                step_losses = {
+                    "total": 0.0,
+                    "reconstruction": 0.0,
+                    "kl": 0.0,
+                    "true": 0.0,
+                    "false": 0.0,
+                }
 
-            # Initialize accumulated gradients
-            accumulated_gradients = None
-            successful_accumulations = 0
+                # Initialize accumulated gradients
+                accumulated_gradients = None
+                successful_accumulations = 0
 
-            # Process sub-steps for gradient accumulation
-            for sub_step in range(accumulation_steps):
-                try:
-                    micro_batch = next(iterator)
+                # Process sub-steps for gradient accumulation
+                for sub_step in range(accumulation_steps):
+                    try:
+                        micro_batch = next(iterator)
 
-                    # Compute gradients & losses
-                    micro_grads, micro_losses = self._distributed_train_step(micro_batch)
+                        # Compute gradients & losses
+                        micro_grads, micro_losses = self._distributed_train_step(micro_batch)
 
-                    # Sanity check: verify gradients are valid before accumulating
-                    if micro_grads is None or all(g is None for g in micro_grads):
-                        logger.warning(
-                            f"Step {step + 1}, sub-step {sub_step + 1}: "
-                            f"All gradients are None, skipping this micro-batch"
+                        # Sanity check: verify gradients are valid before accumulating
+                        if micro_grads is None or all(g is None for g in micro_grads):
+                            logger.warning(
+                                f"Step {step + 1}, sub-step {sub_step + 1}: "
+                                f"All gradients are None, skipping this micro-batch"
+                            )
+                            continue
+
+                        # Accumulate gradients over sub-steps
+                        if accumulated_gradients is None:
+                            accumulated_gradients = micro_grads
+                        else:
+                            accumulated_gradients = [
+                                ag + g if ag is not None and g is not None else ag or g
+                                for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
+                            ]
+
+                        successful_accumulations += 1
+
+                        # Accumulate losses over sub-steps
+                        for key in step_losses:
+                            step_losses[key] += micro_losses[key]
+
+                    except StopIteration:  # Empty dataset
+                        logger.error(
+                            f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}"
                         )
-                        continue
+                        raise
 
-                    # Accumulate gradients over sub-steps
-                    if accumulated_gradients is None:
-                        accumulated_gradients = micro_grads
-                    else:
-                        accumulated_gradients = [
-                            ag + g if ag is not None and g is not None else ag or g
-                            for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
-                        ]
+                    except Exception as e:
+                        logger.error(
+                            f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
+                        )
+                        raise
 
-                    successful_accumulations += 1
+                # Sanity check: verify that gradient accumulation was successful
+                if accumulated_gradients is None or successful_accumulations == 0:
+                    logger.error(f"Step {step + 1}: No valid gradients accumulated!")
+                    raise RuntimeError(f"Failed to accumulate gradients at step {step + 1}")
 
-                    # Accumulate losses over sub-steps
-                    for key in step_losses:
-                        step_losses[key] += micro_losses[key]
+                # Average accumulated gradients over sub-steps
+                accumulated_gradients = [
+                    g / successful_accumulations if g is not None else None
+                    for g in accumulated_gradients
+                ]
 
-                except StopIteration:  # Empty dataset
-                    logger.error(f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}")
-                    raise
+                # Sanity check: verify no NaN/Inf in gradients
+                has_nan_or_inf = False
+                for g in accumulated_gradients:
+                    if g is not None and (
+                        tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
+                    ):
+                        has_nan_or_inf = True
+                        break
 
-                except Exception as e:
-                    logger.error(
-                        f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
+                if has_nan_or_inf:
+                    logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
+                    raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
+
+                # Apply accumulated gradients
+                self._apply_gradients(accumulated_gradients)
+
+                for key, loss in step_losses.items():
+                    # Average step losses over sub-steps
+                    avg_loss = loss / successful_accumulations
+                    step_losses[key] = avg_loss
+                    epoch_losses[key] += avg_loss
+
+                # Log progress every 10 steps
+                if (step + 1) % 10 == 0 or (step + 1) == steps_per_epoch:
+                    logger.info(
+                        f"Step {step + 1}/{steps_per_epoch}, "
+                        f"Total: {step_losses['total']:.4f}, "
+                        f"Recon: {step_losses['reconstruction']:.4f}, "
+                        f"KL: {step_losses['kl']:.4f}, "
+                        f"True: {step_losses['true']:.4f}, "
+                        f"False: {step_losses['false']:.4f}"
                     )
-                    raise
 
-            # Sanity check: verify that gradient accumulation was successful
-            if accumulated_gradients is None or successful_accumulations == 0:
-                logger.error(f"Step {step + 1}: No valid gradients accumulated!")
-                raise RuntimeError(f"Failed to accumulate gradients at step {step + 1}")
+            # Average epoch losses over training steps
+            for key in epoch_losses:
+                epoch_losses[key] /= steps_per_epoch
 
-            # Average accumulated gradients over sub-steps
-            accumulated_gradients = [
-                g / successful_accumulations if g is not None else None
-                for g in accumulated_gradients
-            ]
+            return epoch_losses
 
-            # Sanity check: verify no NaN/Inf in gradients
-            has_nan_or_inf = False
-            for g in accumulated_gradients:
-                if g is not None and (
-                    tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
-                ):
-                    has_nan_or_inf = True
-                    break
-
-            if has_nan_or_inf:
-                logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
-                raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
-
-            # Apply accumulated gradients
-            self._apply_gradients(accumulated_gradients)
-
-            for key, loss in step_losses.items():
-                # Average step losses over sub-steps
-                avg_loss = loss / successful_accumulations
-                step_losses[key] = avg_loss
-                epoch_losses[key] += avg_loss
-
-            # Log progress every 10 steps
-            if (step + 1) % 10 == 0 or (step + 1) == steps_per_epoch:
-                logger.info(
-                    f"Step {step + 1}/{steps_per_epoch}, "
-                    f"Total: {step_losses['total']:.4f}, "
-                    f"Recon: {step_losses['reconstruction']:.4f}, "
-                    f"KL: {step_losses['kl']:.4f}, "
-                    f"True: {step_losses['true']:.4f}, "
-                    f"False: {step_losses['false']:.4f}"
-                )
-
-        # Average epoch losses over training steps
-        for key in epoch_losses:
-            epoch_losses[key] /= steps_per_epoch
-
-        del iterator
-        gc.collect()
-
-        return epoch_losses
+        # Run cleanup regardless if epoch finishes successfully or not
+        finally:
+            del iterator
+            gc.collect()
 
     def _validate_epoch(self, dataset, steps):
         """
@@ -1124,21 +1140,24 @@ class TrainingPipeline:
         val_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
 
-        for _step in range(steps):
-            batch = next(iterator)
-            step_losses = self._distributed_val_step(batch)
+        try:
+            for _step in range(steps):
+                batch = next(iterator)
+                step_losses = self._distributed_val_step(batch)
 
+                for key in val_losses:
+                    val_losses[key] += step_losses[key]
+
+            # Average validation losses over validation steps
             for key in val_losses:
-                val_losses[key] += step_losses[key]
+                val_losses[key] /= steps
 
-        # Average validation losses over validation steps
-        for key in val_losses:
-            val_losses[key] /= steps
+            return val_losses
 
-        del iterator
-        gc.collect()
-
-        return val_losses
+        # Run cleanup regardless if epoch finishes successfully or not
+        finally:
+            del iterator
+            gc.collect()
 
     @tf.function
     def _distributed_train_step(self, batch_data):
@@ -1295,86 +1314,84 @@ class TrainingPipeline:
             logger.warning(f"Could not verify encoder weights status: {e}")
             logger.warning("Proceeding with current encoder weights")
 
+        n_samples = self.config.training.num_samples_rf
+        snr_base = self.config.training.snr_base
+        snr_range = (
+            self.config.training.initial_snr_range
+        )  # NOTE: should we use initial_snr_range or final_snr_range?
+
+        latent_dim = self.config.beta_vae.latent_dim
+        num_observations = self.config.data.num_observations
+        time_bins = self.config.data.time_bins
+        width_bin = self.config.data.width_bin // self.config.data.downsample_factor
+
+        # Generate training data
+        logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
+
+        rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
+
+        # Prepare distributed dataset for inference
+        results = prepare_distributed_dataset(
+            data=rf_data,
+            n_samples=n_samples,
+            train_val_split=None,
+            per_replica_batch_size=self.config.training.per_replica_val_batch_size,
+            global_batch_size=None,
+            per_replica_val_batch_size=None,
+            num_replicas=self.strategy.num_replicas_in_sync,
+            strategy=self.strategy,
+            shuffle=False,  # Deterministic latent generation
+        )
+
+        del rf_data
+        gc.collect()
+
+        dataset = results["dataset"]
+        n_trimmed = results["n_trimmed"]
+        steps = results["steps"]
+        holder = results["_holder"]
+
+        del results
+        gc.collect()
+
+        logger.info(f"Generating latents for {n_trimmed} samples using distributed inference")
+
+        # Pre-allocate latent arrays
+        true_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
+        false_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
+
+        # Create distributed inference function
+        @tf.function
+        def distributed_encode(batch_data):
+            """Encode batch data using distributed strategy"""
+
+            def encode_fn(data):
+                """Per-replica encoding step"""
+                x, _ = data
+                true_data = x[1]  # Extract true component
+                false_data = x[2]  # Extract false component
+
+                # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
+                batch_size = tf.shape(true_data)[0]
+                true_reshaped = tf.reshape(true_data, [-1, time_bins, width_bin, 1])
+                false_reshaped = tf.reshape(false_data, [-1, time_bins, width_bin, 1])
+
+                # Encode (returns mean, log_var, z)
+                _, _, true_z = self.vae.encoder(true_reshaped, training=False)
+                _, _, false_z = self.vae.encoder(false_reshaped, training=False)
+
+                return true_z, false_z
+
+            # Run encoding on all replicas
+            per_replica_true, per_replica_false = self.strategy.run(encode_fn, args=(batch_data,))
+
+            return per_replica_true, per_replica_false
+
+        # Process all batches
+        iterator = iter(dataset)
+        current_idx = 0
+
         try:
-            n_samples = self.config.training.num_samples_rf
-            snr_base = self.config.training.snr_base
-            snr_range = (
-                self.config.training.initial_snr_range
-            )  # NOTE: should we use initial_snr_range or final_snr_range?
-
-            latent_dim = self.config.beta_vae.latent_dim
-            num_observations = self.config.data.num_observations
-            time_bins = self.config.data.time_bins
-            width_bin = self.config.data.width_bin // self.config.data.downsample_factor
-
-            # Generate training data
-            logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
-
-            rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
-
-            # Prepare distributed dataset for inference
-            results = prepare_distributed_dataset(
-                data=rf_data,
-                n_samples=n_samples,
-                train_val_split=None,
-                per_replica_batch_size=self.config.training.per_replica_val_batch_size,
-                global_batch_size=None,
-                per_replica_val_batch_size=None,
-                num_replicas=self.strategy.num_replicas_in_sync,
-                strategy=self.strategy,
-                shuffle=False,  # Deterministic latent generation
-            )
-
-            del rf_data
-            gc.collect()
-
-            dataset = results["dataset"]
-            n_trimmed = results["n_trimmed"]
-            steps = results["steps"]
-            holder = results["_holder"]
-
-            del results
-            gc.collect()
-
-            logger.info(f"Generating latents for {n_trimmed} samples using distributed inference")
-
-            # Pre-allocate latent arrays
-            true_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
-            false_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
-
-            # Create distributed inference function
-            @tf.function
-            def distributed_encode(batch_data):
-                """Encode batch data using distributed strategy"""
-
-                def encode_fn(data):
-                    """Per-replica encoding step"""
-                    x, _ = data
-                    true_data = x[1]  # Extract true component
-                    false_data = x[2]  # Extract false component
-
-                    # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
-                    batch_size = tf.shape(true_data)[0]
-                    true_reshaped = tf.reshape(true_data, [-1, time_bins, width_bin, 1])
-                    false_reshaped = tf.reshape(false_data, [-1, time_bins, width_bin, 1])
-
-                    # Encode (returns mean, log_var, z)
-                    _, _, true_z = self.vae.encoder(true_reshaped, training=False)
-                    _, _, false_z = self.vae.encoder(false_reshaped, training=False)
-
-                    return true_z, false_z
-
-                # Run encoding on all replicas
-                per_replica_true, per_replica_false = self.strategy.run(
-                    encode_fn, args=(batch_data,)
-                )
-
-                return per_replica_true, per_replica_false
-
-            # Process all batches
-            iterator = iter(dataset)
-            current_idx = 0
-
             for step in range(steps):
                 batch = next(iterator)
 
@@ -1404,8 +1421,13 @@ class TrainingPipeline:
                 del per_replica_false, false_results, false_batch_np
                 gc.collect()
 
+            # Train Random Forest classifier
+            self.rf_model.train(true_latents, false_latents)
+
+            logger.info("Random Forest training complete")
+
+        finally:
             del iterator
-            gc.collect()
 
             # Clear intermediate data
             holder.clear()
@@ -1416,23 +1438,11 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
-            gc.collect()
-
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
-            # Train Random Forest classifier
-            self.rf_model.train(true_latents, false_latents)
-
-            # Clean up
             del true_latents, false_latents
             gc.collect()
-
-            logger.info("Random Forest training complete")
-
-        except Exception as e:
-            logger.error(f"Random Forest training failed: {e}")
-            raise
 
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""

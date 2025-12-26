@@ -441,6 +441,9 @@ def main():
         logger.error("See usage")
         sys.exit(1)
 
+    # Exit on success
+    sys.exit(0)  # TEST: does this properly trigger cleanup on completion?
+
 
 if __name__ == "__main__":
     main()
