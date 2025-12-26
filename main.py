@@ -18,7 +18,7 @@ from cli import apply_args_to_config, setup_argument_parser, validate_args
 from config import get_config, init_config
 from db import init_db
 from logger import init_logger
-from manager import init_manager, register_logger
+from manager import get_manager, init_manager, register_logger
 from monitor import init_monitor
 from preprocessing import DataPreprocessor
 from train import get_latest_tag, train_full_pipeline
@@ -425,24 +425,31 @@ def main():
         logger.error(f"Failed to initialize resource monitor: {e}")
         sys.exit(1)
 
-    # Execute command
-    if args.command == "train":
-        train_command()
-    # NOTE: come back to this later
-    # elif args.command == "inference":
-    #     inference_command(args)
-    # NOTE: come back to this later
-    # elif args.command == 'evaluate':
-    #     evaluate_command(args)
-    else:
-        # Print help message & exit if no valid command provided
-        parser.print_help()
-        logger.error("Invalid CLI command received")
-        logger.error("See usage")
-        sys.exit(1)
+    try:
+        # Execute command
+        if args.command == "train":
+            train_command()
+        # NOTE: come back to this later
+        # elif args.command == "inference":
+        #     inference_command(args)
+        # NOTE: come back to this later
+        # elif args.command == 'evaluate':
+        #     evaluate_command(args)
+        else:
+            # Print help message & exit if no valid command provided
+            parser.print_help()
+            logger.error("Invalid CLI command received")
+            logger.error("See usage")
+            sys.exit(1)
 
-    # Exit on success
-    sys.exit(0)  # TEST: does this properly trigger cleanup on completion?
+    finally:
+        # TEST: does this properly exit program on successful run without deadlocks?
+        # Explicitly cleanup before exiting to avoid deadlock
+        # Without this, non-daemon threads block sys.exit() from running atexit handlers
+        # NOTE: does this mean the other sys.exit(1) calls in main.py are blocked by non-daemon threads?
+        manager = get_manager()
+        if manager:
+            manager.cleanup_all()
 
 
 if __name__ == "__main__":
