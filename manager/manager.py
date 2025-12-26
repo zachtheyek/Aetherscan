@@ -68,6 +68,7 @@ class ManagedPool:
         try:
             logger.info(f"Forcefully terminating pool '{self.name}'")
 
+            # NOTE: does terminating instead of closing lead to any issues with corrupted db writes?
             # Forcefully kill all running processes & clear internal job queues with .terminate()
             # Then, wait for parent to finish handling dead processes,
             # and exit & close the pool with .join()
