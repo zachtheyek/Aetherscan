@@ -1003,10 +1003,11 @@ class TrainingPipeline:
             val_holder.clear()
             del train_dataset, val_dataset
 
+            # TEST: benchmark performance & test memory leaks if no clear_session()
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
-            tf.keras.backend.clear_session()
-            logger.info("Cleared TensorFlow session state")
+            # tf.keras.backend.clear_session()
+            # logger.info("Cleared TensorFlow session state")
 
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
@@ -1434,10 +1435,11 @@ class TrainingPipeline:
             holder.clear()
             del dataset
 
+            # TEST: benchmark performance & test memory leaks if no clear_session()
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
-            tf.keras.backend.clear_session()
-            logger.info("Cleared TensorFlow session state")
+            # tf.keras.backend.clear_session()
+            # logger.info("Cleared TensorFlow session state")
 
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
