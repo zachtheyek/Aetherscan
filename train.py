@@ -619,8 +619,6 @@ class TrainingPipeline:
             self.train_writer.close()
         if hasattr(self, "val_writer"):
             self.val_writer.close()
-        # if hasattr(self, "data_generator"):
-        #     self.data_generator.close()
 
     def _build_optimizer(self):
         """
@@ -1441,7 +1439,6 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
-            # NOTE: is it safe to call self.data_generator.close() here?
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
@@ -1665,18 +1662,23 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
     # Create pipeline
     pipeline = TrainingPipeline(background_data, strategy)
 
-    # Train beta-VAE
-    pipeline.train_beta_vae()
+    try:
+        # Train beta-VAE
+        pipeline.train_beta_vae()
 
-    # Train Random Forest
-    pipeline.train_random_forest()
+        # Train Random Forest
+        pipeline.train_random_forest()
 
-    # Save final models
-    pipeline.save_models()
+        # Save final models
+        pipeline.save_models()
 
-    # Final plot
-    pipeline.plot_beta_vae_training_progress()
+        # Final plot
+        pipeline.plot_beta_vae_training_progress()
 
-    logger.info("Training complete!")
+        logger.info("Training complete!")
 
-    return pipeline
+        return pipeline
+
+    finally:
+        # Free shared resources before exiting
+        pipeline.data_generator.close()
