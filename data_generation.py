@@ -560,7 +560,7 @@ class DataGenerator:
             The pool is managed by the ResourceManager and should be closed via
             _free_managed_pool() or close() to properly release resources.
         """
-        # NOTE: should we guarantee that only 1 shm & 1 pool can exist at any time?
+        # NOTE: should we explicitly guarantee only 1 shm & 1 pool can exist at a time?
         # If shared memory exists, then create pool using shared memory reference
         if self.shm:
             self.pool = self.manager.create_pool(
@@ -608,11 +608,11 @@ class DataGenerator:
         self._free_managed_shared_memory()
         logger.info("DataGenerator closed")
 
-    # NOTE: write separate generate_test_batch method for evaluate.py?
-    # NOTE: no data generation needed during inference?
-    # NOTE: replace generate_train_batch with generate_test_batch in train_random_forest?
-    # NOTE: or just rename to generate_X_batch (come up with better name)?
-    # NOTE: generate_batch okay?
+    # TODO:
+    # separate generate_batch() into generate_train_batch() & generate_test_batch()
+    # since test doesn't require (main, false, true), just (false, true)
+    # verify this is correct with train_random_forest() vs train_round()
+    # benchmark compute time / memory saved with this change
     def generate_batch(
         self, n_samples: int, snr_base: int, snr_range: int
     ) -> dict[str, np.ndarray]:

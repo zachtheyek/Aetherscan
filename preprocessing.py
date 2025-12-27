@@ -153,7 +153,7 @@ class DataPreprocessor:
         logger.info(f"Processing chunks of: {chunk_size}")
         logger.info(f"Final resolution: {final_width}")
 
-        all_backgrounds = []  # NOTE: preallocate this as ndarray?
+        all_backgrounds = []  # NOTE: preallocate this as empty ndarray?
 
         for filename in self.config.data.train_files:
             filepath = self.config.get_training_file_path(filename)

@@ -1,4 +1,3 @@
-# BUG: cleanup doesn't run properly (on ctrl-c or sys.exit())
 """
 Resource manager for Aetherscan Pipeline
 Centralizes orchestration of all system resources -- including multiprocessing pools, shared memory,
@@ -68,7 +67,7 @@ class ManagedPool:
         try:
             logger.info(f"Forcefully terminating pool '{self.name}'")
 
-            # NOTE: does terminating instead of closing lead to any issues with corrupted db writes?
+            # TEST: does terminating instead of closing lead to any issues with corrupted db writes?
             # Forcefully kill all running processes & clear internal job queues with .terminate()
             # Then, wait for parent to finish handling dead processes,
             # and exit & close the pool with .join()
@@ -301,6 +300,7 @@ class ResourceManager:
         # sys.exit(1): exit with failed termination status
         sys.exit(0)
 
+    # TEST: does cleanup_all() run properly for all scenarios? ✅: normal exit, ❓: ctrl+c during setup/multiprocessing/distributed training/other, sys.exit() from main.py
     def cleanup_all(self):
         """
         Unified cleanup of all resources.

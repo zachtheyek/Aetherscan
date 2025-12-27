@@ -1,5 +1,3 @@
-# TODO: make sure config params are used where possible, and remove unaccessed config params
-
 # Note, we avoid logging anything in config.py to prevent coupling with the logger module
 """
 Configuration module for Aetherscan Pipeline
@@ -33,7 +31,7 @@ class ManagerConfig:
     # TODO: experiment with larger chunk sizes
     # NOTE: should we move chunks_per_worker to TrainingConfig() and make it specific to preproc/data_gen?
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    pool_terminate_timeout: float = 5.0  # seconds
+    pool_terminate_timeout: float = 10.0  # seconds
 
 
 @dataclass
@@ -90,7 +88,7 @@ class DataConfig:
 
     num_target_backgrounds: int = 15000  # Number of background cadences to load
     # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
-    # TODO: experiment with larger chunk sizes
+    # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file)
     background_load_chunk_size: int = (
         1000  # Maximum cadences to process at once during background loading
     )
@@ -118,12 +116,15 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     num_training_rounds: int = 20
+    # NOTE: try 150 epochs & compare loss curves
     epochs_per_round: int = 100
 
+    # NOTE: use more samples on bla0?
     num_samples_beta_vae: int = 120000
     num_samples_rf: int = 24000
     train_val_split: float = 0.8
 
+    # NOTE: use higher batch sizes on bla0?
     per_replica_batch_size: int = 128
     global_batch_size: int = 2048  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096

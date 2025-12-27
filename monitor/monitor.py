@@ -1,4 +1,7 @@
-# BUG: system total CPU usage appears "unnormalized" compared to process + children CPU usage. process + children CPU & RAM sometimes exceeds system total. split GPU usage & memory into separate plots?
+# BUG:
+# system total CPU usage appears "unnormalized" compared to process + children CPU usage
+# process + children CPU & RAM sometimes exceeds system total
+# also, split GPU usage & memory into separate plots?
 # TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup
 """
 Resource monitor for Aetherscan Pipeline

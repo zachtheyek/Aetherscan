@@ -1,6 +1,7 @@
 """
 Training orchestration for Aetherscan Pipeline
-...
+Implements full workflow for both beta-VAE & RF classifier,
+Supports curriculum learning, distributed GPU training, and model checkpointing
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from models import RandomForestModel, Sampling, create_beta_vae_model
 logger = logging.getLogger(__name__)
 
 
+# TODO: simplify this to exclude tensorboard setup & rename to archive_directories()
 def handle_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
     """
     Archive and clean up a directory
@@ -241,7 +243,7 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
-# NOTE: should we split the if-else branches into 2 separate functions?
+# TODO: split if-else branches into prepare_distributed_train_dataset & prepare_distributed_inference_dataset
 def prepare_distributed_dataset(
     data: dict,
     n_samples: int,
@@ -276,6 +278,7 @@ def prepare_distributed_dataset(
             Train/val distributed datasets, number of samples in each, number of steps for each (including accumulation sub-steps)
     """
 
+    # NOTE: should this class be defined outside function scope?
     # Create data holder objects (to be paired with generators)
     # Allows for explicit dereferencing of large arrays using DataHolder.clear()
     class DataHolder:
@@ -586,7 +589,7 @@ class TrainingPipeline:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
             # since fault tolerance expects a clean directory structure
 
-            # NOTE: replace this with db writes? (search for all self.history instances)
+            # TODO: replace this with db writes? (search for all self.history instances)
             # Training history
             self.history = {
                 "loss": [],
@@ -605,12 +608,11 @@ class TrainingPipeline:
             # Setup directories
             self._setup_directories()
 
-            # NOTE: should we just replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
+            # TODO: replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
             # Setup TensorBoard logging
             self._setup_tensorboard_logging()
 
-    # NOTE: is this still needed? when does this run? replace with close() instead?
-    # NOTE: maybe we use close() in try-except-finally within train_full_pipeline() to free resources?
+    # TODO: delete this method once tensorboard logging is removed
     def __del__(self):
         """Cleanup TensorBoard writers and data generator"""
         if hasattr(self, "train_writer"):
@@ -791,7 +793,7 @@ class TrainingPipeline:
 
     def train_beta_vae(self):
         """
-        Train beta-VAE with curriculum learning
+        Train beta-VAE with curriculum learning & adaptive LR setup
         """
         n_rounds = self.config.training.num_training_rounds
         epochs = self.config.training.epochs_per_round
@@ -1290,7 +1292,7 @@ class TrainingPipeline:
             logger.info("Random Forest classifier already trained. Exiting training loop.")
             return
 
-        # NOTE: edge case where if save-tag was already used in the past, train_random_forest() will load previous model weights to train RF, since pipeline.save_models() happens after pipeline.train_random_forest(). add a check to validate_args() to make sure save-tag is distinct?
+        # BUG: edge case where if save-tag was already used in the past, train_random_forest() will load previous model weights to train RF, since pipeline.save_models() happens after pipeline.train_random_forest(). add a check to validate_args() to make sure save-tag is distinct?
         # Load encoder weights if untrained
         logger.info("Checking if encoder weights appear trained")
 
@@ -1439,6 +1441,7 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
+            # NOTE: is it safe to call self.data_generator.close() here?
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
@@ -1571,11 +1574,10 @@ class TrainingPipeline:
             self.rf_model.save(rf_path)
             logger.info(f"Saved Random Forest to {rf_path}")
 
-    # TODO: update docstring to properly describe load_models() behavior
     def load_models(self, tag: str | None = None, dir: str | None = None):
         """Load model weights"""
         if tag is None:
-            # NOTE: should we use a more sensible default?
+            # NOTE: use a more sensible default
             logger.info("No tag specified. Defaulting to 'final'")
             tag = "final"
         original_tag = tag

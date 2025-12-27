@@ -109,7 +109,7 @@ def train_command():
     try:
         preprocessor = DataPreprocessor()
         background_data = preprocessor.load_background_data().astype(np.float32)
-        # NOTE: close preprocessing pools and/or shared memory?
+        # NOTE: do we need to close preprocessing pools and/or shared memory?
     except Exception as e:
         logger.error(f"Failed to load backgrounds: {e}")
         sys.exit(1)
@@ -443,10 +443,9 @@ def main():
             sys.exit(1)
 
     finally:
-        # TEST: does this properly exit program on successful run without deadlocks?
-        # Explicitly cleanup before exiting to avoid deadlock
-        # Without this, non-daemon threads block sys.exit() from running atexit handlers
-        # NOTE: does this mean the other sys.exit(1) calls in main.py are blocked by non-daemon threads?
+        # Explicitly call cleanup_all() before exiting to avoid deadlock
+        # Without this, non-daemon threads block sys.exit() from running atexit handlers (race condition)
+        # NOTE: do the other sys.exit() calls in main.py get blocked by non-daemon threads as well?
         manager = get_manager()
         if manager:
             manager.cleanup_all()
