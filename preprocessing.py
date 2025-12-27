@@ -43,22 +43,45 @@ def _init_worker(shm_name, shape, dtype):
         dtype: Data type of the background array
 
     Note:
-        Worker cleanup is automatic - when the pool terminates, the OS reclaims
-        all worker process resources including shared memory file descriptors.
-        Cleanup is handled by the main process
+        Worker cleanup uses a custom SIGTERM handler to properly close shared memory
+        file descriptors before termination. When pool.terminate() is called by the
+        main process, workers intercept SIGTERM, close their shared memory handles,
+        then re-raise the signal to complete termination.
+
+        The main process is responsible for unlinking shared memory (handled by ResourceManager).
     """
     global _GLOBAL_SHM, _GLOBAL_CHUNK_DATA, _GLOBAL_SHAPE, _GLOBAL_DTYPE
-
-    # Ignore SIGINT (Ctrl+C) in workers - let parent handle cleanup coordination
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    # Restore default SIGTERM behavior so pool.terminate() from parent doesn't hang
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     # Initialize worker logging
     init_worker_logging()
 
     # Attach to existing shared memory block
     _GLOBAL_SHM = SharedMemory(name=shm_name)
+
+    # Ignore SIGINT (Ctrl+C) in workers - let parent handle cleanup coordination
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # TEST: does this work? or should we use pool.close() + atexit instead?
+    # Setup custom SIGTERM handler for cleanup before termination
+    def cleanup_on_sigterm(signum, frame):
+        """
+        Cleanup handler called when pool.terminate() sends SIGTERM
+        Closes shared memory file descriptor before process termination
+        """
+        try:
+            if _GLOBAL_SHM is not None:
+                _GLOBAL_SHM.close()
+        except Exception:
+            # Silently ignore errors during emergency cleanup
+            # The main process will still unlink the shared memory
+            pass
+
+        # Restore default handler and re-raise signal to actually terminate
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    # Register SIGTERM handler for graceful cleanup on pool.terminate()
+    signal.signal(signal.SIGTERM, cleanup_on_sigterm)
 
     # Create numpy array view of shared memory (no copy!)
     _GLOBAL_CHUNK_DATA = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
