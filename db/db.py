@@ -1,3 +1,4 @@
+# TODO: add external function to combine (join & dedup) different aetherscan.db files. where should source of truth be located? (bla0?)
 """
 Database for Aetherscan Pipeline
 Uses SQLite with asynchronous queue-based writes to handle concurrent data collection from multiple
