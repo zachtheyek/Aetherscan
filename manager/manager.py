@@ -50,15 +50,6 @@ class ManagedPool:
     process_count: int
     closed: bool = False
 
-    def _check_alive(self):
-        """Check if any worker processes are still alive"""
-        try:
-            return any(p.is_alive() for p in getattr(self.pool, "_pool", []))
-        except Exception as e:
-            logger.info(f"_check_alive(): unable to inspect pool '{self.name}': {e}")
-            logger.info(f"Assuming pool '{self.name}' is gone and no remaining workers alive")
-            return False  # pool already destroyed or internal state corrupted
-
     def close(self, timeout):
         """Close the pool with terminate-or-fail policy"""
         if self.closed:
@@ -74,7 +65,7 @@ class ManagedPool:
             # Note, less forceful alternative is to use self.pool.close()
             # Which stops accepting new jobs, but lets running processes finish current job queue
             # Don't use both! Better to "terminate or fail". Inconsistent states are worse than leaks
-            self.pool.terminate()  # Trigger termination
+            self.pool.terminate()
 
             # For .join(), we wrap the call in a daemon thread with timeout
             # so it doesn't block on exit or hang indefinitely
@@ -108,6 +99,15 @@ class ManagedPool:
                 self._force_kill_workers()
             self.closed = True
 
+    def _check_alive(self):
+        """Check if any worker processes are still alive"""
+        try:
+            return any(p.is_alive() for p in getattr(self.pool, "_pool", []))
+        except Exception as e:
+            logger.info(f"_check_alive(): unable to inspect pool '{self.name}': {e}")
+            logger.info(f"Assuming pool '{self.name}' is gone and no remaining workers alive")
+            return False  # pool already destroyed or internal state corrupted
+
     def _force_kill_workers(self):
         """Force-kill all worker processes with SIGKILL"""
         try:
@@ -135,19 +135,6 @@ class ManagedSharedMemory:
     created_at: float
     size_gb: float
     closed: bool = False
-
-    def _check_unlinked(self):
-        """Check if shared memory can still be reattached to by name"""
-        try:
-            test_shm = SharedMemory(name=self.name)
-            test_shm.close()
-            return False  # Reattached successfully, shared memory object still exists
-        except FileNotFoundError:
-            return True  # Successfully unlinked
-        except Exception as e:
-            logger.info(f"_check_unlinked(): unable to inspect shared memory'{self.name}': {e}")
-            logger.info(f"Assuming shared memory '{self.name}' didn't close properly")
-            return False  # Assume unexpected failure = close() didn't run properly
 
     def close(self):
         """Close and unlink shared memory"""
@@ -180,6 +167,19 @@ class ManagedSharedMemory:
 
         self.closed = True
         logger.info(f"Shared memory '{self.shm.name}' cleaned ({self.size_gb:.2f} GB)")
+
+    def _check_unlinked(self):
+        """Check if shared memory can still be reattached to by name"""
+        try:
+            test_shm = SharedMemory(name=self.name)
+            test_shm.close()
+            return False  # Reattached successfully, shared memory object still exists
+        except FileNotFoundError:
+            return True  # Successfully unlinked
+        except Exception as e:
+            logger.info(f"_check_unlinked(): unable to inspect shared memory'{self.name}': {e}")
+            logger.info(f"Assuming shared memory '{self.name}' didn't close properly")
+            return False  # Assume unexpected failure = close() didn't run properly
 
 
 class ResourceManager:
