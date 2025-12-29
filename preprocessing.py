@@ -7,6 +7,7 @@ Uses multiprocessing and shared memory to process data in parallel
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
@@ -58,25 +59,29 @@ def _init_worker(shm_name, shape, dtype):
     # Attach to existing shared memory block
     _GLOBAL_SHM = SharedMemory(name=shm_name)
 
-    # Ignore SIGINT (Ctrl+C) in workers - let parent handle cleanup coordination
+    # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    # TEST: does this work? or should we use pool.close() + atexit instead?
-    # Setup custom SIGTERM handler for cleanup before termination
+    # Setup custom SIGTERM handler for additional cleanup before termination
+    # Note, manager will escalate SIGTERM to SIGKILL after pool_terminate_timeout seconds (see config.py)
+    # This may interrupt the worker's cleanup process
+    # Consider increasing pool_terminate_timeout if you're experiencing such issues
     def cleanup_on_sigterm(signum, frame):
         """
         Cleanup handler called when pool.terminate() sends SIGTERM
         Closes shared memory file descriptor before process termination
         """
-        try:
+        # Note, a race condition may occur if a worker receives more than 1 SIGTERM delivery
+        # at a time, triggering re-entry of the same cleanup handler
+        # It suffices to guard against this by simply suppressing exceptions, since subsequent
+        # close() calls will just raise an error; no state corruption or kernel-level hazards exist
+        # Also, there are no cross-worker race conditions, since each worker's close() operates on
+        # per-process resources, even though they all refer to the same underlying POSIX shm object
+        with contextlib.suppress(Exception):
             if _GLOBAL_SHM is not None:
                 _GLOBAL_SHM.close()
-        except Exception:
-            # Silently ignore errors during emergency cleanup
-            # The main process will still unlink the shared memory
-            pass
 
-        # Restore default handler and re-raise signal to actually terminate
+        # Restore default handler and re-raise SIGTERM to resume termination
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         os.kill(os.getpid(), signal.SIGTERM)
 
