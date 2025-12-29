@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from datetime import datetime
 
 import matplotlib.lines as mlines
@@ -284,17 +285,19 @@ def prepare_distributed_dataset(
     class DataHolder:
         def __init__(self, concat, true, false):
             self._cleared = False
+            self._lock = threading.Lock()
             self.concat = concat
             self.true = true
             self.false = false
 
         def clear(self):
-            if self._cleared:
-                return
-            self._cleared = True
-            self.concat = None
-            self.true = None
-            self.false = None
+            with self._lock:
+                if self._cleared:
+                    return
+                self._cleared = True
+                self.concat = None
+                self.true = None
+                self.false = None
 
     if train_val_split is not None:
         # Training case: split into train and val
@@ -330,31 +333,50 @@ def prepare_distributed_dataset(
         # Create generator functions for memory-efficient data loading
         def train_generator():
             while True:  # Make generators infinite to reset state between epochs
-                if train_holder._cleared:
-                    return  # Exit if data already cleared
-                indices = np.arange(len(train_holder.concat))
+                # Acquire lock to check cleared status and capture data references
+                with train_holder._lock:
+                    if train_holder._cleared:
+                        return  # Exit if data already cleared
+                    # Cache references while holding lock
+                    concat = train_holder.concat
+                    true = train_holder.true
+                    false = train_holder.false
+
+                # Work with local references (safe from clearing)
+                indices = np.arange(len(concat))
                 if shuffle:
                     # Perform global shuffle on each epoch so each pass through the data is unique
                     np.random.shuffle(indices)
                 for idx in indices:
-                    if train_holder._cleared:
-                        return  # Exit if data already cleared
+                    # Check cleared status before yielding
+                    with train_holder._lock:
+                        if train_holder._cleared:
+                            return  # Exit if data already cleared
                     yield (
-                        (train_holder.concat[idx], train_holder.true[idx], train_holder.false[idx]),
-                        train_holder.concat[idx],
+                        (concat[idx], true[idx], false[idx]),
+                        concat[idx],
                     )
 
         def val_generator():
             while True:  # Make generators infinite to reset state between epochs
-                if val_holder._cleared:
-                    return  # Exit if data already cleared
-                # Maintain order on each epoch since no gradients are calculated during validation
-                for idx in range(len(val_holder.concat)):
+                # Acquire lock to check cleared status and capture data references
+                with val_holder._lock:
                     if val_holder._cleared:
                         return  # Exit if data already cleared
+                    # Cache references while holding lock
+                    concat = val_holder.concat
+                    true = val_holder.true
+                    false = val_holder.false
+
+                # Maintain order on each epoch since no gradients are calculated during validation
+                for idx in range(len(concat)):
+                    # Check cleared status before yielding
+                    with val_holder._lock:
+                        if val_holder._cleared:
+                            return  # Exit if data already cleared
                     yield (
-                        (val_holder.concat[idx], val_holder.true[idx], val_holder.false[idx]),
-                        val_holder.concat[idx],
+                        (concat[idx], true[idx], false[idx]),
+                        concat[idx],
                     )
 
         # Determine dataset output signature
@@ -428,17 +450,27 @@ def prepare_distributed_dataset(
         # Create generator function for memory-efficient data loading
         def data_generator():
             while True:  # Make generator infinite to reset state between passes
-                if holder._cleared:
-                    return  # Exit if data already cleared
-                indices = np.arange(len(holder.concat))
+                # Acquire lock to check cleared status and capture data references
+                with holder._lock:
+                    if holder._cleared:
+                        return  # Exit if data already cleared
+                    # Cache references while holding lock
+                    concat = holder.concat
+                    true = holder.true
+                    false = holder.false
+
+                # Work with local references (safe from clearing)
+                indices = np.arange(len(concat))
                 if shuffle:
                     np.random.shuffle(indices)
                 for idx in indices:
-                    if holder._cleared:
-                        return  # Exit if data already cleared
+                    # Check cleared status before yielding
+                    with holder._lock:
+                        if holder._cleared:
+                            return  # Exit if data already cleared
                     yield (
-                        (holder.concat[idx], holder.true[idx], holder.false[idx]),
-                        holder.concat[idx],
+                        (concat[idx], true[idx], false[idx]),
+                        concat[idx],
                     )
 
         # Determine dataset output signature
