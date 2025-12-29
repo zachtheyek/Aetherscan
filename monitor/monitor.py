@@ -281,6 +281,7 @@ class ResourceMonitor:
             return
 
         self.stop_event.clear()
+        # NOTE: should monitor be daemon or non-daemon thread?
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=False)
         self.monitor_thread.start()
         logger.info("Resource monitoring thread started")

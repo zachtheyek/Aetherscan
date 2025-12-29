@@ -267,6 +267,7 @@ class Database:
             return
 
         self.stop_event.clear()
+        # NOTE: should db be daemon or non-daemon thread?
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=False)
         self.writer_thread.start()
         logger.info("Database writer thread started")
