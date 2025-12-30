@@ -244,6 +244,85 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
+def compute_expected_std(layer):
+    """Compute expected std based on initializer."""
+    weights = layer.get_weights()
+    if not weights:
+        return None
+
+    kernel = weights[0]
+
+    if isinstance(layer.kernel_initializer, HeNormal):
+        # HeNormal: std = sqrt(2 / fan_in)
+        fan_in = np.prod(kernel.shape[:-1])
+        expected_std = np.sqrt(2.0 / fan_in)
+    elif isinstance(layer.kernel_initializer, GlorotNormal):
+        # GlorotNormal: std = sqrt(2 / (fan_in + fan_out))
+        fan_in = np.prod(kernel.shape[:-1])
+        fan_out = kernel.shape[-1]
+        expected_std = np.sqrt(2.0 / (fan_in + fan_out))
+    else:
+        return None
+
+    return expected_std
+
+
+def check_encoder_trained(encoder, threshold=0.2):
+    """
+    Checks all Conv2D and Dense layers in encoder for deviation from initializer.
+    Returns True if at least one layer shows substantial deviation (i.e. the encoder was likely trained).
+    """
+    trained_layers = []
+    for layer in encoder.layers:
+        if isinstance(layer, Conv2D | Dense):
+            weights = layer.get_weights()
+            if not weights:
+                continue  # skip layers without weights
+
+            kernel = weights[0]
+            actual_std = np.std(kernel)
+            expected_std = compute_expected_std(layer)
+            if expected_std is None:
+                continue  # skip layers with no expected std
+
+            relative_dev = abs(actual_std - expected_std) / expected_std
+
+            logger.info(
+                f"{layer.name}: actual std={actual_std:.5f}, expected std={expected_std:.5f}, deviation={relative_dev:.2%}"
+            )
+
+            if relative_dev > threshold:
+                trained_layers.append(layer.name)
+
+    if trained_layers:
+        logger.info("Encoder appears trained (substantial deviation detected in layers):")
+        logger.info(f"{trained_layers}")
+        return True
+    else:
+        logger.info("Encoder appears untrained (all layers close to initializer).")
+        return False
+
+
+# Create data holder objects (to be paired with generators)
+# Allows for explicit dereferencing of large arrays using DataHolder.clear()
+class DataHolder:
+    def __init__(self, concat, true, false):
+        self._cleared = False
+        self._lock = threading.Lock()
+        self.concat = concat
+        self.true = true
+        self.false = false
+
+    def clear(self):
+        with self._lock:
+            if self._cleared:
+                return
+            self._cleared = True
+            self.concat = None
+            self.true = None
+            self.false = None
+
+
 # TODO: split if-else branches into prepare_distributed_train_dataset & prepare_distributed_inference_dataset
 def prepare_distributed_dataset(
     data: dict,
@@ -278,27 +357,6 @@ def prepare_distributed_dataset(
             {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps, accumulation_steps, val_steps}
             Train/val distributed datasets, number of samples in each, number of steps for each (including accumulation sub-steps)
     """
-
-    # NOTE: should this class be defined outside function scope?
-    # Create data holder objects (to be paired with generators)
-    # Allows for explicit dereferencing of large arrays using DataHolder.clear()
-    class DataHolder:
-        def __init__(self, concat, true, false):
-            self._cleared = False
-            self._lock = threading.Lock()
-            self.concat = concat
-            self.true = true
-            self.false = false
-
-        def clear(self):
-            with self._lock:
-                if self._cleared:
-                    return
-                self._cleared = True
-                self.concat = None
-                self.true = None
-                self.false = None
-
     if train_val_split is not None:
         # Training case: split into train and val
         if global_batch_size is None or per_replica_val_batch_size is None:
@@ -493,65 +551,6 @@ def prepare_distributed_dataset(
             "steps": steps,
             "_holder": holder,
         }
-
-
-def compute_expected_std(layer):
-    """Compute expected std based on initializer."""
-    weights = layer.get_weights()
-    if not weights:
-        return None
-
-    kernel = weights[0]
-
-    if isinstance(layer.kernel_initializer, HeNormal):
-        # HeNormal: std = sqrt(2 / fan_in)
-        fan_in = np.prod(kernel.shape[:-1])
-        expected_std = np.sqrt(2.0 / fan_in)
-    elif isinstance(layer.kernel_initializer, GlorotNormal):
-        # GlorotNormal: std = sqrt(2 / (fan_in + fan_out))
-        fan_in = np.prod(kernel.shape[:-1])
-        fan_out = kernel.shape[-1]
-        expected_std = np.sqrt(2.0 / (fan_in + fan_out))
-    else:
-        return None
-
-    return expected_std
-
-
-def check_encoder_trained(encoder, threshold=0.2):
-    """
-    Checks all Conv2D and Dense layers in encoder for deviation from initializer.
-    Returns True if at least one layer shows substantial deviation (i.e. the encoder was likely trained).
-    """
-    trained_layers = []
-    for layer in encoder.layers:
-        if isinstance(layer, Conv2D | Dense):
-            weights = layer.get_weights()
-            if not weights:
-                continue  # skip layers without weights
-
-            kernel = weights[0]
-            actual_std = np.std(kernel)
-            expected_std = compute_expected_std(layer)
-            if expected_std is None:
-                continue  # skip layers with no expected std
-
-            relative_dev = abs(actual_std - expected_std) / expected_std
-
-            logger.info(
-                f"{layer.name}: actual std={actual_std:.5f}, expected std={expected_std:.5f}, deviation={relative_dev:.2%}"
-            )
-
-            if relative_dev > threshold:
-                trained_layers.append(layer.name)
-
-    if trained_layers:
-        logger.info("Encoder appears trained (substantial deviation detected in layers):")
-        logger.info(f"{trained_layers}")
-        return True
-    else:
-        logger.info("Encoder appears untrained (all layers close to initializer).")
-        return False
 
 
 class TrainingPipeline:
@@ -1017,8 +1016,6 @@ class TrainingPipeline:
             val_holder.clear()
             del train_dataset, val_dataset
 
-            # NOTE: commented out since memory leaks seem under control without clear_session()
-            # TEST: uncommented to test race conditions / deadlocks
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
             tf.keras.backend.clear_session()
@@ -1450,8 +1447,6 @@ class TrainingPipeline:
             holder.clear()
             del dataset
 
-            # NOTE: commented out since memory leaks seem under control without clear_session()
-            # TEST: uncommented to test race conditions / deadlocks
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
             tf.keras.backend.clear_session()
