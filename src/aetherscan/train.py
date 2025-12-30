@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import shutil
-import threading
 from datetime import datetime
 
 import matplotlib.lines as mlines
@@ -303,6 +302,7 @@ def check_encoder_trained(encoder, threshold=0.2):
         return False
 
 
+# NOTE: removing thread locking temporarily since it's interfering with DataGen pool reset
 # TEST: resources are properly released on normal exits (between rounds) & emergency shutdown
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
 # Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
@@ -320,19 +320,26 @@ def check_encoder_trained(encoder, threshold=0.2):
 class DataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
-        self._lock = threading.Lock()
+        # self._lock = threading.Lock()
         self.concat = concat
         self.true = true
         self.false = false
 
     def clear(self):
-        with self._lock:
-            if self._cleared:
-                return
-            self._cleared = True
-            self.concat = None
-            self.true = None
-            self.false = None
+        # with self._lock:
+        #     if self._cleared:
+        #         return
+        #     self._cleared = True
+        #     self.concat = None
+        #     self.true = None
+        #     self.false = None
+
+        if self._cleared:
+            return
+        self._cleared = True
+        self.concat = None
+        self.true = None
+        self.false = None
 
 
 # TODO: split if-else branches into prepare_distributed_train_dataset & prepare_distributed_inference_dataset
@@ -403,45 +410,72 @@ def prepare_distributed_dataset(
         # Create generator functions for memory-efficient data loading
         def train_generator():
             while True:  # Make generators infinite to reset state between epochs
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with train_holder._lock:
-                    if train_holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = train_holder.concat
-                    true = train_holder.true
-                    false = train_holder.false
+                # # Acquire lock to check cleared status and capture data references
+                # # Local references keep data alive even if clear() is called mid-epoch
+                # with train_holder._lock:
+                #     if train_holder._cleared:
+                #         return  # Exit if data already cleared
+                #     # Cache references while holding lock
+                #     concat = train_holder.concat
+                #     true = train_holder.true
+                #     false = train_holder.false
+                #
+                # # Work with local references (safe from clearing, no per-sample lock needed)
+                # indices = np.arange(len(concat))
+                # if shuffle:
+                #     # Perform global shuffle on each epoch so each pass through the data is unique
+                #     np.random.shuffle(indices)
+                # for idx in indices:
+                #     yield (concat[idx], true[idx], false[idx]), concat[idx]
+                #
+                # # Remove cache references for future garbage collection
+                # del concat, true, false
 
-                # Work with local references (safe from clearing, no per-sample lock needed)
-                indices = np.arange(len(concat))
+                # NOTE: removing thread locking & caching temporarily since it's interfering with DataGen pool reset
+                if train_holder._cleared:
+                    return  # Exit if data already cleared
+                indices = np.arange(len(train_holder.concat))
                 if shuffle:
                     # Perform global shuffle on each epoch so each pass through the data is unique
                     np.random.shuffle(indices)
                 for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
-
-                # Remove cache references for future garbage collection
-                del concat, true, false
+                    if train_holder._cleared:
+                        return  # Exit if data already cleared
+                    yield (
+                        (train_holder.concat[idx], train_holder.true[idx], train_holder.false[idx]),
+                        train_holder.concat[idx],
+                    )
 
         def val_generator():
             while True:  # Make generators infinite to reset state between epochs
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with val_holder._lock:
+                # # Acquire lock to check cleared status and capture data references
+                # # Local references keep data alive even if clear() is called mid-epoch
+                # with val_holder._lock:
+                #     if val_holder._cleared:
+                #         return  # Exit if data already cleared
+                #     # Cache references while holding lock
+                #     concat = val_holder.concat
+                #     true = val_holder.true
+                #     false = val_holder.false
+                #
+                # # Maintain order on each epoch since no gradients are calculated during validation
+                # for idx in range(len(concat)):
+                #     yield (concat[idx], true[idx], false[idx]), concat[idx]
+                #
+                # # Remove cache references for future garbage collection
+                # del concat, true, false
+
+                # NOTE: removing thread locking & caching temporarily since it's interfering with DataGen pool reset
+                if val_holder._cleared:
+                    return  # Exit if data already cleared
+                # Maintain order on each epoch since no gradients are calculated during validation
+                for idx in range(len(val_holder.concat)):
                     if val_holder._cleared:
                         return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = val_holder.concat
-                    true = val_holder.true
-                    false = val_holder.false
-
-                # Maintain order on each epoch since no gradients are calculated during validation
-                for idx in range(len(concat)):
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
-
-                # Remove cache references for future garbage collection
-                del concat, true, false
+                    yield (
+                        (val_holder.concat[idx], val_holder.true[idx], val_holder.false[idx]),
+                        val_holder.concat[idx],
+                    )
 
         # Determine dataset output signature
         sample_shape = train_concat.shape[1:]
@@ -514,25 +548,39 @@ def prepare_distributed_dataset(
         # Create generator function for memory-efficient data loading
         def data_generator():
             while True:  # Make generator infinite to reset state between passes
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with holder._lock:
-                    if holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = holder.concat
-                    true = holder.true
-                    false = holder.false
+                # # Acquire lock to check cleared status and capture data references
+                # # Local references keep data alive even if clear() is called mid-epoch
+                # with holder._lock:
+                #     if holder._cleared:
+                #         return  # Exit if data already cleared
+                #     # Cache references while holding lock
+                #     concat = holder.concat
+                #     true = holder.true
+                #     false = holder.false
+                #
+                # # Work with local references (safe from clearing, no per-sample lock needed)
+                # indices = np.arange(len(concat))
+                # if shuffle:
+                #     np.random.shuffle(indices)
+                # for idx in indices:
+                #     yield (concat[idx], true[idx], false[idx]), concat[idx]
+                #
+                # # Remove cache references for future garbage collection
+                # del concat, true, false
 
-                # Work with local references (safe from clearing, no per-sample lock needed)
-                indices = np.arange(len(concat))
+                # NOTE: removing thread locking & caching temporarily since it's interfering with DataGen pool reset
+                if holder._cleared:
+                    return  # Exit if data already cleared
+                indices = np.arange(len(holder.concat))
                 if shuffle:
                     np.random.shuffle(indices)
                 for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
-
-                # Remove cache references for future garbage collection
-                del concat, true, false
+                    if holder._cleared:
+                        return  # Exit if data already cleared
+                    yield (
+                        (holder.concat[idx], holder.true[idx], holder.false[idx]),
+                        holder.concat[idx],
+                    )
 
         # Determine dataset output signature
         sample_shape = concat.shape[1:]
@@ -1039,9 +1087,6 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
-            # TEST:
-            self.data_generator.reset_managed_pool()
-
             # Clear intermediate data
             train_holder.clear()
             val_holder.clear()
@@ -1054,7 +1099,7 @@ class TrainingPipeline:
 
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
-            # self.data_generator.reset_managed_pool()
+            self.data_generator.reset_managed_pool()
 
             gc.collect()
 
