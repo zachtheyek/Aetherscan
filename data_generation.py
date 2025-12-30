@@ -478,8 +478,8 @@ def batch_create_cadence(
         # Use pool to generate cadences in parallel
         for i, result in enumerate(
             # NOTE: does return order matter?
-            # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
-            pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):
             cadence[i, :, :, :] = result
     else:

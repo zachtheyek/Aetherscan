@@ -274,10 +274,10 @@ class DataPreprocessor:
                     # NOTE: should we use separate chunks_per_worker? how to benchmark?
                     chunksize = max(1, n_cadences // (n_workers * chunks_per_worker))
                     # NOTE: does return order matter?
-                    # results = chunk_pool.map(_downsample_worker, args_list, chunksize=chunksize)
-                    results = chunk_pool.imap_unordered(
-                        _downsample_worker, args_list, chunksize=chunksize
-                    )
+                    results = chunk_pool.map(_downsample_worker, args_list, chunksize=chunksize)
+                    # results = chunk_pool.imap_unordered(
+                    #     _downsample_worker, args_list, chunksize=chunksize
+                    # )
 
                 else:
                     # Sequential processing
