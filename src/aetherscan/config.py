@@ -90,9 +90,9 @@ class DataConfig:
     # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
     # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file) (how to track chunk processing efficiency)
     background_load_chunk_size: int = (
-        1000  # Maximum cadences to process at once during background loading
+        5000  # Maximum cadences to process at once during background loading
     )
-    max_chunks_per_file: int = 5  # Maximum chunks to load from a single file
+    max_chunks_per_file: int = 1  # Maximum chunks to load from a single file
 
     # Data files
     # Note, Python dataclasses don't allow mutable objects (e.g. lists) to be used as defaults,
