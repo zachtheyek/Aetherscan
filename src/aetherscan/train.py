@@ -1039,6 +1039,9 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
+            # TEST:
+            self.data_generator.reset_managed_pool()
+
             # Clear intermediate data
             train_holder.clear()
             val_holder.clear()
@@ -1051,7 +1054,7 @@ class TrainingPipeline:
 
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
-            self.data_generator.reset_managed_pool()
+            # self.data_generator.reset_managed_pool()
 
             gc.collect()
 
