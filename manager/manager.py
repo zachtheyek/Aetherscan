@@ -58,7 +58,7 @@ class ManagedPool:
         try:
             logger.info(f"Forcefully terminating pool '{self.name}'")
 
-            # TEST: does terminating instead of closing lead to any issues with corrupted db writes?
+            # NOTE: does terminating instead of closing lead to any issues with corrupted db writes?
             # Forcefully kill all running processes & clear internal job queues with .terminate()
             # Then, wait for parent to finish handling dead processes,
             # and exit & close the pool with .join()
@@ -78,6 +78,7 @@ class ManagedPool:
                 logger.warning(f"Pool '{self.name}' join timeout exceeded")
                 logger.info("Force-killing remaining worker processes with SIGKILL")
                 self._force_kill_workers()
+                # NOTE: 0.2 seems arbitrary & can potentially add latency to shutdown. is there a more precise wall we can use?
                 time.sleep(0.2)  # Brief wait for SIGKILL to take effect
 
             # Verify cleanup
@@ -95,6 +96,7 @@ class ManagedPool:
             # Still try to force-kill on error
             # If it fails, let the OS handle on process exit
             # NOTE: is it safe to just ignore workers that survive SIGKILL? will self.closed = True lead to issues down the line?
+            # NOTE: should we add time.sleep(0.2) & _check_alive() after _force_kill_workers()? would logging an error on SIGKILL fail be useful?
             with contextlib.suppress(Exception):
                 self._force_kill_workers()
             self.closed = True
@@ -106,10 +108,14 @@ class ManagedPool:
         except Exception as e:
             logger.info(f"_check_alive(): unable to inspect pool '{self.name}': {e}")
             logger.info(f"Assuming pool '{self.name}' is gone and no remaining workers alive")
+            # NOTE: is there a more precise way to differentiate pool already destroyed vs internal state corrupted?
             return False  # pool already destroyed or internal state corrupted
 
     def _force_kill_workers(self):
         """Force-kill all worker processes with SIGKILL"""
+        killed_any = False
+
+        # Method 1: Via pool._pool attribute
         try:
             for worker in getattr(self.pool, "_pool", []):
                 if worker.is_alive():
@@ -118,12 +124,52 @@ class ManagedPool:
                         process = psutil.Process(pid)
                         process.kill()  # SIGKILL - cannot be ignored
                         logger.info(f"Force-killed worker PID {pid}")
+                        killed_any = True
                     except psutil.NoSuchProcess:
                         pass  # Already dead
                     except Exception as e:
                         logger.warning(f"Failed to kill worker PID {pid}: {e}")
         except Exception as e:
-            logger.warning(f"Error during force-kill: {e}")
+            logger.warning(f"Error accessing pool._pool: {e}")
+
+            # Method 2: Fallback - find & kill all child processes via psutil
+            # Useful for when getattr(self.pool, "_pool", []) raises an Exception, of if _pool is
+            # in an inconsistent state during cleanup
+            # Note, method 2 kills ALL child processes, not just the workers belonging to a specific
+            # Pool. This is acceptable in our current implementation, since pool closures either
+            # happen sequentially (PreProc Pool is opened & closed before DataGen, etc.), or
+            # indiscriminately during cleanup (atexit, SIGINT, SIGTERM, etc.).
+            # However, in the case where we have multiple long-lived pools or workers, and SIGTERM
+            # is escalated to SIGKILL, and pool._pool attribution fails, that innocent workers may
+            # be killed by accident. If this becomes an issue in the future, simply comment out
+            # method 2 and let the OS clean up on process exit
+            # Note, could alternatively try tracking worker PIDs by Pool proactively, though this
+            # requires architectural changes that aren't worth the time rn
+
+            # logger.info("Attempting fallback: killing ALL child processes directly")
+            # try:
+            #     current = psutil.Process(os.getpid())
+            #     children = current.children(recursive=True)
+            #
+            #     if not children:
+            #         logger.info("No child processes found")
+            #         return
+            #
+            #     for child in children:
+            #         try:
+            #             if child.is_running():
+            #                 child.kill()
+            #                 logger.info(f"Force-killed child process PID {child.pid}")
+            #                 killed_any = True
+            #         except psutil.NoSuchProcess:
+            #             pass  # Already terminated
+            #         except Exception as child_error:
+            #             logger.warning(f"Failed to kill child PID {child.pid}: {child_error}")
+            # except Exception as fallback_error:
+            #     logger.error(f"Fallback force-kill failed: {fallback_error}")
+
+        if not killed_any:
+            logger.info("No workers force-killed")
 
 
 @dataclass
