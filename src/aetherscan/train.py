@@ -1040,17 +1040,9 @@ class TrainingPipeline:
         # Run cleanup regardless if round finishes successfully or not
         finally:
             # Clear intermediate data
-            # TEST:
-            del train_dataset, val_dataset
-            gc.collect()
-
-            import time  # noqa: PLC0415
-
-            time.sleep(0.1)
-
             train_holder.clear()
             val_holder.clear()
-            # del train_dataset, val_dataset
+            del train_dataset, val_dataset
 
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
