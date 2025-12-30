@@ -28,7 +28,7 @@ class ManagerConfig:
     """Resource manager configuration"""
 
     n_processes: int = cpu_count()  # use all available cores
-    # TODO: experiment with larger chunk sizes
+    # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     # NOTE: should we move chunks_per_worker to TrainingConfig() and make it specific to preproc/data_gen?
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
     pool_terminate_timeout: float = 10.0  # seconds
@@ -88,7 +88,7 @@ class DataConfig:
 
     num_target_backgrounds: int = 15000  # Number of background cadences to load
     # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
-    # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file)
+    # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file) (how to track chunk processing efficiency)
     background_load_chunk_size: int = (
         1000  # Maximum cadences to process at once during background loading
     )
@@ -121,6 +121,7 @@ class TrainingConfig:
 
     # NOTE: use more samples on bla0?
     num_samples_beta_vae: int = 120000
+    # NOTE: use more samples on bla0?
     num_samples_rf: int = 24000
     train_val_split: float = 0.8
 
@@ -129,7 +130,7 @@ class TrainingConfig:
     global_batch_size: int = 2048  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096
 
-    # TODO: experiment with larger chunk sizes
+    # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     signal_injection_chunk_size: int = (
         1000  # Maximum cadences to process at once during data generation
     )
