@@ -346,7 +346,6 @@ class ResourceManager:
         # sys.exit(1): exit with failed termination status
         sys.exit(0)
 
-    # TEST: does cleanup_all() run properly for all scenarios? ✅: normal exit, ❓: ctrl+c during setup/multiprocessing/distributed training/other, sys.exit() from main.py, in between training retries
     def cleanup_all(self):
         """
         Unified cleanup of all resources.
@@ -417,6 +416,7 @@ class ResourceManager:
                 with contextlib.suppress(Exception):
                     logger.error(f"Error during database shutdown: {e}")
 
+        # BUG: sometimes total_memory_freed_gb < 0
         # Log final stats
         final_memory = self._get_memory_usage()
         self.stats.total_memory_freed_gb = initial_memory - final_memory
