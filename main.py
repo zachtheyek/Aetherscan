@@ -18,7 +18,7 @@ from cli import apply_args_to_config, setup_argument_parser, validate_args
 from config import get_config, init_config
 from db import init_db
 from logger import init_logger
-from manager import init_manager, register_logger
+from manager import get_manager, init_manager, register_logger
 from monitor import init_monitor
 from preprocessing import DataPreprocessor
 from train import get_latest_tag, train_full_pipeline
@@ -109,7 +109,7 @@ def train_command():
     try:
         preprocessor = DataPreprocessor()
         background_data = preprocessor.load_background_data().astype(np.float32)
-        # NOTE: close preprocessing pools and/or shared memory?
+        # NOTE: do we need to close preprocessing pools and/or shared memory?
     except Exception as e:
         logger.error(f"Failed to load backgrounds: {e}")
         sys.exit(1)
@@ -121,14 +121,18 @@ def train_command():
     retry_delay = config.training.retry_delay
 
     for attempt in range(max_retries):
+        pipeline = None
+
         try:
             logger.info(f"Training attempt: {attempt + 1}/{max_retries}")
 
             if attempt > 0:
                 logger.info(f"Retrying training from round {config.checkpoint.start_round}")
+            else:
+                logger.info(f"Starting training from round {config.checkpoint.start_round}")
 
             # Reinitialize training pipeline on each attempt so no corrupted state is persisted
-            train_full_pipeline(background_data=background_data, strategy=strategy)
+            pipeline = train_full_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded
 
@@ -147,27 +151,38 @@ def train_command():
                     f"Attempting to recover from failure: attempt {attempt + 2}/{max_retries}"
                 )
 
-                try:
-                    # Collect garbage
-                    gc.collect()
+                # Collect garbage
+                if pipeline:
+                    del pipeline
+                gc.collect()
 
+                # Save original checkpoint values in case of failure recovery
+                original_dir = config.checkpoint.load_dir
+                original_tag = config.checkpoint.load_tag
+                original_round = config.checkpoint.start_round
+
+                try:
                     # Find the latest checkpoint & determine where to resume from
                     config.checkpoint.load_dir = "checkpoints"
                     config.checkpoint.load_tag = get_latest_tag(
                         os.path.join(config.model_path, config.checkpoint.load_dir)
                     )
-                    config.checkpoint.infer_start_round()
-
-                    if not config.checkpoint.load_tag.startswith("round_"):
+                    if config.checkpoint.load_tag.startswith("round_"):
+                        config.checkpoint.infer_start_round()
+                    else:
                         raise ValueError("No valid checkpoints loaded")
 
                     logger.info(
-                        f"Loaded latest checkpoint from round {config.checkpoint.start_round - 1}"
+                        f"Found latest checkpoint from round {config.checkpoint.start_round - 1}"
                     )
                     logger.info(f"Waiting {retry_delay} seconds before retry...")
 
                 except Exception as recovery_error:
-                    # If no checkpoints loaded, restart from last valid start_round
+                    # If no checkpoints loaded, restart from last valid point
+                    config.checkpoint.load_dir = original_dir
+                    config.checkpoint.load_tag = original_tag
+                    config.checkpoint.start_round = original_round
+
                     logger.error(f"Recovery failed: {recovery_error}")
                     logger.info(
                         f"Restarting training from round {config.checkpoint.start_round} in {retry_delay} seconds..."
@@ -410,21 +425,30 @@ def main():
         logger.error(f"Failed to initialize resource monitor: {e}")
         sys.exit(1)
 
-    # Execute command
-    if args.command == "train":
-        train_command()
-    # NOTE: come back to this later
-    # elif args.command == "inference":
-    #     inference_command(args)
-    # NOTE: come back to this later
-    # elif args.command == 'evaluate':
-    #     evaluate_command(args)
-    else:
-        # Print help message & exit if no valid command provided
-        parser.print_help()
-        logger.error("Invalid CLI command received")
-        logger.error("See usage")
-        sys.exit(1)
+    try:
+        # Execute command
+        if args.command == "train":
+            train_command()
+        # NOTE: come back to this later
+        # elif args.command == "inference":
+        #     inference_command(args)
+        # NOTE: come back to this later
+        # elif args.command == 'evaluate':
+        #     evaluate_command(args)
+        else:
+            # Print help message & exit if no valid command provided
+            parser.print_help()
+            logger.error("Invalid CLI command received")
+            logger.error("See usage")
+            sys.exit(1)
+
+    finally:
+        # Explicitly call cleanup_all() before exiting to avoid deadlock
+        # Without this, non-daemon threads block sys.exit() from running atexit handlers (race condition)
+        # NOTE: do the other sys.exit() calls in main.py get blocked by non-daemon threads as well?
+        manager = get_manager()
+        if manager:
+            manager.cleanup_all()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,8 @@
+# BUG:
+# system total CPU usage appears "unnormalized" compared to process + children CPU usage
+# process + children CPU & RAM sometimes exceeds system total
+# also, split GPU usage & memory into separate plots?
+# TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup
 """
 Resource monitor for Aetherscan Pipeline
 Runs as background thread & records system metrics (CPU, RAM, GPU) to database writer queue
@@ -276,6 +281,7 @@ class ResourceMonitor:
             return
 
         self.stop_event.clear()
+        # NOTE: should monitor be daemon or non-daemon thread?
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=False)
         self.monitor_thread.start()
         logger.info("Resource monitoring thread started")

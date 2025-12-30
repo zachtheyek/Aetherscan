@@ -7,9 +7,11 @@ Uses multiprocessing and shared memory to process data in parallel
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
+import signal
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
@@ -42,9 +44,12 @@ def _init_worker(shm_name, shape, dtype):
         dtype: Data type of the background array
 
     Note:
-        Worker cleanup is automatic - when the pool terminates, the OS reclaims
-        all worker process resources including shared memory file descriptors.
-        Cleanup is handled by the main process
+        Worker cleanup uses a custom SIGTERM handler to properly close shared memory
+        file descriptors before termination. When pool.terminate() is called by the
+        main process, workers intercept SIGTERM, close their shared memory handles,
+        then re-raise the signal to complete termination.
+
+        The main process is responsible for unlinking shared memory (handled by ResourceManager).
     """
     global _GLOBAL_SHM, _GLOBAL_CHUNK_DATA, _GLOBAL_SHAPE, _GLOBAL_DTYPE
 
@@ -53,6 +58,35 @@ def _init_worker(shm_name, shape, dtype):
 
     # Attach to existing shared memory block
     _GLOBAL_SHM = SharedMemory(name=shm_name)
+
+    # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # Setup custom SIGTERM handler for additional cleanup before termination
+    # Note, manager will escalate SIGTERM to SIGKILL after pool_terminate_timeout seconds (see config.py)
+    # This may interrupt the worker's cleanup process
+    # Consider increasing pool_terminate_timeout if you're experiencing such issues
+    def cleanup_on_sigterm(signum, frame):
+        """
+        Cleanup handler called when pool.terminate() sends SIGTERM
+        Closes shared memory file descriptor before process termination
+        """
+        # Note, a race condition may occur if a worker receives more than 1 SIGTERM delivery
+        # at a time, triggering re-entry of the same cleanup handler
+        # It suffices to guard against this by simply suppressing exceptions, since subsequent
+        # close() calls will just raise an error; no state corruption or kernel-level hazards exist
+        # Also, there are no cross-worker race conditions, since each worker's close() operates on
+        # per-process resources, even though they all refer to the same underlying POSIX shm object
+        with contextlib.suppress(Exception):
+            if _GLOBAL_SHM is not None:
+                _GLOBAL_SHM.close()
+
+        # Restore default handler and re-raise SIGTERM to resume termination
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    # Register SIGTERM handler for graceful cleanup on pool.terminate()
+    signal.signal(signal.SIGTERM, cleanup_on_sigterm)
 
     # Create numpy array view of shared memory (no copy!)
     _GLOBAL_CHUNK_DATA = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
@@ -147,7 +181,7 @@ class DataPreprocessor:
         logger.info(f"Processing chunks of: {chunk_size}")
         logger.info(f"Final resolution: {final_width}")
 
-        all_backgrounds = []  # NOTE: preallocate this as ndarray?
+        all_backgrounds = []  # NOTE: preallocate this as empty ndarray?
 
         for filename in self.config.data.train_files:
             filepath = self.config.get_training_file_path(filename)
@@ -188,7 +222,7 @@ class DataPreprocessor:
             n_chunks = min(max_chunks, (raw_data.shape[0] + chunk_size - 1) // chunk_size)
 
             for chunk_idx in range(n_chunks):
-                logger.info(f"Processing filename: chunk {chunk_idx + 1}/{n_chunks}")
+                logger.info(f"Processing {filename}: chunk {chunk_idx + 1}/{n_chunks}")
 
                 chunk_start = chunk_idx * chunk_size
                 chunk_end = min((chunk_idx + 1) * chunk_size, raw_data.shape[0])
@@ -208,6 +242,7 @@ class DataPreprocessor:
                     for i in range(n_cadences)
                 ]
 
+                # NOTE: do we need to create & destroy the pool every chunk? or just the shared memory & pass new references in? is there a differenc?
                 if n_processes > 1:
                     # Create shared memory block for chunk data
                     chunk_shm = self.manager.create_shared_memory(
@@ -239,10 +274,10 @@ class DataPreprocessor:
                     # NOTE: should we use separate chunks_per_worker? how to benchmark?
                     chunksize = max(1, n_cadences // (n_workers * chunks_per_worker))
                     # NOTE: does return order matter?
-                    # results = chunk_pool.map(_downsample_worker, args_list, chunksize=chunksize)
-                    results = chunk_pool.imap_unordered(
-                        _downsample_worker, args_list, chunksize=chunksize
-                    )
+                    results = chunk_pool.map(_downsample_worker, args_list, chunksize=chunksize)
+                    # results = chunk_pool.imap_unordered(
+                    #     _downsample_worker, args_list, chunksize=chunksize
+                    # )
 
                 else:
                     # Sequential processing

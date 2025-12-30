@@ -6,10 +6,12 @@ Uses multiprocessing and shared memory to process backgrounds in parallel
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
 import random
+import signal
 from multiprocessing import Pool, cpu_count
 from multiprocessing.shared_memory import SharedMemory
 
@@ -44,9 +46,12 @@ def _init_worker(shm_name, shape, dtype):
         dtype: Data type of the background array
 
     Note:
-        Worker cleanup is automatic - when the pool terminates, the OS reclaims
-        all worker process resources including shared memory file descriptors.
-        Cleanup is handled by the main process
+        Worker cleanup uses a custom SIGTERM handler to properly close shared memory
+        file descriptors before termination. When pool.terminate() is called by the
+        main process, workers intercept SIGTERM, close their shared memory handles,
+        then re-raise the signal to complete termination.
+
+        The main process is responsible for unlinking shared memory (handled by ResourceManager).
     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
 
@@ -59,6 +64,35 @@ def _init_worker(shm_name, shape, dtype):
 
     # Attach to existing shared memory block
     _GLOBAL_SHM = SharedMemory(name=shm_name)
+
+    # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # Setup custom SIGTERM handler for additional cleanup before termination
+    # Note, manager will escalate SIGTERM to SIGKILL after pool_terminate_timeout seconds (see config.py)
+    # This may interrupt the worker's cleanup process
+    # Consider increasing pool_terminate_timeout if you're experiencing such issues
+    def cleanup_on_sigterm(signum, frame):
+        """
+        Cleanup handler called when pool.terminate() sends SIGTERM
+        Closes shared memory file descriptor before process termination
+        """
+        # Note, a race condition may occur if a worker receives more than 1 SIGTERM delivery
+        # at a time, triggering re-entry of the same cleanup handler
+        # It suffices to guard against this by simply suppressing exceptions, since subsequent
+        # close() calls will just raise an error; no state corruption or kernel-level hazards exist
+        # Also, there are no cross-worker race conditions, since each worker's close() operates on
+        # per-process resources, even though they all refer to the same underlying POSIX shm object
+        with contextlib.suppress(Exception):
+            if _GLOBAL_SHM is not None:
+                _GLOBAL_SHM.close()
+
+        # Restore default handler and re-raise SIGTERM to resume termination
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    # Register SIGTERM handler for graceful cleanup on pool.terminate()
+    signal.signal(signal.SIGTERM, cleanup_on_sigterm)
 
     # Create numpy array view of shared memory (no copy!)
     _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
@@ -156,6 +190,10 @@ def new_cadence(
 
     # Extract the modified data (with signal injection) from the setigen Frame
     modified_data = frame.data.copy()
+
+    # Cleanup intermediate data
+    del frame, signal
+    gc.collect()
 
     # Return the modified data array, slope (in pixel coordinates), and y-intercept
     return modified_data, slope_pixel, y_intercept
@@ -440,8 +478,8 @@ def batch_create_cadence(
         # Use pool to generate cadences in parallel
         for i, result in enumerate(
             # NOTE: does return order matter?
-            # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
-            pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):
             cadence[i, :, :, :] = result
     else:
@@ -550,7 +588,7 @@ class DataGenerator:
             The pool is managed by the ResourceManager and should be closed via
             _free_managed_pool() or close() to properly release resources.
         """
-        # NOTE: should we guarantee that only 1 shm & 1 pool can exist at any time?
+        # NOTE: should we explicitly guarantee only 1 shm & 1 pool can exist at a time?
         # If shared memory exists, then create pool using shared memory reference
         if self.shm:
             self.pool = self.manager.create_pool(
@@ -598,11 +636,11 @@ class DataGenerator:
         self._free_managed_shared_memory()
         logger.info("DataGenerator closed")
 
-    # NOTE: write separate generate_test_batch method for evaluate.py?
-    # NOTE: no data generation needed during inference?
-    # NOTE: replace generate_train_batch with generate_test_batch in train_random_forest?
-    # NOTE: or just rename to generate_X_batch (come up with better name)?
-    # NOTE: generate_batch okay?
+    # TODO:
+    # separate generate_batch() into generate_train_batch() & generate_test_batch()
+    # since test doesn't require (main, false, true), just (false, true)
+    # verify this is correct with train_random_forest() vs train_round()
+    # benchmark compute time / memory saved with this change
     def generate_batch(
         self, n_samples: int, snr_base: int, snr_range: int
     ) -> dict[str, np.ndarray]:
@@ -803,6 +841,7 @@ class DataGenerator:
         # Create result dictionary with references to pre-allocated arrays
         result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
+        # NOTE: is there a more efficient way to do this?
         # Sanity check: verify post-injection data normalization
         for key in ["concatenated", "false", "true"]:
             min_val = np.min(result[key])

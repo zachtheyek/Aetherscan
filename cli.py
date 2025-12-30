@@ -542,38 +542,39 @@ def validate_args(args: argparse.Namespace) -> None:
     """
     errors = []
 
-    # Check: signal-injection-chunk-size must be divisible by 4 (for balanced class generation)
-    if (
-        hasattr(args, "signal_injection_chunk_size")
-        and args.signal_injection_chunk_size is not None
-        and args.signal_injection_chunk_size % 4 != 0
-    ):
-        errors.append(
-            f"--signal-injection-chunk-size must be divisible by 4 for balanced class generation, "
-            f"got {args.signal_injection_chunk_size}"
-        )
-
-    # Check: num-samples-vae must be divisible by 4 (for balanced class generation)
-    if (
-        hasattr(args, "num_samples_vae")
-        and args.num_samples_vae is not None
-        and args.num_samples_vae % 4 != 0
-    ):
-        errors.append(
-            f"--num-samples-vae must be divisible by 4 for balanced class generation, "
-            f"got {args.num_samples_vae}"
-        )
-
-    # Check: num-samples-rf must be divisible by 4 (for balanced class generation)
-    if (
-        hasattr(args, "num_samples_rf")
-        and args.num_samples_rf is not None
-        and args.num_samples_rf % 4 != 0
-    ):
-        errors.append(
-            f"--num-samples-rf must be divisible by 4 for balanced class generation, "
-            f"got {args.num_samples_rf}"
-        )
+    # NOTE: comment out temporarily for bla0
+    # # Check: signal-injection-chunk-size must be divisible by 4 (for balanced class generation)
+    # if (
+    #     hasattr(args, "signal_injection_chunk_size")
+    #     and args.signal_injection_chunk_size is not None
+    #     and args.signal_injection_chunk_size % 4 != 0
+    # ):
+    #     errors.append(
+    #         f"--signal-injection-chunk-size must be divisible by 4 for balanced class generation, "
+    #         f"got {args.signal_injection_chunk_size}"
+    #     )
+    #
+    # # Check: num-samples-vae must be divisible by 4 (for balanced class generation)
+    # if (
+    #     hasattr(args, "num_samples_vae")
+    #     and args.num_samples_vae is not None
+    #     and args.num_samples_vae % 4 != 0
+    # ):
+    #     errors.append(
+    #         f"--num-samples-vae must be divisible by 4 for balanced class generation, "
+    #         f"got {args.num_samples_vae}"
+    #     )
+    #
+    # # Check: num-samples-rf must be divisible by 4 (for balanced class generation)
+    # if (
+    #     hasattr(args, "num_samples_rf")
+    #     and args.num_samples_rf is not None
+    #     and args.num_samples_rf % 4 != 0
+    # ):
+    #     errors.append(
+    #         f"--num-samples-rf must be divisible by 4 for balanced class generation, "
+    #         f"got {args.num_samples_rf}"
+    #     )
 
     # TODO: come back to this later
     # double check if these are correct
@@ -597,7 +598,7 @@ def validate_args(args: argparse.Namespace) -> None:
     # max_retries >= 0
     # retry_delay >= 0
     # start_round < num_training_rounds
-    # do directories specified have to exist? or we assume we'll create them on the fly and handle errors in-flight?
+    # do directories specified have to exist? or we assume we'll create them on the fly and handle errors in-flight? (currently train_command, TrainingPipeline(), and load_models() all attempt to handle errors on the fly. is this optimal behavior?)
     #
     # Template for adding more checks:
     # if hasattr(args, "some_param") and args.some_param is not None:

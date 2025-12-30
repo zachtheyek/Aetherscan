@@ -1,3 +1,4 @@
+# TODO: add external function to combine (join & dedup) different aetherscan.db files. where should source of truth be located? (bla0?)
 """
 Database for Aetherscan Pipeline
 Uses SQLite with asynchronous queue-based writes to handle concurrent data collection from multiple
@@ -266,6 +267,7 @@ class Database:
             return
 
         self.stop_event.clear()
+        # NOTE: should db be daemon or non-daemon thread?
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=False)
         self.writer_thread.start()
         logger.info("Database writer thread started")
