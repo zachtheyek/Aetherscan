@@ -334,6 +334,7 @@ def prepare_distributed_dataset(
         def train_generator():
             while True:  # Make generators infinite to reset state between epochs
                 # Acquire lock to check cleared status and capture data references
+                # Local references keep data alive even if clear() is called mid-epoch
                 with train_holder._lock:
                     if train_holder._cleared:
                         return  # Exit if data already cleared
@@ -342,24 +343,18 @@ def prepare_distributed_dataset(
                     true = train_holder.true
                     false = train_holder.false
 
-                # Work with local references (safe from clearing)
+                # Work with local references (safe from clearing, no per-sample lock needed)
                 indices = np.arange(len(concat))
                 if shuffle:
                     # Perform global shuffle on each epoch so each pass through the data is unique
                     np.random.shuffle(indices)
                 for idx in indices:
-                    # Check cleared status before yielding
-                    with train_holder._lock:
-                        if train_holder._cleared:
-                            return  # Exit if data already cleared
-                    yield (
-                        (concat[idx], true[idx], false[idx]),
-                        concat[idx],
-                    )
+                    yield (concat[idx], true[idx], false[idx]), concat[idx]
 
         def val_generator():
             while True:  # Make generators infinite to reset state between epochs
                 # Acquire lock to check cleared status and capture data references
+                # Local references keep data alive even if clear() is called mid-epoch
                 with val_holder._lock:
                     if val_holder._cleared:
                         return  # Exit if data already cleared
@@ -370,14 +365,7 @@ def prepare_distributed_dataset(
 
                 # Maintain order on each epoch since no gradients are calculated during validation
                 for idx in range(len(concat)):
-                    # Check cleared status before yielding
-                    with val_holder._lock:
-                        if val_holder._cleared:
-                            return  # Exit if data already cleared
-                    yield (
-                        (concat[idx], true[idx], false[idx]),
-                        concat[idx],
-                    )
+                    yield (concat[idx], true[idx], false[idx]), concat[idx]
 
         # Determine dataset output signature
         sample_shape = train_concat.shape[1:]
@@ -451,6 +439,7 @@ def prepare_distributed_dataset(
         def data_generator():
             while True:  # Make generator infinite to reset state between passes
                 # Acquire lock to check cleared status and capture data references
+                # Local references keep data alive even if clear() is called mid-epoch
                 with holder._lock:
                     if holder._cleared:
                         return  # Exit if data already cleared
@@ -459,19 +448,12 @@ def prepare_distributed_dataset(
                     true = holder.true
                     false = holder.false
 
-                # Work with local references (safe from clearing)
+                # Work with local references (safe from clearing, no per-sample lock needed)
                 indices = np.arange(len(concat))
                 if shuffle:
                     np.random.shuffle(indices)
                 for idx in indices:
-                    # Check cleared status before yielding
-                    with holder._lock:
-                        if holder._cleared:
-                            return  # Exit if data already cleared
-                    yield (
-                        (concat[idx], true[idx], false[idx]),
-                        concat[idx],
-                    )
+                    yield (concat[idx], true[idx], false[idx]), concat[idx]
 
         # Determine dataset output signature
         sample_shape = concat.shape[1:]
