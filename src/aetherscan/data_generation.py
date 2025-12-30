@@ -19,9 +19,9 @@ import numpy as np
 import setigen as stg
 from astropy import units as u
 
-from config import get_config
-from logger import init_worker_logging
-from manager import get_manager
+from aetherscan.config import get_config
+from aetherscan.logger import init_worker_logging
+from aetherscan.manager import get_manager
 
 logger = logging.getLogger(__name__)
 

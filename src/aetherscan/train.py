@@ -23,9 +23,9 @@ from matplotlib.gridspec import GridSpec
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
-from config import get_config
-from data_generation import DataGenerator
-from models import RandomForestModel, Sampling, create_beta_vae_model
+from aetherscan.config import get_config
+from aetherscan.data_generation import DataGenerator
+from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
 

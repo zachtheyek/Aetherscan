@@ -21,9 +21,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 import psutil
 
-from config import get_config
-from logger import get_logger
-from monitor import get_process_tree_stats
+from aetherscan.config import get_config
+from aetherscan.logger import get_logger
+from aetherscan.monitor import get_process_tree_stats
 
 logger = logging.getLogger(__name__)
 

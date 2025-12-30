@@ -1,9 +1,15 @@
-# TODO: Add build backend (use uv)
+# TODO: add build backend (uv)
 # TODO: How to release as package on PyPI & display on GitHub? How to tag new releases on GitHub?
+# [build-system]
+# requires = ["hatchling"]
+# build-backend = "hatchling.build"
+#
+# [tool.hatch.build.targets.wheel]
+# packages = ["src/aetherscan"]
 
 [project]
 name = "aetherscan"
-version = "0.1.0"  # TODO: update on v1 release, then sync version & release date with CITATION.cff
+version = "0.1.0"  # TODO: update on v1 release, then sync version & release date with CITATION.cff & src/aetherscan/__init__.py
 authors = [
     { name = "Zach Yek", email = "xiaoxiyek1.5@gmail.com" },
 ]
@@ -52,7 +58,7 @@ target-version = "py310"   # Target Python version
 line-length = 100          # Set maximum line length
 
 # Exclude directories from linting
-exclude = [  # TODO: partially sync with .gitignore
+exclude = [  # TODO: partially sync with .gitignore (local & global)
     ".claude",
     ".git",
     ".ipynb_checkpoints",
@@ -100,13 +106,7 @@ unfixable = []
 
 [tool.ruff.lint.isort]
 # Declare first-party imports (for sorting order)
-known-first-party = [  # TODO: sync with internal modules
-    "db",
-    "logger",
-    "manager",
-    "models",
-    "monitor",
-]
+known-first-party = ["aetherscan"]
 
 [tool.ruff.format]
 # Configure formatter

@@ -15,8 +15,8 @@ import pandas as pd
 import tensorflow as tf
 from numba import jit
 
-from models.random_forest import RandomForestModel
-from preprocessing import DataPreprocessor
+from aetherscan.models.random_forest import RandomForestModel
+from aetherscan.preprocessing import DataPreprocessor
 
 logger = logging.getLogger(__name__)
 

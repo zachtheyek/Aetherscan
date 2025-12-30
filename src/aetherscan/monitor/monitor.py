@@ -27,7 +27,7 @@ import tensorflow as tf
 
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
-from config import get_config
+from aetherscan.config import get_config
 
 logger = logging.getLogger(__name__)
 
