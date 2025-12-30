@@ -21,9 +21,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 import psutil
 
-from config import get_config
-from logger import get_logger
-from monitor import get_process_tree_stats
+from aetherscan.config import get_config
+from aetherscan.logger import get_logger
+from aetherscan.monitor import get_process_tree_stats
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +346,6 @@ class ResourceManager:
         # sys.exit(1): exit with failed termination status
         sys.exit(0)
 
-    # TEST: does cleanup_all() run properly for all scenarios? ✅: normal exit, ❓: ctrl+c during setup/multiprocessing/distributed training/other, sys.exit() from main.py, in between training retries
     def cleanup_all(self):
         """
         Unified cleanup of all resources.
@@ -398,7 +397,7 @@ class ResourceManager:
             logger.info("Shutting down monitor...")
             try:
                 # Late import to avoid circular dependency (monitor imports from manager)
-                from monitor import shutdown_monitor  # noqa: PLC0415
+                from aetherscan.monitor import shutdown_monitor  # noqa: PLC0415
 
                 shutdown_monitor()
             except Exception as e:
@@ -410,13 +409,14 @@ class ResourceManager:
             logger.info("Shutting down database...")
             try:
                 # Late import to avoid circular dependency (db imports from manager)
-                from db import shutdown_db  # noqa: PLC0415
+                from aetherscan.db import shutdown_db  # noqa: PLC0415
 
                 shutdown_db()
             except Exception as e:
                 with contextlib.suppress(Exception):
                     logger.error(f"Error during database shutdown: {e}")
 
+        # BUG: sometimes total_memory_freed_gb < 0
         # Log final stats
         final_memory = self._get_memory_usage()
         self.stats.total_memory_freed_gb = initial_memory - final_memory
@@ -436,7 +436,7 @@ class ResourceManager:
         if self._logger:
             with contextlib.suppress(Exception):
                 # Late import to avoid circular dependency (logger imports from manager)
-                from logger import shutdown_logger  # noqa: PLC0415
+                from aetherscan.logger import shutdown_logger  # noqa: PLC0415
 
                 shutdown_logger()
                 # Note, we can't log after stopping the listener thread, so no final message here

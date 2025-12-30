@@ -14,14 +14,14 @@ import time
 import numpy as np
 import tensorflow as tf
 
-from cli import apply_args_to_config, setup_argument_parser, validate_args
-from config import get_config, init_config
-from db import init_db
-from logger import init_logger
-from manager import get_manager, init_manager, register_logger
-from monitor import init_monitor
-from preprocessing import DataPreprocessor
-from train import get_latest_tag, train_full_pipeline
+from aetherscan.cli import apply_args_to_config, setup_argument_parser, validate_args
+from aetherscan.config import get_config, init_config
+from aetherscan.db import init_db
+from aetherscan.logger import init_logger
+from aetherscan.manager import get_manager, init_manager, register_logger
+from aetherscan.monitor import init_monitor
+from aetherscan.preprocessing import DataPreprocessor
+from aetherscan.train import get_latest_tag, train_full_pipeline
 
 logger = logging.getLogger(__name__)
 

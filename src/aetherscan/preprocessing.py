@@ -17,9 +17,9 @@ from multiprocessing.shared_memory import SharedMemory
 import numpy as np
 from skimage.transform import downscale_local_mean
 
-from config import get_config
-from logger import init_worker_logging
-from manager import get_manager
+from aetherscan.config import get_config
+from aetherscan.logger import init_worker_logging
+from aetherscan.manager import get_manager
 
 logger = logging.getLogger(__name__)
 

@@ -19,8 +19,8 @@ from contextlib import contextmanager
 from queue import Empty, Queue
 from typing import Any
 
-from config import get_config
-from manager import register_db
+from aetherscan.config import get_config
+from aetherscan.manager import register_db
 
 logger = logging.getLogger(__name__)
 

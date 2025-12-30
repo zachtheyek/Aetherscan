@@ -13,7 +13,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import shuffle
 
-from config import get_config
+from aetherscan.config import get_config
 
 logger = logging.getLogger(__name__)
 

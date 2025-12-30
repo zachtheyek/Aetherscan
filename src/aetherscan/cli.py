@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from config import get_config
+from aetherscan.config import get_config
 
 logger = logging.getLogger(__name__)
 

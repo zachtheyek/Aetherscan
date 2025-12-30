@@ -16,7 +16,7 @@ from tensorflow.keras import layers
 from tensorflow.keras.initializers import Constant, GlorotNormal, HeNormal, Zeros
 from tensorflow.keras.regularizers import l1, l2
 
-from config import get_config
+from aetherscan.config import get_config
 
 logger = logging.getLogger(__name__)
 

@@ -20,7 +20,7 @@ from multiprocessing import Queue
 
 import tensorflow as tf
 
-from config import get_config
+from aetherscan.config import get_config
 
 logger = logging.getLogger(__name__)
 
