@@ -303,8 +303,20 @@ def check_encoder_trained(encoder, threshold=0.2):
         return False
 
 
-# Create data holder objects (to be paired with generators)
-# Allows for explicit dereferencing of large arrays using DataHolder.clear()
+# TEST: resources are properly released on normal exits (between rounds) & emergency shutdown
+# Create data holder objects, to be paired with data generators, for TF's distributed datasets
+# Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
+# Python's garbage collector free up memory on-demand
+# Note, DataHolder.clear() is only useful at the end of an epoch, once indices have been exhausted,
+# since the data generators' local caches maintain references to the data until then
+# This is not an issue in our current implementation, where we only clear & reset resources at the
+# end of a round. However, if you require early exit behavior, you may want to remove the _lock and
+# use explicit _cleared() checks instead, which negates the need for local caches (see commit hash
+# 2a404a4). The trade-off being that you're at risk of race conditions if multiple threads attempt
+# to access/clear the DataHolder simultaneously. While this is not the case in our current
+# implementation, we opted for a more defensive approach rather than accomodating future design
+# patterns. As well, the data should not be modified once the DataHolder has been initialized to
+# prevent corrupted state in the DataHolder
 class DataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
@@ -409,6 +421,9 @@ def prepare_distributed_dataset(
                 for idx in indices:
                     yield (concat[idx], true[idx], false[idx]), concat[idx]
 
+                # Remove cache references for future garbage collection
+                del concat, true, false
+
         def val_generator():
             while True:  # Make generators infinite to reset state between epochs
                 # Acquire lock to check cleared status and capture data references
@@ -424,6 +439,9 @@ def prepare_distributed_dataset(
                 # Maintain order on each epoch since no gradients are calculated during validation
                 for idx in range(len(concat)):
                     yield (concat[idx], true[idx], false[idx]), concat[idx]
+
+                # Remove cache references for future garbage collection
+                del concat, true, false
 
         # Determine dataset output signature
         sample_shape = train_concat.shape[1:]
@@ -512,6 +530,9 @@ def prepare_distributed_dataset(
                     np.random.shuffle(indices)
                 for idx in indices:
                     yield (concat[idx], true[idx], false[idx]), concat[idx]
+
+                # Remove cache references for future garbage collection
+                del concat, true, false
 
         # Determine dataset output signature
         sample_shape = concat.shape[1:]
