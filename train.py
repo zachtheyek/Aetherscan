@@ -754,17 +754,24 @@ class TrainingPipeline:
         # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
         progress = round_idx / (total_rounds - 1)
 
+        # Linear progression from wide to narrow SNR range
         if schedule == "linear":
-            # Linear progression from wide to narrow SNR range
             current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
+        # Exponential decay - start easy, then get hard quickly
         elif schedule == "exponential":
-            # Exponential decay - start easy, then get hard quickly
-            current_range = final_snr_range + (initial_snr_range - final_snr_range) * np.exp(
-                decay_rate * progress
+            # Sanity check: validate decay_rate < 0 to avoid division by zero
+            if decay_rate >= 0:
+                raise ValueError(
+                    f"exponential_decay_rate must be < 0 for exponential schedule, got {decay_rate}"
+                )
+            # Normalize exponential to ensure exact endpoints at progress=0 and progress=1
+            decay_factor = (np.exp(decay_rate * progress) - np.exp(decay_rate)) / (
+                1 - np.exp(decay_rate)
             )
+            current_range = final_snr_range + (initial_snr_range - final_snr_range) * decay_factor
+        # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
+        # Step function - easy for first part, hard for second part
         elif schedule == "step":
-            # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
-            # Step function - easy for first part, hard for second part
             if round_idx < easy_rounds:
                 current_range = initial_snr_range
             elif round_idx - easy_rounds < hard_rounds:

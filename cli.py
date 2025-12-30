@@ -279,7 +279,7 @@ def _add_train_arguments(subparsers):
     )
     train_parser.add_argument(
         "--exponential-decay-rate",
-        type=int,
+        type=float,
         default=None,
         help="Decay rate for exponential curriculum schedule (must be negative; more negative = faster difficulty increase)",
     )
