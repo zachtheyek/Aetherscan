@@ -158,7 +158,7 @@ class ResourceMonitor:
 
         # Get database instance
         # Late import to avoid circular dependency (db imports from manager)
-        from db import get_db  # noqa: PLC0415
+        from aetherscan.db import get_db  # noqa: PLC0415
 
         self.db = get_db()
         if self.db is None:
@@ -615,7 +615,7 @@ def init_monitor() -> ResourceMonitor:
     monitor.start()
 
     # Late import to avoid circular dependency (manager imports from monitor)
-    from manager import register_monitor  # noqa: PLC0415
+    from aetherscan.manager import register_monitor  # noqa: PLC0415
 
     register_monitor(monitor)
 
