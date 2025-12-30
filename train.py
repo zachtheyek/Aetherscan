@@ -759,9 +759,11 @@ class TrainingPipeline:
             current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
         elif schedule == "exponential":
             # Exponential decay - start easy, then get hard quickly
-            current_range = final_snr_range + (initial_snr_range - final_snr_range) * np.exp(
-                decay_rate * progress
+            # Normalize exponential to ensure exact endpoints at progress=0 and progress=1
+            decay_factor = (np.exp(decay_rate * progress) - np.exp(decay_rate)) / (
+                1 - np.exp(decay_rate)
             )
+            current_range = final_snr_range + (initial_snr_range - final_snr_range) * decay_factor
         elif schedule == "step":
             # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
             # Step function - easy for first part, hard for second part
