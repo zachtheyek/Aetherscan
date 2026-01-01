@@ -1085,6 +1085,9 @@ class TrainingPipeline:
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
 
+        except Exception as e:
+            logger.error(f"Error in train_round(): {e}")
+
         # Run cleanup regardless if round finishes successfully or not
         finally:
             # Clear intermediate data
@@ -1218,6 +1221,9 @@ class TrainingPipeline:
 
             return epoch_losses
 
+        except Exception as e:
+            logger.error(f"Error in _train_epoch(): {e}")
+
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
             del iterator
@@ -1243,6 +1249,9 @@ class TrainingPipeline:
                 val_losses[key] /= steps
 
             return val_losses
+
+        except Exception as e:
+            logger.error(f"Error in _validate_epoch(): {e}")
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
@@ -1517,6 +1526,9 @@ class TrainingPipeline:
 
             logger.info("Random Forest training complete")
 
+        except Exception as e:
+            logger.error(f"Error in train_random_forest(): {e}")
+
         finally:
             del iterator
 
@@ -1769,6 +1781,9 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
         logger.info("Training complete!")
 
         return pipeline
+
+    except Exception as e:
+        logger.error(f"Error in train_full_pipeline(): {e}")
 
     finally:
         # Free shared resources before exiting
