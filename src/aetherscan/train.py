@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from datetime import datetime
 
 import matplotlib.lines as mlines
@@ -320,7 +321,7 @@ def check_encoder_trained(encoder, threshold=0.2):
 class DataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
-        # self._lock = threading.Lock()
+        self._lock = threading.Lock()
         self.concat = concat
         self.true = true
         self.false = false
