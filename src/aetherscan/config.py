@@ -152,7 +152,7 @@ class TrainingConfig:
     reduction_factor: float = 0.2  # 20% LR reduction
 
     # Fault tolerance params
-    max_retries: int = 5
+    max_retries: int = 3
     retry_delay: int = 60  # seconds
 
 
