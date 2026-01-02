@@ -85,7 +85,11 @@ def _init_worker(shm_name, shape, dtype):
         # per-process resources, even though they all refer to the same underlying POSIX shm object
         with contextlib.suppress(Exception):
             if _GLOBAL_SHM is not None:
-                # TEST:
+                # WARN: DO NOT LOG ANYTHING ON CLEANUP!
+                # Any calls to logger will attempt to put a message onto QueueHandler, whose feeder
+                # thread needs the GIL to transfer data to the underlying pipe. However, the main
+                # process may be holding the GIL (e.g. TF's prefetch threads during training)
+                # This causes deadlocks, preventing workers from completing their SIGTERM handlers
                 # logger.info(f"Closing shared memory file descriptor in worker PID {os.getpid()}")
                 _GLOBAL_SHM.close()
 
@@ -480,6 +484,7 @@ def batch_create_cadence(
         # Use pool to generate cadences in parallel
         for i, result in enumerate(
             # NOTE: does return order matter?
+            # pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
             pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):

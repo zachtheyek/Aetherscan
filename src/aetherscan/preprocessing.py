@@ -79,7 +79,11 @@ def _init_worker(shm_name, shape, dtype):
         # per-process resources, even though they all refer to the same underlying POSIX shm object
         with contextlib.suppress(Exception):
             if _GLOBAL_SHM is not None:
-                # TEST:
+                # WARN: DO NOT LOG ANYTHING ON CLEANUP!
+                # Any calls to logger will attempt to put a message onto QueueHandler, whose feeder
+                # thread needs the GIL to transfer data to the underlying pipe. However, the main
+                # process may be holding the GIL (e.g. TF's prefetch threads during training)
+                # This causes deadlocks, preventing workers from completing their SIGTERM handlers
                 # logger.info(f"Closing shared memory file descriptor in worker PID {os.getpid()}")
                 _GLOBAL_SHM.close()
 
@@ -277,6 +281,7 @@ class DataPreprocessor:
                     chunksize = max(1, n_cadences // (n_workers * chunks_per_worker))
                     # NOTE: does return order matter?
                     results = chunk_pool.map(_downsample_worker, args_list, chunksize=chunksize)
+                    # results = chunk_pool.imap(_downsample_worker, args_list, chunksize=chunksize)
                     # results = chunk_pool.imap_unordered(
                     #     _downsample_worker, args_list, chunksize=chunksize
                     # )
