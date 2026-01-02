@@ -1060,6 +1060,7 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
+            # TEST: does not resetting make data generation faster?
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
@@ -1503,6 +1504,7 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
+            # TEST: does not resetting make data generation faster?
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
