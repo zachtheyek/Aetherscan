@@ -1104,7 +1104,7 @@ class TrainingPipeline:
             # TEST:
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
-            # self.data_generator.reset_managed_pool()
+            self.data_generator.reset_managed_pool()
 
             gc.collect()
 
@@ -1544,7 +1544,7 @@ class TrainingPipeline:
 
             # TEST:
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
-            # self.data_generator.reset_managed_pool()
+            self.data_generator.reset_managed_pool()
 
             del true_latents, false_latents
             gc.collect()
