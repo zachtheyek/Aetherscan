@@ -651,15 +651,17 @@ class TrainingPipeline:
 
             # TODO: replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
             # Setup TensorBoard logging
-            self._setup_tensorboard_logging()
+            # COMMENTED OUT: Removing TensorBoard support
+            # self._setup_tensorboard_logging()
 
     # TODO: delete this method once tensorboard logging is removed
-    def __del__(self):
-        """Cleanup TensorBoard writers and data generator"""
-        if hasattr(self, "train_writer"):
-            self.train_writer.close()
-        if hasattr(self, "val_writer"):
-            self.val_writer.close()
+    # COMMENTED OUT: Removing TensorBoard support
+    # def __del__(self):
+    #     """Cleanup TensorBoard writers and data generator"""
+    #     if hasattr(self, "train_writer"):
+    #         self.train_writer.close()
+    #     if hasattr(self, "val_writer"):
+    #         self.val_writer.close()
 
     def _build_optimizer(self):
         """
@@ -707,32 +709,33 @@ class TrainingPipeline:
 
         logger.info("Setup directories complete")
 
-    def _setup_tensorboard_logging(self):
-        """Setup TensorBoard logging"""
-        logger.info("Setting up TensorBoard logging")
-
-        start_round = self.config.checkpoint.start_round
-
-        logs_dir = os.path.join(self.config.output_path, "logs")
-        handle_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
-
-        self.global_step = (start_round - 1) * self.config.training.epochs_per_round
-        if start_round == 1:
-            logger.info("Starting fresh TensorBoard logs")
-        else:
-            logger.info(
-                f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})"
-            )
-
-        # Create TensorBoard writers
-        train_log_dir = os.path.join(logs_dir, "train")
-        val_log_dir = os.path.join(logs_dir, "validation")
-
-        self.train_writer = tf.summary.create_file_writer(train_log_dir)
-        self.val_writer = tf.summary.create_file_writer(val_log_dir)
-
-        logger.info(f"TensorBoard logs directory: {logs_dir}")
-        logger.info(f"Initial global_step: {self.global_step}")
+    # COMMENTED OUT: Removing TensorBoard support
+    # def _setup_tensorboard_logging(self):
+    #     """Setup TensorBoard logging"""
+    #     logger.info("Setting up TensorBoard logging")
+    #
+    #     start_round = self.config.checkpoint.start_round
+    #
+    #     logs_dir = os.path.join(self.config.output_path, "logs")
+    #     handle_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
+    #
+    #     self.global_step = (start_round - 1) * self.config.training.epochs_per_round
+    #     if start_round == 1:
+    #         logger.info("Starting fresh TensorBoard logs")
+    #     else:
+    #         logger.info(
+    #             f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})"
+    #         )
+    #
+    #     # Create TensorBoard writers
+    #     train_log_dir = os.path.join(logs_dir, "train")
+    #     val_log_dir = os.path.join(logs_dir, "validation")
+    #
+    #     self.train_writer = tf.summary.create_file_writer(train_log_dir)
+    #     self.val_writer = tf.summary.create_file_writer(val_log_dir)
+    #
+    #     logger.info(f"TensorBoard logs directory: {logs_dir}")
+    #     logger.info(f"Initial global_step: {self.global_step}")
 
     def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
         """
@@ -992,43 +995,44 @@ class TrainingPipeline:
                 )
 
                 # TensorBoard logging
-                with self.train_writer.as_default():
-                    tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
-                    tf.summary.scalar(
-                        "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
-                    )
-                    tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
-                    tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
-                    tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
-                    tf.summary.scalar(
-                        "learning_rate",
-                        self.vae.optimizer.learning_rate.numpy(),
-                        step=self.global_step,
-                    )
-
-                with self.val_writer.as_default():
-                    tf.summary.scalar(
-                        "validation_total_loss", val_losses["total"], step=self.global_step
-                    )
-                    tf.summary.scalar(
-                        "validation_reconstruction_loss",
-                        val_losses["reconstruction"],
-                        step=self.global_step,
-                    )
-                    tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
-                    tf.summary.scalar(
-                        "validation_true_loss", val_losses["true"], step=self.global_step
-                    )
-                    tf.summary.scalar(
-                        "validation_false_loss", val_losses["false"], step=self.global_step
-                    )
-
-                # Flush writers to ensure data is written
-                self.train_writer.flush()
-                self.val_writer.flush()
-
-                # Increment global step
-                self.global_step += 1
+                # COMMENTED OUT: Removing TensorBoard support
+                # with self.train_writer.as_default():
+                #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
+                #     tf.summary.scalar(
+                #         "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
+                #     )
+                #     tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
+                #     tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
+                #     tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
+                #     tf.summary.scalar(
+                #         "learning_rate",
+                #         self.vae.optimizer.learning_rate.numpy(),
+                #         step=self.global_step,
+                #     )
+                #
+                # with self.val_writer.as_default():
+                #     tf.summary.scalar(
+                #         "validation_total_loss", val_losses["total"], step=self.global_step
+                #     )
+                #     tf.summary.scalar(
+                #         "validation_reconstruction_loss",
+                #         val_losses["reconstruction"],
+                #         step=self.global_step,
+                #     )
+                #     tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
+                #     tf.summary.scalar(
+                #         "validation_true_loss", val_losses["true"], step=self.global_step
+                #     )
+                #     tf.summary.scalar(
+                #         "validation_false_loss", val_losses["false"], step=self.global_step
+                #     )
+                #
+                # # Flush writers to ensure data is written
+                # self.train_writer.flush()
+                # self.val_writer.flush()
+                #
+                # # Increment global step
+                # self.global_step += 1
 
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
