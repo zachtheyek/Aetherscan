@@ -30,8 +30,11 @@ from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 logger = logging.getLogger(__name__)
 
 
-# TODO: simplify this to exclude tensorboard setup & rename to archive_directories()
-def handle_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
+# NOTE: Removing TensorBoard support
+# archive_directory() includes (incomplete) functionality for setting up & handling
+# TensorBoard directories. unless you're reviving TensorBoard support, simply leave target_dirs as
+# None to use the function as "normal"
+def archive_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
     """
     Archive and clean up a directory
 
@@ -649,17 +652,17 @@ class TrainingPipeline:
             # Setup directories
             self._setup_directories()
 
-            # TODO: replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
+            # COMMENTED OUT: Removing TensorBoard support
             # Setup TensorBoard logging
-            self._setup_tensorboard_logging()
+            # self._setup_tensorboard_logging()
 
-    # TODO: delete this method once tensorboard logging is removed
-    def __del__(self):
-        """Cleanup TensorBoard writers and data generator"""
-        if hasattr(self, "train_writer"):
-            self.train_writer.close()
-        if hasattr(self, "val_writer"):
-            self.val_writer.close()
+    # COMMENTED OUT: Removing TensorBoard support
+    # def __del__(self):
+    #     """Cleanup TensorBoard writers and data generator"""
+    #     if hasattr(self, "train_writer"):
+    #         self.train_writer.close()
+    #     if hasattr(self, "val_writer"):
+    #         self.val_writer.close()
 
     def _build_optimizer(self):
         """
@@ -700,39 +703,40 @@ class TrainingPipeline:
         start_round = self.config.checkpoint.start_round
 
         model_checkpoints_dir = os.path.join(self.config.model_path, "checkpoints")
-        handle_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
+        archive_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
 
         plot_checkpoints_dir = os.path.join(self.config.output_path, "plots", "checkpoints")
-        handle_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
+        archive_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
 
         logger.info("Setup directories complete")
 
-    def _setup_tensorboard_logging(self):
-        """Setup TensorBoard logging"""
-        logger.info("Setting up TensorBoard logging")
-
-        start_round = self.config.checkpoint.start_round
-
-        logs_dir = os.path.join(self.config.output_path, "logs")
-        handle_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
-
-        self.global_step = (start_round - 1) * self.config.training.epochs_per_round
-        if start_round == 1:
-            logger.info("Starting fresh TensorBoard logs")
-        else:
-            logger.info(
-                f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})"
-            )
-
-        # Create TensorBoard writers
-        train_log_dir = os.path.join(logs_dir, "train")
-        val_log_dir = os.path.join(logs_dir, "validation")
-
-        self.train_writer = tf.summary.create_file_writer(train_log_dir)
-        self.val_writer = tf.summary.create_file_writer(val_log_dir)
-
-        logger.info(f"TensorBoard logs directory: {logs_dir}")
-        logger.info(f"Initial global_step: {self.global_step}")
+    # COMMENTED OUT: Removing TensorBoard support
+    # def _setup_tensorboard_logging(self):
+    #     """Setup TensorBoard logging"""
+    #     logger.info("Setting up TensorBoard logging")
+    #
+    #     start_round = self.config.checkpoint.start_round
+    #
+    #     logs_dir = os.path.join(self.config.output_path, "logs")
+    #     archive_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
+    #
+    #     self.global_step = (start_round - 1) * self.config.training.epochs_per_round
+    #     if start_round == 1:
+    #         logger.info("Starting fresh TensorBoard logs")
+    #     else:
+    #         logger.info(
+    #             f"Resuming TensorBoard logs from step {self.global_step} (round {start_round})"
+    #         )
+    #
+    #     # Create TensorBoard writers
+    #     train_log_dir = os.path.join(logs_dir, "train")
+    #     val_log_dir = os.path.join(logs_dir, "validation")
+    #
+    #     self.train_writer = tf.summary.create_file_writer(train_log_dir)
+    #     self.val_writer = tf.summary.create_file_writer(val_log_dir)
+    #
+    #     logger.info(f"TensorBoard logs directory: {logs_dir}")
+    #     logger.info(f"Initial global_step: {self.global_step}")
 
     def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
         """
@@ -991,44 +995,45 @@ class TrainingPipeline:
                     float(self.vae.optimizer.learning_rate.numpy())
                 )
 
+                # COMMENTED OUT: Removing TensorBoard support
                 # TensorBoard logging
-                with self.train_writer.as_default():
-                    tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
-                    tf.summary.scalar(
-                        "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
-                    )
-                    tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
-                    tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
-                    tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
-                    tf.summary.scalar(
-                        "learning_rate",
-                        self.vae.optimizer.learning_rate.numpy(),
-                        step=self.global_step,
-                    )
-
-                with self.val_writer.as_default():
-                    tf.summary.scalar(
-                        "validation_total_loss", val_losses["total"], step=self.global_step
-                    )
-                    tf.summary.scalar(
-                        "validation_reconstruction_loss",
-                        val_losses["reconstruction"],
-                        step=self.global_step,
-                    )
-                    tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
-                    tf.summary.scalar(
-                        "validation_true_loss", val_losses["true"], step=self.global_step
-                    )
-                    tf.summary.scalar(
-                        "validation_false_loss", val_losses["false"], step=self.global_step
-                    )
-
-                # Flush writers to ensure data is written
-                self.train_writer.flush()
-                self.val_writer.flush()
-
-                # Increment global step
-                self.global_step += 1
+                # with self.train_writer.as_default():
+                #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
+                #     tf.summary.scalar(
+                #         "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
+                #     )
+                #     tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
+                #     tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
+                #     tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
+                #     tf.summary.scalar(
+                #         "learning_rate",
+                #         self.vae.optimizer.learning_rate.numpy(),
+                #         step=self.global_step,
+                #     )
+                #
+                # with self.val_writer.as_default():
+                #     tf.summary.scalar(
+                #         "validation_total_loss", val_losses["total"], step=self.global_step
+                #     )
+                #     tf.summary.scalar(
+                #         "validation_reconstruction_loss",
+                #         val_losses["reconstruction"],
+                #         step=self.global_step,
+                #     )
+                #     tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
+                #     tf.summary.scalar(
+                #         "validation_true_loss", val_losses["true"], step=self.global_step
+                #     )
+                #     tf.summary.scalar(
+                #         "validation_false_loss", val_losses["false"], step=self.global_step
+                #     )
+                #
+                # # Flush writers to ensure data is written
+                # self.train_writer.flush()
+                # self.val_writer.flush()
+                #
+                # # Increment global step
+                # self.global_step += 1
 
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
@@ -1350,7 +1355,13 @@ class TrainingPipeline:
             logger.info("Random Forest classifier already trained. Exiting training loop.")
             return
 
-        # BUG: edge case where if save-tag was already used in the past, train_random_forest() will load previous model weights to train RF, since pipeline.save_models() happens after pipeline.train_random_forest(). add a check to validate_args() to make sure save-tag is distinct?
+        # # BUG:
+        # # edge case where if save-tag was already used in the past, train_random_forest() will
+        # # load previous model weights to train RF, since pipeline.save_models() happens after
+        # # pipeline.train_random_forest()
+        # # add a check to validate_args() to make sure save-tag is distinct?
+        # # note, should only be a problem during testing, since load_models() only runs if
+        # # check_encoder_trained() fails
         # Load encoder weights if untrained
         logger.info("Checking if encoder weights appear trained")
 
