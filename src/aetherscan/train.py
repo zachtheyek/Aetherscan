@@ -1529,6 +1529,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error in train_random_forest(): {e}")
+            raise
 
         finally:
             del iterator
