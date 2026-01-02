@@ -30,8 +30,11 @@ from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 logger = logging.getLogger(__name__)
 
 
-# TODO: simplify this to exclude tensorboard setup & rename to archive_directories()
-def handle_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
+# NOTE: Removing TensorBoard support
+# archive_directory() includes (incomplete) functionality for setting up & handling
+# TensorBoard directories. unless you're reviving TensorBoard support, simply leave target_dirs as
+# None to use the function as "normal"
+def archive_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
     """
     Archive and clean up a directory
 
@@ -649,12 +652,10 @@ class TrainingPipeline:
             # Setup directories
             self._setup_directories()
 
-            # TODO: replace tensorboard logging with db writes + checkpoint plots? (search for all _setup_tensorboard_logging() & self.global_step instances)
-            # Setup TensorBoard logging
             # COMMENTED OUT: Removing TensorBoard support
+            # Setup TensorBoard logging
             # self._setup_tensorboard_logging()
 
-    # TODO: delete this method once tensorboard logging is removed
     # COMMENTED OUT: Removing TensorBoard support
     # def __del__(self):
     #     """Cleanup TensorBoard writers and data generator"""
@@ -702,10 +703,10 @@ class TrainingPipeline:
         start_round = self.config.checkpoint.start_round
 
         model_checkpoints_dir = os.path.join(self.config.model_path, "checkpoints")
-        handle_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
+        archive_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
 
         plot_checkpoints_dir = os.path.join(self.config.output_path, "plots", "checkpoints")
-        handle_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
+        archive_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
 
         logger.info("Setup directories complete")
 
@@ -717,7 +718,7 @@ class TrainingPipeline:
     #     start_round = self.config.checkpoint.start_round
     #
     #     logs_dir = os.path.join(self.config.output_path, "logs")
-    #     handle_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
+    #     archive_directory(logs_dir, target_dirs=["train", "validation"], round_num=start_round)
     #
     #     self.global_step = (start_round - 1) * self.config.training.epochs_per_round
     #     if start_round == 1:
@@ -994,8 +995,8 @@ class TrainingPipeline:
                     float(self.vae.optimizer.learning_rate.numpy())
                 )
 
-                # TensorBoard logging
                 # COMMENTED OUT: Removing TensorBoard support
+                # TensorBoard logging
                 # with self.train_writer.as_default():
                 #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
                 #     tf.summary.scalar(
