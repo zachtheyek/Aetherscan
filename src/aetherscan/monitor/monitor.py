@@ -15,6 +15,7 @@ import contextlib
 import gc
 import logging
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -457,7 +458,12 @@ class ResourceMonitor:
 
         # Create figure with 3 subplots
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
-        fig.suptitle("Aetherscan Pipeline: Resource Utilization", fontsize=16, fontweight="bold")
+        machine_name = socket.gethostname()
+        fig.suptitle(
+            f"Aetherscan Pipeline: Resource Utilization ({machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
 
         # CPU plot
         ax_cpu = axes[0]
