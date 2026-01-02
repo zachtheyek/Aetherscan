@@ -31,7 +31,7 @@ class ManagerConfig:
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     # NOTE: should we move chunks_per_worker to TrainingConfig() and make it specific to preproc/data_gen?
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    pool_terminate_timeout: float = 10.0  # seconds
+    pool_terminate_timeout: float = 10.0  # seconds (actual timeout may be 2x from terminate + join)
 
 
 @dataclass
