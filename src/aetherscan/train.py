@@ -624,6 +624,8 @@ class TrainingPipeline:
             self.config.checkpoint.load_tag = None
             self.config.checkpoint.start_round = 1
 
+            raise  # Re-raise to propagate error
+
         finally:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
             # since fault tolerance expects a clean directory structure
@@ -1044,6 +1046,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error in train_round(): {e}")
+            raise  # Re-raise to propagate error
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
@@ -1119,13 +1122,13 @@ class TrainingPipeline:
                         logger.error(
                             f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}"
                         )
-                        raise
+                        raise  # Re-raise to propagate error
 
                     except Exception as e:
                         logger.error(
                             f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
                         )
-                        raise
+                        raise  # Re-raise to propagate error
 
                 # Sanity check: verify that gradient accumulation was successful
                 if accumulated_gradients is None or successful_accumulations == 0:
@@ -1179,6 +1182,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error in _train_epoch(): {e}")
+            raise  # Re-raise to propagate error
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
@@ -1208,6 +1212,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error in _validate_epoch(): {e}")
+            raise  # Re-raise to propagate error
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
@@ -1484,7 +1489,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error in train_random_forest(): {e}")
-            raise  # Re-raise to propagate to train_full_pipeline()
+            raise  # Re-raise to propagate error
 
         finally:
             del iterator
@@ -1704,7 +1709,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
-            raise
+            raise  # Re-raise to propagate error
 
 
 def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingPipeline:
@@ -1740,6 +1745,7 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
 
     except Exception as e:
         logger.error(f"Error in train_full_pipeline(): {e}")
+        raise  # Re-raise to propagate error
 
     finally:
         # Free shared resources before exiting
