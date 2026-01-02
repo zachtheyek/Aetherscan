@@ -85,7 +85,8 @@ def _init_worker(shm_name, shape, dtype):
         # per-process resources, even though they all refer to the same underlying POSIX shm object
         with contextlib.suppress(Exception):
             if _GLOBAL_SHM is not None:
-                logger.info(f"Closing shared memory file descriptor in worker PID {os.getpid()}")
+                # TEST:
+                # logger.info(f"Closing shared memory file descriptor in worker PID {os.getpid()}")
                 _GLOBAL_SHM.close()
 
         # Restore default handler and re-raise SIGTERM to resume termination
