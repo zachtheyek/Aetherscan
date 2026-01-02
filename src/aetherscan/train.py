@@ -303,8 +303,6 @@ def check_encoder_trained(encoder, threshold=0.2):
         return False
 
 
-# NOTE: removing thread locking temporarily since it's interfering with DataGen pool reset
-# TEST: resources are properly released on normal exits (between rounds) & emergency shutdown
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
 # Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
 # Python's garbage collector free up memory on-demand
@@ -318,6 +316,12 @@ def check_encoder_trained(encoder, threshold=0.2):
 # implementation, we opted for a more defensive approach rather than accomodating future design
 # patterns. As well, the data should not be modified once the DataHolder has been initialized to
 # prevent corrupted state in the DataHolder
+# Note, there's a potential deadlock issue with DataHolder's lock contention
+# Since the generators acquire locks at the start of every loop iteration, if TF's prefetch threads
+# (.prefetch(tf.data.AUTOTUNE)) are blocked waiting on this lock while the main thread is trying to
+# call self.data_generator.clear() (which also needs the lock), there could be contention.
+# This has not been an issue so far, but if you encounter this in the future, pls update this
+# comment with your findings
 class DataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
@@ -334,13 +338,6 @@ class DataHolder:
             self.concat = None
             self.true = None
             self.false = None
-
-        # if self._cleared:
-        #     return
-        # self._cleared = True
-        # self.concat = None
-        # self.true = None
-        # self.false = None
 
 
 # TODO: split if-else branches into prepare_distributed_train_dataset & prepare_distributed_inference_dataset
@@ -432,21 +429,6 @@ def prepare_distributed_dataset(
                 # Remove cache references for future garbage collection
                 del concat, true, false
 
-                # # NOTE: removing thread locking & caching temporarily since it's interfering with DataGen pool reset
-                # if train_holder._cleared:
-                #     return  # Exit if data already cleared
-                # indices = np.arange(len(train_holder.concat))
-                # if shuffle:
-                #     # Perform global shuffle on each epoch so each pass through the data is unique
-                #     np.random.shuffle(indices)
-                # for idx in indices:
-                #     if train_holder._cleared:
-                #         return  # Exit if data already cleared
-                #     yield (
-                #         (train_holder.concat[idx], train_holder.true[idx], train_holder.false[idx]),
-                #         train_holder.concat[idx],
-                #     )
-
         def val_generator():
             while True:  # Make generators infinite to reset state between epochs
                 # Acquire lock to check cleared status and capture data references
@@ -465,18 +447,6 @@ def prepare_distributed_dataset(
 
                 # Remove cache references for future garbage collection
                 del concat, true, false
-
-                # # NOTE: removing thread locking & caching temporarily since it's interfering with DataGen pool reset
-                # if val_holder._cleared:
-                #     return  # Exit if data already cleared
-                # # Maintain order on each epoch since no gradients are calculated during validation
-                # for idx in range(len(val_holder.concat)):
-                #     if val_holder._cleared:
-                #         return  # Exit if data already cleared
-                #     yield (
-                #         (val_holder.concat[idx], val_holder.true[idx], val_holder.false[idx]),
-                #         val_holder.concat[idx],
-                #     )
 
         # Determine dataset output signature
         sample_shape = train_concat.shape[1:]
@@ -568,20 +538,6 @@ def prepare_distributed_dataset(
 
                 # Remove cache references for future garbage collection
                 del concat, true, false
-
-                # # NOTE: removing thread locking & caching temporarily since it's interfering with DataGen pool reset
-                # if holder._cleared:
-                #     return  # Exit if data already cleared
-                # indices = np.arange(len(holder.concat))
-                # if shuffle:
-                #     np.random.shuffle(indices)
-                # for idx in indices:
-                #     if holder._cleared:
-                #         return  # Exit if data already cleared
-                #     yield (
-                #         (holder.concat[idx], holder.true[idx], holder.false[idx]),
-                #         holder.concat[idx],
-                #     )
 
         # Determine dataset output signature
         sample_shape = concat.shape[1:]
@@ -1101,7 +1057,6 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
-            # TEST:
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
@@ -1529,7 +1484,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error in train_random_forest(): {e}")
-            raise
+            raise  # Re-raise to propagate to train_full_pipeline()
 
         finally:
             del iterator
@@ -1543,7 +1498,6 @@ class TrainingPipeline:
             tf.keras.backend.clear_session()
             logger.info("Cleared TensorFlow session state")
 
-            # TEST:
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
