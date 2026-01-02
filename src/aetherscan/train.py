@@ -1594,7 +1594,10 @@ class TrainingPipeline:
             shadow=True,
         )
 
-        plt.tight_layout()
+        # TEST: does the following warning go away.
+        # UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+        # plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
 
         # Save plot
         if tag is None:
