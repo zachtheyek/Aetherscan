@@ -384,7 +384,7 @@ def main():
         # Exit code 2 = command line syntax error (standard for CLI tools)
         if e.code == 2:  # argparse error (syntax/type error)
             # Print help message & exit if parse_args() fails
-            # Note, argeparse prints its own error message, but we call print_help() again
+            # Note, argparse prints its own error message, but we call print_help() again
             # just to be safe
             parser.print_help()
             logger.error("Invalid CLI arguments received")
