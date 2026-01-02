@@ -303,7 +303,6 @@ def check_encoder_trained(encoder, threshold=0.2):
         return False
 
 
-# TEST: resources are properly released on normal exits (between rounds) & emergency shutdown
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
 # Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
 # Python's garbage collector free up memory on-demand
@@ -317,6 +316,12 @@ def check_encoder_trained(encoder, threshold=0.2):
 # implementation, we opted for a more defensive approach rather than accomodating future design
 # patterns. As well, the data should not be modified once the DataHolder has been initialized to
 # prevent corrupted state in the DataHolder
+# Note, there's a potential deadlock issue with DataHolder's lock contention
+# Since the generators acquire locks at the start of every loop iteration, if TF's prefetch threads
+# (.prefetch(tf.data.AUTOTUNE)) are blocked waiting on this lock while the main thread is trying to
+# call self.data_generator.clear() (which also needs the lock), there could be contention.
+# This has not been an issue so far, but if you encounter this in the future, pls update this
+# comment with your findings
 class DataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
@@ -618,6 +623,8 @@ class TrainingPipeline:
             self.config.checkpoint.load_dir = None
             self.config.checkpoint.load_tag = None
             self.config.checkpoint.start_round = 1
+
+            raise  # Re-raise to propagate error
 
         finally:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
@@ -1037,6 +1044,10 @@ class TrainingPipeline:
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
 
+        except Exception as e:
+            logger.error(f"Error in train_round(): {e}")
+            raise  # Re-raise to propagate error
+
         # Run cleanup regardless if round finishes successfully or not
         finally:
             # Clear intermediate data
@@ -1111,13 +1122,13 @@ class TrainingPipeline:
                         logger.error(
                             f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}"
                         )
-                        raise
+                        raise  # Re-raise to propagate error
 
                     except Exception as e:
                         logger.error(
                             f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
                         )
-                        raise
+                        raise  # Re-raise to propagate error
 
                 # Sanity check: verify that gradient accumulation was successful
                 if accumulated_gradients is None or successful_accumulations == 0:
@@ -1169,6 +1180,10 @@ class TrainingPipeline:
 
             return epoch_losses
 
+        except Exception as e:
+            logger.error(f"Error in _train_epoch(): {e}")
+            raise  # Re-raise to propagate error
+
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
             del iterator
@@ -1194,6 +1209,10 @@ class TrainingPipeline:
                 val_losses[key] /= steps
 
             return val_losses
+
+        except Exception as e:
+            logger.error(f"Error in _validate_epoch(): {e}")
+            raise  # Re-raise to propagate error
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
@@ -1468,6 +1487,10 @@ class TrainingPipeline:
 
             logger.info("Random Forest training complete")
 
+        except Exception as e:
+            logger.error(f"Error in train_random_forest(): {e}")
+            raise  # Re-raise to propagate error
+
         finally:
             del iterator
 
@@ -1686,7 +1709,7 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
-            raise
+            raise  # Re-raise to propagate error
 
 
 def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingPipeline:
@@ -1719,6 +1742,10 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
         logger.info("Training complete!")
 
         return pipeline
+
+    except Exception as e:
+        logger.error(f"Error in train_full_pipeline(): {e}")
+        raise  # Re-raise to propagate error
 
     finally:
         # Free shared resources before exiting

@@ -383,9 +383,12 @@ def main():
         # which is why we catch with SystemExit instead of Exception
         # Exit code 2 = command line syntax error (standard for CLI tools)
         if e.code == 2:  # argparse error (syntax/type error)
+            # Print help message & exit if parse_args() fails
+            # Note, argparse prints its own error message, but we call print_help() again
+            # just to be safe
+            parser.print_help()
             logger.error("Invalid CLI arguments received")
             logger.error("See usage")
-            # Note, argparse already prints error message, no need to print_help() again
         # Here, we simply let the original traceback propagate by re-raising
         # so cleanup handlers still run via atexit
         raise
@@ -446,7 +449,8 @@ def main():
         # Explicitly call cleanup_all() before exiting to avoid deadlock
         # Without this, non-daemon threads block sys.exit() from running atexit handlers (race condition)
         # NOTE: do the other sys.exit() calls in main.py get blocked by non-daemon threads as well?
-        manager = get_manager()
+        # BUG: sys.exit() calls DO get blocked. directly call manager.cleanup_all() instead
+        manager = get_manager()  # NOTE: is this needed? since manager initialized in main?
         if manager:
             manager.cleanup_all()
 

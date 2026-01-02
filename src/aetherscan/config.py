@@ -31,7 +31,7 @@ class ManagerConfig:
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     # NOTE: should we move chunks_per_worker to TrainingConfig() and make it specific to preproc/data_gen?
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    pool_terminate_timeout: float = 10.0  # seconds
+    pool_terminate_timeout: float = 10.0  # seconds (actual timeout may be 2x from terminate + join)
 
 
 @dataclass
@@ -90,9 +90,9 @@ class DataConfig:
     # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
     # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file) (how to track chunk processing efficiency)
     background_load_chunk_size: int = (
-        1000  # Maximum cadences to process at once during background loading
+        5000  # Maximum cadences to process at once during background loading
     )
-    max_chunks_per_file: int = 5  # Maximum chunks to load from a single file
+    max_chunks_per_file: int = 1  # Maximum chunks to load from a single file
 
     # Data files
     # Note, Python dataclasses don't allow mutable objects (e.g. lists) to be used as defaults,

@@ -56,49 +56,72 @@ class ManagedPool:
             return
 
         try:
-            logger.info(f"Forcefully terminating pool '{self.name}'")
+            logger.info(f"Terminating pool '{self.name}'")
 
             # NOTE: does terminating instead of closing lead to any issues with corrupted db writes?
-            # Forcefully kill all running processes & clear internal job queues with .terminate()
-            # Then, wait for parent to finish handling dead processes,
-            # and exit & close the pool with .join()
+            # Forcefully kill all running processes & clear internal job queues with pool.terminate()
+            # Then, wait for parent to finish handling dead processes, and exit & close the pool
+            # with pool.join()
             # Note, less forceful alternative is to use self.pool.close()
             # Which stops accepting new jobs, but lets running processes finish current job queue
             # Don't use both! Better to "terminate or fail". Inconsistent states are worse than leaks
-            self.pool.terminate()
+            # We wrap both terminate() and join() in daemon threads with timeout as a defensive
+            # measure against blocking on exit or hanging indefinitely
+            # If the thread timeout is exceeded, force-kill surviving workers
 
-            # For .join(), we wrap the call in a daemon thread with timeout
-            # so it doesn't block on exit or hang indefinitely
+            # Send SIGTERM to workers
+            terminate_thread = threading.Thread(target=self.pool.terminate, daemon=True)
+            terminate_thread.start()
+            terminate_thread.join(timeout=timeout)
+
+            if terminate_thread.is_alive():
+                logger.warning(f"Pool '{self.name}' terminate() timed out, escalating to SIGKILL")
+                self._force_kill_workers()
+                # NOTE: 0.1 seems arbitrary & can potentially add latency to shutdown. is there a more precise wall we can use?
+                time.sleep(0.1)  # Brief wait for SIGKILL to take effect
+
+            # Join to reap processes & clean up Pool internals
+            # Should be fast if workers are dead (either from SIGTERM or SIGKILL)
             join_thread = threading.Thread(target=self.pool.join, daemon=True)
             join_thread.start()
             join_thread.join(timeout=timeout)
 
-            # If timeout exceeded, force-kill survivors
             if join_thread.is_alive():
-                logger.warning(f"Pool '{self.name}' join timeout exceeded")
-                logger.info("Force-killing remaining worker processes with SIGKILL")
-                self._force_kill_workers()
-                # NOTE: 0.2 seems arbitrary & can potentially add latency to shutdown. is there a more precise wall we can use?
-                time.sleep(0.2)  # Brief wait for SIGKILL to take effect
+                # join() hanging after workers should be dead indicates Pool internal thread issues
+                # (feeder thread, result handler) - SIGKILL on workers won't help here, so just log
+                # a warning & move on
+                logger.warning(
+                    f"Pool '{self.name}' join() timed out (Pool internal threads may be stuck)"
+                )
 
-            # Verify cleanup
+            # Verify workers are gone
             if self._check_alive():
-                logger.error(f"Pool '{self.name}' workers still alive after SIGKILL!")
-                # At this point, we proceed anyway instead of raising
-                # The OS should clean up on process exit
-                # NOTE: is it safe to just ignore workers that survive SIGKILL? will self.closed = True lead to issues down the line?
+                logger.warning(f"Pool '{self.name}' workers still alive, forcing SIGKILL")
+                self._force_kill_workers()
+                # NOTE: 0.1 seems arbitrary & can potentially add latency to shutdown. is there a more precise wall we can use?
+                time.sleep(0.1)  # Brief wait for SIGKILL to take effect
+
+                # Verify again after SIGKILL
+                if self._check_alive():
+                    # Workers surviving SIGKILL is extremely rare (only possible with
+                    # uninterruptible sleep state 'D'). Log and proceed -- OS will clean up on exit
+                    # NOTE: will self.closed = True on repeated failure lead to downstream issues?
+                    logger.error(
+                        f"Pool '{self.name}' workers survived SIGKILL (uninterruptible state?)"
+                    )
 
             self.closed = True
             logger.info(f"Pool '{self.name}' closed ({self.process_count} processes)")
 
         except Exception as e:
             logger.warning(f"Error terminating pool '{self.name}': {e}")
-            # Still try to force-kill on error
-            # If it fails, let the OS handle on process exit
-            # NOTE: is it safe to just ignore workers that survive SIGKILL? will self.closed = True lead to issues down the line?
-            # NOTE: should we add time.sleep(0.2) & _check_alive() after _force_kill_workers()? would logging an error on SIGKILL fail be useful?
+            # Still try to force-kill on error, If it fails, let the OS clean up on exit
             with contextlib.suppress(Exception):
                 self._force_kill_workers()
+                # NOTE: 0.1 seems arbitrary & can potentially add latency to shutdown. is there a more precise wall we can use?
+                time.sleep(0.1)  # Brief wait for SIGKILL to take effect
+                # NOTE: should we add _check_alive() & error logging after failed SIGKILL?
+                # NOTE: will self.closed = True on repeated failure lead to downstream issues?
             self.closed = True
 
     def _check_alive(self):
