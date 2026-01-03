@@ -19,7 +19,6 @@ import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
-from matplotlib.gridspec import GridSpec
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -1523,7 +1522,7 @@ class TrainingPipeline:
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         fig = plt.figure(figsize=(25, 12))
-        gs = GridSpec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
+        gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
         # Top subplot spanning full width - Total Loss
         ax_top = fig.add_subplot(gs[0, :])
@@ -1594,10 +1593,7 @@ class TrainingPipeline:
             shadow=True,
         )
 
-        # TEST: does the following warning go away.
-        # UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
-        # plt.tight_layout()
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.tight_layout()
 
         # Save plot
         if tag is None:
