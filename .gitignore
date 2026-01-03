@@ -4,8 +4,11 @@
 # Forward-search paper
 2301.12670v1.pdf
 
+# Reverse-search paper
+rzad056.pdf
+
 # Outputs
 outputs/
 
-# Local development environment
+# Local development environment (for LSP)
 environment_nocuda.yml
