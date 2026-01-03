@@ -1522,6 +1522,11 @@ class TrainingPipeline:
 
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        machine_name = socket.gethostname()
+
         fig = plt.figure(figsize=(25, 12))
         gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
@@ -1533,11 +1538,6 @@ class TrainingPipeline:
         ax_kl = fig.add_subplot(gs[1, 1])
         ax_true = fig.add_subplot(gs[1, 2])
         ax_false = fig.add_subplot(gs[1, 3])
-
-        if tag is None:
-            tag = self.config.checkpoint.save_tag
-
-        machine_name = socket.gethostname()
 
         fig.suptitle(
             f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=16, fontweight="bold"
