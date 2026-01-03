@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import threading
 from datetime import datetime
 
@@ -1533,7 +1534,14 @@ class TrainingPipeline:
         ax_true = fig.add_subplot(gs[1, 2])
         ax_false = fig.add_subplot(gs[1, 3])
 
-        fig.suptitle("Beta-VAE Training Progress", fontsize=16)
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        machine_name = socket.gethostname()
+
+        fig.suptitle(
+            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=16, fontweight="bold"
+        )
 
         epochs = range(1, len(self.history.get("loss", [])) + 1)
 
@@ -1560,11 +1568,12 @@ class TrainingPipeline:
                     linestyle="--",
                 )
 
-            ax.set_title(title)
-            ax.set_xlabel("epoch")
+            ax.set_title(title, fontsize=12)
+            ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
-            ax2.tick_params(axis="y", labelcolor="grey")
+            ax.tick_params(axis="both", labelsize=10)
+            ax2.tick_params(axis="y", labelcolor="grey", labelsize=10)
 
         # Top subplot - Total Loss
         plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
@@ -1588,6 +1597,7 @@ class TrainingPipeline:
             handles=[train_line, val_line, lr_line],
             loc="upper right",
             bbox_to_anchor=(0.98, 0.98),
+            fontsize=10,
             frameon=True,
             fancybox=True,
             shadow=True,
@@ -1596,9 +1606,6 @@ class TrainingPipeline:
         plt.tight_layout()
 
         # Save plot
-        if tag is None:
-            tag = self.config.checkpoint.save_tag
-
         if dir is not None:
             save_path = os.path.join(
                 self.config.output_path, "plots", dir, f"beta_vae_training_progress_{tag}.png"

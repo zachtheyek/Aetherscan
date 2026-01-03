@@ -460,7 +460,7 @@ class ResourceMonitor:
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
         machine_name = socket.gethostname()
         fig.suptitle(
-            f"Aetherscan Pipeline: Resource Utilization ({machine_name})",
+            f"Aetherscan Pipeline: Resource Utilization ({self.tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
