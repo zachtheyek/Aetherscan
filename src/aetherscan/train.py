@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import threading
 from datetime import datetime
 
@@ -19,7 +20,6 @@ import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
-from matplotlib.gridspec import GridSpec
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -1522,8 +1522,13 @@ class TrainingPipeline:
 
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        machine_name = socket.gethostname()
+
         fig = plt.figure(figsize=(25, 12))
-        gs = GridSpec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
+        gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
         # Top subplot spanning full width - Total Loss
         ax_top = fig.add_subplot(gs[0, :])
@@ -1534,7 +1539,9 @@ class TrainingPipeline:
         ax_true = fig.add_subplot(gs[1, 2])
         ax_false = fig.add_subplot(gs[1, 3])
 
-        fig.suptitle("Beta-VAE Training Progress", fontsize=16)
+        fig.suptitle(
+            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=16, fontweight="bold"
+        )
 
         epochs = range(1, len(self.history.get("loss", [])) + 1)
 
@@ -1561,11 +1568,12 @@ class TrainingPipeline:
                     linestyle="--",
                 )
 
-            ax.set_title(title)
-            ax.set_xlabel("epoch")
+            ax.set_title(title, fontsize=12)
+            ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
-            ax2.tick_params(axis="y", labelcolor="grey")
+            ax.tick_params(axis="both", labelsize=10)
+            ax2.tick_params(axis="y", labelcolor="grey", labelsize=10)
 
         # Top subplot - Total Loss
         plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
@@ -1589,6 +1597,7 @@ class TrainingPipeline:
             handles=[train_line, val_line, lr_line],
             loc="upper right",
             bbox_to_anchor=(0.98, 0.98),
+            fontsize=10,
             frameon=True,
             fancybox=True,
             shadow=True,
@@ -1597,9 +1606,6 @@ class TrainingPipeline:
         plt.tight_layout()
 
         # Save plot
-        if tag is None:
-            tag = self.config.checkpoint.save_tag
-
         if dir is not None:
             save_path = os.path.join(
                 self.config.output_path, "plots", dir, f"beta_vae_training_progress_{tag}.png"

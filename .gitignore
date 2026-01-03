@@ -1,8 +1,14 @@
+# Note, this is the project's local gitignore. Find my global gitignore here:
+# https://github.com/zachtheyek/dotfiles/blob/master/git/.gitignore_global
+
 # Forward-search paper
 2301.12670v1.pdf
 
-# Outputs
+# Reverse-search paper
+rzad056.pdf
+
+# Outputs directory
 outputs/
 
-# Local development environment
+# Local development environment (for LSP)
 environment_nocuda.yml

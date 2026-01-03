@@ -1,7 +1,4 @@
-# BUG:
-# system total CPU usage appears "unnormalized" compared to process + children CPU usage
-# process + children CPU & RAM sometimes exceeds system total
-# also, split GPU usage & memory into separate plots?
+# TODO: split GPU usage & memory into separate plots?
 # TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup
 """
 Resource monitor for Aetherscan Pipeline
@@ -15,6 +12,7 @@ import contextlib
 import gc
 import logging
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -32,6 +30,9 @@ from aetherscan.config import get_config
 logger = logging.getLogger(__name__)
 
 
+# BUG:
+# system total CPU usage appears "unnormalized" compared to process + children CPU usage
+# process + children CPU & RAM sometimes exceeds system total
 def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
     """
     Get total CPU and RAM usage for a process and all child processes.
@@ -457,7 +458,12 @@ class ResourceMonitor:
 
         # Create figure with 3 subplots
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
-        fig.suptitle("Aetherscan Pipeline: Resource Utilization", fontsize=16, fontweight="bold")
+        machine_name = socket.gethostname()
+        fig.suptitle(
+            f"Aetherscan Pipeline: Resource Utilization ({self.tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
 
         # CPU plot
         ax_cpu = axes[0]
