@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # BUG:
 # system total CPU usage appears "unnormalized" compared to process + children CPU usage
 # process + children CPU & RAM sometimes exceeds system total
+# https://github.com/zachtheyek/Aetherscan/issues/12
 def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
     """
     Get total CPU and RAM usage for a process and all child processes.
