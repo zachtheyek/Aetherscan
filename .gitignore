@@ -6,3 +6,45 @@ outputs/
 
 # Local development environment
 environment_nocuda.yml
+
+
+# NOTE: my ~/.gitignore_global is set up as follows:
+# # Mac system files
+# .DS_Store
+# .localized
+#
+# # Python bytecode
+# __pycache__/
+#
+# # Python virtual environments
+# .venv/
+# venv/
+# env/
+# ENV/
+#
+# # Jupyter checkpoints
+# .ipynb_checkpoints/
+#
+# # Linters/formatters
+# .ruff_cache
+#
+# # Vim/Neovim artifacts
+# *.swp
+# *.swo
+# .session
+# .nv/
+# Session.vim
+#
+# # Claude configs
+# .claude/
+#
+# # Caches/backups
+# .cache/
+# *.tmp
+# *.bak
+# *.backup
+# *.old
+#
+# # Logs/outputs
+# *.log
+# *.out
