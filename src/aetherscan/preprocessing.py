@@ -120,11 +120,9 @@ def _downsample_worker(args):
 
         # Skip invalid cadences
         if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
-            logging.info(f"NaN/Inf/Neg values detected. Skipping cadence (index {cadence_idx})")
             return None
 
         # Downsample each observation separately
-        logging.info(f"Downsampling cadence (index {cadence_idx})")
         downsampled_cadence = np.zeros((6, 16, final_width), dtype=np.float32)
 
         for obs_idx in range(6):
