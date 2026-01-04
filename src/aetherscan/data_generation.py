@@ -848,7 +848,7 @@ class DataGenerator:
         # Create result dictionary with references to pre-allocated arrays
         result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
-        # NOTE: is there a more efficient way to do this?
+        # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete
         # Sanity check: verify post-injection data normalization
         for key in ["concatenated", "false", "true"]:
             min_val = np.min(result[key])
