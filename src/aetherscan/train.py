@@ -1540,7 +1540,7 @@ class TrainingPipeline:
         ax_false = fig.add_subplot(gs[1, 3])
 
         fig.suptitle(
-            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=16, fontweight="bold"
+            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
         epochs = range(1, len(self.history.get("loss", [])) + 1)
@@ -1568,12 +1568,12 @@ class TrainingPipeline:
                     linestyle="--",
                 )
 
-            ax.set_title(title, fontsize=12, fontweight="bold")
-            ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
+            ax.set_title(title, fontsize=14, fontweight="bold")
+            ax.set_xlabel("Epoch", fontsize=14, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
-            ax.tick_params(axis="both", labelsize=10)
-            ax2.tick_params(axis="y", labelcolor="grey", labelsize=10)
+            ax.tick_params(axis="both", labelsize=12)
+            ax2.tick_params(axis="y", labelcolor="grey", labelsize=12)
 
         # Top subplot - Total Loss
         plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
@@ -1597,7 +1597,7 @@ class TrainingPipeline:
             handles=[train_line, val_line, lr_line],
             loc="upper right",
             bbox_to_anchor=(0.98, 0.98),
-            fontsize=10,
+            fontsize=14,
             frameon=True,
             fancybox=True,
             shadow=True,
