@@ -1625,6 +1625,8 @@ class TrainingPipeline:
 
         plt.close()
 
+        logger.info(f"Beta-VAE training progress plot saved to: {save_path}")
+
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
         if tag is None:
