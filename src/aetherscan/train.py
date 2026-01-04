@@ -1520,6 +1520,7 @@ class TrainingPipeline:
             del true_latents, false_latents
             gc.collect()
 
+    # TODO: visualize SNR range in training progress plot
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:

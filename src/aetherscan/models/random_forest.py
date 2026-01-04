@@ -102,7 +102,7 @@ class RandomForestModel:
         self.model.fit(features, labels)
         self.is_trained = True
 
-        # TODO: rethink RF visualizations *return feature importance & create plots in training.py? or create directly from here? in evaluation.py)?
+        # TODO: rethink RF visualizations (how to visualize RF training progress?) (return feature importance & create plots in train.py? or create directly from here? in evaluation.py?)
         # Log feature importances
         importances = self.model.feature_importances_
         logger.info(
