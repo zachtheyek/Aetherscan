@@ -1604,6 +1604,9 @@ class TrainingPipeline:
             shadow=True,
         )
 
+        # WARN: not sure why the following warning occurs?
+        # WARN: 2026-01-03 14:01:12,049 | py.warnings | WARNING | /home/zachy/src/Aetherscan/src/aetherscan/train.py:1606: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+        # WARN: plt.tight_layout()
         plt.tight_layout()
 
         # Save plot
