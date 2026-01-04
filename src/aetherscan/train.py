@@ -1568,7 +1568,7 @@ class TrainingPipeline:
                     linestyle="--",
                 )
 
-            ax.set_title(title, fontsize=12)
+            ax.set_title(title, fontsize=12, fontweight="bold")
             ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
