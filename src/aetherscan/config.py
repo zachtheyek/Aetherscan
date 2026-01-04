@@ -124,12 +124,13 @@ class TrainingConfig:
     num_samples_rf: int = 100000
     train_val_split: float = 0.8
 
+    # NOTE: find optimal batch size for 6 A4000s
     per_replica_batch_size: int = 256
     global_batch_size: int = 4096  # Effective batch size for gradient accumulation
-    per_replica_val_batch_size: int = 8192
+    per_replica_val_batch_size: int = 4096
 
     signal_injection_chunk_size: int = (
-        5000  # Maximum cadences to process at once during data generation
+        10000  # Maximum cadences to process at once during data generation
     )
 
     # Curriculum learning params
