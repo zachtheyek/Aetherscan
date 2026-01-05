@@ -2,6 +2,7 @@
 # add slack integration
 # find a way to customize separate logging level for slack vs console/file
 # also find a way to log plots in slack (but not in console/file)
+# TODO: set log level in logger config (search: setLevel)
 # TODO: add tag to file log & archive old logs
 """
 Logger for Aetherscan Pipeline
