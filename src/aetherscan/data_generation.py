@@ -897,26 +897,256 @@ class DataGenerator:
         self._free_managed_shared_memory()
         logger.info("DataGenerator closed")
 
-    # TODO:
-    # separate generate_batch() into generate_train_batch() & generate_test_batch()
-    # since test doesn't require (main, false, true), just (false, true)
-    # verify this is correct with train_random_forest() vs train_round()
-    # benchmark compute time / memory saved with this change
+    # # TODO:
+    # # separate generate_batch() into generate_train_batch() & generate_test_batch()
+    # # since test doesn't require (main, false, true), just (false, true)
+    # # verify this is correct with train_random_forest() vs train_round()
+    # # benchmark compute time / memory saved with this change
+    # def generate_batch(
+    #     self, n_samples: int, snr_base: int, snr_range: int
+    # ) -> dict[str, np.ndarray]:
+    #     """
+    #     Generate batch using chunking & multiprocessing
+    #
+    #     main: collapsed cadences
+    #       - total: n_samples
+    #       - split: 1/4 balanced between false-no-signal, false-with-rfi, true-single, true-double
+    #     false: non-collapsed false cadences
+    #       - total: n_samples
+    #       - split: 1/2 balanced between false-no-signal, false-with-rfi
+    #     true: non-collapsed true cadences
+    #       - total: n_samples
+    #       - split: 1/2 balanced between true-single, true-double
+    #     """
+    #     max_chunk_size = self.config.training.signal_injection_chunk_size
+    #     n_chunks = max(1, (n_samples + max_chunk_size - 1) // max_chunk_size)
+    #
+    #     logger.info(f"Generating {n_samples} samples in {n_chunks} chunks of max {max_chunk_size}")
+    #
+    #     # Pre-allocate output arrays
+    #     all_main = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+    #     all_false = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+    #     all_true = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+    #
+    #     for chunk_idx in range(n_chunks):
+    #         chunk_size = min(max_chunk_size, n_samples - chunk_idx * max_chunk_size)
+    #         if chunk_size <= 0:
+    #             break
+    #
+    #         start_idx = chunk_idx * max_chunk_size
+    #         end_idx = start_idx + chunk_size
+    #
+    #         logger.info(f"Generating chunk {chunk_idx + 1}/{n_chunks} with {chunk_size} samples")
+    #
+    #         # Split chunk into equal partitions (for balanced classes)
+    #         quarter = max(1, chunk_size // 4)
+    #         half = max(1, chunk_size // 2)
+    #
+    #         # Pure background
+    #         quarter_false_no_signal = batch_create_cadence(
+    #             create_false,
+    #             quarter,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             inject=False,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         # RFI only
+    #         quarter_false_with_rfi = batch_create_cadence(
+    #             create_false,
+    #             quarter,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             inject=True,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         # ETI only
+    #         quarter_true_single = batch_create_cadence(
+    #             create_true_single,
+    #             quarter,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         # ETI + RFI
+    #         quarter_true_double = batch_create_cadence(
+    #             create_true_double,
+    #             quarter,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             dynamic_range=1,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         # Concatenate for main training data (collapsed cadences)
+    #         chunk_main = np.concatenate(
+    #             [
+    #                 quarter_false_no_signal,
+    #                 quarter_false_with_rfi,
+    #                 quarter_true_single,
+    #                 quarter_true_double,
+    #             ],
+    #             axis=0,
+    #         )
+    #
+    #         # Generate separate true/false non-collapsed cadences for training set diversity
+    #         # Used to calculate clustering loss & train RF
+    #         half_false_no_signal = batch_create_cadence(
+    #             create_false,
+    #             half,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             inject=False,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         half_false_with_rfi = batch_create_cadence(
+    #             create_false,
+    #             half,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             inject=True,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         half_true_single = batch_create_cadence(
+    #             create_true_single,
+    #             half,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         half_true_double = batch_create_cadence(
+    #             create_true_double,
+    #             half,
+    #             self.backgrounds,
+    #             snr_base=snr_base,
+    #             snr_range=snr_range,
+    #             width_bin=self.width_bin,
+    #             freq_resolution=self.freq_resolution,
+    #             time_resolution=self.time_resolution,
+    #             dynamic_range=1,
+    #             pool=self.pool,
+    #             n_processes=self.n_processes,
+    #             chunks_per_worker=self.chunks_per_worker,
+    #         )
+    #
+    #         chunk_false = np.concatenate([half_false_no_signal, half_false_with_rfi], axis=0)
+    #
+    #         chunk_true = np.concatenate([half_true_single, half_true_double], axis=0)
+    #
+    #         # Store chunks directly into output array
+    #         all_main[start_idx:end_idx] = chunk_main
+    #         all_false[start_idx:end_idx] = chunk_false
+    #         all_true[start_idx:end_idx] = chunk_true
+    #
+    #         # Clean up chunk data immediately
+    #         del (
+    #             quarter_false_no_signal,
+    #             quarter_false_with_rfi,
+    #             quarter_true_single,
+    #             quarter_true_double,
+    #         )
+    #         del half_false_no_signal, half_false_with_rfi, half_true_single, half_true_double
+    #         del chunk_main, chunk_false, chunk_true
+    #         gc.collect()
+    #
+    #         logger.info(f"Chunk {chunk_idx + 1} complete, memory cleared")
+    #
+    #     # Create result dictionary with references to pre-allocated arrays
+    #     result = {"concatenated": all_main, "false": all_false, "true": all_true}
+    #
+    #     # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
+    #     # # Sanity check: verify post-injection data normalization
+    #     # for key in ["concatenated", "false", "true"]:
+    #     #     min_val = np.min(result[key])
+    #     #     max_val = np.max(result[key])
+    #     #     mean_val = np.mean(result[key])
+    #     #     logger.info(
+    #     #         f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
+    #     #     )
+    #     #     if max_val > 1.0:
+    #     #         logger.error(f"Post-injection {key} values too large! Max: {max_val}")
+    #     #         raise ValueError(f"Post-injection {key} normalization check failed")
+    #     #     elif min_val < 0.0:
+    #     #         logger.error(f"Post-injection {key} values too small! Min: {min_val}")
+    #     #         raise ValueError(f"Post-injection {key} normalization check failed")
+    #     #     elif np.isnan(result[key]).any():
+    #     #         logger.error(f"Post-injection {key} contains NaN values!")
+    #     #         raise ValueError(f"Post-injection {key} normalization check failed")
+    #     #     elif np.isinf(result[key]).any():
+    #     #         logger.error(f"Post-injection {key} contains Inf values!")
+    #     #         raise ValueError(f"Post-injection {key} normalization check failed")
+    #     #     else:
+    #     #         logger.info(f"Post-injection {key} data properly normalized")
+    #
+    #     return result
+
     def generate_batch(
         self, n_samples: int, snr_base: int, snr_range: int
     ) -> dict[str, np.ndarray]:
         """
-        Generate batch using chunking & multiprocessing
+        Generate batch using unified task submission and shared memory outputs.
 
-        main: collapsed cadences
-          - total: n_samples
-          - split: 1/4 balanced between false-no-signal, false-with-rfi, true-single, true-double
-        false: non-collapsed false cadences
-          - total: n_samples
-          - split: 1/2 balanced between false-no-signal, false-with-rfi
-        true: non-collapsed true cadences
-          - total: n_samples
-          - split: 1/2 balanced between true-single, true-double
+        Key optimizations:
+        1. Single shared memory allocation for all outputs
+        2. All 8 batch types submitted as unified task queue
+        3. Workers write directly to shared memory (no IPC returns)
+        4. Single synchronization point instead of 8
+
+        Output structure:
+            main: collapsed cadences (n_samples total)
+              - 1/4 false-no-signal, 1/4 false-with-rfi, 1/4 true-single, 1/4 true-double
+            false: non-collapsed false cadences (n_samples total)
+              - 1/2 false-no-signal, 1/2 false-with-rfi
+            true: non-collapsed true cadences (n_samples total)
+              - 1/2 true-single, 1/2 true-double
         """
         max_chunk_size = self.config.training.signal_injection_chunk_size
         n_chunks = max(1, (n_samples + max_chunk_size - 1) // max_chunk_size)
@@ -938,192 +1168,163 @@ class DataGenerator:
 
             logger.info(f"Generating chunk {chunk_idx + 1}/{n_chunks} with {chunk_size} samples")
 
-            # Split chunk into equal partitions (for balanced classes)
+            # Calculate sample counts for this chunk
             quarter = max(1, chunk_size // 4)
             half = max(1, chunk_size // 2)
 
-            # Pure background
-            quarter_false_no_signal = batch_create_cadence(
-                create_false,
-                quarter,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                inject=False,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
+            # Total outputs needed for this chunk:
+            # - main: 4 * quarter = chunk_size
+            # - false: 2 * half = chunk_size
+            # - true: 2 * half = chunk_size
+            # Total: 3 * chunk_size
+            total_outputs = 3 * chunk_size
+
+            # Create output shared memory for this chunk
+            output_shape = (total_outputs, 6, 16, self.width_bin)
+            output_nbytes = int(np.prod(output_shape) * np.float32().nbytes)
+
+            output_shm = self.manager.create_shared_memory(
+                size=output_nbytes,
+                name=f"DataGen_output_chunk_{chunk_idx}_{id(self)}",
             )
 
-            # RFI only
-            quarter_false_with_rfi = batch_create_cadence(
-                create_false,
-                quarter,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                inject=True,
-                pool=self.pool,
+            # Create numpy view of output shared memory
+            output_array = np.ndarray(output_shape, dtype=np.float32, buffer=output_shm.buf)
+
+            # Reinitialize pool with output shared memory reference
+            # Workers need to attach to the new output shared memory
+            if self.pool is not None:
+                self._free_managed_pool()
+
+            self.pool = self.manager.create_pool(
                 n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
+                name=f"DataGen_pool_chunk_{chunk_idx}_{id(self)}",
+                initializer=_init_worker,
+                initargs=(
+                    self.shm.name,
+                    self._background_shape,
+                    self._background_dtype,
+                    output_shm.name,  # NEW: output shared memory
+                    output_shape,  # NEW: output shape
+                ),
             )
 
-            # ETI only
-            quarter_true_single = batch_create_cadence(
-                create_true_single,
-                quarter,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
-            )
+            # Define output layout in shared memory:
+            # [0:quarter]                          -> main: false_no_signal
+            # [quarter:2*quarter]                  -> main: false_with_rfi
+            # [2*quarter:3*quarter]                -> main: true_single
+            # [3*quarter:4*quarter]                -> main: true_double
+            # [chunk_size:chunk_size+half]         -> false: no_signal
+            # [chunk_size+half:chunk_size+2*half]  -> false: with_rfi
+            # [2*chunk_size:2*chunk_size+half]     -> true: single
+            # [2*chunk_size+half:3*chunk_size]     -> true: double
 
-            # ETI + RFI
-            quarter_true_double = batch_create_cadence(
-                create_true_double,
-                quarter,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                dynamic_range=1,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
-            )
+            # Build unified task list for all 8 batch types
+            batch_size = 500  # Cadences per task
+            all_tasks = []
 
-            # Concatenate for main training data (collapsed cadences)
+            # Helper to create batched tasks for a given output range
+            def add_tasks(
+                output_start,
+                count,
+                function,
+                inject=None,
+                dynamic_range=None,
+                _batch_size=batch_size,
+                _all_tasks=all_tasks,
+            ):
+                for batch_start in range(0, count, _batch_size):
+                    batch_end = min(batch_start + _batch_size, count)
+                    _all_tasks.append(
+                        (
+                            output_start + batch_start,
+                            output_start + batch_end,
+                            function,
+                            snr_base,
+                            snr_range,
+                            self.width_bin,
+                            self.freq_resolution,
+                            self.time_resolution,
+                            inject,
+                            dynamic_range,
+                        )
+                    )
+
+            # Main outputs (quarters)
+            add_tasks(0, quarter, create_false, inject=False)
+            add_tasks(quarter, quarter, create_false, inject=True)
+            add_tasks(2 * quarter, quarter, create_true_single)
+            add_tasks(3 * quarter, quarter, create_true_double, dynamic_range=1)
+
+            # False outputs (halves)
+            add_tasks(chunk_size, half, create_false, inject=False)
+            add_tasks(chunk_size + half, half, create_false, inject=True)
+
+            # True outputs (halves)
+            add_tasks(2 * chunk_size, half, create_true_single)
+            add_tasks(2 * chunk_size + half, half, create_true_double, dynamic_range=1)
+
+            logger.info(f"Submitting {len(all_tasks)} unified tasks to pool")
+
+            # Execute ALL tasks in single pool.map call
+            # This is the key optimization: one sync barrier instead of 8
+            n_workers = self.n_processes
+            chunksize = max(1, len(all_tasks) // (n_workers * 4))
+
+            list(self.pool.map(_batch_cadence_worker, all_tasks, chunksize=chunksize))
+
+            logger.info("All tasks complete, extracting results from shared memory")
+
+            # Extract results from shared memory into output arrays
+            # Main outputs
             chunk_main = np.concatenate(
                 [
-                    quarter_false_no_signal,
-                    quarter_false_with_rfi,
-                    quarter_true_single,
-                    quarter_true_double,
+                    output_array[0:quarter],
+                    output_array[quarter : 2 * quarter],
+                    output_array[2 * quarter : 3 * quarter],
+                    output_array[3 * quarter : 4 * quarter],
                 ],
                 axis=0,
             )
 
-            # Generate separate true/false non-collapsed cadences for training set diversity
-            # Used to calculate clustering loss & train RF
-            half_false_no_signal = batch_create_cadence(
-                create_false,
-                half,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                inject=False,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
+            # False outputs
+            chunk_false = np.concatenate(
+                [
+                    output_array[chunk_size : chunk_size + half],
+                    output_array[chunk_size + half : chunk_size + 2 * half],
+                ],
+                axis=0,
             )
 
-            half_false_with_rfi = batch_create_cadence(
-                create_false,
-                half,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                inject=True,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
+            # True outputs
+            chunk_true = np.concatenate(
+                [
+                    output_array[2 * chunk_size : 2 * chunk_size + half],
+                    output_array[2 * chunk_size + half : 3 * chunk_size],
+                ],
+                axis=0,
             )
 
-            half_true_single = batch_create_cadence(
-                create_true_single,
-                half,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
-            )
-
-            half_true_double = batch_create_cadence(
-                create_true_double,
-                half,
-                self.backgrounds,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                width_bin=self.width_bin,
-                freq_resolution=self.freq_resolution,
-                time_resolution=self.time_resolution,
-                dynamic_range=1,
-                pool=self.pool,
-                n_processes=self.n_processes,
-                chunks_per_worker=self.chunks_per_worker,
-            )
-
-            chunk_false = np.concatenate([half_false_no_signal, half_false_with_rfi], axis=0)
-
-            chunk_true = np.concatenate([half_true_single, half_true_double], axis=0)
-
-            # Store chunks directly into output array
+            # Store chunks in pre-allocated arrays
             all_main[start_idx:end_idx] = chunk_main
             all_false[start_idx:end_idx] = chunk_false
             all_true[start_idx:end_idx] = chunk_true
 
-            # Clean up chunk data immediately
-            del (
-                quarter_false_no_signal,
-                quarter_false_with_rfi,
-                quarter_true_single,
-                quarter_true_double,
-            )
-            del half_false_no_signal, half_false_with_rfi, half_true_single, half_true_double
+            # Cleanup chunk resources
             del chunk_main, chunk_false, chunk_true
+            del output_array
+
+            # Close pool before closing shared memory (workers have references)
+            self._free_managed_pool()
+            self.manager.close_shared_memory(output_shm)
+
             gc.collect()
 
             logger.info(f"Chunk {chunk_idx + 1} complete, memory cleared")
 
-        # Create result dictionary with references to pre-allocated arrays
-        result = {"concatenated": all_main, "false": all_false, "true": all_true}
+        # Recreate pool for next generate_batch call
+        self._setup_managed_pool()
 
-        # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
-        # # Sanity check: verify post-injection data normalization
-        # for key in ["concatenated", "false", "true"]:
-        #     min_val = np.min(result[key])
-        #     max_val = np.max(result[key])
-        #     mean_val = np.mean(result[key])
-        #     logger.info(
-        #         f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
-        #     )
-        #     if max_val > 1.0:
-        #         logger.error(f"Post-injection {key} values too large! Max: {max_val}")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif min_val < 0.0:
-        #         logger.error(f"Post-injection {key} values too small! Min: {min_val}")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif np.isnan(result[key]).any():
-        #         logger.error(f"Post-injection {key} contains NaN values!")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif np.isinf(result[key]).any():
-        #         logger.error(f"Post-injection {key} contains Inf values!")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     else:
-        #         logger.info(f"Post-injection {key} data properly normalized")
+        result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
         return result
