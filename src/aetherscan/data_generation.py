@@ -604,7 +604,8 @@ def batch_create_cadence(
     output_offset: int = 0,
     n_processes: int | None = cpu_count(),
     chunks_per_worker: int | None = 4,
-    batch_size: int = 500,  # NEW: cadences per task
+    # NOTE: parametrize this in config
+    batch_size: int = 500,  # cadences per task
 ) -> np.ndarray:
     """
     Batch wrapper for creating multiple cadences using multiprocessing.
@@ -814,27 +815,50 @@ class DataGenerator:
         logger.info(f"  Background shape: {self._background_shape}")
         logger.info(f"  Background dtype: {self._background_dtype}")
 
+    # def _setup_managed_pool(self):
+    #     """
+    #     Setup managed multiprocessing pool with shared memory
+    #
+    #     Creates a persistent worker pool that shares access to background data via
+    #     shared memory, avoiding costly data serialization for each worker process.
+    #
+    #     Note:
+    #         The pool is managed by the ResourceManager and should be closed via
+    #         _free_managed_pool() or close() to properly release resources.
+    #     """
+    #     # NOTE: should we explicitly guarantee only 1 shm & 1 pool can exist at a time?
+    #     # If shared memory exists, then create pool using shared memory reference
+    #     if self.shm:
+    #         self.pool = self.manager.create_pool(
+    #             n_processes=self.n_processes,
+    #             name=f"DataGen_pool_{id(self)}",  # NOTE: come back to this later
+    #             initializer=_init_worker,
+    #             initargs=(self.shm.name, self._background_shape, self._background_dtype),
+    #         )
+    #     # Else run in sequential mode (no pool)
+    #     else:
+    #         self.pool = None
+    #         logger.info("DataGenerator running in sequential mode (n_processes=1)")
+
     def _setup_managed_pool(self):
         """
-        Setup managed multiprocessing pool with shared memory
+        Setup managed multiprocessing pool with shared memory.
 
-        Creates a persistent worker pool that shares access to background data via
-        shared memory, avoiding costly data serialization for each worker process.
+        Why we don't create output shared memory here:
+            Output shared memory size depends on the batch size requested in generate_batch(),
+            which varies between calls. We create output shared memory on-demand in generate_batch()
+            and pass references to workers via the task arguments.
 
-        Note:
-            The pool is managed by the ResourceManager and should be closed via
-            _free_managed_pool() or close() to properly release resources.
+            The pool is initialized with background shared memory only. Workers will attach to
+            output shared memory when provided via _batch_cadence_worker args.
         """
-        # NOTE: should we explicitly guarantee only 1 shm & 1 pool can exist at a time?
-        # If shared memory exists, then create pool using shared memory reference
         if self.shm:
             self.pool = self.manager.create_pool(
                 n_processes=self.n_processes,
-                name=f"DataGen_pool_{id(self)}",  # NOTE: come back to this later
+                name=f"DataGen_pool_{id(self)}",
                 initializer=_init_worker,
                 initargs=(self.shm.name, self._background_shape, self._background_dtype),
             )
-        # Else run in sequential mode (no pool)
         else:
             self.pool = None
             logger.info("DataGenerator running in sequential mode (n_processes=1)")
