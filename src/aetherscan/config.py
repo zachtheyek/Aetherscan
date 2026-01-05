@@ -125,7 +125,7 @@ class TrainingConfig:
     train_val_split: float = 0.8
 
     # NOTE: find optimal batch size for 6 A4000s
-    per_replica_batch_size: int = 256
+    per_replica_batch_size: int = 128
     global_batch_size: int = 4096  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096
 
