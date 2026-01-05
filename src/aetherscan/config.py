@@ -124,7 +124,7 @@ class TrainingConfig:
     num_samples_rf: int = 100000
     train_val_split: float = 0.8
 
-    # TODO: find optimal per replica train batch size for 4 or 6 A4000s (128 or 256?)
+    # TODO: find optimal per replica train batch size for 4 or 6 A4000s (128 or 256?) (does 256 trigger GPU OOM?)
     per_replica_batch_size: int = 128
     global_batch_size: int = 4096  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096

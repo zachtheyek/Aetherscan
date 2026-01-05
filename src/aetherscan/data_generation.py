@@ -65,6 +65,11 @@ def _init_worker(shm_name, shape, dtype):
     # Attach to existing shared memory block
     _GLOBAL_SHM = SharedMemory(name=shm_name)
 
+    # Create numpy array view of shared memory (no copy!)
+    _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
+    _GLOBAL_SHAPE = shape
+    _GLOBAL_DTYPE = dtype
+
     # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -99,11 +104,6 @@ def _init_worker(shm_name, shape, dtype):
 
     # Register SIGTERM handler for graceful cleanup on pool.terminate()
     signal.signal(signal.SIGTERM, cleanup_on_sigterm)
-
-    # Create numpy array view of shared memory (no copy!)
-    _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
-    _GLOBAL_SHAPE = shape
-    _GLOBAL_DTYPE = dtype
 
 
 def log_norm(data: np.ndarray) -> np.ndarray:
