@@ -98,7 +98,7 @@ class Logger:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
-        self.log_path = os.path.join(self.config.output_path, "aetherscan.log")
+        self.log_path = os.path.join(self.config.output_path, "logs", "aetherscan.log")
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)  # Create dir if it doesn't exist
 
         # Create queue for worker processes (no size limit)
