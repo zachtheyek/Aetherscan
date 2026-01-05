@@ -34,26 +34,48 @@ _GLOBAL_BACKGROUNDS = None
 _GLOBAL_SHAPE = None
 _GLOBAL_DTYPE = None
 
+# NEW: Output shared memory for zero-copy results
+_GLOBAL_OUTPUT_SHM = None
+_GLOBAL_OUTPUT_ARRAY = None
+_GLOBAL_OUTPUT_SHAPE = None
 
-def _init_worker(shm_name, shape, dtype):
+
+# def _init_worker(shm_name, shape, dtype):
+#     """
+#     Initialize worker process with shared memory reference and queue-based logging
+#     This avoids serialization overhead between workers
+#
+#     Args:
+#         shm_name: Name of the shared memory block
+#         shape: Shape of the background array
+#         dtype: Data type of the background array
+#
+#     Note:
+#         Worker cleanup uses a custom SIGTERM handler to properly close shared memory
+#         file descriptors before termination. When pool.terminate() is called by the
+#         main process, workers intercept SIGTERM, close their shared memory handles,
+#         then re-raise the signal to complete termination.
+#
+#         The main process is responsible for unlinking shared memory (handled by ResourceManager).
+#     """
+def _init_worker(shm_name, shape, dtype, output_shm_name=None, output_shape=None):
     """
-    Initialize worker process with shared memory reference and queue-based logging
-    This avoids serialization overhead between workers
+    Initialize worker process with shared memory references.
 
     Args:
-        shm_name: Name of the shared memory block
+        shm_name: Name of the shared memory block containing background plates
         shape: Shape of the background array
         dtype: Data type of the background array
+        output_shm_name: Name of shared memory for output results (optional)
+        output_shape: Shape of the output array (optional)
 
-    Note:
-        Worker cleanup uses a custom SIGTERM handler to properly close shared memory
-        file descriptors before termination. When pool.terminate() is called by the
-        main process, workers intercept SIGTERM, close their shared memory handles,
-        then re-raise the signal to complete termination.
-
-        The main process is responsible for unlinking shared memory (handled by ResourceManager).
+    Why this change:
+        Adding output_shm_name and output_shape parameters allows workers to write
+        results directly to shared memory instead of returning them through IPC.
+        This eliminates ~23GB of pickle serialization per training round.
     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
+    global _GLOBAL_OUTPUT_SHM, _GLOBAL_OUTPUT_ARRAY, _GLOBAL_OUTPUT_SHAPE
 
     # Initialize worker logging
     init_worker_logging()
@@ -69,6 +91,14 @@ def _init_worker(shm_name, shape, dtype):
     _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
     _GLOBAL_SHAPE = shape
     _GLOBAL_DTYPE = dtype
+
+    # NEW: Attach to output shared memory if provided
+    if output_shm_name is not None and output_shape is not None:
+        _GLOBAL_OUTPUT_SHM = SharedMemory(name=output_shm_name)
+        _GLOBAL_OUTPUT_ARRAY = np.ndarray(
+            output_shape, dtype=np.float32, buffer=_GLOBAL_OUTPUT_SHM.buf
+        )
+        _GLOBAL_OUTPUT_SHAPE = output_shape
 
     # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
     signal.signal(signal.SIGINT, signal.SIG_IGN)
