@@ -447,6 +447,57 @@ def _single_cadence_wrapper(args):
     )
 
 
+def _batch_cadence_worker(args):
+    """
+    Process a batch of cadences and write results directly to shared memory.
+
+    Args:
+        args: Tuple of (start_idx, end_idx, function, snr_base, snr_range,
+                       width_bin, freq_resolution, time_resolution, inject, dynamic_range)
+
+    Returns:
+        None - results written directly to _GLOBAL_OUTPUT_ARRAY
+
+    Why this approach:
+        Instead of returning 192KB per cadence through IPC (which requires pickle
+        serialization), workers write directly to pre-allocated shared memory.
+        This eliminates the dominant bottleneck: ~23GB of IPC data transfer per round.
+
+        Processing cadences in batches (e.g., 500-1000 per task) also reduces
+        task scheduling overhead from 120,000 dispatches to ~120-240 dispatches.
+    """
+    (
+        start_idx,
+        end_idx,
+        function,
+        snr_base,
+        snr_range,
+        width_bin,
+        freq_resolution,
+        time_resolution,
+        inject,
+        dynamic_range,
+    ) = args
+
+    # Process each cadence in this batch
+    for i in range(start_idx, end_idx):
+        result = function(
+            _GLOBAL_BACKGROUNDS,
+            snr_base=snr_base,
+            snr_range=snr_range,
+            width_bin=width_bin,
+            freq_resolution=freq_resolution,
+            time_resolution=time_resolution,
+            inject=inject,
+            dynamic_range=dynamic_range,
+        )
+
+        # Write directly to shared memory output array - NO IPC!
+        _GLOBAL_OUTPUT_ARRAY[i, :, :, :] = result
+
+    # Return None - no data through IPC
+
+
 def batch_create_cadence(
     function,
     samples: int,
