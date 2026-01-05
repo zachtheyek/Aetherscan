@@ -130,7 +130,7 @@ class TrainingConfig:
     per_replica_val_batch_size: int = 4096
 
     signal_injection_chunk_size: int = (
-        10000  # Maximum cadences to process at once during data generation
+        50000  # Maximum cadences to process at once during data generation
     )
 
     # Curriculum learning params
