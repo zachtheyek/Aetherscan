@@ -498,6 +498,95 @@ def _batch_cadence_worker(args):
     # Return None - no data through IPC
 
 
+# def batch_create_cadence(
+#     function,
+#     samples: int,
+#     plate: np.ndarray,
+#     snr_base: int = 10,
+#     snr_range: float = 40,
+#     width_bin: int = 512,
+#     freq_resolution: float = 2.7939677238464355,
+#     time_resolution: float = 18.25361108,
+#     inject: bool | None = None,
+#     dynamic_range: float | None = None,
+#     pool: Pool | None = None,
+#     n_processes: int | None = cpu_count(),
+#     chunks_per_worker: int | None = 4,
+# ) -> np.ndarray:
+#     """
+#     Batch wrapper for creating multiple cadences using multiprocessing
+#
+#     Args:
+#         function: Cadence generation function (create_false, create_true_single, create_true_double)
+#         samples: Number of cadences to generate
+#         plate: Background plate array (only used if pool is None)
+#         snr_base: Base SNR value
+#         snr_range: SNR range for randomization
+#         width_bin: Number of frequency bins
+#         freq_resolution: Frequency resolution in Hz
+#         time_resolution: Time resolution in seconds
+#         inject: Whether to inject signals (for create_false)
+#         dynamic_range: Dynamic range for signal injection (for create_true_double)
+#         pool: Pre-initialized multiprocessing Pool (if None, runs sequentially)
+#         n_processes: Number of processes in multiprocessing Pool (1 if running sequentially)
+#         chunks_per_worker: Used to calculate optimal chunksize for load balancing
+#
+#     Returns:
+#         Array of shape (samples, 6, 16, width_bin) containing generated cadences
+#     """
+#     # Pre-allocate output array
+#     cadence = np.zeros((samples, 6, 16, width_bin))
+#
+#     if pool:
+#         # Parallel execution using provided pool
+#         # Prepare arguments for each parallel task (no plate - uses global)
+#         args_list = [
+#             (
+#                 function,
+#                 snr_base,
+#                 snr_range,
+#                 width_bin,
+#                 freq_resolution,
+#                 time_resolution,
+#                 inject,
+#                 dynamic_range,
+#             )
+#             for _ in range(samples)
+#         ]
+#
+#         # Calculate optimal chunksize for load balancing
+#         try:
+#             n_workers = pool._processes
+#         except AttributeError:
+#             n_workers = n_processes
+#         # NOTE: should we use separate chunks_per_worker? how to benchmark?
+#         chunksize = max(1, samples // (n_workers * chunks_per_worker))
+#
+#         # Use pool to generate cadences in parallel
+#         for i, result in enumerate(
+#             # NOTE: does return order matter?
+#             # pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
+#             pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+#             # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
+#         ):
+#             cadence[i, :, :, :] = result
+#     else:
+#         # Fallback to sequential execution
+#         for i in range(samples):
+#             cadence[i, :, :, :] = function(
+#                 plate,
+#                 snr_base=snr_base,
+#                 snr_range=snr_range,
+#                 width_bin=width_bin,
+#                 freq_resolution=freq_resolution,
+#                 time_resolution=time_resolution,
+#                 inject=inject,
+#                 dynamic_range=dynamic_range,
+#             )
+#
+#     return cadence
+
+
 def batch_create_cadence(
     function,
     samples: int,
@@ -510,11 +599,20 @@ def batch_create_cadence(
     inject: bool | None = None,
     dynamic_range: float | None = None,
     pool: Pool | None = None,
+    output_shm: SharedMemory | None = None,
+    output_array: np.ndarray | None = None,
+    output_offset: int = 0,
     n_processes: int | None = cpu_count(),
     chunks_per_worker: int | None = 4,
+    batch_size: int = 500,  # NEW: cadences per task
 ) -> np.ndarray:
     """
-    Batch wrapper for creating multiple cadences using multiprocessing
+    Batch wrapper for creating multiple cadences using multiprocessing.
+
+    Key changes from original:
+    1. Workers write directly to shared memory (output_array) instead of returning results
+    2. Tasks are batched (batch_size cadences per task) to reduce scheduling overhead
+    3. output_offset allows writing to a specific slice of the output array
 
     Args:
         function: Cadence generation function (create_false, create_true_single, create_true_double)
@@ -527,19 +625,69 @@ def batch_create_cadence(
         time_resolution: Time resolution in seconds
         inject: Whether to inject signals (for create_false)
         dynamic_range: Dynamic range for signal injection (for create_true_double)
-        pool: Pre-initialized multiprocessing Pool (if None, runs sequentially)
-        n_processes: Number of processes in multiprocessing Pool (1 if running sequentially)
+        pool: Pre-initialized multiprocessing Pool with shared memory
+        output_shm: SharedMemory object for output (used for cleanup tracking)
+        output_array: numpy array view of output shared memory
+        output_offset: Starting index in output_array for this batch
+        n_processes: Number of processes in multiprocessing Pool
         chunks_per_worker: Used to calculate optimal chunksize for load balancing
+        batch_size: Number of cadences per worker task (default 500)
 
     Returns:
         Array of shape (samples, 6, 16, width_bin) containing generated cadences
+        (either from shared memory or newly allocated)
     """
-    # Pre-allocate output array
-    cadence = np.zeros((samples, 6, 16, width_bin))
+    if pool and output_array is not None:
+        # OPTIMIZED PATH: Use shared memory output
 
-    if pool:
-        # Parallel execution using provided pool
-        # Prepare arguments for each parallel task (no plate - uses global)
+        # Create batched task arguments
+        # Instead of 1 task per cadence, create 1 task per batch_size cadences
+        tasks = []
+        for batch_start in range(0, samples, batch_size):
+            batch_end = min(batch_start + batch_size, samples)
+            # Indices are relative to output_offset in the shared memory
+            tasks.append(
+                (
+                    output_offset + batch_start,  # start_idx in output array
+                    output_offset + batch_end,  # end_idx in output array
+                    function,
+                    snr_base,
+                    snr_range,
+                    width_bin,
+                    freq_resolution,
+                    time_resolution,
+                    inject,
+                    dynamic_range,
+                )
+            )
+
+        # Calculate chunksize for pool.map
+        # With batched tasks, we have far fewer tasks, so chunksize can be smaller
+        n_tasks = len(tasks)
+        try:
+            n_workers = pool._processes
+        except AttributeError:
+            n_workers = n_processes
+
+        # Aim for ~4 chunks per worker for load balancing
+        chunksize = max(1, n_tasks // (n_workers * 4))
+
+        logger.debug(
+            f"Dispatching {n_tasks} batched tasks (batch_size={batch_size}, chunksize={chunksize})"
+        )
+
+        # Execute - results are written directly to shared memory
+        # We use pool.map which blocks until complete, but returns None for each task
+        list(pool.map(_batch_cadence_worker, tasks, chunksize=chunksize))
+
+        # Return view of the shared memory output for this batch
+        return output_array[output_offset : output_offset + samples]
+
+    elif pool:
+        # LEGACY PATH: Pool exists but no shared memory output
+        # Fall back to original IPC-based approach (for backward compatibility)
+        cadence = np.zeros((samples, 6, 16, width_bin), dtype=np.float32)
+
         args_list = [
             (
                 function,
@@ -554,24 +702,25 @@ def batch_create_cadence(
             for _ in range(samples)
         ]
 
-        # Calculate optimal chunksize for load balancing
         try:
             n_workers = pool._processes
         except AttributeError:
             n_workers = n_processes
-        # NOTE: should we use separate chunks_per_worker? how to benchmark?
-        chunksize = max(1, samples // (n_workers * chunks_per_worker))
 
-        # Use pool to generate cadences in parallel
+        # FIX: Use reasonable chunksize instead of always 1
+        chunksize = max(50, samples // (n_workers * 4))
+
         for i, result in enumerate(
-            # NOTE: does return order matter?
-            # pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
             pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
-            # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):
             cadence[i, :, :, :] = result
+
+        return cadence
+
     else:
-        # Fallback to sequential execution
+        # Sequential execution (no pool)
+        cadence = np.zeros((samples, 6, 16, width_bin), dtype=np.float32)
+
         for i in range(samples):
             cadence[i, :, :, :] = function(
                 plate,
@@ -584,7 +733,7 @@ def batch_create_cadence(
                 dynamic_range=dynamic_range,
             )
 
-    return cadence
+        return cadence
 
 
 class DataGenerator:
