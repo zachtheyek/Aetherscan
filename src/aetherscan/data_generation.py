@@ -17,7 +17,6 @@ from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
 import setigen as stg
-import tensorflow as tf
 from astropy import units as u
 
 from aetherscan.config import get_config
@@ -135,50 +134,6 @@ def _init_worker(shm_name, shape, dtype, output_shm_name=None, output_shape=None
 
     # Register SIGTERM handler for graceful cleanup on pool.terminate()
     signal.signal(signal.SIGTERM, cleanup_on_sigterm)
-
-
-@contextlib.contextmanager
-def tf_thread_isolation():
-    """
-    Context manager to isolate TensorFlow's thread pools during CPU-intensive operations.
-
-    Why this is needed:
-        After training round 1, TensorFlow creates persistent thread pools for GPU operations.
-        These threads compete for the GIL during multiprocessing IPC operations, causing
-        significant slowdowns in data generation for rounds 2+.
-
-        By limiting TF's inter-op and intra-op parallelism during data generation,
-        we reduce GIL contention and restore near-round-1 performance.
-
-    Usage:
-        with tf_thread_isolation():
-            # CPU-intensive multiprocessing work here
-            data = generate_batch(...)
-    """
-    # Save current settings
-    old_inter = None
-    old_intra = None
-
-    try:
-        # Get current thread counts (if TF is initialized)
-        try:
-            old_inter = tf.config.threading.get_inter_op_parallelism_threads()
-            old_intra = tf.config.threading.get_intra_op_parallelism_threads()
-        except Exception:
-            pass  # TF not initialized yet
-
-        # Limit TF threads during data generation
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-        tf.config.threading.set_intra_op_parallelism_threads(1)
-
-        yield
-
-    finally:
-        # Restore original settings
-        if old_inter is not None:
-            tf.config.threading.set_inter_op_parallelism_threads(old_inter)
-        if old_intra is not None:
-            tf.config.threading.set_intra_op_parallelism_threads(old_intra)
 
 
 def log_norm(data: np.ndarray) -> np.ndarray:

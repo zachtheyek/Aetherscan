@@ -24,7 +24,7 @@ from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
 from aetherscan.config import get_config
-from aetherscan.data_generation import DataGenerator, tf_thread_isolation
+from aetherscan.data_generation import DataGenerator
 from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
@@ -888,17 +888,10 @@ class TrainingPipeline:
             f"Training round {round_idx + 1} - Epochs: {epochs}, SNR: {snr_base}-{snr_base + snr_range}"
         )
 
-        # # Generate training data
-        # train_data = self.data_generator.generate_batch(
-        #     self.config.training.num_samples_beta_vae, snr_base, snr_range
-        # )
-
-        # Generate training data with TF thread isolation
-        # This prevents TF's internal threads from competing for GIL during IPC
-        with tf_thread_isolation():
-            train_data = self.data_generator.generate_batch(
-                self.config.training.num_samples_beta_vae, snr_base, snr_range
-            )
+        # Generate training data
+        train_data = self.data_generator.generate_batch(
+            self.config.training.num_samples_beta_vae, snr_base, snr_range
+        )
 
         # Distribute training data
         data = prepare_distributed_dataset(
@@ -1407,10 +1400,7 @@ class TrainingPipeline:
         # Generate training data
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
 
-        # rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
-
-        with tf_thread_isolation():
-            rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
+        rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
         # Prepare distributed dataset for inference
         results = prepare_distributed_dataset(
