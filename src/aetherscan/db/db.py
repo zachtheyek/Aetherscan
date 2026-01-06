@@ -1,4 +1,3 @@
-# TODO: add external function to combine (join & dedup) different aetherscan.db files. where should source of truth be located? (bla0?)
 """
 Database for Aetherscan Pipeline
 Uses SQLite with asynchronous queue-based writes to handle concurrent data collection from multiple
@@ -154,6 +153,7 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
+            # NOTE: flag here
             # System resources table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS system_resources (
@@ -173,6 +173,7 @@ class Database:
                 ON system_resources(timestamp)
             """)
 
+            # NOTE: flag here
             # Background statistics table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS background_stats (
@@ -196,6 +197,7 @@ class Database:
                 ON background_stats(timestamp)
             """)
 
+            # NOTE: flag here
             # Injection statistics table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS injection_stats (
@@ -220,6 +222,7 @@ class Database:
                 ON injection_stats(timestamp)
             """)
 
+            # NOTE: flag here
             # Training loss table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS training_losses (
@@ -350,6 +353,7 @@ class Database:
                 cursor = conn.cursor()
 
                 for table, values in self.buffer:
+                    # NOTE: flag here
                     if table == "system_resources":
                         cursor.execute(
                             """
@@ -359,6 +363,7 @@ class Database:
                         """,
                             values,
                         )
+                    # NOTE: flag here
                     elif table == "background_stats":
                         cursor.execute(
                             """
@@ -369,6 +374,7 @@ class Database:
                         """,
                             values,
                         )
+                    # NOTE: flag here
                     elif table == "injection_stats":
                         cursor.execute(
                             """
@@ -379,6 +385,7 @@ class Database:
                         """,
                             values,
                         )
+                    # NOTE: flag here
                     elif table == "training_losses":
                         cursor.execute(
                             """
@@ -395,6 +402,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error flushing data buffer: {e}")
 
+    # NOTE: flag here
     def write_system_resource(
         self,
         resource_type: str,
@@ -431,6 +439,7 @@ class Database:
             )
         )
 
+    # NOTE: flag here
     def write_background_stat(
         self,
         stat_name: str,
@@ -475,6 +484,7 @@ class Database:
             )
         )
 
+    # NOTE: flag here
     def write_injection_stat(
         self,
         stat_name: str,
@@ -522,6 +532,7 @@ class Database:
             )
         )
 
+    # NOTE: flag here
     def write_training_loss(
         self,
         model_name: str,
@@ -566,6 +577,8 @@ class Database:
             )
         )
 
+    # NOTE: flag here
+    # TODO: add equivalent functions for querying background_stats, injection_stats, training_losses
     def query_system_resource(
         self,
         start_time: float | None = None,
@@ -668,6 +681,13 @@ def get_db() -> Database | None:
         logger.warning("No database instance initialized")
 
     return db
+
+
+# TODO: write this function
+# NOTE: where should source of truth be? (bla0, blpc2, blpc3, other)
+def merge_db() -> None:
+    """Merge (join & dedup) two different aetherscan.db files into a single source-of-truth"""
+    pass
 
 
 def shutdown_db() -> None:
