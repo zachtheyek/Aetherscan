@@ -449,7 +449,7 @@ def main():
         # Explicitly call cleanup_all() before exiting to avoid deadlock
         # Without this, non-daemon threads block sys.exit() from running atexit handlers (race condition)
         # NOTE: do the other sys.exit() calls in main.py get blocked by non-daemon threads as well?
-        # BUG: sys.exit() calls DO get blocked. directly call manager.cleanup_all() instead
+        # BUG: sys.exit() calls DO get blocked. directly call manager.cleanup_all() instead. actually sometimes it works? further testing required
         manager = get_manager()  # NOTE: is this needed? since manager initialized in main?
         if manager:
             manager.cleanup_all()

@@ -1520,6 +1520,7 @@ class TrainingPipeline:
             del true_latents, false_latents
             gc.collect()
 
+    # TODO: visualize SNR range in training progress plot
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
@@ -1540,7 +1541,7 @@ class TrainingPipeline:
         ax_false = fig.add_subplot(gs[1, 3])
 
         fig.suptitle(
-            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=16, fontweight="bold"
+            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
         epochs = range(1, len(self.history.get("loss", [])) + 1)
@@ -1568,12 +1569,12 @@ class TrainingPipeline:
                     linestyle="--",
                 )
 
-            ax.set_title(title, fontsize=12)
-            ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
+            ax.set_title(title, fontsize=14, fontweight="bold")
+            ax.set_xlabel("Epoch", fontsize=14, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
-            ax.tick_params(axis="both", labelsize=10)
-            ax2.tick_params(axis="y", labelcolor="grey", labelsize=10)
+            ax.tick_params(axis="both", labelsize=12)
+            ax2.tick_params(axis="y", labelcolor="grey", labelsize=12)
 
         # Top subplot - Total Loss
         plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
@@ -1597,12 +1598,15 @@ class TrainingPipeline:
             handles=[train_line, val_line, lr_line],
             loc="upper right",
             bbox_to_anchor=(0.98, 0.98),
-            fontsize=10,
+            fontsize=14,
             frameon=True,
             fancybox=True,
             shadow=True,
         )
 
+        # WARN: not sure why the following warning occurs?
+        # WARN: 2026-01-03 14:01:12,049 | py.warnings | WARNING | /home/zachy/src/Aetherscan/src/aetherscan/train.py:1606: UserWarning: This figure includes Axes that are not compatible with tight_layout, so results might be incorrect.
+        # WARN: plt.tight_layout()
         plt.tight_layout()
 
         # Save plot
@@ -1620,6 +1624,8 @@ class TrainingPipeline:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
         plt.close()
+
+        logger.info(f"Beta-VAE training progress plot saved to: {save_path}")
 
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""

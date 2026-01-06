@@ -2,6 +2,7 @@
 # add slack integration
 # find a way to customize separate logging level for slack vs console/file
 # also find a way to log plots in slack (but not in console/file)
+# TODO: set log level in logger config (search: setLevel)
 # TODO: add tag to file log & archive old logs
 """
 Logger for Aetherscan Pipeline
@@ -97,7 +98,7 @@ class Logger:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
-        self.log_path = os.path.join(self.config.output_path, "aetherscan.log")
+        self.log_path = os.path.join(self.config.output_path, "logs", "aetherscan.log")
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)  # Create dir if it doesn't exist
 
         # Create queue for worker processes (no size limit)

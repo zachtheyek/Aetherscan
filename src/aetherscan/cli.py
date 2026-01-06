@@ -209,7 +209,7 @@ def _add_train_arguments(subparsers):
         help="Number of epochs to train the VAE per curriculum learning round",
     )
     train_parser.add_argument(
-        "--num-samples-vae",
+        "--num-samples-beta-vae",
         type=int,
         default=None,
         # NOTE: divisible by 4 or num_replicas?
@@ -464,8 +464,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.num_training_rounds = args.num_training_rounds
     if hasattr(args, "epochs_per_round") and args.epochs_per_round is not None:
         config.training.epochs_per_round = args.epochs_per_round
-    if hasattr(args, "num_samples_vae") and args.num_samples_vae is not None:
-        config.training.num_samples_beta_vae = args.num_samples_vae
+    if hasattr(args, "num_samples_beta_vae") and args.num_samples_beta_vae is not None:
+        config.training.num_samples_beta_vae = args.num_samples_beta_vae
     if hasattr(args, "num_samples_rf") and args.num_samples_rf is not None:
         config.training.num_samples_rf = args.num_samples_rf
     if hasattr(args, "train_val_split") and args.train_val_split is not None:
@@ -554,15 +554,15 @@ def validate_args(args: argparse.Namespace) -> None:
     #         f"got {args.signal_injection_chunk_size}"
     #     )
     #
-    # # Check: num-samples-vae must be divisible by 4 (for balanced class generation)
+    # # Check: num-samples-beta-vae must be divisible by 4 (for balanced class generation)
     # if (
-    #     hasattr(args, "num_samples_vae")
-    #     and args.num_samples_vae is not None
-    #     and args.num_samples_vae % 4 != 0
+    #     hasattr(args, "num_samples_beta_vae")
+    #     and args.num_samples_beta_vae is not None
+    #     and args.num_samples_beta_vae % 4 != 0
     # ):
     #     errors.append(
-    #         f"--num-samples-vae must be divisible by 4 for balanced class generation, "
-    #         f"got {args.num_samples_vae}"
+    #         f"--num-samples-beta-vae must be divisible by 4 for balanced class generation, "
+    #         f"got {args.num_samples_beta_vae}"
     #     )
     #
     # # Check: num-samples-rf must be divisible by 4 (for balanced class generation)
@@ -584,8 +584,8 @@ def validate_args(args: argparse.Namespace) -> None:
     # time_bin & width bin match data (randomly sample a few files)
     # train_files & test_files exist
     # 0 <= train_val_split <= 1
-    # per_replica_batch_size <= global_batch_size <= num_samples_vae * train_val_split
-    # per_replica_val_batch_size <= num_samples_vae * (1 - train_val_split)
+    # per_replica_batch_size <= global_batch_size <= num_samples_beta_vae * train_val_split
+    # per_replica_val_batch_size <= num_samples_beta_vae * (1 - train_val_split)
     # per_replica_val_batch_size <= num_samples rf
     # snr_base, initial_snr_range, final_snr_range > 0
     # exponential_decay_rate < 0

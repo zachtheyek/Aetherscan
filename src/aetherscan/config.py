@@ -31,7 +31,9 @@ class ManagerConfig:
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     # NOTE: should we move chunks_per_worker to TrainingConfig() and make it specific to preproc/data_gen?
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
-    pool_terminate_timeout: float = 10.0  # seconds (actual timeout may be 2x from terminate + join)
+    pool_terminate_timeout: float = (
+        10.0  # seconds (actual timeout may be 2x this value -- from terminate + join threads)
+    )
 
 
 @dataclass
@@ -86,11 +88,11 @@ class DataConfig:
     freq_resolution: float = 2.7939677238464355  # Hz
     time_resolution: float = 18.25361108  # seconds
 
-    num_target_backgrounds: int = 15000  # Number of background cadences to load
+    num_target_backgrounds: int = 45000  # Number of background cadences to load
     # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
     # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file) (how to track chunk processing efficiency)
     background_load_chunk_size: int = (
-        5000  # Maximum cadences to process at once during background loading
+        15000  # Maximum cadences to process at once during background loading
     )
     max_chunks_per_file: int = 1  # Maximum chunks to load from a single file
 
@@ -116,23 +118,19 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     num_training_rounds: int = 20
-    # NOTE: try 150 epochs & compare loss curves
-    epochs_per_round: int = 100
+    epochs_per_round: int = 150
 
-    # NOTE: use more samples on bla0?
-    num_samples_beta_vae: int = 120000
-    # NOTE: use more samples on bla0?
-    num_samples_rf: int = 24000
+    num_samples_beta_vae: int = 500000
+    num_samples_rf: int = 100000
     train_val_split: float = 0.8
 
-    # NOTE: use higher batch sizes on bla0?
+    # TODO: find optimal per replica train batch size for 4 or 6 A4000s (128 or 256?) (does 256 trigger GPU OOM?)
     per_replica_batch_size: int = 128
-    global_batch_size: int = 2048  # Effective batch size for gradient accumulation
+    global_batch_size: int = 4096  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096
 
-    # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     signal_injection_chunk_size: int = (
-        1000  # Maximum cadences to process at once during data generation
+        50000  # Maximum cadences to process at once during data generation
     )
 
     # Curriculum learning params
@@ -272,10 +270,10 @@ class Config:
         """Get subset parameters for a file (start, end indices)"""
         # Option to define subsets for specific files to manage memory usage
         subset_map = {
-            "real_filtered_LARGE_HIP110750.npy": (None, 5000),
-            "real_filtered_LARGE_HIP13402.npy": (3000, 10000),
-            "real_filtered_LARGE_HIP8497.npy": (8000, None),
-            "real_filtered_LARGE_testHIP83043.npy": (None, None),
+            "real_filtered_LARGE_HIP110750.npy": (None, None),  # Shape: (14567, 6, 16, 4096)
+            "real_filtered_LARGE_HIP13402.npy": (None, None),  # Shape: (14567, 6, 16, 4096)
+            "real_filtered_LARGE_HIP8497.npy": (None, None),  # Shape: (14567, 6, 16, 4096)
+            "real_filtered_LARGE_testHIP83043.npy": (None, None),  # Shape: (14567, 6, 16, 4096)
         }
         return subset_map.get(filename, (None, None))
 

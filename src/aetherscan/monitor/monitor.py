@@ -1,5 +1,4 @@
-# TODO: split GPU usage & memory into separate plots?
-# TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup
+# TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup. set threshold in monitor config
 """
 Resource monitor for Aetherscan Pipeline
 Runs as background thread & records system metrics (CPU, RAM, GPU) to database writer queue
@@ -494,6 +493,7 @@ class ResourceMonitor:
         ax_cpu.set_ylabel("CPU Usage (%)", fontsize=12, fontweight="bold")
         ax_cpu.set_ylim(0, 100)
         ax_cpu.grid(True, alpha=0.3)
+        # TODO: place legend outside of plot (see plot_beta_vae_training_progress()) (only for gpu plot?)
         ax_cpu.legend(loc="upper right", fontsize=10)
         ax_cpu.set_title(f"CPU Pressure (n={psutil.cpu_count()} cores)", fontsize=12)
 

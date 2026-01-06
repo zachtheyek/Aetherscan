@@ -237,6 +237,7 @@ class DataPreprocessor:
                 chunk_data = np.array(raw_data[chunk_start:chunk_end])
 
                 # NOTE: is this access pattern the most efficient (least pickling)? see comments in _single_cadence_wrapper() from data_generation.py for more details
+                # NOTE: currently, loading the backgrounds takes WAY more time than processing the backgrounds
                 # Prepare arguments (just indices, not data - data is in global state)
                 n_cadences = min(chunk_data.shape[0], num_target_backgrounds - len(all_backgrounds))
                 args_list = [

@@ -34,6 +34,12 @@ _GLOBAL_BACKGROUNDS = None
 _GLOBAL_SHAPE = None
 _GLOBAL_DTYPE = None
 
+# NOTE: come back to this later
+# # NEW: Output shared memory for zero-copy results
+# _GLOBAL_OUTPUT_SHM = None
+# _GLOBAL_OUTPUT_ARRAY = None
+# _GLOBAL_OUTPUT_SHAPE = None
+
 
 def _init_worker(shm_name, shape, dtype):
     """
@@ -53,7 +59,25 @@ def _init_worker(shm_name, shape, dtype):
 
         The main process is responsible for unlinking shared memory (handled by ResourceManager).
     """
+    # NOTE: come back to this later
+    # def _init_worker(shm_name, shape, dtype, output_shm_name=None, output_shape=None):
+    #     """
+    #     Initialize worker process with shared memory references.
+    #
+    #     Args:
+    #         shm_name: Name of the shared memory block containing background plates
+    #         shape: Shape of the background array
+    #         dtype: Data type of the background array
+    #         output_shm_name: Name of shared memory for output results (optional)
+    #         output_shape: Shape of the output array (optional)
+    #
+    #     Why this change:
+    #         Adding output_shm_name and output_shape parameters allows workers to write
+    #         results directly to shared memory instead of returning them through IPC.
+    #         This eliminates ~23GB of pickle serialization per training round.
+    #     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
+    # global _GLOBAL_OUTPUT_SHM, _GLOBAL_OUTPUT_ARRAY, _GLOBAL_OUTPUT_SHAPE
 
     # Initialize worker logging
     init_worker_logging()
@@ -64,6 +88,20 @@ def _init_worker(shm_name, shape, dtype):
 
     # Attach to existing shared memory block
     _GLOBAL_SHM = SharedMemory(name=shm_name)
+
+    # Create numpy array view of shared memory (no copy!)
+    _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
+    _GLOBAL_SHAPE = shape
+    _GLOBAL_DTYPE = dtype
+
+    # NOTE: come back to this later
+    # # NEW: Attach to output shared memory if provided
+    # if output_shm_name is not None and output_shape is not None:
+    #     _GLOBAL_OUTPUT_SHM = SharedMemory(name=output_shm_name)
+    #     _GLOBAL_OUTPUT_ARRAY = np.ndarray(
+    #         output_shape, dtype=np.float32, buffer=_GLOBAL_OUTPUT_SHM.buf
+    #     )
+    #     _GLOBAL_OUTPUT_SHAPE = output_shape
 
     # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -99,11 +137,6 @@ def _init_worker(shm_name, shape, dtype):
 
     # Register SIGTERM handler for graceful cleanup on pool.terminate()
     signal.signal(signal.SIGTERM, cleanup_on_sigterm)
-
-    # Create numpy array view of shared memory (no copy!)
-    _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
-    _GLOBAL_SHAPE = shape
-    _GLOBAL_DTYPE = dtype
 
 
 def log_norm(data: np.ndarray) -> np.ndarray:
@@ -417,6 +450,58 @@ def _single_cadence_wrapper(args):
     )
 
 
+# NOTE: come back to this later
+# def _batch_cadence_worker(args):
+#     """
+#     Process a batch of cadences and write results directly to shared memory.
+#
+#     Args:
+#         args: Tuple of (start_idx, end_idx, function, snr_base, snr_range,
+#                        width_bin, freq_resolution, time_resolution, inject, dynamic_range)
+#
+#     Returns:
+#         None - results written directly to _GLOBAL_OUTPUT_ARRAY
+#
+#     Why this approach:
+#         Instead of returning 192KB per cadence through IPC (which requires pickle
+#         serialization), workers write directly to pre-allocated shared memory.
+#         This eliminates the dominant bottleneck: ~23GB of IPC data transfer per round.
+#
+#         Processing cadences in batches (e.g., 500-1000 per task) also reduces
+#         task scheduling overhead from 120,000 dispatches to ~120-240 dispatches.
+#     """
+#     (
+#         start_idx,
+#         end_idx,
+#         function,
+#         snr_base,
+#         snr_range,
+#         width_bin,
+#         freq_resolution,
+#         time_resolution,
+#         inject,
+#         dynamic_range,
+#     ) = args
+#
+#     # Process each cadence in this batch
+#     for i in range(start_idx, end_idx):
+#         result = function(
+#             _GLOBAL_BACKGROUNDS,
+#             snr_base=snr_base,
+#             snr_range=snr_range,
+#             width_bin=width_bin,
+#             freq_resolution=freq_resolution,
+#             time_resolution=time_resolution,
+#             inject=inject,
+#             dynamic_range=dynamic_range,
+#         )
+#
+#         # Write directly to shared memory output array - NO IPC!
+#         _GLOBAL_OUTPUT_ARRAY[i, :, :, :] = result
+#
+#     # Return None - no data through IPC
+
+
 def batch_create_cadence(
     function,
     samples: int,
@@ -484,8 +569,8 @@ def batch_create_cadence(
         # Use pool to generate cadences in parallel
         for i, result in enumerate(
             # NOTE: does return order matter?
-            # pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
-            pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
+            # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):
             cadence[i, :, :, :] = result
@@ -504,6 +589,157 @@ def batch_create_cadence(
             )
 
     return cadence
+
+
+# NOTE: come back to this later
+# def batch_create_cadence(
+#     function,
+#     samples: int,
+#     plate: np.ndarray,
+#     snr_base: int = 10,
+#     snr_range: float = 40,
+#     width_bin: int = 512,
+#     freq_resolution: float = 2.7939677238464355,
+#     time_resolution: float = 18.25361108,
+#     inject: bool | None = None,
+#     dynamic_range: float | None = None,
+#     pool: Pool | None = None,
+#     output_shm: SharedMemory | None = None,
+#     output_array: np.ndarray | None = None,
+#     output_offset: int = 0,
+#     n_processes: int | None = cpu_count(),
+#     chunks_per_worker: int | None = 4,
+#     # NOTE: parametrize this in config
+#     batch_size: int = 500,  # cadences per task
+# ) -> np.ndarray:
+#     """
+#     Batch wrapper for creating multiple cadences using multiprocessing.
+#
+#     Key changes from original:
+#     1. Workers write directly to shared memory (output_array) instead of returning results
+#     2. Tasks are batched (batch_size cadences per task) to reduce scheduling overhead
+#     3. output_offset allows writing to a specific slice of the output array
+#
+#     Args:
+#         function: Cadence generation function (create_false, create_true_single, create_true_double)
+#         samples: Number of cadences to generate
+#         plate: Background plate array (only used if pool is None)
+#         snr_base: Base SNR value
+#         snr_range: SNR range for randomization
+#         width_bin: Number of frequency bins
+#         freq_resolution: Frequency resolution in Hz
+#         time_resolution: Time resolution in seconds
+#         inject: Whether to inject signals (for create_false)
+#         dynamic_range: Dynamic range for signal injection (for create_true_double)
+#         pool: Pre-initialized multiprocessing Pool with shared memory
+#         output_shm: SharedMemory object for output (used for cleanup tracking)
+#         output_array: numpy array view of output shared memory
+#         output_offset: Starting index in output_array for this batch
+#         n_processes: Number of processes in multiprocessing Pool
+#         chunks_per_worker: Used to calculate optimal chunksize for load balancing
+#         batch_size: Number of cadences per worker task (default 500)
+#
+#     Returns:
+#         Array of shape (samples, 6, 16, width_bin) containing generated cadences
+#         (either from shared memory or newly allocated)
+#     """
+#     if pool and output_array is not None:
+#         # OPTIMIZED PATH: Use shared memory output
+#
+#         # Create batched task arguments
+#         # Instead of 1 task per cadence, create 1 task per batch_size cadences
+#         tasks = []
+#         for batch_start in range(0, samples, batch_size):
+#             batch_end = min(batch_start + batch_size, samples)
+#             # Indices are relative to output_offset in the shared memory
+#             tasks.append(
+#                 (
+#                     output_offset + batch_start,  # start_idx in output array
+#                     output_offset + batch_end,  # end_idx in output array
+#                     function,
+#                     snr_base,
+#                     snr_range,
+#                     width_bin,
+#                     freq_resolution,
+#                     time_resolution,
+#                     inject,
+#                     dynamic_range,
+#                 )
+#             )
+#
+#         # Calculate chunksize for pool.map
+#         # With batched tasks, we have far fewer tasks, so chunksize can be smaller
+#         n_tasks = len(tasks)
+#         try:
+#             n_workers = pool._processes
+#         except AttributeError:
+#             n_workers = n_processes
+#
+#         # Aim for ~4 chunks per worker for load balancing
+#         chunksize = max(1, n_tasks // (n_workers * 4))
+#
+#         logger.debug(
+#             f"Dispatching {n_tasks} batched tasks (batch_size={batch_size}, chunksize={chunksize})"
+#         )
+#
+#         # Execute - results are written directly to shared memory
+#         # We use pool.map which blocks until complete, but returns None for each task
+#         list(pool.map(_batch_cadence_worker, tasks, chunksize=chunksize))
+#
+#         # Return view of the shared memory output for this batch
+#         return output_array[output_offset : output_offset + samples]
+#
+#     elif pool:
+#         # LEGACY PATH: Pool exists but no shared memory output
+#         # Fall back to original IPC-based approach (for backward compatibility)
+#         cadence = np.zeros((samples, 6, 16, width_bin), dtype=np.float32)
+#
+#         args_list = [
+#             (
+#                 function,
+#                 snr_base,
+#                 snr_range,
+#                 width_bin,
+#                 freq_resolution,
+#                 time_resolution,
+#                 inject,
+#                 dynamic_range,
+#             )
+#             for _ in range(samples)
+#         ]
+#
+#         try:
+#             n_workers = pool._processes
+#         except AttributeError:
+#             n_workers = n_processes
+#
+#         # FIX: Use reasonable chunksize instead of always 1
+#         chunksize = max(50, samples // (n_workers * 4))
+#
+#         for i, result in enumerate(
+#             pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
+#         ):
+#             cadence[i, :, :, :] = result
+#
+#         return cadence
+#
+#     else:
+#         # Sequential execution (no pool)
+#         cadence = np.zeros((samples, 6, 16, width_bin), dtype=np.float32)
+#
+#         for i in range(samples):
+#             cadence[i, :, :, :] = function(
+#                 plate,
+#                 snr_base=snr_base,
+#                 snr_range=snr_range,
+#                 width_bin=width_bin,
+#                 freq_resolution=freq_resolution,
+#                 time_resolution=time_resolution,
+#                 inject=inject,
+#                 dynamic_range=dynamic_range,
+#             )
+#
+#         return cadence
 
 
 class DataGenerator:
@@ -608,6 +844,30 @@ class DataGenerator:
         else:
             self.pool = None
             logger.info("DataGenerator running in sequential mode (n_processes=1)")
+
+    # NOTE: come back to this later
+    # def _setup_managed_pool(self):
+    #     """
+    #     Setup managed multiprocessing pool with shared memory.
+    #
+    #     Why we don't create output shared memory here:
+    #         Output shared memory size depends on the batch size requested in generate_batch(),
+    #         which varies between calls. We create output shared memory on-demand in generate_batch()
+    #         and pass references to workers via the task arguments.
+    #
+    #         The pool is initialized with background shared memory only. Workers will attach to
+    #         output shared memory when provided via _batch_cadence_worker args.
+    #     """
+    #     if self.shm:
+    #         self.pool = self.manager.create_pool(
+    #             n_processes=self.n_processes,
+    #             name=f"DataGen_pool_{id(self)}",
+    #             initializer=_init_worker,
+    #             initargs=(self.shm.name, self._background_shape, self._background_dtype),
+    #         )
+    #     else:
+    #         self.pool = None
+    #         logger.info("DataGenerator running in sequential mode (n_processes=1)")
 
     def _free_managed_pool(self):
         """Close multiprocessing pool"""
@@ -848,28 +1108,230 @@ class DataGenerator:
         # Create result dictionary with references to pre-allocated arrays
         result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
-        # NOTE: is there a more efficient way to do this?
-        # Sanity check: verify post-injection data normalization
-        for key in ["concatenated", "false", "true"]:
-            min_val = np.min(result[key])
-            max_val = np.max(result[key])
-            mean_val = np.mean(result[key])
-            logger.info(
-                f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
-            )
-            if max_val > 1.0:
-                logger.error(f"Post-injection {key} values too large! Max: {max_val}")
-                raise ValueError(f"Post-injection {key} normalization check failed")
-            elif min_val < 0.0:
-                logger.error(f"Post-injection {key} values too small! Min: {min_val}")
-                raise ValueError(f"Post-injection {key} normalization check failed")
-            elif np.isnan(result[key]).any():
-                logger.error(f"Post-injection {key} contains NaN values!")
-                raise ValueError(f"Post-injection {key} normalization check failed")
-            elif np.isinf(result[key]).any():
-                logger.error(f"Post-injection {key} contains Inf values!")
-                raise ValueError(f"Post-injection {key} normalization check failed")
-            else:
-                logger.info(f"Post-injection {key} data properly normalized")
+        # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
+        # # Sanity check: verify post-injection data normalization
+        # for key in ["concatenated", "false", "true"]:
+        #     min_val = np.min(result[key])
+        #     max_val = np.max(result[key])
+        #     mean_val = np.mean(result[key])
+        #     logger.info(
+        #         f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
+        #     )
+        #     if max_val > 1.0:
+        #         logger.error(f"Post-injection {key} values too large! Max: {max_val}")
+        #         raise ValueError(f"Post-injection {key} normalization check failed")
+        #     elif min_val < 0.0:
+        #         logger.error(f"Post-injection {key} values too small! Min: {min_val}")
+        #         raise ValueError(f"Post-injection {key} normalization check failed")
+        #     elif np.isnan(result[key]).any():
+        #         logger.error(f"Post-injection {key} contains NaN values!")
+        #         raise ValueError(f"Post-injection {key} normalization check failed")
+        #     elif np.isinf(result[key]).any():
+        #         logger.error(f"Post-injection {key} contains Inf values!")
+        #         raise ValueError(f"Post-injection {key} normalization check failed")
+        #     else:
+        #         logger.info(f"Post-injection {key} data properly normalized")
 
         return result
+
+    # NOTE: come back to this later
+    # def generate_batch(
+    #     self, n_samples: int, snr_base: int, snr_range: int
+    # ) -> dict[str, np.ndarray]:
+    #     """
+    #     Generate batch using unified task submission and shared memory outputs.
+    #
+    #     Key optimizations:
+    #     1. Single shared memory allocation for all outputs
+    #     2. All 8 batch types submitted as unified task queue
+    #     3. Workers write directly to shared memory (no IPC returns)
+    #     4. Single synchronization point instead of 8
+    #
+    #     Output structure:
+    #         main: collapsed cadences (n_samples total)
+    #           - 1/4 false-no-signal, 1/4 false-with-rfi, 1/4 true-single, 1/4 true-double
+    #         false: non-collapsed false cadences (n_samples total)
+    #           - 1/2 false-no-signal, 1/2 false-with-rfi
+    #         true: non-collapsed true cadences (n_samples total)
+    #           - 1/2 true-single, 1/2 true-double
+    #     """
+    #     max_chunk_size = self.config.training.signal_injection_chunk_size
+    #     n_chunks = max(1, (n_samples + max_chunk_size - 1) // max_chunk_size)
+    #
+    #     logger.info(f"Generating {n_samples} samples in {n_chunks} chunks of max {max_chunk_size}")
+    #
+    #     # Pre-allocate output arrays
+    #     all_main = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+    #     all_false = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+    #     all_true = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+    #
+    #     for chunk_idx in range(n_chunks):
+    #         chunk_size = min(max_chunk_size, n_samples - chunk_idx * max_chunk_size)
+    #         if chunk_size <= 0:
+    #             break
+    #
+    #         start_idx = chunk_idx * max_chunk_size
+    #         end_idx = start_idx + chunk_size
+    #
+    #         logger.info(f"Generating chunk {chunk_idx + 1}/{n_chunks} with {chunk_size} samples")
+    #
+    #         # Calculate sample counts for this chunk
+    #         quarter = max(1, chunk_size // 4)
+    #         half = max(1, chunk_size // 2)
+    #
+    #         # Total outputs needed for this chunk:
+    #         # - main: 4 * quarter = chunk_size
+    #         # - false: 2 * half = chunk_size
+    #         # - true: 2 * half = chunk_size
+    #         # Total: 3 * chunk_size
+    #         total_outputs = 3 * chunk_size
+    #
+    #         # Create output shared memory for this chunk
+    #         output_shape = (total_outputs, 6, 16, self.width_bin)
+    #         output_nbytes = int(np.prod(output_shape) * np.float32().nbytes)
+    #
+    #         output_shm = self.manager.create_shared_memory(
+    #             size=output_nbytes,
+    #             name=f"DataGen_output_chunk_{chunk_idx}_{id(self)}",
+    #         )
+    #
+    #         # Create numpy view of output shared memory
+    #         output_array = np.ndarray(output_shape, dtype=np.float32, buffer=output_shm.buf)
+    #
+    #         # Reinitialize pool with output shared memory reference
+    #         # Workers need to attach to the new output shared memory
+    #         if self.pool is not None:
+    #             self._free_managed_pool()
+    #
+    #         self.pool = self.manager.create_pool(
+    #             n_processes=self.n_processes,
+    #             name=f"DataGen_pool_chunk_{chunk_idx}_{id(self)}",
+    #             initializer=_init_worker,
+    #             initargs=(
+    #                 self.shm.name,
+    #                 self._background_shape,
+    #                 self._background_dtype,
+    #                 output_shm.name,  # NEW: output shared memory
+    #                 output_shape,  # NEW: output shape
+    #             ),
+    #         )
+    #
+    #         # Define output layout in shared memory:
+    #         # [0:quarter]                          -> main: false_no_signal
+    #         # [quarter:2*quarter]                  -> main: false_with_rfi
+    #         # [2*quarter:3*quarter]                -> main: true_single
+    #         # [3*quarter:4*quarter]                -> main: true_double
+    #         # [chunk_size:chunk_size+half]         -> false: no_signal
+    #         # [chunk_size+half:chunk_size+2*half]  -> false: with_rfi
+    #         # [2*chunk_size:2*chunk_size+half]     -> true: single
+    #         # [2*chunk_size+half:3*chunk_size]     -> true: double
+    #
+    #         # Build unified task list for all 8 batch types
+    #         batch_size = 500  # Cadences per task
+    #         all_tasks = []
+    #
+    #         # Helper to create batched tasks for a given output range
+    #         def add_tasks(
+    #             output_start,
+    #             count,
+    #             function,
+    #             inject=None,
+    #             dynamic_range=None,
+    #             _batch_size=batch_size,
+    #             _all_tasks=all_tasks,
+    #         ):
+    #             for batch_start in range(0, count, _batch_size):
+    #                 batch_end = min(batch_start + _batch_size, count)
+    #                 _all_tasks.append(
+    #                     (
+    #                         output_start + batch_start,
+    #                         output_start + batch_end,
+    #                         function,
+    #                         snr_base,
+    #                         snr_range,
+    #                         self.width_bin,
+    #                         self.freq_resolution,
+    #                         self.time_resolution,
+    #                         inject,
+    #                         dynamic_range,
+    #                     )
+    #                 )
+    #
+    #         # Main outputs (quarters)
+    #         add_tasks(0, quarter, create_false, inject=False)
+    #         add_tasks(quarter, quarter, create_false, inject=True)
+    #         add_tasks(2 * quarter, quarter, create_true_single)
+    #         add_tasks(3 * quarter, quarter, create_true_double, dynamic_range=1)
+    #
+    #         # False outputs (halves)
+    #         add_tasks(chunk_size, half, create_false, inject=False)
+    #         add_tasks(chunk_size + half, half, create_false, inject=True)
+    #
+    #         # True outputs (halves)
+    #         add_tasks(2 * chunk_size, half, create_true_single)
+    #         add_tasks(2 * chunk_size + half, half, create_true_double, dynamic_range=1)
+    #
+    #         logger.info(f"Submitting {len(all_tasks)} unified tasks to pool")
+    #
+    #         # Execute ALL tasks in single pool.map call
+    #         # This is the key optimization: one sync barrier instead of 8
+    #         n_workers = self.n_processes
+    #         chunksize = max(1, len(all_tasks) // (n_workers * 4))
+    #
+    #         list(self.pool.map(_batch_cadence_worker, all_tasks, chunksize=chunksize))
+    #
+    #         logger.info("All tasks complete, extracting results from shared memory")
+    #
+    #         # Extract results from shared memory into output arrays
+    #         # Main outputs
+    #         chunk_main = np.concatenate(
+    #             [
+    #                 output_array[0:quarter],
+    #                 output_array[quarter : 2 * quarter],
+    #                 output_array[2 * quarter : 3 * quarter],
+    #                 output_array[3 * quarter : 4 * quarter],
+    #             ],
+    #             axis=0,
+    #         )
+    #
+    #         # False outputs
+    #         chunk_false = np.concatenate(
+    #             [
+    #                 output_array[chunk_size : chunk_size + half],
+    #                 output_array[chunk_size + half : chunk_size + 2 * half],
+    #             ],
+    #             axis=0,
+    #         )
+    #
+    #         # True outputs
+    #         chunk_true = np.concatenate(
+    #             [
+    #                 output_array[2 * chunk_size : 2 * chunk_size + half],
+    #                 output_array[2 * chunk_size + half : 3 * chunk_size],
+    #             ],
+    #             axis=0,
+    #         )
+    #
+    #         # Store chunks in pre-allocated arrays
+    #         all_main[start_idx:end_idx] = chunk_main
+    #         all_false[start_idx:end_idx] = chunk_false
+    #         all_true[start_idx:end_idx] = chunk_true
+    #
+    #         # Cleanup chunk resources
+    #         del chunk_main, chunk_false, chunk_true
+    #         del output_array
+    #
+    #         # Close pool before closing shared memory (workers have references)
+    #         self._free_managed_pool()
+    #         self.manager.close_shared_memory(output_shm)
+    #
+    #         gc.collect()
+    #
+    #         logger.info(f"Chunk {chunk_idx + 1} complete, memory cleared")
+    #
+    #     # Recreate pool for next generate_batch call
+    #     self._setup_managed_pool()
+    #
+    #     result = {"concatenated": all_main, "false": all_false, "true": all_true}
+    #
+    #     return result
