@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 import os
-import socket
 import subprocess
 import threading
 import time
@@ -21,6 +21,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import psutil
 import tensorflow as tf
+
+from aetherscan.db import get_system_metadata
 
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
@@ -458,7 +460,10 @@ class ResourceMonitor:
 
         # Create figure with 3 subplots
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
-        machine_name = socket.gethostname()
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
         fig.suptitle(
             f"Aetherscan Pipeline: Resource Utilization ({self.tag}, {machine_name})",
             fontsize=16,

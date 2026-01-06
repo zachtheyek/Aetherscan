@@ -579,6 +579,7 @@ def validate_args(args: argparse.Namespace) -> None:
     # TODO: come back to this later
     # double check if these are correct
     # rf_max_features, curriculum_schedule, load_tag, save_tag not following the accepted formats
+    # make sure save tag is unique (check db? is db initialized before validate_args()?)
     # vae_dense_layer_size = freq_resolution // downsample_factor
     # -1 <= rf_n_jobs <= num_cores
     # time_bin & width bin match data (randomly sample a few files)

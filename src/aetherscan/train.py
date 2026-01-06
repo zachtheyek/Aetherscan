@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import gc
 import glob
+import json
 import logging
 import os
 import re
 import shutil
-import socket
 import threading
 from datetime import datetime
 
@@ -25,6 +25,7 @@ from tensorflow.keras.layers import Conv2D, Dense
 
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
+from aetherscan.db import get_system_metadata
 from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
@@ -1526,7 +1527,8 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        machine_name = socket.gethostname()
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
 
         fig = plt.figure(figsize=(25, 12))
         gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
