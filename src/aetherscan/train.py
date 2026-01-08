@@ -1,7 +1,8 @@
 """
 Training orchestration for Aetherscan Pipeline
 Implements full workflow for both beta-VAE & RF classifier,
-Supports curriculum learning, distributed GPU training, and model checkpointing
+Supports curriculum learning, adaptive LR, distributed datasets & training,
+gradient accumulation, and model checkpointing
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from tensorflow.keras.layers import Conv2D, Dense
 
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
-from aetherscan.db import get_system_metadata
+from aetherscan.db import get_db, get_system_metadata
 from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
@@ -344,243 +345,285 @@ class DataHolder:
             self.false = None
 
 
-# TODO: split if-else branches into prepare_distributed_train_dataset & prepare_distributed_inference_dataset
-def prepare_distributed_dataset(
+def prepare_distributed_train_dataset(
     data: dict,
     n_samples: int,
-    train_val_split: float | None,
+    train_val_split: float,
     per_replica_batch_size: int,
-    global_batch_size: int | None,
-    per_replica_val_batch_size: int | None,
+    global_batch_size: int,
+    per_replica_val_batch_size: int,
     num_replicas: int,
     strategy: tf.distribute.Strategy,
     shuffle: bool = True,
 ) -> dict:
     """
-    Prepare distributed datasets for training or inference
+    Prepare distributed datasets for training & validation
 
     Args:
         data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
         n_samples: Number of samples in data
-        train_val_split: If provided, split data into train/val sets. If None, return single dataset for inference
-        per_replica_batch_size: Batch size per replica for training (or inference if no split)
-        global_batch_size: Required if train_val_split is provided. Effective batch size across all replicas for training
-        per_replica_val_batch_size: Required if train_val_split is provided. Batch size per replica for validation
+        train_val_split: Split data into train/val sets
+        per_replica_batch_size: Batch size per replica for training
+        global_batch_size: Effective batch size across all replicas for training
+        per_replica_val_batch_size: Batch size per replica for validation
         num_replicas: Number of replicas in strategy
         strategy: TensorFlow distribution strategy
-        shuffle: Whether to shuffle training data (default True, set False for inference)
+        shuffle: Whether to shuffle training data
 
-    Returns:
-        If train_val_split is None:
-            {dataset, n_trimmed, steps}
-            Single distributed dataset, number of samples in dataset, and number of steps
-        If train_val_split is provided:
-            {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps, accumulation_steps, val_steps}
-            Train/val distributed datasets, number of samples in each, number of steps for each (including accumulation sub-steps)
+    Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
+              accumulation_steps, val_steps, _train_holder, _val_holder}
+             Train/val distributed datasets, number of samples in each, number of steps for each
+              (including accumulation sub-steps), and DataHoldedr references for each
     """
-    if train_val_split is not None:
-        # Training case: split into train and val
-        if global_batch_size is None or per_replica_val_batch_size is None:
-            raise ValueError(
-                "global_batch_size and per_replica_val_batch_size are required when train_val_split is provided"
-            )
+    global_val_batch_size = per_replica_val_batch_size * num_replicas
 
-        # Split & trim to fit train/val batch size
-        n_train = int(n_samples * train_val_split)
-        n_val = n_samples - n_train
+    # Split into train & val
+    n_train = int(n_samples * train_val_split)
+    n_val = n_samples - n_train
 
-        n_train_trimmed = (n_train // global_batch_size) * global_batch_size
-        n_val_trimmed = (n_val // per_replica_val_batch_size) * per_replica_val_batch_size
+    # Trim datasets to fit train/val batch sizes (prevents uneven batches on final step)
+    # Note, n_train should already be divisible by global_batch_size and
+    # per_replica_batch_size * num_replicas
+    # As well, n_val should also already be divisible by per_replica_val_batch_size * num_replicas
+    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
+    # distributing our datasets
+    # Alternatively, we could also pad the data instead of trimming
+    n_train_trimmed = (n_train // global_batch_size) * global_batch_size
+    n_val_trimmed = (n_val // global_val_batch_size) * global_val_batch_size
 
-        logger.info(
-            f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}"
-        )
+    logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
 
-        # Prepare data
-        train_concat = data["concatenated"][:n_train_trimmed]
-        train_true = data["true"][:n_train_trimmed]
-        train_false = data["false"][:n_train_trimmed]
-        train_holder = DataHolder(train_concat, train_true, train_false)
+    # Prepare data
+    train_concat = data["concatenated"][:n_train_trimmed]
+    train_true = data["true"][:n_train_trimmed]
+    train_false = data["false"][:n_train_trimmed]
+    train_holder = DataHolder(train_concat, train_true, train_false)
 
-        val_start = n_train
-        val_end = val_start + n_val_trimmed
-        val_concat = data["concatenated"][val_start:val_end]
-        val_true = data["true"][val_start:val_end]
-        val_false = data["false"][val_start:val_end]
-        val_holder = DataHolder(val_concat, val_true, val_false)
+    val_start = n_train
+    val_end = val_start + n_val_trimmed
 
-        # Create generator functions for memory-efficient data loading
-        def train_generator():
-            while True:  # Make generators infinite to reset state between epochs
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with train_holder._lock:
-                    if train_holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = train_holder.concat
-                    true = train_holder.true
-                    false = train_holder.false
+    val_concat = data["concatenated"][val_start:val_end]
+    val_true = data["true"][val_start:val_end]
+    val_false = data["false"][val_start:val_end]
+    val_holder = DataHolder(val_concat, val_true, val_false)
 
-                # Work with local references (safe from clearing, no per-sample lock needed)
-                indices = np.arange(len(concat))
-                if shuffle:
-                    # Perform global shuffle on each epoch so each pass through the data is unique
-                    np.random.shuffle(indices)
-                for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
+    # Create generator functions for memory-efficient data loading
+    def train_generator():
+        while True:  # Make generators infinite to reset state between epochs
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with train_holder._lock:
+                if train_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = train_holder.concat
+                true = train_holder.true
+                false = train_holder.false
 
-                # Remove cache references for future garbage collection
-                del concat, true, false
+            # Work with local references (safe from clearing, no per-sample lock needed)
+            indices = np.arange(len(concat))
+            if shuffle:
+                # Perform global shuffle on each epoch so each pass through the data is unique
+                np.random.shuffle(indices)
+            for idx in indices:
+                yield (concat[idx], true[idx], false[idx]), concat[idx]
 
-        def val_generator():
-            while True:  # Make generators infinite to reset state between epochs
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with val_holder._lock:
-                    if val_holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = val_holder.concat
-                    true = val_holder.true
-                    false = val_holder.false
+            # Remove cache references to ensure garbage collection in future
+            del concat, true, false
 
-                # Maintain order on each epoch since no gradients are calculated during validation
-                for idx in range(len(concat)):
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
+    def val_generator():
+        while True:  # Make generators infinite to reset state between epochs
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with val_holder._lock:
+                if val_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = val_holder.concat
+                true = val_holder.true
+                false = val_holder.false
 
-                # Remove cache references for future garbage collection
-                del concat, true, false
+            # Maintain order on each epoch since shuffling provides no benefits (no gradients
+            # are calculated during validation)
+            for idx in range(len(concat)):
+                yield (concat[idx], true[idx], false[idx]), concat[idx]
 
-        # Determine dataset output signature
-        sample_shape = train_concat.shape[1:]
-        output_signature = (
-            (
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            ),
+            # Remove cache references to ensure garbage collection in future
+            del concat, true, false
+
+    # Determine dataset output signature
+    sample_shape = train_concat.shape[1:]
+    output_signature = (
+        (
             tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-        )
-
-        # Create datasets using generators to reduce GPU memory pressure
-        # Data is kept on CPU & transferred to GPU in batches on-demand
-        logger.info(
-            f"Creating infinite datasets from generators with per replica batch size - "
-            f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}"
-        )
-
-        train_dataset = (
-            tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
-            .batch(per_replica_batch_size)
-            .repeat()
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        val_dataset = (
-            tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
-            .batch(per_replica_val_batch_size)
-            .repeat()
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        # Distribute datasets across GPUs
-        logger.info(f"Distributing datasets across {num_replicas} GPUs")
-
-        train_dataset = strategy.experimental_distribute_dataset(train_dataset)
-        val_dataset = strategy.experimental_distribute_dataset(val_dataset)
-
-        # Calculate steps
-        train_steps = n_train_trimmed // global_batch_size
-        accumulation_steps = global_batch_size // (per_replica_batch_size * num_replicas)
-        val_steps = n_val_trimmed // (per_replica_val_batch_size * num_replicas)
-
-        return {
-            "train_dataset": train_dataset,
-            "val_dataset": val_dataset,
-            "n_train_trimmed": n_train_trimmed,
-            "n_val_trimmed": n_val_trimmed,
-            "train_steps": train_steps,
-            "accumulation_steps": accumulation_steps,
-            "val_steps": val_steps,
-            "_train_holder": train_holder,
-            "_val_holder": val_holder,
-        }
-
-    else:
-        # Inference case: no train/val split
-        batch_size = per_replica_batch_size * num_replicas
-        n_trimmed = (n_samples // batch_size) * batch_size
-
-        logger.info(f"Data alignment: {n_samples}→{n_trimmed}")
-
-        # Prepare data
-        concat = data["concatenated"][:n_trimmed]
-        true = data["true"][:n_trimmed]
-        false = data["false"][:n_trimmed]
-        holder = DataHolder(concat, true, false)
-
-        # Create generator function for memory-efficient data loading
-        def data_generator():
-            while True:  # Make generator infinite to reset state between passes
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with holder._lock:
-                    if holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = holder.concat
-                    true = holder.true
-                    false = holder.false
-
-                # Work with local references (safe from clearing, no per-sample lock needed)
-                indices = np.arange(len(concat))
-                if shuffle:
-                    np.random.shuffle(indices)
-                for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
-
-                # Remove cache references for future garbage collection
-                del concat, true, false
-
-        # Determine dataset output signature
-        sample_shape = concat.shape[1:]
-        output_signature = (
-            (
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            ),
             tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+        ),
+        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+    )
+
+    # Create datasets using generators to reduce GPU memory pressure
+    # Data is kept on CPU & transferred to GPU in batches on-demand
+    logger.info(
+        f"Creating infinite datasets from generators with per replica batch size - "
+        f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}"
+    )
+
+    train_dataset = (
+        tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
+        .batch(per_replica_batch_size, drop_remainder=True)
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    val_dataset = (
+        tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
+        .batch(per_replica_val_batch_size, drop_remainder=True)
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Distribute datasets across GPUs
+    logger.info(f"Distributing datasets across {num_replicas} GPUs")
+
+    train_dataset_distributed = strategy.experimental_distribute_dataset(train_dataset)
+    val_dataset_distributed = strategy.experimental_distribute_dataset(val_dataset)
+
+    # Calculate steps
+    train_steps = n_train_trimmed // global_batch_size
+    accumulation_steps = global_batch_size // (per_replica_batch_size * num_replicas)
+    val_steps = n_val_trimmed // global_val_batch_size
+
+    # Sanity check: verify step sizes are valid before returning
+    if train_steps < 1:
+        raise ValueError(
+            f"train_steps < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({global_batch_size})"
+        )
+    if accumulation_steps < 1:
+        raise ValueError(
+            f"accumulation_steps < 1: global_batch_size ({global_batch_size}) must be >= per_replica_batch_size * num_replicas ({per_replica_batch_size} * {num_replicas})"
+        )
+    if val_steps < 1:
+        raise ValueError(
+            f"val_steps < 1: n_val_trimmed ({n_val_trimmed}) must be >= per_replica_val_batch_size * num_replicas ({per_replica_val_batch_size} * {num_replicas})"
         )
 
-        # Create dataset using generator to reduce GPU memory pressure
-        # Data is kept on CPU & transferred to GPU in batches on-demand
-        logger.info(
-            f"Creating infinite dataset from generator with per replica batch size: {per_replica_batch_size}"
+    return {
+        "train_dataset": train_dataset_distributed,
+        "val_dataset": val_dataset_distributed,
+        "n_train_trimmed": n_train_trimmed,
+        "n_val_trimmed": n_val_trimmed,
+        "train_steps": train_steps,
+        "accumulation_steps": accumulation_steps,
+        "val_steps": val_steps,
+        "_train_holder": train_holder,
+        "_val_holder": val_holder,
+    }
+
+
+def prepare_distributed_inf_dataset(
+    data: dict,
+    n_samples: int,
+    per_replica_inf_batch_size: int,
+    num_replicas: int,
+    strategy: tf.distribute.Strategy,
+) -> dict:
+    """
+    Prepare distributed datasets for inference
+
+    Args:
+        data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
+        n_samples: Number of samples in data
+        per_replica_inf_batch_size: Batch size per replica for inference
+        num_replicas: Number of replicas in strategy
+        strategy: TensorFlow distribution strategy
+
+    Returns: {inf_dataset, n_inf_trimmed, inf_steps, _inf_holder}
+             Inference distributed dataset, number of samples, number of steps,
+              and DataHolder reference
+    """
+    global_inf_batch_size = per_replica_inf_batch_size * num_replicas
+
+    # Trim datasets to fit batch sizes (prevents uneven batches on final step)
+    # Note, n_samples should already be divisible by global_batch_size
+    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
+    # distributing our datasets
+    # Alternatively, we could also pad the data instead of trimming
+    n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
+
+    logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
+
+    # Prepare data
+    inf_concat = data["concatenated"][:n_inf_trimmed]
+    inf_true = data["true"][:n_inf_trimmed]
+    inf_false = data["false"][:n_inf_trimmed]
+    inf_holder = DataHolder(inf_concat, inf_true, inf_false)
+
+    # Create generator function for memory-efficient data loading
+    def inf_generator():
+        while True:  # Make generator infinite to reset state between passes
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with inf_holder._lock:
+                if inf_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = inf_holder.concat
+                true = inf_holder.true
+                false = inf_holder.false
+
+            # Maintain order on each epoch since shuffling provides no benefits (no gradients
+            # are calculated during inference)
+            for idx in range(len(concat)):
+                yield (concat[idx], true[idx], false[idx]), concat[idx]
+
+            # Remove cache references for future garbage collection
+            del concat, true, false
+
+    # Determine dataset output signature
+    sample_shape = inf_concat.shape[1:]
+    output_signature = (
+        (
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+        ),
+        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+    )
+
+    # Create dataset using generator to reduce GPU memory pressure
+    # Data is kept on CPU & transferred to GPU in batches on-demand
+    logger.info(
+        f"Creating infinite dataset from generator with per replica batch size: {per_replica_inf_batch_size}"
+    )
+
+    inf_dataset = (
+        tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
+        .batch(per_replica_inf_batch_size, drop_remainder=True)
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Distribute dataset across GPUs
+    logger.info(f"Distributing dataset across {num_replicas} GPUs")
+
+    inf_dataset_distributed = strategy.experimental_distribute_dataset(inf_dataset)
+
+    # Calculate steps
+    inf_steps = n_inf_trimmed // global_inf_batch_size
+
+    # Sanity check: verify step sizes are valid before returning
+    if inf_steps < 1:
+        raise ValueError(
+            f"inf_steps < 1: n_inf_trimmed ({n_inf_trimmed}) must be >= per_replica_inf_batch_size * num_replicas ({per_replica_inf_batch_size} * {num_replicas})"
         )
 
-        dataset = (
-            tf.data.Dataset.from_generator(data_generator, output_signature=output_signature)
-            .batch(per_replica_batch_size)
-            .repeat()
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        # Distribute dataset across GPUs
-        logger.info(f"Distributing dataset across {num_replicas} GPUs")
-
-        dataset = strategy.experimental_distribute_dataset(dataset)
-
-        # Calculate steps
-        steps = n_trimmed // batch_size
-
-        return {
-            "dataset": dataset,
-            "n_trimmed": n_trimmed,
-            "steps": steps,
-            "_holder": holder,
-        }
+    return {
+        "inf_dataset": inf_dataset_distributed,
+        "n_inf_trimmed": n_inf_trimmed,
+        "inf_steps": inf_steps,
+        "_inf_holder": inf_holder,
+    }
 
 
 class TrainingPipeline:
@@ -597,6 +640,10 @@ class TrainingPipeline:
         self.config = get_config()
         if self.config is None:
             raise ValueError("get_config() returned None")
+
+        self.db = get_db()
+        if self.db is None:
+            raise ValueError("get_db() returned None")
 
         # Initialize data generator
         self.data_generator = DataGenerator(background_data)
@@ -633,22 +680,6 @@ class TrainingPipeline:
         finally:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
             # since fault tolerance expects a clean directory structure
-
-            # TODO: replace this with db writes? (search for all self.history instances)
-            # Training history
-            self.history = {
-                "loss": [],
-                "reconstruction_loss": [],
-                "kl_loss": [],
-                "true_loss": [],
-                "false_loss": [],
-                "val_loss": [],
-                "val_reconstruction_loss": [],
-                "val_kl_loss": [],
-                "val_true_loss": [],
-                "val_false_loss": [],
-                "learning_rate": [],
-            }
 
             # Setup directories
             self._setup_directories()
@@ -895,7 +926,7 @@ class TrainingPipeline:
         )
 
         # Distribute training data
-        data = prepare_distributed_dataset(
+        data = prepare_distributed_train_dataset(
             data=train_data,
             n_samples=self.config.training.num_samples_beta_vae,
             train_val_split=self.config.training.train_val_split,
@@ -922,20 +953,6 @@ class TrainingPipeline:
 
         del data
         gc.collect()
-
-        # Sanity check: verify step sizes are valid
-        if accumulation_steps < 1:
-            raise ValueError(
-                f"Accumulation steps < 1: global_batch_size ({self.config.training.global_batch_size}) must be >= per_replica_batch_size * num_replicas ({self.config.training.per_replica_batch_size * self.strategy.num_replicas_in_sync})"
-            )
-        if steps_per_epoch < 1:
-            raise ValueError(
-                f"Steps per epoch < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({self.config.training.global_batch_size})"
-            )
-        if val_steps < 1:
-            raise ValueError(
-                f"Validation steps < 1: n_val_trimmed ({n_val_trimmed}) must be >= per_replica_val_batch_size * num_replicas ({self.config.training.per_replica_val_batch_size * self.strategy.num_replicas_in_sync})"
-            )
 
         logger.info(
             f"Initializing training loop with {steps_per_epoch} train steps, {val_steps} val steps"
@@ -971,30 +988,56 @@ class TrainingPipeline:
                     f"False: {val_losses['false']:.4f}"
                 )
 
-                # Update history
-                for key, train_key in [
-                    ("loss", "total"),
-                    ("reconstruction_loss", "reconstruction"),
-                    ("kl_loss", "kl"),
-                    ("true_loss", "true"),
-                    ("false_loss", "false"),
-                ]:
-                    if key not in self.history:
-                        self.history[key] = []
-                    self.history[key].append(float(epoch_losses[train_key]))
-                for key, val_key in [
-                    ("val_loss", "total"),
-                    ("val_reconstruction_loss", "reconstruction"),
-                    ("val_kl_loss", "kl"),
-                    ("val_true_loss", "true"),
-                    ("val_false_loss", "false"),
-                ]:
-                    if key not in self.history:
-                        self.history[key] = []
-                    self.history[key].append(float(val_losses[val_key]))
-                self.history["learning_rate"].append(
-                    float(self.vae.optimizer.learning_rate.numpy())
-                )
+                # # Update history
+                # for key, train_key in [
+                #     ("total_loss", "total"),
+                #     ("reconstruction_loss", "reconstruction"),
+                #     ("kl_loss", "kl"),
+                #     ("true_loss", "true"),
+                #     ("false_loss", "false"),
+                # ]:
+
+                # def write_training_loss(
+                #     self,
+                #     model_name: str,
+                #     loss_name: str,
+                #     value: float,
+                #     round_number: int | None = None,
+                #     epoch_number: int | None = None,
+                #     step_number: int | None = None,
+                #     learning_rate: float | None = None,
+                #     snr_range_floor: int | None = None,
+                #     snr_range_ceil: int | None = None,
+                #     tag: str | None = None,
+                # ):
+
+                #     # NOTE: what does epoch_losses return? do we need to write to db in _train_epoch() also?
+                #     self.db.write_training_loss(
+                #         model_name="beta_vae",
+                #         loss_name=key,
+                #         value=float(epoch_losses[train_key]),
+                #         round_number=,
+                #         epoch_number=,
+                #         step_number=,
+                #         learning_rate=,
+                #         snr_range_floor=snr_base,
+                #         snr_range_ceil=snr_base+snr_range,
+                #         tag=,
+                #     )
+                #     self.history[key].append(float(epoch_losses[train_key]))
+                # for key, val_key in [
+                #     ("val_loss", "total"),
+                #     ("val_reconstruction_loss", "reconstruction"),
+                #     ("val_kl_loss", "kl"),
+                #     ("val_true_loss", "true"),
+                #     ("val_false_loss", "false"),
+                # ]:
+                #     if key not in self.history:
+                #         self.history[key] = []
+                #     self.history[key].append(float(val_losses[val_key]))
+                # self.history["learning_rate"].append(
+                #     float(self.vae.optimizer.learning_rate.numpy())
+                # )
 
                 # COMMENTED OUT: Removing TensorBoard support
                 # TensorBoard logging
@@ -1404,34 +1447,30 @@ class TrainingPipeline:
         rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
         # Prepare distributed dataset for inference
-        results = prepare_distributed_dataset(
+        results = prepare_distributed_inf_dataset(
             data=rf_data,
             n_samples=n_samples,
-            train_val_split=None,
-            per_replica_batch_size=self.config.training.per_replica_val_batch_size,
-            global_batch_size=None,
-            per_replica_val_batch_size=None,
+            per_replica_inf_batch_size=self.config.inference.per_replica_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
-            shuffle=False,  # Deterministic latent generation
         )
 
         del rf_data
         gc.collect()
 
-        dataset = results["dataset"]
-        n_trimmed = results["n_trimmed"]
-        steps = results["steps"]
-        holder = results["_holder"]
+        inf_dataset = results["inf_dataset"]
+        n_inf_trimmed = results["n_inf_trimmed"]
+        inf_steps = results["inf_steps"]
+        inf_holder = results["_inf_holder"]
 
         del results
         gc.collect()
 
-        logger.info(f"Generating latents for {n_trimmed} samples using distributed inference")
+        logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
 
         # Pre-allocate latent arrays
-        true_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
-        false_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
+        true_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
+        false_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
 
         # Create distributed inference function
         @tf.function
@@ -1461,11 +1500,11 @@ class TrainingPipeline:
             return per_replica_true, per_replica_false
 
         # Process all batches
-        iterator = iter(dataset)
+        iterator = iter(inf_dataset)
         current_idx = 0
 
         try:
-            for step in range(steps):
+            for step in range(inf_steps):
                 batch = next(iterator)
 
                 # Get per-replica latents for this batch
@@ -1487,8 +1526,8 @@ class TrainingPipeline:
                 current_idx += batch_latent_size
 
                 # Log progress
-                if (step + 1) % 10 == 0 or (step + 1) == steps:
-                    logger.info(f"Generated latents for step {step + 1}/{steps}")
+                if (step + 1) % 10 == 0 or (step + 1) == inf_steps:
+                    logger.info(f"Generated latents for step {step + 1}/{inf_steps}")
 
                 del per_replica_true, true_results, true_batch_np
                 del per_replica_false, false_results, false_batch_np
@@ -1507,8 +1546,8 @@ class TrainingPipeline:
             del iterator
 
             # Clear intermediate data
-            holder.clear()
-            del dataset
+            inf_holder.clear()
+            del inf_dataset
 
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
@@ -1572,7 +1611,7 @@ class TrainingPipeline:
                 )
 
             ax.set_title(title, fontsize=14, fontweight="bold")
-            ax.set_xlabel("Epoch", fontsize=14, fontweight="bold")
+            ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
             ax.tick_params(axis="both", labelsize=12)
@@ -1600,7 +1639,7 @@ class TrainingPipeline:
             handles=[train_line, val_line, lr_line],
             loc="upper right",
             bbox_to_anchor=(0.98, 0.98),
-            fontsize=14,
+            fontsize=12,
             frameon=True,
             fancybox=True,
             shadow=True,
