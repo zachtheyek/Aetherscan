@@ -32,8 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 # BUG:
-# system total CPU usage appears "unnormalized" compared to process + children CPU usage
-# process + children CPU & RAM sometimes exceeds system total
+# system total CPU usage appears "unnormalized" compared to aetherscan CPU usage (aetherscan CPU & RAM sometimes exceeds system total)
 # https://github.com/zachtheyek/Aetherscan/issues/12
 def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
     """
@@ -478,7 +477,7 @@ class ResourceMonitor:
                 cpu_process_data,
                 color="#1f77b4",
                 linewidth=1.5,
-                label="Process + Children",
+                label="Aetherscan",
                 alpha=0.8,
             )
             ax_cpu.fill_between(
@@ -510,7 +509,7 @@ class ResourceMonitor:
                 ram_process_data,
                 color="#2ca02c",
                 linewidth=1.5,
-                label="Process + Children",
+                label="Aetherscan",
                 alpha=0.8,
             )
             ax_ram.fill_between(

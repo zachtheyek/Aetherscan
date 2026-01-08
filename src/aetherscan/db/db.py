@@ -185,7 +185,6 @@ class Database:
                     filename TEXT,
                     process_id INTEGER,
                     chunk_number INTEGER,
-                    duration_seconds REAL,
                     tag TEXT,
                     metadata TEXT
                 )
@@ -210,7 +209,6 @@ class Database:
                     round_number INTEGER,
                     process_id INTEGER,
                     chunk_number INTEGER,
-                    duration_seconds REAL,
                     tag TEXT,
                     metadata TEXT
                 )
@@ -222,7 +220,6 @@ class Database:
                 ON injection_stats(timestamp)
             """)
 
-            # NOTE: flag here
             # Training loss table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS training_losses (
@@ -233,8 +230,10 @@ class Database:
                     value REAL NOT NULL,
                     round_number INTEGER,
                     epoch_number INTEGER,
+                    num_steps INTEGER,
                     learning_rate REAL,
-                    duration_seconds REAL,
+                    snr_range_floor INTEGER,
+                    snr_range_ceil INTEGER,
                     tag TEXT,
                     metadata TEXT
                 )
@@ -369,7 +368,7 @@ class Database:
                             """
                             INSERT INTO background_stats
                             (timestamp, stat_name, value, unit, filename, process_id,
-                             chunk_number, duration_seconds, tag, metadata)
+                             chunk_number, tag, metadata)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             values,
@@ -380,7 +379,7 @@ class Database:
                             """
                             INSERT INTO injection_stats
                             (timestamp, stat_name, value, unit, model_name, round_number,
-                             process_id, chunk_number, duration_seconds, tag, metadata)
+                             process_id, chunk_number, tag, metadata)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             values,
@@ -390,8 +389,9 @@ class Database:
                         cursor.execute(
                             """
                             INSERT INTO training_losses
-                            (timestamp, model_name, loss_name, value, round_number,
-                             epoch_number, learning_rate, duration_seconds, tag, metadata)
+                            (timestamp, model_name, loss_name, value, round_number, epoch_number,
+                             step_number, learning_rate, snr_range_floor, snr_range_ceil,
+                             tag, metadata)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             values,
@@ -448,7 +448,6 @@ class Database:
         filename: str | None = None,
         process_id: int | None = None,
         chunk_number: int | None = None,
-        duration_seconds: float | None = None,
         tag: str | None = None,
     ):
         """
@@ -461,7 +460,6 @@ class Database:
             filename: Optional filename of background
             process_id: Optional process ID that calculated the statistic
             chunk_number: Optional chunk number being processed
-            duration_seconds: Optional operation duration in seconds
             tag: Optional tag for current pipeline run
         """
         metadata_json = get_system_metadata()
@@ -477,7 +475,6 @@ class Database:
                     filename,
                     process_id,
                     chunk_number,
-                    duration_seconds,
                     tag,
                     metadata_json,
                 ),
@@ -494,7 +491,6 @@ class Database:
         round_number: int | None = None,
         process_id: int | None = None,
         chunk_number: int | None = None,
-        duration_seconds: float | None = None,
         tag: str | None = None,
     ):
         """
@@ -508,7 +504,6 @@ class Database:
             round_number: Optional current training round number
             process_id: Optional process ID that calculated the statistic
             chunk_number: Optional chunk number being processed
-            duration_seconds: Optional operation duration in seconds
             tag: Optional tag for current pipeline run
         """
         metadata_json = get_system_metadata()
@@ -525,7 +520,6 @@ class Database:
                     round_number,
                     process_id,
                     chunk_number,
-                    duration_seconds,
                     tag,
                     metadata_json,
                 ),
@@ -540,8 +534,10 @@ class Database:
         value: float,
         round_number: int | None = None,
         epoch_number: int | None = None,
+        step_number: int | None = None,
         learning_rate: float | None = None,
-        duration_seconds: float | None = None,
+        snr_range_floor: int | None = None,
+        snr_range_ceil: int | None = None,
         tag: str | None = None,
     ):
         """
@@ -554,7 +550,6 @@ class Database:
             round_number: Optional current training round number
             epoch_number: Optional current training epoch number
             learning_rate: Optional current learning rate
-            duration_seconds: Optional operation duration in seconds
             tag: Optional tag for current pipeline run
         """
         metadata_json = get_system_metadata()
@@ -569,8 +564,10 @@ class Database:
                     value,
                     round_number,
                     epoch_number,
+                    step_number,
                     learning_rate,
-                    duration_seconds,
+                    snr_range_floor,
+                    snr_range_ceil,
                     tag,
                     metadata_json,
                 ),
