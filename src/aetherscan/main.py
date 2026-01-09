@@ -26,6 +26,7 @@ from aetherscan.train import get_latest_tag, train_full_pipeline
 logger = logging.getLogger(__name__)
 
 
+# NOTE: split this into strategy.py? have config option & cli flag to set single-GPU, multi-GPU, multi-node strategy. test thoroughly for each option
 def setup_gpu_strategy():
     """Configure GPU memory growth, memory limits, multi-GPU strategy with load balancing & async allocator"""
 
