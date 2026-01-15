@@ -15,6 +15,8 @@ import os
 import re
 import shutil
 import threading
+import time
+from collections.abc import Callable
 from datetime import datetime
 
 import matplotlib.lines as mlines
@@ -521,6 +523,7 @@ def prepare_distributed_train_dataset(
     }
 
 
+# NOTE: should we move this to inference.py & import into train.py?
 def prepare_distributed_inf_dataset(
     data: dict,
     n_samples: int,
@@ -677,11 +680,10 @@ class TrainingPipeline:
 
             raise  # Re-raise to propagate error
 
+        # NOTE: similar to _setup_directories() & archive_directory(), perhaps we need a flag that gets toggled when fault tolerance is triggered, s.t. future reads from the db know to ignore the flagged rows as "archived" from a previous failed training run?
         finally:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
             # since fault tolerance expects a clean directory structure
-
-            # Setup directories
             self._setup_directories()
 
             # COMMENTED OUT: Removing TensorBoard support
@@ -786,9 +788,6 @@ class TrainingPipeline:
         initial_snr_range = self.config.training.initial_snr_range
         final_snr_range = self.config.training.final_snr_range
         schedule = self.config.training.curriculum_schedule
-        decay_rate = self.config.training.exponential_decay_rate
-        easy_rounds = self.config.training.step_easy_rounds
-        hard_rounds = self.config.training.step_hard_rounds
 
         # Edge case: use initial snr range if only training for 1 round
         if total_rounds == 1:
@@ -802,6 +801,7 @@ class TrainingPipeline:
             current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
         # Exponential decay - start easy, then get hard quickly
         elif schedule == "exponential":
+            decay_rate = self.config.training.exponential_decay_rate
             # Sanity check: validate decay_rate < 0 to avoid division by zero
             if decay_rate >= 0:
                 raise ValueError(
@@ -815,6 +815,13 @@ class TrainingPipeline:
         # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
         # Step function - easy for first part, hard for second part
         elif schedule == "step":
+            easy_rounds = self.config.training.step_easy_rounds
+            hard_rounds = self.config.training.step_hard_rounds
+            # Sanity check: validate easy_rounds + hard_rounds add up to total_rounds
+            if easy_rounds + hard_rounds != total_rounds:
+                raise ValueError(
+                    f"easy_rounds ({easy_rounds}) + hard_rounds ({hard_rounds}) must equal total_rounds ({total_rounds}), got {easy_rounds + hard_rounds} instead"
+                )
             if round_idx < easy_rounds:
                 current_range = initial_snr_range
             elif round_idx - easy_rounds < hard_rounds:
@@ -834,7 +841,7 @@ class TrainingPipeline:
         """
         Robust adaptive learning rate with multiple safeguards
 
-        Note the following soft constraint:
+        Note the following heuristic:
         min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
           => LR can only reach min_learning_rate during round if above expression is > 0
           => else LR will reset at start of new round before reaching min_learning_rate
@@ -887,6 +894,9 @@ class TrainingPipeline:
             logger.info(f"Resuming training from round {start_round}/{n_rounds}")
         else:
             logger.info(f"Starting training for {n_rounds} rounds")
+
+        # NOTE: this approach doesn't play well with fault tolerance. rethink later
+        self.start_time = time.time()
 
         for round_idx in range(start_round - 1, n_rounds):
             snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
@@ -961,17 +971,18 @@ class TrainingPipeline:
 
         try:
             for epoch in range(epochs):
-                # Log resources at start of epoch
                 logger.info(f"{'-' * 30}")
                 logger.info(f"Epoch {epoch + 1}/{epochs} Start")
 
                 # Training
-                epoch_losses = self._train_epoch(train_dataset, steps_per_epoch, accumulation_steps)
+                epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
+                    train_dataset, steps_per_epoch, accumulation_steps, time.time()
+                )
 
                 # Validation
-                val_losses = self._validate_epoch(val_dataset, val_steps)
+                val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
 
-                # Log results
+                # Log results & queue db writes (non-blocking)
                 logger.info(f"Epoch {epoch + 1} Complete")
                 logger.info(
                     f"Train -- Total: {epoch_losses['total']:.4f}, "
@@ -988,56 +999,101 @@ class TrainingPipeline:
                     f"False: {val_losses['false']:.4f}"
                 )
 
-                # # Update history
-                # for key, train_key in [
-                #     ("total_loss", "total"),
-                #     ("reconstruction_loss", "reconstruction"),
-                #     ("kl_loss", "kl"),
-                #     ("true_loss", "true"),
-                #     ("false_loss", "false"),
-                # ]:
+                current_time = time.time()
 
-                # def write_training_loss(
-                #     self,
-                #     model_name: str,
-                #     loss_name: str,
-                #     value: float,
-                #     round_number: int | None = None,
-                #     epoch_number: int | None = None,
-                #     step_number: int | None = None,
-                #     learning_rate: float | None = None,
-                #     snr_range_floor: int | None = None,
-                #     snr_range_ceil: int | None = None,
-                #     tag: str | None = None,
-                # ):
+                if self.db is None:
+                    raise RuntimeError(
+                        "No database instance detected - cannot generate training progress plot"
+                    )
 
-                #     # NOTE: what does epoch_losses return? do we need to write to db in _train_epoch() also?
-                #     self.db.write_training_loss(
-                #         model_name="beta_vae",
-                #         loss_name=key,
-                #         value=float(epoch_losses[train_key]),
-                #         round_number=,
-                #         epoch_number=,
-                #         step_number=,
-                #         learning_rate=,
-                #         snr_range_floor=snr_base,
-                #         snr_range_ceil=snr_base+snr_range,
-                #         tag=,
-                #     )
-                #     self.history[key].append(float(epoch_losses[train_key]))
-                # for key, val_key in [
-                #     ("val_loss", "total"),
-                #     ("val_reconstruction_loss", "reconstruction"),
-                #     ("val_kl_loss", "kl"),
-                #     ("val_true_loss", "true"),
-                #     ("val_false_loss", "false"),
-                # ]:
-                #     if key not in self.history:
-                #         self.history[key] = []
-                #     self.history[key].append(float(val_losses[val_key]))
-                # self.history["learning_rate"].append(
-                #     float(self.vae.optimizer.learning_rate.numpy())
-                # )
+                # Training losses
+                for stat_name, key in [
+                    ("total_loss", "total"),
+                    ("reconstruction_loss", "reconstruction"),
+                    ("kl_loss", "kl"),
+                    ("true_loss", "true"),
+                    ("false_loss", "false"),
+                ]:
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=float(epoch_losses[key]),
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
+
+                # Validation losses
+                for stat_name, key in [
+                    ("val_total_loss", "total"),
+                    ("val_reconstruction_loss", "reconstruction"),
+                    ("val_kl_loss", "kl"),
+                    ("val_true_loss", "true"),
+                    ("val_false_loss", "false"),
+                ]:
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=float(val_losses[key]),
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
+
+                # Gradient norm/clipping statistics
+                gradient_norm_mean = np.mean(epoch_gradient_norms)
+                gradient_norm_max = np.max(epoch_gradient_norms)
+                gradient_norm_std = np.std(epoch_gradient_norms)
+                clipping_rate = np.sum(np.array(epoch_gradient_norms) > 1.0) / steps_per_epoch
+
+                for stat_name, stat_value in [
+                    ("gradient_norm_mean", gradient_norm_mean),
+                    ("gradient_norm_max", gradient_norm_max),
+                    ("gradient_norm_std", gradient_norm_std),
+                    ("clipping_rate", clipping_rate),
+                ]:
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=float(stat_value),
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
+
+                # Learning rate
+                current_lr = float(self.vae.optimizer.learning_rate.numpy())
+                self.db.write_training_stat(
+                    model_name="beta_vae",
+                    stat_name="learning_rate",
+                    value=current_lr,
+                    round_number=round_idx + 1,
+                    epoch_number=epoch + 1,
+                    tag=self.config.checkpoint.save_tag,
+                    timestamp=current_time,
+                )
+
+                # Misc stats
+                for stat_name, stat_value in [
+                    ("train_duration", train_duration),
+                    ("val_duration", val_duration),
+                    ("snr_range_floor", snr_base),
+                    ("snr_range_ceil", snr_base + snr_range),
+                    ("num_steps", steps_per_epoch),
+                    ("num_sub_steps", accumulation_steps),
+                ]:
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=stat_value,
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
 
                 # COMMENTED OUT: Removing TensorBoard support
                 # TensorBoard logging
@@ -1082,16 +1138,15 @@ class TrainingPipeline:
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
 
-                # Log resources at end of epoch
                 logger.info(f"Epoch {epoch + 1}/{epochs} End")
-
-            # Save checkpoint
-            self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
             # Plot progress
             self.plot_beta_vae_training_progress(
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
+
+            # Save checkpoint
+            self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
         except Exception as e:
             logger.error(f"Error in train_round(): {e}")
@@ -1099,6 +1154,7 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
+            # NOTE: should check to make sure holders & datasets exist first
             # Clear intermediate data
             train_holder.clear()
             val_holder.clear()
@@ -1115,11 +1171,15 @@ class TrainingPipeline:
 
             gc.collect()
 
-    def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1):
+    def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1, start_time=None):
         """
         Perform a single training epoch with gradient accumulation
         """
+        if not start_time:
+            start_time = time.time()
+
         epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
+        epoch_gradient_norms = []
         iterator = iter(dataset)
 
         try:
@@ -1144,6 +1204,7 @@ class TrainingPipeline:
                         # Compute gradients & losses
                         micro_grads, micro_losses = self._distributed_train_step(micro_batch)
 
+                        # NOTE: come back to this later (any or all?)
                         # Sanity check: verify gradients are valid before accumulating
                         if micro_grads is None or all(g is None for g in micro_grads):
                             logger.warning(
@@ -1157,6 +1218,7 @@ class TrainingPipeline:
                             accumulated_gradients = micro_grads
                         else:
                             accumulated_gradients = [
+                                # NOTE: come back to this later (what if ag and g are both None)
                                 ag + g if ag is not None and g is not None else ag or g
                                 for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
                             ]
@@ -1204,12 +1266,14 @@ class TrainingPipeline:
                     raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
                 # Apply accumulated gradients
-                self._apply_gradients(accumulated_gradients)
+                global_norm = self._apply_gradients(accumulated_gradients)
+                epoch_gradient_norms.append(float(global_norm))
 
                 for key, loss in step_losses.items():
                     # Average step losses over sub-steps
                     avg_loss = loss / successful_accumulations
                     step_losses[key] = avg_loss
+                    # Accumulate epoch losses over training steps
                     epoch_losses[key] += avg_loss
 
                 # Log progress every 10 steps
@@ -1220,14 +1284,18 @@ class TrainingPipeline:
                         f"Recon: {step_losses['reconstruction']:.4f}, "
                         f"KL: {step_losses['kl']:.4f}, "
                         f"True: {step_losses['true']:.4f}, "
-                        f"False: {step_losses['false']:.4f}"
+                        f"False: {step_losses['false']:.4f}, "
+                        f"Gradient norm: {global_norm:.4f} "
                     )
 
             # Average epoch losses over training steps
             for key in epoch_losses:
                 epoch_losses[key] /= steps_per_epoch
 
-            return epoch_losses
+            # Calculate train epoch duration
+            train_duration = time.time() - start_time
+
+            return epoch_losses, epoch_gradient_norms, train_duration
 
         except Exception as e:
             logger.error(f"Error in _train_epoch(): {e}")
@@ -1235,21 +1303,28 @@ class TrainingPipeline:
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
+            # NOTE: should check to make sure iterator exist first
             del iterator
             gc.collect()
 
-    def _validate_epoch(self, dataset, steps):
+    def _validate_epoch(self, dataset, steps, start_time=None):
         """
         Perform a single validation epoch
         """
+        if not start_time:
+            start_time = time.time()
+
         val_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
 
         try:
             for _step in range(steps):
                 batch = next(iterator)
+
+                # Compute losses
                 step_losses = self._distributed_val_step(batch)
 
+                # Accumulate validation losses over validation steps
                 for key in val_losses:
                     val_losses[key] += step_losses[key]
 
@@ -1257,7 +1332,10 @@ class TrainingPipeline:
             for key in val_losses:
                 val_losses[key] /= steps
 
-            return val_losses
+            # Calculate val epoch duration
+            val_duration = time.time() - start_time
+
+            return val_losses, val_duration
 
         except Exception as e:
             logger.error(f"Error in _validate_epoch(): {e}")
@@ -1265,6 +1343,7 @@ class TrainingPipeline:
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
+            # NOTE: should check to make sure iterator exist first
             del iterator
             gc.collect()
 
@@ -1289,11 +1368,8 @@ class TrainingPipeline:
                     main_data, true_data, false_data, y, training=True
                 )
 
-                # Scale loss by num_replicas for gradient averaging
-                scaled_loss = losses["total_loss"] / tf.cast(num_replicas, tf.float32)
-
             # Compute gradients
-            gradients = tape.gradient(scaled_loss, self.vae.trainable_variables)
+            gradients = tape.gradient(losses["total_loss"], self.vae.trainable_variables)
 
             return gradients, losses
 
@@ -1333,14 +1409,37 @@ class TrainingPipeline:
     @tf.function
     def _apply_gradients(self, gradients):
         """
-        Clip & apply gradients
+        Apply gradients after gradient clipping by global L2 norm
         """
         # Clip gradients for additional stability
-        clipped_gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        # Note, this step is optional but recommended given our beta-VAE architecture's
+        # heterogeneous gradient scale (reconstruction + KL loss components)
+        # Gradient clipping computes the global L2 norm across all gradient tensors, then rescales
+        # them proportionally if that norm exceeds some clip_norm threshold. This preserves the
+        # relative direction of the gradient vector in parameter space while simultaneously bounding
+        # its magnitude, maintaining the optimization trajectory's direction, which is critical for
+        # training stability
+        # Alternatively, per-tensor clipping (with tf.clip_by_norm() on each gradient independently)
+        # could also work, but may distort the gradient direction (parameters with smaller gradients
+        # get disproportionately boosted relative to those with larger gradients). Only use if you
+        # need layer-specific interventions (e.g. lower LR for encoder, or gradient clipping
+        # per-component, etc.)
+        # The 1.0 threshold was chosen to be aggressive enough to prevent exploding gradients, while
+        # permissive enough to not overly dampen learning. Healthy training should progress with
+        # global_norm consistently below clip_norm, with the occasional instability (e.g. due to bad
+        # batches, or KL spikes) getting caught & dampened. If you notice global_norm consistently
+        # exceeding clip_norm, even with adaptive LR in place, consider increasing clip_norm to
+        # allow more of the true gradients to pass through. A general heuristic for clip_norm is to
+        # have no more than 1-5% of steps trigger gradient clipping
+        clipped_gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
+
         # Apply gradients
         self.vae.optimizer.apply_gradients(
             zip(clipped_gradients, self.vae.trainable_variables, strict=False)
         )
+
+        # Return pre-clipping global norm (for monitoring)
+        return global_norm
 
     @tf.function
     def _distributed_val_step(self, batch_data):
@@ -1387,6 +1486,8 @@ class TrainingPipeline:
 
         return reduced_losses
 
+    # NOTE: write what to db?
+    # NOTE: move some of the latent generation functionality to inference.py & import into train.py instead?
     def train_random_forest(self):
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
@@ -1543,8 +1644,10 @@ class TrainingPipeline:
             raise  # Re-raise to propagate error
 
         finally:
+            # NOTE: should check to make sure iterator exist first
             del iterator
 
+            # NOTE: should check to make sure holder & dataset exist first
             # Clear intermediate data
             inf_holder.clear()
             del inf_dataset
@@ -1557,10 +1660,12 @@ class TrainingPipeline:
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
+            # NOTE: should check to make sure arrays exist first
             del true_latents, false_latents
             gc.collect()
 
     # TODO: visualize SNR range in training progress plot
+    # TODO: visualize gradient stats in separate plot (subplot?) -> main: clipping_rate, secondary: mean, max, std
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
@@ -1569,6 +1674,52 @@ class TrainingPipeline:
         metadata_json = get_system_metadata()
         machine_name = json.loads(metadata_json).get("machine_name")
 
+        current_time = time.time()
+
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate training progress plot"
+            )
+
+        # NOTE: how to handle retries under current implementation?
+        # Query training stats from database
+        all_stats = self.db.query_training_stat(
+            model_name="beta_vae",
+            start_round_number=1,  # NOTE: come back to this later (is this correct? what about fault tolerance?)
+            tag=self.config.checkpoint.save_tag,  # The query tag is different from the input arg tag
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        if not all_stats:
+            logger.warning("No training progress data to plot")
+            return
+
+        # TODO: potential memory optimization here with array pre-allocation? is there a way to just use the all_stats dict directly? is the potential improvement worth the effort?
+        # Group query results by stat_name
+        raw_history = {}
+        for stat in all_stats:
+            key = stat["stat_name"]
+            if key not in raw_history:
+                raw_history[key] = []
+            # Store (round, epoch, value) tuple for later sorting
+            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+
+        del all_stats
+        gc.collect()
+
+        # Sort by (round, epoch) and extract just the values
+        history = {}
+        for key, values in raw_history.items():
+            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))  # Sort by round, epoch
+            history[key] = [v[2] for v in sorted_values]  # Extract just the values
+
+        del raw_history
+        gc.collect()
+
+        epochs = range(1, len(history.get("total_loss", [])) + 1)
+
+        # Create figure & setup gridspec
         fig = plt.figure(figsize=(25, 12))
         gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
@@ -1585,24 +1736,22 @@ class TrainingPipeline:
             f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
-        epochs = range(1, len(self.history.get("loss", [])) + 1)
-
         # Helper function to plot dual y-axis
         def plot_dual_axis(ax, title, train_key, val_key):
             # Create secondary y-axis for learning rate
             ax2 = ax.twinx()
 
             # Plot train and validation on left y-axis
-            if train_key in self.history and self.history[train_key]:
-                ax.plot(epochs, self.history[train_key], color="blue", label="train", linewidth=2)
-            if val_key in self.history and self.history[val_key]:
-                ax.plot(epochs, self.history[val_key], color="orange", label="val", linewidth=2)
+            if train_key in history and history[train_key]:
+                ax.plot(epochs, history[train_key], color="blue", label="train", linewidth=2)
+            if val_key in history and history[val_key]:
+                ax.plot(epochs, history[val_key], color="orange", label="val", linewidth=2)
 
             # Plot learning rate on right y-axis
-            if "learning_rate" in self.history and self.history["learning_rate"]:
+            if "learning_rate" in history and history["learning_rate"]:
                 ax2.plot(
                     epochs,
-                    self.history["learning_rate"],
+                    history["learning_rate"],
                     color="grey",
                     label="learning rate",
                     linewidth=1,
@@ -1618,7 +1767,7 @@ class TrainingPipeline:
             ax2.tick_params(axis="y", labelcolor="grey", labelsize=12)
 
         # Top subplot - Total Loss
-        plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
+        plot_dual_axis(ax_top, "Total Loss", "total_loss", "val_total_loss")
 
         # Bottom subplots
         plot_dual_axis(
@@ -1787,30 +1936,57 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
     Returns:
         Trained pipeline object
     """
-    # Create pipeline
-    pipeline = TrainingPipeline(background_data, strategy)
+    try:
+        # Create pipeline (no cleanup needed on failure)
+        pipeline = TrainingPipeline(background_data, strategy)
+    except Exception as e:
+        logger.error(f"Error creating TrainingPipeline: {e}")
+        raise  # Re-raise to propagate error
 
     try:
-        # Train beta-VAE
-        pipeline.train_beta_vae()
+        try:
+            # Train beta-VAE
+            pipeline.train_beta_vae()
+        except Exception as e:
+            logger.error(f"Error in train_beta_vae(): {e}")
+            raise  # Re-raise to propagate error
 
-        # Train Random Forest
-        pipeline.train_random_forest()
+        try:
+            # Plot training progress
+            pipeline.plot_beta_vae_training_progress()
+        except Exception as e:
+            logger.error(f"Error in plot_beta_vae_training_progress(): {e}")
+            raise  # Re-raise to propagate error
 
-        # Save final models
-        pipeline.save_models()
+        try:
+            # Train Random Forest
+            pipeline.train_random_forest()
+        except Exception as e:
+            logger.error(f"Error in train_random_forest(): {e}")
+            # Attempt to save models on RF training failure
+            pipeline.rf_model = None  # Avoid saving incomplete RF model state
+            _safe_call(pipeline.save_models, "save_models")
+            raise  # Re-raise to propagate error
 
-        # Final plot
-        pipeline.plot_beta_vae_training_progress()
+        try:
+            # Save final models
+            pipeline.save_models()
+        except Exception as e:
+            logger.error(f"Error in save_models(): {e}")
+            raise  # Re-raise to propagate error
 
         logger.info("Training complete!")
 
         return pipeline
 
-    except Exception as e:
-        logger.error(f"Error in train_full_pipeline(): {e}")
-        raise  # Re-raise to propagate error
-
     finally:
-        # Free shared resources before exiting
+        # Free shared resources on exit
         pipeline.data_generator.close()
+
+
+def _safe_call(func: Callable, name: str, args: tuple | None = None) -> None:
+    """Best-effort execution during error cleanup."""
+    try:
+        func(*args) if args else func
+    except Exception as e:
+        logger.warning(f"Failed to execute {name} during cleanup: {e}")
