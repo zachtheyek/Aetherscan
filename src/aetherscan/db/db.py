@@ -153,7 +153,6 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # NOTE: flag here
             # System resources table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS system_resources (
@@ -168,81 +167,76 @@ class Database:
                 )
             """)
 
+            # TODO: add additional index for frequent queries, then add wrapper func below
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_timestamp
                 ON system_resources(timestamp)
             """)
 
-            # NOTE: flag here
-            # Background statistics table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS background_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    stat_name TEXT NOT NULL,
-                    value REAL NOT NULL,
-                    unit TEXT,
-                    filename TEXT,
-                    process_id INTEGER,
-                    chunk_number INTEGER,
-                    tag TEXT,
-                    metadata TEXT
-                )
-            """)
+            # # Background statistics table
+            # cursor.execute("""
+            #     CREATE TABLE IF NOT EXISTS background_stats (
+            #         id INTEGER PRIMARY KEY AUTOINCREMENT,
+            #         timestamp REAL NOT NULL,
+            #         stat_name TEXT NOT NULL,
+            #         value REAL NOT NULL,
+            #         unit TEXT,
+            #         filename TEXT,
+            #         process_id INTEGER,
+            #         chunk_number INTEGER,
+            #         tag TEXT,
+            #         metadata TEXT
+            #     )
+            # """)
+            #
+            # # TODO: add additional index for frequent queries, then add wrapper func below
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_timestamp
+            #     ON background_stats(timestamp)
+            # """)
 
-            # TODO: add additional index for frequent queries, then add wrapper func below
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON background_stats(timestamp)
-            """)
+            # # Injection statistics table
+            # cursor.execute("""
+            #     CREATE TABLE IF NOT EXISTS injection_stats (
+            #         id INTEGER PRIMARY KEY AUTOINCREMENT,
+            #         timestamp REAL NOT NULL,
+            #         stat_name TEXT NOT NULL,
+            #         value REAL NOT NULL,
+            #         unit TEXT,
+            #         model_name TEXT,
+            #         round_number INTEGER,
+            #         process_id INTEGER,
+            #         chunk_number INTEGER,
+            #         tag TEXT,
+            #         metadata TEXT
+            #     )
+            # """)
+            #
+            # # TODO: add additional index for frequent queries, then add wrapper func below
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_timestamp
+            #     ON injection_stats(timestamp)
+            # """)
 
-            # NOTE: flag here
-            # Injection statistics table
+            # Training statistics table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS injection_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    stat_name TEXT NOT NULL,
-                    value REAL NOT NULL,
-                    unit TEXT,
-                    model_name TEXT,
-                    round_number INTEGER,
-                    process_id INTEGER,
-                    chunk_number INTEGER,
-                    tag TEXT,
-                    metadata TEXT
-                )
-            """)
-
-            # TODO: add additional index for frequent queries, then add wrapper func below
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON injection_stats(timestamp)
-            """)
-
-            # Training loss table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS training_losses (
+                CREATE TABLE IF NOT EXISTS training_stats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
                     model_name TEXT NOT NULL,
-                    loss_name TEXT NOT NULL,
+                    stat_name TEXT NOT NULL,
                     value REAL NOT NULL,
                     round_number INTEGER,
                     epoch_number INTEGER,
-                    num_steps INTEGER,
-                    learning_rate REAL,
-                    snr_range_floor INTEGER,
-                    snr_range_ceil INTEGER,
                     tag TEXT,
                     metadata TEXT
                 )
             """)
 
-            # TODO: add additional index for frequent queries, then add wrapper func below
+            # TODO: add additional index for frequent queries, then add wrapper func below (use tag, round_number, epoch_number, model_name, and/or stat_name instead?)
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON training_losses(timestamp)
+                ON training_stats(timestamp)
             """)
 
             conn.commit()
@@ -352,7 +346,6 @@ class Database:
                 cursor = conn.cursor()
 
                 for table, values in self.buffer:
-                    # NOTE: flag here
                     if table == "system_resources":
                         cursor.execute(
                             """
@@ -362,37 +355,33 @@ class Database:
                         """,
                             values,
                         )
-                    # NOTE: flag here
-                    elif table == "background_stats":
+                    # elif table == "background_stats":
+                    #     cursor.execute(
+                    #         """
+                    #         INSERT INTO background_stats
+                    #         (timestamp, stat_name, value, unit, filename, process_id,
+                    #          chunk_number, tag, metadata)
+                    #         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    #     """,
+                    #         values,
+                    #     )
+                    # elif table == "injection_stats":
+                    #     cursor.execute(
+                    #         """
+                    #         INSERT INTO injection_stats
+                    #         (timestamp, stat_name, value, unit, model_name, round_number,
+                    #          process_id, chunk_number, tag, metadata)
+                    #         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    #     """,
+                    #         values,
+                    #     )
+                    elif table == "training_stats":
                         cursor.execute(
                             """
-                            INSERT INTO background_stats
-                            (timestamp, stat_name, value, unit, filename, process_id,
-                             chunk_number, tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            values,
-                        )
-                    # NOTE: flag here
-                    elif table == "injection_stats":
-                        cursor.execute(
-                            """
-                            INSERT INTO injection_stats
-                            (timestamp, stat_name, value, unit, model_name, round_number,
-                             process_id, chunk_number, tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            values,
-                        )
-                    # NOTE: flag here
-                    elif table == "training_losses":
-                        cursor.execute(
-                            """
-                            INSERT INTO training_losses
-                            (timestamp, model_name, loss_name, value, round_number, epoch_number,
-                             step_number, learning_rate, snr_range_floor, snr_range_ceil,
+                            INSERT INTO training_stats
+                            (timestamp, model_name, stat_name, value, round_number, epoch_number,
                              tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             values,
                         )
@@ -402,7 +391,6 @@ class Database:
         except Exception as e:
             logger.error(f"Error flushing data buffer: {e}")
 
-    # NOTE: flag here
     def write_system_resource(
         self,
         resource_type: str,
@@ -421,6 +409,7 @@ class Database:
             value: Resource value
             unit: Optional unit of measurement (e.g. 'percent', 'MB')
             tag: Optional tag for current pipeline run
+            timestamp: Optional timestamp when resource was logged (uses current time if not provided)
         """
         metadata_json = get_system_metadata()
 
@@ -439,145 +428,137 @@ class Database:
             )
         )
 
-    # NOTE: flag here
-    def write_background_stat(
-        self,
-        stat_name: str,
-        value: float,
-        unit: str | None = None,
-        filename: str | None = None,
-        process_id: int | None = None,
-        chunk_number: int | None = None,
-        tag: str | None = None,
-    ):
-        """
-        Queue write to background_stats table (non-blocking)
+    # def write_background_stat(
+    #     self,
+    #     stat_name: str,
+    #     value: float,
+    #     unit: str | None = None,
+    #     filename: str | None = None,
+    #     process_id: int | None = None,
+    #     chunk_number: int | None = None,
+    #     tag: str | None = None,
+    # ):
+    #     """
+    #     Queue write to background_stats table (non-blocking)
+    #
+    #     Args:
+    #         stat_name: Type of statistic (e.g. mean, stdev, skew, kurtosis, etc.)
+    #         value: Statistic value
+    #         unit: Optional unit of measurement
+    #         filename: Optional filename of background
+    #         process_id: Optional process ID that calculated the statistic
+    #         chunk_number: Optional chunk number being processed
+    #         tag: Optional tag for current pipeline run
+    #     """
+    #     metadata_json = get_system_metadata()
+    #
+    #     self.write_queue.put(
+    #         (
+    #             "background_stats",
+    #             (
+    #                 time.time(),
+    #                 stat_name,
+    #                 value,
+    #                 unit,
+    #                 filename,
+    #                 process_id,
+    #                 chunk_number,
+    #                 tag,
+    #                 metadata_json,
+    #             ),
+    #         )
+    #     )
 
-        Args:
-            stat_name: Type of statistic (e.g. mean, stdev, skew, kurtosis, etc.)
-            value: Statistic value
-            unit: Optional unit of measurement
-            filename: Optional filename of background
-            process_id: Optional process ID that calculated the statistic
-            chunk_number: Optional chunk number being processed
-            tag: Optional tag for current pipeline run
-        """
-        metadata_json = get_system_metadata()
+    # def write_injection_stat(
+    #     self,
+    #     stat_name: str,
+    #     value: float,
+    #     unit: str | None = None,
+    #     model_name: str | None = None,
+    #     round_number: int | None = None,
+    #     process_id: int | None = None,
+    #     chunk_number: int | None = None,
+    #     tag: str | None = None,
+    # ):
+    #     """
+    #     Queue write to injection_stats table (non-blocking)
+    #
+    #     Args:
+    #         stat_name: Type of statistic (e.g. mean, stdev, skew, kurtosis, etc.)
+    #         value: Statistic value
+    #         unit: Optional unit of measurement
+    #         model_name: Optional model name that requested injection (e.g. 'beta_vae', 'rf')
+    #         round_number: Optional current training round number
+    #         process_id: Optional process ID that calculated the statistic
+    #         chunk_number: Optional chunk number being processed
+    #         tag: Optional tag for current pipeline run
+    #     """
+    #     metadata_json = get_system_metadata()
+    #
+    #     self.write_queue.put(
+    #         (
+    #             "injection_stats",
+    #             (
+    #                 time.time(),
+    #                 stat_name,
+    #                 value,
+    #                 unit,
+    #                 model_name,
+    #                 round_number,
+    #                 process_id,
+    #                 chunk_number,
+    #                 tag,
+    #                 metadata_json,
+    #             ),
+    #         )
+    #     )
 
-        self.write_queue.put(
-            (
-                "background_stats",
-                (
-                    time.time(),
-                    stat_name,
-                    value,
-                    unit,
-                    filename,
-                    process_id,
-                    chunk_number,
-                    tag,
-                    metadata_json,
-                ),
-            )
-        )
-
-    # NOTE: flag here
-    def write_injection_stat(
-        self,
-        stat_name: str,
-        value: float,
-        unit: str | None = None,
-        model_name: str | None = None,
-        round_number: int | None = None,
-        process_id: int | None = None,
-        chunk_number: int | None = None,
-        tag: str | None = None,
-    ):
-        """
-        Queue write to injection_stats table (non-blocking)
-
-        Args:
-            stat_name: Type of statistic (e.g. mean, stdev, skew, kurtosis, etc.)
-            value: Statistic value
-            unit: Optional unit of measurement
-            model_name: Optional model name that requested injection (e.g. 'beta_vae', 'rf')
-            round_number: Optional current training round number
-            process_id: Optional process ID that calculated the statistic
-            chunk_number: Optional chunk number being processed
-            tag: Optional tag for current pipeline run
-        """
-        metadata_json = get_system_metadata()
-
-        self.write_queue.put(
-            (
-                "injection_stats",
-                (
-                    time.time(),
-                    stat_name,
-                    value,
-                    unit,
-                    model_name,
-                    round_number,
-                    process_id,
-                    chunk_number,
-                    tag,
-                    metadata_json,
-                ),
-            )
-        )
-
-    # NOTE: flag here
-    def write_training_loss(
+    def write_training_stat(
         self,
         model_name: str,
-        loss_name: str,
+        stat_name: str,
         value: float,
         round_number: int | None = None,
         epoch_number: int | None = None,
-        step_number: int | None = None,
-        learning_rate: float | None = None,
-        snr_range_floor: int | None = None,
-        snr_range_ceil: int | None = None,
         tag: str | None = None,
+        timestamp: float | None = None,
     ):
         """
-        Queue write to training_losses table (non-blocking)
+        Queue write to training_stats table (non-blocking)
 
         Args:
             model_name: Model name (e.g. 'beta_vae', 'rf')
-            loss_name: Loss name (e.g. 'total_loss', 'reconstruction_loss')
-            value: Loss value
+            stat_name: Stat name (e.g. 'total_loss', 'reconstruction_loss', 'learning_rate')
+            value: Stat value
             round_number: Optional current training round number
             epoch_number: Optional current training epoch number
-            learning_rate: Optional current learning rate
             tag: Optional tag for current pipeline run
+            timestamp: Optional timestamp when stat was logged (uses current time if not provided)
         """
         metadata_json = get_system_metadata()
 
         self.write_queue.put(
             (
-                "training_losses",
+                "training_stats",
                 (
-                    time.time(),
+                    timestamp or time.time(),
                     model_name,
-                    loss_name,
+                    stat_name,
                     value,
                     round_number,
                     epoch_number,
-                    step_number,
-                    learning_rate,
-                    snr_range_floor,
-                    snr_range_ceil,
                     tag,
                     metadata_json,
                 ),
             )
         )
 
-    # NOTE: flag here
-    # TODO: add equivalent functions for querying background_stats, injection_stats, training_losses
+    # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     def query_system_resource(
         self,
+        resource_type: str | None = None,
+        resource_name: str | None = None,
+        tag: str | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -585,6 +566,9 @@ class Database:
         Query from system_resources table
 
         Args:
+            resource_type: Type of resource (e.g. 'cpu', 'ram', 'gpu')
+            resource_name: Name of resource (e.g. 'system_total', 'process_tree')
+            tag: Tag for current pipeline run
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
 
@@ -601,6 +585,18 @@ class Database:
             params = []
 
             # Build the query dynamically based on user-specified conditions
+            if resource_type:
+                query += " AND resource_type = ?"
+                params.append(resource_type)
+
+            if resource_name:
+                query += " AND resource_name = ?"
+                params.append(resource_name)
+
+            if tag:
+                query += " AND tag = ?"
+                params.append(tag)
+
             if start_time:
                 query += " AND timestamp >= ?"
                 params.append(start_time)
@@ -609,7 +605,200 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            query += " ORDER BY timestamp"
+            query += " ORDER BY tag, timestamp DESC, resource_type, resource_name"
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dictionary
+            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+    # def query_background_stat(
+    #     self,
+    #     start_time: float | None = None,
+    #     end_time: float | None = None,
+    #     tag: str | None = None,
+    #     # resource_type: str,
+    #     # resource_name: str,
+    #     # value: float,
+    #     # unit: str | None = None,
+    #     # tag: str | None = None,
+    #     # timestamp: float | None = None,
+    # ) -> list[dict[str, Any]]:
+    #     """
+    #     Query from system_resources table
+    #
+    #     Args:
+    #         start_time: Start timestamp (unix time)
+    #         end_time: End timestamp (unix time)
+    #         tag: Tag for current pipeline run
+    #
+    #     Returns:
+    #         List of metric dictionaries
+    #     """
+    #     with self._get_connection() as conn:
+    #         cursor = conn.cursor()
+    #
+    #         # WHERE 1=1 is a trick for building dynamic queries
+    #         # Since it's always true, it does nothing
+    #         # But it lets us safely add more conditions with AND
+    #         query = "SELECT * FROM system_resources WHERE 1=1"
+    #         params = []
+    #
+    #         # Build the query dynamically based on user-specified conditions
+    #         if start_time:
+    #             query += " AND timestamp >= ?"
+    #             params.append(start_time)
+    #
+    #         if end_time:
+    #             query += " AND timestamp <= ?"
+    #             params.append(end_time)
+    #
+    #         if tag:
+    #             query += " AND tag = ?"
+    #             params.append(tag)
+    #
+    #         query += " ORDER BY tag, timestamp"
+    #
+    #         cursor.execute(query, params)
+    #
+    #         # Create a list of column names using query result's metadata
+    #         columns = [desc[0] for desc in cursor.description]
+    #         # Pair column names with values and return to user as a dictionary
+    #         return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+    # def query_injection_stat(
+    #     self,
+    #     start_time: float | None = None,
+    #     end_time: float | None = None,
+    #     tag: str | None = None,
+    #     # resource_type: str,
+    #     # resource_name: str,
+    #     # value: float,
+    #     # unit: str | None = None,
+    #     # tag: str | None = None,
+    #     # timestamp: float | None = None,
+    # ) -> list[dict[str, Any]]:
+    #     """
+    #     Query from system_resources table
+    #
+    #     Args:
+    #         start_time: Start timestamp (unix time)
+    #         end_time: End timestamp (unix time)
+    #         tag: Tag for current pipeline run
+    #
+    #     Returns:
+    #         List of metric dictionaries
+    #     """
+    #     with self._get_connection() as conn:
+    #         cursor = conn.cursor()
+    #
+    #         # WHERE 1=1 is a trick for building dynamic queries
+    #         # Since it's always true, it does nothing
+    #         # But it lets us safely add more conditions with AND
+    #         query = "SELECT * FROM system_resources WHERE 1=1"
+    #         params = []
+    #
+    #         # Build the query dynamically based on user-specified conditions
+    #         if start_time:
+    #             query += " AND timestamp >= ?"
+    #             params.append(start_time)
+    #
+    #         if end_time:
+    #             query += " AND timestamp <= ?"
+    #             params.append(end_time)
+    #
+    #         if tag:
+    #             query += " AND tag = ?"
+    #             params.append(tag)
+    #
+    #         query += " ORDER BY tag, timestamp"
+    #
+    #         cursor.execute(query, params)
+    #
+    #         # Create a list of column names using query result's metadata
+    #         columns = [desc[0] for desc in cursor.description]
+    #         # Pair column names with values and return to user as a dictionary
+    #         return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+    # NOTE: how to additionally filter by metadata (e.g. machine_name)?
+    def query_training_stat(
+        self,
+        model_name: str | None = None,
+        stat_name: str | None = None,
+        start_round_number: int | None = None,
+        end_round_number: int | None = None,
+        start_epoch_number: int | None = None,
+        end_epoch_number: int | None = None,
+        tag: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query from training_stats table
+
+        Args:
+            model_name: Model name (e.g. 'beta_vae', 'rf')
+            stat_name: Stat name (e.g. 'total_loss', 'reconstruction_loss', 'learning_rate')
+            start_round_number: Start round number
+            end_round_number: End round number
+            start_epoch_number: Start epoch number
+            end_epoch_number: End epoch number
+            tag: Tag for current pipeline run
+            start_time: Start timestamp (unix time)
+            end_time: End timestamp (unix time)
+
+        Returns:
+            List of metric dictionaries
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # WHERE 1=1 is a trick for building dynamic queries
+            # Since it's always true, it does nothing
+            # But it lets us safely add more conditions with AND
+            query = "SELECT * FROM training_stats WHERE 1=1"
+            params = []
+
+            # Build the query dynamically based on user-specified conditions
+            if model_name:
+                query += " AND model_name = ?"
+                params.append(model_name)
+
+            if stat_name:
+                query += " AND stat_name = ?"
+                params.append(stat_name)
+
+            if start_round_number:
+                query += " AND round_number >= ?"
+                params.append(start_round_number)
+
+            if end_round_number:
+                query += " AND round_number <= ?"
+                params.append(end_round_number)
+
+            if start_epoch_number:
+                query += " AND epoch_number >= ?"
+                params.append(start_epoch_number)
+
+            if end_epoch_number:
+                query += " AND epoch_number <= ?"
+                params.append(end_epoch_number)
+
+            if tag:
+                query += " AND tag = ?"
+                params.append(tag)
+
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
 
             cursor.execute(query, params)
 
@@ -629,14 +818,14 @@ class Database:
             cursor.execute("SELECT COUNT(*) FROM system_resources")
             stats["system_resources_row_count"] = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM background_stats")
-            stats["background_stats_row_count"] = cursor.fetchone()[0]
+            # cursor.execute("SELECT COUNT(*) FROM background_stats")
+            # stats["background_stats_row_count"] = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM injection_stats")
-            stats["injection_stats_row_count"] = cursor.fetchone()[0]
+            # cursor.execute("SELECT COUNT(*) FROM injection_stats")
+            # stats["injection_stats_row_count"] = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM training_losses")
-            stats["training_losses_row_count"] = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM training_stats")
+            stats["training_stats_row_count"] = cursor.fetchone()[0]
 
             # Time range
             # Use system_resources as proxy
@@ -680,7 +869,7 @@ def get_db() -> Database | None:
     return db
 
 
-# TODO: write this function
+# TODO: complete this function
 # NOTE: where should source of truth be? (bla0, blpc2, blpc3, other)
 def merge_db() -> None:
     """Merge (join & dedup) two different aetherscan.db files into a single source-of-truth"""
