@@ -22,8 +22,6 @@ import numpy as np
 import psutil
 import tensorflow as tf
 
-from aetherscan.db import get_system_metadata
-
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
 from aetherscan.config import get_config
@@ -459,6 +457,9 @@ class ResourceMonitor:
 
         # Create figure with 3 subplots
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+
+        # Late import to avoid circular dependency (db imports from manager)
+        from aetherscan.db import get_system_metadata  # noqa: PLC0415
 
         metadata_json = get_system_metadata()
         machine_name = json.loads(metadata_json).get("machine_name")
