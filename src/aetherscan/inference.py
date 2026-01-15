@@ -1,4 +1,5 @@
 # TODO:
+# NOTE: will inference use a different tagging system as train?
 """
 Inference orchestration for Aetherscan Pipeline
 ...

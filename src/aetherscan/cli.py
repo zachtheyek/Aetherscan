@@ -595,6 +595,7 @@ def validate_args(args: argparse.Namespace) -> None:
     # num_samples_rf is divisible by inference per_replica_batch_size * num_replicas
     # # how to ensure divisibility for actual n_samples during inference?
     # snr_base, initial_snr_range, final_snr_range > 0
+    # initial_snr_range >= final_snr_range
     # exponential_decay_rate < 0
     # 0 <= step_easy_rounds, step_hard_rounds <= num_training_rounds
     # step_easy_rounds + step_hard_rounds = num_training_rounds
