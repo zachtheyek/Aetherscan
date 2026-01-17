@@ -21,6 +21,7 @@ class DBConfig:
     write_interval: float = 5.0  # seconds
     write_buffer_max_size: int = 100  # records
     write_retry_delay: float = 1.0  # seconds
+    flush_timeout: float = 10.0  # seconds
 
 
 @dataclass
@@ -292,6 +293,7 @@ class Config:
                 "write_interval": self.db.write_interval,
                 "write_buffer_max_size": self.db.write_buffer_max_size,
                 "write_retry_delay": self.db.write_retry_delay,
+                "flush_timeout": self.db.flush_timeout,
             },
             "manager": {
                 "n_processes": self.manager.n_processes,

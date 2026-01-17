@@ -23,6 +23,10 @@ from aetherscan.manager import register_db
 
 logger = logging.getLogger(__name__)
 
+# Unique sentinel object for flush requests - writer thread recognizes this
+# as a command to flush immediately rather than data to be written
+_FLUSH_SENTINEL = object()
+
 
 def get_system_metadata() -> str:
     """
@@ -119,6 +123,7 @@ class Database:
         self.write_interval = self.config.db.write_interval
         self.write_buffer_max_size = self.config.db.write_buffer_max_size
         self.write_retry_delay = self.config.db.write_retry_delay
+        self.flush_timeout = self.config.db.flush_timeout
 
         self.write_queue = Queue()
         self.writer_thread = None
@@ -268,6 +273,60 @@ class Database:
         else:
             logger.info("Database writer thread stopped")
 
+    def flush(self, timeout: float | None = None) -> bool:
+        """
+        Block until all queued writes are flushed to database.
+
+        This method ensures data consistency by waiting for all pending writes
+        to complete before returning. Use this before any operation that reads
+        from the database and expects to see recently written data.
+
+        Args:
+            timeout: Maximum time to wait for flush completion (seconds).
+                     If None, uses the configured flush_timeout.
+
+        Returns:
+            True if flush completed successfully, False if timed out or
+            shutdown was initiated during the wait.
+        """
+        if timeout is None:
+            timeout = self.flush_timeout
+
+        # No-op if writer isn't running
+        if self.writer_thread is None or not self.writer_thread.is_alive():
+            logger.debug("Flush called but writer thread not running")
+            return True
+
+        # Check if shutdown is already in progress
+        if self.stop_event.is_set():
+            logger.warning("Flush called during shutdown, skipping")
+            return False
+
+        # Create a completion event for this specific flush request
+        flush_complete = threading.Event()
+
+        # Put sentinel in queue - when writer sees this, it will flush and signal
+        self.write_queue.put((_FLUSH_SENTINEL, flush_complete))
+
+        # Block until writer signals completion, timeout, or shutdown
+        # Use a loop with short waits to also check stop_event
+        wait_interval = 0.1  # Check stop_event every 100ms
+        elapsed = 0.0
+
+        while elapsed < timeout:
+            if flush_complete.wait(timeout=wait_interval):
+                return True  # Flush completed successfully
+
+            # Check if shutdown was initiated while waiting
+            if self.stop_event.is_set():
+                logger.warning("Shutdown initiated during flush, aborting wait")
+                return False
+
+            elapsed += wait_interval
+
+        logger.warning(f"Database flush timed out after {timeout} seconds")
+        return False
+
     def _writer_loop(self):
         """Background loop that consumes data from queue and writes to database"""
         self.buffer = []
@@ -282,6 +341,19 @@ class Database:
                 # Retrive items from the queue one-by-one & append to local buffer
                 timeout = max(0.1, min(1.0, self.write_interval - (time.time() - last_write_time)))
                 metric = self.write_queue.get(timeout=timeout)
+
+                # Check for flush sentinel - signals immediate flush request
+                if metric[0] is _FLUSH_SENTINEL:
+                    flush_complete_event = metric[1]
+                    # Flush current buffer immediately
+                    if self.buffer:
+                        self._flush_buffer()
+                        self.buffer.clear()
+                        last_write_time = time.time()
+                    # Signal that flush is complete
+                    flush_complete_event.set()
+                    continue
+
                 self.buffer.append(metric)
 
                 # Write when buffer is full or interval elapsed

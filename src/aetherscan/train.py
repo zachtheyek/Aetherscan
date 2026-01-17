@@ -1140,6 +1140,11 @@ class TrainingPipeline:
 
                 logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
+            # Flush database to ensure all training stats are written before plotting
+            if self.db is not None:
+                logger.info("Flushing database before plotting...")
+                self.db.flush()
+
             # Plot progress
             self.plot_beta_vae_training_progress(
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
@@ -1952,6 +1957,11 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
             raise  # Re-raise to propagate error
 
         try:
+            # Flush database to ensure all training stats are written before final plot
+            if pipeline.db is not None:
+                logger.info("Flushing database before final plot...")
+                pipeline.db.flush()
+
             # Plot training progress
             pipeline.plot_beta_vae_training_progress()
         except Exception as e:
