@@ -932,7 +932,7 @@ class TrainingPipeline:
 
         # Generate training data
         train_data = self.data_generator.generate_batch(
-            self.config.training.num_samples_beta_vae, snr_base, snr_range
+            self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
         )
 
         # Distribute training data

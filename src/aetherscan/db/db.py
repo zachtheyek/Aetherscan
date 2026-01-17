@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 def get_system_metadata() -> str:
     """
-    Collects system metadata (machine name, user name, IP address)
+    Collects system metadata (machine name, user name, IP address, process ID)
     and returns it as a JSON string suitable for database storage.
     """
     # Machine and user info
@@ -48,11 +48,15 @@ def get_system_metadata() -> str:
 
     ip_address = _get_ip_address()
 
+    # Process ID
+    process_id = os.getpid()
+
     # Pack into JSON
     metadata = {
         "machine_name": machine_name,
         "user_name": user_name,
         "ip_address": ip_address,
+        "process_id": process_id,
     }
 
     # Use sorted keys for deterministic ordering (optional, good for diffs)
@@ -167,56 +171,36 @@ class Database:
                 )
             """)
 
-            # TODO: add additional index for frequent queries, then add wrapper func below
+            # TODO: add additional index for frequent queries
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_timestamp
                 ON system_resources(timestamp)
             """)
 
-            # # Background statistics table
-            # cursor.execute("""
-            #     CREATE TABLE IF NOT EXISTS background_stats (
-            #         id INTEGER PRIMARY KEY AUTOINCREMENT,
-            #         timestamp REAL NOT NULL,
-            #         stat_name TEXT NOT NULL,
-            #         value REAL NOT NULL,
-            #         unit TEXT,
-            #         filename TEXT,
-            #         process_id INTEGER,
-            #         chunk_number INTEGER,
-            #         tag TEXT,
-            #         metadata TEXT
-            #     )
-            # """)
-            #
-            # # TODO: add additional index for frequent queries, then add wrapper func below
-            # cursor.execute("""
-            #     CREATE INDEX IF NOT EXISTS idx_timestamp
-            #     ON background_stats(timestamp)
-            # """)
+            # Injection statistics table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS injection_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    stat_name TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    round_number INTEGER,
+                    chunk_number INTEGER,
+                    sample_index INTEGER,
+                    background_index INTEGER,
+                    signal_class TEXT,
+                    signal_type TEXT,
+                    injection_stage TEXT,
+                    tag TEXT,
+                    metadata TEXT
+                )
+            """)
 
-            # # Injection statistics table
-            # cursor.execute("""
-            #     CREATE TABLE IF NOT EXISTS injection_stats (
-            #         id INTEGER PRIMARY KEY AUTOINCREMENT,
-            #         timestamp REAL NOT NULL,
-            #         stat_name TEXT NOT NULL,
-            #         value REAL NOT NULL,
-            #         unit TEXT,
-            #         model_name TEXT,
-            #         round_number INTEGER,
-            #         process_id INTEGER,
-            #         chunk_number INTEGER,
-            #         tag TEXT,
-            #         metadata TEXT
-            #     )
-            # """)
-            #
-            # # TODO: add additional index for frequent queries, then add wrapper func below
-            # cursor.execute("""
-            #     CREATE INDEX IF NOT EXISTS idx_timestamp
-            #     ON injection_stats(timestamp)
-            # """)
+            # TODO: add additional index for frequent queries
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_timestamp
+                ON injection_stats(timestamp)
+            """)
 
             # Training statistics table
             cursor.execute("""
@@ -233,7 +217,7 @@ class Database:
                 )
             """)
 
-            # TODO: add additional index for frequent queries, then add wrapper func below (use tag, round_number, epoch_number, model_name, and/or stat_name instead?)
+            # TODO: add additional index for frequent queries
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_timestamp
                 ON training_stats(timestamp)
@@ -355,26 +339,16 @@ class Database:
                         """,
                             values,
                         )
-                    # elif table == "background_stats":
-                    #     cursor.execute(
-                    #         """
-                    #         INSERT INTO background_stats
-                    #         (timestamp, stat_name, value, unit, filename, process_id,
-                    #          chunk_number, tag, metadata)
-                    #         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    #     """,
-                    #         values,
-                    #     )
-                    # elif table == "injection_stats":
-                    #     cursor.execute(
-                    #         """
-                    #         INSERT INTO injection_stats
-                    #         (timestamp, stat_name, value, unit, model_name, round_number,
-                    #          process_id, chunk_number, tag, metadata)
-                    #         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    #     """,
-                    #         values,
-                    #     )
+                    elif table == "injection_stats":
+                        cursor.execute(
+                            """
+                            INSERT INTO injection_stats
+                            (timestamp, stat_name, value, round_number, chunk_number, sample_index,
+                             background_index, signal_class, signal_type, injection_stage, tag, metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                            values,
+                        )
                     elif table == "training_stats":
                         cursor.execute(
                             """
@@ -428,90 +402,57 @@ class Database:
             )
         )
 
-    # def write_background_stat(
-    #     self,
-    #     stat_name: str,
-    #     value: float,
-    #     unit: str | None = None,
-    #     filename: str | None = None,
-    #     process_id: int | None = None,
-    #     chunk_number: int | None = None,
-    #     tag: str | None = None,
-    # ):
-    #     """
-    #     Queue write to background_stats table (non-blocking)
-    #
-    #     Args:
-    #         stat_name: Type of statistic (e.g. mean, stdev, skew, kurtosis, etc.)
-    #         value: Statistic value
-    #         unit: Optional unit of measurement
-    #         filename: Optional filename of background
-    #         process_id: Optional process ID that calculated the statistic
-    #         chunk_number: Optional chunk number being processed
-    #         tag: Optional tag for current pipeline run
-    #     """
-    #     metadata_json = get_system_metadata()
-    #
-    #     self.write_queue.put(
-    #         (
-    #             "background_stats",
-    #             (
-    #                 time.time(),
-    #                 stat_name,
-    #                 value,
-    #                 unit,
-    #                 filename,
-    #                 process_id,
-    #                 chunk_number,
-    #                 tag,
-    #                 metadata_json,
-    #             ),
-    #         )
-    #     )
+    def write_injection_stat(
+        self,
+        stat_name: str,
+        value: float,
+        round_number: int | None = None,
+        chunk_number: int | None = None,
+        sample_index: int | None = None,
+        background_index: int | None = None,
+        signal_class: str | None = None,
+        signal_type: str | None = None,
+        injection_stage: str | None = None,
+        tag: str | None = None,
+        timestamp: float | None = None,
+    ):
+        """
+        Queue write to injection_stats table (non-blocking)
 
-    # def write_injection_stat(
-    #     self,
-    #     stat_name: str,
-    #     value: float,
-    #     unit: str | None = None,
-    #     model_name: str | None = None,
-    #     round_number: int | None = None,
-    #     process_id: int | None = None,
-    #     chunk_number: int | None = None,
-    #     tag: str | None = None,
-    # ):
-    #     """
-    #     Queue write to injection_stats table (non-blocking)
-    #
-    #     Args:
-    #         stat_name: Type of statistic (e.g. mean, stdev, skew, kurtosis, etc.)
-    #         value: Statistic value
-    #         unit: Optional unit of measurement
-    #         model_name: Optional model name that requested injection (e.g. 'beta_vae', 'rf')
-    #         round_number: Optional current training round number
-    #         process_id: Optional process ID that calculated the statistic
-    #         chunk_number: Optional chunk number being processed
-    #         tag: Optional tag for current pipeline run
-    #     """
-    #     metadata_json = get_system_metadata()
-    #
-    #     self.write_queue.put(
-    #         (
-    #             "injection_stats",
-    #             (
-    #                 time.time(),
-    #                 stat_name,
-    #                 value,
-    #                 unit,
-    #                 model_name,
-    #                 round_number,
-    #                 process_id,
-    #                 chunk_number,
-    #                 tag,
-    #                 metadata_json,
-    #             ),
-    #         )
-    #     )
+        Args:
+            stat_name: Stat name (e.g. global_mean, eti_snr, rfi_drift_rate, num_samples, etc.)
+            value: Stat value
+            round_number: Optional current training round number
+            chunk_number: Optional current injection chunk number
+            sample_index: Optional sample index within batch (0 to N-1)
+            background_index: Optional index of background plate used for this sample
+            signal_class: Optional signal class (e.g. main, false, true)
+            signal_type: Optional signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
+            injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            tag: Optional tag for current pipeline run
+            timestamp: Optional timestamp when stat was logged (uses current time if not provided)
+        """
+        metadata_json = get_system_metadata()
+
+        self.write_queue.put(
+            (
+                "injection_stats",
+                (
+                    timestamp or time.time(),
+                    stat_name,
+                    value,
+                    round_number,
+                    chunk_number,
+                    sample_index,
+                    background_index,
+                    signal_class,
+                    signal_type,
+                    injection_stage,
+                    tag,
+                    metadata_json,
+                ),
+            )
+        )
 
     def write_training_stat(
         self,
@@ -554,6 +495,8 @@ class Database:
         )
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
+    # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
+    # NOTE: how to allow str args to be lists & filter accordingly?
     def query_system_resource(
         self,
         resource_type: str | None = None,
@@ -605,7 +548,7 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            query += " ORDER BY tag, timestamp DESC, resource_type, resource_name"
+            query += " ORDER BY tag, timestamp, resource_type, resource_name"
 
             cursor.execute(query, params)
 
@@ -614,115 +557,132 @@ class Database:
             # Pair column names with values and return to user as a dictionary
             return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
-    # def query_background_stat(
-    #     self,
-    #     start_time: float | None = None,
-    #     end_time: float | None = None,
-    #     tag: str | None = None,
-    #     # resource_type: str,
-    #     # resource_name: str,
-    #     # value: float,
-    #     # unit: str | None = None,
-    #     # tag: str | None = None,
-    #     # timestamp: float | None = None,
-    # ) -> list[dict[str, Any]]:
-    #     """
-    #     Query from system_resources table
-    #
-    #     Args:
-    #         start_time: Start timestamp (unix time)
-    #         end_time: End timestamp (unix time)
-    #         tag: Tag for current pipeline run
-    #
-    #     Returns:
-    #         List of metric dictionaries
-    #     """
-    #     with self._get_connection() as conn:
-    #         cursor = conn.cursor()
-    #
-    #         # WHERE 1=1 is a trick for building dynamic queries
-    #         # Since it's always true, it does nothing
-    #         # But it lets us safely add more conditions with AND
-    #         query = "SELECT * FROM system_resources WHERE 1=1"
-    #         params = []
-    #
-    #         # Build the query dynamically based on user-specified conditions
-    #         if start_time:
-    #             query += " AND timestamp >= ?"
-    #             params.append(start_time)
-    #
-    #         if end_time:
-    #             query += " AND timestamp <= ?"
-    #             params.append(end_time)
-    #
-    #         if tag:
-    #             query += " AND tag = ?"
-    #             params.append(tag)
-    #
-    #         query += " ORDER BY tag, timestamp"
-    #
-    #         cursor.execute(query, params)
-    #
-    #         # Create a list of column names using query result's metadata
-    #         columns = [desc[0] for desc in cursor.description]
-    #         # Pair column names with values and return to user as a dictionary
-    #         return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+    # NOTE: how to additionally filter by metadata (e.g. machine_name)?
+    # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
+    # NOTE: how to allow str args to be lists & filter accordingly?
+    def query_injection_stat(
+        self,
+        stat_name: str | None = None,
+        start_round_number: int | None = None,
+        end_round_number: int | None = None,
+        start_chunk_number: int | None = None,
+        end_chunk_number: int | None = None,
+        start_sample_index: int | None = None,
+        end_sample_index: int | None = None,
+        start_background_index: int | None = None,
+        end_background_index: int | None = None,
+        signal_class: str | None = None,
+        signal_type: str | None = None,
+        injection_stage: str | None = None,
+        tag: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query from injection_stats table
 
-    # def query_injection_stat(
-    #     self,
-    #     start_time: float | None = None,
-    #     end_time: float | None = None,
-    #     tag: str | None = None,
-    #     # resource_type: str,
-    #     # resource_name: str,
-    #     # value: float,
-    #     # unit: str | None = None,
-    #     # tag: str | None = None,
-    #     # timestamp: float | None = None,
-    # ) -> list[dict[str, Any]]:
-    #     """
-    #     Query from system_resources table
-    #
-    #     Args:
-    #         start_time: Start timestamp (unix time)
-    #         end_time: End timestamp (unix time)
-    #         tag: Tag for current pipeline run
-    #
-    #     Returns:
-    #         List of metric dictionaries
-    #     """
-    #     with self._get_connection() as conn:
-    #         cursor = conn.cursor()
-    #
-    #         # WHERE 1=1 is a trick for building dynamic queries
-    #         # Since it's always true, it does nothing
-    #         # But it lets us safely add more conditions with AND
-    #         query = "SELECT * FROM system_resources WHERE 1=1"
-    #         params = []
-    #
-    #         # Build the query dynamically based on user-specified conditions
-    #         if start_time:
-    #             query += " AND timestamp >= ?"
-    #             params.append(start_time)
-    #
-    #         if end_time:
-    #             query += " AND timestamp <= ?"
-    #             params.append(end_time)
-    #
-    #         if tag:
-    #             query += " AND tag = ?"
-    #             params.append(tag)
-    #
-    #         query += " ORDER BY tag, timestamp"
-    #
-    #         cursor.execute(query, params)
-    #
-    #         # Create a list of column names using query result's metadata
-    #         columns = [desc[0] for desc in cursor.description]
-    #         # Pair column names with values and return to user as a dictionary
-    #         return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+        Args:
+            stat_name: Stat name (e.g. global_mean, eti_snr, rfi_drift_rate, num_samples, etc.)
+            start_round_number: Start round number
+            end_round_number: End round number
+            start_chunk_number: Start chunk number
+            end_chunk_number: End chunk number
+            start_sample_index: Start sample index
+            end_sample_index: End sample index
+            start_background_index: Start background index
+            end_background_index: End background index
+            signal_class: Signal class (e.g. main, false, true)
+            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
+            injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            tag: Tag for current pipeline run
+            start_time: Start timestamp (unix time)
+            end_time: End timestamp (unix time)
+
+        Returns:
+            List of metric dictionaries
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # WHERE 1=1 is a trick for building dynamic queries
+            # Since it's always true, it does nothing
+            # But it lets us safely add more conditions with AND
+            query = "SELECT * FROM injection_stats WHERE 1=1"
+            params = []
+
+            # Build the query dynamically based on user-specified conditions
+            if stat_name:
+                query += " AND stat_name = ?"
+                params.append(stat_name)
+
+            if start_round_number:
+                query += " AND round_number >= ?"
+                params.append(start_round_number)
+
+            if end_round_number:
+                query += " AND round_number <= ?"
+                params.append(end_round_number)
+
+            if start_chunk_number:
+                query += " AND chunk_number >= ?"
+                params.append(start_chunk_number)
+
+            if end_chunk_number:
+                query += " AND chunk_number <= ?"
+                params.append(end_chunk_number)
+
+            if start_sample_index is not None:
+                query += " AND sample_index >= ?"
+                params.append(start_sample_index)
+
+            if end_sample_index is not None:
+                query += " AND sample_index <= ?"
+                params.append(end_sample_index)
+
+            if start_background_index is not None:
+                query += " AND background_index >= ?"
+                params.append(start_background_index)
+
+            if end_background_index is not None:
+                query += " AND background_index <= ?"
+                params.append(end_background_index)
+
+            if signal_class:
+                query += " AND signal_class = ?"
+                params.append(signal_class)
+
+            if signal_type:
+                query += " AND signal_type = ?"
+                params.append(signal_type)
+
+            if injection_stage:
+                query += " AND injection_stage = ?"
+                params.append(injection_stage)
+
+            if tag:
+                query += " AND tag = ?"
+                params.append(tag)
+
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dictionary
+            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
+    # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
+    # NOTE: how to allow str args to be lists & filter accordingly?
     def query_training_stat(
         self,
         model_name: str | None = None,
@@ -818,11 +778,8 @@ class Database:
             cursor.execute("SELECT COUNT(*) FROM system_resources")
             stats["system_resources_row_count"] = cursor.fetchone()[0]
 
-            # cursor.execute("SELECT COUNT(*) FROM background_stats")
-            # stats["background_stats_row_count"] = cursor.fetchone()[0]
-
-            # cursor.execute("SELECT COUNT(*) FROM injection_stats")
-            # stats["injection_stats_row_count"] = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM injection_stats")
+            stats["injection_stats_row_count"] = cursor.fetchone()[0]
 
             cursor.execute("SELECT COUNT(*) FROM training_stats")
             stats["training_stats_row_count"] = cursor.fetchone()[0]
