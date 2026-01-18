@@ -25,6 +25,7 @@ import tensorflow as tf
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
 from aetherscan.config import get_config
+from aetherscan.logger import get_logger
 
 logger = logging.getLogger(__name__)
 
@@ -617,6 +618,14 @@ class ResourceMonitor:
         plt.close(fig)
 
         logger.info(f"Resource utilization plot saved to: {output_path}")
+
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                output_path,
+                title=f"Resource Utilization - {self.tag}",
+            )
 
 
 def init_monitor() -> ResourceMonitor:

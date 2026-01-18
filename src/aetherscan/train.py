@@ -30,6 +30,7 @@ from tensorflow.keras.layers import Conv2D, Dense
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
+from aetherscan.logger import get_logger
 from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
@@ -1830,6 +1831,14 @@ class TrainingPipeline:
 
         logger.info(f"Beta-VAE training progress plot saved to: {save_path}")
 
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Beta-VAE Training Progress - {tag}",
+            )
+
     def plot_injection_stats(
         self,
         tag: str | None = None,
@@ -2139,6 +2148,14 @@ class TrainingPipeline:
 
         logger.info(f"Intensity histogram plot saved: {save_path}")
 
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Intensity Histogram ({signal_type}) - {tag}",
+            )
+
     def _plot_signal_characteristics(
         self,
         eti_stats: dict[str, list[float]],
@@ -2227,6 +2244,14 @@ class TrainingPipeline:
         plt.close()
 
         logger.info(f"Signal characteristics plot saved: {save_path}")
+
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Signal Characteristics - {tag}",
+            )
 
     def _plot_stage_transitions(
         self,
@@ -2339,6 +2364,14 @@ class TrainingPipeline:
 
         logger.info(f"Stage transitions plot saved: {save_path}")
 
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Stage Transitions - {tag}",
+            )
+
     def _plot_signal_type_boxplots(
         self,
         stats_by_type: dict[str, dict[str, list[float]]],
@@ -2432,6 +2465,14 @@ class TrainingPipeline:
         plt.close()
 
         logger.info(f"Signal type box plots saved: {save_path}")
+
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Signal Type Box Plots - {tag}",
+            )
 
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
