@@ -26,3 +26,4 @@ dependencies:
   - pip:
       - tensorflow==2.16.*
       - setigen
+      - slack-sdk>=3.23.0
