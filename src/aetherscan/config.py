@@ -56,7 +56,7 @@ class LoggerConfig:
     file_level: str = "INFO"
 
     # Slack configuration
-    slack_level: str = "WARNING"
+    slack_level: str = "INFO"
     slack_enabled: bool = True
     slack_channel: str | None = None  # Override with SLACK_CHANNEL env var
     slack_username: str = "Aetherscan Bot"
