@@ -1834,6 +1834,8 @@ class TrainingPipeline:
         tag: str | None = None,
         dir: str | None = None,
         round_number: int | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
     ) -> None:
         """
         Plot injection statistics for bias/leakage detection.
@@ -1848,9 +1850,17 @@ class TrainingPipeline:
             tag: Plot tag for filename (defaults to save_tag)
             dir: Subdirectory (e.g., "checkpoints" for per-round)
             round_number: Filter to specific round (None = all rounds)
+            start_time: Start timestamp for query bounds (defaults to self.start_time)
+            end_time: End timestamp for query bounds (defaults to current time)
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
+
+        # Set time bounds for queries to current training session
+        if start_time is None:
+            start_time = getattr(self, "start_time", None)
+        if end_time is None:
+            end_time = time.time()
 
         metadata_json = get_system_metadata()
         machine_name = json.loads(metadata_json).get("machine_name")
@@ -1891,6 +1901,8 @@ class TrainingPipeline:
                         start_round_number=1 if round_number is None else round_number,
                         end_round_number=round_number,
                         tag=self.config.checkpoint.save_tag,
+                        start_time=start_time,
+                        end_time=end_time,
                     )
                     stats_by_stage[stage][stat_name] = [r["value"] for r in results]
                     del results
@@ -1926,6 +1938,8 @@ class TrainingPipeline:
                     start_round_number=1 if round_number is None else round_number,
                     end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 eti_results.extend([r["value"] for r in results])
                 del results
@@ -1940,6 +1954,8 @@ class TrainingPipeline:
                     start_round_number=1 if round_number is None else round_number,
                     end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 rfi_results.extend([r["value"] for r in results])
                 del results
@@ -1964,6 +1980,8 @@ class TrainingPipeline:
                     start_round_number=1 if round_number is None else round_number,
                     end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 values_a = [r["value"] for r in results_a]
                 del results_a
@@ -1976,6 +1994,8 @@ class TrainingPipeline:
                     start_round_number=1 if round_number is None else round_number,
                     end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 values_b = [r["value"] for r in results_b]
                 del results_b
@@ -2000,6 +2020,8 @@ class TrainingPipeline:
                     start_round_number=1 if round_number is None else round_number,
                     end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
                 del results
