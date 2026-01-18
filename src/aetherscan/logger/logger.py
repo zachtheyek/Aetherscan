@@ -176,6 +176,7 @@ class Logger:
                         retry_attempts=self.config.logger.slack_retry_attempts,
                         buffer_size=self.config.logger.slack_buffer_size,
                         flush_interval=self.config.logger.slack_flush_interval,
+                        broadcast_level=_parse_level(self.config.logger.slack_broadcast_level),
                     )
                     self.slack_handler.setLevel(_parse_level(self.config.logger.slack_level))
                     self.slack_handler.setFormatter(formatter)

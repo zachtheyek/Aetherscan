@@ -70,6 +70,7 @@ class SlackHandler(logging.Handler):
         retry_attempts: int = 2,
         buffer_size: int = 10,
         flush_interval: float = 5.0,
+        broadcast_level: int = logging.ERROR,
     ):
         """
         Initialize SlackHandler.
@@ -83,6 +84,7 @@ class SlackHandler(logging.Handler):
             retry_attempts: Number of retry attempts on failure
             buffer_size: Maximum messages to buffer before flushing
             flush_interval: Seconds between automatic buffer flushes
+            broadcast_level: Log level at which messages are broadcast to main channel
         """
         super().__init__()
 
@@ -93,6 +95,7 @@ class SlackHandler(logging.Handler):
         self.retry_attempts = retry_attempts
         self.buffer_size = buffer_size
         self.flush_interval = flush_interval
+        self.broadcast_level = broadcast_level
 
         # Track consecutive failures for error throttling
         self._consecutive_failures = 0
@@ -433,6 +436,9 @@ class SlackHandler(logging.Handler):
             # Add thread_ts if we have a run thread
             if self._thread_ts:
                 kwargs["thread_ts"] = self._thread_ts
+                # Broadcast to main channel if max severity >= broadcast_level
+                if max_level >= self.broadcast_level:
+                    kwargs["reply_broadcast"] = True
 
             self._send_with_retry(lambda: client.chat_postMessage(**kwargs))
 

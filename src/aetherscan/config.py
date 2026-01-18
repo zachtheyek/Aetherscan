@@ -57,6 +57,7 @@ class LoggerConfig:
 
     # Slack configuration
     slack_level: str = "INFO"
+    slack_broadcast_level: str = "ERROR"  # Messages at this level+ are broadcast to main channel
     slack_enabled: bool = True
     slack_channel: str | None = None  # Override with SLACK_CHANNEL env var
     slack_username: str = "Aetherscan"
@@ -324,6 +325,7 @@ class Config:
                 "console_level": self.logger.console_level,
                 "file_level": self.logger.file_level,
                 "slack_level": self.logger.slack_level,
+                "slack_broadcast_level": self.logger.slack_broadcast_level,
                 "slack_enabled": self.logger.slack_enabled,
                 "slack_channel": self.logger.slack_channel,
                 "slack_username": self.logger.slack_username,
