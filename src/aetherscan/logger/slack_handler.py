@@ -239,7 +239,7 @@ class SlackHandler(logging.Handler):
                 "*Command:*",
                 f"```{cli_args_str}```",
                 "",
-                "_Logs will appear as replies to this message._",
+                "_Logs will appear as batched replies to this message._",
             ]
         )
 
