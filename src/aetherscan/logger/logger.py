@@ -257,15 +257,21 @@ class Logger:
         channels: str | list[str] | None = None,
         title: str | None = None,
         message: str | None = None,
+        broadcast: bool = True,
     ) -> bool:
         """
         Upload an image file to Slack.
+
+        The image is uploaded to the current run's thread. If broadcast=True (default),
+        a message is also posted to the main channel with a link back to the thread
+        (similar to the "Also send to channel" checkbox in Slack).
 
         Args:
             file_path: Path to the image file to upload
             channels: Channel(s) to upload to (defaults to handler's configured channel)
             title: Title for the image
             message: Comment to add with the image
+            broadcast: If True, also echo to main channel with link to thread
 
         Returns:
             True if upload succeeded, False otherwise
@@ -279,6 +285,7 @@ class Logger:
             channels=channels,
             title=title,
             initial_comment=message,
+            broadcast=broadcast,
         )
 
 

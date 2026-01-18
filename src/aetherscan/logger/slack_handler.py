@@ -221,9 +221,9 @@ class SlackHandler(logging.Handler):
         summary_lines = [
             "*Aetherscan Pipeline Run Started*",
             "",
-            f"*Timestamp:* {timestamp}",
-            f"*Host:* {hostname}",
-            f"*Platform:* {platform.system()} {platform.release()}",
+            f"*Start Time:* {timestamp}",
+            f"*Machine:* {hostname}",
+            f"*OS:* {platform.system()} {platform.release()}",
             f"*CPU Cores:* {cpu_count}",
         ]
 
@@ -264,7 +264,7 @@ class SlackHandler(logging.Handler):
         return False
 
     def _get_gpu_info(self) -> str | None:
-        """Get GPU information if available."""
+        """Get GPU information if available, grouped by GPU type."""
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
@@ -275,15 +275,38 @@ class SlackHandler(logging.Handler):
             )
             if result.returncode == 0 and result.stdout.strip():
                 gpus = result.stdout.strip().split("\n")
-                gpu_strs = []
-                for _, gpu in enumerate(gpus):
+
+                # Count GPUs by name and sum total VRAM
+                gpu_counts: dict[str, int] = {}
+                total_vram_mb = 0.0
+
+                for gpu in gpus:
                     parts = gpu.split(", ")
                     if len(parts) == 2:
                         name, mem = parts
-                        gpu_strs.append(f"{name} ({int(float(mem)) / 1024:.1f}GB)")
+                        name = name.strip()
+                        mem_mb = float(mem)
+                        total_vram_mb += mem_mb
+                        gpu_counts[name] = gpu_counts.get(name, 0) + 1
+
+                if not gpu_counts:
+                    return None
+
+                # Format as "N x GPU_NAME" for each type
+                gpu_strs = []
+                for name, count in gpu_counts.items():
+                    if count > 1:
+                        gpu_strs.append(f"{count} x {name}")
                     else:
-                        gpu_strs.append(gpu.strip())
-                return ", ".join(gpu_strs)
+                        gpu_strs.append(name)
+
+                # Convert total VRAM to GB
+                total_vram_gb = total_vram_mb / 1024
+
+                # Format output
+                gpu_list = ", ".join(gpu_strs)
+                return f"{gpu_list} ({total_vram_gb:.0f}GB combined)"
+
         except Exception:
             pass
         return None
@@ -481,15 +504,21 @@ class SlackHandler(logging.Handler):
         channels: str | list[str] | None = None,
         title: str | None = None,
         initial_comment: str | None = None,
+        broadcast: bool = True,
     ) -> bool:
         """
         Upload a file to Slack.
+
+        When uploading to a thread, the file is posted in the thread. If broadcast=True,
+        a message is also posted to the main channel with a link back to the thread
+        (similar to the "Also send to channel" checkbox in Slack).
 
         Args:
             file_path: Path to the file to upload
             channels: Channel(s) to upload to (defaults to handler's channel)
             title: Title for the file
             initial_comment: Comment to add with the file
+            broadcast: If True and in a thread, also echo to main channel
 
         Returns:
             True if upload succeeded, False otherwise
@@ -528,11 +557,58 @@ class SlackHandler(logging.Handler):
             if self._thread_ts:
                 kwargs["thread_ts"] = self._thread_ts
 
-            self._send_with_retry(lambda: client.files_upload_v2(**kwargs))
-            return True
+            response = self._send_with_retry_return(lambda: client.files_upload_v2(**kwargs))
+
+            # If we're in a thread and broadcast is enabled, post a broadcast message
+            # This echoes the upload to the main channel with a link to the thread
+            if response and self._thread_ts and broadcast:
+                self._broadcast_file_upload(client, target_channels, title, initial_comment)
+
+            return response is not None
         except Exception as e:
             logger.debug(f"Failed to upload file to Slack: {e}")
             return False
+
+    def _broadcast_file_upload(
+        self,
+        client: WebClient,
+        channel: str,
+        title: str | None,
+        comment: str | None,
+    ):
+        """
+        Post a broadcast message to the main channel announcing a file upload in the thread.
+
+        Args:
+            client: Slack WebClient instance
+            channel: Channel to broadcast to
+            title: Title of the uploaded file
+            comment: Comment associated with the file
+        """
+        if not self._thread_ts:
+            return
+
+        # Build a brief announcement message
+        if title:
+            text = f":chart_with_upwards_trend: *{title}*"
+        else:
+            text = ":chart_with_upwards_trend: *New plot uploaded*"
+
+        if comment:
+            text += f"\n{comment}"
+
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                text=text,
+                thread_ts=self._thread_ts,
+                reply_broadcast=True,  # This echoes to the main channel
+                username=self.username,
+                icon_emoji=self.icon_emoji,
+            )
+        except Exception as e:
+            # Don't fail the upload if broadcast fails
+            print(f"Failed to broadcast file upload: {e}", file=sys.__stderr__)
 
     def close(self):
         """Close the handler and clean up resources."""
