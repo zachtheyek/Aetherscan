@@ -194,13 +194,14 @@ class Logger:
         queue_handler = QueueHandler(self.log_queue)
         root_logger.addHandler(queue_handler)
 
+        # Start the Slack run thread FIRST (posts run summary, all logs become replies)
+        # This must happen before any log messages so they appear in the thread
+        if self.slack_handler is not None:
+            self.slack_handler.start_run()
+
         # Now that logging infrastructure is ready, log Slack initialization status
         if slack_init_message:
             logger.log(slack_init_level, slack_init_message)
-
-        # Start the Slack run thread (posts run summary, all logs become replies)
-        if self.slack_handler is not None:
-            self.slack_handler.start_run()
 
         # Redirect TensorFlow logs to Python logging
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"  # Show all TF logs
