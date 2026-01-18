@@ -111,6 +111,9 @@ class SlackHandler(logging.Handler):
         self._thread_ts: str | None = None
         self._run_started = False
 
+        # Channel ID cache (files_upload_v2 requires ID, not name)
+        self._channel_id_cache: dict[str, str] = {}
+
         # Message batching
         self._buffer: list[dict] = []
         self._buffer_lock = threading.Lock()
@@ -150,6 +153,66 @@ class SlackHandler(logging.Handler):
                 logger.warning(f"Failed to initialize Slack client: {e}")
                 return None
         return self._client
+
+    def _resolve_channel_id(self, channel: str) -> str | None:
+        """
+        Resolve a channel name to its ID.
+
+        The files_upload_v2 API requires a channel ID, not a name.
+        This method converts channel names (like #aetherscan-logs) to IDs (like C01234ABCD).
+
+        Args:
+            channel: Channel name (with or without #) or channel ID
+
+        Returns:
+            Channel ID, or None if resolution failed
+        """
+        # If it already looks like a channel ID, return as-is
+        if channel and len(channel) >= 9 and channel[0] in "CGDZ":
+            return channel
+
+        # Check cache
+        cache_key = channel.lstrip("#")
+        if cache_key in self._channel_id_cache:
+            return self._channel_id_cache[cache_key]
+
+        client = self._get_client()
+        if client is None:
+            return None
+
+        try:
+            # Use conversations.list to find the channel
+            channel_name = channel.lstrip("#")
+            cursor = None
+
+            while True:
+                response = client.conversations_list(
+                    types="public_channel,private_channel",
+                    limit=200,
+                    cursor=cursor,
+                )
+
+                if not response.get("ok"):
+                    return None
+
+                for ch in response.get("channels", []):
+                    if ch.get("name") == channel_name:
+                        channel_id = ch.get("id")
+                        self._channel_id_cache[cache_key] = channel_id
+                        return channel_id
+
+                # Check for pagination
+                cursor = response.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+
+            # Channel not found
+            print(f"Could not find channel ID for: {channel}", file=sys.__stderr__)
+            return None
+
+        except Exception as e:
+            print(f"Failed to resolve channel ID for {channel}: {e}", file=sys.__stderr__)
+            return None
 
     def _is_in_cooldown(self) -> bool:
         """Check if handler is in cooldown period due to consecutive failures."""
@@ -541,19 +604,26 @@ class SlackHandler(logging.Handler):
             return False
 
         if channels is None:
-            target_channels = self.channel
+            target_channel = self.channel
         elif isinstance(channels, list):
-            target_channels = ",".join(channels)
+            # For simplicity, use first channel for file upload
+            target_channel = channels[0] if channels else self.channel
         else:
-            target_channels = channels
+            target_channel = channels
 
-        if not target_channels:
+        if not target_channel:
             logger.warning("No channel specified for Slack file upload")
+            return False
+
+        # Resolve channel name to ID (required for files_upload_v2)
+        channel_id = self._resolve_channel_id(target_channel)
+        if not channel_id:
+            logger.warning(f"Could not resolve channel ID for: {target_channel}")
             return False
 
         try:
             kwargs = {
-                "channel": target_channels,
+                "channel": channel_id,
                 "file": file_path,
                 "title": title,
                 "initial_comment": initial_comment,
@@ -568,7 +638,7 @@ class SlackHandler(logging.Handler):
             # If we're in a thread and broadcast is enabled, post a broadcast message
             # This echoes the upload to the main channel with a link to the thread
             if response and self._thread_ts and broadcast:
-                self._broadcast_file_upload(client, target_channels, title, initial_comment)
+                self._broadcast_file_upload(client, target_channel, title, initial_comment)
 
             return response is not None
         except Exception as e:
