@@ -63,6 +63,8 @@ class LoggerConfig:
     slack_icon_emoji: str = ":robot_face:"
     slack_timeout: float = 5.0
     slack_retry_attempts: int = 2
+    slack_buffer_size: int = 10  # Max messages to buffer before flushing
+    slack_flush_interval: float = 5.0  # Seconds between automatic flushes
 
 
 @dataclass
@@ -327,6 +329,8 @@ class Config:
                 "slack_icon_emoji": self.logger.slack_icon_emoji,
                 "slack_timeout": self.logger.slack_timeout,
                 "slack_retry_attempts": self.logger.slack_retry_attempts,
+                "slack_buffer_size": self.logger.slack_buffer_size,
+                "slack_flush_interval": self.logger.slack_flush_interval,
             },
             "beta_vae": {
                 "latent_dim": self.beta_vae.latent_dim,

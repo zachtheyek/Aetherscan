@@ -174,6 +174,8 @@ class Logger:
                         icon_emoji=self.config.logger.slack_icon_emoji,
                         timeout=self.config.logger.slack_timeout,
                         retry_attempts=self.config.logger.slack_retry_attempts,
+                        buffer_size=self.config.logger.slack_buffer_size,
+                        flush_interval=self.config.logger.slack_flush_interval,
                     )
                     self.slack_handler.setLevel(_parse_level(self.config.logger.slack_level))
                     self.slack_handler.setFormatter(formatter)
@@ -195,6 +197,10 @@ class Logger:
         # Now that logging infrastructure is ready, log Slack initialization status
         if slack_init_message:
             logger.log(slack_init_level, slack_init_message)
+
+        # Start the Slack run thread (posts run summary, all logs become replies)
+        if self.slack_handler is not None:
+            self.slack_handler.start_run()
 
         # Redirect TensorFlow logs to Python logging
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"  # Show all TF logs
@@ -235,7 +241,11 @@ class Logger:
             # Note, can't log here after tear down
 
     def stop(self):
-        """Stop the queue listener thread"""
+        """Stop the queue listener thread and flush Slack messages"""
+        # Flush and close Slack handler first (while listener is still running)
+        if self.slack_handler is not None:
+            self.slack_handler.close()
+
         if self.log_listener is not None:
             self.log_listener.stop()
             # Note, can't log after this point -- listener thread has stopped

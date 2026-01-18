@@ -1,15 +1,24 @@
 """
 Slack logging handler for Aetherscan Pipeline
-Provides custom logging handler that sends messages to Slack API with retry logic,
-color-coded messages, and image upload functionality.
+Provides custom logging handler that sends messages to Slack API with:
+- Batched message delivery (buffer size + time interval)
+- Thread-based logging (all logs as replies to a run summary message)
+- Color-coded messages by log level
+- Retry logic with exponential backoff
+- Image upload functionality
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import platform
+import socket
+import subprocess
 import sys
+import threading
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,12 +36,23 @@ LEVEL_COLORS = {
     logging.DEBUG: "#808080",  # Gray
 }
 
+# Level name to emoji mapping for batched messages
+LEVEL_EMOJI = {
+    logging.CRITICAL: ":rotating_light:",
+    logging.ERROR: ":x:",
+    logging.WARNING: ":warning:",
+    logging.INFO: ":information_source:",
+    logging.DEBUG: ":mag:",
+}
+
 
 class SlackHandler(logging.Handler):
     """
     Custom logging handler that sends messages to Slack.
 
     Features:
+    - Batched message delivery to prevent rate limiting
+    - Thread-based logging (replies to initial run summary)
     - Color-coded messages by log level
     - Retry logic with exponential backoff
     - Error throttling to prevent spam on consecutive failures
@@ -48,6 +68,8 @@ class SlackHandler(logging.Handler):
         icon_emoji: str = ":robot_face:",
         timeout: float = 5.0,
         retry_attempts: int = 2,
+        buffer_size: int = 10,
+        flush_interval: float = 5.0,
     ):
         """
         Initialize SlackHandler.
@@ -59,6 +81,8 @@ class SlackHandler(logging.Handler):
             icon_emoji: Emoji icon for the bot
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts on failure
+            buffer_size: Maximum messages to buffer before flushing
+            flush_interval: Seconds between automatic buffer flushes
         """
         super().__init__()
 
@@ -67,6 +91,8 @@ class SlackHandler(logging.Handler):
         self.icon_emoji = icon_emoji
         self.timeout = timeout
         self.retry_attempts = retry_attempts
+        self.buffer_size = buffer_size
+        self.flush_interval = flush_interval
 
         # Track consecutive failures for error throttling
         self._consecutive_failures = 0
@@ -77,6 +103,35 @@ class SlackHandler(logging.Handler):
         # Initialize Slack client lazily to avoid import errors if slack_sdk not installed
         self._client: WebClient | None = None
         self._token = token
+
+        # Thread-based logging: store the thread timestamp for replies
+        self._thread_ts: str | None = None
+        self._run_started = False
+
+        # Message batching
+        self._buffer: list[dict] = []
+        self._buffer_lock = threading.Lock()
+        self._last_flush_time = time.time()
+        self._flush_thread: threading.Thread | None = None
+        self._stop_flush_thread = threading.Event()
+
+        # Start the background flush thread
+        self._start_flush_thread()
+
+    def _start_flush_thread(self):
+        """Start the background thread that periodically flushes the buffer."""
+        self._stop_flush_thread.clear()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
+
+    def _flush_loop(self):
+        """Background loop that flushes buffer at regular intervals."""
+        while not self._stop_flush_thread.is_set():
+            time.sleep(1.0)  # Check every second
+            with self._buffer_lock:
+                elapsed = time.time() - self._last_flush_time
+                if self._buffer and elapsed >= self.flush_interval:
+                    self._flush_buffer_locked()
 
     def _get_client(self) -> WebClient | None:
         """Lazily initialize and return the Slack WebClient."""
@@ -109,7 +164,6 @@ class SlackHandler(logging.Handler):
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._max_failures_before_cooldown:
             self._cooldown_until = time.time() + self._cooldown_duration
-            # Use stderr directly to avoid recursive logging
             print(
                 f"Slack handler entering cooldown for {self._cooldown_duration}s "
                 f"after {self._consecutive_failures} consecutive failures",
@@ -121,14 +175,179 @@ class SlackHandler(logging.Handler):
         self._consecutive_failures = 0
         self._cooldown_until = None
 
+    def start_run(self, cli_args: list[str] | None = None) -> bool:
+        """
+        Post the initial run summary message to Slack.
+
+        All subsequent log messages will be posted as replies to this message.
+
+        Args:
+            cli_args: Command line arguments for this run
+
+        Returns:
+            True if the run summary was posted successfully
+        """
+        if self._run_started:
+            return True
+
+        if self._is_in_cooldown():
+            return False
+
+        client = self._get_client()
+        if client is None:
+            return False
+
+        # Gather system information
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            hostname = "unknown"
+
+        try:
+            cpu_count = os.cpu_count() or "unknown"
+        except Exception:
+            cpu_count = "unknown"
+
+        # Try to get GPU info
+        gpu_info = self._get_gpu_info()
+
+        # Format CLI args
+        if cli_args is None:
+            cli_args = sys.argv
+        cli_args_str = " ".join(cli_args)
+
+        # Build the run summary message
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        summary_lines = [
+            "*Aetherscan Pipeline Run Started*",
+            "",
+            f"*Timestamp:* {timestamp}",
+            f"*Host:* {hostname}",
+            f"*Platform:* {platform.system()} {platform.release()}",
+            f"*CPU Cores:* {cpu_count}",
+        ]
+
+        if gpu_info:
+            summary_lines.append(f"*GPUs:* {gpu_info}")
+
+        summary_lines.extend(
+            [
+                "",
+                "*Command:*",
+                f"```{cli_args_str}```",
+                "",
+                "_Logs will appear as replies to this message._",
+            ]
+        )
+
+        summary_text = "\n".join(summary_lines)
+
+        try:
+            response = self._send_with_retry_return(
+                lambda: client.chat_postMessage(
+                    channel=self.channel,
+                    text=summary_text,
+                    username=self.username,
+                    icon_emoji=self.icon_emoji,
+                    mrkdwn=True,
+                )
+            )
+
+            if response and response.get("ok"):
+                self._thread_ts = response.get("ts")
+                self._run_started = True
+                return True
+
+        except Exception as e:
+            print(f"Failed to post run summary to Slack: {e}", file=sys.__stderr__)
+
+        return False
+
+    def _get_gpu_info(self) -> str | None:
+        """Get GPU information if available."""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                gpus = result.stdout.strip().split("\n")
+                gpu_strs = []
+                for _, gpu in enumerate(gpus):
+                    parts = gpu.split(", ")
+                    if len(parts) == 2:
+                        name, mem = parts
+                        gpu_strs.append(f"{name} ({int(float(mem)) / 1024:.1f}GB)")
+                    else:
+                        gpu_strs.append(gpu.strip())
+                return ", ".join(gpu_strs)
+        except Exception:
+            pass
+        return None
+
     def emit(self, record: logging.LogRecord) -> None:
         """
-        Send log record to Slack.
+        Buffer log record for batched sending to Slack.
 
         Args:
             record: The log record to send
         """
-        # Skip if in cooldown
+        if self._is_in_cooldown():
+            return
+
+        try:
+            # Format the message
+            msg = self.format(record)
+            color = LEVEL_COLORS.get(record.levelno, "#808080")
+            emoji = LEVEL_EMOJI.get(record.levelno, ":speech_balloon:")
+
+            # Add to buffer
+            with self._buffer_lock:
+                self._buffer.append(
+                    {
+                        "text": msg,
+                        "color": color,
+                        "emoji": emoji,
+                        "level": record.levelname,
+                        "name": record.name,
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    }
+                )
+
+                # Flush if buffer is full
+                if len(self._buffer) >= self.buffer_size:
+                    self._flush_buffer_locked()
+
+        except Exception:
+            self._record_failure()
+
+    def _flush_buffer_locked(self):
+        """Flush the buffer. Must be called with _buffer_lock held."""
+        if not self._buffer:
+            return
+
+        messages = self._buffer.copy()
+        self._buffer.clear()
+        self._last_flush_time = time.time()
+
+        # Release lock before network call
+        self._buffer_lock.release()
+        try:
+            self._send_batched_messages(messages)
+        finally:
+            self._buffer_lock.acquire()
+
+    def flush(self):
+        """Flush any buffered messages immediately."""
+        with self._buffer_lock:
+            if self._buffer:
+                self._flush_buffer_locked()
+
+    def _send_batched_messages(self, messages: list[dict]):
+        """Send a batch of messages as a single Slack message."""
         if self._is_in_cooldown():
             return
 
@@ -136,34 +355,66 @@ class SlackHandler(logging.Handler):
         if client is None:
             return
 
+        # Determine the highest severity level for the batch color
+        level_priority = {
+            logging.CRITICAL: 5,
+            logging.ERROR: 4,
+            logging.WARNING: 3,
+            logging.INFO: 2,
+            logging.DEBUG: 1,
+        }
+
+        max_level = logging.DEBUG
+        for msg in messages:
+            level_name = msg.get("level", "INFO")
+            level_num = getattr(logging, level_name, logging.INFO)
+            if level_priority.get(level_num, 0) > level_priority.get(max_level, 0):
+                max_level = level_num
+
+        batch_color = LEVEL_COLORS.get(max_level, "#808080")
+
+        # Build the combined message text
+        lines = []
+        for msg in messages:
+            emoji = msg.get("emoji", "")
+            timestamp = msg.get("timestamp", "")
+            text = msg.get("text", "")
+            # Truncate very long messages
+            if len(text) > 500:
+                text = text[:497] + "..."
+            lines.append(f"{emoji} `{timestamp}` {text}")
+
+        combined_text = "\n".join(lines)
+
+        # Truncate if total message is too long (Slack limit is ~40k chars)
+        if len(combined_text) > 3000:
+            combined_text = combined_text[:2997] + "\n..."
+
+        # Build the message with text field to avoid warnings
         try:
-            # Format the message
-            msg = self.format(record)
+            kwargs = {
+                "channel": self.channel,
+                "text": f"{len(messages)} log message(s)",  # Fallback text for notifications
+                "username": self.username,
+                "icon_emoji": self.icon_emoji,
+                "attachments": [
+                    {
+                        "color": batch_color,
+                        "text": combined_text,
+                        "fallback": f"{len(messages)} log message(s)",  # Fixes warning
+                        "mrkdwn_in": ["text"],
+                    }
+                ],
+            }
 
-            # Get color based on level
-            color = LEVEL_COLORS.get(record.levelno, "#808080")
+            # Add thread_ts if we have a run thread
+            if self._thread_ts:
+                kwargs["thread_ts"] = self._thread_ts
 
-            # Build attachment with color
-            attachments = [
-                {
-                    "color": color,
-                    "text": msg,
-                    "footer": f"{record.name} | {record.levelname}",
-                }
-            ]
+            self._send_with_retry(lambda: client.chat_postMessage(**kwargs))
 
-            # Send with retry logic
-            self._send_with_retry(
-                lambda: client.chat_postMessage(
-                    channel=self.channel,
-                    username=self.username,
-                    icon_emoji=self.icon_emoji,
-                    attachments=attachments,
-                )
-            )
-
-        except Exception:
-            # Silently fail - don't crash the application
+        except Exception as e:
+            print(f"Failed to send batched messages to Slack: {e}", file=sys.__stderr__)
             self._record_failure()
 
     def _send_with_retry(self, send_func):
@@ -183,18 +434,46 @@ class SlackHandler(logging.Handler):
             except Exception as e:
                 last_exception = e
                 if attempt < self.retry_attempts:
-                    # Exponential backoff: 1s, 2s, 4s, ...
                     wait_time = 2**attempt
                     time.sleep(wait_time)
 
-        # All retries failed
         self._record_failure()
         if last_exception:
-            # Use stderr directly to avoid recursive logging
             print(
                 f"Slack send failed after {self.retry_attempts + 1} attempts: {last_exception}",
                 file=sys.__stderr__,
             )
+
+    def _send_with_retry_return(self, send_func):
+        """
+        Execute send function with retry and return the response.
+
+        Args:
+            send_func: Callable that performs the Slack API call
+
+        Returns:
+            The API response dict, or None on failure
+        """
+        last_exception = None
+
+        for attempt in range(self.retry_attempts + 1):
+            try:
+                response = send_func()
+                self._record_success()
+                return response
+            except Exception as e:
+                last_exception = e
+                if attempt < self.retry_attempts:
+                    wait_time = 2**attempt
+                    time.sleep(wait_time)
+
+        self._record_failure()
+        if last_exception:
+            print(
+                f"Slack send failed after {self.retry_attempts + 1} attempts: {last_exception}",
+                file=sys.__stderr__,
+            )
+        return None
 
     def upload_file(
         self,
@@ -215,12 +494,10 @@ class SlackHandler(logging.Handler):
         Returns:
             True if upload succeeded, False otherwise
         """
-        # Check if file exists
         if not os.path.exists(file_path):
             logger.warning(f"File not found for Slack upload: {file_path}")
             return False
 
-        # Skip if in cooldown
         if self._is_in_cooldown():
             return False
 
@@ -228,7 +505,6 @@ class SlackHandler(logging.Handler):
         if client is None:
             return False
 
-        # Determine target channel(s)
         if channels is None:
             target_channels = self.channel
         elif isinstance(channels, list):
@@ -241,14 +517,18 @@ class SlackHandler(logging.Handler):
             return False
 
         try:
-            self._send_with_retry(
-                lambda: client.files_upload_v2(
-                    channel=target_channels,
-                    file=file_path,
-                    title=title,
-                    initial_comment=initial_comment,
-                )
-            )
+            kwargs = {
+                "channel": target_channels,
+                "file": file_path,
+                "title": title,
+                "initial_comment": initial_comment,
+            }
+
+            # Upload in thread if we have one
+            if self._thread_ts:
+                kwargs["thread_ts"] = self._thread_ts
+
+            self._send_with_retry(lambda: client.files_upload_v2(**kwargs))
             return True
         except Exception as e:
             logger.debug(f"Failed to upload file to Slack: {e}")
@@ -256,5 +536,13 @@ class SlackHandler(logging.Handler):
 
     def close(self):
         """Close the handler and clean up resources."""
+        # Stop the flush thread
+        self._stop_flush_thread.set()
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=2.0)
+
+        # Flush any remaining messages
+        self.flush()
+
         super().close()
         self._client = None
