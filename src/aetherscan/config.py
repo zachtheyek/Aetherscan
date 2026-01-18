@@ -59,7 +59,7 @@ class LoggerConfig:
     slack_level: str = "INFO"
     slack_enabled: bool = True
     slack_channel: str | None = None  # Override with SLACK_CHANNEL env var
-    slack_username: str = "Aetherscan Bot"
+    slack_username: str = "Aetherscan"
     slack_icon_emoji: str = ":robot_face:"
     slack_timeout: float = 5.0
     slack_retry_attempts: int = 2

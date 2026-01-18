@@ -1,7 +1,3 @@
-# TODO:
-# add slack integration
-# find a way to customize separate logging level for slack vs console/file
-# also find a way to log plots in slack (but not in console/file)
 # TODO: set log level in logger config (search: setLevel)
 # TODO: add tag to file log & archive old logs
 """
@@ -148,21 +144,27 @@ class Logger:
         handlers: list[logging.Handler] = [file_handler, stream_handler]
 
         # Initialize Slack handler if enabled
+        # Note: We defer logging until after the queue infrastructure is ready
         self.slack_handler: SlackHandler | None = None
+        slack_init_message: str | None = None
+        slack_init_level: int = logging.INFO
+
         if self.config.logger.slack_enabled:
             slack_token = os.environ.get("SLACK_BOT_TOKEN")
             slack_channel = os.environ.get("SLACK_CHANNEL", self.config.logger.slack_channel)
 
             if not slack_token:
-                logger.warning(
+                slack_init_message = (
                     "Slack logging enabled but SLACK_BOT_TOKEN not found in environment. "
                     "Slack logging disabled."
                 )
+                slack_init_level = logging.WARNING
             elif not slack_channel:
-                logger.warning(
+                slack_init_message = (
                     "Slack logging enabled but no channel configured. "
                     "Set SLACK_CHANNEL env var or config.logger.slack_channel. Slack logging disabled."
                 )
+                slack_init_level = logging.WARNING
             else:
                 try:
                     self.slack_handler = SlackHandler(
@@ -176,9 +178,11 @@ class Logger:
                     self.slack_handler.setLevel(_parse_level(self.config.logger.slack_level))
                     self.slack_handler.setFormatter(formatter)
                     handlers.append(self.slack_handler)
-                    logger.info(f"Slack handler initialized for channel: {slack_channel}")
+                    slack_init_message = f"Slack handler initialized for channel: {slack_channel}"
+                    slack_init_level = logging.INFO
                 except Exception as e:
-                    logger.warning(f"Failed to initialize Slack handler: {e}")
+                    slack_init_message = f"Failed to initialize Slack handler: {e}"
+                    slack_init_level = logging.WARNING
 
         # Create queue listener - runs in background thread, writes logs from queue
         self.log_listener = QueueListener(self.log_queue, *handlers, respect_handler_level=True)
@@ -187,6 +191,10 @@ class Logger:
         # Add queue handler to root logger (both main and workers use this)
         queue_handler = QueueHandler(self.log_queue)
         root_logger.addHandler(queue_handler)
+
+        # Now that logging infrastructure is ready, log Slack initialization status
+        if slack_init_message:
+            logger.log(slack_init_level, slack_init_message)
 
         # Redirect TensorFlow logs to Python logging
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"  # Show all TF logs
