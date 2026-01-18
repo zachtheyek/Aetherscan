@@ -2064,21 +2064,48 @@ class TrainingPipeline:
             row, col = idx // 3, idx % 3
             ax = axes[row, col]
 
-            for stage in ["A", "B", "C"]:
+            # Plot stages A and B on primary axis (pre-normalization scale)
+            for stage in ["A", "B"]:
                 data = stats_by_stage[stage].get(stat_name, [])
                 if data:
                     ax.hist(
                         data,
                         bins=50,
-                        alpha=0.5,
+                        alpha=0.25,
                         label=f"Stage {stage}",
                         color=stage_colors[stage],
+                        edgecolor=stage_colors[stage],
+                        linewidth=1.5,
+                        histtype="stepfilled",
                     )
 
+            # Create twin x-axis for stage C (post-normalization scale [0,1])
+            ax2 = ax.twiny()
+            data_c = stats_by_stage["C"].get(stat_name, [])
+            if data_c:
+                ax2.hist(
+                    data_c,
+                    bins=50,
+                    alpha=0.25,
+                    label="Stage C",
+                    color=stage_colors["C"],
+                    edgecolor=stage_colors["C"],
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
+
             ax.set_title(stat_name, fontsize=12, fontweight="bold")
-            ax.set_xlabel("Value", fontsize=10)
+            ax.set_xlabel("Pre-norm (A, B)", fontsize=9, color="darkblue")
             ax.set_ylabel("Count", fontsize=10)
-            ax.legend(fontsize=8)
+            ax.tick_params(axis="x", colors="darkblue")
+            ax2.set_xlabel("Post-norm (C)", fontsize=9, color="darkgreen")
+            ax2.tick_params(axis="x", colors="darkgreen")
+
+            # Combine legends from both axes
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right")
+
             ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -2120,9 +2147,27 @@ class TrainingPipeline:
             rfi_data = rfi_stats.get(stat_name, [])
 
             if eti_data:
-                ax.hist(eti_data, bins=50, alpha=0.5, label="ETI", color="blue")
+                ax.hist(
+                    eti_data,
+                    bins=50,
+                    alpha=0.25,
+                    label="ETI",
+                    color="blue",
+                    edgecolor="blue",
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
             if rfi_data:
-                ax.hist(rfi_data, bins=50, alpha=0.5, label="RFI", color="orange")
+                ax.hist(
+                    rfi_data,
+                    bins=50,
+                    alpha=0.25,
+                    label="RFI",
+                    color="orange",
+                    edgecolor="orange",
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
 
             ax.set_title(stat_name, fontsize=12, fontweight="bold")
             ax.set_xlabel("Value", fontsize=10)
@@ -2184,10 +2229,12 @@ class TrainingPipeline:
                     ax.scatter(
                         values_a,
                         values_b,
-                        alpha=0.3,
+                        alpha=0.15,
                         label=signal_type,
-                        color=type_colors[signal_type],
-                        s=10,
+                        facecolor=type_colors[signal_type],
+                        edgecolor=type_colors[signal_type],
+                        linewidth=0.3,
+                        s=12,
                     )
 
             # Add diagonal reference line
