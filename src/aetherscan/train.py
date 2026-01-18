@@ -1150,6 +1150,13 @@ class TrainingPipeline:
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
 
+            # Plot injection stats
+            self.plot_injection_stats(
+                tag=f"round_{round_idx + 1:02d}",
+                dir="checkpoints",
+                round_number=round_idx + 1,
+            )
+
             # Save checkpoint
             self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
@@ -1822,6 +1829,409 @@ class TrainingPipeline:
 
         logger.info(f"Beta-VAE training progress plot saved to: {save_path}")
 
+    def plot_injection_stats(
+        self,
+        tag: str | None = None,
+        dir: str | None = None,
+        round_number: int | None = None,
+    ) -> None:
+        """
+        Plot injection statistics for bias/leakage detection.
+
+        Generates 7 figures:
+        - 4 intensity histograms (one per signal_type)
+        - 1 signal characteristics (ETI vs RFI)
+        - 1 stage transition scatter plots
+        - 1 per-signal-type box plots
+
+        Args:
+            tag: Plot tag for filename (defaults to save_tag)
+            dir: Subdirectory (e.g., "checkpoints" for per-round)
+            round_number: Filter to specific round (None = all rounds)
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate injection stats plot"
+            )
+
+        # Determine save directory
+        if dir is not None:
+            save_dir = os.path.join(self.config.output_path, "plots", dir)
+        else:
+            save_dir = os.path.join(self.config.output_path, "plots")
+        os.makedirs(save_dir, exist_ok=True)
+
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stages = ["A", "B", "C"]
+
+        # Figure 1-4: Intensity histograms per signal_type
+        for signal_type in signal_types:
+            stats_by_stage = {stage: {} for stage in stages}
+
+            for stat_name in intensity_stats:
+                for stage in stages:
+                    results = self.db.query_injection_stat(
+                        stat_name=stat_name,
+                        injection_stage=stage,
+                        signal_type=signal_type,
+                        start_round_number=1 if round_number is None else round_number,
+                        end_round_number=round_number,
+                        tag=self.config.checkpoint.save_tag,
+                    )
+                    stats_by_stage[stage][stat_name] = [r["value"] for r in results]
+                    del results
+
+            # Generate plot for this signal_type
+            save_path = os.path.join(save_dir, f"injection_stats_intensity_{signal_type}_{tag}.png")
+            self._plot_intensity_histograms_for_type(
+                stats_by_stage, signal_type, tag, machine_name, save_path
+            )
+
+            del stats_by_stage
+            gc.collect()
+
+        # Figure 5: Signal characteristics (ETI vs RFI)
+        signal_stats = [
+            "snr",
+            "drift_rate",
+            "signal_width",
+            "starting_bin",
+            "slope_pixel",
+            "y_intercept",
+        ]
+        eti_stats = {}
+        rfi_stats = {}
+
+        for stat_name in signal_stats:
+            # Query ETI stats (from true_only_eti and true_eti_rfi)
+            eti_results = []
+            for st in ["true_only_eti", "true_eti_rfi"]:
+                results = self.db.query_injection_stat(
+                    stat_name=f"eti_{stat_name}",
+                    signal_type=st,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                )
+                eti_results.extend([r["value"] for r in results])
+                del results
+            eti_stats[stat_name] = eti_results
+
+            # Query RFI stats (from false_with_rfi and true_eti_rfi)
+            rfi_results = []
+            for st in ["false_with_rfi", "true_eti_rfi"]:
+                results = self.db.query_injection_stat(
+                    stat_name=f"rfi_{stat_name}",
+                    signal_type=st,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                )
+                rfi_results.extend([r["value"] for r in results])
+                del results
+            rfi_stats[stat_name] = rfi_results
+
+        save_path = os.path.join(save_dir, f"injection_stats_signals_{tag}.png")
+        self._plot_signal_characteristics(eti_stats, rfi_stats, tag, machine_name, save_path)
+
+        del eti_stats, rfi_stats
+        gc.collect()
+
+        # Figure 6: Stage transitions (A→B scatter plots)
+        transitions = {stat_name: {} for stat_name in intensity_stats}
+
+        for stat_name in intensity_stats:
+            for signal_type in signal_types:
+                # Query stage A values
+                results_a = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="A",
+                    signal_type=signal_type,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                )
+                values_a = [r["value"] for r in results_a]
+                del results_a
+
+                # Query stage B values
+                results_b = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="B",
+                    signal_type=signal_type,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                )
+                values_b = [r["value"] for r in results_b]
+                del results_b
+
+                transitions[stat_name][signal_type] = (values_a, values_b)
+
+        save_path = os.path.join(save_dir, f"injection_stats_transitions_{tag}.png")
+        self._plot_stage_transitions(transitions, tag, machine_name, save_path)
+
+        del transitions
+        gc.collect()
+
+        # Figure 7: Per-signal-type box plots at Stage C
+        stats_by_type = {signal_type: {} for signal_type in signal_types}
+
+        for signal_type in signal_types:
+            for stat_name in intensity_stats:
+                results = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="C",
+                    signal_type=signal_type,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                )
+                stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
+                del results
+
+        save_path = os.path.join(save_dir, f"injection_stats_boxplots_{tag}.png")
+        self._plot_signal_type_boxplots(stats_by_type, tag, machine_name, save_path)
+
+        del stats_by_type
+        gc.collect()
+
+        logger.info(f"Injection stats plots saved to: {save_dir}")
+
+    def _plot_intensity_histograms_for_type(
+        self,
+        stats_by_stage: dict[str, dict[str, list[float]]],
+        signal_type: str,
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 intensity histogram grid for one signal_type."""
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stage_colors = {"A": "blue", "B": "orange", "C": "green"}
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Injection Stats: Intensity - {signal_type} ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(intensity_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            for stage in ["A", "B", "C"]:
+                data = stats_by_stage[stage].get(stat_name, [])
+                if data:
+                    ax.hist(
+                        data,
+                        bins=50,
+                        alpha=0.5,
+                        label=f"Stage {stage}",
+                        color=stage_colors[stage],
+                    )
+
+            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_xlabel("Value", fontsize=10)
+            ax.set_ylabel("Count", fontsize=10)
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Intensity histogram plot saved: {save_path}")
+
+    def _plot_signal_characteristics(
+        self,
+        eti_stats: dict[str, list[float]],
+        rfi_stats: dict[str, list[float]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 signal characteristics grid."""
+        signal_stats = [
+            "snr",
+            "drift_rate",
+            "signal_width",
+            "starting_bin",
+            "slope_pixel",
+            "y_intercept",
+        ]
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Injection Stats: Signal Characteristics ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(signal_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            eti_data = eti_stats.get(stat_name, [])
+            rfi_data = rfi_stats.get(stat_name, [])
+
+            if eti_data:
+                ax.hist(eti_data, bins=50, alpha=0.5, label="ETI", color="blue")
+            if rfi_data:
+                ax.hist(rfi_data, bins=50, alpha=0.5, label="RFI", color="orange")
+
+            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_xlabel("Value", fontsize=10)
+            ax.set_ylabel("Count", fontsize=10)
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Signal characteristics plot saved: {save_path}")
+
+    def _plot_stage_transitions(
+        self,
+        transitions: dict[str, dict[str, tuple[list, list]]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 scatter plot grid showing A→B transitions."""
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        type_colors = {
+            "false_no_signal": "blue",
+            "false_with_rfi": "orange",
+            "true_only_eti": "green",
+            "true_eti_rfi": "red",
+        }
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Injection Stats: Stage Transitions A→B ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(intensity_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            all_values = []
+            for signal_type in signal_types:
+                values_a, values_b = transitions[stat_name].get(signal_type, ([], []))
+                if values_a and values_b:
+                    # Ensure equal length (take minimum)
+                    min_len = min(len(values_a), len(values_b))
+                    values_a = values_a[:min_len]
+                    values_b = values_b[:min_len]
+                    all_values.extend(values_a)
+                    all_values.extend(values_b)
+                    ax.scatter(
+                        values_a,
+                        values_b,
+                        alpha=0.3,
+                        label=signal_type,
+                        color=type_colors[signal_type],
+                        s=10,
+                    )
+
+            # Add diagonal reference line
+            if all_values:
+                min_val, max_val = min(all_values), max(all_values)
+                ax.plot([min_val, max_val], [min_val, max_val], "k--", alpha=0.5, linewidth=1)
+
+            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_xlabel("Stage A", fontsize=10)
+            ax.set_ylabel("Stage B", fontsize=10)
+            ax.legend(fontsize=6, loc="upper left")
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Stage transitions plot saved: {save_path}")
+
+    def _plot_signal_type_boxplots(
+        self,
+        stats_by_type: dict[str, dict[str, list[float]]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 box plot grid comparing signal types at Stage C."""
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        short_labels = ["no_sig", "rfi", "eti", "eti+rfi"]
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Injection Stats: Stage C Distributions ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(intensity_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            box_data = []
+            for signal_type in signal_types:
+                data = stats_by_type[signal_type].get(stat_name, [])
+                box_data.append(data if data else [0])  # Use [0] if empty to avoid error
+
+            ax.boxplot(box_data, labels=short_labels)
+            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_xlabel("Signal Type", fontsize=10)
+            ax.set_ylabel("Value", fontsize=10)
+            ax.grid(True, alpha=0.3, axis="y")
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Signal type box plots saved: {save_path}")
+
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
         if tag is None:
@@ -1964,8 +2374,11 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
 
             # Plot training progress
             pipeline.plot_beta_vae_training_progress()
+
+            # Plot injection stats (all rounds cumulative)
+            pipeline.plot_injection_stats()
         except Exception as e:
-            logger.error(f"Error in plot_beta_vae_training_progress(): {e}")
+            logger.error(f"Error in plotting: {e}")
             raise  # Re-raise to propagate error
 
         try:

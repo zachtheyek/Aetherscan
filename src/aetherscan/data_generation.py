@@ -201,6 +201,16 @@ def new_cadence(
             time_resolution / freq_resolution
         ) - random.random() * noise
 
+    # Guard against division by near-zero
+    MIN_SLOPE_PHYSICAL = 1e-6  # noqa: N806
+    if abs(slope_physical) < MIN_SLOPE_PHYSICAL:
+        logger.warning(f"new_cadence: slope_physical ({slope_physical}) near zero, clamping")
+        slope_physical = (
+            np.sign(slope_physical) * MIN_SLOPE_PHYSICAL
+            if slope_physical != 0
+            else MIN_SLOPE_PHYSICAL
+        )
+
     # Convert slope to drift rate
     drift_rate = -1 * (1 / slope_physical)
 
@@ -282,9 +292,26 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         Dict with keys: global_mean, global_median, global_std,
                        global_mad, global_skew, global_kurtosis
     """
-    flat = data.ravel()
+    # Handle empty arrays
+    if data.size == 0:
+        logger.warning("_compute_intensity_stats received empty array")
+        return dict.fromkeys(
+            [
+                "global_mean",
+                "global_median",
+                "global_std",
+                "global_mad",
+                "global_skew",
+                "global_kurtosis",
+            ],
+            0.0,
+        )
+
+    # Promote to float64 to prevent overflow in higher-order moments
+    flat = data.ravel().astype(np.float64)
     median_val = np.median(flat)
-    return {
+
+    stats = {
         "global_mean": float(np.mean(flat)),
         "global_median": float(median_val),
         "global_std": float(np.std(flat)),
@@ -292,6 +319,14 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         "global_skew": float(scipy_stats.skew(flat)),
         "global_kurtosis": float(scipy_stats.kurtosis(flat)),
     }
+
+    # Sanitize any remaining NaN/inf
+    for key, value in stats.items():
+        if not np.isfinite(value):
+            logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
+            stats[key] = 0.0
+
+    return stats
 
 
 def create_false(

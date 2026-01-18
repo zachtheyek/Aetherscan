@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from queue import Empty, Queue
 from typing import Any
 
+import numpy as np
+
 from aetherscan.config import get_config
 from aetherscan.manager import register_db
 
@@ -26,6 +28,14 @@ logger = logging.getLogger(__name__)
 # Unique sentinel object for flush requests - writer thread recognizes this
 # as a command to flush immediately rather than data to be written
 _FLUSH_SENTINEL = object()
+
+
+def _sanitize_float(value: float, fallback: float = 0.0, name: str = "value") -> float:
+    """Replace NaN/inf with fallback for SQLite compatibility."""
+    if not np.isfinite(value):
+        logger.warning(f"_sanitize_float: {name} is {value}, replacing with {fallback}")
+        return fallback
+    return value
 
 
 def get_system_metadata() -> str:
@@ -506,13 +516,16 @@ class Database:
         """
         metadata_json = get_system_metadata()
 
+        # Sanitize value to prevent NaN/inf from violating NOT NULL constraint
+        sanitized_value = _sanitize_float(value, fallback=0.0, name=stat_name)
+
         self.write_queue.put(
             (
                 "injection_stats",
                 (
                     timestamp or time.time(),
                     stat_name,
-                    value,
+                    sanitized_value,
                     round_number,
                     chunk_number,
                     sample_index,
