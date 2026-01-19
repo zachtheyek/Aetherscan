@@ -2055,7 +2055,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"Injection Stats: Intensity - {signal_type} ({tag}, {machine_name})",
+            f"{signal_type} Global Intensities ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
@@ -2094,6 +2094,7 @@ class TrainingPipeline:
                     histtype="stepfilled",
                 )
 
+            # TODO: Remap stat_name to "Mean", "Median", "Standard Deviation", ...
             ax.set_title(stat_name, fontsize=12, fontweight="bold")
             ax.set_xlabel("Pre-norm (A, B)", fontsize=9, color="darkblue")
             ax.set_ylabel("Count", fontsize=10)
@@ -2101,6 +2102,7 @@ class TrainingPipeline:
             ax2.set_xlabel("Post-norm (C)", fontsize=9, color="darkgreen")
             ax2.tick_params(axis="x", colors="darkgreen")
 
+            # TODO: move legend to outside subplots like beta vae training progress plot
             # Combine legends from both axes
             lines1, labels1 = ax.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
@@ -2134,7 +2136,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"Injection Stats: Signal Characteristics ({tag}, {machine_name})",
+            f"Injected Signal Characteristics ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
@@ -2169,9 +2171,10 @@ class TrainingPipeline:
                     histtype="stepfilled",
                 )
 
+            # TODO: Remap stat_name to "SNR", "Drift Rate", "Signal Width", ...
             ax.set_title(stat_name, fontsize=12, fontweight="bold")
-            ax.set_xlabel("Value", fontsize=10)
             ax.set_ylabel("Count", fontsize=10)
+            # TODO: move legend to outside subplots like beta vae training progress plot
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
 
@@ -2207,7 +2210,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"Injection Stats: Stage Transitions A→B ({tag}, {machine_name})",
+            f"A→B Global Intensity Biases ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
@@ -2242,9 +2245,11 @@ class TrainingPipeline:
                 min_val, max_val = min(all_values), max(all_values)
                 ax.plot([min_val, max_val], [min_val, max_val], "k--", alpha=0.5, linewidth=1)
 
+            # TODO: Remap stat_name to "Mean", "Median", "Standard Deviation", ...
             ax.set_title(stat_name, fontsize=12, fontweight="bold")
             ax.set_xlabel("Stage A", fontsize=10)
             ax.set_ylabel("Stage B", fontsize=10)
+            # TODO: move legend to outside subplots like beta vae training progress plot
             ax.legend(fontsize=6, loc="upper left")
             ax.grid(True, alpha=0.3)
 
@@ -2275,7 +2280,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"Injection Stats: Stage C Distributions ({tag}, {machine_name})",
+            f"Final Global Intensity Biases ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
@@ -2284,15 +2289,17 @@ class TrainingPipeline:
             row, col = idx // 3, idx % 3
             ax = axes[row, col]
 
+            # TODO: plot horizontal box plots, not vertical (signal type on y-axis, values on x-axis)
+            # TODO: either share y-axis across subplots, or color-code and place legend outside subplots like in beta vae training progress + no axis labels
             box_data = []
             for signal_type in signal_types:
                 data = stats_by_type[signal_type].get(stat_name, [])
                 box_data.append(data if data else [0])  # Use [0] if empty to avoid error
 
             ax.boxplot(box_data, labels=short_labels)
+            # TODO: Remap stat_name to "Mean", "Median", "Standard Deviation", ...
             ax.set_title(stat_name, fontsize=12, fontweight="bold")
-            ax.set_xlabel("Signal Type", fontsize=10)
-            ax.set_ylabel("Value", fontsize=10)
+            ax.set_ylabel("Signal Type", fontsize=10)
             ax.grid(True, alpha=0.3, axis="y")
 
         plt.tight_layout()
@@ -2479,6 +2486,6 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
 def _safe_call(func: Callable, name: str, args: tuple | None = None) -> None:
     """Best-effort execution during error cleanup."""
     try:
-        func(*args) if args else func
+        func(*args) if args else func()
     except Exception as e:
         logger.warning(f"Failed to execute {name} during cleanup: {e}")
