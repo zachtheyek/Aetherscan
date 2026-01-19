@@ -1561,6 +1561,19 @@ class TrainingPipeline:
 
         rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
+        # DIAGNOSTIC: Check generated data for NaN before encoding
+        logger.info("=== Checking generated data before encoding ===")
+        for key in ["concatenated", "true", "false"]:
+            data_has_nan = np.isnan(rf_data[key]).any()
+            data_has_inf = np.isinf(rf_data[key]).any()
+            logger.info(f"{key} has NaN: {data_has_nan}, has Inf: {data_has_inf}")
+            if data_has_nan:
+                logger.error(f"{key} contains NaN values BEFORE encoding!")
+                raise ValueError(f"Generated data contains NaN in {key}")
+            if data_has_inf:
+                logger.error(f"{key} contains Inf values BEFORE encoding!")
+                raise ValueError(f"Generated data contains Inf in {key}")
+
         # Prepare distributed dataset for inference
         results = prepare_distributed_inf_dataset(
             data=rf_data,
@@ -1634,6 +1647,24 @@ class TrainingPipeline:
                 true_batch_np = np.concatenate([t.numpy() for t in true_results], axis=0)
                 false_batch_np = np.concatenate([f.numpy() for f in false_results], axis=0)
 
+                # DIAGNOSTIC: Check for NaN in batch before storing
+                true_batch_has_nan = np.isnan(true_batch_np).any()
+                false_batch_has_nan = np.isnan(false_batch_np).any()
+
+                if true_batch_has_nan or false_batch_has_nan:
+                    logger.error(f"Step {step + 1}: NaN detected in encoder output!")
+                    logger.error(f"  true_batch has NaN: {true_batch_has_nan}")
+                    logger.error(f"  false_batch has NaN: {false_batch_has_nan}")
+                    if true_batch_has_nan:
+                        logger.error(
+                            f"  true_batch NaN count: {np.isnan(true_batch_np).sum()}/{true_batch_np.size}"
+                        )
+                    if false_batch_has_nan:
+                        logger.error(
+                            f"  false_batch NaN count: {np.isnan(false_batch_np).sum()}/{false_batch_np.size}"
+                        )
+                    raise ValueError(f"Encoder produced NaN values at step {step + 1}")
+
                 batch_latent_size = true_batch_np.shape[0]
                 true_latents[current_idx : current_idx + batch_latent_size] = true_batch_np
                 false_latents[current_idx : current_idx + batch_latent_size] = false_batch_np
@@ -1647,6 +1678,54 @@ class TrainingPipeline:
                 del per_replica_true, true_results, true_batch_np
                 del per_replica_false, false_results, false_batch_np
                 gc.collect()
+
+            # DIAGNOSTIC: Check for NaN values before RF training
+            logger.info("=== NaN Diagnostics ===")
+            logger.info(f"true_latents shape: {true_latents.shape}")
+            logger.info(f"false_latents shape: {false_latents.shape}")
+            logger.info(f"current_idx (samples filled): {current_idx}")
+            logger.info(f"n_inf_trimmed (expected samples): {n_inf_trimmed * num_observations}")
+
+            true_has_nan = np.isnan(true_latents).any()
+            false_has_nan = np.isnan(false_latents).any()
+            true_has_inf = np.isinf(true_latents).any()
+            false_has_inf = np.isinf(false_latents).any()
+
+            logger.info(f"true_latents contains NaN: {true_has_nan}")
+            logger.info(f"false_latents contains NaN: {false_has_nan}")
+            logger.info(f"true_latents contains Inf: {true_has_inf}")
+            logger.info(f"false_latents contains Inf: {false_has_inf}")
+
+            if true_has_nan:
+                nan_count = np.isnan(true_latents).sum()
+                nan_ratio = nan_count / true_latents.size
+                logger.error(f"true_latents has {nan_count} NaN values ({nan_ratio:.2%} of total)")
+                logger.error(
+                    f"true_latents stats: min={np.nanmin(true_latents):.4f}, max={np.nanmax(true_latents):.4f}, mean={np.nanmean(true_latents):.4f}"
+                )
+            else:
+                logger.info(
+                    f"true_latents stats: min={np.min(true_latents):.4f}, max={np.max(true_latents):.4f}, mean={np.mean(true_latents):.4f}"
+                )
+
+            if false_has_nan:
+                nan_count = np.isnan(false_latents).sum()
+                nan_ratio = nan_count / false_latents.size
+                logger.error(f"false_latents has {nan_count} NaN values ({nan_ratio:.2%} of total)")
+                logger.error(
+                    f"false_latents stats: min={np.nanmin(false_latents):.4f}, max={np.nanmax(false_latents):.4f}, mean={np.nanmean(false_latents):.4f}"
+                )
+            else:
+                logger.info(
+                    f"false_latents stats: min={np.min(false_latents):.4f}, max={np.max(false_latents):.4f}, mean={np.mean(false_latents):.4f}"
+                )
+
+            if true_has_nan or false_has_nan:
+                raise ValueError(
+                    "NaN values detected in latents before RF training. Check encoder output or data generation."
+                )
+
+            logger.info("=== End NaN Diagnostics ===")
 
             # Train Random Forest classifier
             self.rf_model.train(true_latents, false_latents)
