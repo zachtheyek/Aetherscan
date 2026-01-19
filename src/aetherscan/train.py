@@ -20,6 +20,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
@@ -2051,6 +2052,14 @@ class TrainingPipeline:
             "global_skew",
             "global_kurtosis",
         ]
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
         stage_colors = {"A": "blue", "B": "orange", "C": "green"}
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -2072,7 +2081,6 @@ class TrainingPipeline:
                         data,
                         bins=50,
                         alpha=0.25,
-                        label=f"Stage {stage}",
                         color=stage_colors[stage],
                         edgecolor=stage_colors[stage],
                         linewidth=1.5,
@@ -2087,30 +2095,45 @@ class TrainingPipeline:
                     data_c,
                     bins=50,
                     alpha=0.25,
-                    label="Stage C",
                     color=stage_colors["C"],
                     edgecolor=stage_colors["C"],
                     linewidth=1.5,
                     histtype="stepfilled",
                 )
 
-            # TODO: Remap stat_name to "Mean", "Median", "Standard Deviation", ...
-            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
             ax.set_xlabel("Pre-norm (A, B)", fontsize=9, color="darkblue")
             ax.set_ylabel("Count", fontsize=10)
             ax.tick_params(axis="x", colors="darkblue")
             ax2.set_xlabel("Post-norm (C)", fontsize=9, color="darkgreen")
             ax2.tick_params(axis="x", colors="darkgreen")
-
-            # TODO: move legend to outside subplots like beta vae training progress plot
-            # Combine legends from both axes
-            lines1, labels1 = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right")
-
             ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D(
+                [], [], color=stage_colors["A"], linewidth=4, alpha=0.5, label="Stage A (pre-inj)"
+            ),
+            mlines.Line2D(
+                [], [], color=stage_colors["B"], linewidth=4, alpha=0.5, label="Stage B (post-inj)"
+            ),
+            mlines.Line2D(
+                [], [], color=stage_colors["C"], linewidth=4, alpha=0.5, label="Stage C (post-norm)"
+            ),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])  # Leave room for legend on right
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
@@ -2133,6 +2156,15 @@ class TrainingPipeline:
             "slope_pixel",
             "y_intercept",
         ]
+        stat_display_names = {
+            "snr": "SNR",
+            "drift_rate": "Drift Rate (Hz/s)",
+            "signal_width": "Signal Width (Hz)",
+            "starting_bin": "Starting Bin",
+            "slope_pixel": "Slope (px)",
+            "y_intercept": "Y-Intercept",
+        }
+        signal_colors = {"ETI": "blue", "RFI": "orange"}
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
@@ -2153,9 +2185,8 @@ class TrainingPipeline:
                     eti_data,
                     bins=50,
                     alpha=0.25,
-                    label="ETI",
-                    color="blue",
-                    edgecolor="blue",
+                    color=signal_colors["ETI"],
+                    edgecolor=signal_colors["ETI"],
                     linewidth=1.5,
                     histtype="stepfilled",
                 )
@@ -2164,21 +2195,34 @@ class TrainingPipeline:
                     rfi_data,
                     bins=50,
                     alpha=0.25,
-                    label="RFI",
-                    color="orange",
-                    edgecolor="orange",
+                    color=signal_colors["RFI"],
+                    edgecolor=signal_colors["RFI"],
                     linewidth=1.5,
                     histtype="stepfilled",
                 )
 
-            # TODO: Remap stat_name to "SNR", "Drift Rate", "Signal Width", ...
-            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
             ax.set_ylabel("Count", fontsize=10)
-            # TODO: move legend to outside subplots like beta vae training progress plot
-            ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D([], [], color=signal_colors["ETI"], linewidth=4, alpha=0.5, label="ETI"),
+            mlines.Line2D([], [], color=signal_colors["RFI"], linewidth=4, alpha=0.5, label="RFI"),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.92, 1])  # Leave room for legend on right
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
@@ -2200,12 +2244,26 @@ class TrainingPipeline:
             "global_skew",
             "global_kurtosis",
         ]
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
         type_colors = {
             "false_no_signal": "blue",
             "false_with_rfi": "orange",
             "true_only_eti": "green",
             "true_eti_rfi": "red",
+        }
+        type_display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
         }
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -2233,7 +2291,6 @@ class TrainingPipeline:
                         values_a,
                         values_b,
                         alpha=0.15,
-                        label=signal_type,
                         facecolor=type_colors[signal_type],
                         edgecolor=type_colors[signal_type],
                         linewidth=0.3,
@@ -2245,15 +2302,38 @@ class TrainingPipeline:
                 min_val, max_val = min(all_values), max(all_values)
                 ax.plot([min_val, max_val], [min_val, max_val], "k--", alpha=0.5, linewidth=1)
 
-            # TODO: Remap stat_name to "Mean", "Median", "Standard Deviation", ...
-            ax.set_title(stat_name, fontsize=12, fontweight="bold")
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
             ax.set_xlabel("Stage A", fontsize=10)
             ax.set_ylabel("Stage B", fontsize=10)
-            # TODO: move legend to outside subplots like beta vae training progress plot
-            ax.legend(fontsize=6, loc="upper left")
             ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D(
+                [],
+                [],
+                marker="o",
+                color="w",
+                markerfacecolor=type_colors[st],
+                markersize=8,
+                alpha=0.7,
+                label=type_display_names[st],
+            )
+            for st in signal_types
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=9,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])  # Leave room for legend on right
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
@@ -2275,8 +2355,27 @@ class TrainingPipeline:
             "global_skew",
             "global_kurtosis",
         ]
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
-        short_labels = ["no_sig", "rfi", "eti", "eti+rfi"]
+        type_colors = {
+            "false_no_signal": "blue",
+            "false_with_rfi": "orange",
+            "true_only_eti": "green",
+            "true_eti_rfi": "red",
+        }
+        type_display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
@@ -2289,20 +2388,46 @@ class TrainingPipeline:
             row, col = idx // 3, idx % 3
             ax = axes[row, col]
 
-            # TODO: plot horizontal box plots, not vertical (signal type on y-axis, values on x-axis)
-            # TODO: either share y-axis across subplots, or color-code and place legend outside subplots like in beta vae training progress + no axis labels
             box_data = []
             for signal_type in signal_types:
                 data = stats_by_type[signal_type].get(stat_name, [])
                 box_data.append(data if data else [0])  # Use [0] if empty to avoid error
 
-            ax.boxplot(box_data, labels=short_labels)
-            # TODO: Remap stat_name to "Mean", "Median", "Standard Deviation", ...
-            ax.set_title(stat_name, fontsize=12, fontweight="bold")
-            ax.set_ylabel("Signal Type", fontsize=10)
-            ax.grid(True, alpha=0.3, axis="y")
+            # Horizontal box plots with colors
+            bp = ax.boxplot(
+                box_data,
+                vert=False,
+                patch_artist=True,
+                tick_labels=[""] * len(signal_types),  # No y-axis labels, use legend instead
+            )
 
-        plt.tight_layout()
+            # Color each box
+            for patch, signal_type in zip(bp["boxes"], signal_types, strict=True):
+                patch.set_facecolor(type_colors[signal_type])
+                patch.set_alpha(0.6)
+
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
+            ax.set_xlabel("Value", fontsize=10)
+            ax.grid(True, alpha=0.3, axis="x")
+
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mpatches.Patch(facecolor=type_colors[st], alpha=0.6, label=type_display_names[st])
+            for st in signal_types
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=9,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])  # Leave room for legend on right
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
