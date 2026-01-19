@@ -469,20 +469,20 @@ def prepare_distributed_train_dataset(
     # Create datasets using generators to reduce GPU memory pressure
     # Data is kept on CPU & transferred to GPU in batches on-demand
     logger.info(
-        f"Creating infinite datasets from generators with per replica batch size - "
-        f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}"
+        f"Creating infinite datasets from generators with global batch size - "
+        f"Train: {per_replica_batch_size * num_replicas}, Val: {global_val_batch_size}"
     )
 
     train_dataset = (
         tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
-        .batch(per_replica_batch_size, drop_remainder=True)
+        .batch(per_replica_batch_size * num_replicas, drop_remainder=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
 
     val_dataset = (
         tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
-        .batch(per_replica_val_batch_size, drop_remainder=True)
+        .batch(global_val_batch_size, drop_remainder=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -599,12 +599,12 @@ def prepare_distributed_inf_dataset(
     # Create dataset using generator to reduce GPU memory pressure
     # Data is kept on CPU & transferred to GPU in batches on-demand
     logger.info(
-        f"Creating infinite dataset from generator with per replica batch size: {per_replica_inf_batch_size}"
+        f"Creating infinite dataset from generator with global batch size: {global_inf_batch_size}"
     )
 
     inf_dataset = (
         tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
-        .batch(per_replica_inf_batch_size, drop_remainder=True)
+        .batch(global_inf_batch_size, drop_remainder=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
