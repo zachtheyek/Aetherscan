@@ -1,3 +1,4 @@
+# TODO: add functions to delete entries in db based on query results (e.g. query_system_resource -> DELETE)
 """
 Database for Aetherscan Pipeline
 Uses SQLite with asynchronous queue-based writes to handle concurrent data collection from multiple
