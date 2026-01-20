@@ -1561,19 +1561,6 @@ class TrainingPipeline:
 
         rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
-        # DIAGNOSTIC: Check generated data for NaN before encoding
-        logger.info("=== Checking generated data before encoding ===")
-        for key in ["concatenated", "true", "false"]:
-            data_has_nan = np.isnan(rf_data[key]).any()
-            data_has_inf = np.isinf(rf_data[key]).any()
-            logger.info(f"{key} has NaN: {data_has_nan}, has Inf: {data_has_inf}")
-            if data_has_nan:
-                logger.error(f"{key} contains NaN values BEFORE encoding!")
-                raise ValueError(f"Generated data contains NaN in {key}")
-            if data_has_inf:
-                logger.error(f"{key} contains Inf values BEFORE encoding!")
-                raise ValueError(f"Generated data contains Inf in {key}")
-
         # Prepare distributed dataset for inference
         results = prepare_distributed_inf_dataset(
             data=rf_data,
@@ -1597,10 +1584,9 @@ class TrainingPipeline:
         logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
 
         # Pre-allocate latent arrays
-        # NOTE: Using zeros() instead of empty() to avoid uninitialized memory containing NaN/garbage
-        # This ensures unfilled positions are 0 rather than undefined, making debugging easier
-        true_latents = np.zeros((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
-        false_latents = np.zeros((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
+        # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
+        true_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
+        false_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
 
         # Create distributed inference function
         @tf.function
@@ -1645,65 +1631,9 @@ class TrainingPipeline:
                 true_results = self.strategy.experimental_local_results(per_replica_true)
                 false_results = self.strategy.experimental_local_results(per_replica_false)
 
-                # DIAGNOSTIC: Check per-replica shapes before concatenation
-                if (step + 1) == 1:
-                    logger.info(f"Step {step + 1} - Number of replicas: {len(true_results)}")
-                    for i, t in enumerate(true_results):
-                        logger.info(f"  Replica {i} true shape: {t.shape}")
-                    for i, f in enumerate(false_results):
-                        logger.info(f"  Replica {i} false shape: {f.shape}")
-
                 # Concatenate results from all replicas
                 true_batch_np = np.concatenate([t.numpy() for t in true_results], axis=0)
                 false_batch_np = np.concatenate([f.numpy() for f in false_results], axis=0)
-
-                # DIAGNOSTIC: Check for NaN and extreme values in batch before storing
-                true_batch_has_nan = np.isnan(true_batch_np).any()
-                false_batch_has_nan = np.isnan(false_batch_np).any()
-                true_batch_has_inf = np.isinf(true_batch_np).any()
-                false_batch_has_inf = np.isinf(false_batch_np).any()
-
-                # Check for extreme values (potential overflow)
-                true_batch_max = (
-                    np.max(np.abs(true_batch_np[~np.isnan(true_batch_np)]))
-                    if not np.all(np.isnan(true_batch_np))
-                    else 0
-                )
-                false_batch_max = (
-                    np.max(np.abs(false_batch_np[~np.isnan(false_batch_np)]))
-                    if not np.all(np.isnan(false_batch_np))
-                    else 0
-                )
-                EXTREME_THRESHOLD = 1e10  # Flag values > 10 billion as suspicious  # noqa: N806
-
-                if (
-                    true_batch_has_nan
-                    or false_batch_has_nan
-                    or true_batch_has_inf
-                    or false_batch_has_inf
-                ):
-                    logger.error(f"Step {step + 1}: NaN/Inf detected in encoder output!")
-                    logger.error(
-                        f"  true_batch has NaN: {true_batch_has_nan}, has Inf: {true_batch_has_inf}"
-                    )
-                    logger.error(
-                        f"  false_batch has NaN: {false_batch_has_nan}, has Inf: {false_batch_has_inf}"
-                    )
-                    if true_batch_has_nan:
-                        logger.error(
-                            f"  true_batch NaN count: {np.isnan(true_batch_np).sum()}/{true_batch_np.size}"
-                        )
-                    if false_batch_has_nan:
-                        logger.error(
-                            f"  false_batch NaN count: {np.isnan(false_batch_np).sum()}/{false_batch_np.size}"
-                        )
-                    raise ValueError(f"Encoder produced NaN/Inf values at step {step + 1}")
-
-                if true_batch_max > EXTREME_THRESHOLD or false_batch_max > EXTREME_THRESHOLD:
-                    logger.warning(f"Step {step + 1}: Extreme values detected in encoder output")
-                    logger.warning(f"  true_batch max abs value: {true_batch_max:.2e}")
-                    logger.warning(f"  false_batch max abs value: {false_batch_max:.2e}")
-                    logger.warning("  This may indicate numerical instability in the encoder")
 
                 batch_latent_size = true_batch_np.shape[0]
                 true_latents[current_idx : current_idx + batch_latent_size] = true_batch_np
@@ -1714,76 +1644,10 @@ class TrainingPipeline:
                 # Log progress
                 if (step + 1) % 10 == 0 or (step + 1) == inf_steps:
                     logger.info(f"Generated latents for step {step + 1}/{inf_steps}")
-                    logger.info(
-                        f"  batch_latent_size: {batch_latent_size}, current_idx: {current_idx}"
-                    )
 
                 del per_replica_true, true_results, true_batch_np
                 del per_replica_false, false_results, false_batch_np
                 gc.collect()
-
-            # DIAGNOSTIC: Validate encoding loop completed correctly
-            expected_latents = n_inf_trimmed * num_observations
-            if current_idx != expected_latents:
-                logger.error("Encoding loop mismatch!")
-                logger.error(
-                    f"  Expected {expected_latents} latents ({n_inf_trimmed} cadences * {num_observations} obs)"
-                )
-                logger.error(f"  But only filled {current_idx} positions")
-                logger.error(f"  Missing {expected_latents - current_idx} latents")
-                logger.error(
-                    "This indicates a reshape or batch size calculation error in the encoding loop."
-                )
-
-            # DIAGNOSTIC: Check for NaN values before RF training
-            logger.info("=== NaN Diagnostics ===")
-            logger.info(f"true_latents shape: {true_latents.shape}")
-            logger.info(f"false_latents shape: {false_latents.shape}")
-            logger.info(f"current_idx (latents filled): {current_idx}")
-            logger.info(
-                f"expected latents: {n_inf_trimmed * num_observations} ({n_inf_trimmed} cadences * {num_observations} obs)"
-            )
-
-            true_has_nan = np.isnan(true_latents).any()
-            false_has_nan = np.isnan(false_latents).any()
-            true_has_inf = np.isinf(true_latents).any()
-            false_has_inf = np.isinf(false_latents).any()
-
-            logger.info(f"true_latents contains NaN: {true_has_nan}")
-            logger.info(f"false_latents contains NaN: {false_has_nan}")
-            logger.info(f"true_latents contains Inf: {true_has_inf}")
-            logger.info(f"false_latents contains Inf: {false_has_inf}")
-
-            if true_has_nan:
-                nan_count = np.isnan(true_latents).sum()
-                nan_ratio = nan_count / true_latents.size
-                logger.error(f"true_latents has {nan_count} NaN values ({nan_ratio:.2%} of total)")
-                logger.error(
-                    f"true_latents stats: min={np.nanmin(true_latents):.4f}, max={np.nanmax(true_latents):.4f}, mean={np.nanmean(true_latents):.4f}"
-                )
-            else:
-                logger.info(
-                    f"true_latents stats: min={np.min(true_latents):.4f}, max={np.max(true_latents):.4f}, mean={np.mean(true_latents):.4f}"
-                )
-
-            if false_has_nan:
-                nan_count = np.isnan(false_latents).sum()
-                nan_ratio = nan_count / false_latents.size
-                logger.error(f"false_latents has {nan_count} NaN values ({nan_ratio:.2%} of total)")
-                logger.error(
-                    f"false_latents stats: min={np.nanmin(false_latents):.4f}, max={np.nanmax(false_latents):.4f}, mean={np.nanmean(false_latents):.4f}"
-                )
-            else:
-                logger.info(
-                    f"false_latents stats: min={np.min(false_latents):.4f}, max={np.max(false_latents):.4f}, mean={np.mean(false_latents):.4f}"
-                )
-
-            if true_has_nan or false_has_nan:
-                raise ValueError(
-                    "NaN values detected in latents before RF training. Check encoder output or data generation."
-                )
-
-            logger.info("=== End NaN Diagnostics ===")
 
             # Train Random Forest classifier
             self.rf_model.train(true_latents, false_latents)
