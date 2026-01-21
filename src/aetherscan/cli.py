@@ -472,8 +472,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.train_val_split = args.train_val_split
     if hasattr(args, "per_replica_batch_size") and args.per_replica_batch_size is not None:
         config.training.per_replica_batch_size = args.per_replica_batch_size
-    if hasattr(args, "global_batch_size") and args.global_batch_size is not None:
-        config.training.global_batch_size = args.global_batch_size
+    if hasattr(args, "effective_batch_size") and args.effective_batch_size is not None:
+        config.training.effective_batch_size = args.effective_batch_size
     if hasattr(args, "per_replica_val_batch_size") and args.per_replica_val_batch_size is not None:
         config.training.per_replica_val_batch_size = args.per_replica_val_batch_size
     if (
@@ -586,13 +586,14 @@ def validate_args(args: argparse.Namespace) -> None:
     # time_bin & width bin match data (randomly sample a few files)
     # train_files & test_files exist
     # 0 <= train_val_split <= 1
-    # per_replica_batch_size * num_replicas <= global_batch_size <= num_samples_beta_vae * train_val_split
+    # per_replica_batch_size * num_replicas <= effective_batch_size <= num_samples_beta_vae * train_val_split
     # per_replica_val_batch_size * num_replicas <= num_samples_beta_vae * (1 - train_val_split)
     # inference per_replica_val_batch_size * num_replicas <= num_samples_rf
-    # global_batch_size is divisible by per_replica_batch_size * num_replicas
-    # num_samples_beta_vae * train_val_split is divisible by global_batch_size
+    # effective_batch_size is divisible by per_replica_batch_size * num_replicas
+    # num_samples_beta_vae * train_val_split is divisible by effective_batch_size
     # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by inference per_replica_batch_size * num_replicas
+    # num_samples_rf is divisible by 2 (for generate_batch)
     # # how to ensure divisibility for actual n_samples during inference?
     # snr_base, initial_snr_range, final_snr_range > 0
     # initial_snr_range >= final_snr_range
