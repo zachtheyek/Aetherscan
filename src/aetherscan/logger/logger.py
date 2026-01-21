@@ -1,4 +1,3 @@
-# TODO: set log level in logger config (search: setLevel)
 # TODO: add tag to file log & archive old logs
 """
 Logger for Aetherscan Pipeline
@@ -18,6 +17,8 @@ from multiprocessing import Queue
 import tensorflow as tf
 
 from aetherscan.config import get_config
+
+# NOTE: can this just be from aetherscan.logger import SlackHandler?
 from aetherscan.logger.slack_handler import SlackHandler
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,6 @@ class Logger:
         handlers: list[logging.Handler] = [file_handler, stream_handler]
 
         # Initialize Slack handler if enabled
-        # Note: We defer logging until after the queue infrastructure is ready
         self.slack_handler: SlackHandler | None = None
         slack_init_message: str | None = None
         slack_init_level: int = logging.INFO
@@ -153,6 +153,7 @@ class Logger:
             slack_token = os.environ.get("SLACK_BOT_TOKEN")
             slack_channel = os.environ.get("SLACK_CHANNEL", self.config.logger.slack_channel)
 
+            # Defer logging until after the queue infrastructure is ready
             if not slack_token:
                 slack_init_message = (
                     "Slack logging enabled but SLACK_BOT_TOKEN not found in environment. "
@@ -171,7 +172,6 @@ class Logger:
                         token=slack_token,
                         channel=slack_channel,
                         username=self.config.logger.slack_username,
-                        icon_emoji=self.config.logger.slack_icon_emoji,
                         timeout=self.config.logger.slack_timeout,
                         retry_attempts=self.config.logger.slack_retry_attempts,
                         buffer_size=self.config.logger.slack_buffer_size,
@@ -179,7 +179,8 @@ class Logger:
                         broadcast_level=_parse_level(self.config.logger.slack_broadcast_level),
                     )
                     self.slack_handler.setLevel(_parse_level(self.config.logger.slack_level))
-                    self.slack_handler.setFormatter(formatter)
+                    slack_formatter = logging.Formatter("%(message)s")
+                    self.slack_handler.setFormatter(slack_formatter)
                     handlers.append(self.slack_handler)
                     slack_init_message = f"Slack handler initialized for channel: {slack_channel}"
                     slack_init_level = logging.INFO
@@ -253,6 +254,10 @@ class Logger:
             # Note, can't log after this point -- listener thread has stopped
             # All subsequent logs will get queued but never logged
 
+    # NOTE:
+    # currently only title is broadcasted to main channel,
+    # since there's a delay in the title vs image appearing in the thread
+    # not sure if this is a fundamental limitation to slack webhooks?
     def upload_image_to_slack(
         self,
         file_path: str,

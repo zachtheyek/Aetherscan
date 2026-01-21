@@ -26,11 +26,14 @@ from aetherscan.manager import register_db
 
 logger = logging.getLogger(__name__)
 
-# Unique sentinel object for flush requests - writer thread recognizes this
-# as a command to flush immediately rather than data to be written
+# Unique sentinel object (i.e. an object with no attributes, no methods beyond those inherited from
+# Python's base object type, and no meaningful equality semantics except identity) for flush
+# requests - writer thread recognizes this as a command to flush immediately rather than data to be
+# written
 _FLUSH_SENTINEL = object()
 
 
+# TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _compute_intensity_stats() from data_generation.py?
 def _sanitize_float(value: float, fallback: float = 0.0, name: str = "value") -> float:
     """Replace NaN/inf with fallback for SQLite compatibility."""
     if not np.isfinite(value):
@@ -294,7 +297,7 @@ class Database:
 
         Args:
             timeout: Maximum time to wait for flush completion (seconds).
-                     If None, uses the configured flush_timeout.
+                     If None, uses the default configured flush_timeout.
 
         Returns:
             True if flush completed successfully, False if timed out or
@@ -305,7 +308,7 @@ class Database:
 
         # No-op if writer isn't running
         if self.writer_thread is None or not self.writer_thread.is_alive():
-            logger.debug("Flush called but writer thread not running")
+            logger.info("Flush called but writer thread not running")
             return True
 
         # Check if shutdown is already in progress
@@ -358,8 +361,11 @@ class Database:
                     flush_complete_event = metric[1]
                     # Flush current buffer immediately
                     if self.buffer:
+                        # Write all buffered data to db
                         self._flush_buffer()
+                        # Clear the buffer (empty the list)
                         self.buffer.clear()
+                        # Reset the timer
                         last_write_time = time.time()
                     # Signal that flush is complete
                     flush_complete_event.set()
@@ -517,6 +523,7 @@ class Database:
         """
         metadata_json = get_system_metadata()
 
+        # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting?
         # Sanitize value to prevent NaN/inf from violating NOT NULL constraint
         sanitized_value = _sanitize_float(value, fallback=0.0, name=stat_name)
 
