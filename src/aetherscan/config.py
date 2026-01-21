@@ -171,8 +171,7 @@ class TrainingConfig:
 class InferenceConfig:
     """Inference configuration"""
 
-    # per_replica_batch_size: int = 4096
-    per_replica_batch_size: int = 350  # TEST:
+    per_replica_batch_size: int = 320
 
     # NOTE: come back to this later
     # classification_threshold: float = 0.5
