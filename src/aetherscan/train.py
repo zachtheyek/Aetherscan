@@ -1010,7 +1010,7 @@ class TrainingPipeline:
 
                 if self.db is None:
                     raise RuntimeError(
-                        "No database instance detected - cannot generate training progress plot"
+                        "No database instance detected - cannot generate loss curves plot"
                     )
 
                 # Training losses
@@ -1147,10 +1147,8 @@ class TrainingPipeline:
 
                 logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
-            # Plot training progress
-            self.plot_beta_vae_training_progress(
-                tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
-            )
+            # Plot loss curves
+            self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
             # Plot injection stats
             self.plot_injection_stats(
@@ -1582,6 +1580,7 @@ class TrainingPipeline:
         del results
         gc.collect()
 
+        # NOTE: should we move the latent generation code to inference.py & import into train.py?
         logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
 
         # Pre-allocate latent arrays
@@ -1680,9 +1679,9 @@ class TrainingPipeline:
             del true_latents, false_latents
             gc.collect()
 
-    # TODO: visualize SNR range in training progress plot
+    # TODO: visualize SNR range in loss curves plot
     # TODO: visualize gradient stats in separate plot (subplot?) -> main: clipping_rate, secondary: mean, max, std
-    def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
+    def plot_beta_vae_loss_curves(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -1693,9 +1692,7 @@ class TrainingPipeline:
         current_time = time.time()
 
         if self.db is None:
-            raise RuntimeError(
-                "No database instance detected - cannot generate training progress plot"
-            )
+            raise RuntimeError("No database instance detected - cannot generate loss curves plot")
 
         # Flush database to ensure all training stats are written before plotting
         logger.info("Flushing database before plotting...")
@@ -1715,7 +1712,7 @@ class TrainingPipeline:
         )
 
         if not all_stats:
-            logger.warning("No training progress data to plot")
+            logger.warning("No training stats data to plot")
             return
 
         # TODO: potential memory optimization here with array pre-allocation? is there a way to just use the all_stats dict directly? is the potential improvement worth the effort?
@@ -1756,7 +1753,7 @@ class TrainingPipeline:
         ax_false = fig.add_subplot(gs[1, 3])
 
         fig.suptitle(
-            f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=18, fontweight="bold"
+            f"Beta-VAE Loss Curves ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
         # Helper function to plot dual y-axis
@@ -1825,11 +1822,11 @@ class TrainingPipeline:
         # Save plot
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"beta_vae_training_progress_{tag}.png"
+                self.config.output_path, "plots", dir, f"beta_vae_loss_curves_{tag}.png"
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"beta_vae_training_progress_{tag}.png"
+                self.config.output_path, "plots", f"beta_vae_loss_curves_{tag}.png"
             )
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)  # Create dir if it doesn't exist
@@ -1838,14 +1835,14 @@ class TrainingPipeline:
 
         plt.close()
 
-        logger.info(f"Beta-VAE training progress plot saved to: {save_path}")
+        logger.info(f"Beta-VAE loss curves plot saved to: {save_path}")
 
         # Upload to Slack
         logger_instance = get_logger()
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Beta-VAE Training Progress - {tag}",
+                title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
             )
 
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
@@ -2602,8 +2599,8 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
             raise  # Re-raise to propagate error
 
         try:
-            # Plot training progress
-            pipeline.plot_beta_vae_training_progress()
+            # Plot loss curves
+            pipeline.plot_beta_vae_loss_curves()
 
             # Plot injection stats
             pipeline.plot_injection_stats()
