@@ -161,7 +161,6 @@ def log_norm(data: np.ndarray) -> np.ndarray:
 
 
 # NOTE: not 100% sure how this function works. ported from Peter's code. comments added by Claude. assuming it works as intended?
-# NOTE: verify that we're randomly drawing a combo of snr, drift_rate, and signal_width for each injection?
 def new_cadence(
     data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
 ) -> tuple[np.ndarray, dict[str, float]]:
@@ -172,7 +171,7 @@ def new_cadence(
         modified_data: Array with injected signal
         signal_info: Dict with keys: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept
     """
-    # NOTE: should this be parametrized?
+    # NOTE: should noise = 3 parametrized?
     # Set noise parameter (for simulating randomness in drift rate calculation)
     noise = 3
 
@@ -201,7 +200,13 @@ def new_cadence(
             time_resolution / freq_resolution
         ) - random.random() * noise
 
-    # Guard against division by near-zero
+    # Clamp slopes that are too small to prevent divide-by-zero errors
+    # While this may alter the physics slightly, a near-zero slope is an edge-case representing a
+    # nearly horizontal signal trajectory
+    # Still, we should monitor the logs for how frequently slopes are clamped, and adjust if needed
+    # NOTE: should MIN_SLOPE_PHYSICAL = 1e-6 be parametrized in config.py instead?
+    # NOTE: does slope_pixel need to be changed before db write if slope_physical is clamped?
+    # NOTE: should we plot slope_clamping_rate (alongside gradient_clipping_rate, for example)?
     MIN_SLOPE_PHYSICAL = 1e-6  # noqa: N806
     if abs(slope_physical) < MIN_SLOPE_PHYSICAL:
         logger.warning(f"new_cadence: slope_physical ({slope_physical}) near zero, clamping")
@@ -214,6 +219,8 @@ def new_cadence(
     # Convert slope to drift rate
     drift_rate = -1 * (1 / slope_physical)
 
+    # NOTE: should 0-50 randomness be parametrized?
+    # NOTE: where does 18.0 come from? hard-coded time resolution?
     # Calculate signal width (in Hz)
     # Base random component: 0-50 Hz
     # Add component proportional to drift rate magnitude to keep signal coherent
@@ -290,8 +297,9 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
 
     Returns:
         Dict with keys: global_mean, global_median, global_std,
-                       global_mad, global_skew, global_kurtosis
+                        global_mad, global_skew, global_kurtosis
     """
+    # TEST: is 0.0 the correct fallback here?
     # Handle empty arrays
     if data.size == 0:
         logger.warning("_compute_intensity_stats received empty array")
@@ -307,7 +315,7 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
             0.0,
         )
 
-    # Promote to float64 to prevent overflow in higher-order moments
+    # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for stage A & B stats)
     flat = data.ravel().astype(np.float64)
     median_val = np.median(flat)
 
@@ -320,11 +328,12 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         "global_kurtosis": float(scipy_stats.kurtosis(flat)),
     }
 
-    # Sanitize any remaining NaN/inf
-    for key, value in stats.items():
-        if not np.isfinite(value):
-            logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
-            stats[key] = 0.0
+    # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _sanitize_float() from db.py?
+    # # Sanitize any remaining NaN/inf
+    # for key, value in stats.items():
+    #     if not np.isfinite(value):
+    #         logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
+    #         stats[key] = 0.0
 
     return stats
 
@@ -340,7 +349,7 @@ def create_false(
     dynamic_range: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create false signal class with intensity statistics at each stage.
+    Create false signal class
     If specified, RFI is injected into all 6 observations. Otherwise, no RFI is injected.
 
     Returns:
@@ -401,6 +410,7 @@ def create_false(
     sample_info = {
         "background_index": background_index,
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
+        # NOTE: how do we handle db writes & plotting when signal_info is empty?
         "signal_info": signal_info,  # Empty if no injection, rfi_* if injected
     }
 
@@ -418,7 +428,7 @@ def create_true_single(
     dynamic_range: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create true-single signal class with intensity statistics at each stage.
+    Create true-single signal class
     ETI signal is injected into the ON observations only.
 
     Returns:
@@ -486,7 +496,7 @@ def create_true_double(
     dynamic_range: float = 1,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create true-double signal class with intensity statistics at each stage.
+    Create true-double signal class
     Non-intersecting ETI & RFI signals are injected into ON-only & ON-OFF, respectively.
 
     Returns:
@@ -729,7 +739,7 @@ def batch_create_cadence(
 
         # Use pool to generate cadences in parallel
         for i, (result, sample_info) in enumerate(
-            # NOTE: does return order matter?
+            # TEST: does return order matter?
             pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
@@ -1137,6 +1147,7 @@ class DataGenerator:
                         timestamp=timestamp,
                     )
 
+            # NOTE: what happens when signal_info is empty for false_no_rfi signal types?
             # Write signal characteristics (eti_snr, rfi_drift_rate, etc.)
             # injection_stage=None since these describe the injection itself
             for stat_name, value in signal_info.items():
@@ -1498,6 +1509,7 @@ class DataGenerator:
         # Create result dictionary with references to pre-allocated arrays
         result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
+        # TEST: is this still needed?
         # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
         # # Sanity check: verify post-injection data normalization
         # for key in ["concatenated", "false", "true"]:

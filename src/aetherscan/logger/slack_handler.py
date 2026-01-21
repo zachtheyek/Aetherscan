@@ -1,3 +1,4 @@
+# NOTE: come back to this later
 """
 Slack logging handler for Aetherscan Pipeline
 Provides custom logging handler that sends messages to Slack API with:
@@ -21,6 +22,9 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+# Defer runtime import to _get_client() as lazy import
+# Allows slack_sdk to be an optional dependency that doesn't crash the entire application if it's
+# not installed (just throws a warning)
 if TYPE_CHECKING:
     from slack_sdk import WebClient
 
@@ -64,13 +68,12 @@ class SlackHandler(logging.Handler):
         self,
         token: str,
         channel: str,
-        username: str = "Aetherscan Bot",
-        icon_emoji: str = ":robot_face:",
-        timeout: float = 5.0,
-        retry_attempts: int = 2,
-        buffer_size: int = 10,
-        flush_interval: float = 5.0,
-        broadcast_level: int = logging.ERROR,
+        username: str,
+        timeout: float,
+        retry_attempts: int,
+        buffer_size: int,
+        flush_interval: float,
+        broadcast_level: int,
     ):
         """
         Initialize SlackHandler.
@@ -79,7 +82,6 @@ class SlackHandler(logging.Handler):
             token: Slack Bot User OAuth Token
             channel: Default channel to post messages to (e.g., "#aetherscan-logs")
             username: Bot username displayed in Slack
-            icon_emoji: Emoji icon for the bot
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts on failure
             buffer_size: Maximum messages to buffer before flushing
@@ -90,7 +92,6 @@ class SlackHandler(logging.Handler):
 
         self.channel = channel
         self.username = username
-        self.icon_emoji = icon_emoji
         self.timeout = timeout
         self.retry_attempts = retry_attempts
         self.buffer_size = buffer_size
@@ -314,7 +315,6 @@ class SlackHandler(logging.Handler):
                     channel=self.channel,
                     text=summary_text,
                     username=self.username,
-                    icon_emoji=self.icon_emoji,
                     mrkdwn=True,
                 )
             )
@@ -485,7 +485,6 @@ class SlackHandler(logging.Handler):
                 "channel": self.channel,
                 "text": f"{len(messages)} log message(s)",  # Fallback text for notifications
                 "username": self.username,
-                "icon_emoji": self.icon_emoji,
                 "attachments": [
                     {
                         "color": batch_color,
@@ -680,7 +679,6 @@ class SlackHandler(logging.Handler):
                 thread_ts=self._thread_ts,
                 reply_broadcast=True,  # This echoes to the main channel
                 username=self.username,
-                icon_emoji=self.icon_emoji,
             )
         except Exception as e:
             # Don't fail the upload if broadcast fails
