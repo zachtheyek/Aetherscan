@@ -51,21 +51,20 @@ class MonitorConfig:
 class LoggerConfig:
     """Logger configuration"""
 
-    # Console and file log levels
+    # Set log levels
     console_level: str = "INFO"
     file_level: str = "INFO"
+    slack_level: str = "INFO"
 
     # Slack configuration
-    slack_level: str = "INFO"
-    slack_broadcast_level: str = "ERROR"  # Messages at this level+ are broadcast to main channel
     slack_enabled: bool = True
     slack_channel: str | None = None  # Override with SLACK_CHANNEL env var
     slack_username: str = "Aetherscan"
-    slack_icon_emoji: str = ":robot_face:"
     slack_timeout: float = 5.0
     slack_retry_attempts: int = 2
-    slack_buffer_size: int = 10  # Max messages to buffer before flushing
-    slack_flush_interval: float = 5.0  # Seconds between automatic flushes
+    slack_buffer_size: int = 100  # Max messages to buffer before flushing
+    slack_flush_interval: float = 10.0  # Seconds between automatic flushes
+    slack_broadcast_level: str = "ERROR"  # Messages at this level+ are broadcast to main channel
 
 
 @dataclass
@@ -140,8 +139,8 @@ class TrainingConfig:
     train_val_split: float = 0.8
 
     per_replica_batch_size: int = 128
-    global_batch_size: int = 3072  # Effective batch size for gradient accumulation
-    per_replica_val_batch_size: int = 4096
+    effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
+    per_replica_val_batch_size: int = 4096  # TODO: lower val batch size (and match to inference)
 
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
@@ -325,15 +324,14 @@ class Config:
                 "console_level": self.logger.console_level,
                 "file_level": self.logger.file_level,
                 "slack_level": self.logger.slack_level,
-                "slack_broadcast_level": self.logger.slack_broadcast_level,
                 "slack_enabled": self.logger.slack_enabled,
                 "slack_channel": self.logger.slack_channel,
                 "slack_username": self.logger.slack_username,
-                "slack_icon_emoji": self.logger.slack_icon_emoji,
                 "slack_timeout": self.logger.slack_timeout,
                 "slack_retry_attempts": self.logger.slack_retry_attempts,
                 "slack_buffer_size": self.logger.slack_buffer_size,
                 "slack_flush_interval": self.logger.slack_flush_interval,
+                "slack_broadcast_level": self.logger.slack_broadcast_level,
             },
             "beta_vae": {
                 "latent_dim": self.beta_vae.latent_dim,
@@ -369,7 +367,7 @@ class Config:
                 "num_samples_rf": self.training.num_samples_rf,
                 "train_val_split": self.training.train_val_split,
                 "per_replica_batch_size": self.training.per_replica_batch_size,
-                "global_batch_size": self.training.global_batch_size,
+                "effective_batch_size": self.training.effective_batch_size,
                 "per_replica_val_batch_size": self.training.per_replica_val_batch_size,
                 "signal_injection_chunk_size": self.training.signal_injection_chunk_size,
                 "snr_base": self.training.snr_base,

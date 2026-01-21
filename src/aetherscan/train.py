@@ -354,7 +354,7 @@ def prepare_distributed_train_dataset(
     n_samples: int,
     train_val_split: float,
     per_replica_batch_size: int,
-    global_batch_size: int,
+    effective_batch_size: int,
     per_replica_val_batch_size: int,
     num_replicas: int,
     strategy: tf.distribute.Strategy,
@@ -368,7 +368,7 @@ def prepare_distributed_train_dataset(
         n_samples: Number of samples in data
         train_val_split: Split data into train/val sets
         per_replica_batch_size: Batch size per replica for training
-        global_batch_size: Effective batch size across all replicas for training
+        effective_batch_size: Effective batch size across all replicas for training
         per_replica_val_batch_size: Batch size per replica for validation
         num_replicas: Number of replicas in strategy
         strategy: TensorFlow distribution strategy
@@ -379,6 +379,7 @@ def prepare_distributed_train_dataset(
              Train/val distributed datasets, number of samples in each, number of steps for each
               (including accumulation sub-steps), and DataHoldedr references for each
     """
+    global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
 
     # Split into train & val
@@ -386,13 +387,13 @@ def prepare_distributed_train_dataset(
     n_val = n_samples - n_train
 
     # Trim datasets to fit train/val batch sizes (prevents uneven batches on final step)
-    # Note, n_train should already be divisible by global_batch_size and
+    # Note, n_train should already be divisible by effective_batch_size and
     # per_replica_batch_size * num_replicas
     # As well, n_val should also already be divisible by per_replica_val_batch_size * num_replicas
     # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
     # distributing our datasets
     # Alternatively, we could also pad the data instead of trimming
-    n_train_trimmed = (n_train // global_batch_size) * global_batch_size
+    n_train_trimmed = (n_train // effective_batch_size) * effective_batch_size
     n_val_trimmed = (n_val // global_val_batch_size) * global_val_batch_size
 
     logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
@@ -468,14 +469,16 @@ def prepare_distributed_train_dataset(
 
     # Create datasets using generators to reduce GPU memory pressure
     # Data is kept on CPU & transferred to GPU in batches on-demand
+    # Note that the datasets yield data in batches before being sharded (distributed) across replicas
+    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
     logger.info(
         f"Creating infinite datasets from generators with global batch size - "
-        f"Train: {per_replica_batch_size * num_replicas}, Val: {global_val_batch_size}"
+        f"Train: {global_train_batch_size}, Val: {global_val_batch_size}"
     )
 
     train_dataset = (
         tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
-        .batch(per_replica_batch_size * num_replicas, drop_remainder=True)
+        .batch(global_train_batch_size, drop_remainder=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -494,18 +497,18 @@ def prepare_distributed_train_dataset(
     val_dataset_distributed = strategy.experimental_distribute_dataset(val_dataset)
 
     # Calculate steps
-    train_steps = n_train_trimmed // global_batch_size
-    accumulation_steps = global_batch_size // (per_replica_batch_size * num_replicas)
+    train_steps = n_train_trimmed // effective_batch_size
+    accumulation_steps = effective_batch_size // (global_train_batch_size)
     val_steps = n_val_trimmed // global_val_batch_size
 
     # Sanity check: verify step sizes are valid before returning
     if train_steps < 1:
         raise ValueError(
-            f"train_steps < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({global_batch_size})"
+            f"train_steps < 1: n_train_trimmed ({n_train_trimmed}) must be >= effective_batch_size ({effective_batch_size})"
         )
     if accumulation_steps < 1:
         raise ValueError(
-            f"accumulation_steps < 1: global_batch_size ({global_batch_size}) must be >= per_replica_batch_size * num_replicas ({per_replica_batch_size} * {num_replicas})"
+            f"accumulation_steps < 1: effective_batch_size ({effective_batch_size}) must be >= per_replica_batch_size * num_replicas ({per_replica_batch_size} * {num_replicas})"
         )
     if val_steps < 1:
         raise ValueError(
@@ -550,7 +553,7 @@ def prepare_distributed_inf_dataset(
     global_inf_batch_size = per_replica_inf_batch_size * num_replicas
 
     # Trim datasets to fit batch sizes (prevents uneven batches on final step)
-    # Note, n_samples should already be divisible by global_batch_size
+    # Note, n_samples should already be divisible by effective_batch_size
     # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
     # distributing our datasets
     # Alternatively, we could also pad the data instead of trimming
@@ -598,6 +601,8 @@ def prepare_distributed_inf_dataset(
 
     # Create dataset using generator to reduce GPU memory pressure
     # Data is kept on CPU & transferred to GPU in batches on-demand
+    # Note that the dataset yields data in batches before being sharded (distributed) across replicas
+    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
     logger.info(
         f"Creating infinite dataset from generator with global batch size: {global_inf_batch_size}"
     )
@@ -943,7 +948,7 @@ class TrainingPipeline:
             n_samples=self.config.training.num_samples_beta_vae,
             train_val_split=self.config.training.train_val_split,
             per_replica_batch_size=self.config.training.per_replica_batch_size,
-            global_batch_size=self.config.training.global_batch_size,
+            effective_batch_size=self.config.training.effective_batch_size,
             per_replica_val_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
@@ -1142,12 +1147,7 @@ class TrainingPipeline:
 
                 logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
-            # Flush database to ensure all training stats are written before plotting
-            if self.db is not None:
-                logger.info("Flushing database before plotting...")
-                self.db.flush()
-
-            # Plot progress
+            # Plot training progress
             self.plot_beta_vae_training_progress(
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
@@ -1156,7 +1156,6 @@ class TrainingPipeline:
             self.plot_injection_stats(
                 tag=f"round_{round_idx + 1:02d}",
                 dir="checkpoints",
-                round_number=round_idx + 1,
             )
 
             # Save checkpoint
@@ -1521,6 +1520,7 @@ class TrainingPipeline:
         # # add a check to validate_args() to make sure save-tag is distinct?
         # # note, should only be a problem during testing, since load_models() only runs if
         # # check_encoder_trained() fails
+        # # maybe we first look into checkpoints first, then only in the main models directory?
         # Load encoder weights if untrained
         logger.info("Checking if encoder weights appear trained")
 
@@ -1545,7 +1545,8 @@ class TrainingPipeline:
             logger.warning(f"Could not verify encoder weights status: {e}")
             logger.warning("Proceeding with current encoder weights")
 
-        n_samples = self.config.training.num_samples_rf
+        # NOTE: divide by 2 to compensate for generate_batch creating n_samples * 2 samples
+        n_samples = self.config.training.num_samples_rf // 2
         snr_base = self.config.training.snr_base
         snr_range = (
             self.config.training.initial_snr_range
@@ -1696,6 +1697,13 @@ class TrainingPipeline:
                 "No database instance detected - cannot generate training progress plot"
             )
 
+        # Flush database to ensure all training stats are written before plotting
+        logger.info("Flushing database before plotting...")
+        if not self.db.flush():
+            logger.warning(
+                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            )
+
         # NOTE: how to handle retries under current implementation?
         # Query training stats from database
         all_stats = self.db.query_training_stat(
@@ -1840,94 +1848,47 @@ class TrainingPipeline:
                 title=f"Beta-VAE Training Progress - {tag}",
             )
 
-    def plot_injection_stats(
-        self,
-        tag: str | None = None,
-        dir: str | None = None,
-        round_number: int | None = None,
-        start_time: float | None = None,
-        end_time: float | None = None,
-    ) -> None:
+    def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
         Plot injection statistics for bias/leakage detection.
 
         Generates 7 figures:
-        - 4 intensity histograms (one per signal_type)
-        - 1 signal characteristics (ETI vs RFI)
-        - 1 stage transition scatter plots
-        - 1 per-signal-type box plots
+        - 1 injected signal characteristics
+        - 4 global intensity distributions (one per signal_type)
+        - 1 A->B global intensity biases
+        - 1 final global intensity biases
 
         Args:
             tag: Plot tag for filename (defaults to save_tag)
             dir: Subdirectory (e.g., "checkpoints" for per-round)
-            round_number: Filter to specific round (None = all rounds)
-            start_time: Start timestamp for query bounds (defaults to self.start_time)
-            end_time: End timestamp for query bounds (defaults to current time)
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        # Set time bounds for queries to current training session
-        if start_time is None:
-            start_time = getattr(self, "start_time", None)
-        if end_time is None:
-            end_time = time.time()
-
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
-
-        if self.db is None:
-            raise RuntimeError(
-                "No database instance detected - cannot generate injection stats plot"
-            )
-
-        # Determine save directory
         if dir is not None:
             save_dir = os.path.join(self.config.output_path, "plots", dir)
         else:
             save_dir = os.path.join(self.config.output_path, "plots")
         os.makedirs(save_dir, exist_ok=True)
 
-        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
-        intensity_stats = [
-            "global_mean",
-            "global_median",
-            "global_std",
-            "global_mad",
-            "global_skew",
-            "global_kurtosis",
-        ]
-        stages = ["A", "B", "C"]
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
 
-        # Figure 1-4: Intensity histograms per signal_type
-        for signal_type in signal_types:
-            stats_by_stage = {stage: {} for stage in stages}
+        current_time = time.time()
 
-            for stat_name in intensity_stats:
-                for stage in stages:
-                    results = self.db.query_injection_stat(
-                        stat_name=stat_name,
-                        injection_stage=stage,
-                        signal_type=signal_type,
-                        start_round_number=1 if round_number is None else round_number,
-                        end_round_number=round_number,
-                        tag=self.config.checkpoint.save_tag,
-                        start_time=start_time,
-                        end_time=end_time,
-                    )
-                    stats_by_stage[stage][stat_name] = [r["value"] for r in results]
-                    del results
-
-            # Generate plot for this signal_type
-            save_path = os.path.join(save_dir, f"injection_stats_intensity_{signal_type}_{tag}.png")
-            self._plot_intensity_histograms_for_type(
-                stats_by_stage, signal_type, tag, machine_name, save_path
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate injection stats plot"
             )
 
-            del stats_by_stage
-            gc.collect()
+        # Flush database to ensure all injection stats are written before plotting
+        logger.info("Flushing database before plotting...")
+        if not self.db.flush():
+            logger.warning(
+                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            )
 
-        # Figure 5: Signal characteristics (ETI vs RFI)
+        # Figure 1: Injected signal characteristics
         signal_stats = [
             "snr",
             "drift_rate",
@@ -1946,11 +1907,9 @@ class TrainingPipeline:
                 results = self.db.query_injection_stat(
                     stat_name=f"eti_{stat_name}",
                     signal_type=st,
-                    start_round_number=1 if round_number is None else round_number,
-                    end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=self.start_time,
+                    end_time=current_time,
                 )
                 eti_results.extend([r["value"] for r in results])
                 del results
@@ -1962,23 +1921,62 @@ class TrainingPipeline:
                 results = self.db.query_injection_stat(
                     stat_name=f"rfi_{stat_name}",
                     signal_type=st,
-                    start_round_number=1 if round_number is None else round_number,
-                    end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=self.start_time,
+                    end_time=current_time,
                 )
                 rfi_results.extend([r["value"] for r in results])
                 del results
             rfi_stats[stat_name] = rfi_results
 
-        save_path = os.path.join(save_dir, f"injection_stats_signals_{tag}.png")
-        self._plot_signal_characteristics(eti_stats, rfi_stats, tag, machine_name, save_path)
+        save_path = os.path.join(save_dir, f"injected_signal_characteristics_{tag}.png")
+        self._plot_injected_signal_characteristics(
+            eti_stats, rfi_stats, tag, machine_name, save_path
+        )
 
         del eti_stats, rfi_stats
         gc.collect()
 
-        # Figure 6: Stage transitions (A→B scatter plots)
+        # Figure 2-5: Global intensity distribution (one per signal_type)
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stages = ["A", "B", "C"]
+
+        for signal_type in signal_types:
+            stats_by_stage = {stage: {} for stage in stages}
+
+            for stat_name in intensity_stats:
+                for stage in stages:
+                    results = self.db.query_injection_stat(
+                        stat_name=stat_name,
+                        injection_stage=stage,
+                        signal_type=signal_type,
+                        tag=self.config.checkpoint.save_tag,
+                        start_time=self.start_time,
+                        end_time=current_time,
+                    )
+                    stats_by_stage[stage][stat_name] = [r["value"] for r in results]
+                    del results
+
+            # Generate plot for this signal_type
+            save_path = os.path.join(
+                save_dir, f"{signal_type}_global_intensity_distributions_{tag}.png"
+            )
+            self._plot_global_intensity_distributions(
+                stats_by_stage, signal_type, tag, machine_name, save_path
+            )
+
+            del stats_by_stage
+            gc.collect()
+
+        # Figure 6: A->B global intensity biases
         transitions = {stat_name: {} for stat_name in intensity_stats}
 
         for stat_name in intensity_stats:
@@ -1988,11 +1986,9 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="A",
                     signal_type=signal_type,
-                    start_round_number=1 if round_number is None else round_number,
-                    end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=self.start_time,
+                    end_time=current_time,
                 )
                 values_a = [r["value"] for r in results_a]
                 del results_a
@@ -2002,24 +1998,22 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="B",
                     signal_type=signal_type,
-                    start_round_number=1 if round_number is None else round_number,
-                    end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=self.start_time,
+                    end_time=current_time,
                 )
                 values_b = [r["value"] for r in results_b]
                 del results_b
 
                 transitions[stat_name][signal_type] = (values_a, values_b)
 
-        save_path = os.path.join(save_dir, f"injection_stats_transitions_{tag}.png")
-        self._plot_stage_transitions(transitions, tag, machine_name, save_path)
+        save_path = os.path.join(save_dir, f"a_b_global_intensity_biases{tag}.png")
+        self._plot_injection_intensity_biases(transitions, tag, machine_name, save_path)
 
         del transitions
         gc.collect()
 
-        # Figure 7: Per-signal-type box plots at Stage C
+        # Figure 7: Final global intensity biases
         stats_by_type = {signal_type: {} for signal_type in signal_types}
 
         for signal_type in signal_types:
@@ -2028,24 +2022,120 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="C",
                     signal_type=signal_type,
-                    start_round_number=1 if round_number is None else round_number,
-                    end_round_number=round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=self.start_time,
+                    end_time=current_time,
                 )
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
                 del results
 
-        save_path = os.path.join(save_dir, f"injection_stats_boxplots_{tag}.png")
-        self._plot_signal_type_boxplots(stats_by_type, tag, machine_name, save_path)
+        save_path = os.path.join(save_dir, f"final_global_intensity_biases_{tag}.png")
+        self._plot_final_intensity_biases(stats_by_type, tag, machine_name, save_path)
 
         del stats_by_type
         gc.collect()
 
         logger.info(f"Injection stats plots saved to: {save_dir}")
 
-    def _plot_intensity_histograms_for_type(
+    def _plot_injected_signal_characteristics(
+        self,
+        eti_stats: dict[str, list[float]],
+        rfi_stats: dict[str, list[float]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 signal characteristics grid."""
+        signal_stats = [
+            "snr",
+            "drift_rate",
+            "signal_width",
+            "starting_bin",
+            "slope_pixel",
+            "y_intercept",
+        ]
+        # NOTE: are these units correct?
+        stat_display_names = {
+            "snr": "SNR",
+            "drift_rate": "Drift Rate (Hz/s)",
+            "signal_width": "Signal Width (Hz)",
+            "starting_bin": "Starting Bin",
+            "slope_pixel": "Slope (px)",
+            "y_intercept": "Y-Intercept",
+        }
+        signal_colors = {"ETI": "blue", "RFI": "orange"}
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Injected Signal Characteristics ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(signal_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            eti_data = eti_stats.get(stat_name, [])
+            rfi_data = rfi_stats.get(stat_name, [])
+
+            if eti_data:
+                ax.hist(
+                    eti_data,
+                    bins=50,
+                    alpha=0.25,
+                    color=signal_colors["ETI"],
+                    edgecolor=signal_colors["ETI"],
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
+            if rfi_data:
+                ax.hist(
+                    rfi_data,
+                    bins=50,
+                    alpha=0.25,
+                    color=signal_colors["RFI"],
+                    edgecolor=signal_colors["RFI"],
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
+
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
+            ax.set_ylabel("Count", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D([], [], color=signal_colors["ETI"], linewidth=4, alpha=0.5, label="ETI"),
+            mlines.Line2D([], [], color=signal_colors["RFI"], linewidth=4, alpha=0.5, label="RFI"),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.92, 1])  # Leave room for legend on right
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Injected signal characteristics plot saved: {save_path}")
+
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Injected signal characteristics ({tag}, {machine_name})",
+            )
+
+    def _plot_global_intensity_distributions(
         self,
         stats_by_stage: dict[str, dict[str, list[float]]],
         signal_type: str,
@@ -2154,107 +2244,10 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Intensity Histogram ({signal_type}) - {tag}",
+                title=f"{signal_type} global intensity distributions ({tag}, {machine_name})",
             )
 
-    def _plot_signal_characteristics(
-        self,
-        eti_stats: dict[str, list[float]],
-        rfi_stats: dict[str, list[float]],
-        tag: str,
-        machine_name: str,
-        save_path: str,
-    ) -> None:
-        """Generate 2x3 signal characteristics grid."""
-        signal_stats = [
-            "snr",
-            "drift_rate",
-            "signal_width",
-            "starting_bin",
-            "slope_pixel",
-            "y_intercept",
-        ]
-        stat_display_names = {
-            "snr": "SNR",
-            "drift_rate": "Drift Rate (Hz/s)",
-            "signal_width": "Signal Width (Hz)",
-            "starting_bin": "Starting Bin",
-            "slope_pixel": "Slope (px)",
-            "y_intercept": "Y-Intercept",
-        }
-        signal_colors = {"ETI": "blue", "RFI": "orange"}
-
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle(
-            f"Injected Signal Characteristics ({tag}, {machine_name})",
-            fontsize=16,
-            fontweight="bold",
-        )
-
-        for idx, stat_name in enumerate(signal_stats):
-            row, col = idx // 3, idx % 3
-            ax = axes[row, col]
-
-            eti_data = eti_stats.get(stat_name, [])
-            rfi_data = rfi_stats.get(stat_name, [])
-
-            if eti_data:
-                ax.hist(
-                    eti_data,
-                    bins=50,
-                    alpha=0.25,
-                    color=signal_colors["ETI"],
-                    edgecolor=signal_colors["ETI"],
-                    linewidth=1.5,
-                    histtype="stepfilled",
-                )
-            if rfi_data:
-                ax.hist(
-                    rfi_data,
-                    bins=50,
-                    alpha=0.25,
-                    color=signal_colors["RFI"],
-                    edgecolor=signal_colors["RFI"],
-                    linewidth=1.5,
-                    histtype="stepfilled",
-                )
-
-            ax.set_title(
-                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
-            )
-            ax.set_ylabel("Count", fontsize=10)
-            ax.grid(True, alpha=0.3)
-
-        # Create legend handles for figure-level legend
-        legend_handles = [
-            mlines.Line2D([], [], color=signal_colors["ETI"], linewidth=4, alpha=0.5, label="ETI"),
-            mlines.Line2D([], [], color=signal_colors["RFI"], linewidth=4, alpha=0.5, label="RFI"),
-        ]
-        fig.legend(
-            handles=legend_handles,
-            loc="upper right",
-            bbox_to_anchor=(0.99, 0.99),
-            fontsize=10,
-            frameon=True,
-            fancybox=True,
-            shadow=True,
-        )
-
-        plt.tight_layout(rect=[0, 0, 0.92, 1])  # Leave room for legend on right
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        plt.close()
-
-        logger.info(f"Signal characteristics plot saved: {save_path}")
-
-        # Upload to Slack
-        logger_instance = get_logger()
-        if logger_instance:
-            logger_instance.upload_image_to_slack(
-                save_path,
-                title=f"Signal Characteristics - {tag}",
-            )
-
-    def _plot_stage_transitions(
+    def _plot_injection_intensity_biases(
         self,
         transitions: dict[str, dict[str, tuple[list, list]]],
         tag: str,
@@ -2331,8 +2324,8 @@ class TrainingPipeline:
             ax.set_title(
                 stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
             )
-            ax.set_xlabel("Stage A", fontsize=10)
-            ax.set_ylabel("Stage B", fontsize=10)
+            ax.set_xlabel("Stage A (pre-inj)", fontsize=10)
+            ax.set_ylabel("Stage B (post-inj)", fontsize=10)
             ax.grid(True, alpha=0.3)
 
         # Create legend handles for figure-level legend
@@ -2370,10 +2363,10 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Stage Transitions - {tag}",
+                title=f"A→B global intensity biases ({tag}, {machine_name})",
             )
 
-    def _plot_signal_type_boxplots(
+    def _plot_final_intensity_biases(
         self,
         stats_by_type: dict[str, dict[str, list[float]]],
         tag: str,
@@ -2443,7 +2436,6 @@ class TrainingPipeline:
             ax.set_title(
                 stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
             )
-            ax.set_xlabel("Value", fontsize=10)
             ax.grid(True, alpha=0.3, axis="x")
 
         # Create legend handles for figure-level legend
@@ -2472,7 +2464,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Signal Type Box Plots - {tag}",
+                title=f"Final global intensity biases ({tag}, {machine_name})",
             )
 
     def save_models(self, tag: str | None = None, dir: str | None = None):
@@ -2610,15 +2602,10 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
             raise  # Re-raise to propagate error
 
         try:
-            # Flush database to ensure all training stats are written before final plot
-            if pipeline.db is not None:
-                logger.info("Flushing database before final plot...")
-                pipeline.db.flush()
-
             # Plot training progress
             pipeline.plot_beta_vae_training_progress()
 
-            # Plot injection stats (all rounds cumulative)
+            # Plot injection stats
             pipeline.plot_injection_stats()
         except Exception as e:
             logger.error(f"Error in plotting: {e}")
