@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+# TODO: come back to this later
 """
 Optimize training parameters to satisfy divisibility constraints across multiple replica counts.
 
@@ -102,6 +104,7 @@ def calculate_distance(original: dict, candidate: dict) -> int:
     """Calculate L1 distance between original and candidate values."""
     distance = 0
     for key, value in original.items():
+        # NOTE: why do we omit train_val_split?
         if key != "train_val_split":  # Don't include train_val_split in distance
             distance += abs(value - candidate[key])
     return distance
