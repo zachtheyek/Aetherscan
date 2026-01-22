@@ -132,7 +132,7 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     num_training_rounds: int = 20
-    epochs_per_round: int = 150
+    epochs_per_round: int = 100
 
     num_samples_beta_vae: int = 491520
     num_samples_rf: int = 98304
