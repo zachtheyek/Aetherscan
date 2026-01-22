@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 _FLUSH_SENTINEL = object()
 
 
-# TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _compute_intensity_stats() from data_generation.py?
+# TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _compute_intensity_stats() from data_generation.py? should we add metrics to track sanitization frequency (indicating possible data corruption)
 def _sanitize_float(value: float, fallback: float = 0.0, name: str = "value") -> float:
     """Replace NaN/inf with fallback for SQLite compatibility."""
     if not np.isfinite(value):
