@@ -2004,7 +2004,7 @@ class TrainingPipeline:
 
                 transitions[stat_name][signal_type] = (values_a, values_b)
 
-        save_path = os.path.join(save_dir, f"a_b_global_intensity_biases{tag}.png")
+        save_path = os.path.join(save_dir, f"a_b_global_intensity_biases_{tag}.png")
         self._plot_injection_intensity_biases(transitions, tag, machine_name, save_path)
 
         del transitions
