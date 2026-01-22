@@ -1422,6 +1422,7 @@ class TrainingPipeline:
         """
         Apply gradients after gradient clipping by global L2 norm
         """
+        # TEST: is this still needed? currently every step seems to be getting clipped. what happens if we just don't?
         # Clip gradients for additional stability
         # Note, this step is optional but recommended given our beta-VAE architecture's
         # heterogeneous gradient scale (reconstruction + KL loss components)
