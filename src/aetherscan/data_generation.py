@@ -328,7 +328,7 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         "global_kurtosis": float(scipy_stats.kurtosis(flat)),
     }
 
-    # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _sanitize_float() from db.py?
+    # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _sanitize_float() from db.py? should we add metrics to track sanitization frequency (indicating possible data corruption)
     # Sanitize any remaining NaN/inf
     for key, value in stats.items():
         if not np.isfinite(value):
