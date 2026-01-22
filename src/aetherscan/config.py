@@ -134,13 +134,14 @@ class TrainingConfig:
     num_training_rounds: int = 20
     epochs_per_round: int = 150
 
-    num_samples_beta_vae: int = 499200
-    num_samples_rf: int = 99840
+    num_samples_beta_vae: int = 491520
+    num_samples_rf: int = 98304
     train_val_split: float = 0.8
 
     per_replica_batch_size: int = 128
     effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
-    per_replica_val_batch_size: int = 320
+    # TEST: 2^12 ran into OOM. does 2^11 work?
+    per_replica_val_batch_size: int = 2048
 
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
@@ -171,7 +172,8 @@ class TrainingConfig:
 class InferenceConfig:
     """Inference configuration"""
 
-    per_replica_batch_size: int = 320
+    # TEST: 2^12 ran into OOM. does 2^11 work?
+    per_replica_batch_size: int = 2048
 
     # NOTE: come back to this later
     # classification_threshold: float = 0.5
