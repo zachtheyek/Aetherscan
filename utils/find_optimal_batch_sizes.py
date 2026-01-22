@@ -191,6 +191,20 @@ def optimize_parameters(
     print(f"\nTarget num_replicas: {num_replicas_list}")
     print()
 
+    # Check if current parameters already satisfy all constraints
+    if check_constraints(
+        base_values["num_samples_beta_vae"],
+        base_values["num_samples_rf"],
+        base_values["train_val_split"],
+        base_values["per_replica_batch_size"],
+        base_values["effective_batch_size"],
+        base_values["per_replica_val_batch_size"],
+        num_replicas_list,
+    ):
+        print("Current parameters already satisfy all constraints!")
+        print("No optimization needed.\n")
+        return base_values
+
     candidates = generate_candidates(base_values, hold_params, direction_constraints, search_ranges)
 
     print(f"Total candidates to check: {len(candidates):,}")
