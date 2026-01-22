@@ -18,6 +18,7 @@ import numpy as np
 from skimage.transform import downscale_local_mean
 
 from aetherscan.config import get_config
+from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 
@@ -148,7 +149,14 @@ class DataPreprocessor:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
+        # NOTE: do we need db here?
+        self.db = get_db()
+        if self.db is None:
+            raise ValueError("get_db() returned None")
+
         self.manager = get_manager()
+        if self.manager is None:
+            raise ValueError("get_manager() returned None")
 
     # NOTE: come back to this later
     def close(self):

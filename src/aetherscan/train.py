@@ -1,22 +1,26 @@
 """
 Training orchestration for Aetherscan Pipeline
 Implements full workflow for both beta-VAE & RF classifier,
-Supports curriculum learning, distributed GPU training, and model checkpointing
+Supports curriculum learning, adaptive LR, distributed datasets & training,
+gradient accumulation, and model checkpointing
 """
 
 from __future__ import annotations
 
 import gc
 import glob
+import json
 import logging
 import os
 import re
 import shutil
-import socket
 import threading
+import time
+from collections.abc import Callable
 from datetime import datetime
 
 import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
@@ -25,6 +29,7 @@ from tensorflow.keras.layers import Conv2D, Dense
 
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
+from aetherscan.db import get_db, get_system_metadata
 from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
 
 logger = logging.getLogger(__name__)
@@ -343,243 +348,286 @@ class DataHolder:
             self.false = None
 
 
-# TODO: split if-else branches into prepare_distributed_train_dataset & prepare_distributed_inference_dataset
-def prepare_distributed_dataset(
+def prepare_distributed_train_dataset(
     data: dict,
     n_samples: int,
-    train_val_split: float | None,
+    train_val_split: float,
     per_replica_batch_size: int,
-    global_batch_size: int | None,
-    per_replica_val_batch_size: int | None,
+    global_batch_size: int,
+    per_replica_val_batch_size: int,
     num_replicas: int,
     strategy: tf.distribute.Strategy,
     shuffle: bool = True,
 ) -> dict:
     """
-    Prepare distributed datasets for training or inference
+    Prepare distributed datasets for training & validation
 
     Args:
         data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
         n_samples: Number of samples in data
-        train_val_split: If provided, split data into train/val sets. If None, return single dataset for inference
-        per_replica_batch_size: Batch size per replica for training (or inference if no split)
-        global_batch_size: Required if train_val_split is provided. Effective batch size across all replicas for training
-        per_replica_val_batch_size: Required if train_val_split is provided. Batch size per replica for validation
+        train_val_split: Split data into train/val sets
+        per_replica_batch_size: Batch size per replica for training
+        global_batch_size: Effective batch size across all replicas for training
+        per_replica_val_batch_size: Batch size per replica for validation
         num_replicas: Number of replicas in strategy
         strategy: TensorFlow distribution strategy
-        shuffle: Whether to shuffle training data (default True, set False for inference)
+        shuffle: Whether to shuffle training data
 
-    Returns:
-        If train_val_split is None:
-            {dataset, n_trimmed, steps}
-            Single distributed dataset, number of samples in dataset, and number of steps
-        If train_val_split is provided:
-            {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps, accumulation_steps, val_steps}
-            Train/val distributed datasets, number of samples in each, number of steps for each (including accumulation sub-steps)
+    Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
+              accumulation_steps, val_steps, _train_holder, _val_holder}
+             Train/val distributed datasets, number of samples in each, number of steps for each
+              (including accumulation sub-steps), and DataHoldedr references for each
     """
-    if train_val_split is not None:
-        # Training case: split into train and val
-        if global_batch_size is None or per_replica_val_batch_size is None:
-            raise ValueError(
-                "global_batch_size and per_replica_val_batch_size are required when train_val_split is provided"
-            )
+    global_val_batch_size = per_replica_val_batch_size * num_replicas
 
-        # Split & trim to fit train/val batch size
-        n_train = int(n_samples * train_val_split)
-        n_val = n_samples - n_train
+    # Split into train & val
+    n_train = int(n_samples * train_val_split)
+    n_val = n_samples - n_train
 
-        n_train_trimmed = (n_train // global_batch_size) * global_batch_size
-        n_val_trimmed = (n_val // per_replica_val_batch_size) * per_replica_val_batch_size
+    # Trim datasets to fit train/val batch sizes (prevents uneven batches on final step)
+    # Note, n_train should already be divisible by global_batch_size and
+    # per_replica_batch_size * num_replicas
+    # As well, n_val should also already be divisible by per_replica_val_batch_size * num_replicas
+    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
+    # distributing our datasets
+    # Alternatively, we could also pad the data instead of trimming
+    n_train_trimmed = (n_train // global_batch_size) * global_batch_size
+    n_val_trimmed = (n_val // global_val_batch_size) * global_val_batch_size
 
-        logger.info(
-            f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}"
-        )
+    logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
 
-        # Prepare data
-        train_concat = data["concatenated"][:n_train_trimmed]
-        train_true = data["true"][:n_train_trimmed]
-        train_false = data["false"][:n_train_trimmed]
-        train_holder = DataHolder(train_concat, train_true, train_false)
+    # Prepare data
+    train_concat = data["concatenated"][:n_train_trimmed]
+    train_true = data["true"][:n_train_trimmed]
+    train_false = data["false"][:n_train_trimmed]
+    train_holder = DataHolder(train_concat, train_true, train_false)
 
-        val_start = n_train
-        val_end = val_start + n_val_trimmed
-        val_concat = data["concatenated"][val_start:val_end]
-        val_true = data["true"][val_start:val_end]
-        val_false = data["false"][val_start:val_end]
-        val_holder = DataHolder(val_concat, val_true, val_false)
+    val_start = n_train
+    val_end = val_start + n_val_trimmed
 
-        # Create generator functions for memory-efficient data loading
-        def train_generator():
-            while True:  # Make generators infinite to reset state between epochs
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with train_holder._lock:
-                    if train_holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = train_holder.concat
-                    true = train_holder.true
-                    false = train_holder.false
+    val_concat = data["concatenated"][val_start:val_end]
+    val_true = data["true"][val_start:val_end]
+    val_false = data["false"][val_start:val_end]
+    val_holder = DataHolder(val_concat, val_true, val_false)
 
-                # Work with local references (safe from clearing, no per-sample lock needed)
-                indices = np.arange(len(concat))
-                if shuffle:
-                    # Perform global shuffle on each epoch so each pass through the data is unique
-                    np.random.shuffle(indices)
-                for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
+    # Create generator functions for memory-efficient data loading
+    def train_generator():
+        while True:  # Make generators infinite to reset state between epochs
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with train_holder._lock:
+                if train_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = train_holder.concat
+                true = train_holder.true
+                false = train_holder.false
 
-                # Remove cache references for future garbage collection
-                del concat, true, false
+            # Work with local references (safe from clearing, no per-sample lock needed)
+            indices = np.arange(len(concat))
+            if shuffle:
+                # Perform global shuffle on each epoch so each pass through the data is unique
+                np.random.shuffle(indices)
+            for idx in indices:
+                yield (concat[idx], true[idx], false[idx]), concat[idx]
 
-        def val_generator():
-            while True:  # Make generators infinite to reset state between epochs
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with val_holder._lock:
-                    if val_holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = val_holder.concat
-                    true = val_holder.true
-                    false = val_holder.false
+            # Remove cache references to ensure garbage collection in future
+            del concat, true, false
 
-                # Maintain order on each epoch since no gradients are calculated during validation
-                for idx in range(len(concat)):
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
+    def val_generator():
+        while True:  # Make generators infinite to reset state between epochs
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with val_holder._lock:
+                if val_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = val_holder.concat
+                true = val_holder.true
+                false = val_holder.false
 
-                # Remove cache references for future garbage collection
-                del concat, true, false
+            # Maintain order on each epoch since shuffling provides no benefits (no gradients
+            # are calculated during validation)
+            for idx in range(len(concat)):
+                yield (concat[idx], true[idx], false[idx]), concat[idx]
 
-        # Determine dataset output signature
-        sample_shape = train_concat.shape[1:]
-        output_signature = (
-            (
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            ),
+            # Remove cache references to ensure garbage collection in future
+            del concat, true, false
+
+    # Determine dataset output signature
+    sample_shape = train_concat.shape[1:]
+    output_signature = (
+        (
             tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-        )
-
-        # Create datasets using generators to reduce GPU memory pressure
-        # Data is kept on CPU & transferred to GPU in batches on-demand
-        logger.info(
-            f"Creating infinite datasets from generators with per replica batch size - "
-            f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}"
-        )
-
-        train_dataset = (
-            tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
-            .batch(per_replica_batch_size)
-            .repeat()
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        val_dataset = (
-            tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
-            .batch(per_replica_val_batch_size)
-            .repeat()
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        # Distribute datasets across GPUs
-        logger.info(f"Distributing datasets across {num_replicas} GPUs")
-
-        train_dataset = strategy.experimental_distribute_dataset(train_dataset)
-        val_dataset = strategy.experimental_distribute_dataset(val_dataset)
-
-        # Calculate steps
-        train_steps = n_train_trimmed // global_batch_size
-        accumulation_steps = global_batch_size // (per_replica_batch_size * num_replicas)
-        val_steps = n_val_trimmed // (per_replica_val_batch_size * num_replicas)
-
-        return {
-            "train_dataset": train_dataset,
-            "val_dataset": val_dataset,
-            "n_train_trimmed": n_train_trimmed,
-            "n_val_trimmed": n_val_trimmed,
-            "train_steps": train_steps,
-            "accumulation_steps": accumulation_steps,
-            "val_steps": val_steps,
-            "_train_holder": train_holder,
-            "_val_holder": val_holder,
-        }
-
-    else:
-        # Inference case: no train/val split
-        batch_size = per_replica_batch_size * num_replicas
-        n_trimmed = (n_samples // batch_size) * batch_size
-
-        logger.info(f"Data alignment: {n_samples}→{n_trimmed}")
-
-        # Prepare data
-        concat = data["concatenated"][:n_trimmed]
-        true = data["true"][:n_trimmed]
-        false = data["false"][:n_trimmed]
-        holder = DataHolder(concat, true, false)
-
-        # Create generator function for memory-efficient data loading
-        def data_generator():
-            while True:  # Make generator infinite to reset state between passes
-                # Acquire lock to check cleared status and capture data references
-                # Local references keep data alive even if clear() is called mid-epoch
-                with holder._lock:
-                    if holder._cleared:
-                        return  # Exit if data already cleared
-                    # Cache references while holding lock
-                    concat = holder.concat
-                    true = holder.true
-                    false = holder.false
-
-                # Work with local references (safe from clearing, no per-sample lock needed)
-                indices = np.arange(len(concat))
-                if shuffle:
-                    np.random.shuffle(indices)
-                for idx in indices:
-                    yield (concat[idx], true[idx], false[idx]), concat[idx]
-
-                # Remove cache references for future garbage collection
-                del concat, true, false
-
-        # Determine dataset output signature
-        sample_shape = concat.shape[1:]
-        output_signature = (
-            (
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-                tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            ),
             tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+        ),
+        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+    )
+
+    # Create datasets using generators to reduce GPU memory pressure
+    # Data is kept on CPU & transferred to GPU in batches on-demand
+    logger.info(
+        f"Creating infinite datasets from generators with per replica batch size - "
+        f"Train: {per_replica_batch_size}, Val: {per_replica_val_batch_size}"
+    )
+
+    train_dataset = (
+        tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
+        .batch(per_replica_batch_size, drop_remainder=True)
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    val_dataset = (
+        tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
+        .batch(per_replica_val_batch_size, drop_remainder=True)
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Distribute datasets across GPUs
+    logger.info(f"Distributing datasets across {num_replicas} GPUs")
+
+    train_dataset_distributed = strategy.experimental_distribute_dataset(train_dataset)
+    val_dataset_distributed = strategy.experimental_distribute_dataset(val_dataset)
+
+    # Calculate steps
+    train_steps = n_train_trimmed // global_batch_size
+    accumulation_steps = global_batch_size // (per_replica_batch_size * num_replicas)
+    val_steps = n_val_trimmed // global_val_batch_size
+
+    # Sanity check: verify step sizes are valid before returning
+    if train_steps < 1:
+        raise ValueError(
+            f"train_steps < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({global_batch_size})"
+        )
+    if accumulation_steps < 1:
+        raise ValueError(
+            f"accumulation_steps < 1: global_batch_size ({global_batch_size}) must be >= per_replica_batch_size * num_replicas ({per_replica_batch_size} * {num_replicas})"
+        )
+    if val_steps < 1:
+        raise ValueError(
+            f"val_steps < 1: n_val_trimmed ({n_val_trimmed}) must be >= per_replica_val_batch_size * num_replicas ({per_replica_val_batch_size} * {num_replicas})"
         )
 
-        # Create dataset using generator to reduce GPU memory pressure
-        # Data is kept on CPU & transferred to GPU in batches on-demand
-        logger.info(
-            f"Creating infinite dataset from generator with per replica batch size: {per_replica_batch_size}"
+    return {
+        "train_dataset": train_dataset_distributed,
+        "val_dataset": val_dataset_distributed,
+        "n_train_trimmed": n_train_trimmed,
+        "n_val_trimmed": n_val_trimmed,
+        "train_steps": train_steps,
+        "accumulation_steps": accumulation_steps,
+        "val_steps": val_steps,
+        "_train_holder": train_holder,
+        "_val_holder": val_holder,
+    }
+
+
+# NOTE: should we move this to inference.py & import into train.py?
+def prepare_distributed_inf_dataset(
+    data: dict,
+    n_samples: int,
+    per_replica_inf_batch_size: int,
+    num_replicas: int,
+    strategy: tf.distribute.Strategy,
+) -> dict:
+    """
+    Prepare distributed datasets for inference
+
+    Args:
+        data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
+        n_samples: Number of samples in data
+        per_replica_inf_batch_size: Batch size per replica for inference
+        num_replicas: Number of replicas in strategy
+        strategy: TensorFlow distribution strategy
+
+    Returns: {inf_dataset, n_inf_trimmed, inf_steps, _inf_holder}
+             Inference distributed dataset, number of samples, number of steps,
+              and DataHolder reference
+    """
+    global_inf_batch_size = per_replica_inf_batch_size * num_replicas
+
+    # Trim datasets to fit batch sizes (prevents uneven batches on final step)
+    # Note, n_samples should already be divisible by global_batch_size
+    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
+    # distributing our datasets
+    # Alternatively, we could also pad the data instead of trimming
+    n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
+
+    logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
+
+    # Prepare data
+    inf_concat = data["concatenated"][:n_inf_trimmed]
+    inf_true = data["true"][:n_inf_trimmed]
+    inf_false = data["false"][:n_inf_trimmed]
+    inf_holder = DataHolder(inf_concat, inf_true, inf_false)
+
+    # Create generator function for memory-efficient data loading
+    def inf_generator():
+        while True:  # Make generator infinite to reset state between passes
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with inf_holder._lock:
+                if inf_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = inf_holder.concat
+                true = inf_holder.true
+                false = inf_holder.false
+
+            # Maintain order on each epoch since shuffling provides no benefits (no gradients
+            # are calculated during inference)
+            for idx in range(len(concat)):
+                yield (concat[idx], true[idx], false[idx]), concat[idx]
+
+            # Remove cache references for future garbage collection
+            del concat, true, false
+
+    # Determine dataset output signature
+    sample_shape = inf_concat.shape[1:]
+    output_signature = (
+        (
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+        ),
+        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
+    )
+
+    # Create dataset using generator to reduce GPU memory pressure
+    # Data is kept on CPU & transferred to GPU in batches on-demand
+    logger.info(
+        f"Creating infinite dataset from generator with per replica batch size: {per_replica_inf_batch_size}"
+    )
+
+    inf_dataset = (
+        tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
+        .batch(per_replica_inf_batch_size, drop_remainder=True)
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Distribute dataset across GPUs
+    logger.info(f"Distributing dataset across {num_replicas} GPUs")
+
+    inf_dataset_distributed = strategy.experimental_distribute_dataset(inf_dataset)
+
+    # Calculate steps
+    inf_steps = n_inf_trimmed // global_inf_batch_size
+
+    # Sanity check: verify step sizes are valid before returning
+    if inf_steps < 1:
+        raise ValueError(
+            f"inf_steps < 1: n_inf_trimmed ({n_inf_trimmed}) must be >= per_replica_inf_batch_size * num_replicas ({per_replica_inf_batch_size} * {num_replicas})"
         )
 
-        dataset = (
-            tf.data.Dataset.from_generator(data_generator, output_signature=output_signature)
-            .batch(per_replica_batch_size)
-            .repeat()
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        # Distribute dataset across GPUs
-        logger.info(f"Distributing dataset across {num_replicas} GPUs")
-
-        dataset = strategy.experimental_distribute_dataset(dataset)
-
-        # Calculate steps
-        steps = n_trimmed // batch_size
-
-        return {
-            "dataset": dataset,
-            "n_trimmed": n_trimmed,
-            "steps": steps,
-            "_holder": holder,
-        }
+    return {
+        "inf_dataset": inf_dataset_distributed,
+        "n_inf_trimmed": n_inf_trimmed,
+        "inf_steps": inf_steps,
+        "_inf_holder": inf_holder,
+    }
 
 
 class TrainingPipeline:
@@ -596,6 +644,10 @@ class TrainingPipeline:
         self.config = get_config()
         if self.config is None:
             raise ValueError("get_config() returned None")
+
+        self.db = get_db()
+        if self.db is None:
+            raise ValueError("get_db() returned None")
 
         # Initialize data generator
         self.data_generator = DataGenerator(background_data)
@@ -629,27 +681,10 @@ class TrainingPipeline:
 
             raise  # Re-raise to propagate error
 
+        # NOTE: similar to _setup_directories() & archive_directory(), perhaps we need a flag that gets toggled when fault tolerance is triggered, s.t. future reads from the db know to ignore the flagged rows as "archived" from a previous failed training run?
         finally:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
             # since fault tolerance expects a clean directory structure
-
-            # TODO: replace this with db writes? (search for all self.history instances)
-            # Training history
-            self.history = {
-                "loss": [],
-                "reconstruction_loss": [],
-                "kl_loss": [],
-                "true_loss": [],
-                "false_loss": [],
-                "val_loss": [],
-                "val_reconstruction_loss": [],
-                "val_kl_loss": [],
-                "val_true_loss": [],
-                "val_false_loss": [],
-                "learning_rate": [],
-            }
-
-            # Setup directories
             self._setup_directories()
 
             # COMMENTED OUT: Removing TensorBoard support
@@ -754,9 +789,6 @@ class TrainingPipeline:
         initial_snr_range = self.config.training.initial_snr_range
         final_snr_range = self.config.training.final_snr_range
         schedule = self.config.training.curriculum_schedule
-        decay_rate = self.config.training.exponential_decay_rate
-        easy_rounds = self.config.training.step_easy_rounds
-        hard_rounds = self.config.training.step_hard_rounds
 
         # Edge case: use initial snr range if only training for 1 round
         if total_rounds == 1:
@@ -770,6 +802,7 @@ class TrainingPipeline:
             current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
         # Exponential decay - start easy, then get hard quickly
         elif schedule == "exponential":
+            decay_rate = self.config.training.exponential_decay_rate
             # Sanity check: validate decay_rate < 0 to avoid division by zero
             if decay_rate >= 0:
                 raise ValueError(
@@ -783,6 +816,13 @@ class TrainingPipeline:
         # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
         # Step function - easy for first part, hard for second part
         elif schedule == "step":
+            easy_rounds = self.config.training.step_easy_rounds
+            hard_rounds = self.config.training.step_hard_rounds
+            # Sanity check: validate easy_rounds + hard_rounds add up to total_rounds
+            if easy_rounds + hard_rounds != total_rounds:
+                raise ValueError(
+                    f"easy_rounds ({easy_rounds}) + hard_rounds ({hard_rounds}) must equal total_rounds ({total_rounds}), got {easy_rounds + hard_rounds} instead"
+                )
             if round_idx < easy_rounds:
                 current_range = initial_snr_range
             elif round_idx - easy_rounds < hard_rounds:
@@ -802,7 +842,7 @@ class TrainingPipeline:
         """
         Robust adaptive learning rate with multiple safeguards
 
-        Note the following soft constraint:
+        Note the following heuristic:
         min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
           => LR can only reach min_learning_rate during round if above expression is > 0
           => else LR will reset at start of new round before reaching min_learning_rate
@@ -856,6 +896,9 @@ class TrainingPipeline:
         else:
             logger.info(f"Starting training for {n_rounds} rounds")
 
+        # NOTE: this approach doesn't play well with fault tolerance. rethink later
+        self.start_time = time.time()
+
         for round_idx in range(start_round - 1, n_rounds):
             snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
 
@@ -890,11 +933,11 @@ class TrainingPipeline:
 
         # Generate training data
         train_data = self.data_generator.generate_batch(
-            self.config.training.num_samples_beta_vae, snr_base, snr_range
+            self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
         )
 
         # Distribute training data
-        data = prepare_distributed_dataset(
+        data = prepare_distributed_train_dataset(
             data=train_data,
             n_samples=self.config.training.num_samples_beta_vae,
             train_val_split=self.config.training.train_val_split,
@@ -922,20 +965,6 @@ class TrainingPipeline:
         del data
         gc.collect()
 
-        # Sanity check: verify step sizes are valid
-        if accumulation_steps < 1:
-            raise ValueError(
-                f"Accumulation steps < 1: global_batch_size ({self.config.training.global_batch_size}) must be >= per_replica_batch_size * num_replicas ({self.config.training.per_replica_batch_size * self.strategy.num_replicas_in_sync})"
-            )
-        if steps_per_epoch < 1:
-            raise ValueError(
-                f"Steps per epoch < 1: n_train_trimmed ({n_train_trimmed}) must be >= global_batch_size ({self.config.training.global_batch_size})"
-            )
-        if val_steps < 1:
-            raise ValueError(
-                f"Validation steps < 1: n_val_trimmed ({n_val_trimmed}) must be >= per_replica_val_batch_size * num_replicas ({self.config.training.per_replica_val_batch_size * self.strategy.num_replicas_in_sync})"
-            )
-
         logger.info(
             f"Initializing training loop with {steps_per_epoch} train steps, {val_steps} val steps"
         )
@@ -943,17 +972,18 @@ class TrainingPipeline:
 
         try:
             for epoch in range(epochs):
-                # Log resources at start of epoch
                 logger.info(f"{'-' * 30}")
                 logger.info(f"Epoch {epoch + 1}/{epochs} Start")
 
                 # Training
-                epoch_losses = self._train_epoch(train_dataset, steps_per_epoch, accumulation_steps)
+                epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
+                    train_dataset, steps_per_epoch, accumulation_steps, time.time()
+                )
 
                 # Validation
-                val_losses = self._validate_epoch(val_dataset, val_steps)
+                val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
 
-                # Log results
+                # Log results & queue db writes (non-blocking)
                 logger.info(f"Epoch {epoch + 1} Complete")
                 logger.info(
                     f"Train -- Total: {epoch_losses['total']:.4f}, "
@@ -970,30 +1000,101 @@ class TrainingPipeline:
                     f"False: {val_losses['false']:.4f}"
                 )
 
-                # Update history
-                for key, train_key in [
-                    ("loss", "total"),
+                current_time = time.time()
+
+                if self.db is None:
+                    raise RuntimeError(
+                        "No database instance detected - cannot generate training progress plot"
+                    )
+
+                # Training losses
+                for stat_name, key in [
+                    ("total_loss", "total"),
                     ("reconstruction_loss", "reconstruction"),
                     ("kl_loss", "kl"),
                     ("true_loss", "true"),
                     ("false_loss", "false"),
                 ]:
-                    if key not in self.history:
-                        self.history[key] = []
-                    self.history[key].append(float(epoch_losses[train_key]))
-                for key, val_key in [
-                    ("val_loss", "total"),
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=float(epoch_losses[key]),
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
+
+                # Validation losses
+                for stat_name, key in [
+                    ("val_total_loss", "total"),
                     ("val_reconstruction_loss", "reconstruction"),
                     ("val_kl_loss", "kl"),
                     ("val_true_loss", "true"),
                     ("val_false_loss", "false"),
                 ]:
-                    if key not in self.history:
-                        self.history[key] = []
-                    self.history[key].append(float(val_losses[val_key]))
-                self.history["learning_rate"].append(
-                    float(self.vae.optimizer.learning_rate.numpy())
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=float(val_losses[key]),
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
+
+                # Gradient norm/clipping statistics
+                gradient_norm_mean = np.mean(epoch_gradient_norms)
+                gradient_norm_max = np.max(epoch_gradient_norms)
+                gradient_norm_std = np.std(epoch_gradient_norms)
+                clipping_rate = np.sum(np.array(epoch_gradient_norms) > 1.0) / steps_per_epoch
+
+                for stat_name, stat_value in [
+                    ("gradient_norm_mean", gradient_norm_mean),
+                    ("gradient_norm_max", gradient_norm_max),
+                    ("gradient_norm_std", gradient_norm_std),
+                    ("clipping_rate", clipping_rate),
+                ]:
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=float(stat_value),
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
+
+                # Learning rate
+                current_lr = float(self.vae.optimizer.learning_rate.numpy())
+                self.db.write_training_stat(
+                    model_name="beta_vae",
+                    stat_name="learning_rate",
+                    value=current_lr,
+                    round_number=round_idx + 1,
+                    epoch_number=epoch + 1,
+                    tag=self.config.checkpoint.save_tag,
+                    timestamp=current_time,
                 )
+
+                # Misc stats
+                for stat_name, stat_value in [
+                    ("train_duration", train_duration),
+                    ("val_duration", val_duration),
+                    ("snr_range_floor", snr_base),
+                    ("snr_range_ceil", snr_base + snr_range),
+                    ("num_steps", steps_per_epoch),
+                    ("num_sub_steps", accumulation_steps),
+                ]:
+                    self.db.write_training_stat(
+                        model_name="beta_vae",
+                        stat_name=stat_name,
+                        value=stat_value,
+                        round_number=round_idx + 1,
+                        epoch_number=epoch + 1,
+                        tag=self.config.checkpoint.save_tag,
+                        timestamp=current_time,
+                    )
 
                 # COMMENTED OUT: Removing TensorBoard support
                 # TensorBoard logging
@@ -1038,16 +1139,27 @@ class TrainingPipeline:
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
 
-                # Log resources at end of epoch
                 logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
-            # Save checkpoint
-            self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+            # Flush database to ensure all training stats are written before plotting
+            if self.db is not None:
+                logger.info("Flushing database before plotting...")
+                self.db.flush()
 
             # Plot progress
             self.plot_beta_vae_training_progress(
                 tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
             )
+
+            # Plot injection stats
+            self.plot_injection_stats(
+                tag=f"round_{round_idx + 1:02d}",
+                dir="checkpoints",
+                round_number=round_idx + 1,
+            )
+
+            # Save checkpoint
+            self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
         except Exception as e:
             logger.error(f"Error in train_round(): {e}")
@@ -1055,6 +1167,7 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
+            # NOTE: should check to make sure holders & datasets exist first
             # Clear intermediate data
             train_holder.clear()
             val_holder.clear()
@@ -1071,11 +1184,15 @@ class TrainingPipeline:
 
             gc.collect()
 
-    def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1):
+    def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1, start_time=None):
         """
         Perform a single training epoch with gradient accumulation
         """
+        if not start_time:
+            start_time = time.time()
+
         epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
+        epoch_gradient_norms = []
         iterator = iter(dataset)
 
         try:
@@ -1100,6 +1217,7 @@ class TrainingPipeline:
                         # Compute gradients & losses
                         micro_grads, micro_losses = self._distributed_train_step(micro_batch)
 
+                        # NOTE: come back to this later (any or all?)
                         # Sanity check: verify gradients are valid before accumulating
                         if micro_grads is None or all(g is None for g in micro_grads):
                             logger.warning(
@@ -1113,6 +1231,7 @@ class TrainingPipeline:
                             accumulated_gradients = micro_grads
                         else:
                             accumulated_gradients = [
+                                # NOTE: come back to this later (what if ag and g are both None)
                                 ag + g if ag is not None and g is not None else ag or g
                                 for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
                             ]
@@ -1160,12 +1279,14 @@ class TrainingPipeline:
                     raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
                 # Apply accumulated gradients
-                self._apply_gradients(accumulated_gradients)
+                global_norm = self._apply_gradients(accumulated_gradients)
+                epoch_gradient_norms.append(float(global_norm))
 
                 for key, loss in step_losses.items():
                     # Average step losses over sub-steps
                     avg_loss = loss / successful_accumulations
                     step_losses[key] = avg_loss
+                    # Accumulate epoch losses over training steps
                     epoch_losses[key] += avg_loss
 
                 # Log progress every 10 steps
@@ -1176,14 +1297,18 @@ class TrainingPipeline:
                         f"Recon: {step_losses['reconstruction']:.4f}, "
                         f"KL: {step_losses['kl']:.4f}, "
                         f"True: {step_losses['true']:.4f}, "
-                        f"False: {step_losses['false']:.4f}"
+                        f"False: {step_losses['false']:.4f}, "
+                        f"Gradient norm: {global_norm:.4f} "
                     )
 
             # Average epoch losses over training steps
             for key in epoch_losses:
                 epoch_losses[key] /= steps_per_epoch
 
-            return epoch_losses
+            # Calculate train epoch duration
+            train_duration = time.time() - start_time
+
+            return epoch_losses, epoch_gradient_norms, train_duration
 
         except Exception as e:
             logger.error(f"Error in _train_epoch(): {e}")
@@ -1191,21 +1316,28 @@ class TrainingPipeline:
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
+            # NOTE: should check to make sure iterator exist first
             del iterator
             gc.collect()
 
-    def _validate_epoch(self, dataset, steps):
+    def _validate_epoch(self, dataset, steps, start_time=None):
         """
         Perform a single validation epoch
         """
+        if not start_time:
+            start_time = time.time()
+
         val_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
         iterator = iter(dataset)
 
         try:
             for _step in range(steps):
                 batch = next(iterator)
+
+                # Compute losses
                 step_losses = self._distributed_val_step(batch)
 
+                # Accumulate validation losses over validation steps
                 for key in val_losses:
                     val_losses[key] += step_losses[key]
 
@@ -1213,7 +1345,10 @@ class TrainingPipeline:
             for key in val_losses:
                 val_losses[key] /= steps
 
-            return val_losses
+            # Calculate val epoch duration
+            val_duration = time.time() - start_time
+
+            return val_losses, val_duration
 
         except Exception as e:
             logger.error(f"Error in _validate_epoch(): {e}")
@@ -1221,6 +1356,7 @@ class TrainingPipeline:
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
+            # NOTE: should check to make sure iterator exist first
             del iterator
             gc.collect()
 
@@ -1245,11 +1381,8 @@ class TrainingPipeline:
                     main_data, true_data, false_data, y, training=True
                 )
 
-                # Scale loss by num_replicas for gradient averaging
-                scaled_loss = losses["total_loss"] / tf.cast(num_replicas, tf.float32)
-
             # Compute gradients
-            gradients = tape.gradient(scaled_loss, self.vae.trainable_variables)
+            gradients = tape.gradient(losses["total_loss"], self.vae.trainable_variables)
 
             return gradients, losses
 
@@ -1289,14 +1422,37 @@ class TrainingPipeline:
     @tf.function
     def _apply_gradients(self, gradients):
         """
-        Clip & apply gradients
+        Apply gradients after gradient clipping by global L2 norm
         """
         # Clip gradients for additional stability
-        clipped_gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        # Note, this step is optional but recommended given our beta-VAE architecture's
+        # heterogeneous gradient scale (reconstruction + KL loss components)
+        # Gradient clipping computes the global L2 norm across all gradient tensors, then rescales
+        # them proportionally if that norm exceeds some clip_norm threshold. This preserves the
+        # relative direction of the gradient vector in parameter space while simultaneously bounding
+        # its magnitude, maintaining the optimization trajectory's direction, which is critical for
+        # training stability
+        # Alternatively, per-tensor clipping (with tf.clip_by_norm() on each gradient independently)
+        # could also work, but may distort the gradient direction (parameters with smaller gradients
+        # get disproportionately boosted relative to those with larger gradients). Only use if you
+        # need layer-specific interventions (e.g. lower LR for encoder, or gradient clipping
+        # per-component, etc.)
+        # The 1.0 threshold was chosen to be aggressive enough to prevent exploding gradients, while
+        # permissive enough to not overly dampen learning. Healthy training should progress with
+        # global_norm consistently below clip_norm, with the occasional instability (e.g. due to bad
+        # batches, or KL spikes) getting caught & dampened. If you notice global_norm consistently
+        # exceeding clip_norm, even with adaptive LR in place, consider increasing clip_norm to
+        # allow more of the true gradients to pass through. A general heuristic for clip_norm is to
+        # have no more than 1-5% of steps trigger gradient clipping
+        clipped_gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
+
         # Apply gradients
         self.vae.optimizer.apply_gradients(
             zip(clipped_gradients, self.vae.trainable_variables, strict=False)
         )
+
+        # Return pre-clipping global norm (for monitoring)
+        return global_norm
 
     @tf.function
     def _distributed_val_step(self, batch_data):
@@ -1343,6 +1499,8 @@ class TrainingPipeline:
 
         return reduced_losses
 
+    # NOTE: write what to db?
+    # NOTE: move some of the latent generation functionality to inference.py & import into train.py instead?
     def train_random_forest(self):
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
@@ -1403,34 +1561,30 @@ class TrainingPipeline:
         rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
 
         # Prepare distributed dataset for inference
-        results = prepare_distributed_dataset(
+        results = prepare_distributed_inf_dataset(
             data=rf_data,
             n_samples=n_samples,
-            train_val_split=None,
-            per_replica_batch_size=self.config.training.per_replica_val_batch_size,
-            global_batch_size=None,
-            per_replica_val_batch_size=None,
+            per_replica_inf_batch_size=self.config.inference.per_replica_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
-            shuffle=False,  # Deterministic latent generation
         )
 
         del rf_data
         gc.collect()
 
-        dataset = results["dataset"]
-        n_trimmed = results["n_trimmed"]
-        steps = results["steps"]
-        holder = results["_holder"]
+        inf_dataset = results["inf_dataset"]
+        n_inf_trimmed = results["n_inf_trimmed"]
+        inf_steps = results["inf_steps"]
+        inf_holder = results["_inf_holder"]
 
         del results
         gc.collect()
 
-        logger.info(f"Generating latents for {n_trimmed} samples using distributed inference")
+        logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
 
         # Pre-allocate latent arrays
-        true_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
-        false_latents = np.empty((n_trimmed * num_observations, latent_dim), dtype=np.float32)
+        true_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
+        false_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
 
         # Create distributed inference function
         @tf.function
@@ -1460,11 +1614,11 @@ class TrainingPipeline:
             return per_replica_true, per_replica_false
 
         # Process all batches
-        iterator = iter(dataset)
+        iterator = iter(inf_dataset)
         current_idx = 0
 
         try:
-            for step in range(steps):
+            for step in range(inf_steps):
                 batch = next(iterator)
 
                 # Get per-replica latents for this batch
@@ -1486,8 +1640,8 @@ class TrainingPipeline:
                 current_idx += batch_latent_size
 
                 # Log progress
-                if (step + 1) % 10 == 0 or (step + 1) == steps:
-                    logger.info(f"Generated latents for step {step + 1}/{steps}")
+                if (step + 1) % 10 == 0 or (step + 1) == inf_steps:
+                    logger.info(f"Generated latents for step {step + 1}/{inf_steps}")
 
                 del per_replica_true, true_results, true_batch_np
                 del per_replica_false, false_results, false_batch_np
@@ -1503,11 +1657,13 @@ class TrainingPipeline:
             raise  # Re-raise to propagate error
 
         finally:
+            # NOTE: should check to make sure iterator exist first
             del iterator
 
+            # NOTE: should check to make sure holder & dataset exist first
             # Clear intermediate data
-            holder.clear()
-            del dataset
+            inf_holder.clear()
+            del inf_dataset
 
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
@@ -1517,17 +1673,66 @@ class TrainingPipeline:
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
 
+            # NOTE: should check to make sure arrays exist first
             del true_latents, false_latents
             gc.collect()
 
     # TODO: visualize SNR range in training progress plot
+    # TODO: visualize gradient stats in separate plot (subplot?) -> main: clipping_rate, secondary: mean, max, std
     def plot_beta_vae_training_progress(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        machine_name = socket.gethostname()
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
 
+        current_time = time.time()
+
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate training progress plot"
+            )
+
+        # NOTE: how to handle retries under current implementation?
+        # Query training stats from database
+        all_stats = self.db.query_training_stat(
+            model_name="beta_vae",
+            start_round_number=1,  # NOTE: come back to this later (is this correct? what about fault tolerance?)
+            tag=self.config.checkpoint.save_tag,  # The query tag is different from the input arg tag
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        if not all_stats:
+            logger.warning("No training progress data to plot")
+            return
+
+        # TODO: potential memory optimization here with array pre-allocation? is there a way to just use the all_stats dict directly? is the potential improvement worth the effort?
+        # Group query results by stat_name
+        raw_history = {}
+        for stat in all_stats:
+            key = stat["stat_name"]
+            if key not in raw_history:
+                raw_history[key] = []
+            # Store (round, epoch, value) tuple for later sorting
+            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+
+        del all_stats
+        gc.collect()
+
+        # Sort by (round, epoch) and extract just the values
+        history = {}
+        for key, values in raw_history.items():
+            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))  # Sort by round, epoch
+            history[key] = [v[2] for v in sorted_values]  # Extract just the values
+
+        del raw_history
+        gc.collect()
+
+        epochs = range(1, len(history.get("total_loss", [])) + 1)
+
+        # Create figure & setup gridspec
         fig = plt.figure(figsize=(25, 12))
         gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
@@ -1544,24 +1749,22 @@ class TrainingPipeline:
             f"Beta-VAE Training Progress ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
-        epochs = range(1, len(self.history.get("loss", [])) + 1)
-
         # Helper function to plot dual y-axis
         def plot_dual_axis(ax, title, train_key, val_key):
             # Create secondary y-axis for learning rate
             ax2 = ax.twinx()
 
             # Plot train and validation on left y-axis
-            if train_key in self.history and self.history[train_key]:
-                ax.plot(epochs, self.history[train_key], color="blue", label="train", linewidth=2)
-            if val_key in self.history and self.history[val_key]:
-                ax.plot(epochs, self.history[val_key], color="orange", label="val", linewidth=2)
+            if train_key in history and history[train_key]:
+                ax.plot(epochs, history[train_key], color="blue", label="train", linewidth=2)
+            if val_key in history and history[val_key]:
+                ax.plot(epochs, history[val_key], color="orange", label="val", linewidth=2)
 
             # Plot learning rate on right y-axis
-            if "learning_rate" in self.history and self.history["learning_rate"]:
+            if "learning_rate" in history and history["learning_rate"]:
                 ax2.plot(
                     epochs,
-                    self.history["learning_rate"],
+                    history["learning_rate"],
                     color="grey",
                     label="learning rate",
                     linewidth=1,
@@ -1570,14 +1773,14 @@ class TrainingPipeline:
                 )
 
             ax.set_title(title, fontsize=14, fontweight="bold")
-            ax.set_xlabel("Epoch", fontsize=14, fontweight="bold")
+            ax.set_xlabel("Epoch", fontsize=12, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
             ax.tick_params(axis="both", labelsize=12)
             ax2.tick_params(axis="y", labelcolor="grey", labelsize=12)
 
         # Top subplot - Total Loss
-        plot_dual_axis(ax_top, "Total Loss", "loss", "val_loss")
+        plot_dual_axis(ax_top, "Total Loss", "total_loss", "val_total_loss")
 
         # Bottom subplots
         plot_dual_axis(
@@ -1598,7 +1801,7 @@ class TrainingPipeline:
             handles=[train_line, val_line, lr_line],
             loc="upper right",
             bbox_to_anchor=(0.98, 0.98),
-            fontsize=14,
+            fontsize=12,
             frameon=True,
             fancybox=True,
             shadow=True,
@@ -1626,6 +1829,609 @@ class TrainingPipeline:
         plt.close()
 
         logger.info(f"Beta-VAE training progress plot saved to: {save_path}")
+
+    def plot_injection_stats(
+        self,
+        tag: str | None = None,
+        dir: str | None = None,
+        round_number: int | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> None:
+        """
+        Plot injection statistics for bias/leakage detection.
+
+        Generates 7 figures:
+        - 4 intensity histograms (one per signal_type)
+        - 1 signal characteristics (ETI vs RFI)
+        - 1 stage transition scatter plots
+        - 1 per-signal-type box plots
+
+        Args:
+            tag: Plot tag for filename (defaults to save_tag)
+            dir: Subdirectory (e.g., "checkpoints" for per-round)
+            round_number: Filter to specific round (None = all rounds)
+            start_time: Start timestamp for query bounds (defaults to self.start_time)
+            end_time: End timestamp for query bounds (defaults to current time)
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        # Set time bounds for queries to current training session
+        if start_time is None:
+            start_time = getattr(self, "start_time", None)
+        if end_time is None:
+            end_time = time.time()
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate injection stats plot"
+            )
+
+        # Determine save directory
+        if dir is not None:
+            save_dir = os.path.join(self.config.output_path, "plots", dir)
+        else:
+            save_dir = os.path.join(self.config.output_path, "plots")
+        os.makedirs(save_dir, exist_ok=True)
+
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stages = ["A", "B", "C"]
+
+        # Figure 1-4: Intensity histograms per signal_type
+        for signal_type in signal_types:
+            stats_by_stage = {stage: {} for stage in stages}
+
+            for stat_name in intensity_stats:
+                for stage in stages:
+                    results = self.db.query_injection_stat(
+                        stat_name=stat_name,
+                        injection_stage=stage,
+                        signal_type=signal_type,
+                        start_round_number=1 if round_number is None else round_number,
+                        end_round_number=round_number,
+                        tag=self.config.checkpoint.save_tag,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                    stats_by_stage[stage][stat_name] = [r["value"] for r in results]
+                    del results
+
+            # Generate plot for this signal_type
+            save_path = os.path.join(save_dir, f"injection_stats_intensity_{signal_type}_{tag}.png")
+            self._plot_intensity_histograms_for_type(
+                stats_by_stage, signal_type, tag, machine_name, save_path
+            )
+
+            del stats_by_stage
+            gc.collect()
+
+        # Figure 5: Signal characteristics (ETI vs RFI)
+        signal_stats = [
+            "snr",
+            "drift_rate",
+            "signal_width",
+            "starting_bin",
+            "slope_pixel",
+            "y_intercept",
+        ]
+        eti_stats = {}
+        rfi_stats = {}
+
+        for stat_name in signal_stats:
+            # Query ETI stats (from true_only_eti and true_eti_rfi)
+            eti_results = []
+            for st in ["true_only_eti", "true_eti_rfi"]:
+                results = self.db.query_injection_stat(
+                    stat_name=f"eti_{stat_name}",
+                    signal_type=st,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                eti_results.extend([r["value"] for r in results])
+                del results
+            eti_stats[stat_name] = eti_results
+
+            # Query RFI stats (from false_with_rfi and true_eti_rfi)
+            rfi_results = []
+            for st in ["false_with_rfi", "true_eti_rfi"]:
+                results = self.db.query_injection_stat(
+                    stat_name=f"rfi_{stat_name}",
+                    signal_type=st,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                rfi_results.extend([r["value"] for r in results])
+                del results
+            rfi_stats[stat_name] = rfi_results
+
+        save_path = os.path.join(save_dir, f"injection_stats_signals_{tag}.png")
+        self._plot_signal_characteristics(eti_stats, rfi_stats, tag, machine_name, save_path)
+
+        del eti_stats, rfi_stats
+        gc.collect()
+
+        # Figure 6: Stage transitions (A→B scatter plots)
+        transitions = {stat_name: {} for stat_name in intensity_stats}
+
+        for stat_name in intensity_stats:
+            for signal_type in signal_types:
+                # Query stage A values
+                results_a = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="A",
+                    signal_type=signal_type,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                values_a = [r["value"] for r in results_a]
+                del results_a
+
+                # Query stage B values
+                results_b = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="B",
+                    signal_type=signal_type,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                values_b = [r["value"] for r in results_b]
+                del results_b
+
+                transitions[stat_name][signal_type] = (values_a, values_b)
+
+        save_path = os.path.join(save_dir, f"injection_stats_transitions_{tag}.png")
+        self._plot_stage_transitions(transitions, tag, machine_name, save_path)
+
+        del transitions
+        gc.collect()
+
+        # Figure 7: Per-signal-type box plots at Stage C
+        stats_by_type = {signal_type: {} for signal_type in signal_types}
+
+        for signal_type in signal_types:
+            for stat_name in intensity_stats:
+                results = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="C",
+                    signal_type=signal_type,
+                    start_round_number=1 if round_number is None else round_number,
+                    end_round_number=round_number,
+                    tag=self.config.checkpoint.save_tag,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
+                del results
+
+        save_path = os.path.join(save_dir, f"injection_stats_boxplots_{tag}.png")
+        self._plot_signal_type_boxplots(stats_by_type, tag, machine_name, save_path)
+
+        del stats_by_type
+        gc.collect()
+
+        logger.info(f"Injection stats plots saved to: {save_dir}")
+
+    def _plot_intensity_histograms_for_type(
+        self,
+        stats_by_stage: dict[str, dict[str, list[float]]],
+        signal_type: str,
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 intensity histogram grid for one signal_type."""
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
+        stage_colors = {"A": "blue", "B": "orange", "C": "green"}
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"{signal_type} Global Intensities ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(intensity_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            # Plot stages A and B on primary axis (pre-normalization scale)
+            for stage in ["A", "B"]:
+                data = stats_by_stage[stage].get(stat_name, [])
+                if data:
+                    ax.hist(
+                        data,
+                        bins=50,
+                        alpha=0.25,
+                        color=stage_colors[stage],
+                        edgecolor=stage_colors[stage],
+                        linewidth=1.5,
+                        histtype="stepfilled",
+                    )
+
+            # Create twin x-axis for stage C (post-normalization scale [0,1])
+            ax2 = ax.twiny()
+            data_c = stats_by_stage["C"].get(stat_name, [])
+            if data_c:
+                ax2.hist(
+                    data_c,
+                    bins=50,
+                    alpha=0.25,
+                    color=stage_colors["C"],
+                    edgecolor=stage_colors["C"],
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
+
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
+            ax.set_xlabel("Pre-norm (A, B)", fontsize=9, color="darkblue")
+            ax.set_ylabel("Count", fontsize=10)
+            ax.tick_params(axis="x", colors="darkblue")
+            ax2.set_xlabel("Post-norm (C)", fontsize=9, color="darkgreen")
+            ax2.tick_params(axis="x", colors="darkgreen")
+            ax.grid(True, alpha=0.3)
+
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D(
+                [], [], color=stage_colors["A"], linewidth=4, alpha=0.5, label="Stage A (pre-inj)"
+            ),
+            mlines.Line2D(
+                [], [], color=stage_colors["B"], linewidth=4, alpha=0.5, label="Stage B (post-inj)"
+            ),
+            mlines.Line2D(
+                [], [], color=stage_colors["C"], linewidth=4, alpha=0.5, label="Stage C (post-norm)"
+            ),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])  # Leave room for legend on right
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Intensity histogram plot saved: {save_path}")
+
+    def _plot_signal_characteristics(
+        self,
+        eti_stats: dict[str, list[float]],
+        rfi_stats: dict[str, list[float]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 signal characteristics grid."""
+        signal_stats = [
+            "snr",
+            "drift_rate",
+            "signal_width",
+            "starting_bin",
+            "slope_pixel",
+            "y_intercept",
+        ]
+        stat_display_names = {
+            "snr": "SNR",
+            "drift_rate": "Drift Rate (Hz/s)",
+            "signal_width": "Signal Width (Hz)",
+            "starting_bin": "Starting Bin",
+            "slope_pixel": "Slope (px)",
+            "y_intercept": "Y-Intercept",
+        }
+        signal_colors = {"ETI": "blue", "RFI": "orange"}
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Injected Signal Characteristics ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(signal_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            eti_data = eti_stats.get(stat_name, [])
+            rfi_data = rfi_stats.get(stat_name, [])
+
+            if eti_data:
+                ax.hist(
+                    eti_data,
+                    bins=50,
+                    alpha=0.25,
+                    color=signal_colors["ETI"],
+                    edgecolor=signal_colors["ETI"],
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
+            if rfi_data:
+                ax.hist(
+                    rfi_data,
+                    bins=50,
+                    alpha=0.25,
+                    color=signal_colors["RFI"],
+                    edgecolor=signal_colors["RFI"],
+                    linewidth=1.5,
+                    histtype="stepfilled",
+                )
+
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
+            ax.set_ylabel("Count", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D([], [], color=signal_colors["ETI"], linewidth=4, alpha=0.5, label="ETI"),
+            mlines.Line2D([], [], color=signal_colors["RFI"], linewidth=4, alpha=0.5, label="RFI"),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.92, 1])  # Leave room for legend on right
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Signal characteristics plot saved: {save_path}")
+
+    def _plot_stage_transitions(
+        self,
+        transitions: dict[str, dict[str, tuple[list, list]]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 scatter plot grid showing A→B transitions."""
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        type_colors = {
+            "false_no_signal": "blue",
+            "false_with_rfi": "orange",
+            "true_only_eti": "green",
+            "true_eti_rfi": "red",
+        }
+        type_display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"A→B Global Intensity Biases ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(intensity_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            all_values = []
+            for signal_type in signal_types:
+                values_a, values_b = transitions[stat_name].get(signal_type, ([], []))
+                if values_a and values_b:
+                    # Ensure equal length (take minimum)
+                    min_len = min(len(values_a), len(values_b))
+                    values_a = values_a[:min_len]
+                    values_b = values_b[:min_len]
+                    all_values.extend(values_a)
+                    all_values.extend(values_b)
+                    ax.scatter(
+                        values_a,
+                        values_b,
+                        alpha=0.15,
+                        facecolor=type_colors[signal_type],
+                        edgecolor=type_colors[signal_type],
+                        linewidth=0.3,
+                        s=12,
+                    )
+
+            # Add diagonal reference line
+            if all_values:
+                min_val, max_val = min(all_values), max(all_values)
+                ax.plot([min_val, max_val], [min_val, max_val], "k--", alpha=0.5, linewidth=1)
+
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
+            ax.set_xlabel("Stage A", fontsize=10)
+            ax.set_ylabel("Stage B", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mlines.Line2D(
+                [],
+                [],
+                marker="o",
+                color="w",
+                markerfacecolor=type_colors[st],
+                markersize=8,
+                alpha=0.7,
+                label=type_display_names[st],
+            )
+            for st in signal_types
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=9,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])  # Leave room for legend on right
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Stage transitions plot saved: {save_path}")
+
+    def _plot_signal_type_boxplots(
+        self,
+        stats_by_type: dict[str, dict[str, list[float]]],
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """Generate 2x3 box plot grid comparing signal types at Stage C."""
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        type_colors = {
+            "false_no_signal": "blue",
+            "false_with_rfi": "orange",
+            "true_only_eti": "green",
+            "true_eti_rfi": "red",
+        }
+        type_display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(
+            f"Final Global Intensity Biases ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        for idx, stat_name in enumerate(intensity_stats):
+            row, col = idx // 3, idx % 3
+            ax = axes[row, col]
+
+            box_data = []
+            for signal_type in signal_types:
+                data = stats_by_type[signal_type].get(stat_name, [])
+                box_data.append(data if data else [0])  # Use [0] if empty to avoid error
+
+            # Horizontal box plots with colors
+            bp = ax.boxplot(
+                box_data,
+                vert=False,
+                patch_artist=True,
+                tick_labels=[""] * len(signal_types),  # No y-axis labels, use legend instead
+            )
+
+            # Color each box
+            for patch, signal_type in zip(bp["boxes"], signal_types, strict=True):
+                patch.set_facecolor(type_colors[signal_type])
+                patch.set_alpha(0.6)
+
+            ax.set_title(
+                stat_display_names.get(stat_name, stat_name), fontsize=12, fontweight="bold"
+            )
+            ax.set_xlabel("Value", fontsize=10)
+            ax.grid(True, alpha=0.3, axis="x")
+
+        # Create legend handles for figure-level legend
+        legend_handles = [
+            mpatches.Patch(facecolor=type_colors[st], alpha=0.6, label=type_display_names[st])
+            for st in signal_types
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=9,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])  # Leave room for legend on right
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Signal type box plots saved: {save_path}")
 
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
@@ -1746,30 +2552,65 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
     Returns:
         Trained pipeline object
     """
-    # Create pipeline
-    pipeline = TrainingPipeline(background_data, strategy)
+    try:
+        # Create pipeline (no cleanup needed on failure)
+        pipeline = TrainingPipeline(background_data, strategy)
+    except Exception as e:
+        logger.error(f"Error creating TrainingPipeline: {e}")
+        raise  # Re-raise to propagate error
 
     try:
-        # Train beta-VAE
-        pipeline.train_beta_vae()
+        try:
+            # Train beta-VAE
+            pipeline.train_beta_vae()
+        except Exception as e:
+            logger.error(f"Error in train_beta_vae(): {e}")
+            raise  # Re-raise to propagate error
 
-        # Train Random Forest
-        pipeline.train_random_forest()
+        try:
+            # Flush database to ensure all training stats are written before final plot
+            if pipeline.db is not None:
+                logger.info("Flushing database before final plot...")
+                pipeline.db.flush()
 
-        # Save final models
-        pipeline.save_models()
+            # Plot training progress
+            pipeline.plot_beta_vae_training_progress()
 
-        # Final plot
-        pipeline.plot_beta_vae_training_progress()
+            # Plot injection stats (all rounds cumulative)
+            pipeline.plot_injection_stats()
+        except Exception as e:
+            logger.error(f"Error in plotting: {e}")
+            raise  # Re-raise to propagate error
+
+        try:
+            # Train Random Forest
+            pipeline.train_random_forest()
+        except Exception as e:
+            logger.error(f"Error in train_random_forest(): {e}")
+            # Attempt to save models on RF training failure
+            pipeline.rf_model = None  # Avoid saving incomplete RF model state
+            _safe_call(pipeline.save_models, "save_models")
+            raise  # Re-raise to propagate error
+
+        try:
+            # Save final models
+            pipeline.save_models()
+        except Exception as e:
+            logger.error(f"Error in save_models(): {e}")
+            raise  # Re-raise to propagate error
 
         logger.info("Training complete!")
 
         return pipeline
 
-    except Exception as e:
-        logger.error(f"Error in train_full_pipeline(): {e}")
-        raise  # Re-raise to propagate error
-
     finally:
-        # Free shared resources before exiting
+        # Free shared resources on exit
         pipeline.data_generator.close()
+
+
+def _safe_call(func: Callable, name: str, args: tuple | None = None) -> None:
+    """Best-effort execution during error cleanup."""
+    try:
+        func(*args) if args else func()
+    except Exception as e:
+        logger.warning(f"Failed to execute {name} during cleanup: {e}")

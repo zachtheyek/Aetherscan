@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 import os
-import socket
 import subprocess
 import threading
 import time
@@ -30,8 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # BUG:
-# system total CPU usage appears "unnormalized" compared to process + children CPU usage
-# process + children CPU & RAM sometimes exceeds system total
+# system total CPU usage appears "unnormalized" compared to aetherscan CPU usage (aetherscan CPU & RAM sometimes exceeds system total)
 # https://github.com/zachtheyek/Aetherscan/issues/12
 def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
     """
@@ -317,17 +316,17 @@ class ResourceMonitor:
 
                 # Get system resources & queue db writes (non-blocking)
                 self.db.write_system_resource(
-                    "cpu",
-                    "system_total",
-                    psutil.cpu_percent(interval=0.1),
+                    resource_type="cpu",
+                    resource_name="system_total",
+                    value=psutil.cpu_percent(interval=0.1),
                     unit="percent",
                     tag=self.tag,
                     timestamp=current_time,
                 )
                 self.db.write_system_resource(
-                    "ram",
-                    "system_total",
-                    psutil.virtual_memory().percent,
+                    resource_type="ram",
+                    resource_name="system_total",
+                    value=psutil.virtual_memory().percent,
                     unit="percent",
                     tag=self.tag,
                     timestamp=current_time,
@@ -335,17 +334,17 @@ class ResourceMonitor:
 
                 cpu_process, ram_process = self._get_process_tree_stats()
                 self.db.write_system_resource(
-                    "cpu",
-                    "process_tree",
-                    cpu_process,
+                    resource_type="cpu",
+                    resource_name="process_tree",
+                    value=cpu_process,
                     unit="percent",
                     tag=self.tag,
                     timestamp=current_time,
                 )
                 self.db.write_system_resource(
-                    "ram",
-                    "process_tree",
-                    ram_process,
+                    resource_type="ram",
+                    resource_name="process_tree",
+                    value=ram_process,
                     unit="percent",
                     tag=self.tag,
                     timestamp=current_time,
@@ -361,17 +360,17 @@ class ResourceMonitor:
                         else f"GPU:{gpu_idx}"
                     )
                     self.db.write_system_resource(
-                        "gpu",
-                        f"{gpu_name}_utilization",
-                        gpu_util,
+                        resource_type="gpu",
+                        resource_name=f"{gpu_name}_utilization",
+                        value=gpu_util,
                         unit="percent",
                         tag=self.tag,
                         timestamp=current_time,
                     )
                     self.db.write_system_resource(
-                        "gpu",
-                        f"{gpu_name}_memory",
-                        gpu_mem,
+                        resource_type="gpu",
+                        resource_name=f"{gpu_name}_memory",
+                        value=gpu_mem,
                         unit="percent",
                         tag=self.tag,
                         timestamp=current_time,
@@ -397,6 +396,7 @@ class ResourceMonitor:
             raise RuntimeError("No database instance detected - cannot generate resource plot")
 
         all_resources = self.db.query_system_resource(
+            tag=self.tag,
             start_time=self.start_time,
             end_time=current_time,
         )
@@ -405,8 +405,7 @@ class ResourceMonitor:
             logger.warning("No resource monitoring data to plot")
             return
 
-        # TODO: potential memory optimization here with array pre-allocation?
-        # TODO: or instead of extracting dict -> ndarray|dict, just use dict directly?
+        # TODO: potential memory optimization here with array pre-allocation? or instead of extracting dict -> ndarray|dict, just use dict directly? is the potential improvement worth the effort?
         # Organize resources by type and name
         timestamps_dict = {}
         values_dict = {}
@@ -458,7 +457,13 @@ class ResourceMonitor:
 
         # Create figure with 3 subplots
         fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
-        machine_name = socket.gethostname()
+
+        # Late import to avoid circular dependency (db imports from manager)
+        from aetherscan.db import get_system_metadata  # noqa: PLC0415
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
         fig.suptitle(
             f"Aetherscan Pipeline: Resource Utilization ({self.tag}, {machine_name})",
             fontsize=16,
@@ -473,7 +478,7 @@ class ResourceMonitor:
                 cpu_process_data,
                 color="#1f77b4",
                 linewidth=1.5,
-                label="Process + Children",
+                label="Aetherscan",
                 alpha=0.8,
             )
             ax_cpu.fill_between(
@@ -505,7 +510,7 @@ class ResourceMonitor:
                 ram_process_data,
                 color="#2ca02c",
                 linewidth=1.5,
-                label="Process + Children",
+                label="Aetherscan",
                 alpha=0.8,
             )
             ax_ram.fill_between(

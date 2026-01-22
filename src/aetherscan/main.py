@@ -26,6 +26,7 @@ from aetherscan.train import get_latest_tag, train_full_pipeline
 logger = logging.getLogger(__name__)
 
 
+# NOTE: split this into strategy.py? have config option & cli flag to set single-GPU, multi-GPU, multi-node strategy. test thoroughly for each option
 def setup_gpu_strategy():
     """Configure GPU memory growth, memory limits, multi-GPU strategy with load balancing & async allocator"""
 
@@ -142,6 +143,7 @@ def train_command():
             logger.info("Training interrupted by user")
             raise
 
+        # NOTE: fault tolerance currently only accounts for beta-vae training failure. what about cases when train_random_forest fails and we wish to resume from there? should we add a check where if new round number is greater than specified rounds, skip directly to train RF? how would this look like? what about when save_models or plot_beta_vae_training_progress fails?
         except Exception as e:
             logger.error(f"Training attempt {attempt + 1} failed with error: {e}")
 

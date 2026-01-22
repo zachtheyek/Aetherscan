@@ -21,6 +21,7 @@ class DBConfig:
     write_interval: float = 5.0  # seconds
     write_buffer_max_size: int = 100  # records
     write_retry_delay: float = 1.0  # seconds
+    flush_timeout: float = 10.0  # seconds
 
 
 @dataclass
@@ -120,13 +121,12 @@ class TrainingConfig:
     num_training_rounds: int = 20
     epochs_per_round: int = 150
 
-    num_samples_beta_vae: int = 500000
-    num_samples_rf: int = 100000
+    num_samples_beta_vae: int = 491520
+    num_samples_rf: int = 98304
     train_val_split: float = 0.8
 
-    # TODO: find optimal per replica train batch size for 4 or 6 A4000s (128 or 256?) (does 256 trigger GPU OOM?)
     per_replica_batch_size: int = 128
-    global_batch_size: int = 4096  # Effective batch size for gradient accumulation
+    global_batch_size: int = 3072  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 4096
 
     signal_injection_chunk_size: int = (
@@ -154,14 +154,16 @@ class TrainingConfig:
     retry_delay: int = 60  # seconds
 
 
-# NOTE: come back to this later
 @dataclass
 class InferenceConfig:
     """Inference configuration"""
 
-    classification_threshold: float = 0.5
-    batch_size: int = 4048
-    max_drift_rate: float = 10.0  # Hz/s
+    per_replica_batch_size: int = 4096
+
+    # NOTE: come back to this later
+    # classification_threshold: float = 0.5
+    # batch_size: int = 4048
+    # max_drift_rate: float = 10.0  # Hz/s
     # overlap search
 
 
@@ -291,6 +293,7 @@ class Config:
                 "write_interval": self.db.write_interval,
                 "write_buffer_max_size": self.db.write_buffer_max_size,
                 "write_retry_delay": self.db.write_retry_delay,
+                "flush_timeout": self.db.flush_timeout,
             },
             "manager": {
                 "n_processes": self.manager.n_processes,
@@ -359,9 +362,11 @@ class Config:
                 "retry_delay": self.training.retry_delay,
             },
             "inference": {
-                "classification_threshold": self.inference.classification_threshold,
-                "batch_size": self.inference.batch_size,
-                "max_drift_rate": self.inference.max_drift_rate,
+                "per_replica_batch_size": self.inference.per_replica_batch_size,
+                # NOTE: come back to this later
+                # "classification_threshold": self.inference.classification_threshold,
+                # "batch_size": self.inference.batch_size,
+                # "max_drift_rate": self.inference.max_drift_rate,
             },
             "checkpoint": {
                 "load_dir": self.checkpoint.load_dir,

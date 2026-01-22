@@ -525,6 +525,7 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # ...
 
 
+# NOTE: should we change validate_args() to validate_config() and run the tests on the final "applied" config singleton? or should we check both separately?
 def validate_args(args: argparse.Namespace) -> None:
     """
     Validate parsed arguments are compatible with downstream pipeline
@@ -577,17 +578,24 @@ def validate_args(args: argparse.Namespace) -> None:
     #     )
 
     # TODO: come back to this later
-    # double check if these are correct
+    # NOTE: double check if these are correct
     # rf_max_features, curriculum_schedule, load_tag, save_tag not following the accepted formats
+    # make sure save tag is unique (check db? is db initialized before validate_args()?)
     # vae_dense_layer_size = freq_resolution // downsample_factor
     # -1 <= rf_n_jobs <= num_cores
     # time_bin & width bin match data (randomly sample a few files)
     # train_files & test_files exist
     # 0 <= train_val_split <= 1
-    # per_replica_batch_size <= global_batch_size <= num_samples_beta_vae * train_val_split
-    # per_replica_val_batch_size <= num_samples_beta_vae * (1 - train_val_split)
-    # per_replica_val_batch_size <= num_samples rf
+    # per_replica_batch_size * num_replicas <= global_batch_size <= num_samples_beta_vae * train_val_split
+    # per_replica_val_batch_size * num_replicas <= num_samples_beta_vae * (1 - train_val_split)
+    # inference per_replica_val_batch_size * num_replicas <= num_samples_rf
+    # global_batch_size is divisible by per_replica_batch_size * num_replicas
+    # num_samples_beta_vae * train_val_split is divisible by global_batch_size
+    # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
+    # num_samples_rf is divisible by inference per_replica_batch_size * num_replicas
+    # # how to ensure divisibility for actual n_samples during inference?
     # snr_base, initial_snr_range, final_snr_range > 0
+    # initial_snr_range >= final_snr_range
     # exponential_decay_rate < 0
     # 0 <= step_easy_rounds, step_hard_rounds <= num_training_rounds
     # step_easy_rounds + step_hard_rounds = num_training_rounds

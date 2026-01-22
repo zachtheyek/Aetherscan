@@ -12,14 +12,17 @@ import logging
 import os
 import random
 import signal
+import time
 from multiprocessing import Pool, cpu_count
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
 import setigen as stg
 from astropy import units as u
+from scipy import stats as scipy_stats
 
 from aetherscan.config import get_config
+from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 
@@ -161,10 +164,15 @@ def log_norm(data: np.ndarray) -> np.ndarray:
 # NOTE: verify that we're randomly drawing a combo of snr, drift_rate, and signal_width for each injection?
 def new_cadence(
     data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
-) -> tuple[np.ndarray, float, float]:
+) -> tuple[np.ndarray, dict[str, float]]:
     """
     Inject a single drifting narrowband signal into a stacked cadence array
+
+    Returns:
+        modified_data: Array with injected signal
+        signal_info: Dict with keys: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept
     """
+    # NOTE: should this be parametrized?
     # Set noise parameter (for simulating randomness in drift rate calculation)
     noise = 3
 
@@ -192,6 +200,16 @@ def new_cadence(
         slope_physical = (slope_pixel) * (
             time_resolution / freq_resolution
         ) - random.random() * noise
+
+    # Guard against division by near-zero
+    MIN_SLOPE_PHYSICAL = 1e-6  # noqa: N806
+    if abs(slope_physical) < MIN_SLOPE_PHYSICAL:
+        logger.warning(f"new_cadence: slope_physical ({slope_physical}) near zero, clamping")
+        slope_physical = (
+            np.sign(slope_physical) * MIN_SLOPE_PHYSICAL
+            if slope_physical != 0
+            else MIN_SLOPE_PHYSICAL
+        )
 
     # Convert slope to drift rate
     drift_rate = -1 * (1 / slope_physical)
@@ -234,8 +252,18 @@ def new_cadence(
     del frame, signal
     gc.collect()
 
-    # Return the modified data array, slope (in pixel coordinates), and y-intercept
-    return modified_data, slope_pixel, y_intercept
+    # Build signal info dictionary
+    signal_info = {
+        "snr": float(snr),
+        "drift_rate": float(drift_rate),
+        "signal_width": float(signal_width),
+        "starting_bin": float(starting_bin),
+        "slope_pixel": float(slope_pixel),
+        "y_intercept": float(y_intercept),
+    }
+
+    # Return the modified data array and signal info
+    return modified_data, signal_info
 
 
 def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
@@ -252,6 +280,55 @@ def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
     return all(not y_lower <= y_intersect <= y_upper for y_lower, y_upper in on_y_coords)
 
 
+# TODO: add more sophisticated statistics for data leakage analysis
+def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
+    """
+    Compute global intensity statistics on a spectrogram array.
+
+    Args:
+        data: Array of any shape (will be flattened for global stats)
+
+    Returns:
+        Dict with keys: global_mean, global_median, global_std,
+                       global_mad, global_skew, global_kurtosis
+    """
+    # Handle empty arrays
+    if data.size == 0:
+        logger.warning("_compute_intensity_stats received empty array")
+        return dict.fromkeys(
+            [
+                "global_mean",
+                "global_median",
+                "global_std",
+                "global_mad",
+                "global_skew",
+                "global_kurtosis",
+            ],
+            0.0,
+        )
+
+    # Promote to float64 to prevent overflow in higher-order moments
+    flat = data.ravel().astype(np.float64)
+    median_val = np.median(flat)
+
+    stats = {
+        "global_mean": float(np.mean(flat)),
+        "global_median": float(median_val),
+        "global_std": float(np.std(flat)),
+        "global_mad": float(np.median(np.abs(flat - median_val))),
+        "global_skew": float(scipy_stats.skew(flat)),
+        "global_kurtosis": float(scipy_stats.kurtosis(flat)),
+    }
+
+    # Sanitize any remaining NaN/inf
+    for key, value in stats.items():
+        if not np.isfinite(value):
+            logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
+            stats[key] = 0.0
+
+    return stats
+
+
 def create_false(
     plate: np.ndarray,
     snr_base: float,
@@ -261,10 +338,14 @@ def create_false(
     time_resolution: float,
     inject: bool = True,
     dynamic_range: float | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     """
-    Create false signal class
-    If specified, RFI is injected into all 6 observations. Otherwise, no RFI is injected
+    Create false signal class with intensity statistics at each stage.
+    If specified, RFI is injected into all 6 observations. Otherwise, no RFI is injected.
+
+    Returns:
+        final: Output array of shape (6, 16, width_bin)
+        sample_info: Dict with background_index, intensity_stats, signal_info
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -274,6 +355,12 @@ def create_false(
     n_obs = plate.shape[1]
     n_time = plate.shape[2]
     final = np.zeros((n_obs, n_time, width_bin))
+
+    # STAGE A: Pre-injection, pre-normalization (raw background)
+    stats_a = _compute_intensity_stats(base)
+
+    # Initialize signal info (will be populated if inject=True)
+    signal_info = {}
 
     # Inject RFI into all 6 observations
     if inject:
@@ -286,7 +373,15 @@ def create_false(
 
         # Select a random SNR from the given range & inject RFI into all 6 observations
         snr = random.random() * snr_range + snr_base
-        cadence, _, _ = new_cadence(data, snr, width_bin, freq_resolution, time_resolution)
+        cadence, rfi_signal_info = new_cadence(
+            data, snr, width_bin, freq_resolution, time_resolution
+        )
+
+        # Prefix signal characteristics with rfi_ (this is RFI injection)
+        signal_info = {f"rfi_{k}": v for k, v in rfi_signal_info.items()}
+
+        # STAGE B: Post-injection, pre-normalization
+        stats_b = _compute_intensity_stats(cadence)
 
         # Reshape stacked data back into original shape & log-normalize after signal injection
         for i in range(n_obs):
@@ -294,11 +389,22 @@ def create_false(
 
     # Just return background. No signal injection
     else:
+        # No injection: Stage B = Stage A, no signal_info
+        stats_b = stats_a.copy()
         # Log-normalize base background
         for i in range(n_obs):
             final[i, :, :] = log_norm(base[i, :, :])
 
-    return final
+    # STAGE C: Post-injection, post-normalization
+    stats_c = _compute_intensity_stats(final)
+
+    sample_info = {
+        "background_index": background_index,
+        "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
+        "signal_info": signal_info,  # Empty if no injection, rfi_* if injected
+    }
+
+    return final, sample_info
 
 
 def create_true_single(
@@ -310,10 +416,14 @@ def create_true_single(
     time_resolution: float,
     inject: bool | None = None,
     dynamic_range: float | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     """
-    Create true-single signal class
-    ETI signal is injected into the ON observations only
+    Create true-single signal class with intensity statistics at each stage.
+    ETI signal is injected into the ON observations only.
+
+    Returns:
+        final: Output array of shape (6, 16, width_bin)
+        sample_info: Dict with background_index, intensity_stats, signal_info
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -324,6 +434,9 @@ def create_true_single(
     n_time = plate.shape[2]
     final = np.zeros((n_obs, n_time, width_bin))
 
+    # STAGE A: Pre-injection, pre-normalization (raw background)
+    stats_a = _compute_intensity_stats(base)
+
     # Prepare data for signal injection by stacking all 6 observations vertically
     # (6, 16, 512) -> (96, 512)
     # Obs 0: rows 0-15, Obs 1: rows 16-31, Obs 2: rows 32-47, ...
@@ -331,9 +444,15 @@ def create_true_single(
     for i in range(n_obs):
         data[i * n_time : (i + 1) * n_time, :] = base[i, :, :]
 
-    # Select a random SNR from the given range & inject RFI
+    # Select a random SNR from the given range & inject ETI
     snr = random.random() * snr_range + snr_base
-    cadence, _, _ = new_cadence(data, snr, width_bin, freq_resolution, time_resolution)
+    cadence, eti_signal_info = new_cadence(data, snr, width_bin, freq_resolution, time_resolution)
+
+    # Prefix signal characteristics with eti_ (this is ETI injection)
+    signal_info = {f"eti_{k}": v for k, v in eti_signal_info.items()}
+
+    # STAGE B: Post-injection, pre-normalization
+    stats_b = _compute_intensity_stats(cadence)
 
     # Reshape stacked data back into original shape & log-normalize after signal injection
     for i in range(n_obs):
@@ -344,7 +463,16 @@ def create_true_single(
             # OFFs: original background
             final[i, :, :] = log_norm(data[i * n_time : (i + 1) * n_time, :])
 
-    return final
+    # STAGE C: Post-injection, post-normalization
+    stats_c = _compute_intensity_stats(final)
+
+    sample_info = {
+        "background_index": background_index,
+        "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
+        "signal_info": signal_info,  # eti_* signal characteristics
+    }
+
+    return final, sample_info
 
 
 def create_true_double(
@@ -356,10 +484,14 @@ def create_true_double(
     time_resolution: float,
     inject: bool | None = None,
     dynamic_range: float = 1,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     """
-    Create true-double signal class
-    Non-intersecting ETI & RFI signals are injected into ON-only & ON-OFF, respectively
+    Create true-double signal class with intensity statistics at each stage.
+    Non-intersecting ETI & RFI signals are injected into ON-only & ON-OFF, respectively.
+
+    Returns:
+        final: Output array of shape (6, 16, width_bin)
+        sample_info: Dict with background_index, intensity_stats, signal_info
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -369,6 +501,9 @@ def create_true_double(
     n_obs = plate.shape[1]
     n_time = plate.shape[2]
     final = np.zeros((n_obs, n_time, width_bin))
+
+    # STAGE A: Pre-injection, pre-normalization (raw background)
+    stats_a = _compute_intensity_stats(base)
 
     # Prepare data for signal injection by stacking all 6 observations vertically
     # (6, 16, 512) -> (96, 512)
@@ -384,18 +519,33 @@ def create_true_double(
     # Retry signal injection until we get valid non-intersecting signals
     while True:
         # Inject RFI
-        cadence_1, slope_1, intercept_1 = new_cadence(
+        cadence_1, rfi_signal_info = new_cadence(
             data, snr, width_bin, freq_resolution, time_resolution
         )
         # Inject ETI
-        cadence_2, slope_2, intercept_2 = new_cadence(
+        cadence_2, eti_signal_info = new_cadence(
             cadence_1, snr * dynamic_range, width_bin, freq_resolution, time_resolution
         )
+
+        # Extract slope and intercept for intersection check
+        slope_1 = rfi_signal_info["slope_pixel"]
+        intercept_1 = rfi_signal_info["y_intercept"]
+        slope_2 = eti_signal_info["slope_pixel"]
+        intercept_2 = eti_signal_info["y_intercept"]
 
         if slope_1 != slope_2 and check_valid_intersection(
             slope_1, slope_2, intercept_1, intercept_2
         ):
             break
+
+    # Combine both signal infos with appropriate prefixes
+    signal_info = {
+        **{f"rfi_{k}": v for k, v in rfi_signal_info.items()},
+        **{f"eti_{k}": v for k, v in eti_signal_info.items()},
+    }
+
+    # STAGE B: Post-injection, pre-normalization (after both injections)
+    stats_b = _compute_intensity_stats(cadence_2)
 
     # Reshape stacked data back into original shape & log-normalize after signal injection
     for i in range(n_obs):
@@ -406,7 +556,16 @@ def create_true_double(
             # OFFs: 1 injected signal (RFI only)
             final[i, :, :] = log_norm(cadence_1[i * n_time : (i + 1) * n_time, :])
 
-    return final
+    # STAGE C: Post-injection, post-normalization
+    stats_c = _compute_intensity_stats(final)
+
+    sample_info = {
+        "background_index": background_index,
+        "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
+        "signal_info": signal_info,  # Both eti_* and rfi_* signal characteristics
+    }
+
+    return final, sample_info
 
 
 def _single_cadence_wrapper(args):
@@ -516,7 +675,7 @@ def batch_create_cadence(
     pool: Pool | None = None,
     n_processes: int | None = cpu_count(),
     chunks_per_worker: int | None = 4,
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[dict]]:
     """
     Batch wrapper for creating multiple cadences using multiprocessing
 
@@ -536,10 +695,12 @@ def batch_create_cadence(
         chunks_per_worker: Used to calculate optimal chunksize for load balancing
 
     Returns:
-        Array of shape (samples, 6, 16, width_bin) containing generated cadences
+        cadence: Array of shape (samples, 6, 16, width_bin) containing generated cadences
+        all_sample_info: List of sample_info dicts (one per sample)
     """
     # Pre-allocate output array
     cadence = np.zeros((samples, 6, 16, width_bin))
+    all_sample_info = []
 
     if pool:
         # Parallel execution using provided pool
@@ -567,17 +728,18 @@ def batch_create_cadence(
         chunksize = max(1, samples // (n_workers * chunks_per_worker))
 
         # Use pool to generate cadences in parallel
-        for i, result in enumerate(
+        for i, (result, sample_info) in enumerate(
             # NOTE: does return order matter?
             pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
         ):
             cadence[i, :, :, :] = result
+            all_sample_info.append(sample_info)
     else:
         # Fallback to sequential execution
         for i in range(samples):
-            cadence[i, :, :, :] = function(
+            result, sample_info = function(
                 plate,
                 snr_base=snr_base,
                 snr_range=snr_range,
@@ -587,8 +749,10 @@ def batch_create_cadence(
                 inject=inject,
                 dynamic_range=dynamic_range,
             )
+            cadence[i, :, :, :] = result
+            all_sample_info.append(sample_info)
 
-    return cadence
+    return cadence, all_sample_info
 
 
 # NOTE: come back to this later
@@ -760,7 +924,13 @@ class DataGenerator:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
+        self.db = get_db()
+        if self.db is None:
+            raise ValueError("get_db() returned None")
+
         self.manager = get_manager()
+        if self.manager is None:
+            raise ValueError("get_manager() returned None")
 
         # Load background plates into shared memory
         self._load_backgrounds(background_plates)
@@ -903,13 +1073,117 @@ class DataGenerator:
         self._free_managed_shared_memory()
         logger.info("DataGenerator closed")
 
+    # NOTE: update docstring values when more stats are added
+    def _write_batch_stats(
+        self,
+        stats_list: list[dict],
+        round_number: int | None,
+        chunk_number: int,
+        signal_class: str,
+        signal_type: str,
+        snr_range_floor: float,
+        snr_range_ceil: float,
+        num_samples: int,
+        inject_duration: float,
+        timestamp: float,
+    ):
+        """
+        Write per-sample stats to DB.
+
+        Per-sample writes:
+        - Intensity stats: 6 stats × 3 stages = 18 writes per sample
+        - Signal characteristics: 0-12 writes depending on signal_type
+        - background_index is included with each write
+
+        Batch-level writes:
+        - 4 metadata stats written once per batch
+        """
+        tag = self.config.checkpoint.save_tag
+
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate training progress plot"
+            )
+
+        # Write per-sample stats
+        for sample_idx, sample_info in enumerate(stats_list):
+            background_index = sample_info["background_index"]
+            intensity_stats = sample_info["intensity_stats"]
+            signal_info = sample_info["signal_info"]
+
+            # Write intensity stats for each stage
+            for stage in ["A", "B", "C"]:
+                stage_stats = intensity_stats[stage]
+
+                for stat_name in [
+                    "global_mean",
+                    "global_median",
+                    "global_std",
+                    "global_mad",
+                    "global_skew",
+                    "global_kurtosis",
+                ]:
+                    self.db.write_injection_stat(
+                        stat_name=stat_name,
+                        value=stage_stats[stat_name],
+                        round_number=round_number,
+                        chunk_number=chunk_number,
+                        sample_index=sample_idx,
+                        background_index=background_index,
+                        signal_class=signal_class,
+                        signal_type=signal_type,
+                        injection_stage=stage,
+                        tag=tag,
+                        timestamp=timestamp,
+                    )
+
+            # Write signal characteristics (eti_snr, rfi_drift_rate, etc.)
+            # injection_stage=None since these describe the injection itself
+            for stat_name, value in signal_info.items():
+                self.db.write_injection_stat(
+                    stat_name=stat_name,
+                    value=float(value),
+                    round_number=round_number,
+                    chunk_number=chunk_number,
+                    sample_index=sample_idx,
+                    background_index=background_index,
+                    signal_class=signal_class,
+                    signal_type=signal_type,
+                    injection_stage=None,
+                    tag=tag,
+                    timestamp=timestamp,
+                )
+
+        # Write batch-level metadata stats (once per batch, not per sample)
+        metadata_stats = [
+            ("snr_range_floor", snr_range_floor),
+            ("snr_range_ceil", snr_range_ceil),
+            ("num_samples", float(num_samples)),
+            ("inject_duration", inject_duration),
+        ]
+
+        for stat_name, value in metadata_stats:
+            self.db.write_injection_stat(
+                stat_name=stat_name,
+                value=value,
+                round_number=round_number,
+                chunk_number=chunk_number,
+                sample_index=None,
+                background_index=None,
+                signal_class=signal_class,
+                signal_type=signal_type,
+                injection_stage=None,
+                tag=tag,
+                timestamp=timestamp,
+            )
+
     # TODO:
     # separate generate_batch() into generate_train_batch() & generate_test_batch()
     # since test doesn't require (main, false, true), just (false, true)
     # verify this is correct with train_random_forest() vs train_round()
     # benchmark compute time / memory saved with this change
     def generate_batch(
-        self, n_samples: int, snr_base: int, snr_range: int
+        self, n_samples: int, snr_base: int, snr_range: int, round_num: int | None = None
     ) -> dict[str, np.ndarray]:
         """
         Generate batch using chunking & multiprocessing
@@ -944,12 +1218,16 @@ class DataGenerator:
 
             logger.info(f"Generating chunk {chunk_idx + 1}/{n_chunks} with {chunk_size} samples")
 
+            # Capture single timestamp for all stats in this chunk
+            chunk_timestamp = time.time()
+
             # Split chunk into equal partitions (for balanced classes)
             quarter = max(1, chunk_size // 4)
             half = max(1, chunk_size // 2)
 
-            # Pure background
-            quarter_false_no_signal = batch_create_cadence(
+            # Pure background (main)
+            batch_start = time.time()
+            quarter_false_no_signal, stats_main_false_no_signal = batch_create_cadence(
                 create_false,
                 quarter,
                 self.backgrounds,
@@ -963,9 +1241,22 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
+            self._write_batch_stats(
+                stats_list=stats_main_false_no_signal,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="main",
+                signal_type="false_no_signal",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=quarter,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
+            )
 
-            # RFI only
-            quarter_false_with_rfi = batch_create_cadence(
+            # RFI only (main)
+            batch_start = time.time()
+            quarter_false_with_rfi, stats_main_false_with_rfi = batch_create_cadence(
                 create_false,
                 quarter,
                 self.backgrounds,
@@ -979,9 +1270,22 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
+            self._write_batch_stats(
+                stats_list=stats_main_false_with_rfi,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="main",
+                signal_type="false_with_rfi",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=quarter,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
+            )
 
-            # ETI only
-            quarter_true_single = batch_create_cadence(
+            # ETI only (main)
+            batch_start = time.time()
+            quarter_true_single, stats_main_true_only_eti = batch_create_cadence(
                 create_true_single,
                 quarter,
                 self.backgrounds,
@@ -994,9 +1298,22 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
+            self._write_batch_stats(
+                stats_list=stats_main_true_only_eti,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="main",
+                signal_type="true_only_eti",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=quarter,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
+            )
 
-            # ETI + RFI
-            quarter_true_double = batch_create_cadence(
+            # ETI + RFI (main)
+            batch_start = time.time()
+            quarter_true_double, stats_main_true_eti_rfi = batch_create_cadence(
                 create_true_double,
                 quarter,
                 self.backgrounds,
@@ -1009,6 +1326,18 @@ class DataGenerator:
                 pool=self.pool,
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
+            )
+            self._write_batch_stats(
+                stats_list=stats_main_true_eti_rfi,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="main",
+                signal_type="true_eti_rfi",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=quarter,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
             )
 
             # Concatenate for main training data (collapsed cadences)
@@ -1024,7 +1353,10 @@ class DataGenerator:
 
             # Generate separate true/false non-collapsed cadences for training set diversity
             # Used to calculate clustering loss & train RF
-            half_false_no_signal = batch_create_cadence(
+
+            # Pure background (false)
+            batch_start = time.time()
+            half_false_no_signal, stats_false_no_signal = batch_create_cadence(
                 create_false,
                 half,
                 self.backgrounds,
@@ -1038,8 +1370,22 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
+            self._write_batch_stats(
+                stats_list=stats_false_no_signal,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="false",
+                signal_type="false_no_signal",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=half,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
+            )
 
-            half_false_with_rfi = batch_create_cadence(
+            # RFI only (false)
+            batch_start = time.time()
+            half_false_with_rfi, stats_false_with_rfi = batch_create_cadence(
                 create_false,
                 half,
                 self.backgrounds,
@@ -1053,8 +1399,22 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
+            self._write_batch_stats(
+                stats_list=stats_false_with_rfi,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="false",
+                signal_type="false_with_rfi",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=half,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
+            )
 
-            half_true_single = batch_create_cadence(
+            # ETI only (true)
+            batch_start = time.time()
+            half_true_single, stats_true_only_eti = batch_create_cadence(
                 create_true_single,
                 half,
                 self.backgrounds,
@@ -1067,8 +1427,22 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
+            self._write_batch_stats(
+                stats_list=stats_true_only_eti,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="true",
+                signal_type="true_only_eti",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=half,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
+            )
 
-            half_true_double = batch_create_cadence(
+            # ETI + RFI (true)
+            batch_start = time.time()
+            half_true_double, stats_true_eti_rfi = batch_create_cadence(
                 create_true_double,
                 half,
                 self.backgrounds,
@@ -1081,6 +1455,18 @@ class DataGenerator:
                 pool=self.pool,
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
+            )
+            self._write_batch_stats(
+                stats_list=stats_true_eti_rfi,
+                round_number=round_num,
+                chunk_number=chunk_idx + 1,
+                signal_class="true",
+                signal_type="true_eti_rfi",
+                snr_range_floor=snr_base,
+                snr_range_ceil=snr_base + snr_range,
+                num_samples=half,
+                inject_duration=time.time() - batch_start,
+                timestamp=chunk_timestamp,
             )
 
             chunk_false = np.concatenate([half_false_no_signal, half_false_with_rfi], axis=0)
@@ -1101,6 +1487,10 @@ class DataGenerator:
             )
             del half_false_no_signal, half_false_with_rfi, half_true_single, half_true_double
             del chunk_main, chunk_false, chunk_true
+            del stats_main_false_no_signal, stats_main_false_with_rfi
+            del stats_main_true_only_eti, stats_main_true_eti_rfi
+            del stats_false_no_signal, stats_false_with_rfi
+            del stats_true_only_eti, stats_true_eti_rfi
             gc.collect()
 
             logger.info(f"Chunk {chunk_idx + 1} complete, memory cleared")
