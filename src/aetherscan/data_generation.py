@@ -329,11 +329,11 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
     }
 
     # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _sanitize_float() from db.py?
-    # # Sanitize any remaining NaN/inf
-    # for key, value in stats.items():
-    #     if not np.isfinite(value):
-    #         logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
-    #         stats[key] = 0.0
+    # Sanitize any remaining NaN/inf
+    for key, value in stats.items():
+        if not np.isfinite(value):
+            logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
+            stats[key] = 0.0
 
     return stats
 
