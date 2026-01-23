@@ -45,11 +45,11 @@ logger = logging.getLogger(__name__)
 
 # Color mapping for Slack message attachments based on log level
 LEVEL_COLORS = {
-    logging.CRITICAL: "#8B0000",  # Dark red
-    logging.ERROR: "#FF0000",  # Red
-    logging.WARNING: "#FFA500",  # Orange/Yellow
+    logging.CRITICAL: "#FF0000",  # Red
+    logging.ERROR: "#FFA500",  # Orange
+    logging.WARNING: "#FFFF00",  # Yellow
     logging.INFO: "#36A64F",  # Green
-    logging.DEBUG: "#808080",  # Gray
+    logging.DEBUG: "#FFFFFF",  # White
 }
 
 # Level name to emoji mapping for batched messages
