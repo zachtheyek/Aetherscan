@@ -140,7 +140,6 @@ class TrainingConfig:
 
     per_replica_batch_size: int = 128
     effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
-    # TEST: 2^12 ran into OOM. does 2^11 work?
     per_replica_val_batch_size: int = 832
 
     signal_injection_chunk_size: int = (
@@ -172,7 +171,6 @@ class TrainingConfig:
 class InferenceConfig:
     """Inference configuration"""
 
-    # TEST: 2^12 ran into OOM. does 2^11 work?
     per_replica_batch_size: int = 832
 
     # NOTE: come back to this later
