@@ -2255,20 +2255,20 @@ class TrainingPipeline:
                 ax.hist(
                     eti_data,
                     bins=50,
-                    alpha=0.15,
+                    alpha=0.2,
                     color=signal_colors["ETI"],
                     edgecolor=signal_colors["ETI"],
-                    linewidth=2.5,
+                    linewidth=2,
                     histtype="stepfilled",
                 )
             if rfi_data:
                 ax.hist(
                     rfi_data,
                     bins=50,
-                    alpha=0.15,
+                    alpha=0.2,
                     color=signal_colors["RFI"],
                     edgecolor=signal_colors["RFI"],
-                    linewidth=2.5,
+                    linewidth=2,
                     histtype="stepfilled",
                 )
 
@@ -2285,10 +2285,10 @@ class TrainingPipeline:
             ax_bg.hist(
                 background_indices,
                 bins=range(0, max_bg + 2),  # Discrete integer bins from 0 to max+1
-                alpha=0.15,
+                alpha=0.2,
                 color="purple",
                 edgecolor="purple",
-                linewidth=2.5,
+                linewidth=2,
                 histtype="stepfilled",
             )
         ax_bg.set_title("Background Index", fontsize=12, fontweight="bold")
@@ -2374,10 +2374,10 @@ class TrainingPipeline:
                     ax.hist(
                         data,
                         bins=50,
-                        alpha=0.15,
+                        alpha=0.2,
                         color=stage_colors[stage],
                         edgecolor=stage_colors[stage],
-                        linewidth=2.5,
+                        linewidth=2,
                         histtype="stepfilled",
                     )
 
@@ -2388,10 +2388,10 @@ class TrainingPipeline:
                 ax2.hist(
                     data_c,
                     bins=50,
-                    alpha=0.15,
+                    alpha=0.2,
                     color=stage_colors["C"],
                     edgecolor=stage_colors["C"],
-                    linewidth=2.5,
+                    linewidth=2,
                     histtype="stepfilled",
                 )
 
@@ -2431,7 +2431,7 @@ class TrainingPipeline:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        logger.info(f"Intensity histogram plot saved: {save_path}")
+        logger.info(f"{signal_type} global intensity distributions plot saved: {save_path}")
 
         # Upload to Slack
         logger_instance = get_logger()
@@ -2503,7 +2503,7 @@ class TrainingPipeline:
                     ax.scatter(
                         values_a,
                         values_b,
-                        alpha=0.08,
+                        alpha=0.12,
                         facecolor=type_colors[signal_type],
                         edgecolor=type_colors[signal_type],
                         linewidth=0.3,
@@ -2550,7 +2550,7 @@ class TrainingPipeline:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        logger.info(f"Stage transitions plot saved: {save_path}")
+        logger.info(f"A→B global intensity biases plot saved: {save_path}")
 
         # Upload to Slack
         logger_instance = get_logger()
@@ -2651,7 +2651,7 @@ class TrainingPipeline:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        logger.info(f"Signal type box plots saved: {save_path}")
+        logger.info(f"Final global intensity biases plot saved: {save_path}")
 
         # Upload to Slack
         logger_instance = get_logger()
