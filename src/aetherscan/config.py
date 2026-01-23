@@ -60,10 +60,10 @@ class LoggerConfig:
     slack_enabled: bool = True
     slack_channel: str | None = None  # Override with SLACK_CHANNEL env var
     slack_username: str = "Aetherscan"
-    slack_timeout: float = 10.0
+    slack_timeout: float = 15.0
     slack_retry_attempts: int = 3
-    slack_buffer_size: int = 100  # Max messages to buffer before flushing
-    slack_flush_interval: float = 30.0  # Seconds between automatic flushes
+    slack_buffer_size: int = 50  # Max messages to buffer before flushing
+    slack_flush_interval: float = 60.0  # Seconds between automatic flushes
     slack_broadcast_level: str = "ERROR"  # Messages at this level+ are broadcast to main channel
 
 
