@@ -1151,7 +1151,9 @@ class TrainingPipeline:
             self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
             # Plot clipping rate
-            self.plot_clipping_rate(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+            self.plot_beta_vae_training_stability(
+                tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+            )
 
             # Plot injection stats
             self.plot_injection_stats(
@@ -1851,7 +1853,7 @@ class TrainingPipeline:
                 title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
             )
 
-    def plot_clipping_rate(self, tag: str | None = None, dir: str | None = None):
+    def plot_beta_vae_training_stability(self, tag: str | None = None, dir: str | None = None):
         """
         Plot gradient clipping rate and gradient norm statistics.
 
@@ -1868,7 +1870,18 @@ class TrainingPipeline:
         current_time = time.time()
 
         if self.db is None:
-            raise RuntimeError("No database instance detected - cannot generate clipping rate plot")
+            raise RuntimeError(
+                "No database instance detected - cannot generate training stability plot"
+            )
+
+        # Flush database to ensure all training stats are written before plotting
+        logger.info("Flushing database before plotting...")
+        if not self.db.flush():
+            logger.warning(
+                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            )
+        else:
+            logger.info("Database flushed")
 
         # Query training stats from database
         all_stats = self.db.query_training_stat(
@@ -1880,7 +1893,7 @@ class TrainingPipeline:
         )
 
         if not all_stats:
-            logger.warning("No training progress data to plot for clipping rate")
+            logger.warning("No training stats data to plot")
             return
 
         # Group query results by stat_name
@@ -1922,7 +1935,7 @@ class TrainingPipeline:
         ax_max = fig.add_subplot(gs[1, 2])
 
         fig.suptitle(
-            f"Beta-VAE Clipping Rate ({tag}, {machine_name})", fontsize=18, fontweight="bold"
+            f"Beta-VAE Training Stability ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
         # Top plot: Clipping Rate
@@ -1938,9 +1951,8 @@ class TrainingPipeline:
             epochs, 0.01, 0.05, color="green", alpha=0.1, label="Optimal region (1%-5%)"
         )
 
-        ax_top.set_title("Clipping Rate", fontsize=14, fontweight="bold")
+        ax_top.set_title("Gradient Clipping Rate", fontsize=14, fontweight="bold")
         ax_top.set_xlabel("Epoch", fontsize=12, fontweight="bold")
-        ax_top.set_ylabel("Clipping Rate", fontsize=12, fontweight="bold")
         ax_top.grid(True, alpha=0.3)
         ax_top.legend(loc="upper right")
 
@@ -1948,31 +1960,38 @@ class TrainingPipeline:
         if "gradient_norm_mean" in history and history["gradient_norm_mean"]:
             ax_mean.plot(epochs, history["gradient_norm_mean"], color="blue", linewidth=2)
         ax_mean.axhline(
-            y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.7, label="Clip threshold"
+            y=1.0,
+            color="gray",
+            linestyle="--",
+            linewidth=1,
+            alpha=0.7,
+            label="Clip threshold (1.0)",
         )
         ax_mean.set_title("Gradient Norm Mean", fontsize=14, fontweight="bold")
         ax_mean.set_xlabel("Epoch", fontsize=12, fontweight="bold")
-        ax_mean.set_ylabel("Norm", fontsize=12, fontweight="bold")
         ax_mean.grid(True, alpha=0.3)
         ax_mean.legend(loc="upper right")
 
         # Bottom center: Gradient Norm Std
         if "gradient_norm_std" in history and history["gradient_norm_std"]:
-            ax_std.plot(epochs, history["gradient_norm_std"], color="orange", linewidth=2)
+            ax_std.plot(epochs, history["gradient_norm_std"], color="blue", linewidth=2)
         ax_std.set_title("Gradient Norm Std", fontsize=14, fontweight="bold")
         ax_std.set_xlabel("Epoch", fontsize=12, fontweight="bold")
-        ax_std.set_ylabel("Std", fontsize=12, fontweight="bold")
         ax_std.grid(True, alpha=0.3)
 
         # Bottom right: Gradient Norm Max
         if "gradient_norm_max" in history and history["gradient_norm_max"]:
-            ax_max.plot(epochs, history["gradient_norm_max"], color="red", linewidth=2)
+            ax_max.plot(epochs, history["gradient_norm_max"], color="blue", linewidth=2)
         ax_max.axhline(
-            y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.7, label="Clip threshold"
+            y=1.0,
+            color="gray",
+            linestyle="--",
+            linewidth=1,
+            alpha=0.7,
+            label="Clip threshold (1.0)",
         )
         ax_max.set_title("Gradient Norm Max", fontsize=14, fontweight="bold")
         ax_max.set_xlabel("Epoch", fontsize=12, fontweight="bold")
-        ax_max.set_ylabel("Norm", fontsize=12, fontweight="bold")
         ax_max.grid(True, alpha=0.3)
         ax_max.legend(loc="upper right")
 
@@ -1981,11 +2000,11 @@ class TrainingPipeline:
         # Save plot
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"beta_vae_clipping_rate_{tag}.png"
+                self.config.output_path, "plots", dir, f"beta_vae_training_stability_{tag}.png"
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"beta_vae_clipping_rate_{tag}.png"
+                self.config.output_path, "plots", f"beta_vae_training_stability_{tag}.png"
             )
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1993,14 +2012,14 @@ class TrainingPipeline:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        logger.info(f"Beta-VAE clipping rate plot saved to: {save_path}")
+        logger.info(f"Beta-VAE training stability plot saved to: {save_path}")
 
         # Upload to Slack
         logger_instance = get_logger()
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Beta-VAE Clipping Rate - ({tag}, {machine_name})",
+                title=f"Beta-VAE Training Stability - ({tag}, {machine_name})",
             )
 
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
@@ -2217,7 +2236,7 @@ class TrainingPipeline:
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate 3x3 signal characteristics grid with background_index histogram."""
+        """Generate 3x3 signal characteristics grid."""
         signal_stats = [
             "snr",
             "drift_rate",
@@ -2291,8 +2310,7 @@ class TrainingPipeline:
                 linewidth=2,
                 histtype="stepfilled",
             )
-        ax_bg.set_title("Background Index", fontsize=12, fontweight="bold")
-        ax_bg.set_xlabel("Background Index (0 to N-1)", fontsize=10)
+        ax_bg.set_title("Background Plates", fontsize=12, fontweight="bold")
         ax_bg.set_ylabel("Count", fontsize=10)
         ax_bg.grid(True, alpha=0.3)
 
@@ -2800,7 +2818,7 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
             pipeline.plot_beta_vae_loss_curves()
 
             # Plot clipping rate
-            pipeline.plot_clipping_rate()
+            pipeline.plot_beta_vae_training_stability()
 
             # Plot injection stats
             pipeline.plot_injection_stats()
