@@ -1704,6 +1704,8 @@ class TrainingPipeline:
             logger.warning(
                 "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
             )
+        else:
+            logger.info("Database flushed")
 
         # NOTE: how to handle retries under current implementation?
         # Query training stats from database
@@ -2040,6 +2042,8 @@ class TrainingPipeline:
             logger.warning(
                 "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
             )
+        else:
+            logger.info("Database flushed")
 
         # Figure 1: Injected signal characteristics
         signal_stats = [
