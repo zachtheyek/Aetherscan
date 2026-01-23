@@ -1,7 +1,3 @@
-# TODO:
-# add slack integration
-# find a way to customize separate logging level for slack vs console/file
-# also find a way to log plots in slack (but not in console/file)
 # TODO: set log level in logger config (search: setLevel)
 # TODO: add tag to file log & archive old logs
 """
@@ -22,8 +18,30 @@ from multiprocessing import Queue
 import tensorflow as tf
 
 from aetherscan.config import get_config
+from aetherscan.logger.slack_handler import SlackHandler
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_level(level_str: str) -> int:
+    """
+    Convert log level string to logging constant.
+
+    Args:
+        level_str: Log level name (e.g., "INFO", "WARNING", "DEBUG")
+
+    Returns:
+        Logging level constant (e.g., logging.INFO)
+    """
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "WARN": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }
+    return level_map.get(level_str.upper(), logging.INFO)
 
 
 class StreamToLogger:
@@ -104,9 +122,9 @@ class Logger:
         # Create queue for worker processes (no size limit)
         self.log_queue = Queue(-1)
 
-        # Setup root logger
+        # Setup root logger - set to DEBUG to let handlers filter
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)  # Ignore DEBUG level logs
+        root_logger.setLevel(logging.DEBUG)
         root_logger.handlers.clear()  # Clear existing handlers
 
         # Create formatter
@@ -114,23 +132,77 @@ class Logger:
 
         # Setup file handler (only used by main process via listener)
         file_handler = logging.FileHandler(self.log_path, mode="w")
-        file_handler.setLevel(logging.INFO)
+        file_handler.setLevel(_parse_level(self.config.logger.file_level))
         file_handler.setFormatter(formatter)
 
         # Setup stream handler (only used by main process via listener)
         stream_handler = logging.StreamHandler(sys.stdout)
-        stream_handler.setLevel(logging.INFO)
+        stream_handler.setLevel(_parse_level(self.config.logger.console_level))
         stream_handler.setFormatter(formatter)
 
+        # Build handler list for QueueListener
+        handlers: list[logging.Handler] = [file_handler, stream_handler]
+
+        # Initialize Slack handler if enabled
+        # Note: We defer logging until after the queue infrastructure is ready
+        self.slack_handler: SlackHandler | None = None
+        slack_init_message: str | None = None
+        slack_init_level: int = logging.INFO
+
+        if self.config.logger.slack_enabled:
+            slack_token = os.environ.get("SLACK_BOT_TOKEN")
+            slack_channel = os.environ.get("SLACK_CHANNEL", self.config.logger.slack_channel)
+
+            if not slack_token:
+                slack_init_message = (
+                    "Slack logging enabled but SLACK_BOT_TOKEN not found in environment. "
+                    "Slack logging disabled."
+                )
+                slack_init_level = logging.WARNING
+            elif not slack_channel:
+                slack_init_message = (
+                    "Slack logging enabled but no channel configured. "
+                    "Set SLACK_CHANNEL env var or config.logger.slack_channel. Slack logging disabled."
+                )
+                slack_init_level = logging.WARNING
+            else:
+                try:
+                    self.slack_handler = SlackHandler(
+                        token=slack_token,
+                        channel=slack_channel,
+                        username=self.config.logger.slack_username,
+                        icon_emoji=self.config.logger.slack_icon_emoji,
+                        timeout=self.config.logger.slack_timeout,
+                        retry_attempts=self.config.logger.slack_retry_attempts,
+                        buffer_size=self.config.logger.slack_buffer_size,
+                        flush_interval=self.config.logger.slack_flush_interval,
+                        broadcast_level=_parse_level(self.config.logger.slack_broadcast_level),
+                    )
+                    self.slack_handler.setLevel(_parse_level(self.config.logger.slack_level))
+                    self.slack_handler.setFormatter(formatter)
+                    handlers.append(self.slack_handler)
+                    slack_init_message = f"Slack handler initialized for channel: {slack_channel}"
+                    slack_init_level = logging.INFO
+                except Exception as e:
+                    slack_init_message = f"Failed to initialize Slack handler: {e}"
+                    slack_init_level = logging.WARNING
+
         # Create queue listener - runs in background thread, writes logs from queue
-        self.log_listener = QueueListener(
-            self.log_queue, file_handler, stream_handler, respect_handler_level=True
-        )
+        self.log_listener = QueueListener(self.log_queue, *handlers, respect_handler_level=True)
         self.log_listener.start()
 
         # Add queue handler to root logger (both main and workers use this)
         queue_handler = QueueHandler(self.log_queue)
         root_logger.addHandler(queue_handler)
+
+        # Start the Slack run thread FIRST (posts run summary, all logs become replies)
+        # This must happen before any log messages so they appear in the thread
+        if self.slack_handler is not None:
+            self.slack_handler.start_run()
+
+        # Now that logging infrastructure is ready, log Slack initialization status
+        if slack_init_message:
+            logger.log(slack_init_level, slack_init_message)
 
         # Redirect TensorFlow logs to Python logging
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"  # Show all TF logs
@@ -171,11 +243,52 @@ class Logger:
             # Note, can't log here after tear down
 
     def stop(self):
-        """Stop the queue listener thread"""
+        """Stop the queue listener thread and flush Slack messages"""
+        # Flush and close Slack handler first (while listener is still running)
+        if self.slack_handler is not None:
+            self.slack_handler.close()
+
         if self.log_listener is not None:
             self.log_listener.stop()
             # Note, can't log after this point -- listener thread has stopped
             # All subsequent logs will get queued but never logged
+
+    def upload_image_to_slack(
+        self,
+        file_path: str,
+        channels: str | list[str] | None = None,
+        title: str | None = None,
+        message: str | None = None,
+        broadcast: bool = True,
+    ) -> bool:
+        """
+        Upload an image file to Slack.
+
+        The image is uploaded to the current run's thread. If broadcast=True (default),
+        a message is also posted to the main channel with a link back to the thread
+        (similar to the "Also send to channel" checkbox in Slack).
+
+        Args:
+            file_path: Path to the image file to upload
+            channels: Channel(s) to upload to (defaults to handler's configured channel)
+            title: Title for the image
+            message: Comment to add with the image
+            broadcast: If True, also echo to main channel with link to thread
+
+        Returns:
+            True if upload succeeded, False otherwise
+        """
+        if self.slack_handler is None:
+            logger.debug("Slack handler not initialized, skipping image upload")
+            return False
+
+        return self.slack_handler.upload_file(
+            file_path=file_path,
+            channels=channels,
+            title=title,
+            initial_comment=message,
+            broadcast=broadcast,
+        )
 
 
 def init_logger() -> Logger:

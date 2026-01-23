@@ -51,7 +51,21 @@ class MonitorConfig:
 class LoggerConfig:
     """Logger configuration"""
 
-    # NOTE: come back to this later
+    # Console and file log levels
+    console_level: str = "INFO"
+    file_level: str = "INFO"
+
+    # Slack configuration
+    slack_level: str = "INFO"
+    slack_broadcast_level: str = "ERROR"  # Messages at this level+ are broadcast to main channel
+    slack_enabled: bool = True
+    slack_channel: str | None = None  # Override with SLACK_CHANNEL env var
+    slack_username: str = "Aetherscan"
+    slack_icon_emoji: str = ":robot_face:"
+    slack_timeout: float = 5.0
+    slack_retry_attempts: int = 2
+    slack_buffer_size: int = 10  # Max messages to buffer before flushing
+    slack_flush_interval: float = 5.0  # Seconds between automatic flushes
 
 
 @dataclass
@@ -158,7 +172,8 @@ class TrainingConfig:
 class InferenceConfig:
     """Inference configuration"""
 
-    per_replica_batch_size: int = 4096
+    # per_replica_batch_size: int = 4096
+    per_replica_batch_size: int = 350  # TEST:
 
     # NOTE: come back to this later
     # classification_threshold: float = 0.5
@@ -307,7 +322,18 @@ class Config:
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
             },
             "logger": {
-                # NOTE: come back to this later
+                "console_level": self.logger.console_level,
+                "file_level": self.logger.file_level,
+                "slack_level": self.logger.slack_level,
+                "slack_broadcast_level": self.logger.slack_broadcast_level,
+                "slack_enabled": self.logger.slack_enabled,
+                "slack_channel": self.logger.slack_channel,
+                "slack_username": self.logger.slack_username,
+                "slack_icon_emoji": self.logger.slack_icon_emoji,
+                "slack_timeout": self.logger.slack_timeout,
+                "slack_retry_attempts": self.logger.slack_retry_attempts,
+                "slack_buffer_size": self.logger.slack_buffer_size,
+                "slack_flush_interval": self.logger.slack_flush_interval,
             },
             "beta_vae": {
                 "latent_dim": self.beta_vae.latent_dim,
