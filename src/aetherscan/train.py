@@ -1965,7 +1965,7 @@ class TrainingPipeline:
             linestyle="--",
             linewidth=1,
             alpha=0.7,
-            label="Clip threshold (1.0)",
+            label="Clipping threshold (1.0)",
         )
         ax_mean.set_title("Gradient Norm Mean", fontsize=14, fontweight="bold")
         ax_mean.set_xlabel("Epoch", fontsize=12, fontweight="bold")
@@ -1988,7 +1988,7 @@ class TrainingPipeline:
             linestyle="--",
             linewidth=1,
             alpha=0.7,
-            label="Clip threshold (1.0)",
+            label="Clipping threshold (1.0)",
         )
         ax_max.set_title("Gradient Norm Max", fontsize=14, fontweight="bold")
         ax_max.set_xlabel("Epoch", fontsize=12, fontweight="bold")
