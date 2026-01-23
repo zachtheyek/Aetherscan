@@ -199,6 +199,10 @@ class Database:
             # CREATE INDEX IF NOT EXISTS idx_system_resources_query
             # ON system_resources(tag, timestamp, resource_type, resource_name);
 
+            # -- system_resources: Queries filter by tag + resource_type + resource_name
+            # CREATE INDEX idx_system_resources_tag_type
+            # ON system_resources(tag, resource_type, resource_name);
+
             # Injection statistics table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS injection_stats (
@@ -228,6 +232,10 @@ class Database:
             # CREATE INDEX IF NOT EXISTS idx_injection_stats_query
             # ON injection_stats(tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name);
 
+            # -- injection_stats: Queries filter by tag + stat_name + signal_type + injection_stage
+            # CREATE INDEX idx_injection_stats_tag_stat
+            # ON injection_stats(tag, stat_name, signal_type, injection_stage, round_number);
+
             # Training statistics table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS training_stats (
@@ -251,6 +259,10 @@ class Database:
             # -- For query_training_stat ORDER BY pattern
             # CREATE INDEX IF NOT EXISTS idx_training_stats_query
             # ON training_stats(tag, model_name, round_number, epoch_number, stat_name);
+
+            # -- training_stats: Queries filter by tag + model_name, sort by round/epoch
+            # CREATE INDEX idx_training_stats_tag_model
+            # ON training_stats(tag, model_name, round_number, epoch_number);
 
             conn.commit()
 
