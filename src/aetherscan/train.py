@@ -1150,6 +1150,9 @@ class TrainingPipeline:
             # Plot loss curves
             self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
+            # Plot clipping rate
+            self.plot_clipping_rate(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+
             # Plot injection stats
             self.plot_injection_stats(
                 tag=f"round_{round_idx + 1:02d}",
@@ -1846,6 +1849,158 @@ class TrainingPipeline:
                 title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
             )
 
+    def plot_clipping_rate(self, tag: str | None = None, dir: str | None = None):
+        """
+        Plot gradient clipping rate and gradient norm statistics.
+
+        Generates a 2x3 grid:
+        - Top row: Clipping rate spanning full width
+        - Bottom row: gradient_norm_mean, gradient_norm_std, gradient_norm_max
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        current_time = time.time()
+
+        if self.db is None:
+            raise RuntimeError("No database instance detected - cannot generate clipping rate plot")
+
+        # Query training stats from database
+        all_stats = self.db.query_training_stat(
+            model_name="beta_vae",
+            start_round_number=1,
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        if not all_stats:
+            logger.warning("No training progress data to plot for clipping rate")
+            return
+
+        # Group query results by stat_name
+        raw_history = {}
+        for stat in all_stats:
+            key = stat["stat_name"]
+            if key not in raw_history:
+                raw_history[key] = []
+            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+
+        del all_stats
+        gc.collect()
+
+        # Sort by (round, epoch) and extract just the values
+        history = {}
+        for key, values in raw_history.items():
+            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))
+            history[key] = [v[2] for v in sorted_values]
+
+        del raw_history
+        gc.collect()
+
+        epochs = range(1, len(history.get("clipping_rate", [])) + 1)
+
+        if not epochs:
+            logger.warning("No clipping rate data to plot")
+            return
+
+        # Create figure & setup gridspec (following plot_beta_vae_loss_curves pattern)
+        fig = plt.figure(figsize=(25, 12))
+        gs = fig.add_gridspec(2, 3, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
+
+        # Top subplot spanning full width - Clipping Rate
+        ax_top = fig.add_subplot(gs[0, :])
+
+        # Bottom subplots - Gradient norm statistics
+        ax_mean = fig.add_subplot(gs[1, 0])
+        ax_std = fig.add_subplot(gs[1, 1])
+        ax_max = fig.add_subplot(gs[1, 2])
+
+        fig.suptitle(
+            f"Beta-VAE Clipping Rate ({tag}, {machine_name})", fontsize=18, fontweight="bold"
+        )
+
+        # Top plot: Clipping Rate
+        if "clipping_rate" in history and history["clipping_rate"]:
+            ax_top.plot(
+                epochs, history["clipping_rate"], color="blue", label="Clipping Rate", linewidth=2
+            )
+
+        # Add optimal region markers (1% to 5%)
+        ax_top.axhline(y=0.01, color="gray", linestyle="--", linewidth=1, alpha=0.7)
+        ax_top.axhline(y=0.05, color="gray", linestyle="--", linewidth=1, alpha=0.7)
+        ax_top.fill_between(
+            epochs, 0.01, 0.05, color="green", alpha=0.1, label="Optimal region (1%-5%)"
+        )
+
+        ax_top.set_title("Clipping Rate", fontsize=14, fontweight="bold")
+        ax_top.set_xlabel("Epoch", fontsize=12, fontweight="bold")
+        ax_top.set_ylabel("Clipping Rate", fontsize=12, fontweight="bold")
+        ax_top.grid(True, alpha=0.3)
+        ax_top.legend(loc="upper right")
+
+        # Bottom left: Gradient Norm Mean
+        if "gradient_norm_mean" in history and history["gradient_norm_mean"]:
+            ax_mean.plot(epochs, history["gradient_norm_mean"], color="blue", linewidth=2)
+        ax_mean.axhline(
+            y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.7, label="Clip threshold"
+        )
+        ax_mean.set_title("Gradient Norm Mean", fontsize=14, fontweight="bold")
+        ax_mean.set_xlabel("Epoch", fontsize=12, fontweight="bold")
+        ax_mean.set_ylabel("Norm", fontsize=12, fontweight="bold")
+        ax_mean.grid(True, alpha=0.3)
+        ax_mean.legend(loc="upper right")
+
+        # Bottom center: Gradient Norm Std
+        if "gradient_norm_std" in history and history["gradient_norm_std"]:
+            ax_std.plot(epochs, history["gradient_norm_std"], color="orange", linewidth=2)
+        ax_std.set_title("Gradient Norm Std", fontsize=14, fontweight="bold")
+        ax_std.set_xlabel("Epoch", fontsize=12, fontweight="bold")
+        ax_std.set_ylabel("Std", fontsize=12, fontweight="bold")
+        ax_std.grid(True, alpha=0.3)
+
+        # Bottom right: Gradient Norm Max
+        if "gradient_norm_max" in history and history["gradient_norm_max"]:
+            ax_max.plot(epochs, history["gradient_norm_max"], color="red", linewidth=2)
+        ax_max.axhline(
+            y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.7, label="Clip threshold"
+        )
+        ax_max.set_title("Gradient Norm Max", fontsize=14, fontweight="bold")
+        ax_max.set_xlabel("Epoch", fontsize=12, fontweight="bold")
+        ax_max.set_ylabel("Norm", fontsize=12, fontweight="bold")
+        ax_max.grid(True, alpha=0.3)
+        ax_max.legend(loc="upper right")
+
+        plt.tight_layout()
+
+        # Save plot
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"beta_vae_clipping_rate_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"beta_vae_clipping_rate_{tag}.png"
+            )
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Beta-VAE clipping rate plot saved to: {save_path}")
+
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Beta-VAE Clipping Rate - ({tag}, {machine_name})",
+            )
+
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
         Plot injection statistics for bias/leakage detection.
@@ -1927,12 +2082,26 @@ class TrainingPipeline:
                 del results
             rfi_stats[stat_name] = rfi_results
 
+        # Query background_index values (use any stat to get unique background indices)
+        background_indices = []
+        results = self.db.query_injection_stat(
+            stat_name="global_mean",  # Use any stat to get background_index
+            injection_stage="A",  # Stage A to avoid duplicates across stages
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+        background_indices = [
+            r["background_index"] for r in results if r["background_index"] is not None
+        ]
+        del results
+
         save_path = os.path.join(save_dir, f"injected_signal_characteristics_{tag}.png")
         self._plot_injected_signal_characteristics(
-            eti_stats, rfi_stats, tag, machine_name, save_path
+            eti_stats, rfi_stats, background_indices, tag, machine_name, save_path
         )
 
-        del eti_stats, rfi_stats
+        del eti_stats, rfi_stats, background_indices
         gc.collect()
 
         # Figure 2-5: Global intensity distribution (one per signal_type)
@@ -2039,11 +2208,12 @@ class TrainingPipeline:
         self,
         eti_stats: dict[str, list[float]],
         rfi_stats: dict[str, list[float]],
+        background_indices: list[int],
         tag: str,
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate 2x3 signal characteristics grid."""
+        """Generate 3x3 signal characteristics grid with background_index histogram."""
         signal_stats = [
             "snr",
             "drift_rate",
@@ -2063,7 +2233,7 @@ class TrainingPipeline:
         }
         signal_colors = {"ETI": "blue", "RFI": "orange"}
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
         fig.suptitle(
             f"Injected Signal Characteristics ({tag}, {machine_name})",
             fontsize=16,
@@ -2081,20 +2251,20 @@ class TrainingPipeline:
                 ax.hist(
                     eti_data,
                     bins=50,
-                    alpha=0.25,
+                    alpha=0.15,
                     color=signal_colors["ETI"],
                     edgecolor=signal_colors["ETI"],
-                    linewidth=1.5,
+                    linewidth=2.5,
                     histtype="stepfilled",
                 )
             if rfi_data:
                 ax.hist(
                     rfi_data,
                     bins=50,
-                    alpha=0.25,
+                    alpha=0.15,
                     color=signal_colors["RFI"],
                     edgecolor=signal_colors["RFI"],
-                    linewidth=1.5,
+                    linewidth=2.5,
                     histtype="stepfilled",
                 )
 
@@ -2103,6 +2273,28 @@ class TrainingPipeline:
             )
             ax.set_ylabel("Count", fontsize=10)
             ax.grid(True, alpha=0.3)
+
+        # Background index histogram (7th subplot at position [2, 0])
+        ax_bg = axes[2, 0]
+        if background_indices:
+            max_bg = max(background_indices)
+            ax_bg.hist(
+                background_indices,
+                bins=range(0, max_bg + 2),  # Discrete integer bins from 0 to max+1
+                alpha=0.15,
+                color="purple",
+                edgecolor="purple",
+                linewidth=2.5,
+                histtype="stepfilled",
+            )
+        ax_bg.set_title("Background Index", fontsize=12, fontweight="bold")
+        ax_bg.set_xlabel("Background Index (0 to N-1)", fontsize=10)
+        ax_bg.set_ylabel("Count", fontsize=10)
+        ax_bg.grid(True, alpha=0.3)
+
+        # Hide unused subplots
+        axes[2, 1].axis("off")
+        axes[2, 2].axis("off")
 
         # Create legend handles for figure-level legend
         legend_handles = [
@@ -2178,10 +2370,10 @@ class TrainingPipeline:
                     ax.hist(
                         data,
                         bins=50,
-                        alpha=0.25,
+                        alpha=0.15,
                         color=stage_colors[stage],
                         edgecolor=stage_colors[stage],
-                        linewidth=1.5,
+                        linewidth=2.5,
                         histtype="stepfilled",
                     )
 
@@ -2192,10 +2384,10 @@ class TrainingPipeline:
                 ax2.hist(
                     data_c,
                     bins=50,
-                    alpha=0.25,
+                    alpha=0.15,
                     color=stage_colors["C"],
                     edgecolor=stage_colors["C"],
-                    linewidth=1.5,
+                    linewidth=2.5,
                     histtype="stepfilled",
                 )
 
@@ -2307,7 +2499,7 @@ class TrainingPipeline:
                     ax.scatter(
                         values_a,
                         values_b,
-                        alpha=0.15,
+                        alpha=0.08,
                         facecolor=type_colors[signal_type],
                         edgecolor=type_colors[signal_type],
                         linewidth=0.3,
@@ -2602,6 +2794,9 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
         try:
             # Plot loss curves
             pipeline.plot_beta_vae_loss_curves()
+
+            # Plot clipping rate
+            pipeline.plot_clipping_rate()
 
             # Plot injection stats
             pipeline.plot_injection_stats()
