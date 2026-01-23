@@ -1,4 +1,5 @@
 # NOTE: come back to this later
+# BUG: batched slack messages should be colored by the highest priority message (e.g. red if any message in the batch has priority ERROR). currently seeing INFO + WARN + ERROR be colored yellow (WARN)
 """
 Slack logging handler for Aetherscan Pipeline
 Provides custom logging handler that sends messages to Slack API with:
