@@ -33,15 +33,6 @@ logger = logging.getLogger(__name__)
 _FLUSH_SENTINEL = object()
 
 
-# TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _compute_intensity_stats() from data_generation.py? should we add metrics to track sanitization frequency (indicating possible data corruption)
-def _sanitize_float(value: float, fallback: float = 0.0, name: str = "value") -> float:
-    """Replace NaN/inf with fallback for SQLite compatibility."""
-    if not np.isfinite(value):
-        logger.warning(f"_sanitize_float: {name} is {value}, replacing with {fallback}")
-        return fallback
-    return value
-
-
 def get_system_metadata() -> str:
     """
     Collects system metadata (machine name, user name, IP address, process ID)
@@ -171,11 +162,15 @@ class Database:
             cls._instance = None
             logger.info("Database singleton instance reset")
 
+    # TODO:
     # We currently don't support schema versioning or migration scripting for schema changes
-    # For the current pipeline design, CREATE TABLE IF NOT EXISTS is sufficient
-    # Migratin frameworks add complexity that simply aren't necessary for our current use cases
-    # For now, we'll manually change schemas as-needed
-    # Revisit this if schema changes become frequent
+    # This means that while new tables can be easily added using CREATE TABLE IF NOT EXISTS
+    # statements, existing tables cannot be easily modified (i.e. no ALTER TABLE support for adding
+    # new columns to tables, modifying column constraints, renaming columns, or dropping obsolete
+    # columns), and no rollback mechanisms exist
+    # This makes it impossible to evolve existing schema without manual database updates. As well as
+    # having no audit trail of schema changes, or no rollback capability for failed upgrades. It's
+    # also difficult to coordinate deployments across multiple db instances
     def _init_database(self):
         """Create database tables if they don't exist"""
         with self._get_connection() as conn:
@@ -424,13 +419,26 @@ class Database:
             self.buffer.clear()
             logger.info(f"Flushed {len(self.buffer)} remaining data on shutdown")
 
+    # In commit 08fc37d, we switched from using sequential execute() to executemany()
+    # The sequential approaches parses SQL statements N times & performs N round trips to the db
+    # engine, in exchange for lower peak memory & more granular errors (can identify exactly which
+    # row failed). In contrast, executemany() only parses SQL statements once & performs only 1
+    # round trip to the db engine, but requires all rows to be in memory & fails the entire batch
+    # if any row fails
+    # In general, sequential execute() is preferred when db buffer sizes are small, if write
+    # frequency is low, if each record in the buffer is guaranteed to go to different tables, or
+    # if we require per-row error handling
+    # In our case, we have a larger buffer (100+ records), most records in a batch will go to the
+    # same table, and we're okay with all-or-nothing batch semantics. So the increased write speeds
+    # in exchange for increased memory pressure is worth it
+    # As well, since our db writes happen in a background thread & don't block the main process,
+    # either approach should have minimal practical impact
     def _flush_buffer(self):
         """
         Write buffered data to database in a single transaction using executemany().
 
-        Groups records by table type and uses executemany() for bulk inserts, which is
-        more efficient than individual execute() calls because the SQL is parsed once
-        and reused for all rows.
+        Groups records by table and uses executemany() for bulk inserts, which is more efficient
+        than individual execute() calls because the SQL is parsed once and reused for all rows.
         """
         if not self.buffer:
             return
