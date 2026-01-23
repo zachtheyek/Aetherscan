@@ -210,7 +210,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
                     stat_name TEXT NOT NULL,
-                    value REAL NOT NULL,
+                    value REAL,
                     round_number INTEGER,
                     chunk_number INTEGER,
                     sample_index INTEGER,
@@ -219,7 +219,8 @@ class Database:
                     signal_type TEXT,
                     injection_stage TEXT,
                     tag TEXT,
-                    metadata TEXT
+                    metadata TEXT,
+                    is_valid INTEGER DEFAULT 1
                 )
             """)
 
@@ -467,8 +468,8 @@ class Database:
                         """
                         INSERT INTO injection_stats
                         (timestamp, stat_name, value, round_number, chunk_number, sample_index,
-                         background_index, signal_class, signal_type, injection_stage, tag, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         background_index, signal_class, signal_type, injection_stage, tag, metadata, is_valid)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         injection_stats_records,
                     )
@@ -558,9 +559,15 @@ class Database:
         """
         metadata_json = get_system_metadata()
 
-        # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting?
-        # Sanitize value to prevent NaN/inf from violating NOT NULL constraint
-        sanitized_value = _sanitize_float(value, fallback=0.0, name=stat_name)
+        # Check if value is valid (finite) and set is_valid flag accordingly
+        # Store NULL for invalid values instead of clamping to 0.0
+        is_valid = 1 if np.isfinite(value) else 0
+        sanitized_value = float(value) if is_valid else None
+
+        if not is_valid:
+            logger.warning(
+                f"write_injection_stat: {stat_name} is {value}, storing as NULL with is_valid=0"
+            )
 
         self.write_queue.put(
             (
@@ -578,6 +585,7 @@ class Database:
                     injection_stage,
                     tag,
                     metadata_json,
+                    is_valid,
                 ),
             )
         )
@@ -706,6 +714,7 @@ class Database:
         tag: str | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        only_valid: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Query from injection_stats table
@@ -726,6 +735,7 @@ class Database:
             tag: Tag for current pipeline run
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
+            only_valid: If True (default), only return rows where is_valid=1
 
         Returns:
             List of metric dictionaries
@@ -799,6 +809,9 @@ class Database:
             if end_time:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
+
+            if only_valid:
+                query += " AND is_valid = 1"
 
             # Intentionally hard-coded. Update if schema changes
             query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
