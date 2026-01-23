@@ -204,7 +204,9 @@ def new_cadence(
     # Clamp slopes that are too small to prevent divide-by-zero errors
     # While this may alter the physics slightly, a near-zero slope is an edge-case representing a
     # nearly horizontal signal trajectory
+    # Note that we still preserve the drift direction; merely the magnitude is clamped
     # NOTE: should MIN_SLOPE_PHYSICAL = 1e-6 be parametrized in config.py instead?
+    # NOTE: does slope_pixel need to be changed before db write if slope_physical is clamped?
     MIN_SLOPE_PHYSICAL = 1e-6  # noqa: N806
     slope_was_clamped = False
     if abs(slope_physical) < MIN_SLOPE_PHYSICAL:
@@ -299,8 +301,7 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         Dict with keys: global_mean, global_median, global_std,
                         global_mad, global_skew, global_kurtosis
     """
-    # TEST: is 0.0 the correct fallback here?
-    # Handle empty arrays
+    # Handle empty arrays - return NaN to signal is_finite=0 in write_injection_stat()
     if data.size == 0:
         logger.warning("_compute_intensity_stats received empty array")
         return dict.fromkeys(
@@ -312,7 +313,7 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
                 "global_skew",
                 "global_kurtosis",
             ],
-            0.0,
+            float("nan"),
         )
 
     # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for stage A & B stats)
@@ -327,10 +328,6 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         "global_skew": float(scipy_stats.skew(flat)),
         "global_kurtosis": float(scipy_stats.kurtosis(flat)),
     }
-
-    # NOTE: NaN/inf values (e.g., skewness/kurtosis for constant arrays) are intentionally
-    # NOT sanitized here. They flow through to db.py where write_injection_stat() handles
-    # them with NULL + is_valid flag for proper tracking and filtering.
 
     return stats
 
@@ -1126,6 +1123,7 @@ class DataGenerator:
             background_index = sample_info["background_index"]
             intensity_stats = sample_info["intensity_stats"]
             signal_info = sample_info["signal_info"]
+            slope_was_clamped = sample_info.get("slope_was_clamped", False)
 
             # Write intensity stats for each stage
             for stage in ["A", "B", "C"]:
@@ -1149,6 +1147,7 @@ class DataGenerator:
                         signal_class=signal_class,
                         signal_type=signal_type,
                         injection_stage=stage,
+                        slope_clamped=slope_was_clamped,
                         tag=tag,
                         timestamp=timestamp,
                     )
@@ -1167,13 +1166,10 @@ class DataGenerator:
                     signal_class=signal_class,
                     signal_type=signal_type,
                     injection_stage=None,
+                    slope_clamped=slope_was_clamped,
                     tag=tag,
                     timestamp=timestamp,
                 )
-
-        # Calculate slope clamping rate for this batch
-        slope_clamp_count = sum(1 for s in stats_list if s.get("slope_was_clamped", False))
-        slope_clamping_rate = slope_clamp_count / num_samples if num_samples > 0 else 0.0
 
         # Write batch-level metadata stats (once per batch, not per sample)
         metadata_stats = [
@@ -1181,8 +1177,6 @@ class DataGenerator:
             ("snr_range_ceil", snr_range_ceil),
             ("num_samples", float(num_samples)),
             ("inject_duration", inject_duration),
-            ("slope_clamping_rate", slope_clamping_rate),
-            ("slope_clamp_count", float(slope_clamp_count)),
         ]
 
         for stat_name, value in metadata_stats:

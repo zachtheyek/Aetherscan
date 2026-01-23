@@ -1685,8 +1685,101 @@ class TrainingPipeline:
             del true_latents, false_latents
             gc.collect()
 
-    # TODO: visualize SNR range in loss curves plot
-    # TODO: visualize gradient stats in separate plot (subplot?) -> main: clipping_rate, secondary: mean, max, std
+    def _get_snr_by_round(self, current_time: float) -> dict[int, dict[str, float]]:
+        """
+        Query SNR range data from training_stats and return per-round SNR info.
+
+        Returns:
+            Dict mapping round_number to {"floor": x, "ceil": y}
+        """
+        if self.db is None:
+            return {}
+
+        snr_by_round: dict[int, dict[str, float]] = {}
+
+        # Query snr_range_floor
+        floor_results = self.db.query_training_stat(
+            model_name="beta_vae",
+            stat_name="snr_range_floor",
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        for r in floor_results:
+            round_num = r["round_number"]
+            if round_num not in snr_by_round:
+                snr_by_round[round_num] = {}
+            snr_by_round[round_num]["floor"] = r["value"]
+
+        # Query snr_range_ceil
+        ceil_results = self.db.query_training_stat(
+            model_name="beta_vae",
+            stat_name="snr_range_ceil",
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        for r in ceil_results:
+            round_num = r["round_number"]
+            if round_num not in snr_by_round:
+                snr_by_round[round_num] = {}
+            snr_by_round[round_num]["ceil"] = r["value"]
+
+        return snr_by_round
+
+    def _add_snr_range_shading(
+        self,
+        ax,
+        snr_by_round: dict[int, dict[str, float]],
+        epochs_per_round: int,
+    ) -> None:
+        """
+        Add transparent background regions showing SNR range per round.
+
+        Args:
+            ax: Matplotlib axis to add shading to
+            snr_by_round: Dict mapping round_number to {"floor": x, "ceil": y}
+            epochs_per_round: Number of epochs per training round
+        """
+        if not snr_by_round:
+            return
+
+        # Alternating colors for visual distinction
+        colors = ["#e6f2ff", "#fff2e6"]  # Light blue, light orange
+
+        for idx, (round_num, snr_info) in enumerate(sorted(snr_by_round.items())):
+            if "floor" not in snr_info or "ceil" not in snr_info:
+                continue
+
+            start_epoch = (round_num - 1) * epochs_per_round + 1
+            end_epoch = round_num * epochs_per_round
+
+            # Add shaded region
+            ax.axvspan(
+                start_epoch - 0.5,
+                end_epoch + 0.5,
+                color=colors[idx % 2],
+                alpha=0.3,
+                zorder=0,
+            )
+
+            # Add SNR text annotation at top of region
+            mid_epoch = (start_epoch + end_epoch) / 2
+            snr_floor = int(snr_info["floor"])
+            snr_ceil = int(snr_info["ceil"])
+            ax.text(
+                mid_epoch,
+                0.98,
+                f"SNR: {snr_floor}-{snr_ceil}",
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=8,
+                alpha=0.7,
+            )
+
     def plot_beta_vae_loss_curves(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
@@ -1763,6 +1856,13 @@ class TrainingPipeline:
         fig.suptitle(
             f"Beta-VAE Loss Curves ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
+
+        # Add SNR range background shading to all axes
+        snr_by_round = self._get_snr_by_round(current_time)
+        epochs_per_round = self.config.training.beta_vae_epochs
+        all_axes = [ax_top, ax_recon, ax_kl, ax_true, ax_false]
+        for ax in all_axes:
+            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round)
 
         # Helper function to plot dual y-axis
         def plot_dual_axis(ax, title, train_key, val_key):
@@ -1938,39 +2038,32 @@ class TrainingPipeline:
             f"Beta-VAE Training Stability ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
+        # Add SNR range background shading to all axes
+        snr_by_round = self._get_snr_by_round(current_time)
+        epochs_per_round = self.config.training.beta_vae_epochs
+        all_axes = [ax_top, ax_mean, ax_std, ax_max]
+        for ax in all_axes:
+            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round)
+
         # Top plot: Clipping Rate
         if "clipping_rate" in history and history["clipping_rate"]:
-            ax_top.plot(
-                epochs, history["clipping_rate"], color="blue", label="Clipping Rate", linewidth=2
-            )
+            ax_top.plot(epochs, history["clipping_rate"], color="blue", linewidth=2)
 
-        # Add optimal region markers (1% to 5%)
-        ax_top.axhline(y=0.01, color="gray", linestyle="--", linewidth=1, alpha=0.7)
-        ax_top.axhline(y=0.05, color="gray", linestyle="--", linewidth=1, alpha=0.7)
-        ax_top.fill_between(
-            epochs, 0.01, 0.05, color="green", alpha=0.1, label="Optimal region (1%-5%)"
-        )
+        # Add optimal clipping rate bounds with distinct line styles
+        ax_top.axhline(y=0.01, color="green", linestyle="--", linewidth=1.5, alpha=0.8)  # Dashed
+        ax_top.axhline(y=0.05, color="green", linestyle=":", linewidth=1.5, alpha=0.8)  # Dotted
 
         ax_top.set_title("Gradient Clipping Rate", fontsize=14, fontweight="bold")
         ax_top.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_top.grid(True, alpha=0.3)
-        ax_top.legend(loc="upper right")
 
         # Bottom left: Gradient Norm Mean
         if "gradient_norm_mean" in history and history["gradient_norm_mean"]:
             ax_mean.plot(epochs, history["gradient_norm_mean"], color="blue", linewidth=2)
-        ax_mean.axhline(
-            y=1.0,
-            color="gray",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.7,
-            label="Clipping threshold (1.0)",
-        )
+        ax_mean.axhline(y=1.0, color="red", linestyle="-.", linewidth=1.5, alpha=0.8)  # Dash-dot
         ax_mean.set_title("Gradient Norm Mean", fontsize=14, fontweight="bold")
         ax_mean.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_mean.grid(True, alpha=0.3)
-        ax_mean.legend(loc="upper right")
 
         # Bottom center: Gradient Norm Std
         if "gradient_norm_std" in history and history["gradient_norm_std"]:
@@ -1982,20 +2075,45 @@ class TrainingPipeline:
         # Bottom right: Gradient Norm Max
         if "gradient_norm_max" in history and history["gradient_norm_max"]:
             ax_max.plot(epochs, history["gradient_norm_max"], color="blue", linewidth=2)
-        ax_max.axhline(
-            y=1.0,
-            color="gray",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.7,
-            label="Clipping threshold (1.0)",
-        )
+        ax_max.axhline(y=1.0, color="red", linestyle="-.", linewidth=1.5, alpha=0.8)  # Dash-dot
         ax_max.set_title("Gradient Norm Max", fontsize=14, fontweight="bold")
         ax_max.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_max.grid(True, alpha=0.3)
-        ax_max.legend(loc="upper right")
 
-        plt.tight_layout()
+        # Unified figure legend
+        legend_handles = [
+            mlines.Line2D([], [], color="blue", linewidth=2, label="Clipping Rate / Gradient Norm"),
+            mlines.Line2D(
+                [],
+                [],
+                color="green",
+                linestyle="--",
+                linewidth=1.5,
+                label="Optimal clipping rate (min: 1%)",
+            ),
+            mlines.Line2D(
+                [],
+                [],
+                color="green",
+                linestyle=":",
+                linewidth=1.5,
+                label="Optimal clipping rate (max: 5%)",
+            ),
+            mlines.Line2D(
+                [], [], color="red", linestyle="-.", linewidth=1.5, label="Clipping threshold (1.0)"
+            ),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.98, 0.98),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.85, 1])  # Room for legend
 
         # Save plot
         if dir is not None:
@@ -2026,8 +2144,9 @@ class TrainingPipeline:
         """
         Plot injection statistics for bias/leakage detection.
 
-        Generates 7 figures:
+        Generates 8 figures:
         - 1 injected signal characteristics
+        - 1 injection stability metrics (sanitization & clamping rates)
         - 4 global intensity distributions (one per signal_type)
         - 1 A->B global intensity biases
         - 1 final global intensity biases
@@ -2105,27 +2224,54 @@ class TrainingPipeline:
                 del results
             rfi_stats[stat_name] = rfi_results
 
-        # Query background_index values (use any stat to get unique background indices)
-        background_indices = []
-        results = self.db.query_injection_stat(
-            stat_name="global_mean",  # Use any stat to get background_index
-            injection_stage="A",  # Stage A to avoid duplicates across stages
-            tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
-        )
-        background_indices = [
-            r["background_index"] for r in results if r["background_index"] is not None
-        ]
-        del results
+        # Query background_index values separately for ETI and RFI signal types
+        eti_background_indices = []
+        for st in ["true_only_eti", "true_eti_rfi"]:
+            results = self.db.query_injection_stat(
+                stat_name="global_mean",
+                injection_stage="A",
+                signal_type=st,
+                tag=self.config.checkpoint.save_tag,
+                start_time=self.start_time,
+                end_time=current_time,
+            )
+            eti_background_indices.extend(
+                [r["background_index"] for r in results if r["background_index"] is not None]
+            )
+            del results
+
+        rfi_background_indices = []
+        for st in ["false_with_rfi", "true_eti_rfi"]:
+            results = self.db.query_injection_stat(
+                stat_name="global_mean",
+                injection_stage="A",
+                signal_type=st,
+                tag=self.config.checkpoint.save_tag,
+                start_time=self.start_time,
+                end_time=current_time,
+            )
+            rfi_background_indices.extend(
+                [r["background_index"] for r in results if r["background_index"] is not None]
+            )
+            del results
 
         save_path = os.path.join(save_dir, f"injected_signal_characteristics_{tag}.png")
         self._plot_injected_signal_characteristics(
-            eti_stats, rfi_stats, background_indices, tag, machine_name, save_path
+            eti_stats,
+            rfi_stats,
+            eti_background_indices,
+            rfi_background_indices,
+            tag,
+            machine_name,
+            save_path,
         )
 
-        del eti_stats, rfi_stats, background_indices
+        del eti_stats, rfi_stats, eti_background_indices, rfi_background_indices
         gc.collect()
+
+        # Figure 2: Injection stability metrics
+        save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
+        self._plot_injection_stability(tag, machine_name, save_path)
 
         # Figure 2-5: Global intensity distribution (one per signal_type)
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
@@ -2231,12 +2377,17 @@ class TrainingPipeline:
         self,
         eti_stats: dict[str, list[float]],
         rfi_stats: dict[str, list[float]],
-        background_indices: list[int],
+        eti_background_indices: list[int],
+        rfi_background_indices: list[int],
         tag: str,
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate 3x3 signal characteristics grid."""
+        """Generate signal characteristics grid with GridSpec layout.
+
+        Top 2 rows: 6 signal stats in 3x2 grid
+        Bottom row: Background plates spanning full width with ETI/RFI overlapping histograms
+        """
         signal_stats = [
             "snr",
             "drift_rate",
@@ -2256,16 +2407,20 @@ class TrainingPipeline:
         }
         signal_colors = {"ETI": "blue", "RFI": "orange"}
 
-        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+        # Use GridSpec for flexible layout
+        fig = plt.figure(figsize=(15, 15))
+        gs = fig.add_gridspec(3, 3, height_ratios=[1, 1, 1], hspace=0.3, wspace=0.3)
+
         fig.suptitle(
             f"Injected Signal Characteristics ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
 
+        # 6 signal stats in top 2 rows
         for idx, stat_name in enumerate(signal_stats):
             row, col = idx // 3, idx % 3
-            ax = axes[row, col]
+            ax = fig.add_subplot(gs[row, col])
 
             eti_data = eti_stats.get(stat_name, [])
             rfi_data = rfi_stats.get(stat_name, [])
@@ -2297,26 +2452,42 @@ class TrainingPipeline:
             ax.set_ylabel("Count", fontsize=10)
             ax.grid(True, alpha=0.3)
 
-        # Background index histogram (7th subplot at position [2, 0])
-        ax_bg = axes[2, 0]
-        if background_indices:
-            max_bg = max(background_indices)
-            ax_bg.hist(
-                background_indices,
-                bins=range(0, max_bg + 2),  # Discrete integer bins from 0 to max+1
-                alpha=0.2,
-                color="purple",
-                edgecolor="purple",
-                linewidth=2,
-                histtype="stepfilled",
-            )
+        # Background plates histogram spanning full bottom row
+        ax_bg = fig.add_subplot(gs[2, :])  # Spans all 3 columns
+
+        # Plot overlapping ETI and RFI background indices
+        all_bg_indices = eti_background_indices + rfi_background_indices
+        if all_bg_indices:
+            max_bg = max(all_bg_indices)
+            bins = range(0, max_bg + 2)  # Discrete integer bins from 0 to max+1
+
+            if eti_background_indices:
+                ax_bg.hist(
+                    eti_background_indices,
+                    bins=bins,
+                    alpha=0.2,
+                    color=signal_colors["ETI"],
+                    edgecolor=signal_colors["ETI"],
+                    linewidth=2,
+                    histtype="stepfilled",
+                    label="ETI",
+                )
+            if rfi_background_indices:
+                ax_bg.hist(
+                    rfi_background_indices,
+                    bins=bins,
+                    alpha=0.2,
+                    color=signal_colors["RFI"],
+                    edgecolor=signal_colors["RFI"],
+                    linewidth=2,
+                    histtype="stepfilled",
+                    label="RFI",
+                )
+
         ax_bg.set_title("Background Plates", fontsize=12, fontweight="bold")
+        ax_bg.set_xlabel("Background Index", fontsize=10)
         ax_bg.set_ylabel("Count", fontsize=10)
         ax_bg.grid(True, alpha=0.3)
-
-        # Hide unused subplots
-        axes[2, 1].axis("off")
-        axes[2, 2].axis("off")
 
         # Create legend handles for figure-level legend
         legend_handles = [
@@ -2345,6 +2516,254 @@ class TrainingPipeline:
             logger_instance.upload_image_to_slack(
                 save_path,
                 title=f"Injected signal characteristics ({tag}, {machine_name})",
+            )
+
+    def _plot_injection_stability(
+        self,
+        tag: str,
+        machine_name: str,
+        save_path: str,
+    ) -> None:
+        """
+        Plot injection stability metrics: sanitization rate and clamping rate.
+
+        Top plot: Sanitization rate per statistic (global_mean, global_median, etc.)
+                  - Rate = count(is_finite=0) / total_count per round
+                  - Multiple lines, one per statistic type
+
+        Bottom plot: Slope clamping rate per round
+                  - Rate = count(slope_clamped=1) / total_count per round
+
+        Unified legend outside subplots.
+        """
+        current_time = time.time()
+
+        if self.db is None:
+            raise RuntimeError(
+                "No database instance detected - cannot generate injection stability plot"
+            )
+
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        stat_colors = {
+            "global_mean": "blue",
+            "global_median": "orange",
+            "global_std": "green",
+            "global_mad": "red",
+            "global_skew": "purple",
+            "global_kurtosis": "brown",
+        }
+        stat_display_names = {
+            "global_mean": "Mean",
+            "global_median": "Median",
+            "global_std": "Std Dev",
+            "global_mad": "MAD",
+            "global_skew": "Skewness",
+            "global_kurtosis": "Kurtosis",
+        }
+
+        # Query all injection stats (including non-finite) to compute sanitization rates
+        # Group by round_number and stat_name
+        sanitization_rates_by_stat: dict[str, dict[int, float]] = {s: {} for s in intensity_stats}
+        clamping_rates_by_round: dict[int, float] = {}
+
+        # Get all unique round numbers first
+        all_results = self.db.query_injection_stat(
+            stat_name="global_mean",
+            injection_stage="A",
+            only_finite=False,
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        if not all_results:
+            logger.warning("No injection stats data for stability plot")
+            return
+
+        # NOTE: come back to this later
+        # round_numbers = sorted(set(r["round_number"] for r in all_results if r["round_number"]))
+        round_numbers = sorted({r["round_number"] for r in all_results if r["round_number"]})
+        del all_results
+        gc.collect()
+
+        if not round_numbers:
+            logger.warning("No round numbers found for injection stability plot")
+            return
+
+        # Compute sanitization rate per stat per round
+        for stat_name in intensity_stats:
+            for round_num in round_numbers:
+                # Query all (finite and non-finite) for this stat and round
+                results = self.db.query_injection_stat(
+                    stat_name=stat_name,
+                    injection_stage="A",
+                    start_round_number=round_num,
+                    end_round_number=round_num,
+                    only_finite=False,
+                    tag=self.config.checkpoint.save_tag,
+                    start_time=self.start_time,
+                    end_time=current_time,
+                )
+
+                if results:
+                    total_count = len(results)
+                    non_finite_count = sum(1 for r in results if r.get("is_finite", 1) == 0)
+                    sanitization_rate = non_finite_count / total_count if total_count > 0 else 0.0
+                    sanitization_rates_by_stat[stat_name][round_num] = sanitization_rate
+
+                del results
+
+        # Compute clamping rate per round (using slope_clamped column)
+        for round_num in round_numbers:
+            # Query all samples for this round (use any stat, stage A)
+            results = self.db.query_injection_stat(
+                stat_name="global_mean",
+                injection_stage="A",
+                start_round_number=round_num,
+                end_round_number=round_num,
+                only_finite=False,
+                tag=self.config.checkpoint.save_tag,
+                start_time=self.start_time,
+                end_time=current_time,
+            )
+
+            if results:
+                total_count = len(results)
+                clamped_count = sum(1 for r in results if r.get("slope_clamped", 0) == 1)
+                clamping_rate = clamped_count / total_count if total_count > 0 else 0.0
+                clamping_rates_by_round[round_num] = clamping_rate
+
+            del results
+
+        gc.collect()
+
+        # Create figure with GridSpec layout
+        fig = plt.figure(figsize=(15, 10))
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.3)
+
+        ax_sanitization = fig.add_subplot(gs[0])
+        ax_clamping = fig.add_subplot(gs[1])
+
+        fig.suptitle(
+            f"Injection Stability Metrics ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        # Add SNR range annotations for round-based plot
+        snr_by_round = self._get_snr_by_round(current_time)
+        for ax in [ax_sanitization, ax_clamping]:
+            for round_num, snr_info in sorted(snr_by_round.items()):
+                if "floor" in snr_info and "ceil" in snr_info:
+                    snr_floor = int(snr_info["floor"])
+                    snr_ceil = int(snr_info["ceil"])
+                    ax.text(
+                        round_num,
+                        0.98,
+                        f"{snr_floor}-{snr_ceil}",
+                        transform=ax.get_xaxis_transform(),
+                        ha="center",
+                        va="top",
+                        fontsize=7,
+                        alpha=0.6,
+                    )
+
+        # Top plot: Sanitization rate per statistic
+        for stat_name in intensity_stats:
+            rates = sanitization_rates_by_stat[stat_name]
+            if rates:
+                rounds = sorted(rates.keys())
+                values = [rates[r] for r in rounds]
+                ax_sanitization.plot(
+                    rounds,
+                    values,
+                    color=stat_colors[stat_name],
+                    linewidth=2,
+                    marker="o",
+                    markersize=4,
+                    label=stat_display_names[stat_name],
+                )
+
+        ax_sanitization.set_title("Sanitization Rate by Statistic", fontsize=14, fontweight="bold")
+        ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
+        ax_sanitization.set_ylabel("Rate (non-finite / total)", fontsize=12, fontweight="bold")
+        ax_sanitization.grid(True, alpha=0.3)
+        ax_sanitization.set_ylim(bottom=0)
+
+        # Bottom plot: Slope clamping rate
+        if clamping_rates_by_round:
+            rounds = sorted(clamping_rates_by_round.keys())
+            values = [clamping_rates_by_round[r] for r in rounds]
+            ax_clamping.plot(
+                rounds,
+                values,
+                color="blue",
+                linewidth=2,
+                marker="o",
+                markersize=4,
+                label="Slope Clamping Rate",
+            )
+
+        ax_clamping.set_title("Slope Clamping Rate", fontsize=14, fontweight="bold")
+        ax_clamping.set_xlabel("Round", fontsize=12, fontweight="bold")
+        ax_clamping.set_ylabel("Rate (clamped / total)", fontsize=12, fontweight="bold")
+        ax_clamping.grid(True, alpha=0.3)
+        ax_clamping.set_ylim(bottom=0)
+
+        # Create unified legend
+        legend_handles = [
+            mlines.Line2D(
+                [],
+                [],
+                color=stat_colors[stat_name],
+                linewidth=2,
+                marker="o",
+                markersize=4,
+                label=stat_display_names[stat_name],
+            )
+            for stat_name in intensity_stats
+        ]
+        legend_handles.append(
+            mlines.Line2D(
+                [],
+                [],
+                color="blue",
+                linewidth=2,
+                marker="o",
+                markersize=4,
+                label="Slope Clamping",
+            )
+        )
+
+        fig.legend(
+            handles=legend_handles,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            fontsize=10,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+        )
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        logger.info(f"Injection stability plot saved: {save_path}")
+
+        # Upload to Slack
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"Injection stability metrics ({tag}, {machine_name})",
             )
 
     def _plot_global_intensity_distributions(

@@ -190,18 +190,22 @@ class Database:
                 )
             """)
 
-            # TODO: add additional index for frequent queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON system_resources(timestamp)
-            """)
-            # -- For query_system_resource ORDER BY pattern
-            # CREATE INDEX IF NOT EXISTS idx_system_resources_query
-            # ON system_resources(tag, timestamp, resource_type, resource_name);
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # # Composite index optimized for query_system_resource ORDER BY pattern
+            # # Also works for common filter patterns (tag + timestamp)
+            # # Recall that composite indices follow the left-prefix rule
+            # # That is, if your query contains a left prefix of the index columns,
+            # # you'll still get (some of) the benefits of indexing
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_system_resources_query
+            #     ON system_resources(tag, timestamp, resource_type, resource_name)
+            # """)
 
-            # -- system_resources: Queries filter by tag + resource_type + resource_name
-            # CREATE INDEX idx_system_resources_tag_type
-            # ON system_resources(tag, resource_type, resource_name);
+            # Composite index for common filter patterns (tag + timestamp)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_system_resources_query
+                ON system_resources(tag, timestamp)
+            """)
 
             # Injection statistics table
             cursor.execute("""
@@ -209,7 +213,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
                     stat_name TEXT NOT NULL,
-                    value REAL,
+                    value REAL NOT NULL,
                     round_number INTEGER,
                     chunk_number INTEGER,
                     sample_index INTEGER,
@@ -217,24 +221,25 @@ class Database:
                     signal_class TEXT,
                     signal_type TEXT,
                     injection_stage TEXT,
+                    is_finite INTEGER DEFAULT 1,
+                    slope_clamped INTEGER DEFAULT 0,
                     tag TEXT,
-                    metadata TEXT,
-                    is_valid INTEGER DEFAULT 1
+                    metadata TEXT
                 )
             """)
 
-            # TODO: add additional index for frequent queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON injection_stats(timestamp)
-            """)
-            # -- For query_injection_stat ORDER BY pattern
-            # CREATE INDEX IF NOT EXISTS idx_injection_stats_query
-            # ON injection_stats(tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name);
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # # Composite index optimized for query_injection_stat ORDER BY pattern
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_injection_stats_query
+            #     ON injection_stats(tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name)
+            # """)
 
-            # -- injection_stats: Queries filter by tag + stat_name + signal_type + injection_stage
-            # CREATE INDEX idx_injection_stats_tag_stat
-            # ON injection_stats(tag, stat_name, signal_type, injection_stage, round_number);
+            # Composite index for common filter pattern (tag + timestamp + stat_name + signal_type + injection_stage)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_injection_stats_filter
+                ON injection_stats(tag, timestamp, stat_name, signal_type, injection_stage)
+            """)
 
             # Training statistics table
             cursor.execute("""
@@ -251,18 +256,18 @@ class Database:
                 )
             """)
 
-            # TODO: add additional index for frequent queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON training_stats(timestamp)
-            """)
-            # -- For query_training_stat ORDER BY pattern
-            # CREATE INDEX IF NOT EXISTS idx_training_stats_query
-            # ON training_stats(tag, model_name, round_number, epoch_number, stat_name);
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # # Composite index optimized for query_training_stat ORDER BY pattern
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_training_stats_query
+            #     ON training_stats(tag, model_name, round_number, epoch_number, stat_name)
+            # """)
 
-            # -- training_stats: Queries filter by tag + model_name, sort by round/epoch
-            # CREATE INDEX idx_training_stats_tag_model
-            # ON training_stats(tag, model_name, round_number, epoch_number);
+            # Composite index for common filter pattern (tag + timestamp + model_name + stat_name)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_training_stats_filter
+                ON training_stats(tag, timestamp, model_name, stat_name)
+            """)
 
             conn.commit()
 
@@ -488,8 +493,9 @@ class Database:
                         """
                         INSERT INTO injection_stats
                         (timestamp, stat_name, value, round_number, chunk_number, sample_index,
-                         background_index, signal_class, signal_type, injection_stage, tag, metadata, is_valid)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         background_index, signal_class, signal_type, injection_stage, is_finite,
+                         slope_clamped, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         injection_stats_records,
                     )
@@ -558,6 +564,7 @@ class Database:
         signal_class: str | None = None,
         signal_type: str | None = None,
         injection_stage: str | None = None,
+        slope_clamped: bool | None = None,
         tag: str | None = None,
         timestamp: float | None = None,
     ):
@@ -574,20 +581,27 @@ class Database:
             signal_class: Optional signal class (e.g. main, false, true)
             signal_type: Optional signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
             injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            slope_clamped: Optional per-sample flag indicating if slope was clamped during injection
             tag: Optional tag for current pipeline run
             timestamp: Optional timestamp when stat was logged (uses current time if not provided)
         """
         metadata_json = get_system_metadata()
 
-        # Check if value is valid (finite) and set is_valid flag accordingly
-        # Store NULL for invalid values instead of clamping to 0.0
-        is_valid = 1 if np.isfinite(value) else 0
-        sanitized_value = float(value) if is_valid else None
+        # Since higher-order moments from _compute_intensity_stats() could lead to infinite values
+        # We explicitly check if a value is finite to set the flag accordingly
+        # We will opt to store these values as 0.0 due to the schema's NOT NULL constraint
+        # However, queries for injection_stats should ideally always use the is_finite flag for
+        # sanitization
+        is_finite = 1 if np.isfinite(value) else 0
+        sanitized_value = float(value) if is_finite else 0.0
 
-        if not is_valid:
+        if not is_finite:
             logger.warning(
-                f"write_injection_stat: {stat_name} is {value}, storing as NULL with is_valid=0"
+                f"write_injection_stat: {stat_name} is {value}, storing as 0.0 with is_finite=0"
             )
+
+        # Convert slope_clamped bool to int (0 or 1), defaulting to 0 if None
+        slope_clamped_int = 1 if slope_clamped else 0
 
         self.write_queue.put(
             (
@@ -603,9 +617,10 @@ class Database:
                     signal_class,
                     signal_type,
                     injection_stage,
+                    is_finite,
+                    slope_clamped_int,
                     tag,
                     metadata_json,
-                    is_valid,
                 ),
             )
         )
@@ -704,8 +719,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # NOTE: removing ORDER BY to reduce indexing costs
             # Intentionally hard-coded. Update if schema changes
-            query += " ORDER BY tag, timestamp, resource_type, resource_name"
+            # query += " ORDER BY tag, timestamp, resource_type, resource_name"
 
             cursor.execute(query, params)
 
@@ -731,10 +747,11 @@ class Database:
         signal_class: str | None = None,
         signal_type: str | None = None,
         injection_stage: str | None = None,
+        only_finite: bool = True,
+        only_slope_clamped: bool | None = None,
         tag: str | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
-        only_valid: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Query from injection_stats table
@@ -752,10 +769,11 @@ class Database:
             signal_class: Signal class (e.g. main, false, true)
             signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
             injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            only_finite: If True (default), only return rows where is_finite=1
+            only_slope_clamped: If True, only return rows where slope_clamped=1; if False, only where slope_clamped=0; if None, no filter
             tag: Tag for current pipeline run
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
-            only_valid: If True (default), only return rows where is_valid=1
 
         Returns:
             List of metric dictionaries
@@ -818,6 +836,13 @@ class Database:
                 query += " AND injection_stage = ?"
                 params.append(injection_stage)
 
+            if only_finite:
+                query += " AND is_finite = 1"
+
+            if only_slope_clamped is not None:
+                query += " AND slope_clamped = ?"
+                params.append(1 if only_slope_clamped else 0)
+
             if tag:
                 query += " AND tag = ?"
                 params.append(tag)
@@ -830,11 +855,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            if only_valid:
-                query += " AND is_valid = 1"
-
+            # NOTE: removing ORDER BY to reduce indexing costs
             # Intentionally hard-coded. Update if schema changes
-            query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
+            # query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
 
             cursor.execute(query, params)
 
@@ -921,8 +944,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # NOTE: removing ORDER BY to reduce indexing costs
             # Intentionally hard-coded. Update if schema changes
-            query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
+            # query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
 
             cursor.execute(query, params)
 
