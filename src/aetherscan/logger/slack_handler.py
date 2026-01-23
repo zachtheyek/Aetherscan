@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# NOTE: should we parametrize this into config.py?
 # Color mapping for Slack message attachments based on log level
 LEVEL_COLORS = {
     logging.CRITICAL: "#FF0000",  # Red
@@ -53,6 +54,7 @@ LEVEL_COLORS = {
     logging.DEBUG: "#FFFFFF",  # White
 }
 
+# NOTE: should we parametrize this into config.py?
 # Level name to emoji mapping for batched messages
 LEVEL_EMOJI = {
     logging.CRITICAL: ":rotating_light:",
@@ -62,6 +64,7 @@ LEVEL_EMOJI = {
     logging.DEBUG: ":mag:",
 }
 
+# NOTE: should we parametrize this into config.py?
 # Priority mapping for determining batch severity (higher = more severe)
 LEVEL_PRIORITY = {
     logging.CRITICAL: 5,
