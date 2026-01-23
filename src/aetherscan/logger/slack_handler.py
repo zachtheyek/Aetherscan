@@ -71,6 +71,7 @@ LEVEL_PRIORITY = {
     logging.DEBUG: 1,
 }
 
+# NOTE: should we parametrize this into config.py?
 # Configuration constants
 FLUSH_CHECK_INTERVAL = 1.0  # Seconds between flush thread checks
 THREAD_STOP_TIMEOUT = 2.0  # Seconds to wait for flush thread to stop
@@ -158,7 +159,7 @@ class SlackHandler(logging.Handler):
         self._run_started = False
 
         # Channel ID cache (files_upload_v2 requires ID, not name)
-        # Note: This cache is unbounded, but in practice only a few channels (1-3) are used
+        # NOTE: This cache is unbounded, but in practice only a few channels (1-3) are used
         # per pipeline run. If dynamic channel generation becomes a use case, consider using
         # functools.lru_cache or adding a TTL-based eviction policy.
         self._channel_id_cache: dict[str, str] = {}
