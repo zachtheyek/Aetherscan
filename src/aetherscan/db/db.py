@@ -171,6 +171,11 @@ class Database:
             cls._instance = None
             logger.info("Database singleton instance reset")
 
+    # We currently don't support schema versioning or migration scripting for schema changes
+    # For the current pipeline design, CREATE TABLE IF NOT EXISTS is sufficient
+    # Migratin frameworks add complexity that simply aren't necessary for our current use cases
+    # For now, we'll manually change schemas as-needed
+    # Revisit this if schema changes become frequent
     def _init_database(self):
         """Create database tables if they don't exist"""
         with self._get_connection() as conn:
@@ -195,6 +200,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_timestamp
                 ON system_resources(timestamp)
             """)
+            # -- For query_system_resource ORDER BY pattern
+            # CREATE INDEX IF NOT EXISTS idx_system_resources_query
+            # ON system_resources(tag, timestamp, resource_type, resource_name);
 
             # Injection statistics table
             cursor.execute("""
@@ -220,6 +228,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_timestamp
                 ON injection_stats(timestamp)
             """)
+            # -- For query_injection_stat ORDER BY pattern
+            # CREATE INDEX IF NOT EXISTS idx_injection_stats_query
+            # ON injection_stats(tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name);
 
             # Training statistics table
             cursor.execute("""
@@ -241,6 +252,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_timestamp
                 ON training_stats(timestamp)
             """)
+            # -- For query_training_stat ORDER BY pattern
+            # CREATE INDEX IF NOT EXISTS idx_training_stats_query
+            # ON training_stats(tag, model_name, round_number, epoch_number, stat_name);
 
             conn.commit()
 
@@ -410,7 +424,13 @@ class Database:
             logger.info(f"Flushed {len(self.buffer)} remaining data on shutdown")
 
     def _flush_buffer(self):
-        """Write buffered data to database in a single transaction"""
+        """
+        Write buffered data to database in a single transaction using executemany().
+
+        Groups records by table type and uses executemany() for bulk inserts, which is
+        more efficient than individual execute() calls because the SQL is parsed once
+        and reused for all rows.
+        """
         if not self.buffer:
             return
 
@@ -418,36 +438,51 @@ class Database:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
+                # Group records by table for bulk inserts
+                system_resources_records: list[tuple] = []
+                injection_stats_records: list[tuple] = []
+                training_stats_records: list[tuple] = []
+
                 for table, values in self.buffer:
                     if table == "system_resources":
-                        cursor.execute(
-                            """
-                            INSERT INTO system_resources
-                            (timestamp, resource_type, resource_name, value, unit, tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            values,
-                        )
+                        system_resources_records.append(values)
                     elif table == "injection_stats":
-                        cursor.execute(
-                            """
-                            INSERT INTO injection_stats
-                            (timestamp, stat_name, value, round_number, chunk_number, sample_index,
-                             background_index, signal_class, signal_type, injection_stage, tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            values,
-                        )
+                        injection_stats_records.append(values)
                     elif table == "training_stats":
-                        cursor.execute(
-                            """
-                            INSERT INTO training_stats
-                            (timestamp, model_name, stat_name, value, round_number, epoch_number,
-                             tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        training_stats_records.append(values)
+
+                # Bulk insert each table type
+                if system_resources_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO system_resources
+                        (timestamp, resource_type, resource_name, value, unit, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                            values,
-                        )
+                        system_resources_records,
+                    )
+
+                if injection_stats_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO injection_stats
+                        (timestamp, stat_name, value, round_number, chunk_number, sample_index,
+                         background_index, signal_class, signal_type, injection_stage, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        injection_stats_records,
+                    )
+
+                if training_stats_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO training_stats
+                        (timestamp, model_name, stat_name, value, round_number, epoch_number,
+                         tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        training_stats_records,
+                    )
 
                 conn.commit()
 
@@ -641,6 +676,7 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # Intentionally hard-coded. Update if schema changes
             query += " ORDER BY tag, timestamp, resource_type, resource_name"
 
             cursor.execute(query, params)
@@ -764,6 +800,7 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # Intentionally hard-coded. Update if schema changes
             query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
 
             cursor.execute(query, params)
@@ -851,6 +888,7 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # Intentionally hard-coded. Update if schema changes
             query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
 
             cursor.execute(query, params)
