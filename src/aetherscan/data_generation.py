@@ -163,13 +163,14 @@ def log_norm(data: np.ndarray) -> np.ndarray:
 # NOTE: not 100% sure how this function works. ported from Peter's code. comments added by Claude. assuming it works as intended?
 def new_cadence(
     data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
-) -> tuple[np.ndarray, dict[str, float]]:
+) -> tuple[np.ndarray, dict[str, float], bool]:
     """
     Inject a single drifting narrowband signal into a stacked cadence array
 
     Returns:
         modified_data: Array with injected signal
         signal_info: Dict with keys: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept
+        slope_was_clamped: True if slope was clamped due to being near zero
     """
     # NOTE: should noise = 3 parametrized?
     # Set noise parameter (for simulating randomness in drift rate calculation)
@@ -203,12 +204,11 @@ def new_cadence(
     # Clamp slopes that are too small to prevent divide-by-zero errors
     # While this may alter the physics slightly, a near-zero slope is an edge-case representing a
     # nearly horizontal signal trajectory
-    # Still, we should monitor the logs for how frequently slopes are clamped, and adjust if needed
     # NOTE: should MIN_SLOPE_PHYSICAL = 1e-6 be parametrized in config.py instead?
-    # NOTE: does slope_pixel need to be changed before db write if slope_physical is clamped?
-    # NOTE: should we plot slope_clamping_rate (alongside gradient_clipping_rate, for example)?
     MIN_SLOPE_PHYSICAL = 1e-6  # noqa: N806
+    slope_was_clamped = False
     if abs(slope_physical) < MIN_SLOPE_PHYSICAL:
+        slope_was_clamped = True
         logger.warning(f"new_cadence: slope_physical ({slope_physical}) near zero, clamping")
         slope_physical = (
             np.sign(slope_physical) * MIN_SLOPE_PHYSICAL
@@ -269,8 +269,8 @@ def new_cadence(
         "y_intercept": float(y_intercept),
     }
 
-    # Return the modified data array and signal info
-    return modified_data, signal_info
+    # Return the modified data array, signal info, and clamping flag
+    return modified_data, signal_info, slope_was_clamped
 
 
 def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
@@ -328,12 +328,9 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         "global_kurtosis": float(scipy_stats.kurtosis(flat)),
     }
 
-    # TEST: is this still needed? is there a more sensible fallback value than 0.0? should we remove the NaN values manually from db writes and plotting? does this conflict with _sanitize_float() from db.py? should we add metrics to track sanitization frequency (indicating possible data corruption)
-    # Sanitize any remaining NaN/inf
-    for key, value in stats.items():
-        if not np.isfinite(value):
-            logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
-            stats[key] = 0.0
+    # NOTE: NaN/inf values (e.g., skewness/kurtosis for constant arrays) are intentionally
+    # NOT sanitized here. They flow through to db.py where write_injection_stat() handles
+    # them with NULL + is_valid flag for proper tracking and filtering.
 
     return stats
 
@@ -372,6 +369,7 @@ def create_false(
     signal_info = {}
 
     # Inject RFI into all 6 observations
+    slope_was_clamped = False
     if inject:
         # Prepare data for signal injection by stacking all 6 observations vertically
         # (6, 16, 512) -> (96, 512)
@@ -382,7 +380,7 @@ def create_false(
 
         # Select a random SNR from the given range & inject RFI into all 6 observations
         snr = random.random() * snr_range + snr_base
-        cadence, rfi_signal_info = new_cadence(
+        cadence, rfi_signal_info, slope_was_clamped = new_cadence(
             data, snr, width_bin, freq_resolution, time_resolution
         )
 
@@ -412,6 +410,7 @@ def create_false(
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         # NOTE: how do we handle db writes & plotting when signal_info is empty?
         "signal_info": signal_info,  # Empty if no injection, rfi_* if injected
+        "slope_was_clamped": slope_was_clamped,
     }
 
     return final, sample_info
@@ -456,7 +455,9 @@ def create_true_single(
 
     # Select a random SNR from the given range & inject ETI
     snr = random.random() * snr_range + snr_base
-    cadence, eti_signal_info = new_cadence(data, snr, width_bin, freq_resolution, time_resolution)
+    cadence, eti_signal_info, slope_was_clamped = new_cadence(
+        data, snr, width_bin, freq_resolution, time_resolution
+    )
 
     # Prefix signal characteristics with eti_ (this is ETI injection)
     signal_info = {f"eti_{k}": v for k, v in eti_signal_info.items()}
@@ -480,6 +481,7 @@ def create_true_single(
         "background_index": background_index,
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # eti_* signal characteristics
+        "slope_was_clamped": slope_was_clamped,
     }
 
     return final, sample_info
@@ -529,11 +531,11 @@ def create_true_double(
     # Retry signal injection until we get valid non-intersecting signals
     while True:
         # Inject RFI
-        cadence_1, rfi_signal_info = new_cadence(
+        cadence_1, rfi_signal_info, rfi_slope_clamped = new_cadence(
             data, snr, width_bin, freq_resolution, time_resolution
         )
         # Inject ETI
-        cadence_2, eti_signal_info = new_cadence(
+        cadence_2, eti_signal_info, eti_slope_clamped = new_cadence(
             cadence_1, snr * dynamic_range, width_bin, freq_resolution, time_resolution
         )
 
@@ -547,6 +549,9 @@ def create_true_double(
             slope_1, slope_2, intercept_1, intercept_2
         ):
             break
+
+    # Track if any slope was clamped (either RFI or ETI)
+    slope_was_clamped = rfi_slope_clamped or eti_slope_clamped
 
     # Combine both signal infos with appropriate prefixes
     signal_info = {
@@ -573,6 +578,7 @@ def create_true_double(
         "background_index": background_index,
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # Both eti_* and rfi_* signal characteristics
+        "slope_was_clamped": slope_was_clamped,
     }
 
     return final, sample_info
@@ -1165,12 +1171,18 @@ class DataGenerator:
                     timestamp=timestamp,
                 )
 
+        # Calculate slope clamping rate for this batch
+        slope_clamp_count = sum(1 for s in stats_list if s.get("slope_was_clamped", False))
+        slope_clamping_rate = slope_clamp_count / num_samples if num_samples > 0 else 0.0
+
         # Write batch-level metadata stats (once per batch, not per sample)
         metadata_stats = [
             ("snr_range_floor", snr_range_floor),
             ("snr_range_ceil", snr_range_ceil),
             ("num_samples", float(num_samples)),
             ("inject_duration", inject_duration),
+            ("slope_clamping_rate", slope_clamping_rate),
+            ("slope_clamp_count", float(slope_clamp_count)),
         ]
 
         for stat_name, value in metadata_stats:
