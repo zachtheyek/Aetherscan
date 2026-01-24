@@ -2153,9 +2153,10 @@ class TrainingPipeline:
         fig.text(
             ax_mean_bbox.x1 + 0.005,
             data_to_fig_y(ax_mean, 1.0),
-            "Clipping threshold (1.0)",
+            "Clipping\nthreshold\n(1.0)",
             fontsize=9,
             va="center",
+            ma="left",
             color="gray",
         )
 
@@ -2163,9 +2164,10 @@ class TrainingPipeline:
         fig.text(
             ax_max_bbox.x1 + 0.005,
             data_to_fig_y(ax_max, 1.0),
-            "Clipping threshold (1.0)",
+            "Clipping\nthreshold\n(1.0)",
             fontsize=9,
             va="center",
+            ma="left",
             color="gray",
         )
 
