@@ -1760,17 +1760,19 @@ class TrainingPipeline:
         colors = ["#e6f2ff", "#fff2e6"]  # Light blue, light orange
         hatches = ["//", None]  # Striped for odd idx, solid for even idx
 
+        # TEST:
+        fontsize, rotation = 10, 0
         # NOTE: is rotation necessary? is it enough to just reduce fontsize + increase figure size?
-        # Dynamic sizing based on num_rounds
-        num_rounds = len(snr_by_round)
-        if num_rounds <= 5:
-            fontsize, rotation = 10, 0
-        elif num_rounds <= 10:
-            fontsize, rotation = 8, 0
-        elif num_rounds <= 15:
-            fontsize, rotation = 7, 45
-        else:
-            fontsize, rotation = 6, 90
+        # # Dynamic sizing based on num_rounds
+        # num_rounds = len(snr_by_round)
+        # if num_rounds <= 5:
+        #     fontsize, rotation = 10, 0
+        # elif num_rounds <= 10:
+        #     fontsize, rotation = 8, 0
+        # elif num_rounds <= 15:
+        #     fontsize, rotation = 7, 45
+        # else:
+        #     fontsize, rotation = 6, 90
 
         for idx, (round_num, snr_info) in enumerate(sorted(snr_by_round.items())):
             if "floor" not in snr_info or "ceil" not in snr_info:
