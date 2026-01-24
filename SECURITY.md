@@ -1,5 +1,9 @@
 # TODO:
 
+- in the case of token leaks (e.g. through .env), rotate the following credentials immediately:
+  - slack bot token
+  - gcp token
+
 ---
 
 ---

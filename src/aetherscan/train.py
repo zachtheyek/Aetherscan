@@ -1859,7 +1859,7 @@ class TrainingPipeline:
 
         # Add SNR range background shading to all axes
         snr_by_round = self._get_snr_by_round(current_time)
-        epochs_per_round = self.config.training.beta_vae_epochs
+        epochs_per_round = self.config.training.epochs_per_round
         all_axes = [ax_top, ax_recon, ax_kl, ax_true, ax_false]
         for ax in all_axes:
             self._add_snr_range_shading(ax, snr_by_round, epochs_per_round)
@@ -2040,7 +2040,7 @@ class TrainingPipeline:
 
         # Add SNR range background shading to all axes
         snr_by_round = self._get_snr_by_round(current_time)
-        epochs_per_round = self.config.training.beta_vae_epochs
+        epochs_per_round = self.config.training.epochs_per_round
         all_axes = [ax_top, ax_mean, ax_std, ax_max]
         for ax in all_axes:
             self._add_snr_range_shading(ax, snr_by_round, epochs_per_round)

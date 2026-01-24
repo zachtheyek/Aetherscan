@@ -203,7 +203,7 @@ class Database:
 
             # Composite index for common filter patterns (tag + timestamp)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_system_resources_query
+                CREATE INDEX IF NOT EXISTS idx_system_resources_filter
                 ON system_resources(tag, timestamp)
             """)
 
