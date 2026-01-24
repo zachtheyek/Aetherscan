@@ -1763,7 +1763,7 @@ class TrainingPipeline:
                 start_epoch - 0.5,
                 end_epoch + 0.5,
                 color=colors[idx % 2],
-                alpha=0.3,
+                alpha=0.5,
                 zorder=0,
             )
 
@@ -2148,7 +2148,7 @@ class TrainingPipeline:
 
         Generates 8 figures:
         - 1 injected signal characteristics
-        - 1 injection stability metrics (sanitization & clamping rates)
+        - 1 injection stability
         - 4 global intensity distributions (one per signal_type)
         - 1 A->B global intensity biases
         - 1 final global intensity biases
@@ -2275,7 +2275,7 @@ class TrainingPipeline:
         save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
         self._plot_injection_stability(tag, machine_name, save_path)
 
-        # Figure 2-5: Global intensity distribution (one per signal_type)
+        # Figure 3-6: Global intensity distribution (one per signal_type)
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
         intensity_stats = [
             "global_mean",
@@ -2314,7 +2314,7 @@ class TrainingPipeline:
             del stats_by_stage
             gc.collect()
 
-        # Figure 6: A->B global intensity biases
+        # Figure 7: A->B global intensity biases
         transitions = {stat_name: {} for stat_name in intensity_stats}
 
         for stat_name in intensity_stats:
@@ -2351,7 +2351,7 @@ class TrainingPipeline:
         del transitions
         gc.collect()
 
-        # Figure 7: Final global intensity biases
+        # Figure 8: Final global intensity biases
         stats_by_type = {signal_type: {} for signal_type in signal_types}
 
         for signal_type in signal_types:
@@ -2517,7 +2517,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Injected signal characteristics ({tag}, {machine_name})",
+                title=f"Injected signal characteristics - ({tag}, {machine_name})",
             )
 
     def _plot_injection_stability(
@@ -2586,11 +2586,9 @@ class TrainingPipeline:
         )
 
         if not all_results:
-            logger.warning("No injection stats data for stability plot")
+            logger.warning("No injection stats data to plot")
             return
 
-        # NOTE: come back to this later
-        # round_numbers = sorted(set(r["round_number"] for r in all_results if r["round_number"]))
         round_numbers = sorted({r["round_number"] for r in all_results if r["round_number"]})
         del all_results
         gc.collect()
@@ -2599,6 +2597,7 @@ class TrainingPipeline:
             logger.warning("No round numbers found for injection stability plot")
             return
 
+        # NOTE: should we be computing for all injection stages, instead of just A?
         # Compute sanitization rate per stat per round
         for stat_name in intensity_stats:
             for round_num in round_numbers:
@@ -2624,10 +2623,10 @@ class TrainingPipeline:
 
         # Compute clamping rate per round (using slope_clamped column)
         for round_num in round_numbers:
-            # Query all samples for this round (use any stat, stage A)
+            # Query all samples for this round
             results = self.db.query_injection_stat(
                 stat_name="global_mean",
-                injection_stage="A",
+                injection_stage="A",  # Slope is the same for all stages. Use stage A (W.L.O.G.)
                 start_round_number=round_num,
                 end_round_number=round_num,
                 only_finite=False,
@@ -2654,11 +2653,12 @@ class TrainingPipeline:
         ax_clamping = fig.add_subplot(gs[1])
 
         fig.suptitle(
-            f"Injection Stability Metrics ({tag}, {machine_name})",
+            f"Injection Stability ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
 
+        # TODO: why are we manually adding anotations without adding shading? why not just use _add_snr_range_shading()?
         # Add SNR range annotations for round-based plot
         snr_by_round = self._get_snr_by_round(current_time)
         for ax in [ax_sanitization, ax_clamping]:
@@ -2693,11 +2693,10 @@ class TrainingPipeline:
                     label=stat_display_names[stat_name],
                 )
 
-        ax_sanitization.set_title("Sanitization Rate by Statistic", fontsize=14, fontweight="bold")
+        ax_sanitization.set_title("NaN/Inf Sanitization Rate", fontsize=14, fontweight="bold")
         ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
-        ax_sanitization.set_ylabel("Rate (non-finite / total)", fontsize=12, fontweight="bold")
         ax_sanitization.grid(True, alpha=0.3)
-        ax_sanitization.set_ylim(bottom=0)
+        ax_sanitization.set_ylim(bottom=0.05)
 
         # Bottom plot: Slope clamping rate
         if clamping_rates_by_round:
@@ -2715,9 +2714,8 @@ class TrainingPipeline:
 
         ax_clamping.set_title("Slope Clamping Rate", fontsize=14, fontweight="bold")
         ax_clamping.set_xlabel("Round", fontsize=12, fontweight="bold")
-        ax_clamping.set_ylabel("Rate (clamped / total)", fontsize=12, fontweight="bold")
         ax_clamping.grid(True, alpha=0.3)
-        ax_clamping.set_ylim(bottom=0)
+        ax_clamping.set_ylim(bottom=0.05)
 
         # Create unified legend
         legend_handles = [
@@ -2732,17 +2730,6 @@ class TrainingPipeline:
             )
             for stat_name in intensity_stats
         ]
-        legend_handles.append(
-            mlines.Line2D(
-                [],
-                [],
-                color="blue",
-                linewidth=2,
-                marker="o",
-                markersize=4,
-                label="Slope Clamping",
-            )
-        )
 
         fig.legend(
             handles=legend_handles,
@@ -2765,7 +2752,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Injection stability metrics ({tag}, {machine_name})",
+                title=f"Injection stability - ({tag}, {machine_name})",
             )
 
     def _plot_global_intensity_distributions(
@@ -2877,7 +2864,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"{signal_type} global intensity distributions ({tag}, {machine_name})",
+                title=f"{signal_type} global intensity distributions - ({tag}, {machine_name})",
             )
 
     def _plot_injection_intensity_biases(
@@ -2996,7 +2983,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"A→B global intensity biases ({tag}, {machine_name})",
+                title=f"A→B global intensity biases - ({tag}, {machine_name})",
             )
 
     def _plot_final_intensity_biases(
@@ -3097,7 +3084,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Final global intensity biases ({tag}, {machine_name})",
+                title=f"Final global intensity biases - ({tag}, {machine_name})",
             )
 
     def save_models(self, tag: str | None = None, dir: str | None = None):

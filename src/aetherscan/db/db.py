@@ -587,11 +587,11 @@ class Database:
         """
         metadata_json = get_system_metadata()
 
-        # Since higher-order moments from _compute_intensity_stats() could lead to infinite values
+        # Since higher-order moments from _compute_intensity_stats() could lead to NaN/Inf values
         # We explicitly check if a value is finite to set the flag accordingly
         # We will opt to store these values as 0.0 due to the schema's NOT NULL constraint
-        # However, queries for injection_stats should ideally always use the is_finite flag for
-        # sanitization
+        # However, queries for injection_stats should by default use the is_finite flag, unless
+        # sanitization is explicitly not needed
         is_finite = 1 if np.isfinite(value) else 0
         sanitized_value = float(value) if is_finite else 0.0
 
@@ -770,7 +770,7 @@ class Database:
             signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
             injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
             only_finite: If True (default), only return rows where is_finite=1
-            only_slope_clamped: If True, only return rows where slope_clamped=1; if False, only where slope_clamped=0; if None, no filter
+            only_slope_clamped: If True, only return rows where slope_clamped=1; if False, only where slope_clamped=0; if None (default), no filter
             tag: Tag for current pipeline run
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)

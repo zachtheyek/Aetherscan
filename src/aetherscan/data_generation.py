@@ -301,7 +301,8 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         Dict with keys: global_mean, global_median, global_std,
                         global_mad, global_skew, global_kurtosis
     """
-    # Handle empty arrays - return NaN to signal is_finite=0 in write_injection_stat()
+    # Return NaN for empty arrays
+    # write_injection_stat() will set is_finite=0
     if data.size == 0:
         logger.warning("_compute_intensity_stats received empty array")
         return dict.fromkeys(
@@ -316,7 +317,7 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
             float("nan"),
         )
 
-    # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for stage A & B stats)
+    # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for pre-normalization stats)
     flat = data.ravel().astype(np.float64)
     median_val = np.median(flat)
 
@@ -1515,30 +1516,29 @@ class DataGenerator:
         # Create result dictionary with references to pre-allocated arrays
         result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
-        # TEST: is this still needed?
         # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
-        # # Sanity check: verify post-injection data normalization
-        # for key in ["concatenated", "false", "true"]:
-        #     min_val = np.min(result[key])
-        #     max_val = np.max(result[key])
-        #     mean_val = np.mean(result[key])
-        #     logger.info(
-        #         f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
-        #     )
-        #     if max_val > 1.0:
-        #         logger.error(f"Post-injection {key} values too large! Max: {max_val}")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif min_val < 0.0:
-        #         logger.error(f"Post-injection {key} values too small! Min: {min_val}")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif np.isnan(result[key]).any():
-        #         logger.error(f"Post-injection {key} contains NaN values!")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif np.isinf(result[key]).any():
-        #         logger.error(f"Post-injection {key} contains Inf values!")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     else:
-        #         logger.info(f"Post-injection {key} data properly normalized")
+        # Sanity check: verify post-injection data normalization
+        for key in ["concatenated", "false", "true"]:
+            min_val = np.min(result[key])
+            max_val = np.max(result[key])
+            mean_val = np.mean(result[key])
+            logger.info(
+                f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
+            )
+            if max_val > 1.0:
+                logger.error(f"Post-injection {key} values too large! Max: {max_val}")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            elif min_val < 0.0:
+                logger.error(f"Post-injection {key} values too small! Min: {min_val}")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            elif np.isnan(result[key]).any():
+                logger.error(f"Post-injection {key} contains NaN values!")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            elif np.isinf(result[key]).any():
+                logger.error(f"Post-injection {key} contains Inf values!")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            else:
+                logger.info(f"Post-injection {key} data properly normalized")
 
         return result
 
