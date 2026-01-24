@@ -2133,7 +2133,7 @@ class TrainingPipeline:
         # External annotations for threshold lines (placed outside subplots on right)
         ax_top_bbox = ax_top.get_position()
         fig.text(
-            ax_top_bbox.x1 + 0.01,
+            ax_top_bbox.x1 + 0.005,
             data_to_fig_y(ax_top, 0.01),
             "Min optimal clipping rate (1%)",
             fontsize=9,
@@ -2141,7 +2141,7 @@ class TrainingPipeline:
             color="gray",
         )
         fig.text(
-            ax_top_bbox.x1 + 0.01,
+            ax_top_bbox.x1 + 0.005,
             data_to_fig_y(ax_top, 0.05),
             "Max optimal clipping rate (5%)",
             fontsize=9,
@@ -2151,7 +2151,7 @@ class TrainingPipeline:
 
         ax_mean_bbox = ax_mean.get_position()
         fig.text(
-            ax_mean_bbox.x1 + 0.01,
+            ax_mean_bbox.x1 + 0.005,
             data_to_fig_y(ax_mean, 1.0),
             "Clipping threshold (1.0)",
             fontsize=9,
@@ -2161,7 +2161,7 @@ class TrainingPipeline:
 
         ax_max_bbox = ax_max.get_position()
         fig.text(
-            ax_max_bbox.x1 + 0.01,
+            ax_max_bbox.x1 + 0.005,
             data_to_fig_y(ax_max, 1.0),
             "Clipping threshold (1.0)",
             fontsize=9,
@@ -2559,20 +2559,7 @@ class TrainingPipeline:
                     label="RFI",
                 )
 
-            # X-axis labels showing ranges
-            bin_centers = [(bins[i] + bins[i + 1]) / 2 for i in range(len(bins) - 1)]
-            bin_labels = [f"{bins[i]}-{bins[i + 1] - 1}" for i in range(len(bins) - 1)]
-
-            if num_bins <= 10:
-                ax_bg.set_xticks(bin_centers)
-                ax_bg.set_xticklabels(bin_labels, rotation=45, ha="right", fontsize=8)
-            else:
-                step = max(1, num_bins // 10)
-                ax_bg.set_xticks(bin_centers[::step])
-                ax_bg.set_xticklabels(bin_labels[::step], rotation=45, ha="right", fontsize=8)
-
         ax_bg.set_title("Background Plates", fontsize=12, fontweight="bold")
-        ax_bg.set_xlabel("Background Index Range", fontsize=10)
         ax_bg.set_ylabel("Count", fontsize=10)
         ax_bg.grid(True, alpha=0.3)
 
@@ -2644,7 +2631,7 @@ class TrainingPipeline:
             "global_std": "green",
             "global_mad": "red",
             "global_skew": "purple",
-            "global_kurtosis": "brown",
+            "global_kurtosis": "pink",
         }
         stat_display_names = {
             "global_mean": "Mean",
@@ -2783,7 +2770,6 @@ class TrainingPipeline:
             ax_sanitization.set_xticks(rounds)
 
         ax_sanitization.set_title("NaN/Inf Sanitization Rate", fontsize=14, fontweight="bold")
-        ax_sanitization.set_ylabel("Rate", fontsize=12, fontweight="bold")
         ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
         ax_sanitization.grid(True, alpha=0.3, axis="y")
         ax_sanitization.set_ylim(bottom=0)
@@ -2804,7 +2790,6 @@ class TrainingPipeline:
             ax_clamping.set_xticks(rounds_clamping)
 
         ax_clamping.set_title("Slope Clamping Rate", fontsize=14, fontweight="bold")
-        ax_clamping.set_ylabel("Rate", fontsize=12, fontweight="bold")
         ax_clamping.set_xlabel("Round", fontsize=12, fontweight="bold")
         ax_clamping.grid(True, alpha=0.3, axis="y")
         ax_clamping.set_ylim(bottom=0)
@@ -2819,14 +2804,6 @@ class TrainingPipeline:
             )
             for stat_name in intensity_stats
         ]
-        legend_handles.append(
-            mpatches.Patch(
-                facecolor="blue",
-                edgecolor="black",
-                linewidth=0.5,
-                label="Slope Clamping Rate",
-            )
-        )
 
         fig.legend(
             handles=legend_handles,
