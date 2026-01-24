@@ -2773,7 +2773,7 @@ class TrainingPipeline:
             ax_sanitization.set_xticks(rounds)
 
         ax_sanitization.set_title("NaN/Inf Sanitization Rate", fontsize=14, fontweight="bold")
-        ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
+        # ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
         ax_sanitization.grid(True, alpha=0.3, axis="y")
         ax_sanitization.set_ylim(bottom=0)
 
