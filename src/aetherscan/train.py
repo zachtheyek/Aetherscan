@@ -1147,6 +1147,7 @@ class TrainingPipeline:
 
                 logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
+            # NOTE: combine plot_beta_vae_loss_curves() and plot_beta_vae_training_stability() into plot_training_progress()?
             # Plot loss curves
             self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
@@ -3298,6 +3299,7 @@ def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingP
             raise  # Re-raise to propagate error
 
         try:
+            # NOTE: combine plot_beta_vae_loss_curves() and plot_beta_vae_training_stability() into plot_training_progress()?
             # Plot loss curves
             pipeline.plot_beta_vae_loss_curves()
 
