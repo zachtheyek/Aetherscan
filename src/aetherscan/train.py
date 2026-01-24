@@ -1735,7 +1735,8 @@ class TrainingPipeline:
         self,
         ax,
         snr_by_round: dict[int, dict[str, float]],
-        epochs_per_round: int,
+        epochs_per_round: int | None = None,
+        use_rounds: bool = False,
     ) -> None:
         """
         Add transparent background regions showing SNR range per round.
@@ -1743,42 +1744,70 @@ class TrainingPipeline:
         Args:
             ax: Matplotlib axis to add shading to
             snr_by_round: Dict mapping round_number to {"floor": x, "ceil": y}
-            epochs_per_round: Number of epochs per training round
+            epochs_per_round: Number of epochs per training round (required if use_rounds=False)
+            use_rounds: If True, use round numbers for x-axis; if False, use epochs
         """
         if not snr_by_round:
             return
 
+        if not use_rounds and epochs_per_round is None:
+            raise ValueError("epochs_per_round is required when use_rounds=False")
+
         # Alternating colors for visual distinction
         colors = ["#e6f2ff", "#fff2e6"]  # Light blue, light orange
+        hatches = ["//", None]  # Striped for odd idx, solid for even idx
+
+        # Dynamic sizing based on num_rounds
+        num_rounds = len(snr_by_round)
+        if num_rounds <= 5:
+            fontsize, rotation = 10, 0
+        elif num_rounds <= 10:
+            fontsize, rotation = 8, 0
+        elif num_rounds <= 15:
+            fontsize, rotation = 7, 45
+        else:
+            fontsize, rotation = 6, 90
 
         for idx, (round_num, snr_info) in enumerate(sorted(snr_by_round.items())):
             if "floor" not in snr_info or "ceil" not in snr_info:
                 continue
 
-            start_epoch = (round_num - 1) * epochs_per_round + 1
-            end_epoch = round_num * epochs_per_round
+            # Calculate x positions based on use_rounds flag
+            if use_rounds:
+                start_x = round_num - 0.5
+                end_x = round_num + 0.5
+                mid_x = round_num
+            else:
+                start_epoch = (round_num - 1) * epochs_per_round + 1
+                end_epoch = round_num * epochs_per_round
+                start_x = start_epoch - 0.5
+                end_x = end_epoch + 0.5
+                mid_x = (start_epoch + end_epoch) / 2
 
-            # Add shaded region
+            # Add shaded region with alternating hatch patterns
+            hatch = hatches[idx % 2]
             ax.axvspan(
-                start_epoch - 0.5,
-                end_epoch + 0.5,
+                start_x,
+                end_x,
                 color=colors[idx % 2],
                 alpha=0.5,
                 zorder=0,
+                hatch=hatch,
+                edgecolor="gray" if hatch else None,
             )
 
             # Add SNR text annotation at top of region
-            mid_epoch = (start_epoch + end_epoch) / 2
             snr_floor = int(snr_info["floor"])
             snr_ceil = int(snr_info["ceil"])
             ax.text(
-                mid_epoch,
+                mid_x,
                 0.98,
                 f"SNR: {snr_floor}-{snr_ceil}",
                 transform=ax.get_xaxis_transform(),
                 ha="center",
                 va="top",
-                fontsize=8,
+                fontsize=fontsize,
+                rotation=rotation,
                 alpha=0.7,
             )
 
@@ -1842,8 +1871,17 @@ class TrainingPipeline:
 
         epochs = range(1, len(history.get("total_loss", [])) + 1)
 
+        # Add SNR range background shading to all axes
+        snr_by_round = self._get_snr_by_round(current_time)
+        epochs_per_round = self.config.training.epochs_per_round
+
+        # Scale figure width for many rounds
+        num_rounds = len(snr_by_round)
+        base_width = 25
+        fig_width = base_width * (1 + max(0, num_rounds - 10) * 0.05)  # +5% width per round over 10
+
         # Create figure & setup gridspec
-        fig = plt.figure(figsize=(25, 12))
+        fig = plt.figure(figsize=(fig_width, 12))
         gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
         # Top subplot spanning full width - Total Loss
@@ -1859,12 +1897,9 @@ class TrainingPipeline:
             f"Beta-VAE Loss Curves ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
-        # Add SNR range background shading to all axes
-        snr_by_round = self._get_snr_by_round(current_time)
-        epochs_per_round = self.config.training.epochs_per_round
         all_axes = [ax_top, ax_recon, ax_kl, ax_true, ax_false]
         for ax in all_axes:
-            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round)
+            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round, use_rounds=False)
 
         # Helper function to plot dual y-axis
         def plot_dual_axis(ax, title, train_key, val_key):
@@ -2024,8 +2059,17 @@ class TrainingPipeline:
             logger.warning("No clipping rate data to plot")
             return
 
+        # Add SNR range background shading to all axes
+        snr_by_round = self._get_snr_by_round(current_time)
+        epochs_per_round = self.config.training.epochs_per_round
+
+        # Scale figure width for many rounds
+        num_rounds = len(snr_by_round)
+        base_width = 25
+        fig_width = base_width * (1 + max(0, num_rounds - 10) * 0.05)  # +5% width per round over 10
+
         # Create figure & setup gridspec (following plot_beta_vae_loss_curves pattern)
-        fig = plt.figure(figsize=(25, 12))
+        fig = plt.figure(figsize=(fig_width, 12))
         gs = fig.add_gridspec(2, 3, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
         # Top subplot spanning full width - Clipping Rate
@@ -2040,70 +2084,95 @@ class TrainingPipeline:
             f"Beta-VAE Training Stability ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
-        # Add SNR range background shading to all axes
-        snr_by_round = self._get_snr_by_round(current_time)
-        epochs_per_round = self.config.training.epochs_per_round
         all_axes = [ax_top, ax_mean, ax_std, ax_max]
         for ax in all_axes:
-            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round)
+            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round, use_rounds=False)
 
-        # Top plot: Clipping Rate
+        # Top plot: Clipping Rate (blue)
         if "clipping_rate" in history and history["clipping_rate"]:
             ax_top.plot(epochs, history["clipping_rate"], color="blue", linewidth=2)
 
-        # Add optimal clipping rate bounds with distinct line styles
-        ax_top.axhline(y=0.01, color="green", linestyle="--", linewidth=1.5, alpha=0.8)  # Dashed
-        ax_top.axhline(y=0.05, color="green", linestyle=":", linewidth=1.5, alpha=0.8)  # Dotted
+        # Add optimal clipping rate bounds (gray dashed)
+        ax_top.axhline(y=0.01, color="gray", linestyle="--", linewidth=1.5, alpha=0.8)
+        ax_top.axhline(y=0.05, color="gray", linestyle="--", linewidth=1.5, alpha=0.8)
 
         ax_top.set_title("Gradient Clipping Rate", fontsize=14, fontweight="bold")
         ax_top.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_top.grid(True, alpha=0.3)
 
-        # Bottom left: Gradient Norm Mean
+        # Bottom left: Gradient Norm Mean (orange)
         if "gradient_norm_mean" in history and history["gradient_norm_mean"]:
-            ax_mean.plot(epochs, history["gradient_norm_mean"], color="blue", linewidth=2)
-        ax_mean.axhline(y=1.0, color="red", linestyle="-.", linewidth=1.5, alpha=0.8)  # Dash-dot
+            ax_mean.plot(epochs, history["gradient_norm_mean"], color="orange", linewidth=2)
+        ax_mean.axhline(y=1.0, color="gray", linestyle="--", linewidth=1.5, alpha=0.8)
         ax_mean.set_title("Gradient Norm Mean", fontsize=14, fontweight="bold")
         ax_mean.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_mean.grid(True, alpha=0.3)
 
-        # Bottom center: Gradient Norm Std
+        # Bottom center: Gradient Norm Std (orange)
         if "gradient_norm_std" in history and history["gradient_norm_std"]:
-            ax_std.plot(epochs, history["gradient_norm_std"], color="blue", linewidth=2)
+            ax_std.plot(epochs, history["gradient_norm_std"], color="orange", linewidth=2)
         ax_std.set_title("Gradient Norm Std", fontsize=14, fontweight="bold")
         ax_std.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_std.grid(True, alpha=0.3)
 
-        # Bottom right: Gradient Norm Max
+        # Bottom right: Gradient Norm Max (orange)
         if "gradient_norm_max" in history and history["gradient_norm_max"]:
-            ax_max.plot(epochs, history["gradient_norm_max"], color="blue", linewidth=2)
-        ax_max.axhline(y=1.0, color="red", linestyle="-.", linewidth=1.5, alpha=0.8)  # Dash-dot
+            ax_max.plot(epochs, history["gradient_norm_max"], color="orange", linewidth=2)
+        ax_max.axhline(y=1.0, color="gray", linestyle="--", linewidth=1.5, alpha=0.8)
         ax_max.set_title("Gradient Norm Max", fontsize=14, fontweight="bold")
         ax_max.set_xlabel("Epoch", fontsize=12, fontweight="bold")
         ax_max.grid(True, alpha=0.3)
 
-        # Unified figure legend
+        # Helper to convert data y to figure y
+        def data_to_fig_y(ax, y_data):
+            ax_bbox = ax.get_position()
+            ylim = ax.get_ylim()
+            y_norm = (y_data - ylim[0]) / (ylim[1] - ylim[0])
+            return ax_bbox.y0 + y_norm * ax_bbox.height
+
+        # External annotations for threshold lines (placed outside subplots on right)
+        ax_top_bbox = ax_top.get_position()
+        fig.text(
+            ax_top_bbox.x1 + 0.01,
+            data_to_fig_y(ax_top, 0.01),
+            "Min optimal clipping rate (1%)",
+            fontsize=9,
+            va="center",
+            color="gray",
+        )
+        fig.text(
+            ax_top_bbox.x1 + 0.01,
+            data_to_fig_y(ax_top, 0.05),
+            "Max optimal clipping rate (5%)",
+            fontsize=9,
+            va="center",
+            color="gray",
+        )
+
+        ax_mean_bbox = ax_mean.get_position()
+        fig.text(
+            ax_mean_bbox.x1 + 0.01,
+            data_to_fig_y(ax_mean, 1.0),
+            "Clipping threshold (1.0)",
+            fontsize=9,
+            va="center",
+            color="gray",
+        )
+
+        ax_max_bbox = ax_max.get_position()
+        fig.text(
+            ax_max_bbox.x1 + 0.01,
+            data_to_fig_y(ax_max, 1.0),
+            "Clipping threshold (1.0)",
+            fontsize=9,
+            va="center",
+            color="gray",
+        )
+
+        # Unified figure legend (separate entries for Clipping Rate and Gradient Norm)
         legend_handles = [
-            mlines.Line2D([], [], color="blue", linewidth=2, label="Clipping Rate / Gradient Norm"),
-            mlines.Line2D(
-                [],
-                [],
-                color="green",
-                linestyle="--",
-                linewidth=1.5,
-                label="Optimal clipping rate (min: 1%)",
-            ),
-            mlines.Line2D(
-                [],
-                [],
-                color="green",
-                linestyle=":",
-                linewidth=1.5,
-                label="Optimal clipping rate (max: 5%)",
-            ),
-            mlines.Line2D(
-                [], [], color="red", linestyle="-.", linewidth=1.5, label="Clipping threshold (1.0)"
-            ),
+            mlines.Line2D([], [], color="blue", linewidth=2, label="Clipping Rate"),
+            mlines.Line2D([], [], color="orange", linewidth=2, label="Gradient Norm"),
         ]
         fig.legend(
             handles=legend_handles,
@@ -2115,7 +2184,7 @@ class TrainingPipeline:
             shadow=True,
         )
 
-        plt.tight_layout(rect=[0, 0, 0.85, 1])  # Room for legend
+        plt.tight_layout(rect=[0, 0, 0.72, 1])  # More room on right for annotations
 
         # Save plot
         if dir is not None:
@@ -2461,7 +2530,11 @@ class TrainingPipeline:
         all_bg_indices = eti_background_indices + rfi_background_indices
         if all_bg_indices:
             max_bg = max(all_bg_indices)
-            bins = range(0, max_bg + 2)  # Discrete integer bins from 0 to max+1
+
+            # Create bins in units of 1000 (indices 0-999 = bin 1, 1000-1999 = bin 2, etc.)
+            bin_size = 1000
+            num_bins = (max_bg // bin_size) + 1
+            bins = [i * bin_size for i in range(num_bins + 1)]  # [0, 1000, 2000, ...]
 
             if eti_background_indices:
                 ax_bg.hist(
@@ -2486,8 +2559,20 @@ class TrainingPipeline:
                     label="RFI",
                 )
 
+            # X-axis labels showing ranges
+            bin_centers = [(bins[i] + bins[i + 1]) / 2 for i in range(len(bins) - 1)]
+            bin_labels = [f"{bins[i]}-{bins[i + 1] - 1}" for i in range(len(bins) - 1)]
+
+            if num_bins <= 10:
+                ax_bg.set_xticks(bin_centers)
+                ax_bg.set_xticklabels(bin_labels, rotation=45, ha="right", fontsize=8)
+            else:
+                step = max(1, num_bins // 10)
+                ax_bg.set_xticks(bin_centers[::step])
+                ax_bg.set_xticklabels(bin_labels[::step], rotation=45, ha="right", fontsize=8)
+
         ax_bg.set_title("Background Plates", fontsize=12, fontweight="bold")
-        ax_bg.set_xlabel("Background Index", fontsize=10)
+        ax_bg.set_xlabel("Background Index Range", fontsize=10)
         ax_bg.set_ylabel("Count", fontsize=10)
         ax_bg.grid(True, alpha=0.3)
 
@@ -2645,8 +2730,16 @@ class TrainingPipeline:
 
         gc.collect()
 
+        # Add SNR range shading
+        snr_by_round = self._get_snr_by_round(current_time)
+
+        # Scale figure width for many rounds
+        num_rounds = len(snr_by_round)
+        base_width = 15
+        fig_width = base_width * (1 + max(0, num_rounds - 10) * 0.05)  # +5% width per round over 10
+
         # Create figure with GridSpec layout
-        fig = plt.figure(figsize=(15, 10))
+        fig = plt.figure(figsize=(fig_width, 10))
         gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.3)
 
         ax_sanitization = fig.add_subplot(gs[0])
@@ -2658,78 +2751,82 @@ class TrainingPipeline:
             fontweight="bold",
         )
 
-        # TODO: why are we manually adding anotations without adding shading? why not just use _add_snr_range_shading()?
-        # Add SNR range annotations for round-based plot
-        snr_by_round = self._get_snr_by_round(current_time)
+        # Add SNR range shading to both axes
         for ax in [ax_sanitization, ax_clamping]:
-            for round_num, snr_info in sorted(snr_by_round.items()):
-                if "floor" in snr_info and "ceil" in snr_info:
-                    snr_floor = int(snr_info["floor"])
-                    snr_ceil = int(snr_info["ceil"])
-                    ax.text(
-                        round_num,
-                        0.98,
-                        f"{snr_floor}-{snr_ceil}",
-                        transform=ax.get_xaxis_transform(),
-                        ha="center",
-                        va="top",
-                        fontsize=7,
-                        alpha=0.6,
-                    )
+            self._add_snr_range_shading(ax, snr_by_round, use_rounds=True)
 
-        # Top plot: Sanitization rate per statistic
-        for stat_name in intensity_stats:
-            rates = sanitization_rates_by_stat[stat_name]
-            if rates:
-                rounds = sorted(rates.keys())
-                values = [rates[r] for r in rounds]
-                ax_sanitization.plot(
-                    rounds,
+        # Top plot: Sanitization rate per statistic (grouped bar chart)
+        rounds = sorted(
+            set().union(*[set(sanitization_rates_by_stat[s].keys()) for s in intensity_stats])
+        )
+        n_rounds = len(rounds)
+        n_stats = len(intensity_stats)
+
+        if n_rounds > 0:
+            bar_width = 0.8 / n_stats
+            x_positions = np.array(rounds)
+
+            for stat_idx, stat_name in enumerate(intensity_stats):
+                rates = sanitization_rates_by_stat[stat_name]
+                values = [rates.get(r, 0) for r in rounds]
+                offset = (stat_idx - (n_stats - 1) / 2) * bar_width
+
+                ax_sanitization.bar(
+                    x_positions + offset,
                     values,
+                    width=bar_width,
                     color=stat_colors[stat_name],
-                    linewidth=2,
-                    marker="o",
-                    markersize=4,
-                    label=stat_display_names[stat_name],
+                    edgecolor="black",
+                    linewidth=0.5,
                 )
 
-        ax_sanitization.set_title("NaN/Inf Sanitization Rate", fontsize=14, fontweight="bold")
-        ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
-        ax_sanitization.grid(True, alpha=0.3)
-        ax_sanitization.set_ylim(bottom=0.05)
+            ax_sanitization.set_xticks(rounds)
 
-        # Bottom plot: Slope clamping rate
+        ax_sanitization.set_title("NaN/Inf Sanitization Rate", fontsize=14, fontweight="bold")
+        ax_sanitization.set_ylabel("Rate", fontsize=12, fontweight="bold")
+        ax_sanitization.set_xlabel("Round", fontsize=12, fontweight="bold")
+        ax_sanitization.grid(True, alpha=0.3, axis="y")
+        ax_sanitization.set_ylim(bottom=0)
+
+        # Bottom plot: Slope clamping rate (single bar chart)
         if clamping_rates_by_round:
-            rounds = sorted(clamping_rates_by_round.keys())
-            values = [clamping_rates_by_round[r] for r in rounds]
-            ax_clamping.plot(
-                rounds,
+            rounds_clamping = sorted(clamping_rates_by_round.keys())
+            values = [clamping_rates_by_round[r] for r in rounds_clamping]
+
+            ax_clamping.bar(
+                rounds_clamping,
                 values,
+                width=0.6,
                 color="blue",
-                linewidth=2,
-                marker="o",
-                markersize=4,
-                label="Slope Clamping Rate",
+                edgecolor="black",
+                linewidth=0.5,
             )
+            ax_clamping.set_xticks(rounds_clamping)
 
         ax_clamping.set_title("Slope Clamping Rate", fontsize=14, fontweight="bold")
+        ax_clamping.set_ylabel("Rate", fontsize=12, fontweight="bold")
         ax_clamping.set_xlabel("Round", fontsize=12, fontweight="bold")
-        ax_clamping.grid(True, alpha=0.3)
-        ax_clamping.set_ylim(bottom=0.05)
+        ax_clamping.grid(True, alpha=0.3, axis="y")
+        ax_clamping.set_ylim(bottom=0)
 
-        # Create unified legend
+        # Create unified legend using patches for bar charts
         legend_handles = [
-            mlines.Line2D(
-                [],
-                [],
-                color=stat_colors[stat_name],
-                linewidth=2,
-                marker="o",
-                markersize=4,
+            mpatches.Patch(
+                facecolor=stat_colors[stat_name],
+                edgecolor="black",
+                linewidth=0.5,
                 label=stat_display_names[stat_name],
             )
             for stat_name in intensity_stats
         ]
+        legend_handles.append(
+            mpatches.Patch(
+                facecolor="blue",
+                edgecolor="black",
+                linewidth=0.5,
+                label="Slope Clamping Rate",
+            )
+        )
 
         fig.legend(
             handles=legend_handles,
