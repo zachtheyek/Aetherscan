@@ -1,3 +1,4 @@
+# TODO: add warning when aetherscan.db file size exceeds 1TB (at that point we should consider migrating to PostgreSQL or sharding the SQLite db)
 # TODO: add functions to delete entries in db based on query results (e.g. query_system_resource -> DELETE)
 """
 Database for Aetherscan Pipeline
@@ -171,6 +172,7 @@ class Database:
     # This makes it impossible to evolve existing schema without manual database updates. As well as
     # having no audit trail of schema changes, or no rollback capability for failed upgrades. It's
     # also difficult to coordinate deployments across multiple db instances
+    # NOTE: should we consider migrating to PostgreSQL? or should we go all in on SQLite?
     def _init_database(self):
         """Create database tables if they don't exist"""
         with self._get_connection() as conn:

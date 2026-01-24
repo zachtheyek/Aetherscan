@@ -1738,6 +1738,7 @@ class TrainingPipeline:
         snr_by_round: dict[int, dict[str, float]],
         epochs_per_round: int | None = None,
         use_rounds: bool = False,
+        show_text_annotations: bool = True,
     ) -> None:
         """
         Add transparent background regions showing SNR range per round.
@@ -1747,6 +1748,7 @@ class TrainingPipeline:
             snr_by_round: Dict mapping round_number to {"floor": x, "ceil": y}
             epochs_per_round: Number of epochs per training round (required if use_rounds=False)
             use_rounds: If True, use round numbers for x-axis; if False, use epochs
+            show_text_annotations: If True, show SNR range text annotations in subplot
         """
         if not snr_by_round:
             return
@@ -1758,6 +1760,7 @@ class TrainingPipeline:
         colors = ["#e6f2ff", "#fff2e6"]  # Light blue, light orange
         hatches = ["//", None]  # Striped for odd idx, solid for even idx
 
+        # NOTE: is rotation necessary? is it enough to just reduce fontsize + increase figure size?
         # Dynamic sizing based on num_rounds
         num_rounds = len(snr_by_round)
         if num_rounds <= 5:
@@ -1798,19 +1801,20 @@ class TrainingPipeline:
             )
 
             # Add SNR text annotation at top of region
-            snr_floor = int(snr_info["floor"])
-            snr_ceil = int(snr_info["ceil"])
-            ax.text(
-                mid_x,
-                0.98,
-                f"SNR: {snr_floor}-{snr_ceil}",
-                transform=ax.get_xaxis_transform(),
-                ha="center",
-                va="top",
-                fontsize=fontsize,
-                rotation=rotation,
-                alpha=0.7,
-            )
+            if show_text_annotations:
+                snr_floor = int(snr_info["floor"])
+                snr_ceil = int(snr_info["ceil"])
+                ax.text(
+                    mid_x,
+                    0.98,
+                    f"SNR: {snr_floor}-{snr_ceil}",
+                    transform=ax.get_xaxis_transform(),
+                    ha="center",
+                    va="top",
+                    fontsize=fontsize,
+                    rotation=rotation,
+                    alpha=0.7,
+                )
 
     def plot_beta_vae_loss_curves(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
@@ -1898,9 +1902,14 @@ class TrainingPipeline:
             f"Beta-VAE Loss Curves ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
-        all_axes = [ax_top, ax_recon, ax_kl, ax_true, ax_false]
-        for ax in all_axes:
-            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round, use_rounds=False)
+        # Top subplot gets shading + text annotations, bottom subplots get shading only
+        self._add_snr_range_shading(
+            ax_top, snr_by_round, epochs_per_round, use_rounds=False, show_text_annotations=True
+        )
+        for ax in [ax_recon, ax_kl, ax_true, ax_false]:
+            self._add_snr_range_shading(
+                ax, snr_by_round, epochs_per_round, use_rounds=False, show_text_annotations=False
+            )
 
         # Helper function to plot dual y-axis
         def plot_dual_axis(ax, title, train_key, val_key):
@@ -2085,9 +2094,14 @@ class TrainingPipeline:
             f"Beta-VAE Training Stability ({tag}, {machine_name})", fontsize=18, fontweight="bold"
         )
 
-        all_axes = [ax_top, ax_mean, ax_std, ax_max]
-        for ax in all_axes:
-            self._add_snr_range_shading(ax, snr_by_round, epochs_per_round, use_rounds=False)
+        # Top subplot gets shading + text annotations, bottom subplots get shading only
+        self._add_snr_range_shading(
+            ax_top, snr_by_round, epochs_per_round, use_rounds=False, show_text_annotations=True
+        )
+        for ax in [ax_mean, ax_std, ax_max]:
+            self._add_snr_range_shading(
+                ax, snr_by_round, epochs_per_round, use_rounds=False, show_text_annotations=False
+            )
 
         # Top plot: Clipping Rate (blue)
         if "clipping_rate" in history and history["clipping_rate"]:
