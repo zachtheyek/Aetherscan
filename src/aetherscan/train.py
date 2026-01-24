@@ -1570,7 +1570,9 @@ class TrainingPipeline:
         results = prepare_distributed_inf_dataset(
             data=rf_data,
             n_samples=n_samples,
-            per_replica_inf_batch_size=self.config.inference.per_replica_batch_size,
+            # NOTE: come back to this later
+            # per_replica_inf_batch_size=self.config.inference.per_replica_batch_size,
+            per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
         )
