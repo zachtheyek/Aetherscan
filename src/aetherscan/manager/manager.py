@@ -1,3 +1,4 @@
+# BUG: sometimes cleanup_all hangs (is it cuz of slack logger)?
 """
 Resource manager for Aetherscan Pipeline
 Centralizes orchestration of all system resources -- including multiprocessing pools, shared memory,
