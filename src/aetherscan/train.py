@@ -1762,7 +1762,6 @@ class TrainingPipeline:
 
         # TEST:
         fontsize, rotation = 10, 0
-        # NOTE: is rotation necessary? is it enough to just reduce fontsize + increase figure size?
         # # Dynamic sizing based on num_rounds
         # num_rounds = len(snr_by_round)
         # if num_rounds <= 5:
