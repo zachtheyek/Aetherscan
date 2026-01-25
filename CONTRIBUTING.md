@@ -18,6 +18,7 @@ This document describes the process of contributing to Aetherscan.
   - pyproject.toml
   - src/aetherscan/**init**.py
   - CITATION.cff (also update release date)
+- issue/PR authors are automatically designated as assignees. codeowners are automatically designated as reviewers. PRs must be tied to an existing issue. PRs can only be merged after at least one approval from a reviewer. When a PR is merged, the accompanying issue will automatically be closed. claude will automatically triage and label open issues. claude will provide a code review of your PR when it's first set to "ready for review". manual claude triggers are only allowed for users with write access or higher to the repo
 
 ## known issues:
 
