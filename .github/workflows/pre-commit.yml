@@ -16,7 +16,7 @@ jobs:
     steps:
       # Pull repo contents into GitHub Actions runner
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Install the correct Python version
       - name: Set up Python
