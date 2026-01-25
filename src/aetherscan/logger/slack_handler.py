@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, TypedDict
 if TYPE_CHECKING:
     from slack_sdk import WebClient
 
+from aetherscan.config import get_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,6 +82,7 @@ LEVEL_PRIORITY = {
 FLUSH_CHECK_INTERVAL = 1.0  # Seconds between flush thread checks
 THREAD_STOP_TIMEOUT = 2.0  # Seconds to wait for flush thread to stop
 GPU_INFO_TIMEOUT = 5.0  # Seconds to wait for nvidia-smi
+RAM_INFO_TIMEOUT = 5.0  # Seconds to wait for RAM info command
 MAX_MESSAGE_LENGTH = 500  # Max characters per individual log message
 MAX_COMBINED_LENGTH = 3000  # Max characters for combined batch message
 MIN_CHANNEL_ID_LENGTH = 9  # Slack channel IDs are C/G/D/Z + 8 chars
@@ -340,6 +343,13 @@ class SlackHandler(logging.Handler):
         # Try to get GPU info
         gpu_info = self._get_gpu_info()
 
+        # Try to get RAM info
+        ram_info = self._get_ram_info()
+
+        # Get save tag from config
+        config = get_config()
+        save_tag = config.checkpoint.save_tag if config else None
+
         # Format CLI args
         if cli_args is None:
             cli_args = sys.argv
@@ -351,10 +361,14 @@ class SlackHandler(logging.Handler):
             "*Aetherscan Pipeline Run Started*",
             "",
             f"*Start Time:* {timestamp}",
+            f"*Tag:* {save_tag}" if save_tag else None,
             f"*Machine:* {hostname}",
-            f"*OS:* {platform.system()} {platform.release()}",
-            f"*CPU Cores:* {cpu_count}",
+            f"*CPU:* {cpu_count} cores",
+            f"*RAM:* {ram_info}" if ram_info else None,
         ]
+
+        # Filter out None entries
+        summary_lines = [line for line in summary_lines if line is not None]
 
         if gpu_info:
             summary_lines.append(f"*GPUs:* {gpu_info}")
@@ -439,6 +453,37 @@ class SlackHandler(logging.Handler):
                 gpu_list = ", ".join(gpu_strs)
                 return f"{gpu_list} ({total_vram_gb:.0f}GB combined)"
 
+        except Exception:
+            pass
+        return None
+
+    def _get_ram_info(self) -> str | None:
+        """Get total system RAM in GB."""
+        try:
+            system = platform.system()
+            if system == "Darwin":  # macOS
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=RAM_INFO_TIMEOUT,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    ram_bytes = int(result.stdout.strip())
+                    ram_gb = ram_bytes / (1024**3)
+                    return f"{ram_gb:.0f}GB"
+            elif system == "Linux":
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            # Format: "MemTotal:       16384000 kB"
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                ram_kb = int(parts[1])
+                                ram_gb = ram_kb / (1024**2)
+                                return f"{ram_gb:.0f}GB"
+                            break
         except Exception:
             pass
         return None
@@ -690,7 +735,7 @@ class SlackHandler(logging.Handler):
             kwargs = {
                 "channel": channel_id,
                 "file": file_path,
-                "title": title,
+                # "title": title,  # Commented out - only sending the image
                 "initial_comment": initial_comment,
             }
 
@@ -730,18 +775,19 @@ class SlackHandler(logging.Handler):
             return
 
         # Build a brief announcement message
-        if title:
-            text = f":chart_with_upwards_trend: *{title}*"
-        else:
-            text = ":chart_with_upwards_trend: *New plot uploaded*"
-
-        if comment:
-            text += f"\n{comment}"
+        # NOTE: Title message commented out - only sending the image
+        # if title:
+        #     text = f":chart_with_upwards_trend: *{title}*"
+        # else:
+        #     text = ":chart_with_upwards_trend: *New plot uploaded*"
+        #
+        # if comment:
+        #     text += f"\n{comment}"
 
         try:
             client.chat_postMessage(
                 channel=channel,
-                text=text,
+                text="",  # Empty text - image only
                 thread_ts=self._thread_ts,
                 reply_broadcast=True,  # This echoes to the main channel
                 username=self.username,
