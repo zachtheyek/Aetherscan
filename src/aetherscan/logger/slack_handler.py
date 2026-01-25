@@ -1,3 +1,6 @@
+# NOTE: come back to this later
+# BUG: batched slack messages should be colored by the highest priority message (e.g. red if any message in the batch has priority ERROR). currently seeing INFO + WARN + ERROR be colored yellow (WARN)
+# BUG: sometimes certain batched messages that are too long get cut off (even after clicking "show more"). they just end with "..."
 """
 Slack logging handler for Aetherscan Pipeline
 Provides custom logging handler that sends messages to Slack API with:
@@ -6,6 +9,18 @@ Provides custom logging handler that sends messages to Slack API with:
 - Color-coded messages by log level
 - Retry logic with exponential backoff
 - Image upload functionality
+
+Threading Model:
+- Main thread calls emit() to buffer log records
+- Background flush thread (_flush_loop) periodically sends buffered messages
+- _cooldown_lock protects cooldown state (_cooldown_until, _consecutive_failures)
+- _buffer_lock protects the message buffer
+
+Security Note (Log Injection):
+- Log messages are sent to Slack without sanitization of Slack markdown characters
+- This is acceptable because logs are internal pipeline output, not user-generated content
+- If logs could contain untrusted user input in the future, consider escaping <, >, &
+- Timestamps are wrapped in backticks which provides some protection
 """
 
 from __future__ import annotations
@@ -19,23 +34,28 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
+# Defer runtime import to _get_client() as lazy import
+# Allows slack_sdk to be an optional dependency that doesn't crash the entire application if it's
+# not installed (just throws a warning)
 if TYPE_CHECKING:
     from slack_sdk import WebClient
 
 logger = logging.getLogger(__name__)
 
 
+# NOTE: should we parametrize this into config.py?
 # Color mapping for Slack message attachments based on log level
 LEVEL_COLORS = {
-    logging.CRITICAL: "#8B0000",  # Dark red
-    logging.ERROR: "#FF0000",  # Red
-    logging.WARNING: "#FFA500",  # Orange/Yellow
+    logging.CRITICAL: "#FF0000",  # Red
+    logging.ERROR: "#FFA500",  # Orange
+    logging.WARNING: "#FFFF00",  # Yellow
     logging.INFO: "#36A64F",  # Green
-    logging.DEBUG: "#808080",  # Gray
+    logging.DEBUG: "#FFFFFF",  # White
 }
 
+# NOTE: should we parametrize this into config.py?
 # Level name to emoji mapping for batched messages
 LEVEL_EMOJI = {
     logging.CRITICAL: ":rotating_light:",
@@ -44,6 +64,39 @@ LEVEL_EMOJI = {
     logging.INFO: ":information_source:",
     logging.DEBUG: ":mag:",
 }
+
+# NOTE: should we parametrize this into config.py?
+# Priority mapping for determining batch severity (higher = more severe)
+LEVEL_PRIORITY = {
+    logging.CRITICAL: 5,
+    logging.ERROR: 4,
+    logging.WARNING: 3,
+    logging.INFO: 2,
+    logging.DEBUG: 1,
+}
+
+# NOTE: should we parametrize this into config.py?
+# Configuration constants
+FLUSH_CHECK_INTERVAL = 1.0  # Seconds between flush thread checks
+THREAD_STOP_TIMEOUT = 2.0  # Seconds to wait for flush thread to stop
+GPU_INFO_TIMEOUT = 5.0  # Seconds to wait for nvidia-smi
+RAM_INFO_TIMEOUT = 5.0  # Seconds to wait for RAM info command
+MAX_MESSAGE_LENGTH = 500  # Max characters per individual log message
+MAX_COMBINED_LENGTH = 3000  # Max characters for combined batch message
+MIN_CHANNEL_ID_LENGTH = 9  # Slack channel IDs are C/G/D/Z + 8 chars
+CONVERSATIONS_PAGE_SIZE = 200  # Pagination limit for conversations.list API
+EXPONENTIAL_BACKOFF_BASE = 2  # Base for exponential backoff calculation
+
+
+class BufferedMessage(TypedDict):
+    """Type definition for buffered log messages."""
+
+    text: str
+    color: str
+    emoji: str
+    level: str
+    name: str
+    timestamp: str
 
 
 class SlackHandler(logging.Handler):
@@ -64,13 +117,12 @@ class SlackHandler(logging.Handler):
         self,
         token: str,
         channel: str,
-        username: str = "Aetherscan Bot",
-        icon_emoji: str = ":robot_face:",
-        timeout: float = 5.0,
-        retry_attempts: int = 2,
-        buffer_size: int = 10,
-        flush_interval: float = 5.0,
-        broadcast_level: int = logging.ERROR,
+        username: str,
+        timeout: float,
+        retry_attempts: int,
+        buffer_size: int,
+        flush_interval: float,
+        broadcast_level: int,
     ):
         """
         Initialize SlackHandler.
@@ -79,7 +131,6 @@ class SlackHandler(logging.Handler):
             token: Slack Bot User OAuth Token
             channel: Default channel to post messages to (e.g., "#aetherscan-logs")
             username: Bot username displayed in Slack
-            icon_emoji: Emoji icon for the bot
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts on failure
             buffer_size: Maximum messages to buffer before flushing
@@ -90,7 +141,6 @@ class SlackHandler(logging.Handler):
 
         self.channel = channel
         self.username = username
-        self.icon_emoji = icon_emoji
         self.timeout = timeout
         self.retry_attempts = retry_attempts
         self.buffer_size = buffer_size
@@ -98,10 +148,12 @@ class SlackHandler(logging.Handler):
         self.broadcast_level = broadcast_level
 
         # Track consecutive failures for error throttling
+        # Protected by _cooldown_lock for thread-safe access
         self._consecutive_failures = 0
         self._max_failures_before_cooldown = 5
         self._cooldown_duration = 300  # 5 minutes
         self._cooldown_until: float | None = None
+        self._cooldown_lock = threading.Lock()
 
         # Initialize Slack client lazily to avoid import errors if slack_sdk not installed
         self._client: WebClient | None = None
@@ -112,10 +164,13 @@ class SlackHandler(logging.Handler):
         self._run_started = False
 
         # Channel ID cache (files_upload_v2 requires ID, not name)
+        # NOTE: This cache is unbounded, but in practice only a few channels (1-3) are used
+        # per pipeline run. If dynamic channel generation becomes a use case, consider using
+        # functools.lru_cache or adding a TTL-based eviction policy.
         self._channel_id_cache: dict[str, str] = {}
 
         # Message batching
-        self._buffer: list[dict] = []
+        self._buffer: list[BufferedMessage] = []
         self._buffer_lock = threading.Lock()
         self._last_flush_time = time.time()
         self._flush_thread: threading.Thread | None = None
@@ -133,11 +188,16 @@ class SlackHandler(logging.Handler):
     def _flush_loop(self):
         """Background loop that flushes buffer at regular intervals."""
         while not self._stop_flush_thread.is_set():
-            time.sleep(1.0)  # Check every second
+            time.sleep(FLUSH_CHECK_INTERVAL)
+            # Extract messages while holding lock, then send outside lock
+            messages = None
             with self._buffer_lock:
                 elapsed = time.time() - self._last_flush_time
                 if self._buffer and elapsed >= self.flush_interval:
-                    self._flush_buffer_locked()
+                    messages = self._extract_buffer_locked()
+            # Network call outside the lock to avoid blocking emit()
+            if messages:
+                self._send_batched_messages(messages)
 
     def _get_client(self) -> WebClient | None:
         """Lazily initialize and return the Slack WebClient."""
@@ -168,7 +228,8 @@ class SlackHandler(logging.Handler):
             Channel ID, or None if resolution failed
         """
         # If it already looks like a channel ID, return as-is
-        if channel and len(channel) >= 9 and channel[0] in "CGDZ":
+        # Slack channel IDs start with C (public), G (private), D (DM), or Z (app)
+        if channel and len(channel) >= MIN_CHANNEL_ID_LENGTH and channel[0] in "CGDZ":
             return channel
 
         # Check cache
@@ -188,7 +249,7 @@ class SlackHandler(logging.Handler):
             while True:
                 response = client.conversations_list(
                     types="public_channel,private_channel",
-                    limit=200,
+                    limit=CONVERSATIONS_PAGE_SIZE,
                     cursor=cursor,
                 )
 
@@ -216,30 +277,33 @@ class SlackHandler(logging.Handler):
 
     def _is_in_cooldown(self) -> bool:
         """Check if handler is in cooldown period due to consecutive failures."""
-        if self._cooldown_until is None:
+        with self._cooldown_lock:
+            if self._cooldown_until is None:
+                return False
+            if time.time() < self._cooldown_until:
+                return True
+            # Cooldown expired, reset
+            self._cooldown_until = None
+            self._consecutive_failures = 0
             return False
-        if time.time() < self._cooldown_until:
-            return True
-        # Cooldown expired, reset
-        self._cooldown_until = None
-        self._consecutive_failures = 0
-        return False
 
     def _record_failure(self):
         """Record a failure and enter cooldown if threshold exceeded."""
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self._max_failures_before_cooldown:
-            self._cooldown_until = time.time() + self._cooldown_duration
-            print(
-                f"Slack handler entering cooldown for {self._cooldown_duration}s "
-                f"after {self._consecutive_failures} consecutive failures",
-                file=sys.__stderr__,
-            )
+        with self._cooldown_lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_failures_before_cooldown:
+                self._cooldown_until = time.time() + self._cooldown_duration
+                print(
+                    f"Slack handler entering cooldown for {self._cooldown_duration}s "
+                    f"after {self._consecutive_failures} consecutive failures",
+                    file=sys.__stderr__,
+                )
 
     def _record_success(self):
         """Record a successful send, resetting failure counter."""
-        self._consecutive_failures = 0
-        self._cooldown_until = None
+        with self._cooldown_lock:
+            self._consecutive_failures = 0
+            self._cooldown_until = None
 
     def start_run(self, cli_args: list[str] | None = None) -> bool:
         """
@@ -277,6 +341,15 @@ class SlackHandler(logging.Handler):
         # Try to get GPU info
         gpu_info = self._get_gpu_info()
 
+        # Try to get RAM info
+        ram_info = self._get_ram_info()
+
+        # NOTE: cli args are updated after logger init, so tag is out of sync
+        # # Get save tag from config
+        # from aetherscan.config import get_config
+        # config = get_config()
+        # save_tag = config.checkpoint.save_tag if config else None
+
         # Format CLI args
         if cli_args is None:
             cli_args = sys.argv
@@ -288,10 +361,15 @@ class SlackHandler(logging.Handler):
             "*Aetherscan Pipeline Run Started*",
             "",
             f"*Start Time:* {timestamp}",
+            # NOTE: cli args are updated after logger init, so tag is out of sync
+            # f"*Tag:* {save_tag}" if save_tag else None,
             f"*Machine:* {hostname}",
-            f"*OS:* {platform.system()} {platform.release()}",
-            f"*CPU Cores:* {cpu_count}",
+            f"*CPU:* {cpu_count} cores",
+            f"*RAM:* {ram_info}" if ram_info else None,
         ]
+
+        # Filter out None entries
+        summary_lines = [line for line in summary_lines if line is not None]
 
         if gpu_info:
             summary_lines.append(f"*GPUs:* {gpu_info}")
@@ -314,7 +392,6 @@ class SlackHandler(logging.Handler):
                     channel=self.channel,
                     text=summary_text,
                     username=self.username,
-                    icon_emoji=self.icon_emoji,
                     mrkdwn=True,
                 )
             )
@@ -337,7 +414,7 @@ class SlackHandler(logging.Handler):
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=GPU_INFO_TIMEOUT,
             )
             if result.returncode == 0 and result.stdout.strip():
                 gpus = result.stdout.strip().split("\n")
@@ -347,13 +424,17 @@ class SlackHandler(logging.Handler):
                 total_vram_mb = 0.0
 
                 for gpu in gpus:
-                    parts = gpu.split(", ")
-                    if len(parts) == 2:
-                        name, mem = parts
-                        name = name.strip()
-                        mem_mb = float(mem)
-                        total_vram_mb += mem_mb
-                        gpu_counts[name] = gpu_counts.get(name, 0) + 1
+                    # Split on comma (with or without space) for robustness
+                    parts = gpu.split(",")
+                    if len(parts) >= 2:
+                        name = parts[0].strip()
+                        try:
+                            mem_mb = float(parts[1].strip())
+                            total_vram_mb += mem_mb
+                            gpu_counts[name] = gpu_counts.get(name, 0) + 1
+                        except ValueError:
+                            # Skip this GPU if memory value can't be parsed
+                            continue
 
                 if not gpu_counts:
                     return None
@@ -377,6 +458,37 @@ class SlackHandler(logging.Handler):
             pass
         return None
 
+    def _get_ram_info(self) -> str | None:
+        """Get total system RAM in GB."""
+        try:
+            system = platform.system()
+            if system == "Darwin":  # macOS
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=RAM_INFO_TIMEOUT,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    ram_bytes = int(result.stdout.strip())
+                    ram_gb = ram_bytes / (1024**3)
+                    return f"{ram_gb:.0f}GB"
+            elif system == "Linux":
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            # Format: "MemTotal:       16384000 kB"
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                ram_kb = int(parts[1])
+                                ram_gb = ram_kb / (1024**2)
+                                return f"{ram_gb:.0f}GB"
+                            break
+        except Exception:
+            pass
+        return None
+
     def emit(self, record: logging.LogRecord) -> None:
         """
         Buffer log record for batched sending to Slack.
@@ -393,49 +505,57 @@ class SlackHandler(logging.Handler):
             color = LEVEL_COLORS.get(record.levelno, "#808080")
             emoji = LEVEL_EMOJI.get(record.levelno, ":speech_balloon:")
 
-            # Add to buffer
+            # Add to buffer and check if flush needed
+            messages_to_send = None
             with self._buffer_lock:
                 self._buffer.append(
-                    {
-                        "text": msg,
-                        "color": color,
-                        "emoji": emoji,
-                        "level": record.levelname,
-                        "name": record.name,
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    }
+                    BufferedMessage(
+                        text=msg,
+                        color=color,
+                        emoji=emoji,
+                        level=record.levelname,
+                        name=record.name,
+                        timestamp=datetime.now().strftime("%H:%M:%S"),
+                    )
                 )
 
-                # Flush if buffer is full
+                # Extract messages if buffer is full
                 if len(self._buffer) >= self.buffer_size:
-                    self._flush_buffer_locked()
+                    messages_to_send = self._extract_buffer_locked()
 
-        except Exception:
+            # Send outside the lock to avoid blocking other emit() calls
+            if messages_to_send:
+                self._send_batched_messages(messages_to_send)
+
+        except Exception as e:
+            print(f"SlackHandler.emit() error: {e}", file=sys.__stderr__)
             self._record_failure()
 
-    def _flush_buffer_locked(self):
-        """Flush the buffer. Must be called with _buffer_lock held."""
+    def _extract_buffer_locked(self) -> list[BufferedMessage] | None:
+        """
+        Extract messages from buffer. Must be called with _buffer_lock held.
+
+        Returns:
+            List of buffered messages, or None if buffer was empty.
+        """
         if not self._buffer:
-            return
+            return None
 
         messages = self._buffer.copy()
         self._buffer.clear()
         self._last_flush_time = time.time()
-
-        # Release lock before network call
-        self._buffer_lock.release()
-        try:
-            self._send_batched_messages(messages)
-        finally:
-            self._buffer_lock.acquire()
+        return messages
 
     def flush(self):
         """Flush any buffered messages immediately."""
+        messages = None
         with self._buffer_lock:
-            if self._buffer:
-                self._flush_buffer_locked()
+            messages = self._extract_buffer_locked()
+        # Send outside the lock
+        if messages:
+            self._send_batched_messages(messages)
 
-    def _send_batched_messages(self, messages: list[dict]):
+    def _send_batched_messages(self, messages: list[BufferedMessage]):
         """Send a batch of messages as a single Slack message."""
         if self._is_in_cooldown():
             return
@@ -445,19 +565,11 @@ class SlackHandler(logging.Handler):
             return
 
         # Determine the highest severity level for the batch color
-        level_priority = {
-            logging.CRITICAL: 5,
-            logging.ERROR: 4,
-            logging.WARNING: 3,
-            logging.INFO: 2,
-            logging.DEBUG: 1,
-        }
-
         max_level = logging.DEBUG
         for msg in messages:
             level_name = msg.get("level", "INFO")
             level_num = getattr(logging, level_name, logging.INFO)
-            if level_priority.get(level_num, 0) > level_priority.get(max_level, 0):
+            if LEVEL_PRIORITY.get(level_num, 0) > LEVEL_PRIORITY.get(max_level, 0):
                 max_level = level_num
 
         batch_color = LEVEL_COLORS.get(max_level, "#808080")
@@ -469,15 +581,15 @@ class SlackHandler(logging.Handler):
             timestamp = msg.get("timestamp", "")
             text = msg.get("text", "")
             # Truncate very long messages
-            if len(text) > 500:
-                text = text[:497] + "..."
+            if len(text) > MAX_MESSAGE_LENGTH:
+                text = text[: MAX_MESSAGE_LENGTH - 3] + "..."
             lines.append(f"{emoji} `{timestamp}` {text}")
 
         combined_text = "\n".join(lines)
 
         # Truncate if total message is too long (Slack limit is ~40k chars)
-        if len(combined_text) > 3000:
-            combined_text = combined_text[:2997] + "\n..."
+        if len(combined_text) > MAX_COMBINED_LENGTH:
+            combined_text = combined_text[: MAX_COMBINED_LENGTH - 4] + "\n..."
 
         # Build the message with text field to avoid warnings
         try:
@@ -485,7 +597,6 @@ class SlackHandler(logging.Handler):
                 "channel": self.channel,
                 "text": f"{len(messages)} log message(s)",  # Fallback text for notifications
                 "username": self.username,
-                "icon_emoji": self.icon_emoji,
                 "attachments": [
                     {
                         "color": batch_color,
@@ -526,7 +637,7 @@ class SlackHandler(logging.Handler):
             except Exception as e:
                 last_exception = e
                 if attempt < self.retry_attempts:
-                    wait_time = 2**attempt
+                    wait_time = EXPONENTIAL_BACKOFF_BASE**attempt
                     time.sleep(wait_time)
 
         self._record_failure()
@@ -556,7 +667,7 @@ class SlackHandler(logging.Handler):
             except Exception as e:
                 last_exception = e
                 if attempt < self.retry_attempts:
-                    wait_time = 2**attempt
+                    wait_time = EXPONENTIAL_BACKOFF_BASE**attempt
                     time.sleep(wait_time)
 
         self._record_failure()
@@ -593,7 +704,7 @@ class SlackHandler(logging.Handler):
             True if upload succeeded, False otherwise
         """
         if not os.path.exists(file_path):
-            logger.warning(f"File not found for Slack upload: {file_path}")
+            print(f"File not found for Slack upload: {file_path}", file=sys.__stderr__)
             return False
 
         if self._is_in_cooldown():
@@ -612,20 +723,20 @@ class SlackHandler(logging.Handler):
             target_channel = channels
 
         if not target_channel:
-            logger.warning("No channel specified for Slack file upload")
+            print("No channel specified for Slack file upload", file=sys.__stderr__)
             return False
 
         # Resolve channel name to ID (required for files_upload_v2)
         channel_id = self._resolve_channel_id(target_channel)
         if not channel_id:
-            logger.warning(f"Could not resolve channel ID for: {target_channel}")
+            print(f"Could not resolve channel ID for: {target_channel}", file=sys.__stderr__)
             return False
 
         try:
             kwargs = {
                 "channel": channel_id,
                 "file": file_path,
-                "title": title,
+                # "title": title,  # Commented out - only sending the image
                 "initial_comment": initial_comment,
             }
 
@@ -642,7 +753,7 @@ class SlackHandler(logging.Handler):
 
             return response is not None
         except Exception as e:
-            logger.debug(f"Failed to upload file to Slack: {e}")
+            print(f"Failed to upload file to Slack: {e}", file=sys.__stderr__)
             return False
 
     def _broadcast_file_upload(
@@ -665,22 +776,22 @@ class SlackHandler(logging.Handler):
             return
 
         # Build a brief announcement message
-        if title:
-            text = f":chart_with_upwards_trend: *{title}*"
-        else:
-            text = ":chart_with_upwards_trend: *New plot uploaded*"
-
-        if comment:
-            text += f"\n{comment}"
+        # NOTE: Title message commented out - only sending the image
+        # if title:
+        #     text = f":chart_with_upwards_trend: *{title}*"
+        # else:
+        #     text = ":chart_with_upwards_trend: *New plot uploaded*"
+        #
+        # if comment:
+        #     text += f"\n{comment}"
 
         try:
             client.chat_postMessage(
                 channel=channel,
-                text=text,
+                text="",  # Empty text - image only
                 thread_ts=self._thread_ts,
                 reply_broadcast=True,  # This echoes to the main channel
                 username=self.username,
-                icon_emoji=self.icon_emoji,
             )
         except Exception as e:
             # Don't fail the upload if broadcast fails
@@ -691,7 +802,12 @@ class SlackHandler(logging.Handler):
         # Stop the flush thread
         self._stop_flush_thread.set()
         if self._flush_thread and self._flush_thread.is_alive():
-            self._flush_thread.join(timeout=2.0)
+            self._flush_thread.join(timeout=THREAD_STOP_TIMEOUT)
+            if self._flush_thread.is_alive():
+                print(
+                    f"SlackHandler flush thread did not stop within {THREAD_STOP_TIMEOUT}s",
+                    file=sys.__stderr__,
+                )
 
         # Flush any remaining messages
         self.flush()

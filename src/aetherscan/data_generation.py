@@ -161,18 +161,18 @@ def log_norm(data: np.ndarray) -> np.ndarray:
 
 
 # NOTE: not 100% sure how this function works. ported from Peter's code. comments added by Claude. assuming it works as intended?
-# NOTE: verify that we're randomly drawing a combo of snr, drift_rate, and signal_width for each injection?
 def new_cadence(
     data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
-) -> tuple[np.ndarray, dict[str, float]]:
+) -> tuple[np.ndarray, dict[str, float], bool]:
     """
     Inject a single drifting narrowband signal into a stacked cadence array
 
     Returns:
         modified_data: Array with injected signal
         signal_info: Dict with keys: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept
+        slope_was_clamped: True if slope was clamped due to being near zero
     """
-    # NOTE: should this be parametrized?
+    # NOTE: should noise = 3 parametrized?
     # Set noise parameter (for simulating randomness in drift rate calculation)
     noise = 3
 
@@ -201,9 +201,16 @@ def new_cadence(
             time_resolution / freq_resolution
         ) - random.random() * noise
 
-    # Guard against division by near-zero
+    # Clamp slopes that are too small to prevent divide-by-zero errors
+    # While this may alter the physics slightly, a near-zero slope is an edge-case representing a
+    # nearly horizontal signal trajectory
+    # Note that we still preserve the drift direction; merely the magnitude is clamped
+    # NOTE: should MIN_SLOPE_PHYSICAL = 1e-6 be parametrized in config.py instead?
+    # NOTE: does slope_pixel need to be changed before db write if slope_physical is clamped?
     MIN_SLOPE_PHYSICAL = 1e-6  # noqa: N806
+    slope_was_clamped = False
     if abs(slope_physical) < MIN_SLOPE_PHYSICAL:
+        slope_was_clamped = True
         logger.warning(f"new_cadence: slope_physical ({slope_physical}) near zero, clamping")
         slope_physical = (
             np.sign(slope_physical) * MIN_SLOPE_PHYSICAL
@@ -214,6 +221,8 @@ def new_cadence(
     # Convert slope to drift rate
     drift_rate = -1 * (1 / slope_physical)
 
+    # NOTE: should 0-50 randomness be parametrized?
+    # NOTE: where does 18.0 come from? hard-coded time resolution?
     # Calculate signal width (in Hz)
     # Base random component: 0-50 Hz
     # Add component proportional to drift rate magnitude to keep signal coherent
@@ -262,8 +271,8 @@ def new_cadence(
         "y_intercept": float(y_intercept),
     }
 
-    # Return the modified data array and signal info
-    return modified_data, signal_info
+    # Return the modified data array, signal info, and clamping flag
+    return modified_data, signal_info, slope_was_clamped
 
 
 def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
@@ -290,9 +299,10 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
 
     Returns:
         Dict with keys: global_mean, global_median, global_std,
-                       global_mad, global_skew, global_kurtosis
+                        global_mad, global_skew, global_kurtosis
     """
-    # Handle empty arrays
+    # Return NaN for empty arrays
+    # write_injection_stat() will set is_finite=0
     if data.size == 0:
         logger.warning("_compute_intensity_stats received empty array")
         return dict.fromkeys(
@@ -304,10 +314,10 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
                 "global_skew",
                 "global_kurtosis",
             ],
-            0.0,
+            float("nan"),
         )
 
-    # Promote to float64 to prevent overflow in higher-order moments
+    # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for pre-normalization stats)
     flat = data.ravel().astype(np.float64)
     median_val = np.median(flat)
 
@@ -319,12 +329,6 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
         "global_skew": float(scipy_stats.skew(flat)),
         "global_kurtosis": float(scipy_stats.kurtosis(flat)),
     }
-
-    # Sanitize any remaining NaN/inf
-    for key, value in stats.items():
-        if not np.isfinite(value):
-            logger.warning(f"_compute_intensity_stats: {key} is {value}, replacing with 0.0")
-            stats[key] = 0.0
 
     return stats
 
@@ -340,7 +344,7 @@ def create_false(
     dynamic_range: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create false signal class with intensity statistics at each stage.
+    Create false signal class
     If specified, RFI is injected into all 6 observations. Otherwise, no RFI is injected.
 
     Returns:
@@ -363,6 +367,7 @@ def create_false(
     signal_info = {}
 
     # Inject RFI into all 6 observations
+    slope_was_clamped = False
     if inject:
         # Prepare data for signal injection by stacking all 6 observations vertically
         # (6, 16, 512) -> (96, 512)
@@ -373,7 +378,7 @@ def create_false(
 
         # Select a random SNR from the given range & inject RFI into all 6 observations
         snr = random.random() * snr_range + snr_base
-        cadence, rfi_signal_info = new_cadence(
+        cadence, rfi_signal_info, slope_was_clamped = new_cadence(
             data, snr, width_bin, freq_resolution, time_resolution
         )
 
@@ -401,7 +406,9 @@ def create_false(
     sample_info = {
         "background_index": background_index,
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
+        # NOTE: how do we handle db writes & plotting when signal_info is empty?
         "signal_info": signal_info,  # Empty if no injection, rfi_* if injected
+        "slope_was_clamped": slope_was_clamped,
     }
 
     return final, sample_info
@@ -418,7 +425,7 @@ def create_true_single(
     dynamic_range: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create true-single signal class with intensity statistics at each stage.
+    Create true-single signal class
     ETI signal is injected into the ON observations only.
 
     Returns:
@@ -446,7 +453,9 @@ def create_true_single(
 
     # Select a random SNR from the given range & inject ETI
     snr = random.random() * snr_range + snr_base
-    cadence, eti_signal_info = new_cadence(data, snr, width_bin, freq_resolution, time_resolution)
+    cadence, eti_signal_info, slope_was_clamped = new_cadence(
+        data, snr, width_bin, freq_resolution, time_resolution
+    )
 
     # Prefix signal characteristics with eti_ (this is ETI injection)
     signal_info = {f"eti_{k}": v for k, v in eti_signal_info.items()}
@@ -470,6 +479,7 @@ def create_true_single(
         "background_index": background_index,
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # eti_* signal characteristics
+        "slope_was_clamped": slope_was_clamped,
     }
 
     return final, sample_info
@@ -486,7 +496,7 @@ def create_true_double(
     dynamic_range: float = 1,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create true-double signal class with intensity statistics at each stage.
+    Create true-double signal class
     Non-intersecting ETI & RFI signals are injected into ON-only & ON-OFF, respectively.
 
     Returns:
@@ -519,11 +529,11 @@ def create_true_double(
     # Retry signal injection until we get valid non-intersecting signals
     while True:
         # Inject RFI
-        cadence_1, rfi_signal_info = new_cadence(
+        cadence_1, rfi_signal_info, rfi_slope_clamped = new_cadence(
             data, snr, width_bin, freq_resolution, time_resolution
         )
         # Inject ETI
-        cadence_2, eti_signal_info = new_cadence(
+        cadence_2, eti_signal_info, eti_slope_clamped = new_cadence(
             cadence_1, snr * dynamic_range, width_bin, freq_resolution, time_resolution
         )
 
@@ -537,6 +547,9 @@ def create_true_double(
             slope_1, slope_2, intercept_1, intercept_2
         ):
             break
+
+    # Track if any slope was clamped (either RFI or ETI)
+    slope_was_clamped = rfi_slope_clamped or eti_slope_clamped
 
     # Combine both signal infos with appropriate prefixes
     signal_info = {
@@ -563,6 +576,7 @@ def create_true_double(
         "background_index": background_index,
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # Both eti_* and rfi_* signal characteristics
+        "slope_was_clamped": slope_was_clamped,
     }
 
     return final, sample_info
@@ -729,7 +743,7 @@ def batch_create_cadence(
 
         # Use pool to generate cadences in parallel
         for i, (result, sample_info) in enumerate(
-            # NOTE: does return order matter?
+            # TEST: does return order matter?
             pool.map(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap(_single_cadence_wrapper, args_list, chunksize=chunksize)
             # pool.imap_unordered(_single_cadence_wrapper, args_list, chunksize=chunksize)
@@ -1110,6 +1124,7 @@ class DataGenerator:
             background_index = sample_info["background_index"]
             intensity_stats = sample_info["intensity_stats"]
             signal_info = sample_info["signal_info"]
+            slope_was_clamped = sample_info.get("slope_was_clamped", False)
 
             # Write intensity stats for each stage
             for stage in ["A", "B", "C"]:
@@ -1133,10 +1148,12 @@ class DataGenerator:
                         signal_class=signal_class,
                         signal_type=signal_type,
                         injection_stage=stage,
+                        slope_clamped=slope_was_clamped,
                         tag=tag,
                         timestamp=timestamp,
                     )
 
+            # NOTE: what happens when signal_info is empty for false_no_rfi signal types?
             # Write signal characteristics (eti_snr, rfi_drift_rate, etc.)
             # injection_stage=None since these describe the injection itself
             for stat_name, value in signal_info.items():
@@ -1150,6 +1167,7 @@ class DataGenerator:
                     signal_class=signal_class,
                     signal_type=signal_type,
                     injection_stage=None,
+                    slope_clamped=slope_was_clamped,
                     tag=tag,
                     timestamp=timestamp,
                 )
@@ -1499,28 +1517,28 @@ class DataGenerator:
         result = {"concatenated": all_main, "false": all_false, "true": all_true}
 
         # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
-        # # Sanity check: verify post-injection data normalization
-        # for key in ["concatenated", "false", "true"]:
-        #     min_val = np.min(result[key])
-        #     max_val = np.max(result[key])
-        #     mean_val = np.mean(result[key])
-        #     logger.info(
-        #         f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
-        #     )
-        #     if max_val > 1.0:
-        #         logger.error(f"Post-injection {key} values too large! Max: {max_val}")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif min_val < 0.0:
-        #         logger.error(f"Post-injection {key} values too small! Min: {min_val}")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif np.isnan(result[key]).any():
-        #         logger.error(f"Post-injection {key} contains NaN values!")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     elif np.isinf(result[key]).any():
-        #         logger.error(f"Post-injection {key} contains Inf values!")
-        #         raise ValueError(f"Post-injection {key} normalization check failed")
-        #     else:
-        #         logger.info(f"Post-injection {key} data properly normalized")
+        # Sanity check: verify post-injection data normalization
+        for key in ["concatenated", "false", "true"]:
+            min_val = np.min(result[key])
+            max_val = np.max(result[key])
+            mean_val = np.mean(result[key])
+            logger.info(
+                f"Post-injection {key} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}"
+            )
+            if max_val > 1.0:
+                logger.error(f"Post-injection {key} values too large! Max: {max_val}")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            elif min_val < 0.0:
+                logger.error(f"Post-injection {key} values too small! Min: {min_val}")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            elif np.isnan(result[key]).any():
+                logger.error(f"Post-injection {key} contains NaN values!")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            elif np.isinf(result[key]).any():
+                logger.error(f"Post-injection {key} contains Inf values!")
+                raise ValueError(f"Post-injection {key} normalization check failed")
+            else:
+                logger.info(f"Post-injection {key} data properly normalized")
 
         return result
 

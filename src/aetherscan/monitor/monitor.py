@@ -1,3 +1,4 @@
+# BUG: sometimes entire sections (e.g. data generation for round X) just don't show up in the resource utilization plot. not sure if data isn't being written to the db properly (haven't verified)?
 # TODO: add a threshold to config where if RAM usage > threshold, immediately exit & initiate cleanup. set threshold in monitor config
 """
 Resource monitor for Aetherscan Pipeline

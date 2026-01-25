@@ -1,5 +1,6 @@
 # TODO: update to match current pipeline imports (ruff)
 # TODO: rebuild conda environment after updating
+# NOTE: do we need a no_cuda environment?
 name: aetherscan
 channels:
   - conda-forge

@@ -34,10 +34,9 @@ repos:
       - id: trailing-whitespace
       # Check for private keys (vulnerability)
       - id: detect-private-key
-      # TODO: uncomment after configuring repo branch protection rules
       # Blocks commits directly to master branch
-      # - id: no-commit-to-branch
-      #   args: ['--branch', 'master']
+      - id: no-commit-to-branch
+        args: ["--branch", "master"]
 
   # Scan for sensitive data (secrets, credentials, etc.)
   - repo: https://github.com/gitleaks/gitleaks

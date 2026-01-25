@@ -1,5 +1,5 @@
 # TODO:
-# NOTE: will inference use a different tagging system as train?
+# NOTE: will inference use a different tagging system as train? if so, update cli.py
 """
 Inference orchestration for Aetherscan Pipeline
 ...

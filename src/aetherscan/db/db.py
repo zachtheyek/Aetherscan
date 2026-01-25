@@ -1,3 +1,5 @@
+# TODO: add warning when aetherscan.db file size exceeds 1TB (at that point we should consider migrating to PostgreSQL or sharding the SQLite db)
+# TODO: add functions to delete entries in db based on query results (e.g. query_system_resource -> DELETE)
 """
 Database for Aetherscan Pipeline
 Uses SQLite with asynchronous queue-based writes to handle concurrent data collection from multiple
@@ -25,17 +27,11 @@ from aetherscan.manager import register_db
 
 logger = logging.getLogger(__name__)
 
-# Unique sentinel object for flush requests - writer thread recognizes this
-# as a command to flush immediately rather than data to be written
+# Unique sentinel object (i.e. an object with no attributes, no methods beyond those inherited from
+# Python's base object type, and no meaningful equality semantics except identity) for flush
+# requests - writer thread recognizes this as a command to flush immediately rather than data to be
+# written
 _FLUSH_SENTINEL = object()
-
-
-def _sanitize_float(value: float, fallback: float = 0.0, name: str = "value") -> float:
-    """Replace NaN/inf with fallback for SQLite compatibility."""
-    if not np.isfinite(value):
-        logger.warning(f"_sanitize_float: {name} is {value}, replacing with {fallback}")
-        return fallback
-    return value
 
 
 def get_system_metadata() -> str:
@@ -167,6 +163,16 @@ class Database:
             cls._instance = None
             logger.info("Database singleton instance reset")
 
+    # TODO:
+    # We currently don't support schema versioning or migration scripting for schema changes
+    # This means that while new tables can be easily added using CREATE TABLE IF NOT EXISTS
+    # statements, existing tables cannot be easily modified (i.e. no ALTER TABLE support for adding
+    # new columns to tables, modifying column constraints, renaming columns, or dropping obsolete
+    # columns), and no rollback mechanisms exist
+    # This makes it impossible to evolve existing schema without manual database updates. As well as
+    # having no audit trail of schema changes, or no rollback capability for failed upgrades. It's
+    # also difficult to coordinate deployments across multiple db instances
+    # NOTE: should we consider migrating to PostgreSQL? or should we go all in on SQLite?
     def _init_database(self):
         """Create database tables if they don't exist"""
         with self._get_connection() as conn:
@@ -186,10 +192,21 @@ class Database:
                 )
             """)
 
-            # TODO: add additional index for frequent queries
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # # Composite index optimized for query_system_resource ORDER BY pattern
+            # # Also works for common filter patterns (tag + timestamp)
+            # # Recall that composite indices follow the left-prefix rule
+            # # That is, if your query contains a left prefix of the index columns,
+            # # you'll still get (some of) the benefits of indexing
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_system_resources_query
+            #     ON system_resources(tag, timestamp, resource_type, resource_name)
+            # """)
+
+            # Composite index for common filter patterns (tag + timestamp)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON system_resources(timestamp)
+                CREATE INDEX IF NOT EXISTS idx_system_resources_filter
+                ON system_resources(tag, timestamp)
             """)
 
             # Injection statistics table
@@ -206,15 +223,24 @@ class Database:
                     signal_class TEXT,
                     signal_type TEXT,
                     injection_stage TEXT,
+                    is_finite INTEGER DEFAULT 1,
+                    slope_clamped INTEGER DEFAULT 0,
                     tag TEXT,
                     metadata TEXT
                 )
             """)
 
-            # TODO: add additional index for frequent queries
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # # Composite index optimized for query_injection_stat ORDER BY pattern
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_injection_stats_query
+            #     ON injection_stats(tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name)
+            # """)
+
+            # Composite index for common filter pattern (tag + timestamp + stat_name + signal_type + injection_stage)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON injection_stats(timestamp)
+                CREATE INDEX IF NOT EXISTS idx_injection_stats_filter
+                ON injection_stats(tag, timestamp, stat_name, signal_type, injection_stage)
             """)
 
             # Training statistics table
@@ -232,10 +258,17 @@ class Database:
                 )
             """)
 
-            # TODO: add additional index for frequent queries
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # # Composite index optimized for query_training_stat ORDER BY pattern
+            # cursor.execute("""
+            #     CREATE INDEX IF NOT EXISTS idx_training_stats_query
+            #     ON training_stats(tag, model_name, round_number, epoch_number, stat_name)
+            # """)
+
+            # Composite index for common filter pattern (tag + timestamp + model_name + stat_name)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON training_stats(timestamp)
+                CREATE INDEX IF NOT EXISTS idx_training_stats_filter
+                ON training_stats(tag, timestamp, model_name, stat_name)
             """)
 
             conn.commit()
@@ -293,7 +326,7 @@ class Database:
 
         Args:
             timeout: Maximum time to wait for flush completion (seconds).
-                     If None, uses the configured flush_timeout.
+                     If None, uses the default configured flush_timeout.
 
         Returns:
             True if flush completed successfully, False if timed out or
@@ -304,7 +337,7 @@ class Database:
 
         # No-op if writer isn't running
         if self.writer_thread is None or not self.writer_thread.is_alive():
-            logger.debug("Flush called but writer thread not running")
+            logger.info("Flush called but writer thread not running")
             return True
 
         # Check if shutdown is already in progress
@@ -357,8 +390,11 @@ class Database:
                     flush_complete_event = metric[1]
                     # Flush current buffer immediately
                     if self.buffer:
+                        # Write all buffered data to db
                         self._flush_buffer()
+                        # Clear the buffer (empty the list)
                         self.buffer.clear()
+                        # Reset the timer
                         last_write_time = time.time()
                     # Signal that flush is complete
                     flush_complete_event.set()
@@ -402,8 +438,27 @@ class Database:
             self.buffer.clear()
             logger.info(f"Flushed {len(self.buffer)} remaining data on shutdown")
 
+    # In commit 08fc37d, we switched from using sequential execute() to executemany()
+    # The sequential approaches parses SQL statements N times & performs N round trips to the db
+    # engine, in exchange for lower peak memory & more granular errors (can identify exactly which
+    # row failed). In contrast, executemany() only parses SQL statements once & performs only 1
+    # round trip to the db engine, but requires all rows to be in memory & fails the entire batch
+    # if any row fails
+    # In general, sequential execute() is preferred when db buffer sizes are small, if write
+    # frequency is low, if each record in the buffer is guaranteed to go to different tables, or
+    # if we require per-row error handling
+    # In our case, we have a larger buffer (100+ records), most records in a batch will go to the
+    # same table, and we're okay with all-or-nothing batch semantics. So the increased write speeds
+    # in exchange for increased memory pressure is worth it
+    # As well, since our db writes happen in a background thread & don't block the main process,
+    # either approach should have minimal practical impact
     def _flush_buffer(self):
-        """Write buffered data to database in a single transaction"""
+        """
+        Write buffered data to database in a single transaction using executemany().
+
+        Groups records by table and uses executemany() for bulk inserts, which is more efficient
+        than individual execute() calls because the SQL is parsed once and reused for all rows.
+        """
         if not self.buffer:
             return
 
@@ -411,36 +466,52 @@ class Database:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
+                # Group records by table for bulk inserts
+                system_resources_records: list[tuple] = []
+                injection_stats_records: list[tuple] = []
+                training_stats_records: list[tuple] = []
+
                 for table, values in self.buffer:
                     if table == "system_resources":
-                        cursor.execute(
-                            """
-                            INSERT INTO system_resources
-                            (timestamp, resource_type, resource_name, value, unit, tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            values,
-                        )
+                        system_resources_records.append(values)
                     elif table == "injection_stats":
-                        cursor.execute(
-                            """
-                            INSERT INTO injection_stats
-                            (timestamp, stat_name, value, round_number, chunk_number, sample_index,
-                             background_index, signal_class, signal_type, injection_stage, tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                            values,
-                        )
+                        injection_stats_records.append(values)
                     elif table == "training_stats":
-                        cursor.execute(
-                            """
-                            INSERT INTO training_stats
-                            (timestamp, model_name, stat_name, value, round_number, epoch_number,
-                             tag, metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        training_stats_records.append(values)
+
+                # Bulk insert each table type
+                if system_resources_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO system_resources
+                        (timestamp, resource_type, resource_name, value, unit, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                            values,
-                        )
+                        system_resources_records,
+                    )
+
+                if injection_stats_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO injection_stats
+                        (timestamp, stat_name, value, round_number, chunk_number, sample_index,
+                         background_index, signal_class, signal_type, injection_stage, is_finite,
+                         slope_clamped, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        injection_stats_records,
+                    )
+
+                if training_stats_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO training_stats
+                        (timestamp, model_name, stat_name, value, round_number, epoch_number,
+                         tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        training_stats_records,
+                    )
 
                 conn.commit()
 
@@ -495,6 +566,7 @@ class Database:
         signal_class: str | None = None,
         signal_type: str | None = None,
         injection_stage: str | None = None,
+        slope_clamped: bool | None = None,
         tag: str | None = None,
         timestamp: float | None = None,
     ):
@@ -511,13 +583,27 @@ class Database:
             signal_class: Optional signal class (e.g. main, false, true)
             signal_type: Optional signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
             injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            slope_clamped: Optional per-sample flag indicating if slope was clamped during injection
             tag: Optional tag for current pipeline run
             timestamp: Optional timestamp when stat was logged (uses current time if not provided)
         """
         metadata_json = get_system_metadata()
 
-        # Sanitize value to prevent NaN/inf from violating NOT NULL constraint
-        sanitized_value = _sanitize_float(value, fallback=0.0, name=stat_name)
+        # Since higher-order moments from _compute_intensity_stats() could lead to NaN/Inf values
+        # We explicitly check if a value is finite to set the flag accordingly
+        # We will opt to store these values as 0.0 due to the schema's NOT NULL constraint
+        # However, queries for injection_stats should by default use the is_finite flag, unless
+        # sanitization is explicitly not needed
+        is_finite = 1 if np.isfinite(value) else 0
+        sanitized_value = float(value) if is_finite else 0.0
+
+        if not is_finite:
+            logger.warning(
+                f"write_injection_stat: {stat_name} is {value}, storing as 0.0 with is_finite=0"
+            )
+
+        # Convert slope_clamped bool to int (0 or 1), defaulting to 0 if None
+        slope_clamped_int = 1 if slope_clamped else 0
 
         self.write_queue.put(
             (
@@ -533,6 +619,8 @@ class Database:
                     signal_class,
                     signal_type,
                     injection_stage,
+                    is_finite,
+                    slope_clamped_int,
                     tag,
                     metadata_json,
                 ),
@@ -633,7 +721,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            query += " ORDER BY tag, timestamp, resource_type, resource_name"
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # Intentionally hard-coded. Update if schema changes
+            # query += " ORDER BY tag, timestamp, resource_type, resource_name"
 
             cursor.execute(query, params)
 
@@ -659,6 +749,8 @@ class Database:
         signal_class: str | None = None,
         signal_type: str | None = None,
         injection_stage: str | None = None,
+        only_finite: bool = True,
+        only_slope_clamped: bool | None = None,
         tag: str | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
@@ -679,6 +771,8 @@ class Database:
             signal_class: Signal class (e.g. main, false, true)
             signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
             injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            only_finite: If True (default), only return rows where is_finite=1
+            only_slope_clamped: If True, only return rows where slope_clamped=1; if False, only where slope_clamped=0; if None (default), no filter
             tag: Tag for current pipeline run
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
@@ -744,6 +838,13 @@ class Database:
                 query += " AND injection_stage = ?"
                 params.append(injection_stage)
 
+            if only_finite:
+                query += " AND is_finite = 1"
+
+            if only_slope_clamped is not None:
+                query += " AND slope_clamped = ?"
+                params.append(1 if only_slope_clamped else 0)
+
             if tag:
                 query += " AND tag = ?"
                 params.append(tag)
@@ -756,7 +857,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # Intentionally hard-coded. Update if schema changes
+            # query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
 
             cursor.execute(query, params)
 
@@ -843,7 +946,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # Intentionally hard-coded. Update if schema changes
+            # query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
 
             cursor.execute(query, params)
 
