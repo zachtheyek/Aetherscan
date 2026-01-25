@@ -140,7 +140,7 @@ class TrainingConfig:
 
     per_replica_batch_size: int = 128
     effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
-    per_replica_val_batch_size: int = 832
+    per_replica_val_batch_size: int = 320
 
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
@@ -171,7 +171,7 @@ class TrainingConfig:
 class InferenceConfig:
     """Inference configuration"""
 
-    per_replica_batch_size: int = 832
+    per_replica_batch_size: int = 320
 
     # NOTE: come back to this later
     # classification_threshold: float = 0.5
