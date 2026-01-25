@@ -1,5 +1,6 @@
 # TODO:
 
+- do NOT commit sensitive information. pre-commit hooks are configured to scan for sensitive data using gitleaks, but that does not provide full coverage for leaks. practice common sense. failure to comply may result in a blacklist from future contributions
 - in the case of token leaks (e.g. through .env), rotate the following credentials immediately:
   - slack bot token
   - gcp token
