@@ -32,9 +32,9 @@ I include this section to be transparent about the project's usage about AI for 
 
 This project’s AI policy is derived from the Ghostty project’s public AI policy.
 
-Original work: Ghostty
-Repository: [https://github.com/ghostty-org/ghostty](https://github.com/ghostty-org/ghostty)
-File: `AI_POLICY.md`
-Commit hash: `061a0ae`
+- Original work: Ghostty
+- Repository: [https://github.com/ghostty-org/ghostty](https://github.com/ghostty-org/ghostty)
+- File: `AI_POLICY.md`
+- Commit hash: `061a0ae`
 
 The original text has been adapted for use in this project. Any modifications are the responsibility of the authors of this repository and do not reflect the views or policies of the Ghostty project.
