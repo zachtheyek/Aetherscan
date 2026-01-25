@@ -1,0 +1,80 @@
+# Analyze merged PRs and suggest documentation updates
+name: Claude Update Docs
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+
+jobs:
+  claude-update-docs:
+    # Only run when PR is actually merged, not just closed
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Documentation Analysis
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR TITLE: ${{ github.event.pull_request.title }}
+            PR BODY: ${{ github.event.pull_request.body }}
+            AUTHOR: ${{ github.event.pull_request.user.login }}
+            MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+
+            A pull request has just been merged to master. Your task is to analyze the changes
+            and determine if any documentation needs to be updated.
+
+            ## Steps:
+
+            1. First, get the diff of the merged PR:
+               `gh pr diff ${{ github.event.pull_request.number }}`
+
+            2. Review the changes and identify:
+               - New features or functionality added
+               - API changes or new endpoints
+               - Configuration changes
+               - Breaking changes
+               - New dependencies
+               - Changes to installation/setup process
+               - Changes to usage patterns
+
+            3. Check the following documentation files for potential updates needed:
+               - README.md (project overview, installation, usage)
+               - AGENTS.md (AI agent instructions and context)
+               - CONTRIBUTING.md (contribution guidelines)
+               - KNOWN_ISSUES.md (known issues, FAQ)
+               - docs/* (tutorials, guides, API docs)
+
+            4. If documentation updates are needed:
+               - Create a new GitHub issue with the label "documentation"
+               - Title: "Documentation Update Needed: [brief description]"
+               - Body should include:
+                 - Reference to the merged PR (#${{ github.event.pull_request.number }})
+                 - Summary of changes that require documentation
+                 - Specific files that need updates
+                 - Suggested changes or additions
+
+            5. If no documentation updates are needed, do not create an issue.
+               Only create an issue if there are meaningful documentation gaps.
+
+            Use `gh issue create` to create issues when needed.
+            Be specific about what documentation changes are required.
+
+          claude_args: |
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue create:*),Bash(gh issue list:*),Read,Glob,Grep"
+            --model opus

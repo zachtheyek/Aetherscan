@@ -1,0 +1,42 @@
+# Automatically designate the author of an issue/PR as the assignee
+# Note, this does not prevent more assignees from being added in the future
+name: Auto-assign author
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  assign-author:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Assign author to issue/PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.payload.sender.login;
+
+            if (context.eventName === "issues") {
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.issue.number,
+                assignees: [actor],
+              });
+            }
+
+            if (context.eventName === "pull_request") {
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                assignees: [actor],
+              });
+            }
