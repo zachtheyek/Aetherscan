@@ -1,3 +1,4 @@
+# Linting, formatting, and secrets scanning
 name: Pre-commit Hooks
 
 # Run on every push and PR, to any branch, or via manual trigger
@@ -11,6 +12,7 @@ on:
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
+
     steps:
       # Pull repo contents into GitHub Actions runner
       - name: Checkout code
