@@ -30,4 +30,4 @@ I include this section to be transparent about the project's usage about AI for 
 
 ## Attribution
 
-This AI policy is derived from the [Ghostty project’s AI policy](https://github.com/ghostty-org/ghostty/blob/061a0ae5656c05525aa812f474dee2ed32700125/AI_POLICY.md), and has been adapted for use by this project. Any modifications made are the sole responsibility of the authors of this repository and do not reflect the views or policies of the Ghostty project.
+This AI policy is derived from the [Ghostty project’s AI policy](https://github.com/ghostty-org/ghostty/blob/061a0ae5656c05525aa812f474dee2ed32700125/AI_POLICY.md) (as of 2026-01-25), and has been adapted for use by this project. Any modifications made are the sole responsibility of the authors of this repository and do not reflect the views or policies of the Ghostty project.
