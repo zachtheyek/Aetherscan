@@ -42,8 +42,6 @@ from typing import TYPE_CHECKING, TypedDict
 if TYPE_CHECKING:
     from slack_sdk import WebClient
 
-from aetherscan.config import get_config
-
 logger = logging.getLogger(__name__)
 
 
@@ -346,9 +344,11 @@ class SlackHandler(logging.Handler):
         # Try to get RAM info
         ram_info = self._get_ram_info()
 
-        # Get save tag from config
-        config = get_config()
-        save_tag = config.checkpoint.save_tag if config else None
+        # NOTE: cli args are updated after logger init, so tag is out of sync
+        # # Get save tag from config
+        # from aetherscan.config import get_config
+        # config = get_config()
+        # save_tag = config.checkpoint.save_tag if config else None
 
         # Format CLI args
         if cli_args is None:
@@ -361,7 +361,8 @@ class SlackHandler(logging.Handler):
             "*Aetherscan Pipeline Run Started*",
             "",
             f"*Start Time:* {timestamp}",
-            f"*Tag:* {save_tag}" if save_tag else None,
+            # NOTE: cli args are updated after logger init, so tag is out of sync
+            # f"*Tag:* {save_tag}" if save_tag else None,
             f"*Machine:* {hostname}",
             f"*CPU:* {cpu_count} cores",
             f"*RAM:* {ram_info}" if ram_info else None,
