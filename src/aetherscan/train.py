@@ -2218,6 +2218,7 @@ class TrainingPipeline:
                 title=f"Beta-VAE Training Stability - ({tag}, {machine_name})",
             )
 
+    # TODO: move injection plots to data_generation.py & call at end of generate_batch() (instead of at the end of train_round() & train_full_pipeline())
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
         Plot injection statistics for bias/leakage detection.
