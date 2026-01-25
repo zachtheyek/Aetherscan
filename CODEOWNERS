@@ -1,0 +1,7 @@
+# This file designates ownership over different parts of the Aetherscan codebase
+# At least one file owner must approve PRs that attempt to modify files under their jurisdiction
+# For now, @zachtheyek will be the sole owner of the entire project
+# If you'd like to co-own any portion of Aetherscan, see CONTRIBUTING.md for how to get started
+# Active contributors may be offered the responsibility of becoming a maintainer
+
+* @zachtheyek
