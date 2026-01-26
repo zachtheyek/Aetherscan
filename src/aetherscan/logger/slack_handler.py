@@ -736,7 +736,7 @@ class SlackHandler(logging.Handler):
             kwargs = {
                 "channel": channel_id,
                 "file": file_path,
-                # "title": title,  # Commented out - only sending the image
+                "title": title,
                 "initial_comment": initial_comment,
             }
 
@@ -776,19 +776,18 @@ class SlackHandler(logging.Handler):
             return
 
         # Build a brief announcement message
-        # NOTE: Title message commented out - only sending the image
-        # if title:
-        #     text = f":chart_with_upwards_trend: *{title}*"
-        # else:
-        #     text = ":chart_with_upwards_trend: *New plot uploaded*"
-        #
-        # if comment:
-        #     text += f"\n{comment}"
+        if title:
+            text = f":chart_with_upwards_trend: *{title}*"
+        else:
+            text = ":chart_with_upwards_trend: *New plot uploaded*"
+
+        if comment:
+            text += f"\n{comment}"
 
         try:
             client.chat_postMessage(
                 channel=channel,
-                text="",  # Empty text - image only
+                text=text,
                 thread_ts=self._thread_ts,
                 reply_broadcast=True,  # This echoes to the main channel
                 username=self.username,
