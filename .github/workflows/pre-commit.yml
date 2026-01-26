@@ -9,6 +9,9 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
@@ -46,7 +49,7 @@ jobs:
       # Includes linter, formatter, secrets scanning, and other safety checks
       # Guarantees consistency between local development & remote validation
       - name: Run pre-commit
-        uses: pre-commit/action@v3.0.1
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
 
       # NOTE: replace previous pre-commit step with following if you wish to see linter & formatter errors inline during PR reviews
       # NOTE: re-runs ruff checks even if they passed, and might show "no errors" in output annotations if another pre-commit hook failed
