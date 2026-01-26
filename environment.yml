@@ -21,6 +21,7 @@ dependencies:
   - psutil=5.9.*
   - h5py=3.9.*
   - scipy=1.11.*
+  - ipykernel
   - nvidia::cuda-runtime=12.2.*
   - cudnn=8.9.*
   - pip
