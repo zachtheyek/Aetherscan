@@ -213,65 +213,96 @@ def train_command():
     logger.info("=" * 60)
 
 
-# NOTE: come back to this later
-# def inference_command(args):
-#     """Execute inference command"""
-#     logger.info("Starting inference pipeline...")
-#
-#     # Setup GPU
-#     setup_gpu_config()
-#
-#     # Load configuration
-#     config = Config()
-#
-#     # Load saved config if provided
-#     if args.config:
-#         with open(args.config) as f:
-#             saved_config = json.load(f)
-#             # Update config with saved values
-#             for section_key, section_value in saved_config.items():
-#                 if hasattr(config, section_key) and isinstance(section_value, dict):
-#                     for key, value in section_value.items():
-#                         if hasattr(getattr(config, section_key), key):
-#                             setattr(getattr(config, section_key), key, value)
-#
-#     # Prepare observation files
-#     observation_files = []
-#
-#     # Check for prepared test cadences
-#     test_dir = os.path.join(config.data_path, "testing", "prepared_cadences")
-#     if os.path.exists(test_dir):
-#         # Load prepared cadences
-#         for cadence_idx in range(args.n_bands):
-#             cadence_files = []
-#             for obs_idx in range(6):
-#                 obs_file = os.path.join(test_dir, f"cadence_{cadence_idx:04d}_obs_{obs_idx}.npy")
-#                 if os.path.exists(obs_file):
-#                     cadence_files.append(obs_file)
-#
-#             if len(cadence_files) == 6:
-#                 observation_files.append(cadence_files)
-#
-#     if not observation_files:
-#         logger.error("No observation files found. Please prepare test data first.")
-#         sys.exit(1)
-#
-#     logger.info(f"Found {len(observation_files)} cadences for inference")
-#
-#     # Run inference
-#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-#     output_path = args.output or f"/outputs/seti/detections_{timestamp}.csv"
-#
-#     results = run_inference(config, observation_files, args.vae_model, args.rf_model, output_path)
-#
-#     logger.info(f"Inference completed. Results saved to {output_path}")
-#
-#     # Print summary
-#     if results is not None and not results.empty:
-#         n_total = len(results)
-#         n_high_conf = len(results[results["confidence"] > 0.9])
-#         logger.info(f"Total detections: {n_total}")
-#         logger.info(f"High confidence (>90%): {n_high_conf}")
+def inference_command():
+    """Execute inference pipeline with distributed strategy"""
+    pass
+    # logger.info("=" * 60)
+    # logger.info("Starting Aetherscan Inference Pipeline")
+    # logger.info("=" * 60)
+    #
+    # config = get_config()
+    # if config is None:
+    #     raise ValueError("get_config() returned None")
+    #
+    # # logger.info("Configuration:")
+    # # logger.info(f"  Number of rounds: {config.training.num_training_rounds}")
+    # # logger.info(f"  Epochs per round: {config.training.epochs_per_round}")
+    # # logger.info(f"  Data path: {config.data_path}")
+    # # logger.info(f"  Model path: {config.model_path}")
+    # # logger.info(f"  Output path: {config.output_path}")
+    #
+    # # Setup GPU strategy
+    # try:
+    #     strategy = setup_gpu_strategy()
+    # except Exception as e:
+    #     logger.error(f"Failed to setup GPU strategy: {e}")
+    #     sys.exit(1)
+
+    # # Initialize preprocessor & load background data
+    # # Note, we load this in train_command() to avoid reloading backgrounds on training pipeline retries
+    # # This gives us faster startup times at the expense of holding onto more memory during training
+    # # Should be fine since backgrounds only take up low ~10^1 Gb in RAM (benchmarked: Dec '25)
+    # # However, if we decide to trade off reduced memory pressure for slower startup times in future,
+    # # then we should consider moving this into TrainingPipeline proper
+    # try:
+    #     preprocessor = DataPreprocessor()
+    #     background_data = preprocessor.load_background_data().astype(np.float32)
+    #     # NOTE: do we need to close preprocessing pools and/or shared memory?
+    # except Exception as e:
+    #     logger.error(f"Failed to load backgrounds: {e}")
+    #     sys.exit(1)
+
+    # # Train models with fault tolerance
+    # logger.info("Starting training pipeline...")
+
+    # # Load saved config if provided
+    # if args.config:
+    #     with open(args.config) as f:
+    #         saved_config = json.load(f)
+    #         # Update config with saved values
+    #         for section_key, section_value in saved_config.items():
+    #             if hasattr(config, section_key) and isinstance(section_value, dict):
+    #                 for key, value in section_value.items():
+    #                     if hasattr(getattr(config, section_key), key):
+    #                         setattr(getattr(config, section_key), key, value)
+    #
+    # # Prepare observation files
+    # observation_files = []
+    #
+    # # Check for prepared test cadences
+    # test_dir = os.path.join(config.data_path, "testing", "prepared_cadences")
+    # if os.path.exists(test_dir):
+    #     # Load prepared cadences
+    #     for cadence_idx in range(args.n_bands):
+    #         cadence_files = []
+    #         for obs_idx in range(6):
+    #             obs_file = os.path.join(test_dir, f"cadence_{cadence_idx:04d}_obs_{obs_idx}.npy")
+    #             if os.path.exists(obs_file):
+    #                 cadence_files.append(obs_file)
+    #
+    #         if len(cadence_files) == 6:
+    #             observation_files.append(cadence_files)
+    #
+    # if not observation_files:
+    #     logger.error("No observation files found. Please prepare test data first.")
+    #     sys.exit(1)
+    #
+    # logger.info(f"Found {len(observation_files)} cadences for inference")
+    #
+    # # Run inference
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # output_path = args.output or f"/outputs/seti/detections_{timestamp}.csv"
+    #
+    # results = run_inference(config, observation_files, args.vae_model, args.rf_model, output_path)
+    #
+    # logger.info(f"Inference completed. Results saved to {output_path}")
+    #
+    # # Print summary
+    # if results is not None and not results.empty:
+    #     n_total = len(results)
+    #     n_high_conf = len(results[results["confidence"] > 0.9])
+    #     logger.info(f"Total detections: {n_total}")
+    #     logger.info(f"High confidence (>90%): {n_high_conf}")
 
 
 # NOTE: come back to this later
@@ -435,8 +466,8 @@ def main():
         # Execute command
         if args.command == "train":
             train_command()
-        # elif args.command == "inference":
-        #     inference_command(args)
+        elif args.command == "inference":
+            inference_command()
         # NOTE: come back to this later
         # elif args.command == 'evaluate':
         #     evaluate_command(args)
