@@ -1,7 +1,8 @@
 # TODO: add logging to background loading & downsampling
+# TODO: update docstring once preprocessing.py complete
 """
 Data preprocessing for Aetherscan Pipeline
-Handles background data loading & downsampling  # TODO: update once preprocessing.py complete
+Handles data loading, downsampling, log-normalization for both training & inference
 Uses multiprocessing and shared memory to process data in parallel
 """
 
@@ -18,6 +19,7 @@ import numpy as np
 from skimage.transform import downscale_local_mean
 
 from aetherscan.config import get_config
+from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
@@ -149,7 +151,7 @@ class DataPreprocessor:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
-        # NOTE: do we need db here?
+        # TODO: add db writes for inference
         self.db = get_db()
         if self.db is None:
             raise ValueError("get_db() returned None")
@@ -172,20 +174,20 @@ class DataPreprocessor:
         logger.info("DataPreprocessor closed")
 
     # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
-    def load_background_data(self) -> np.ndarray:
+    def load_train_data(self) -> np.ndarray:
         """
-        Load & downsample background plates using parallel processing
+        Load & preprocess data for training
+        Uses parallel processing to load and downsample the data (log-normalization is deferred to data_generation.py)
 
         Returns:
-            Array of background plates with shape (n_backgrounds, 6, 16, width_bin_downsampled)
+            Array of preprocessed cadences with shape (n, 6, 16, width_bin_downsampled)
         """
-        logger.info(f"Loading background data from {self.config.data_path}")
+        logger.info(f"Loading backgrounds from {self.config.data_path} for training")
 
-        # Use config values
-        num_target_backgrounds = self.config.data.num_target_backgrounds
         downsample_factor = self.config.data.downsample_factor
         final_width = self.config.data.width_bin // downsample_factor
 
+        num_target_backgrounds = self.config.data.num_target_backgrounds
         chunk_size = self.config.data.background_load_chunk_size
         max_chunks = self.config.data.max_chunks_per_file
         n_processes = self.config.manager.n_processes
@@ -233,20 +235,21 @@ class DataPreprocessor:
             logger.info(f"  Raw data shape: {raw_data.shape}")
 
             # Divide background into equal chunks, then cutoff if exceeds max_chunks
-            n_chunks = min(max_chunks, (raw_data.shape[0] + chunk_size - 1) // chunk_size)
+            n_backgrounds_total = raw_data.shape[0]
+            n_chunks = min(max_chunks, (n_backgrounds_total + chunk_size - 1) // chunk_size)
 
             for chunk_idx in range(n_chunks):
                 logger.info(f"Processing {filename}: chunk {chunk_idx + 1}/{n_chunks}")
 
                 chunk_start = chunk_idx * chunk_size
-                chunk_end = min((chunk_idx + 1) * chunk_size, raw_data.shape[0])
+                chunk_end = min((chunk_idx + 1) * chunk_size, n_backgrounds_total)
 
                 # Load chunk into memory
                 chunk_data = np.array(raw_data[chunk_start:chunk_end])
 
                 # NOTE: is this access pattern the most efficient (least pickling)? see comments in _single_cadence_wrapper() from data_generation.py for more details
                 # NOTE: currently, loading the backgrounds takes WAY more time than processing the backgrounds
-                # Prepare arguments (just indices, not data - data is in global state)
+                # Prepare arguments for downsampling (just indices, not data - data is in global state)
                 n_cadences = min(chunk_data.shape[0], num_target_backgrounds - len(all_backgrounds))
                 args_list = [
                     (
@@ -333,7 +336,7 @@ class DataPreprocessor:
             gc.collect()
 
         if len(all_backgrounds) == 0:
-            raise ValueError("No background data loaded successfully")
+            raise ValueError("No data loaded successfully")
 
         # Stack all_backgrounds together
         background_array = np.array(all_backgrounds, dtype=np.float32)
@@ -347,7 +350,7 @@ class DataPreprocessor:
         max_val = np.max(background_array)
         mean_val = np.mean(background_array)
 
-        logger.info(f"Total background cadences loaded: {background_array.shape[0]}")
+        logger.info(f"Total backgrounds loaded: {background_array.shape[0]}")
         logger.info(f"Background array shape: {background_array.shape}")
         logger.info(f"Background value range: [{min_val:.6f}, {max_val:.6f}]")
         logger.info(f"Background mean: {mean_val:.6f}")
@@ -355,3 +358,219 @@ class DataPreprocessor:
         logger.info(f"Background data ready at {background_array.shape[3]} resolution")
 
         return background_array
+
+    # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
+    def load_inference_data(self) -> np.ndarray:
+        """
+        Load & preprocess data for inference
+        Uses parallel processing to load, downsample, and log-normalize the data
+
+        Returns:
+            Array of preprocessed cadences with shape (n, 6, 16, width_bin_downsampled)
+        """
+        logger.info(f"Loading backgrounds from {self.config.data_path} for inference")
+
+        downsample_factor = self.config.data.downsample_factor
+        final_width = self.config.data.width_bin // downsample_factor
+
+        chunk_size = self.config.data.inference_background_load_chunk_size
+        n_processes = self.config.manager.n_processes
+        chunks_per_worker = self.config.manager.chunks_per_worker
+
+        logger.info(f"Processing chunks of: {chunk_size}")
+        logger.info(f"Final resolution: {final_width}")
+
+        all_cadences = []
+
+        for filename in self.config.data.test_files:
+            filepath = self.config.get_test_file_path(filename)
+
+            if not os.path.exists(filepath):
+                logger.warning(f"File not found: {filepath}")
+                continue
+
+            logger.info(f"Processing {filename}...")
+
+            try:
+                # Use read-only memory mapping to avoid loading full file into memory
+                # That is, insted of loading the whole file from disk to memory synchronously
+                # The OS' virtual memory manager establishes a virtual address space pointer
+                # from the file's location on disk to the virtual memory of the Python process
+                # This allows us to lazy load the data on-demand page-by-page using page fault
+                # Benefits of this approach include: reduced startup latency,
+                # efficient memory usage (since the memory allocated for the mapped array does not
+                # count towards the Python process' heap memory usage, allowing us to raise the
+                # ceiling up to our OS' virtual memory limits, which is typically constrained by
+                # free disk space and our system's address space, rather than physical RAM),
+                # and optimized access patterns (spatial locality since data is loaded in pages,
+                # and shared memory for multiprocess/multithreaded programs)
+                raw_data = np.load(filepath, mmap_mode="r")
+
+            except Exception as e:
+                logger.error(f"Error loading {filename}: {e}")
+                continue
+
+            # Apply subset parameters if specified in config
+            start, end = self.config.get_file_subset(filename)
+            if start is not None or end is not None:
+                raw_data = raw_data[start:end]
+
+            logger.info(f"  Raw data shape: {raw_data.shape}")
+
+            # Divide background into equal chunks, then cutoff if exceeds max_chunks
+            n_cadences_total = raw_data.shape[0]
+            n_chunks = (n_cadences_total + chunk_size - 1) // chunk_size
+
+            for chunk_idx in range(n_chunks):
+                logger.info(f"Processing {filename}: chunk {chunk_idx + 1}/{n_chunks}")
+
+                chunk_start = chunk_idx * chunk_size
+                chunk_end = min((chunk_idx + 1) * chunk_size, n_cadences_total)
+
+                # Load chunk into memory
+                chunk_data = np.array(raw_data[chunk_start:chunk_end])
+
+                # NOTE: is this access pattern the most efficient (least pickling)? see comments in _single_cadence_wrapper() from data_generation.py for more details
+                # NOTE: currently, loading the backgrounds takes WAY more time than processing the backgrounds
+                # Prepare arguments for downsampling (just indices, not data - data is in global state)
+                n_cadences = chunk_data.shape[0]
+                args_list = [
+                    (
+                        i,
+                        downsample_factor,
+                        final_width,
+                    )  # Just pass the chunk index, not the full cadence data
+                    for i in range(n_cadences)
+                ]
+
+                # NOTE: do we need to create & destroy the pool every chunk? or just the shared memory & pass new references in? is there a differenc?
+                if n_processes > 1:
+                    # Create shared memory block for chunk data
+                    chunk_shm = self.manager.create_shared_memory(
+                        size=chunk_data.nbytes,
+                        name=f"DataPreproc_{filename}_chunk_{chunk_idx}",  # NOTE: come back to this later
+                    )
+
+                    # Copy chunk data into shared memory
+                    shared_chunk = np.ndarray(
+                        chunk_data.shape,
+                        dtype=chunk_data.dtype,
+                        buffer=chunk_shm.buf,  # NOTE: what is self.shm.buf?
+                    )
+                    shared_chunk[:] = chunk_data[:]
+
+                    # Create pool using shared memory reference
+                    chunk_pool = self.manager.create_pool(
+                        n_processes=n_processes,
+                        name=f"DataPreproc_{filename}_chunk_{chunk_idx}",  # NOTE: come back to this later
+                        initializer=_init_worker,
+                        initargs=(chunk_shm.name, chunk_data.shape, chunk_data.dtype),
+                    )
+
+                    # Calculate optimal chunksize for load balancing
+                    try:
+                        n_workers = chunk_pool._processes
+                    except AttributeError:
+                        n_workers = n_processes
+                    # NOTE: should we use separate chunks_per_worker? how to benchmark?
+                    chunksize = max(1, n_cadences // (n_workers * chunks_per_worker))
+                    # TEST: does return order matter?
+                    results = chunk_pool.map(
+                        _downsample_worker,  # TODO: create separate function that performs downsampling & log-norm simultaneously
+                        args_list,
+                        chunksize=chunksize,
+                    )
+                    # results = chunk_pool.imap(_downsample_worker, args_list, chunksize=chunksize)
+                    # results = chunk_pool.imap_unordered(
+                    #     _downsample_worker, args_list, chunksize=chunksize
+                    # )
+
+                else:
+                    # Sequential processing
+                    logger.info("DataPreprocessor running in sequential mode (n_processes=1)")
+
+                    chunk_shm = None
+                    chunk_pool = None
+
+                    # Set global variable manually since no initializer ran
+                    global _GLOBAL_CHUNK_DATA
+                    shared_chunk = chunk_data
+                    _GLOBAL_CHUNK_DATA = shared_chunk
+
+                    # TODO: create separate function that performs downsampling & log-norm simultaneously
+                    results = [_downsample_worker(args) for args in args_list]
+
+                # NOTE: is there a more efficient/elegant way to do this (e.g. with list comprehension/slicing)?
+                # Collect valid results (filter out None from invalid cadences)
+                for result in results:
+                    if result is not None:
+                        all_cadences.append(result)
+
+                # Clear chunk data & shared resources
+                del chunk_data, shared_chunk
+                if chunk_shm:
+                    self.manager.close_shared_memory(chunk_shm)
+                    chunk_shm = None
+                if chunk_pool:
+                    self.manager.close_pool(chunk_pool)
+                    chunk_pool = None
+                del chunk_shm, chunk_pool
+                gc.collect()
+
+            # Clear raw_data reference
+            del raw_data
+            gc.collect()
+
+        if len(all_cadences) == 0:
+            raise ValueError("No data loaded successfully")
+
+        # Stack all_cadences together
+        cadence_array = np.array(all_cadences, dtype=np.float32)
+
+        # Clear all_cadences reference
+        del all_cadences
+        gc.collect()
+
+        logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
+        logger.info(f"Cadence array shape before log norm: {cadence_array.shape}")
+
+        # TODO: create separate function that performs downsampling & log-norm simultaneously
+        # Apply log normalization to each cadence
+        logger.info("Applying log normalization")
+        for i in range(cadence_array.shape[0]):
+            cadence_array[i] = log_norm(cadence_array[i])
+
+            if (i + 1) % 1000 == 0:
+                logger.info(f"Log normalized {i + 1}/{cadence_array.shape[0]} cadences")
+
+        # Sanity check: print descriptive stats
+        min_val = np.min(cadence_array)
+        max_val = np.max(cadence_array)
+        mean_val = np.mean(cadence_array)
+
+        if max_val > 1.0:
+            logger.error(f"Cadence array values too large! Max: {max_val}")
+            raise ValueError("Preprocessing normalization check failed")
+        elif min_val < 0.0:
+            logger.error(f"Cadence array values too small! Min: {min_val}")
+            raise ValueError("Preprocessing normalization check failed")
+        elif np.isnan(cadence_array).any():
+            logger.error("Cadence array contains NaN values!")
+            raise ValueError("Preprocessing normalization check failed")
+        elif np.isinf(cadence_array).any():
+            logger.error("Cadence array contains Inf values!")
+            raise ValueError("Preprocessing normalization check failed")
+        else:
+            logger.info("Cadence array properly normalized")
+            logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
+            logger.info(f"Cadence array shape: {cadence_array.shape}")
+            logger.info(f"Cadence value range: [{min_val:.6f}, {max_val:.6f}]")
+            logger.info(f"Cadence mean: {mean_val:.6f}")
+            logger.info(f"Memory usage: {cadence_array.nbytes / 1e9:.2f} GB")
+            logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
+
+        return cadence_array
+
+    # TODO: complete find_hits function to perform DC spike removal, bandpass filtering, and energy detection. should take .h5 filepaths as input, then write hits into (n, 6, 16, 4096) shaped .npy files (to data_path? output_path?). have boolean flag overlap_search as arg. if true, write additional cadence snippets +/- 50% in frequency from the actual hit to the .npy file. parametrize overlap amount to InferenceConfig().
+    def find_hits(self):
+        pass
