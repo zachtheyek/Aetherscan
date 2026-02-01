@@ -17,18 +17,19 @@
 
 ## Overview
 
-Aetherscan is a deep learning pipeline for detecting anomalies in radio spectrograms with technosignatures-like characteristics. It's comprised of a beta-VAE (for dimensionality reduction/feature extraction) and Random Forest ensemble (for candidate detection), and trained on ~30m unique cadence snippets using a composite loss that balances reconstruction, KL divergence, and true/false clustering. The pipeline is designed with performance in mind, by default running single-node distributed training & inference, using multiprocessing & shared memory during pre- and post-processing.
+Aetherscan is a deep learning pipeline for detecting anomalies in radio spectrograms with technosignature-like characteristics. It combines a beta-VAE (for dimensionality reduction/feature extraction) with a Random Forest ensemble (for candidate detection), trained on ~30m unique cadence snippets using a composite loss that balances reconstruction, KL divergence, and true/false clustering. The pipeline is designed with performance in mind, by default running single-node distributed training & inference, with zero-copy parallelism during pre- and post-processing.
 
 The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("A deep-learning search for technosignatures from 820 unique stars"), extending the research prototype into a production-ready system capable of near real-time inference.
 
-### Key Innovations
+### Key features
 
-- **Curriculum learning** with progressive SNR difficulty schedules
-- **Multi-GPU training** via TensorFlow MirroredStrategy with NCCL
-- **Gradient accumulation** for large effective batch sizes
-- **Custom clustering loss** that leverages the ON/OFF cadence pattern
-- **Fault tolerance** with automatic retry and checkpoint recovery
-- **Real-time monitoring** with Slack integration
+- **Multi-GPU training/inference** via TensorFlow MirroredStrategy with NCCL
+- **Gradient accumulation & on-demand CPU-to-GPU data streaming** for larger effective batch sizes under low VRAM constraints
+- **Custom weighted clustering loss component** that implicitly encourage ON/OFF signal locality, mimicking traditional SETI filters
+- **Curriculum-based training regime** — progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty
+  stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with exponential backoff ensure graceful recovery from transient failures.
+- **Infrastructure Services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack alerts), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
+- **Zero-Copy Parallelism** — Shared memory architecture in preprocessing and data generation modules enables inter-process data sharing without serialization overhead. Custom SIGTERM handlers in pool workers ensure proper cleanup of shared memory handles during interrupts.
 
 ---
 
