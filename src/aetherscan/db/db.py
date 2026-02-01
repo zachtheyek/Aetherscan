@@ -271,6 +271,34 @@ class Database:
                 ON training_stats(tag, timestamp, model_name, stat_name)
             """)
 
+            # Inference results table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS inference_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    npy_path TEXT NOT NULL,
+                    snippet_index INTEGER NOT NULL,
+                    prediction INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    latent_vector TEXT,
+                    target TEXT,
+                    session TEXT,
+                    cadence_id INTEGER,
+                    band TEXT,
+                    frequency_mhz REAL,
+                    timestamp_observed REAL,
+                    h5_path TEXT,
+                    tag TEXT,
+                    metadata TEXT
+                )
+            """)
+
+            # Composite index for common filter pattern (tag + confidence + prediction)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inference_results_filter
+                ON inference_results(tag, timestamp, confidence, prediction)
+            """)
+
             conn.commit()
 
             # Enable Write-Ahead Logging (WAL) mode for better concurrent read performance
@@ -470,6 +498,7 @@ class Database:
                 system_resources_records: list[tuple] = []
                 injection_stats_records: list[tuple] = []
                 training_stats_records: list[tuple] = []
+                inference_results_records: list[tuple] = []
 
                 for table, values in self.buffer:
                     if table == "system_resources":
@@ -478,6 +507,8 @@ class Database:
                         injection_stats_records.append(values)
                     elif table == "training_stats":
                         training_stats_records.append(values)
+                    elif table == "inference_results":
+                        inference_results_records.append(values)
 
                 # Bulk insert each table type
                 if system_resources_records:
@@ -513,11 +544,24 @@ class Database:
                         training_stats_records,
                     )
 
+                if inference_results_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO inference_results
+                        (timestamp, npy_path, snippet_index, prediction, confidence, latent_vector,
+                         target, session, cadence_id, band, frequency_mhz, timestamp_observed,
+                         h5_path, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        inference_results_records,
+                    )
+
                 conn.commit()
 
         except Exception as e:
             logger.error(f"Error flushing data buffer: {e}")
 
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
     def write_system_resource(
         self,
         resource_type: str,
@@ -555,6 +599,7 @@ class Database:
             )
         )
 
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
     def write_injection_stat(
         self,
         stat_name: str,
@@ -627,6 +672,7 @@ class Database:
             )
         )
 
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
     def write_training_stat(
         self,
         model_name: str,
@@ -661,6 +707,73 @@ class Database:
                     value,
                     round_number,
                     epoch_number,
+                    tag,
+                    metadata_json,
+                ),
+            )
+        )
+
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
+    def write_inference_result(
+        self,
+        npy_path: str,
+        snippet_index: int,
+        prediction: int,
+        confidence: float,
+        latent_vector: np.ndarray | None = None,
+        target: str | None = None,
+        session: str | None = None,
+        cadence_id: int | None = None,
+        band: str | None = None,
+        frequency_mhz: float | None = None,
+        timestamp_observed: float | None = None,
+        h5_path: str | None = None,
+        tag: str | None = None,
+        timestamp: float | None = None,
+    ):
+        """
+        Queue write to inference_results table (non-blocking)
+
+        Args:
+            npy_path: Path to the .npy file containing the snippet (e.g. "real_filtered_LARGE_test_HIP15638.npy")
+            snippet_index: Index of the snippet within the .npy file
+            prediction: Classification prediction (0=RFI, 1=candidate)
+            confidence: Classification confidence score (0.0 to 1.0)
+            latent_vector: Optional latent vector (6 x 8 features) for later analysis
+            target: Optional observation target name (e.g. "DDO210")
+            session: Optional observing session identifier (e.g. "AGBT18A_999_103")
+            cadence_id: Optional cadence ID from the observation (e.g. "24777")
+            band: Optional frequency band (e.g. "L", "S", "C", "X")
+            frequency_mhz: Optional center frequency in MHz
+            timestamp_observed: Optional timestamp when observation was made (unix time)
+            h5_path: Optional path to the source HDF5 file
+            tag: Optional tag for current pipeline run
+            timestamp: Optional timestamp when result was logged (uses current time if not provided)
+        """
+        metadata_json = get_system_metadata()
+
+        # Convert latent vector to JSON string if provided
+        latent_json = None
+        if latent_vector is not None:
+            latent_json = json.dumps(latent_vector.tolist())
+
+        self.write_queue.put(
+            (
+                "inference_results",
+                (
+                    timestamp or time.time(),
+                    npy_path,
+                    snippet_index,
+                    prediction,
+                    confidence,
+                    latent_json,
+                    target,
+                    session,
+                    cadence_id,
+                    band,
+                    frequency_mhz,
+                    timestamp_observed,
+                    h5_path,
                     tag,
                     metadata_json,
                 ),
@@ -957,6 +1070,145 @@ class Database:
             # Pair column names with values and return to user as a dictionary
             return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
+    # NOTE: how to additionally filter by metadata (e.g. machine_name)?
+    # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
+    # NOTE: how to allow str args to be lists & filter accordingly?
+    def query_inference_result(
+        self,
+        npy_path: str | None = None,
+        start_snippet_index: int | None = None,
+        end_snippet_index: int | None = None,
+        prediction: int | None = None,
+        min_confidence: float | None = None,
+        max_confidence: float | None = None,
+        target: str | None = None,
+        session: str | None = None,
+        cadence_id: int | None = None,
+        band: str | None = None,
+        min_frequency_mhz: float | None = None,
+        max_frequency_mhz: float | None = None,
+        start_timestamp_observed: float | None = None,
+        end_timestamp_observed: float | None = None,
+        h5_path: str | None = None,
+        tag: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query from inference_results table
+
+        Args:
+            npy_path: Path to the .npy file containing the snippet
+            start_snippet_index: Start snippet index
+            end_snippet_index: End snippet index
+            prediction: Classification prediction (0=RFI, 1=candidate)
+            min_confidence: Minimum confidence threshold
+            max_confidence: Maximum confidence threshold
+            target: Observation target name (e.g. "HIP110750")
+            session: Observing session identifier (e.g. "AGBT18A_999_103")
+            cadence_id: Cadence ID from the observation (e.g. "24777")
+            band: Frequency band (e.g. "L", "S", "C", "X")
+            min_frequency_mhz: Minimum center frequency in MHz
+            max_frequency_mhz: Maximum center frequency in MHz
+            start_timestamp_observed: Start observation timestamp (unix time)
+            end_timestamp_observed: End observation timestamp (unix time)
+            h5_path: Path to the source HDF5 file
+            tag: Tag for current pipeline run
+            start_time: Start timestamp (unix time)
+            end_time: End timestamp (unix time)
+
+        Returns:
+            List of result dictionaries
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # WHERE 1=1 is a trick for building dynamic queries
+            # Since it's always true, it does nothing
+            # But it lets us safely add more conditions with AND
+            query = "SELECT * FROM inference_results WHERE 1=1"
+            params = []
+
+            # Build the query dynamically based on user-specified conditions
+            if npy_path:
+                query += " AND npy_path = ?"
+                params.append(npy_path)
+
+            if start_snippet_index is not None:
+                query += " AND snippet_index >= ?"
+                params.append(start_snippet_index)
+
+            if end_snippet_index is not None:
+                query += " AND snippet_index <= ?"
+                params.append(end_snippet_index)
+
+            if prediction is not None:
+                query += " AND prediction = ?"
+                params.append(prediction)
+
+            if min_confidence is not None:
+                query += " AND confidence >= ?"
+                params.append(min_confidence)
+
+            if max_confidence is not None:
+                query += " AND confidence <= ?"
+                params.append(max_confidence)
+
+            if target:
+                query += " AND target = ?"
+                params.append(target)
+
+            if session:
+                query += " AND session = ?"
+                params.append(session)
+
+            if cadence_id is not None:
+                query += " AND cadence_id = ?"
+                params.append(cadence_id)
+
+            if band:
+                query += " AND band = ?"
+                params.append(band)
+
+            if min_frequency_mhz is not None:
+                query += " AND frequency_mhz >= ?"
+                params.append(min_frequency_mhz)
+
+            if max_frequency_mhz is not None:
+                query += " AND frequency_mhz <= ?"
+                params.append(max_frequency_mhz)
+
+            if start_timestamp_observed is not None:
+                query += " AND timestamp_observed >= ?"
+                params.append(start_timestamp_observed)
+
+            if end_timestamp_observed is not None:
+                query += " AND timestamp_observed <= ?"
+                params.append(end_timestamp_observed)
+
+            if h5_path:
+                query += " AND h5_path = ?"
+                params.append(h5_path)
+
+            if tag:
+                query += " AND tag = ?"
+                params.append(tag)
+
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dictionary
+            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
     def get_db_stats(self) -> dict[str, Any]:
         """Get summary statistics for the database"""
         with self._get_connection() as conn:
@@ -973,6 +1225,9 @@ class Database:
 
             cursor.execute("SELECT COUNT(*) FROM training_stats")
             stats["training_stats_row_count"] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM inference_results")
+            stats["inference_results_row_count"] = cursor.fetchone()[0]
 
             # Time range
             # Use system_resources as proxy
