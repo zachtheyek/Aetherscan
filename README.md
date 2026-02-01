@@ -80,16 +80,16 @@ The architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) 
 
 ## Key Features
 
-| Feature | Description |
-|---------|-------------|
-| **Curriculum Learning** | Progressive difficulty schedules (linear, exponential, step) that start with high-SNR signals and gradually introduce harder examples |
-| **Multi-GPU Training** | Distributed training with MirroredStrategy and NCCL AllReduce for efficient gradient synchronization |
-| **Gradient Accumulation** | Achieves large effective batch sizes (3072) without requiring proportional GPU memory |
-| **Custom Clustering Loss** | Exploits ON/OFF cadence pattern to separate technosignatures from RFI in latent space |
-| **Adaptive Learning Rate** | Patience-based LR reduction when validation loss plateaus |
-| **Fault Tolerance** | Automatic retry with exponential backoff; per-round checkpointing for recovery |
-| **Real-time Monitoring** | Resource tracking (CPU, RAM, GPU) with Slack alerts for errors and milestones |
-| **Async Database** | Thread-safe SQLite with queue-based writes for concurrent metric logging |
+| Feature                    | Description                                                                                                                           |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **Curriculum Learning**    | Progressive difficulty schedules (linear, exponential, step) that start with high-SNR signals and gradually introduce harder examples |
+| **Multi-GPU Training**     | Distributed training with MirroredStrategy and NCCL AllReduce for efficient gradient synchronization                                  |
+| **Gradient Accumulation**  | Achieves large effective batch sizes (3072) without requiring proportional GPU memory                                                 |
+| **Custom Clustering Loss** | Exploits ON/OFF cadence pattern to separate technosignatures from RFI in latent space                                                 |
+| **Adaptive Learning Rate** | Patience-based LR reduction when validation loss plateaus                                                                             |
+| **Fault Tolerance**        | Automatic retry with exponential backoff; per-round checkpointing for recovery                                                        |
+| **Real-time Monitoring**   | Resource tracking (CPU, RAM, GPU) with Slack alerts for errors and milestones                                                         |
+| **Async Database**         | Thread-safe SQLite with queue-based writes for concurrent metric logging                                                              |
 
 ---
 
@@ -97,20 +97,20 @@ The architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) 
 
 ### Training
 
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| GPU | 1x NVIDIA GPU (16GB VRAM) | 4x NVIDIA A100 (80GB each) |
-| RAM | 32 GB | 64+ GB |
-| Storage | 100 GB | 500+ GB SSD |
-| CUDA | 12.2 | 12.2+ |
+| Resource | Minimum                   | Recommended                |
+| -------- | ------------------------- | -------------------------- |
+| GPU      | 1x NVIDIA GPU (16GB VRAM) | 4x NVIDIA A100 (80GB each) |
+| RAM      | 32 GB                     | 64+ GB                     |
+| Storage  | 100 GB                    | 500+ GB SSD                |
+| CUDA     | 12.2                      | 12.2+                      |
 
 ### Inference
 
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| GPU | 1x NVIDIA GPU (8GB VRAM) | 1x NVIDIA GPU (16GB VRAM) |
-| RAM | 16 GB | 32 GB |
-| Storage | 50 GB | 100+ GB SSD |
+| Resource | Minimum                  | Recommended               |
+| -------- | ------------------------ | ------------------------- |
+| GPU      | 1x NVIDIA GPU (8GB VRAM) | 1x NVIDIA GPU (16GB VRAM) |
+| RAM      | 16 GB                    | 32 GB                     |
+| Storage  | 50 GB                    | 100+ GB SSD               |
 
 ---
 
@@ -198,24 +198,25 @@ aetherscan evaluate
 ## Configuration
 
 Aetherscan uses a hierarchical configuration system with dataclass-based configs. Values can be set via:
+
 1. **Defaults** - Defined in `src/aetherscan/config.py`
 2. **Environment variables** - For paths and secrets
 3. **CLI arguments** - Override at runtime
 
 ### Configuration Groups
 
-| Config Class | Description | Key Parameters |
-|--------------|-------------|----------------|
-| `BetaVAEConfig` | VAE architecture | `latent_dim=8`, `beta=1.5`, `alpha=10.0` |
-| `RandomForestConfig` | RF classifier | `n_estimators=1000`, `max_features='sqrt'` |
-| `DataConfig` | Data processing | `num_observations=6`, `width_bin=4096`, `downsample_factor=8` |
-| `TrainingConfig` | Training hyperparams | `num_training_rounds=20`, `epochs_per_round=100`, `effective_batch_size=3072` |
-| `InferenceConfig` | Inference settings | `classification_threshold=0.9`, `per_replica_batch_size=1728` |
-| `CheckpointConfig` | Model persistence | `load_tag`, `save_tag`, `start_round` |
-| `LoggerConfig` | Logging & Slack | `slack_enabled=True`, `slack_broadcast_level='ERROR'` |
-| `MonitorConfig` | Resource monitoring | `monitor_interval=1.0` |
-| `DBConfig` | Database settings | `write_interval=5.0`, `write_buffer_max_size=100` |
-| `ManagerConfig` | Resource management | `n_processes=cpu_count()`, `pool_terminate_timeout=10.0` |
+| Config Class         | Description          | Key Parameters                                                                |
+| -------------------- | -------------------- | ----------------------------------------------------------------------------- |
+| `BetaVAEConfig`      | VAE architecture     | `latent_dim=8`, `beta=1.5`, `alpha=10.0`                                      |
+| `RandomForestConfig` | RF classifier        | `n_estimators=1000`, `max_features='sqrt'`                                    |
+| `DataConfig`         | Data processing      | `num_observations=6`, `width_bin=4096`, `downsample_factor=8`                 |
+| `TrainingConfig`     | Training hyperparams | `num_training_rounds=20`, `epochs_per_round=100`, `effective_batch_size=3072` |
+| `InferenceConfig`    | Inference settings   | `classification_threshold=0.9`, `per_replica_batch_size=1728`                 |
+| `CheckpointConfig`   | Model persistence    | `load_tag`, `save_tag`, `start_round`                                         |
+| `LoggerConfig`       | Logging & Slack      | `slack_enabled=True`, `slack_broadcast_level='ERROR'`                         |
+| `MonitorConfig`      | Resource monitoring  | `monitor_interval=1.0`                                                        |
+| `DBConfig`           | Database settings    | `write_interval=5.0`, `write_buffer_max_size=100`                             |
+| `ManagerConfig`      | Resource management  | `n_processes=cpu_count()`, `pool_terminate_timeout=10.0`                      |
 
 ---
 
@@ -264,18 +265,18 @@ Aetherscan/
 
 ### Module Responsibilities
 
-| Module | Purpose |
-|--------|---------|
-| `train.py` | Orchestrates training: curriculum learning, distributed datasets, gradient accumulation, checkpointing |
-| `inference.py` | Runs trained models on new data, writes candidates to database |
-| `models/vae.py` | Beta-VAE with custom clustering loss (L_same, L_diff) |
-| `models/random_forest.py` | Scikit-learn RF wrapper with save/load |
-| `data_generation.py` | Uses setigen for synthetic signal injection with ON/OFF patterns |
-| `preprocessing.py` | Downsampling, normalization, data alignment |
-| `db/db.py` | Thread-safe SQLite with async queue-based writes |
-| `monitor/monitor.py` | Background thread for CPU/RAM/GPU metrics |
-| `manager/manager.py` | Centralized resource lifecycle (pools, shared memory, cleanup) |
-| `logger/` | Multi-handler logging with Slack integration |
+| Module                    | Purpose                                                                                                |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `train.py`                | Orchestrates training: curriculum learning, distributed datasets, gradient accumulation, checkpointing |
+| `inference.py`            | Runs trained models on new data, writes candidates to database                                         |
+| `models/vae.py`           | Beta-VAE with custom clustering loss (L_same, L_diff)                                                  |
+| `models/random_forest.py` | Scikit-learn RF wrapper with save/load                                                                 |
+| `data_generation.py`      | Uses setigen for synthetic signal injection with ON/OFF patterns                                       |
+| `preprocessing.py`        | Downsampling, normalization, data alignment                                                            |
+| `db/db.py`                | Thread-safe SQLite with async queue-based writes                                                       |
+| `monitor/monitor.py`      | Background thread for CPU/RAM/GPU metrics                                                              |
+| `manager/manager.py`      | Centralized resource lifecycle (pools, shared memory, cleanup)                                         |
+| `logger/`                 | Multi-handler logging with Slack integration                                                           |
 
 ---
 
@@ -284,6 +285,7 @@ Aetherscan/
 ### The ON/OFF Cadence Pattern
 
 Radio telescopes observe potential technosignature targets using an "ON/OFF" cadence:
+
 - **ON**: Telescope points at target star
 - **OFF**: Telescope points at nearby reference position
 
@@ -304,6 +306,7 @@ L_total = L_reconstruction + β·L_KL + α·(L_true + L_false)
 ```
 
 Where:
+
 - **L_reconstruction**: Standard VAE reconstruction loss
 - **L_KL**: KL divergence for latent regularization (β=1.5)
 - **L_true**: For real signals, minimize ON-ON distance, maximize ON-OFF distance
@@ -548,7 +551,7 @@ If you use Aetherscan in your research, please cite:
 
 ```bibtex
 @software{aetherscan,
-  author = {Yek, Zach and Ma, Peter Xiangyuan and Lebofsky, Matt and Croft, Steve},
+  author = {Yek, Zach and Ma, Peter Xiangyuan and Croft, Steve and Lebofsky, Matt},
   title = {Aetherscan: Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale},
   url = {https://github.com/zachtheyek/Aetherscan},
   version = {0.1.0},
