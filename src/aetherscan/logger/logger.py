@@ -258,6 +258,10 @@ class Logger:
     # currently only title is broadcasted to main channel,
     # since there's a delay in the title vs image appearing in the thread
     # not sure if this is a fundamental limitation to slack webhooks?
+    # maybe instead of forcing image to be kept in thread AND broadcast to main,
+    # we simply broadcast it to main and forget about keeping it in thread
+    # logs can always have text references to where images are saved
+    # but the main logs of interest in main are errors & results
     def upload_image_to_slack(
         self,
         file_path: str,
