@@ -1,11 +1,17 @@
-# Aetherscan
-
-[![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10-blue.svg)](https://www.python.org/)
-[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.16-orange.svg)](https://www.tensorflow.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-12.2-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-
-**Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale**
+<h1>
+<p align="center">
+  <br>Aetherscan
+</h1>
+  <p align="center">
+    Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale
+    <br />
+    <br />
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License"></a>
+    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10-blue.svg" alt="Python"></a>
+    <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.16-orange.svg" alt="TensorFlow"></a>
+    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.2-green.svg" alt="CUDA"></a>
+  </p>
+</p>
 
 ---
 
