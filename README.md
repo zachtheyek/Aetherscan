@@ -17,9 +17,9 @@
 
 ## Overview
 
-Aetherscan is a machine learning pipeline designed to detect technosignatures (potential signs of extraterrestrial intelligence) in radio telescope data at scale. It implements a **two-stage approach** combining a Beta-VAE for feature extraction with a Random Forest classifier for candidate detection.
+Aetherscan is a deep learning pipeline for detecting anomalies in radio spectrograms with technosignatures-like characteristics. It's comprised of a beta-VAE (for dimensionality reduction/feature extraction) and Random Forest ensemble (for candidate detection), and trained on ~30m unique cadence snippets using a composite loss that balances reconstruction, KL divergence, and true/false clustering. The pipeline is designed with performance in mind, by default running single-node distributed training & inference, using multiprocessing & shared memory during pre- and post-processing.
 
-The architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("A deep-learning search for technosignatures from 820 unique stars"), extending the research prototype into a production-ready system capable of processing the Breakthrough Listen archive.
+The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("A deep-learning search for technosignatures from 820 unique stars"), extending the research prototype into a production-ready system capable of near real-time inference.
 
 ### Key Innovations
 
