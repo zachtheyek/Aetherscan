@@ -1,422 +1,509 @@
-# TODO:
-# NOTE: will inference use a different tagging system as train? if so, update cli.py
+# TODO: write docstring
 """
 Inference orchestration for Aetherscan Pipeline
+Implements ...
+Supports distributed datasets & latent generation
 ...
 """
 
 from __future__ import annotations
 
+import gc
 import logging
+import os
+import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-import pandas as pd
 import tensorflow as tf
-from numba import jit
 
-from aetherscan.models.random_forest import RandomForestModel
-from aetherscan.preprocessing import DataPreprocessor
+from aetherscan.config import get_config
+from aetherscan.db import get_db
+from aetherscan.models import RandomForestModel, Sampling
 
 logger = logging.getLogger(__name__)
 
 
-@jit(nopython=True, parallel=True)
-def extract_overlapping_snippets(
-    data: np.ndarray, snippet_size: int, overlap: float = 0.5
-) -> list[tuple[int, np.ndarray]]:
+# Create data holder objects, to be paired with data generators, for TF's distributed datasets
+# Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
+# Python's garbage collector free up memory on-demand
+# Note, DataHolder.clear() is only useful at the end of an epoch, once indices have been exhausted,
+# since the data generators' local caches maintain references to the data until then
+# This is not an issue in our current implementation, where we only clear & reset resources at the
+# end of a round. However, if you require early exit behavior, you may want to remove the _lock and
+# use explicit _cleared() checks instead, which negates the need for local caches (see commit hash
+# 2a404a4). The trade-off being that you're at risk of race conditions if multiple threads attempt
+# to access/clear the DataHolder simultaneously. While this is not the case in our current
+# implementation, we opted for a more defensive approach rather than accomodating future design
+# patterns. As well, the data should not be modified once the DataHolder has been initialized to
+# prevent corrupted state in the DataHolder
+# Note, there's a potential deadlock issue with DataHolder's lock contention
+# Since the generators acquire locks at the start of every loop iteration, if TF's prefetch threads
+# (.prefetch(tf.data.AUTOTUNE)) are blocked waiting on this lock while the main thread is trying to
+# call self.data_generator.clear() (which also needs the lock), there could be contention.
+# This has not been an issue so far, but if you encounter this in the future, pls update this
+# comment with your findings
+class InfDataHolder:
+    def __init__(self, data):
+        self._cleared = False
+        self._lock = threading.Lock()
+        self.data = data
+
+    def clear(self):
+        with self._lock:
+            if self._cleared:
+                return
+            self._cleared = True
+            self.data = None
+
+
+def prepare_distributed_inf_dataset(
+    data: dict,
+    n_samples: int,
+    per_replica_inf_batch_size: int,
+    num_replicas: int,
+    strategy: tf.distribute.Strategy,
+) -> dict:
     """
-    Extract overlapping snippets from continuous data
+    Prepare distributed datasets for inference
+    Note, this function is not meant for RF training
+    It is different from aetherscan.train.prepare_distributed_inf_dataset(),
+    since we can't assume signal classes are known ahead of time
 
     Args:
-        data: Continuous observation data
-        snippet_size: Size of each snippet
-        overlap: Overlap fraction
+        data: ndarray with shape (n_samples, 6, 16, 512)
+        n_samples: Number of samples in data
+        per_replica_inf_batch_size: Batch size per replica for inference
+        num_replicas: Number of replicas in strategy
+        strategy: TensorFlow distribution strategy
 
-    Returns:
-        List of (start_index, snippet) tuples
+    Returns: {inf_dataset, n_inf_trimmed, inf_steps, _inf_holder}
+             Inference distributed dataset, number of samples, number of steps,
+              and DataHolder reference
     """
-    step_size = int(snippet_size * (1 - overlap))
-    snippets = []
+    global_inf_batch_size = per_replica_inf_batch_size * num_replicas
 
-    for start in range(0, data.shape[-1] - snippet_size + 1, step_size):
-        snippet = data[..., start : start + snippet_size]
-        snippets.append((start, snippet))
+    # NOTE: does trimming/divisibility matter for inference?
+    # Trim datasets to fit batch sizes (prevents uneven batches on final step)
+    # Note, n_samples should already be divisible by effective_batch_size
+    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
+    # distributing our datasets
+    # Alternatively, we could also pad the data instead of trimming
+    n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
 
-    return snippets
+    logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
+
+    # Sanity check: verify there's enough samples to run inference
+    if n_inf_trimmed == 0:
+        raise ValueError(
+            f"Not enough samples ({n_samples}) for global batch size ({per_replica_inf_batch_size} * {num_replicas})"
+            f"Reduce per_replica_batch_size or provide more samples"
+        )
+
+    # Prepare data
+    inf_data = data[:n_inf_trimmed]
+    inf_holder = InfDataHolder(inf_data)
+
+    # Create generator function for memory-efficient data loading
+    def inf_generator():
+        while True:  # Make generator infinite to reset state between passes
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with inf_holder._lock:
+                if inf_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                data = inf_holder.data
+
+            # Maintain order on each epoch since shuffling provides no benefits (no gradients
+            # are calculated during inference)
+            for idx in range(len(data)):
+                yield data[idx]
+
+            # Remove cache references for future garbage collection
+            del data
+
+    # Determine dataset output signature
+    sample_shape = inf_data.shape[1:]
+    output_signature = tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+
+    # Create dataset using generator to reduce GPU memory pressure
+    # Data is kept on CPU & transferred to GPU in batches on-demand
+    # Note that the dataset yields data in batches before being sharded (distributed) across replicas
+    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
+    logger.info(
+        f"Creating infinite dataset from generator with global batch size: {global_inf_batch_size}"
+    )
+
+    inf_dataset = (
+        tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
+        .batch(global_inf_batch_size, drop_remainder=True)
+        # NOTE: do we need repeat for inf dataset?
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Distribute dataset across GPUs
+    logger.info(f"Distributing dataset across {num_replicas} GPUs")
+
+    inf_dataset_distributed = strategy.experimental_distribute_dataset(inf_dataset)
+
+    # Calculate steps
+    inf_steps = n_inf_trimmed // global_inf_batch_size
+
+    # Sanity check: verify step sizes are valid before returning
+    if inf_steps < 1:
+        raise ValueError(
+            f"inf_steps < 1: n_inf_trimmed ({n_inf_trimmed}) must be >= per_replica_inf_batch_size * num_replicas ({per_replica_inf_batch_size} * {num_replicas})"
+        )
+
+    return {
+        "inf_dataset": inf_dataset_distributed,
+        "n_inf_trimmed": n_inf_trimmed,
+        "inf_steps": inf_steps,
+        "_inf_holder": inf_holder,
+    }
 
 
 class InferencePipeline:
-    """Inference pipeline for SETI signal detection"""
+    """Inference pipeline"""
 
-    def __init__(self, config, vae_encoder_path: str, rf_model_path: str):
+    def __init__(self, strategy: tf.distribute.Strategy = None):
         """
-        Initialize inference pipeline
+        Initialize inference pipeline.
 
         Args:
-            config: Configuration object
-            vae_encoder_path: Path to saved VAE encoder
-            rf_model_path: Path to saved Random Forest model
+            strategy: TensorFlow distribution strategy
         """
-        self.config = config
-        self.preprocessor = DataPreprocessor(config)
+        self.config = get_config()
+        if self.config is None:
+            raise ValueError("get_config() returned None")
 
-        # Load models
-        logger.info("Loading models...")
-        self.vae_encoder = tf.keras.models.load_model(vae_encoder_path)
+        self.db = get_db()
+        if self.db is None:
+            raise ValueError("get_db() returned None")
+        self.start_time = time.time()
 
-        self.rf_model = RandomForestModel(config)
-        self.rf_model.load(rf_model_path)
+        # Set distributed strategy
+        self.strategy = strategy or tf.distribute.get_strategy()
+        self.num_replicas = self.strategy.num_replicas_in_sync
 
-        # Results storage
-        self.results = []
-
-    def process_cadence(self, cadence_files: list[str]) -> dict[str, np.ndarray]:
-        """
-        Process a single cadence (6 observation files)
-
-        Args:
-            cadence_files: List of 6 file paths (3 ON, 3 OFF)
-
-        Returns:
-            Dictionary of results
-        """
-        if len(cadence_files) != 6:
-            raise ValueError(f"Expected 6 files, got {len(cadence_files)}")
-
-        # Load observations
-        observations = []
-        for filepath in cadence_files:
-            # This would be replaced with actual file loading logic
-            # For now, assuming numpy arrays are provided
-            obs = np.load(filepath) if isinstance(filepath, str) else filepath
-            observations.append(obs)
-
-        # Preprocess cadence
-        cadence_data = self.preprocessor.preprocess_cadence(observations)
-
-        # Extract overlapping snippets
-        snippets = self._extract_snippets_from_cadence(cadence_data)
-
-        # Process snippets
-        results = self._process_snippets(snippets)
-
-        return results
-
-    def _extract_snippets_from_cadence(self, cadence: np.ndarray) -> list[dict]:
-        """
-        Extract overlapping snippets from cadence data
-
-        Args:
-            cadence: Preprocessed cadence data
-
-        Returns:
-            List of snippet dictionaries
-        """
-        snippets = []
-        snippet_size = self.config.data.width_bin // self.config.data.downsample_factor
-        overlap = self.config.data.overlap_factor
-
-        # Process each observation in the cadence
-        for obs_idx in range(6):
-            obs_data = cadence[:, obs_idx, :, :, :]
-
-            # Extract snippets with overlap
-            obs_snippets = extract_overlapping_snippets(
-                obs_data[0, :, :, 0],  # Remove batch and channel dims
-                snippet_size,
-                overlap,
-            )
-
-            for start_idx, snippet in obs_snippets:
-                snippets.append(
-                    {
-                        "observation": obs_idx,
-                        "start_index": start_idx,
-                        "data": snippet[np.newaxis, ..., np.newaxis],  # Add batch and channel dims
-                    }
-                )
-
-        return snippets
-
-    def _process_snippets(self, snippets: list[dict]) -> dict[str, np.ndarray]:
-        """
-        Process snippets through VAE and Random Forest
-
-        Args:
-            snippets: List of snippet dictionaries
-
-        Returns:
-            Results dictionary
-        """
-        n_snippets = len(snippets)
-        batch_size = self.config.inference.batch_size
-
-        all_predictions = []
-        all_probabilities = []
-        all_latents = []
-
-        # Process in batches
-        for i in range(0, n_snippets, batch_size):
-            batch_snippets = snippets[i : i + batch_size]
-
-            # Stack snippet data
-            batch_data = np.concatenate([s["data"] for s in batch_snippets], axis=0)
-
-            # Get latent representations
-            _, _, latents = self.vae_encoder.predict(batch_data, batch_size=batch_size)
-
-            # Random Forest predictions
-            if len(latents) >= 6:  # Need full cadence for RF
-                probas = self.rf_model.predict_proba(latents)
-                preds = probas[:, 1] > self.config.inference.classification_threshold
-
-                all_predictions.extend(preds)
-                all_probabilities.extend(probas[:, 1])
-                all_latents.extend(latents)
-
-        return {
-            "predictions": np.array(all_predictions),
-            "probabilities": np.array(all_probabilities),
-            "latents": np.array(all_latents),
-            "snippet_info": snippets,
-        }
-
-    def analyze_frequency_band(
-        self, observations: list[np.ndarray], frequency_range: tuple[float, float]
-    ) -> pd.DataFrame:
-        """
-        Analyze a frequency band for signals
-
-        Args:
-            observations: List of observation arrays
-            frequency_range: (start_freq, end_freq) in MHz
-
-        Returns:
-            DataFrame with detection results
-        """
-        logger.info(
-            f"Analyzing frequency band {frequency_range[0]:.2f}-{frequency_range[1]:.2f} MHz"
+        # Initialize models
+        self.init_models(
+            encoder_path=self.config.inference.encoder_path, rf_path=self.config.inference.rf_path
         )
 
-        start_time = time.time()
+        self.latent_dim = self.config.beta_vae.latent_dim
+        self.num_observations = self.config.data.num_observations
 
-        # Process cadence
-        results = self.process_cadence(observations)
+        self.per_replica_inf_batch_size = self.config.inference.per_replica_batch_size
+        self.threshold = self.config.inference.classification_threshold
 
-        # Filter detections
-        detections = self._filter_detections(results)
-
-        # Create results DataFrame
-        df_results = self._create_results_dataframe(detections, frequency_range)
-
-        elapsed_time = time.time() - start_time
-        logger.info(f"Processed band in {elapsed_time:.2f} seconds")
-
-        return df_results
-
-    def _filter_detections(self, results: dict) -> list[dict]:
+    # TODO: implement model loading from HuggingFace (parametrize args to InferenceConfig)
+    def init_models(self, encoder_path: str, rf_path: str):
         """
-        Filter detections based on cadence pattern and confidence
+        Initialize models within strategy scope
+        """
+        if not os.path.exists(encoder_path):
+            raise FileNotFoundError(f"Encoder not found at {encoder_path}")
+        if not os.path.exists(rf_path):
+            raise FileNotFoundError(f"Random Forest not found at {rf_path}")
+
+        try:
+            # Load encoder within strategy scope
+            logger.info(f"Loading encoder from {encoder_path} within strategy scope")
+            with self.strategy.scope():
+                self.encoder = tf.keras.models.load_model(
+                    encoder_path, custom_objects={"Sampling": Sampling}
+                )
+            logger.info("Encoder loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading encoder: {e}")
+            raise  # Re-raise to propagate error
+
+        try:
+            # Load Random Forest
+            logger.info(f"Loading Random Forest from {rf_path}")
+            self.rf_model = RandomForestModel()
+            self.rf_model.load(rf_path)
+            logger.info("Random Forest loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Error loading Random Forest: {e}")
+            raise  # Re-raise to propagate error
+
+    # TODO: finish writing docstring (how will args be passed?)
+    def run_inference(
+        self,
+        data: np.ndarray,
+        npy_path: str,
+        # NOTE: how do we pass these in from preproc?
+        target: str | None = None,
+        session: str | None = None,
+        cadence_id: int | None = None,
+        band: str | None = None,
+        frequency_mhz: float | None = None,
+        timestamp_observed: float | None = None,
+        h5_path: str | None = None,
+    ) -> dict:
+        """
+        Run inference on preprocessed cadence snippets.
 
         Args:
-            results: Raw detection results
+            data: Preprocessed cadence snippets, shape (n, 6, 16, 512)
+            npy_path: Source .npy file path containing the cadence snippets
+            ...
 
         Returns:
-            Filtered list of detections
+            Dict with inference statistics
         """
-        detections = []
+        # Sanity check
+        if not (self.encoder or self.rf_model):
+            raise RuntimeError("Encoder and/or Random Forest not initialized")
 
-        predictions = results["predictions"]
-        probabilities = results["probabilities"]
-        snippet_info = results["snippet_info"]
+        try:
+            n_samples = data.shape[0]
+            logger.info(f"Running inference on {n_samples} cadence snippets from {npy_path}")
 
-        # Group by frequency location
-        frequency_groups = {}
-        for i, (pred, prob, info) in enumerate(
-            zip(predictions, probabilities, snippet_info, strict=False)
-        ):
-            if pred:  # Positive detection
-                freq_key = info["start_index"]
-                if freq_key not in frequency_groups:
-                    frequency_groups[freq_key] = []
-                frequency_groups[freq_key].append(
-                    {"observation": info["observation"], "probability": prob, "index": i}
-                )
-
-        # Check cadence patterns
-        for freq_key, group in frequency_groups.items():
-            obs_pattern = [d["observation"] for d in group]
-
-            # Check if signal appears in ON observations (0, 2, 4) but not OFF (1, 3, 5)
-            on_obs = [0, 2, 4]
-            off_obs = [1, 3, 5]
-
-            on_detections = sum(1 for obs in obs_pattern if obs in on_obs)
-            off_detections = sum(1 for obs in obs_pattern if obs in off_obs)
-
-            if on_detections >= 2 and off_detections == 0:
-                # Strong ETI candidate
-                avg_prob = np.mean([d["probability"] for d in group])
-                detections.append(
-                    {
-                        "frequency_index": freq_key,
-                        "confidence": avg_prob,
-                        "pattern": obs_pattern,
-                        "classification": "ETI_candidate",
-                    }
-                )
-            elif on_detections > 0 and off_detections > 0:
-                # Possible RFI
-                avg_prob = np.mean([d["probability"] for d in group])
-                detections.append(
-                    {
-                        "frequency_index": freq_key,
-                        "confidence": avg_prob,
-                        "pattern": obs_pattern,
-                        "classification": "RFI_likely",
-                    }
-                )
-
-        return detections
-
-    def _create_results_dataframe(
-        self, detections: list[dict], frequency_range: tuple[float, float]
-    ) -> pd.DataFrame:
-        """
-        Create DataFrame with detection results
-
-        Args:
-            detections: List of detection dictionaries
-            frequency_range: Frequency range being analyzed
-
-        Returns:
-            Results DataFrame
-        """
-        if not detections:
-            return pd.DataFrame()
-
-        # Calculate actual frequencies
-        freq_resolution = (
-            self.config.data.freq_resolution * self.config.data.downsample_factor
-        )  # 2.79 Hz -> 22.35 Hz after downsample
-        start_freq = frequency_range[0] * 1e6  # MHz to Hz
-
-        df_data = []
-        for det in detections:
-            freq_hz = start_freq + (det["frequency_index"] * freq_resolution)
-
-            df_data.append(
-                {
-                    "frequency_MHz": freq_hz / 1e6,
-                    "confidence": det["confidence"],
-                    "classification": det["classification"],
-                    "observation_pattern": str(det["pattern"]),
-                    "frequency_index": det["frequency_index"],
-                }
+            # Prepare distributed dataset for inference
+            results = prepare_distributed_inf_dataset(
+                data=data,
+                n_samples=n_samples,
+                per_replica_inf_batch_size=self.per_replica_inf_batch_size,
+                num_replicas=self.num_replicas,
+                strategy=self.strategy,
             )
 
-        df = pd.DataFrame(df_data)
-        df = df.sort_values("confidence", ascending=False)
+            del data
+            gc.collect()
 
-        return df
+            inf_dataset = results["inf_dataset"]
+            n_inf_trimmed = results["n_inf_trimmed"]
+            inf_steps = results["inf_steps"]
+            inf_holder = results["_inf_holder"]
 
-    def parallel_process_bands(
-        self, observation_files: list[list[str]], n_workers: int = 4
-    ) -> pd.DataFrame:
+            del results
+            gc.collect()
+
+            logger.info(
+                f"Generating latents for {n_inf_trimmed} cadence snippets using distributed inference"
+            )
+
+            latents = self._distributed_encode(inf_dataset, n_inf_trimmed, inf_steps)
+
+            # Run RF classification
+            logger.info("Running Random Forest classification")
+            predictions, confidence_scores = self.rf_model.predict_verbose(latents, self.threshold)
+
+            # Write results to database
+            n_candidates = self._write_inference_results(
+                npy_path=npy_path,
+                predictions=predictions,
+                confidence_scores=confidence_scores,
+                latents=latents,
+                target=target,
+                session=session,
+                cadence_id=cadence_id,
+                band=band,
+                frequency_mhz=frequency_mhz,
+                timestamp_observed=timestamp_observed,
+                h5_path=h5_path,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in run_inference(): {e}")
+            raise  # Re-raise to propagate error
+
+        finally:
+            # NOTE: should check to make sure holder & dataset exist first
+            # Clear intermediate data
+            inf_holder.clear()
+            del inf_dataset
+
+            # Force TensorFlow to release internal references to datasets/iterators
+            # This prevents generator closures from accumulating in memory between rounds
+            tf.keras.backend.clear_session()
+            logger.info("Cleared TensorFlow session state")
+
+            # NOTE: should check to make sure arrays exist first
+            del latents, predictions, confidence_scores
+            gc.collect()
+
+        # NOTE: is this the right location for return statement?
+        return {
+            "n_cadence_snippets": n_samples,
+            "n_processed": n_inf_trimmed,
+            "n_candidates": n_candidates,
+        }
+
+    def _distributed_encode(
+        self,
+        dataset: tf.distribute.DistributedDataset,
+        n_samples: int,
+        n_steps: int,
+    ) -> np.ndarray:
         """
-        Process multiple frequency bands in parallel
-
-        Args:
-            observation_files: List of observation file lists (one per band)
-            n_workers: Number of parallel workers
-
-        Returns:
-            Combined results DataFrame
+        Encode cadence snippets using distributed strategy.
         """
-        logger.info(f"Processing {len(observation_files)} bands with {n_workers} workers")
+        # Pre-allocate latent array
+        # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
+        latents = np.empty((n_samples * self.num_observations, self.latent_dim), dtype=np.float32)
 
-        all_results = []
+        # Cache dimensions for tf.function
+        time_bins = self.config.data.time_bins
+        width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = []
+        @tf.function
+        def encode_step(batch_data):
+            def encode_fn(data):
+                """Per-replica encoding step"""
+                # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
+                reshaped = tf.reshape(data, [-1, time_bins, width_bin, 1])
+                # Encode (returns mean, log_var, z)
+                _, _, z = self.encoder(reshaped, training=False)
+                return z
 
-            for band_idx, obs_files in enumerate(observation_files):
-                # Calculate frequency range for this band
-                band_start = 1100 + (band_idx * 50)  # Example: 50 MHz bands
-                band_end = band_start + 50
+            # Run encoding on all replicas
+            per_replica_z = self.strategy.run(encode_fn, args=(batch_data,))
+            return per_replica_z
 
-                future = executor.submit(
-                    self.analyze_frequency_band, obs_files, (band_start, band_end)
+        # Process all batches
+        iterator = iter(dataset)
+        current_idx = 0
+
+        try:
+            for step in range(n_steps):
+                batch = next(iterator)
+
+                # Get per-replica latents for this batch
+                per_replica_z = encode_step(batch)
+
+                # Extract results from each replica and concatenate
+                # This avoids the inefficient gather operation with NCCL
+                results = self.strategy.experimental_local_results(per_replica_z)
+
+                # Concatenate results from all replicas
+                batch_z = np.concatenate([r.numpy() for r in results], axis=0)
+
+                batch_size = batch_z.shape[0]
+                latents[current_idx : current_idx + batch_size] = batch_z
+
+                current_idx += batch_size
+
+                # Log progress
+                if (step + 1) % 10 == 0 or (step + 1) == n_steps:
+                    logger.info(f"Encoded step {step + 1}/{n_steps}")
+
+                del per_replica_z, results, batch_z
+                gc.collect()
+
+        except Exception as e:
+            logger.error(f"Error in _distributed_encode(): {e}")
+            raise  # Re-raise to propagate error
+
+        finally:
+            # NOTE: should check to make sure iterator exist first
+            del iterator
+
+        # NOTE: is this the right location for return statement?
+        return latents
+
+    def _write_inference_results(
+        self,
+        npy_path: str,
+        predictions: np.ndarray,
+        confidence_scores: np.ndarray,
+        latents: np.ndarray,
+        target: str | None = None,
+        session: str | None = None,
+        cadence_id: int | None = None,
+        band: str | None = None,
+        frequency_mhz: float | None = None,
+        timestamp_observed: float | None = None,
+        h5_path: str | None = None,
+    ) -> int:
+        """Write inference results to database."""
+        if self.db is None:
+            raise RuntimeError("No database instance detected - cannot store inference results")
+
+        tag = self.config.checkpoint.save_tag
+        n_candidates = 0
+
+        for idx in range(len(confidence_scores)):
+            confidence = float(confidence_scores[idx])
+            prediction = int(predictions[idx])
+
+            # NOTE: should we just store everything? benchmark storage requirements
+            # Only store candidates above threshold (to reduce db size)
+            if prediction == 1:
+                n_candidates += 1
+
+                self.db.write_inference_result(
+                    npy_path=npy_path,
+                    # NOTE: is it guaranteed that snippets are processed sequentially?
+                    snippet_index=idx,
+                    prediction=prediction,
+                    confidence=confidence,
+                    # NOTE: does latents need to be reshaped first before being passed as arg?
+                    latent_vector=latents[idx],
+                    # NOTE: how do we pass these in from preproc?
+                    target=target,
+                    session=session,
+                    cadence_id=cadence_id,
+                    band=band,
+                    frequency_mhz=frequency_mhz,
+                    timestamp_observed=timestamp_observed,
+                    h5_path=h5_path,
+                    tag=tag,
                 )
-                futures.append(future)
 
-            # Collect results
-            for future in futures:
-                try:
-                    result = future.result()
-                    if not result.empty:
-                        all_results.append(result)
-                except Exception as e:
-                    logger.error(f"Error processing band: {e}")
+        logger.info(f"Wrote {n_candidates} candidates to database")
+        return n_candidates
 
-        # Combine results
-        if all_results:
-            combined_df = pd.concat(all_results, ignore_index=True)
-            combined_df = combined_df.sort_values("confidence", ascending=False)
-            return combined_df
-        else:
-            return pd.DataFrame()
-
-    def save_results(self, results_df: pd.DataFrame, output_path: str):
-        """Save detection results"""
-        results_df.to_csv(output_path, index=False)
-        logger.info(f"Saved {len(results_df)} detections to {output_path}")
-
-        # Also save high-confidence detections separately
-        high_conf = results_df[results_df["confidence"] > 0.9]
-        if not high_conf.empty:
-            high_conf_path = output_path.replace(".csv", "_high_confidence.csv")
-            high_conf.to_csv(high_conf_path, index=False)
-            logger.info(f"Saved {len(high_conf)} high-confidence detections")
+    # TODO: add plotting functions (remember to call when candidate is found) (full workflow when candidate is found: db write, make plot, save plot, send to slack)
+    def plot_candidate(self):
+        pass
 
 
-def run_inference(
-    config,
-    observation_files: list[list[str]],
-    vae_encoder_path: str,
-    rf_model_path: str,
-    output_path: str,
-) -> pd.DataFrame:
+# TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
+# TODO: add try-except switch statements (see run_training_pipeline())
+def run_inference_pipeline(
+    cadence_data: np.ndarray,
+    npy_path: str,
+    strategy: tf.distribute.Strategy,
+    # NOTE: how do we pass these in from preproc?
+    target: str | None = None,
+    session: str | None = None,
+    cadence_id: int | None = None,
+    band: str | None = None,
+    frequency_mhz: float | None = None,
+    timestamp_observed: float | None = None,
+    h5_path: str | None = None,
+) -> dict:
     """
-    Run inference on observation data
+    Complete Aetherscan inference pipeline run
 
     Args:
-        config: Configuration object
-        observation_files: List of observation file lists
-        vae_encoder_path: Path to VAE encoder
-        rf_model_path: Path to Random Forest model
-        output_path: Path to save results
-
-    Returns:
-        Detection results DataFrame
+        cadence_data: Array of preprocessed cadences, shape (n, 6, 16, 512)
+        npy_path: Source .npy file path containing the cadence snippets
+        strategy: TensorFlow distribution strategy
+        ...
     """
     # Create pipeline
-    pipeline = InferencePipeline(config, vae_encoder_path, rf_model_path)
+    pipeline = InferencePipeline(strategy=strategy)
 
-    # Process data
-    results = pipeline.parallel_process_bands(observation_files)
-
-    # Save results
-    pipeline.save_results(results, output_path)
-
-    # Log summary
-    if not results.empty:
-        n_eti = len(results[results["classification"] == "ETI_candidate"])
-        n_rfi = len(results[results["classification"] == "RFI_likely"])
-        logger.info(f"Detection summary: {n_eti} ETI candidates, {n_rfi} likely RFI")
-    else:
-        logger.info("No detections found")
+    # Run inference
+    results = pipeline.run_inference(
+        data=cadence_data,
+        # NOTE: how do we pass these in from preproc?
+        npy_path=npy_path,
+        target=target,
+        session=session,
+        cadence_id=cadence_id,
+        band=band,
+        frequency_mhz=frequency_mhz,
+        timestamp_observed=timestamp_observed,
+        h5_path=h5_path,
+    )
 
     return results
