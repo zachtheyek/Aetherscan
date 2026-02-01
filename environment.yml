@@ -1,31 +1,51 @@
-# TODO: update to match current pipeline imports (ruff)
-# TODO: rebuild conda environment after updating
-# NOTE: do we need a no_cuda environment?
 name: aetherscan
 channels:
   - conda-forge
   - defaults
   - nvidia
 dependencies:
+  # Core Python
   - python=3.10
+
+  # Scientific computing
   - numpy=1.23.*
-  - scikit-learn=1.3.*
-  - pandas=2.0.*
-  - matplotlib=3.7.*
-  - astropy=5.3.*
-  - numba=0.57.*
-  - joblib=1.3.*
-  - scikit-image=0.21.*
-  - pytest=7.4.*
-  - tensorboard=2.13.*
-  - psutil=5.9.*
-  - h5py=3.9.*
   - scipy=1.11.*
+
+  # Machine learning
+  - scikit-learn=1.3.*
+  - scikit-image=0.21.*
+
+  # Astronomy
+  - astropy=5.3.*
+
+  # Visualization
+  - matplotlib=3.7.*
+
+  # Data handling
+  - joblib=1.3.*
+  - h5py=3.9.*
+
+  # System monitoring
+  - psutil=5.9.*
+
+  # Testing
+  - pytest=7.4.*
+
+  # Development
   - ipykernel
+
+  # CUDA support
   - nvidia::cuda-runtime=12.2.*
   - cudnn=8.9.*
+
+  # Package management
   - pip
   - pip:
+      # Deep learning
       - tensorflow==2.16.*
+
+      # Signal generation
       - setigen
+
+      # Slack integration
       - slack-sdk>=3.23.0
