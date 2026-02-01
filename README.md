@@ -1,6 +1,6 @@
 <h1>
 <p align="center">
-  <span style="font-size: 5em;">Aetherscan</span>
+  Aetherscan
 </h1>
   <p align="center">
     Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale
