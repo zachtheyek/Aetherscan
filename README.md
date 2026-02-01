@@ -6,6 +6,7 @@
 - add docs to `docs/`?
 - move code to `src/`?
 - upload to `PyPI`?
+- system requirements (training, inference, evaluation)
 
 ---
 
