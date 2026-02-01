@@ -1,3 +1,4 @@
+# NOTE: are we properly clearing memory after db read for plotting functions? are there any db reads that can be grouped together to reduce plotting times?
 """
 Training orchestration for Aetherscan Pipeline
 Implements full workflow for both beta-VAE & RF classifier,
@@ -486,6 +487,7 @@ def prepare_distributed_train_dataset(
     val_dataset = (
         tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
         .batch(global_val_batch_size, drop_remainder=True)
+        # NOTE: do we need repeat for val dataset?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -528,7 +530,6 @@ def prepare_distributed_train_dataset(
     }
 
 
-# NOTE: should we move this to inference.py & import into train.py?
 def prepare_distributed_inf_dataset(
     data: dict,
     n_samples: int,
@@ -538,6 +539,9 @@ def prepare_distributed_inf_dataset(
 ) -> dict:
     """
     Prepare distributed datasets for inference
+    Note, this function is meant for RF training
+    It is different from aetherscan.inference.prepare_distributed_inf_dataset(),
+    since we assume signal classes are known ahead of time
 
     Args:
         data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
@@ -552,6 +556,7 @@ def prepare_distributed_inf_dataset(
     """
     global_inf_batch_size = per_replica_inf_batch_size * num_replicas
 
+    # NOTE: does trimming/divisibility matter for inference?
     # Trim datasets to fit batch sizes (prevents uneven batches on final step)
     # Note, n_samples should already be divisible by effective_batch_size
     # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
@@ -610,6 +615,7 @@ def prepare_distributed_inf_dataset(
     inf_dataset = (
         tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
         .batch(global_inf_batch_size, drop_remainder=True)
+        # NOTE: do we need repeat for inf dataset?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -639,7 +645,7 @@ def prepare_distributed_inf_dataset(
 class TrainingPipeline:
     """Training pipeline"""
 
-    def __init__(self, background_data, strategy=None):
+    def __init__(self, background_data, strategy: tf.distribute.Strategy = None):
         """
         Initialize training pipeline
 
@@ -819,7 +825,7 @@ class TrainingPipeline:
                 1 - np.exp(decay_rate)
             )
             current_range = final_snr_range + (initial_snr_range - final_snr_range) * decay_factor
-        # TODO: allow user to pass in a list of step changes (add validation that len(list) divisible by num_training_rounds)
+        # TODO: generalize this to receive a step schedule (as a list/dict?) validate that len(list/dict) is divisible by num_training_rounds
         # Step function - easy for first part, hard for second part
         elif schedule == "step":
             easy_rounds = self.config.training.step_easy_rounds
@@ -938,7 +944,7 @@ class TrainingPipeline:
         )
 
         # Generate training data
-        train_data = self.data_generator.generate_batch(
+        train_data = self.data_generator.generate_triplet_batch(
             self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
         )
 
@@ -989,22 +995,8 @@ class TrainingPipeline:
                 # Validation
                 val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
 
-                # Log results & queue db writes (non-blocking)
+                # Queue db writes (non-blocking) & log results
                 logger.info(f"Epoch {epoch + 1} Complete")
-                logger.info(
-                    f"Train -- Total: {epoch_losses['total']:.4f}, "
-                    f"Recon: {epoch_losses['reconstruction']:.4f}, "
-                    f"KL: {epoch_losses['kl']:.4f}, "
-                    f"True: {epoch_losses['true']:.4f}, "
-                    f"False: {epoch_losses['false']:.4f}, "
-                )
-                logger.info(
-                    f"Val -- Total: {val_losses['total']:.4f}, "
-                    f"Recon: {val_losses['reconstruction']:.4f}, "
-                    f"KL: {val_losses['kl']:.4f}, "
-                    f"True: {val_losses['true']:.4f}, "
-                    f"False: {val_losses['false']:.4f}"
-                )
 
                 current_time = time.time()
 
@@ -1141,6 +1133,29 @@ class TrainingPipeline:
                 #
                 # # Increment global step
                 # self.global_step += 1
+
+                logger.info(
+                    f"Train -- Total: {epoch_losses['total']:.4f}, "
+                    f"Recon: {epoch_losses['reconstruction']:.4f}, "
+                    f"KL: {epoch_losses['kl']:.4f}, "
+                    f"True: {epoch_losses['true']:.4f}, "
+                    f"False: {epoch_losses['false']:.4f}, "
+                    f"Duration: {train_duration} "
+                )
+                logger.info(
+                    f"Gradient norm -- Mean: {gradient_norm_mean}, "
+                    f"Std: {gradient_norm_std}, "
+                    f"Max: {gradient_norm_max}, "
+                    f"Clipping rate: {clipping_rate} "
+                )
+                logger.info(
+                    f"Val -- Total: {val_losses['total']:.4f}, "
+                    f"Recon: {val_losses['reconstruction']:.4f}, "
+                    f"KL: {val_losses['kl']:.4f}, "
+                    f"True: {val_losses['true']:.4f}, "
+                    f"False: {val_losses['false']:.4f}, "
+                    f"Duration: {val_duration} "
+                )
 
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
@@ -1550,7 +1565,7 @@ class TrainingPipeline:
             logger.warning(f"Could not verify encoder weights status: {e}")
             logger.warning("Proceeding with current encoder weights")
 
-        # NOTE: divide by 2 to compensate for generate_batch creating n_samples * 2 samples
+        # NOTE: divide by 2 to compensate for generate_triplet_batch creating n_samples * 2 samples
         n_samples = self.config.training.num_samples_rf // 2
         snr_base = self.config.training.snr_base
         snr_range = (
@@ -1565,14 +1580,12 @@ class TrainingPipeline:
         # Generate training data
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
 
-        rf_data = self.data_generator.generate_batch(n_samples, snr_base, snr_range)
+        rf_data = self.data_generator.generate_triplet_batch(n_samples, snr_base, snr_range)
 
         # Prepare distributed dataset for inference
         results = prepare_distributed_inf_dataset(
             data=rf_data,
             n_samples=n_samples,
-            # NOTE: come back to this later
-            # per_replica_inf_batch_size=self.config.inference.per_replica_batch_size,
             per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
@@ -1589,7 +1602,6 @@ class TrainingPipeline:
         del results
         gc.collect()
 
-        # NOTE: should we move the latent generation code to inference.py & import into train.py?
         logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
 
         # Pre-allocate latent arrays
@@ -2218,7 +2230,7 @@ class TrainingPipeline:
                 title=f"Beta-VAE Training Stability - ({tag}, {machine_name})",
             )
 
-    # TODO: move injection plots to data_generation.py & call at end of generate_batch() (instead of at the end of train_round() & train_full_pipeline())
+    # TODO: move injection plots to data_generation.py & call at end of generate_triplet_batch() (instead of at the end of train_round() & run_training_pipeline())
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
         Plot injection statistics for bias/leakage detection.
@@ -3277,16 +3289,15 @@ class TrainingPipeline:
             raise  # Re-raise to propagate error
 
 
-def train_full_pipeline(background_data: np.ndarray, strategy=None) -> TrainingPipeline:
+def run_training_pipeline(
+    background_data: np.ndarray, strategy: tf.distribute.Strategy = None
+) -> TrainingPipeline:
     """
     Complete Aetherscan training pipeline run
 
     Args:
-        background_data: Array of background observations
+        background_data: Array of preprocessed backgrounds, shape (n, 6, 16, 512)
         strategy: TensorFlow distribution strategy
-
-    Returns:
-        Trained pipeline object
     """
     try:
         # Create pipeline (no cleanup needed on failure)
