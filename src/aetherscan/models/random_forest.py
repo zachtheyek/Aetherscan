@@ -124,7 +124,6 @@ class RandomForestModel:
     def predict(self, latent_vectors: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Predict binary classes given some input latent cadences
-        Returns 1 if probability of true signal > threshold, else 0
         """
         probas = self.predict_proba(latent_vectors)
         return (probas[:, 1] > threshold).astype(int)
