@@ -1,7 +1,7 @@
 """
 Synthetic data generation for Aetherscan Pipeline
-Handles signal injection & log-normalization
-Uses multiprocessing and shared memory to process backgrounds in parallel
+Handles signal injection & log-normalization for training
+Uses multiprocessing and shared memory to process data in parallel
 """
 
 from __future__ import annotations
@@ -1035,8 +1035,8 @@ class DataGenerator:
     #     Setup managed multiprocessing pool with shared memory.
     #
     #     Why we don't create output shared memory here:
-    #         Output shared memory size depends on the batch size requested in generate_batch(),
-    #         which varies between calls. We create output shared memory on-demand in generate_batch()
+    #         Output shared memory size depends on the batch size requested in generate_triplet_batch(),
+    #         which varies between calls. We create output shared memory on-demand in generate_triplet_batch()
     #         and pass references to workers via the task arguments.
     #
     #         The pool is initialized with background shared memory only. Workers will attach to
@@ -1195,16 +1195,11 @@ class DataGenerator:
                 timestamp=timestamp,
             )
 
-    # TODO:
-    # separate generate_batch() into generate_train_batch() & generate_test_batch()
-    # since test doesn't require (main, false, true), just (false, true)
-    # verify this is correct with train_random_forest() vs train_round()
-    # benchmark compute time / memory saved with this change
-    def generate_batch(
+    def generate_triplet_batch(
         self, n_samples: int, snr_base: int, snr_range: int, round_num: int | None = None
     ) -> dict[str, np.ndarray]:
         """
-        Generate batch using chunking & multiprocessing
+        Generate triplet batch using chunking & multiprocessing
 
         main: collapsed cadences
           - total: n_samples
@@ -1543,11 +1538,11 @@ class DataGenerator:
         return result
 
     # NOTE: come back to this later
-    # def generate_batch(
+    # def generate_triplet_batch(
     #     self, n_samples: int, snr_base: int, snr_range: int
     # ) -> dict[str, np.ndarray]:
     #     """
-    #     Generate batch using unified task submission and shared memory outputs.
+    #     Generate triplet batch using unified task submission and shared memory outputs.
     #
     #     Key optimizations:
     #     1. Single shared memory allocation for all outputs
@@ -1737,7 +1732,7 @@ class DataGenerator:
     #
     #         logger.info(f"Chunk {chunk_idx + 1} complete, memory cleared")
     #
-    #     # Recreate pool for next generate_batch call
+    #     # Recreate pool for next generate_triplet_batch call
     #     self._setup_managed_pool()
     #
     #     result = {"concatenated": all_main, "false": all_false, "true": all_true}
