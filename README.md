@@ -34,72 +34,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ---
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              TRAINING PIPELINE                                   │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│   │  Background  │    │   Signal     │    │  Curriculum  │    │   Multi-GPU  │  │
-│   │    Data      │───▶│  Injection   │───▶│   Learning   │───▶│   Training   │  │
-│   │  (.npy)      │    │  (setigen)   │    │  (SNR sched) │    │ (MirroredStr)│  │
-│   └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                                      │          │
-│                                                                      ▼          │
-│                                                              ┌──────────────┐   │
-│                                                              │   Beta-VAE   │   │
-│                                                              │  (8-dim z)   │   │
-│                                                              └──────────────┘   │
-│                                                                      │          │
-│                                                                      ▼          │
-│                                                              ┌──────────────┐   │
-│                                                              │ Random Forest│   │
-│                                                              │ (1000 trees) │   │
-│                                                              └──────────────┘   │
-│                                                                      │          │
-│                                                                      ▼          │
-│                                                              ┌──────────────┐   │
-│                                                              │  Checkpoints │   │
-│                                                              │   (.keras)   │   │
-│                                                              └──────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                             INFERENCE PIPELINE                                   │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│   │  Observation │    │   Preproc    │    │   Encoder    │    │  RF Predict  │  │
-│   │    Data      │───▶│  (downsamp)  │───▶│  (latents)   │───▶│ (candidates) │  │
-│   │   (.h5)      │    │              │    │              │    │              │  │
-│   └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                                      │          │
-│                                                                      ▼          │
-│                                                              ┌──────────────┐   │
-│                                                              │   SQLite DB  │   │
-│                                                              │ (candidates) │   │
-│                                                              └──────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Key Features
-
-| Feature                    | Description                                                                                                                           |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| **Curriculum Learning**    | Progressive difficulty schedules (linear, exponential, step) that start with high-SNR signals and gradually introduce harder examples |
-| **Multi-GPU Training**     | Distributed training with MirroredStrategy and NCCL AllReduce for efficient gradient synchronization                                  |
-| **Gradient Accumulation**  | Achieves large effective batch sizes (3072) without requiring proportional GPU memory                                                 |
-| **Custom Clustering Loss** | Exploits ON/OFF cadence pattern to separate technosignatures from RFI in latent space                                                 |
-| **Adaptive Learning Rate** | Patience-based LR reduction when validation loss plateaus                                                                             |
-| **Fault Tolerance**        | Automatic retry with exponential backoff; per-round checkpointing for recovery                                                        |
-| **Real-time Monitoring**   | Resource tracking (CPU, RAM, GPU) with Slack alerts for errors and milestones                                                         |
-| **Async Database**         | Thread-safe SQLite with queue-based writes for concurrent metric logging                                                              |
-
----
+# TODO:
 
 ## System Requirements
 
@@ -124,27 +59,27 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ## Installation
 
-### 1. Clone the repository
+> [!NOTE]
+> Aetherscan currently only supports running from source.
+> Alternative installation methods like containerized or via pip will be available soon.
+
+### Run From Source
+
+**1. Clone the repository**
 
 ```bash
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 ```
 
-### 2. Create conda environment
+**2. Create conda environment**
 
 ```bash
 conda env create -f environment.yml
 conda activate aetherscan
 ```
 
-### 3. Install the package
-
-```bash
-pip install -e .
-```
-
-### 4. Set environment variables
+**3. Set environment variables**
 
 ```bash
 export AETHERSCAN_DATA_PATH="/path/to/data"
@@ -153,7 +88,13 @@ export AETHERSCAN_OUTPUT_PATH="/path/to/outputs"
 
 # Optional: Slack integration
 export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_CHANNEL="#aetherscan-alerts"
+export SLACK_CHANNEL="#aetherscan-logs"
+```
+
+**4. Run pipeline **
+
+```bash
+SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src python -m aetherscan.main train --max-retries 1 --save-tag final_v1
 ```
 
 ---
@@ -227,114 +168,6 @@ Aetherscan uses a hierarchical configuration system with dataclass-based configs
 | `ManagerConfig`      | Resource management  | `n_processes=cpu_count()`, `pool_terminate_timeout=10.0`                      |
 
 ---
-
-## Project Structure
-
-```
-Aetherscan/
-├── src/aetherscan/
-│   ├── __init__.py           # Package initialization, version
-│   ├── main.py               # Entry point, command dispatch
-│   ├── cli.py                # Argument parsing, validation
-│   ├── config.py             # Configuration dataclasses
-│   ├── train.py              # Training orchestration
-│   ├── inference.py          # Inference pipeline
-│   ├── evaluate.py           # Evaluation metrics
-│   ├── preprocessing.py      # Data preprocessing
-│   ├── data_generation.py    # Synthetic signal injection
-│   ├── models/
-│   │   ├── __init__.py       # Model exports
-│   │   ├── vae.py            # Beta-VAE architecture
-│   │   └── random_forest.py  # RF classifier wrapper
-│   ├── db/
-│   │   ├── __init__.py       # Database exports
-│   │   └── db.py             # SQLite async writer
-│   ├── logger/
-│   │   ├── __init__.py       # Logger exports
-│   │   ├── logger.py         # Logging configuration
-│   │   └── slack_handler.py  # Slack integration
-│   ├── monitor/
-│   │   ├── __init__.py       # Monitor exports
-│   │   └── monitor.py        # Resource monitoring
-│   └── manager/
-│       ├── __init__.py       # Manager exports
-│       └── manager.py        # Resource lifecycle management
-├── tests/                    # Test suite
-├── docs/                     # Documentation
-├── environment.yml           # Conda dependencies
-├── pyproject.toml            # Package metadata
-├── AGENTS.md                 # Claude Code agent guidelines
-├── CONTRIBUTING.md           # Contribution guidelines
-├── KNOWN_ISSUES.md           # Known issues and workarounds
-├── SECURITY.md               # Security policy
-├── LICENSE                   # BSD-3-Clause
-└── CITATION.cff              # Citation metadata
-```
-
-### Module Responsibilities
-
-| Module                    | Purpose                                                                                                |
-| ------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `train.py`                | Orchestrates training: curriculum learning, distributed datasets, gradient accumulation, checkpointing |
-| `inference.py`            | Runs trained models on new data, writes candidates to database                                         |
-| `models/vae.py`           | Beta-VAE with custom clustering loss (L_same, L_diff)                                                  |
-| `models/random_forest.py` | Scikit-learn RF wrapper with save/load                                                                 |
-| `data_generation.py`      | Uses setigen for synthetic signal injection with ON/OFF patterns                                       |
-| `preprocessing.py`        | Downsampling, normalization, data alignment                                                            |
-| `db/db.py`                | Thread-safe SQLite with async queue-based writes                                                       |
-| `monitor/monitor.py`      | Background thread for CPU/RAM/GPU metrics                                                              |
-| `manager/manager.py`      | Centralized resource lifecycle (pools, shared memory, cleanup)                                         |
-| `logger/`                 | Multi-handler logging with Slack integration                                                           |
-
----
-
-## How It Works
-
-### The ON/OFF Cadence Pattern
-
-Radio telescopes observe potential technosignature targets using an "ON/OFF" cadence:
-
-- **ON**: Telescope points at target star
-- **OFF**: Telescope points at nearby reference position
-
-A real technosignature should appear only in ON observations (signal follows target), while RFI appears in both ON and OFF (signal is local interference).
-
-```
-Cadence: [ON₁] [OFF₁] [ON₂] [OFF₂] [ON₃] [OFF₃]
-Signal:   ██     --     ██     --     ██     --   ← Technosignature (target-dependent)
-RFI:      ██     ██     ██     ██     ██     ██   ← Interference (always present)
-```
-
-### Custom Clustering Loss
-
-The Beta-VAE uses a custom loss function that exploits this pattern:
-
-```
-L_total = L_reconstruction + β·L_KL + α·(L_true + L_false)
-```
-
-Where:
-
-- **L_reconstruction**: Standard VAE reconstruction loss
-- **L_KL**: KL divergence for latent regularization (β=1.5)
-- **L_true**: For real signals, minimize ON-ON distance, maximize ON-OFF distance
-- **L_false**: For RFI/noise, minimize all pairwise distances (all observations similar)
-
-```python
-# Pseudo-code for clustering loss
-def loss_same(a, b):  # Minimize distance
-    return mean(sum((a - b)²))
-
-def loss_diff(a, b):  # Maximize distance
-    return mean(1 / (sum((a - b)²) + ε))
-
-# True signals: ON observations cluster together, separate from OFF
-L_true = loss_same(ON₁, ON₂) + loss_same(ON₂, ON₃) + ...  # ON-ON close
-       + loss_diff(ON₁, OFF₁) + loss_diff(ON₁, OFF₂) + ... # ON-OFF far
-
-# False signals: All observations cluster together
-L_false = loss_same(all pairs)  # Everything close
-```
 
 ---
 
@@ -595,3 +428,163 @@ See also the foundational paper:
 ## Acknowledgments
 
 This project is part of [Breakthrough Listen](https://breakthroughlisten.org/), the largest scientific research program aimed at finding evidence of civilizations beyond Earth. The infrastructure and research is funded by the [Breakthrough Prize Foundation](https://breakthroughprize.org/).
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              TRAINING PIPELINE                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│   │  Background  │    │   Signal     │    │  Curriculum  │    │   Multi-GPU  │  │
+│   │    Data      │───▶│  Injection   │───▶│   Learning   │───▶│   Training   │  │
+│   │  (.npy)      │    │  (setigen)   │    │  (SNR sched) │    │ (MirroredStr)│  │
+│   └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘  │
+│                                                                      │          │
+│                                                                      ▼          │
+│                                                              ┌──────────────┐   │
+│                                                              │   Beta-VAE   │   │
+│                                                              │  (8-dim z)   │   │
+│                                                              └──────────────┘   │
+│                                                                      │          │
+│                                                                      ▼          │
+│                                                              ┌──────────────┐   │
+│                                                              │ Random Forest│   │
+│                                                              │ (1000 trees) │   │
+│                                                              └──────────────┘   │
+│                                                                      │          │
+│                                                                      ▼          │
+│                                                              ┌──────────────┐   │
+│                                                              │  Checkpoints │   │
+│                                                              │   (.keras)   │   │
+│                                                              └──────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                             INFERENCE PIPELINE                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│   │  Observation │    │   Preproc    │    │   Encoder    │    │  RF Predict  │  │
+│   │    Data      │───▶│  (downsamp)  │───▶│  (latents)   │───▶│ (candidates) │  │
+│   │   (.h5)      │    │              │    │              │    │              │  │
+│   └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘  │
+│                                                                      │          │
+│                                                                      ▼          │
+│                                                              ┌──────────────┐   │
+│                                                              │   SQLite DB  │   │
+│                                                              │ (candidates) │   │
+│                                                              └──────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Project Structure
+
+```
+Aetherscan/
+├── src/aetherscan/
+│   ├── __init__.py           # Package initialization, version
+│   ├── main.py               # Entry point, command dispatch
+│   ├── cli.py                # Argument parsing, validation
+│   ├── config.py             # Configuration dataclasses
+│   ├── train.py              # Training orchestration
+│   ├── inference.py          # Inference pipeline
+│   ├── evaluate.py           # Evaluation metrics
+│   ├── preprocessing.py      # Data preprocessing
+│   ├── data_generation.py    # Synthetic signal injection
+│   ├── models/
+│   │   ├── __init__.py       # Model exports
+│   │   ├── vae.py            # Beta-VAE architecture
+│   │   └── random_forest.py  # RF classifier wrapper
+│   ├── db/
+│   │   ├── __init__.py       # Database exports
+│   │   └── db.py             # SQLite async writer
+│   ├── logger/
+│   │   ├── __init__.py       # Logger exports
+│   │   ├── logger.py         # Logging configuration
+│   │   └── slack_handler.py  # Slack integration
+│   ├── monitor/
+│   │   ├── __init__.py       # Monitor exports
+│   │   └── monitor.py        # Resource monitoring
+│   └── manager/
+│       ├── __init__.py       # Manager exports
+│       └── manager.py        # Resource lifecycle management
+├── tests/                    # Test suite
+├── docs/                     # Documentation
+├── environment.yml           # Conda dependencies
+├── pyproject.toml            # Package metadata
+├── AGENTS.md                 # Claude Code agent guidelines
+├── CONTRIBUTING.md           # Contribution guidelines
+├── KNOWN_ISSUES.md           # Known issues and workarounds
+├── SECURITY.md               # Security policy
+├── LICENSE                   # BSD-3-Clause
+└── CITATION.cff              # Citation metadata
+```
+
+### Module Responsibilities
+
+| Module                    | Purpose                                                                                                |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `train.py`                | Orchestrates training: curriculum learning, distributed datasets, gradient accumulation, checkpointing |
+| `inference.py`            | Runs trained models on new data, writes candidates to database                                         |
+| `models/vae.py`           | Beta-VAE with custom clustering loss (L_same, L_diff)                                                  |
+| `models/random_forest.py` | Scikit-learn RF wrapper with save/load                                                                 |
+| `data_generation.py`      | Uses setigen for synthetic signal injection with ON/OFF patterns                                       |
+| `preprocessing.py`        | Downsampling, normalization, data alignment                                                            |
+| `db/db.py`                | Thread-safe SQLite with async queue-based writes                                                       |
+| `monitor/monitor.py`      | Background thread for CPU/RAM/GPU metrics                                                              |
+| `manager/manager.py`      | Centralized resource lifecycle (pools, shared memory, cleanup)                                         |
+| `logger/`                 | Multi-handler logging with Slack integration                                                           |
+
+---
+
+## How It Works
+
+### The ON/OFF Cadence Pattern
+
+Radio telescopes observe potential technosignature targets using an "ON/OFF" cadence:
+
+- **ON**: Telescope points at target star
+- **OFF**: Telescope points at nearby reference position
+
+A real technosignature should appear only in ON observations (signal follows target), while RFI appears in both ON and OFF (signal is local interference).
+
+```
+Cadence: [ON₁] [OFF₁] [ON₂] [OFF₂] [ON₃] [OFF₃]
+Signal:   ██     --     ██     --     ██     --   ← Technosignature (target-dependent)
+RFI:      ██     ██     ██     ██     ██     ██   ← Interference (always present)
+```
+
+### Custom Clustering Loss
+
+The Beta-VAE uses a custom loss function that exploits this pattern:
+
+```
+L_total = L_reconstruction + β·L_KL + α·(L_true + L_false)
+```
+
+Where:
+
+- **L_reconstruction**: Standard VAE reconstruction loss
+- **L_KL**: KL divergence for latent regularization (β=1.5)
+- **L_true**: For real signals, minimize ON-ON distance, maximize ON-OFF distance
+- **L_false**: For RFI/noise, minimize all pairwise distances (all observations similar)
+
+```python
+# Pseudo-code for clustering loss
+def loss_same(a, b):  # Minimize distance
+    return mean(sum((a - b)²))
+
+def loss_diff(a, b):  # Maximize distance
+    return mean(1 / (sum((a - b)²) + ε))
+
+# True signals: ON observations cluster together, separate from OFF
+L_true = loss_same(ON₁, ON₂) + loss_same(ON₂, ON₃) + ...  # ON-ON close
+       + loss_diff(ON₁, OFF₁) + loss_diff(ON₁, OFF₂) + ... # ON-OFF far
+
+# False signals: All observations cluster together
+L_false = loss_same(all pairs)  # Everything close
+```
