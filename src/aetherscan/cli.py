@@ -37,6 +37,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# TODO: update descriptions
 def _add_train_arguments(subparsers):
     """Add training command arguments to subparser"""
     train_parser = subparsers.add_parser("train", help="Execute training pipeline")
@@ -229,10 +230,10 @@ def _add_train_arguments(subparsers):
         help="Batch size per GPU/device replica during training",
     )
     train_parser.add_argument(
-        "--global-batch-size",
+        "--effective-batch-size",
         type=int,
         default=None,
-        help="Effective global batch size for gradient accumulation across all replicas",
+        help="Effective batch size for gradient accumulation across all replicas",
     )
     train_parser.add_argument(
         "--per-replica-val-batch-size",
@@ -360,6 +361,7 @@ def _add_train_arguments(subparsers):
 
 
 # NOTE: come back to this later
+# TODO: update descriptions
 def _add_inference_arguments(subparsers):
     """Add inference command arguments to subparser"""
     inf_parser = subparsers.add_parser("inference", help="Execute inference pipeline")
@@ -395,28 +397,42 @@ def _add_inference_arguments(subparsers):
 
     # Inference configuration
     inf_parser.add_argument(
-        "--threshold",
+        "--encoder-path",
+        type=str,
+        default=None,
+        help="Path to trained VAE encoder model file (.keras)",
+    )
+    inf_parser.add_argument(
+        "--rf-path",
+        type=str,
+        default=None,
+        help="Path to trained Random Forest model file (.joblib)",
+    )
+    inf_parser.add_argument(
+        "--config-path",
+        type=str,
+        default=None,
+        help="Path to config file from corresponding training run (.json)",
+    )
+    inf_parser.add_argument(
+        "--per-replica-batch-size",
+        type=int,
+        default=None,
+        help="Batch size per GPU/device replica during inference",
+    )
+    inf_parser.add_argument(
+        "--classification-threshold",
         type=float,
         default=None,
-        help="Classification threshold (default: 0.9)",
+        help="Classification threshold for candidate detection",
     )
-    inf_parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Per-replica batch size for inference (default: 1728)",
-    )
-    inf_parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=None,
-        help="Chunk size for preprocessing (default: 10000)",
-    )
+
+    # Checkpoint configuration
     inf_parser.add_argument(
         "--save-tag",
         type=str,
         default=None,
-        help="Tag for database records (default: timestamp)",
+        help="Tag for current pipeline run. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
     )
 
 
@@ -432,6 +448,7 @@ def _add_evaluate_arguments(subparsers):
     # ...
 
 
+# NOTE: how to ensure only train_parser/inf_parser args get applied depending on whether train/inference is ran?
 def apply_args_to_config(args: argparse.Namespace) -> None:
     """
     Override config values with CLI arguments
@@ -510,7 +527,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.num_samples_rf = args.num_samples_rf
     if hasattr(args, "train_val_split") and args.train_val_split is not None:
         config.training.train_val_split = args.train_val_split
-    if hasattr(args, "per_replica_batch_size") and args.per_replica_batch_size is not None:
+    if (
+        hasattr(args, "per_replica_batch_size")
+        and args.per_replica_batch_size is not None
+        and getattr(args, "command", None) == "train"
+    ):
         config.training.per_replica_batch_size = args.per_replica_batch_size
     if hasattr(args, "effective_batch_size") and args.effective_batch_size is not None:
         config.training.effective_batch_size = args.effective_batch_size
@@ -561,14 +582,21 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     if hasattr(args, "save_tag") and args.save_tag is not None:
         config.checkpoint.save_tag = args.save_tag
 
-    # NOTE: come back to this later
     # Inference configuration
-    if hasattr(args, "threshold") and args.threshold is not None:
-        config.inference.classification_threshold = args.threshold
-    if hasattr(args, "batch_size") and args.batch_size is not None:
-        config.inference.per_replica_batch_size = args.batch_size
-    if hasattr(args, "chunk_size") and args.chunk_size is not None:
-        config.inference.chunk_size = args.chunk_size
+    if hasattr(args, "encoder_path") and args.encoder_path is not None:
+        config.inference.encoder_path = args.encoder_path
+    if hasattr(args, "rf_path") and args.rf_path is not None:
+        config.inference.rf_path = args.rf_path
+    if hasattr(args, "config_path") and args.config_path is not None:
+        config.inference.config_path = args.config_path
+    if hasattr(args, "classification_threshold") and args.classification_threshold is not None:
+        config.inference.classification_threshold = args.classification_threshold
+    if (
+        hasattr(args, "per_replica_batch_size")
+        and args.per_replica_batch_size is not None
+        and getattr(args, "command", None) == "inference"
+    ):
+        config.inference.per_replica_batch_size = args.per_replica_batch_size
 
 
 # NOTE: should we change validate_args() to validate_config() and run the tests on the final "applied" config singleton? or should we check both separately?
