@@ -38,7 +38,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### System Requirements
 
-Aetherscan's default configs have been tested on machines with the following _minimum_ specifications:
+Aetherscan's _default_ configs have been tested on machines with the following _minimum_ specifications:
 
 **Training**
 
@@ -52,7 +52,9 @@ Aetherscan's default configs have been tested on machines with the following _mi
 - 1x NVIDIA GPU, XGB VRAM, CUDA 12.2
 - X GB RAM
 
-If you're running into resource bottlenecks, consider adjusting the appropriate config values (e.g. lower `--num-samples-beta-vae` or `--signal-injection-chunk-size` if RAM is the limiting factor).
+> [!Tip]
+> If you're running into resource bottlenecks, consider adjusting the appropriate config values.
+> e.g. lower `--num-samples-beta-vae` or `--signal-injection-chunk-size` if RAM is the limiting factor.
 
 As the software matures, more detailed system requirements will be made available to the user.
 
