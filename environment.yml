@@ -1,3 +1,4 @@
+# TODO: test with fresh conda install on train & inference
 name: aetherscan
 channels:
   - conda-forge
