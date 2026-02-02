@@ -151,7 +151,7 @@ aetherscan inference
 # Run inference with custom parameters
 aetherscan inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
-    --threshold 0.9
+    --classification-threshold 0.9
 ```
 
 ---
@@ -206,14 +206,13 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
               [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
               [--train-files TRAIN_FILES [TRAIN_FILES ...]]
-              [--test-files TEST_FILES [TEST_FILES ...]]
               [--num-training-rounds NUM_TRAINING_ROUNDS]
               [--epochs-per-round EPOCHS_PER_ROUND]
-              [--num-samples-vae NUM_SAMPLES_VAE]
+              [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
               [--num-samples-rf NUM_SAMPLES_RF]
               [--train-val-split TRAIN_VAL_SPLIT]
               [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
-              [--global-batch-size GLOBAL_BATCH_SIZE]
+              [--effective-batch-size EFFECTIVE_BATCH_SIZE]
               [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
               [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
               [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
@@ -228,8 +227,8 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--patience-threshold PATIENCE_THRESHOLD]
               [--lr-reduction-factor LR_REDUCTION_FACTOR]
               [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
-              [--load-tag LOAD_TAG] [--load-dir LOAD_DIR]
-              [--save-tag SAVE_TAG]
+              [--load-dir LOAD_DIR] [--load-tag LOAD_TAG]
+              [--start-round START_ROUND] [--save-tag SAVE_TAG]
 
 options:
   -h, --help            show this help message and exit
@@ -296,16 +295,13 @@ options:
   --train-files TRAIN_FILES [TRAIN_FILES ...]
                         Space-separated list of training data file names
                         (e.g., real_filtered_LARGE_HIP110750.npy)
-  --test-files TEST_FILES [TEST_FILES ...]
-                        Space-separated list of testing data file names (e.g.,
-                        real_filtered_LARGE_test_HIP15638.npy)
   --num-training-rounds NUM_TRAINING_ROUNDS
                         Total number of training rounds in curriculum learning
                         schedule
   --epochs-per-round EPOCHS_PER_ROUND
                         Number of epochs to train the VAE per curriculum
                         learning round
-  --num-samples-vae NUM_SAMPLES_VAE
+  --num-samples-beta-vae NUM_SAMPLES_BETA_VAE
                         Number of training samples to generate for beta-VAE
                         per round (must be divisible by 4)
   --num-samples-rf NUM_SAMPLES_RF
@@ -316,9 +312,9 @@ options:
                         (e.g., 0.8 = 80% train, 20% val)
   --per-replica-batch-size PER_REPLICA_BATCH_SIZE
                         Batch size per GPU/device replica during training
-  --global-batch-size GLOBAL_BATCH_SIZE
-                        Effective global batch size for gradient accumulation
-                        across all replicas
+  --effective-batch-size EFFECTIVE_BATCH_SIZE
+                        Effective batch size for gradient accumulation across
+                        all replicas
   --per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE
                         Batch size per GPU/device replica during validation
   --signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE
@@ -367,20 +363,60 @@ options:
   --retry-delay RETRY_DELAY
                         Delay in seconds between retry attempts after training
                         failure
-  --load-tag LOAD_TAG   Model tag to resume training from. Accepted formats:
-                        final_vX, round_XX, YYYYMMDD_HHMMSS
-  --load-dir LOAD_DIR   Directory to load model tag from. Argument appended to
-                        AETHERSCAN_OUTPUT_PATH
+  --load-dir LOAD_DIR   Subdirectory for checkpoint loading (relative to
+                        --model-path)
+  --load-tag LOAD_TAG   Model tag for checkpoint loading. Accepted formats:
+                        final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX. If
+                        round_XX format used, and --start-round not specified,
+                        training will resume from round proceeding loaded
+                        checkpoint (i.e., XX + 1)
+  --start-round START_ROUND
+                        Round to begin/resume training from
   --save-tag SAVE_TAG   Tag for current pipeline run. Accepted formats:
-                        final_vX, round_XX, YYYYMMDD_HHMMSS
+                        final_vX, round_XX, test_vX. Current timestamp used
+                        (YYYYMMDD_HHMMSS) if none specified
 ```
 
 ### Inference Command Help
 
 The Aetherscan inference pipeline exposes the following CLI flags to the user:
 
-```bash
-...
+```
+usage:  inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+                  [--output-path OUTPUT_PATH]
+                  [--test-files TEST_FILES [TEST_FILES ...]]
+                  [--encoder-path ENCODER_PATH] [--rf-path RF_PATH]
+                  [--config-path CONFIG_PATH]
+                  [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
+                  [--classification-threshold CLASSIFICATION_THRESHOLD]
+                  [--save-tag SAVE_TAG]
+
+options:
+  -h, --help            show this help message and exit
+  --data-path DATA_PATH
+                        Path to data directory (overrides AETHERSCAN_DATA_PATH
+                        environment variable)
+  --model-path MODEL_PATH
+                        Path to model directory (overrides
+                        AETHERSCAN_MODEL_PATH environment variable)
+  --output-path OUTPUT_PATH
+                        Path to output directory (overrides
+                        AETHERSCAN_OUTPUT_PATH environment variable)
+  --test-files TEST_FILES [TEST_FILES ...]
+                        Space-separated list of testing data file names (e.g.,
+                        real_filtered_LARGE_test_HIP15638.npy)
+  --encoder-path ENCODER_PATH
+                        Path to trained VAE encoder model file (.keras)
+  --rf-path RF_PATH     Path to trained Random Forest model file (.joblib)
+  --config-path CONFIG_PATH
+                        Path to config file from corresponding training run
+                        (.json)
+  --per-replica-batch-size PER_REPLICA_BATCH_SIZE
+                        Batch size per GPU/device replica during inference
+  --classification-threshold CLASSIFICATION_THRESHOLD
+                        Classification threshold for candidate detection
+  --save-tag SAVE_TAG   Tag for current pipeline run. Current timestamp used
+                        (YYYYMMDD_HHMMSS) if none specified
 ```
 
 ---
