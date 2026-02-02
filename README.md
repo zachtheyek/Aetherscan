@@ -82,19 +82,31 @@ conda activate aetherscan
 **3. Set environment variables**
 
 ```bash
+# (Recommended) from .env file
+source .env
+```
+
+```bash
+# (Alternative) manual configuration
+
+# If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
 export AETHERSCAN_DATA_PATH="/path/to/data"
 export AETHERSCAN_MODEL_PATH="/path/to/models"
 export AETHERSCAN_OUTPUT_PATH="/path/to/outputs"
 
-# Optional: Slack integration
+# If none specified, Slack integration is automatically disabled
 export SLACK_BOT_TOKEN="xoxb-..."
 export SLACK_CHANNEL="#aetherscan-logs"
 ```
 
-**4. Run pipeline **
+**4. Run pipeline**
 
 ```bash
-SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src python -m aetherscan.main train --max-retries 1 --save-tag final_v1
+# Use inline environment variables to create a temporary environment frame that applies to the current command and subsequent descendants
+# Necessary for proper parent→child environment inheritance in multiprocess worker pools
+AETHERSCAN_DATA_PATH=$AETHERSCAN_DATA_PATH AETHERSCAN_MODEL_PATH=$AETHERSCAN_MODEL_PATH AETHERSCAN_OUTPUT_PATH=$AETHERSCAN_OUTPUT_PATH SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
+  python -m aetherscan.main {train|inference} \
+  --num-training-rounds 10 --save-tag final_v1  # Custom params (defaults to config.py values if none specified)
 ```
 
 ---
