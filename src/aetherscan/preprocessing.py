@@ -360,6 +360,7 @@ class DataPreprocessor:
         return background_array
 
     # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
+    # NOTE: calculate intensity statistics to overlay with training distributions (C' vs C)?
     def load_inference_data(self) -> np.ndarray:
         """
         Load & preprocess data for inference
