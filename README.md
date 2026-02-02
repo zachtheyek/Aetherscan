@@ -23,13 +23,11 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### Key features
 
-- **Multi-GPU training/inference** via TensorFlow MirroredStrategy with NCCL
-- **Gradient accumulation & on-demand CPU-to-GPU data streaming** for larger effective batch sizes under low VRAM constraints
-- **Weighted clustering loss** that implicitly encourage ON/OFF signal locality, mimicking traditional SETI filters
-- **Curriculum-based training regime** — progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty
-  stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with exponential backoff ensure graceful recovery from transient failures.
-- **Infrastructure Services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack alerts), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
+- **Data-parallel distributed training/inference** — gradients synchronized via TensorFlow MirroredStrategy with NCCL AllReduce. Gradient accumulation achieves larger effective batch sizes under low VRAM constraints. Generator-based distributed datasets stream data from CPU to GPU on-demand rather than loading full arrays into device memory.
+- **Cadence-aware clustering loss** — implicitly mimicks traditional signal locality filters, where real technosignatures appear only in ON observations (target-dependent), while RFI appears uniformly across all observations. The loss combines reconstruction, KL divergence (β-weighted), and true/false clustering (α-weighted) that encourage ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals.
+- **Curriculum-based training regime** — progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with exponential backoff ensure graceful recovery from transient failures.
 - **Zero-Copy Parallelism** — Shared memory architecture in preprocessing and data generation modules enables inter-process data sharing without serialization overhead. Custom SIGTERM handlers in pool workers ensure proper cleanup of shared memory handles during interrupts.
+- **Infrastructure Services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack alerts), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
 
 ---
 
