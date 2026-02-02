@@ -52,17 +52,16 @@ Aetherscan's _default_ configs have been tested on machines with the following _
 - 1x NVIDIA GPU, XGB VRAM, CUDA 12.2
 - X GB RAM
 
-> [!Tip]
-> If you're running into resource bottlenecks, consider adjusting the appropriate config values.
-> e.g. lower `--num-samples-beta-vae` or `--signal-injection-chunk-size` if RAM is the limiting factor.
-
 As the software matures, more detailed system requirements will be made available to the user.
+
+> [!Tip]
+> If you're running into resource bottlenecks, consider adjusting the appropriate config values (e.g. lower `--num-samples-beta-vae` or `--signal-injection-chunk-size` if RAM is the limiting factor).
 
 ### Run From Source
 
 > [!NOTE]
 > Aetherscan currently only supports running from source.
-> Installation via pip and containerized distributions will be available in a later release.
+> Installation via pip and containerized distributions will be made available in a later release.
 
 **1. Clone the repository**
 
@@ -105,8 +104,8 @@ export SLACK_CHANNEL="#aetherscan-logs"
 # Use inline environment variables to create a temporary environment frame that applies to the current command and subsequent descendants
 # Necessary for proper parent→child environment inheritance in multiprocess worker pools
 SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
-  python -m aetherscan.main {train|inference} \  # Specify training or inference
-  --save-tag final_v1   # Set CLI flags (uses config.py defaults if none specified)
+  python -m aetherscan.main {train|inference} \
+  --save-tag final_v1
 ```
 
 ---
@@ -118,9 +117,9 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 > Non-development workflows should avoid directly calling other scripts/modules.
 
 > [!NOTE]
-> The following section will avoid writing the inline environment variables for brevity
-> As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`
-> NOTE TO ZACH: update README once local builds with `pip install -e .` are working as expected
+> The following section will omit writing the inline environment variables for brevity.
+> As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`.
+> NOTE TO ZACH: update README once local builds with `pip install -e .` are working as expected.
 
 ### Training
 
@@ -405,7 +404,7 @@ See [CONTRIBUTING.md](/CONTRIBUTING.md) for full guidelines on workflow, project
 
 ## Citations
 
-If you use Aetherscan in your research, please cite it as below:
+If you use Aetherscan in your research, please cite it using GitHub's citations feature.
 
 <p align="center">
     <img src="docs/assets/SCR-20260203-enwz.png" alt="Citations">
