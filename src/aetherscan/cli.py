@@ -188,13 +188,6 @@ def _add_train_arguments(subparsers):
         default=None,
         help="Space-separated list of training data file names (e.g., real_filtered_LARGE_HIP110750.npy)",
     )
-    train_parser.add_argument(
-        "--test-files",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Space-separated list of testing data file names (e.g., real_filtered_LARGE_test_HIP15638.npy)",
-    )
 
     # Training configuration
     train_parser.add_argument(
@@ -397,7 +390,7 @@ def _add_inference_arguments(subparsers):
         type=str,
         nargs="+",
         default=None,
-        help="Space-separated list of test data file names to run inference on",
+        help="Space-separated list of testing data file names (e.g., real_filtered_LARGE_test_HIP15638.npy)",
     )
 
     # Inference configuration
