@@ -44,13 +44,13 @@ Aetherscan's _default_ configs have been tested on machines with the following _
 
 - Ubuntu 24.04
 - 1x NVIDIA GPU, 9GB VRAM, CUDA 12.2
-- 350 GB RAM
+- 400 GB RAM
 
 **Inference**
 
 - Ubuntu 24.04
-- 1x NVIDIA GPU, XGB VRAM, CUDA 12.2
-- X GB RAM
+- 1x NVIDIA GPU, 12GB VRAM, CUDA 12.2
+- 150 GB RAM
 
 As the software matures, more detailed system requirements will be made available to the user.
 
