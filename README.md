@@ -24,7 +24,7 @@ Aetherscan is a deep learning pipeline for detecting anomalies in radio spectrog
 
 The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("_A deep-learning search for technosignatures from 820 unique stars_"), extending the research prototype into a production-ready system capable of near real-time inference.
 
-### Key features
+### Key Features
 
 - **Data-parallel distributed training/inference** — Gradients synchronized via TensorFlow MirroredStrategy with NCCL AllReduce. Gradient accumulation achieves larger effective batch sizes under low VRAM constraints. Generator-based distributed datasets stream data from CPU to GPU on-demand, further lowering VRAM pressure.
 - **Cadence-aware clustering loss** — The composite loss combines standard beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimick traditional signal locality filters.
@@ -36,32 +36,29 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ## Installation
 
-# TODO:
-
 ### System Requirements
+
+Aetherscan's default configs have been tested on machines with the following _minimum_ specifications:
 
 **Training**
 
-| Resource | Minimum                   | Recommended                |
-| -------- | ------------------------- | -------------------------- |
-| GPU      | 1x NVIDIA GPU (16GB VRAM) | 4x NVIDIA A100 (80GB each) |
-| RAM      | 32 GB                     | 64+ GB                     |
-| Storage  | 100 GB                    | 500+ GB SSD                |
-| CUDA     | 12.2                      | 12.2+                      |
+- Ubuntu 24.04
+- 1x NVIDIA GPU, 9GB VRAM, CUDA 12.2
+- 350 GB RAM
 
 **Inference**
 
-| Resource | Minimum                  | Recommended               |
-| -------- | ------------------------ | ------------------------- |
-| GPU      | 1x NVIDIA GPU (8GB VRAM) | 1x NVIDIA GPU (16GB VRAM) |
-| RAM      | 16 GB                    | 32 GB                     |
-| Storage  | 50 GB                    | 100+ GB SSD               |
+- Ubuntu 24.04
+- 1x NVIDIA GPU, XGB VRAM, CUDA 12.2
+- X GB RAM
+
+As the software matures, more detailed system requirements will be available to the user.
+
+### Run From Source
 
 > [!NOTE]
 > Aetherscan currently only supports running from source.
 > Installation via pip and containerized distributions will be available in a later release.
-
-### Run From Source
 
 **1. Clone the repository**
 
@@ -110,59 +107,65 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 
 ---
 
-# TODO:
+## Usage Examples
 
-- main is the designated entry point. non-development workflows should avoid directly calling other scripts/modules
+> [!NOTE]
+> `main.py` is the designated pipeline entry point.
+> Non-development workflows should avoid directly calling other scripts/modules.
 
-## Usage
+> [!NOTE]
+> The following section will avoid writing the inline environment variables for brevity
+> As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`
+> NOTE TO ZACH: update README once local builds with `pip install -e .` are working as expected
 
 ### Training
 
 ```bash
-# Basic training run
+# Default training run
 aetherscan train
 
 # Training with custom parameters
 aetherscan train \
+    --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
     --num-training-rounds 20 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
-    --save-tag my_experiment
+    --save-tag test_v1
 
 # Resume from checkpoint
 aetherscan train \
+    --load-dir checkpoints \
     --load-tag round_10 \
-    --save-tag my_experiment_resumed
+    --save-tag test_v1
 ```
 
 ### Inference
 
 ```bash
-# Run inference on test data
-aetherscan inference \
-    --test-files data_file.npy \
-    --threshold 0.9
+# Default inference run
+aetherscan inference
 
-# With custom batch size
+# Run inference with custom parameters
 aetherscan inference \
-    --test-files data_file.npy \
-    --batch-size 1728 \
-    --save-tag inference_run_1
+    --test-files real_filtered_LARGE_test_HIP15638.npy \
+    --threshold 0.9
 ```
 
 ---
 
 ## CLI Reference
 
-Aetherscan uses a hierarchical configuration system with dataclass-based configs. Values can be set via:
+Aetherscan uses a hierarchical configuration system with dataclass-based configs, whose state can be modified both at command time and runtime. At command time, the user can specify values via:
 
 1. **Defaults** - Defined in `src/aetherscan/config.py`
 2. **Environment variables** - For paths and secrets
-3. **CLI arguments** - Override at runtime (highest priority)
+3. **CLI arguments** - Override defaults on startup
+
+At runtime, the singleton `Config` instance can be accessed via `get_config()` and modified programmatically.
 
 ### Top-Level Help
 
-Aetherscan supports both training and inference, invoked as the first positional argument.
+Aetherscan supports both training and inference, invoked using the first positional argument.
 
 ```
 usage: [-h] {train,inference} ...
@@ -373,56 +376,48 @@ options:
 
 The Aetherscan inference pipeline exposes the following CLI flags to the user:
 
-# TODO:
-
 ```bash
 ...
 ```
 
 ---
 
-## Citation
+## Contributing To Aetherscan
 
-If you use Aetherscan in your research, please cite:
+Contributions are welcome! Quick start:
 
-```bibtex
-@software{aetherscan,
-  author = {Yek, Zach and Ma, Peter Xiangyuan and Croft, Steve and Lebofsky, Matt},
-  title = {Aetherscan: Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale},
-  url = {https://github.com/zachtheyek/Aetherscan},
-  version = {0.1.0},
-  year = {2026}
-}
+```bash
+# Install pre-commit hooks
+pre-commit install
 ```
 
-See also the foundational paper:
+- Code style: PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/) (see pyproject.toml)
+- Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
+- PRs: Must be linked to an existing issue and pass all hooks
 
-```bibtex
-@article{ma2023deep,
-  title={A deep-learning search for technosignatures from 820 unique stars},
-  author={Ma, Peter Xiangyuan and Ng, Cherry and Croft, Steve and others},
-  journal={Nature Astronomy},
-  year={2023},
-  publisher={Nature Publishing Group}
-}
-```
+See [CONTRIBUTING.md](/CONTRIBUTING.md) for full guidelines on workflow, project structure, and testing.
 
 ---
 
-## Links
+## Citations
 
-- [Contributing Guidelines](CONTRIBUTING.md)
-- [Security Policy](SECURITY.md)
-- [Known Issues](KNOWN_ISSUES.md)
-- [License](LICENSE)
-- [Breakthrough Listen](https://breakthroughlisten.org/)
-- [Ma et al. 2023 Paper](https://arxiv.org/abs/2301.12670)
+If you use Aetherscan in your research, please cite it as below:
+
+<p align="center">
+    <img src="docs/assets/SCR-20260203-enwz.png" alt="Citations">
+</p>
+
+See [CITATION.cff](CITATION.cff) for details
 
 ---
 
-## Acknowledgments
+## License
 
-This project is part of [Breakthrough Listen](https://breakthroughlisten.org/), the largest scientific research program aimed at finding evidence of civilizations beyond Earth. The infrastructure and research is funded by the [Breakthrough Prize Foundation](https://breakthroughprize.org/).
+Aetherscan is distributed under the BSD-3-Clause license, a permissive license that allows commercial use, modification, and distribution with minimal restrictions. See [LICENSE](LICENSE) for details. All contributions to the project are assumed to be licensed under the same terms.
+
+---
+
+## Security
 
 ## Architecture
 
