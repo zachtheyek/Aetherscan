@@ -174,6 +174,7 @@ class TrainingConfig:
     patience_threshold: int = 3  # consecutive epochs with no improvement
     reduction_factor: float = 0.2  # 20% LR reduction
 
+    # NOTE: should we try an exponential backoff?
     # Fault tolerance params
     max_retries: int = 3
     retry_delay: int = 60  # seconds
