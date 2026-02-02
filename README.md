@@ -61,7 +61,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 > [!NOTE]
 > Aetherscan currently only supports running from source.
-> Alternative methods like install via pip or a container will be available soon.
+> Installation via pip and containerized distributions will be available soon.
 
 ### Run From Source
 
