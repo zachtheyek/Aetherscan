@@ -1,6 +1,6 @@
 <h1>
 <p align="center">
-  Aetherscan
+  🔭 Aetherscan 🔭
 </h1>
 <p align="center">
   <img src="docs/assets/f6005114-0f60-4acb-8b20-a5a4624816fc.png" alt="Aetherscan">
