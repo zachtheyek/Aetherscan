@@ -2,6 +2,9 @@
 <p align="center">
   Aetherscan
 </h1>
+<p align="center">
+  <img src="docs/assets/f6005114-0f60-4acb-8b20-a5a4624816fc.png" alt="Aetherscan">
+</p>
   <p align="center">
     Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale
     <br />
@@ -19,7 +22,7 @@
 
 Aetherscan is a deep learning pipeline for detecting anomalies in radio spectrograms with technosignature-like characteristics. It combines a beta-VAE (for dimensionality reduction/feature extraction) with a Random Forest ensemble (for candidate detection), trained on ~30m unique cadence snippets using a composite loss that balances reconstruction, KL divergence, and true/false clustering. The pipeline is designed with performance in mind, by default running single-node distributed training & inference, with zero-copy parallelism during pre- and post-processing.
 
-The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("A deep-learning search for technosignatures from 820 unique stars"), extending the research prototype into a production-ready system capable of near real-time inference.
+The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("_A deep-learning search for technosignatures from 820 unique stars_"), extending the research prototype into a production-ready system capable of near real-time inference.
 
 ### Key features
 
