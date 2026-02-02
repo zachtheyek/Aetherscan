@@ -91,11 +91,11 @@ def train_command():
         raise ValueError("get_config() returned None")
 
     logger.info("Configuration:")
-    logger.info(f"  Number of rounds: {config.training.num_training_rounds}")
-    logger.info(f"  Epochs per round: {config.training.epochs_per_round}")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
     logger.info(f"  Output path: {config.output_path}")
+    logger.info(f"  Number of rounds: {config.training.num_training_rounds}")
+    logger.info(f"  Epochs per round: {config.training.epochs_per_round}")
 
     # Setup GPU strategy
     try:
@@ -245,14 +245,14 @@ def inference_command():
     # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
 
     logger.info("Configuration:")
-    logger.info(f"  Files to process: {config.data.test_files}")
-    logger.info(f"  Encoder path: {config.inference.encoder_path}")
-    logger.info(f"  Random Forest path: {config.inference.rf_path}")
-    logger.info(f"  Config path: {config.inference.config_path}")
-    logger.info(f"  Classification threshold: {config.inference.classification_threshold}")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
     logger.info(f"  Output path: {config.output_path}")
+    logger.info(f"  Encoder path: {config.inference.encoder_path}")
+    logger.info(f"  Random Forest path: {config.inference.rf_path}")
+    logger.info(f"  Config path: {config.inference.config_path}")
+    logger.info(f"  Files to process: {config.data.test_files}")
+    logger.info(f"  Classification threshold: {config.inference.classification_threshold}")
 
     # Setup GPU strategy
     try:
