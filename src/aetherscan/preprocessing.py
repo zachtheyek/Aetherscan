@@ -540,9 +540,6 @@ class DataPreprocessor:
         for i in range(cadence_array.shape[0]):
             cadence_array[i] = log_norm(cadence_array[i])
 
-            if (i + 1) % 1000 == 0:
-                logger.info(f"Log normalized {i + 1}/{cadence_array.shape[0]} cadences")
-
         # Sanity check: print descriptive stats
         min_val = np.min(cadence_array)
         max_val = np.max(cadence_array)
