@@ -61,7 +61,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 > [!NOTE]
 > Aetherscan currently only supports running from source.
-> Installation via pip and containerized distributions will be available soon.
+> Installation via pip and containerized distributions will be available in a later release.
 
 ### Run From Source
 
@@ -82,7 +82,7 @@ conda activate aetherscan
 **3. Set environment variables**
 
 ```bash
-# (Recommended) from .env file
+# (Recommended) from .env file — see SECURITY.md
 source .env
 ```
 
@@ -90,6 +90,7 @@ source .env
 # (Alternative) manual configuration
 
 # If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
+# Note, CLI flags (--data-path, --model-path, --output-path) overrides environment variables
 export AETHERSCAN_DATA_PATH="/path/to/data"
 export AETHERSCAN_MODEL_PATH="/path/to/models"
 export AETHERSCAN_OUTPUT_PATH="/path/to/outputs"
@@ -104,12 +105,16 @@ export SLACK_CHANNEL="#aetherscan-logs"
 ```bash
 # Use inline environment variables to create a temporary environment frame that applies to the current command and subsequent descendants
 # Necessary for proper parent→child environment inheritance in multiprocess worker pools
-AETHERSCAN_DATA_PATH=$AETHERSCAN_DATA_PATH AETHERSCAN_MODEL_PATH=$AETHERSCAN_MODEL_PATH AETHERSCAN_OUTPUT_PATH=$AETHERSCAN_OUTPUT_PATH SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
-  python -m aetherscan.main {train|inference} \
-  --num-training-rounds 10 --save-tag final_v1  # Custom params (defaults to config.py values if none specified)
+SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
+  python -m aetherscan.main {train|inference} \  # Specify training or inference
+  --save-tag final_v1   # Set CLI flags (uses config.py defaults if none specified)
 ```
 
 ---
+
+# TODO:
+
+- main is the designated entry point. non-development workflows should avoid directly calling other scripts/modules
 
 ## Usage
 
@@ -147,60 +152,30 @@ aetherscan inference \
     --save-tag inference_run_1
 ```
 
-### Evaluation
-
-```bash
-# Evaluate model performance
-aetherscan evaluate
-```
-
 ---
 
-## Configuration
+## CLI Reference
 
 Aetherscan uses a hierarchical configuration system with dataclass-based configs. Values can be set via:
 
 1. **Defaults** - Defined in `src/aetherscan/config.py`
 2. **Environment variables** - For paths and secrets
-3. **CLI arguments** - Override at runtime
+3. **CLI arguments** - Override at runtime (highest priority)
 
-### Configuration Groups
+### Top-Level Help
 
-| Config Class         | Description          | Key Parameters                                                                |
-| -------------------- | -------------------- | ----------------------------------------------------------------------------- |
-| `BetaVAEConfig`      | VAE architecture     | `latent_dim=8`, `beta=1.5`, `alpha=10.0`                                      |
-| `RandomForestConfig` | RF classifier        | `n_estimators=1000`, `max_features='sqrt'`                                    |
-| `DataConfig`         | Data processing      | `num_observations=6`, `width_bin=4096`, `downsample_factor=8`                 |
-| `TrainingConfig`     | Training hyperparams | `num_training_rounds=20`, `epochs_per_round=100`, `effective_batch_size=3072` |
-| `InferenceConfig`    | Inference settings   | `classification_threshold=0.9`, `per_replica_batch_size=1728`                 |
-| `CheckpointConfig`   | Model persistence    | `load_tag`, `save_tag`, `start_round`                                         |
-| `LoggerConfig`       | Logging & Slack      | `slack_enabled=True`, `slack_broadcast_level='ERROR'`                         |
-| `MonitorConfig`      | Resource monitoring  | `monitor_interval=1.0`                                                        |
-| `DBConfig`           | Database settings    | `write_interval=5.0`, `write_buffer_max_size=100`                             |
-| `ManagerConfig`      | Resource management  | `n_processes=cpu_count()`, `pool_terminate_timeout=10.0`                      |
-
----
-
----
-
-## CLI Reference
-
-### No Command Provided
-
-When running `aetherscan` with no command:
+Aetherscan supports both training and inference, invoked as the first positional argument.
 
 ```
-usage: [-h] {train,inference,evaluate} ...
+usage: [-h] {train,inference} ...
 
-Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade
-DL pipeline for SETI @ scale
+Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale
 
 positional arguments:
-  {train,inference,evaluate}
+  {train,inference}
                         Command to execute
     train               Execute training pipeline
     inference           Execute inference pipeline
-    evaluate            Execute evaluation pipeline
 
 options:
   -h, --help            show this help message and exit
@@ -208,7 +183,7 @@ options:
 
 ### Train Command Help
 
-When running `aetherscan train --help`:
+The Aetherscan training pipeline exposes the following CLI flags to the user:
 
 ```
 usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
@@ -394,6 +369,16 @@ options:
                         AETHERSCAN_OUTPUT_PATH
   --save-tag SAVE_TAG   Tag for current pipeline run. Accepted formats:
                         final_vX, round_XX, YYYYMMDD_HHMMSS
+```
+
+### Inference Command Help
+
+The Aetherscan inference pipeline exposes the following CLI flags to the user:
+
+# TODO:
+
+```bash
+...
 ```
 
 ---
