@@ -34,7 +34,7 @@ repos:
       - id: trailing-whitespace
       # Check for private keys (vulnerability)
       - id: detect-private-key
-      # NOTE: this will cause merge commits to fail on github actions
+      # NOTE: this will cause merge commits to fail on github actions (safe to ignore)
       # Blocks commits directly to master branch
       - id: no-commit-to-branch
         args: ["--branch", "master"]
