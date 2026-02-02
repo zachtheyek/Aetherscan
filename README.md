@@ -27,18 +27,20 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 ### Key features
 
 - **Data-parallel distributed training/inference** — Gradients synchronized via TensorFlow MirroredStrategy with NCCL AllReduce. Gradient accumulation achieves larger effective batch sizes under low VRAM constraints. Generator-based distributed datasets stream data from CPU to GPU on-demand, further lowering VRAM pressure.
-- **Cadence-aware clustering loss** — The composite loss combines traditional beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimick traditional signal locality filters.
+- **Cadence-aware clustering loss** — The composite loss combines standard beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimick traditional signal locality filters.
 - **Curriculum-based training regime** — Progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with constant backoff ensure graceful recovery from transient failures.
-- **Multiprocess-accelerated data pipelines with zero-Copy Parallelism** — Preprocessing and data generation modules execute in parallel worker pools, while shared memory architecture enables inter-process communication without serialization overhead. Custom SIGTERM handlers ensure proper resource cleanup during interrupts.
-- **Infrastructure Services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack alerts), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
+- **Multiprocess-accelerated data pipelines with zero-Copy parallelism** — Preprocessing and data generation modules execute in parallel worker pools, while shared memory architecture enables inter-process communication without serialization overhead. Custom SIGTERM handlers in workers ensure proper resource cleanup even during interruptions.
+- **Infrastructure services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack webhooks), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
 
 ---
 
+## Installation
+
 # TODO:
 
-## System Requirements
+### System Requirements
 
-### Training
+**Training**
 
 | Resource | Minimum                   | Recommended                |
 | -------- | ------------------------- | -------------------------- |
@@ -47,17 +49,13 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 | Storage  | 100 GB                    | 500+ GB SSD                |
 | CUDA     | 12.2                      | 12.2+                      |
 
-### Inference
+**Inference**
 
 | Resource | Minimum                  | Recommended               |
 | -------- | ------------------------ | ------------------------- |
 | GPU      | 1x NVIDIA GPU (8GB VRAM) | 1x NVIDIA GPU (16GB VRAM) |
 | RAM      | 16 GB                    | 32 GB                     |
 | Storage  | 50 GB                    | 100+ GB SSD               |
-
----
-
-## Installation
 
 > [!NOTE]
 > Aetherscan currently only supports running from source.
