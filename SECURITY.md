@@ -29,7 +29,7 @@ If you discover a security vulnerability in Aetherscan:
 For vulnerabilities that could expose sensitive data or allow unauthorized access:
 
 1. **Do NOT open a public issue**
-2. Contact Zach directly on Slack or via email
+2. Contact Zach directly on Slack (preferred) or via email
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
