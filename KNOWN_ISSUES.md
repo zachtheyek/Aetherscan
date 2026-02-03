@@ -1,6 +1,6 @@
 # Known Issues
 
-This document lists known issues, limitations, and workarounds in Aetherscan
+This document lists known issues, limitations, and workarounds in Aetherscan.
 
 ## Reporting New Issues
 
