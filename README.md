@@ -31,26 +31,6 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ---
 
-## Quickstart
-
-```bash
-# Clone and setup
-git clone https://github.com/zachtheyek/Aetherscan.git
-cd Aetherscan
-conda env create -f environment.yml
-conda activate aetherscan
-
-# Run training
-PYTHONPATH=src python -m aetherscan.main train --save-tag my_first_run
-
-# Run inference (after training completes)
-PYTHONPATH=src python -m aetherscan.main inference --save-tag my_first_run
-```
-
-See [Installation](#installation) for environment variables and [System Requirements](#system-requirements) for hardware specs.
-
----
-
 ## Installation
 
 ### System Requirements
@@ -136,6 +116,7 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 > [!NOTE]
 > The following section will omit writing the inline environment variables for brevity.
 > As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`.
+> TODO: update README once local builds with `pip install -e .` are working as expected.
 
 ### Training
 
