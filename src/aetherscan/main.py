@@ -1,3 +1,4 @@
+# NOTE: remove time filters and strictly query db using tag. would need to ensure save-tag is unique at the start of each run
 # NOTE: is there a way to parallelize the CPU-GPU processing (e.g. while GPU is working on training/inference, CPU starts working on data_generation/preprocessing)
 """
 Entry point for Aetherscan Pipeline
