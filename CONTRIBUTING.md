@@ -392,4 +392,4 @@ If you accidentally commit sensitive data, see [SECURITY.md](SECURITY.md) for re
 
 - Check [README.md](README.md) for project overview
 - Check [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for known problems
-- Open a [GitHub Discussions](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8) for other questions
+- Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8) for other questions
