@@ -1,6 +1,6 @@
 # Known Issues
 
-This document lists known issues, limitations, and workarounds in Aetherscan. It is a constantly evolving document. If you've found an issue that's not listed here, see [`CONTRIBUTING.md`](/CONTRIBUTING.md) for next steps.
+This document lists known issues, limitations, and workarounds in Aetherscan
 
 ## Reporting New Issues
 
