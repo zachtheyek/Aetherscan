@@ -61,7 +61,7 @@ Aetherscan uses the following secrets that must be protected:
    - Production tokens should be rotated regularly
 
 3. **Store secrets securely**
-   - Use a secrets manager (e.g., HashiCorp Vault, Google Secrets Manager)
+   - Use a secrets manager (e.g., HashiCorp Vault or Google Secrets Manager)
    - Or encrypted environment files with restricted permissions
 
 4. **Audit access regularly**
