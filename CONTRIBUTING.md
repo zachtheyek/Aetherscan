@@ -34,7 +34,7 @@ The Aetherscan project has strict rules for AI usage. Please see the [AI usage p
 
 ### Code of Conduct
 
-See [`CODE_OF_CONDUCT.md`](/CODE_OF_CONDUCT.md).
+Basically just don't be an asshole. See [`CODE_OF_CONDUCT.md`](/CODE_OF_CONDUCT.md).
 
 ---
 
