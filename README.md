@@ -1,11 +1,8 @@
-<h1>
+<h1 align="center">📡 Aetherscan 📡</h1>
 <p align="center">
-  📡 Aetherscan 📡
-</h1>
-<p align="center">
-  <img src="docs/assets/f6005114-0f60-4acb-8b20-a5a4624816fc.png" alt="Aetherscan">
+    <img src="docs/assets/aetherscan-banner.png" alt="Aetherscan">
 </p>
-  <p align="center">
+<p align="center">
     Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale
     <br />
     <br />
@@ -27,10 +24,30 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 ### Key Features
 
 - **Data-parallel distributed training/inference** — Gradients synchronized via TensorFlow MirroredStrategy with NCCL AllReduce. Gradient accumulation allows for larger effective batch sizes under low VRAM constraints. Generator-based distributed datasets stream data from CPU to GPU on-demand, further lowering VRAM pressure.
-- **Cadence-aware clustering loss** — The composite loss combines standard beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimick traditional signal locality filters.
+- **Cadence-aware clustering loss** — The composite loss combines standard beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimic traditional signal locality filters.
 - **Curriculum-based training regime** — Progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with constant backoff ensure graceful recovery from transient failures.
 - **Multiprocess-accelerated data pipelines with zero-copy parallelism** — Preprocessing and data generation modules execute in parallel worker pools, while shared memory architecture enables inter-process communication without serialization overhead. Custom SIGTERM handlers in workers ensure proper resource cleanup even during interruptions.
 - **Infrastructure services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack webhooks), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
+
+---
+
+## Quickstart
+
+```bash
+# Clone and setup
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+conda env create -f environment.yml
+conda activate aetherscan
+
+# Run training
+PYTHONPATH=src python -m aetherscan.main train --save-tag my_first_run
+
+# Run inference (after training completes)
+PYTHONPATH=src python -m aetherscan.main inference --save-tag my_first_run
+```
+
+See [Installation](#installation) for environment variables and [System Requirements](#system-requirements) for hardware specs.
 
 ---
 
@@ -94,8 +111,8 @@ export AETHERSCAN_MODEL_PATH="/path/to/models"
 export AETHERSCAN_OUTPUT_PATH="/path/to/outputs"
 
 # If none specified, Slack integration is automatically disabled
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_CHANNEL="#aetherscan-logs"
+export SLACK_BOT_TOKEN="your-slack-bot-token"
+export SLACK_CHANNEL="your-slack-channel"
 ```
 
 **4. Run pipeline**
@@ -119,7 +136,6 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 > [!NOTE]
 > The following section will omit writing the inline environment variables for brevity.
 > As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`.
-> NOTE TO ZACH: update README once local builds with `pip install -e .` are working as expected.
 
 ### Training
 
@@ -371,7 +387,7 @@ options:
   --load-tag LOAD_TAG   Model tag for checkpoint loading. Accepted formats:
                         final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX. If
                         round_XX format used, and --start-round not specified,
-                        training will resume from round proceeding loaded
+                        training will resume from round following loaded
                         checkpoint (i.e., XX + 1)
   --start-round START_ROUND
                         Round to begin/resume training from
@@ -446,7 +462,7 @@ See [CONTRIBUTING.md](/CONTRIBUTING.md) for full guidelines on workflow, project
 If you use Aetherscan in your research, please cite it using GitHub's citations feature.
 
 <p align="center">
-    <img src="docs/assets/SCR-20260203-enwz.png" alt="Citations">
+    <img src="docs/assets/github-citation-button.png" alt="Citations">
 </p>
 
 See [CITATION.cff](CITATION.cff) for details
@@ -455,9 +471,14 @@ See [CITATION.cff](CITATION.cff) for details
 
 ## Security
 
-> [!WARNING]
->
-> # TODO: fill in this section after SECURITY.md is done
+For vulnerability reports, secrets management, and security best practices, see [SECURITY.md](SECURITY.md).
+
+**Quick reference:**
+
+- **Report vulnerabilities:** Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label (non-critical) or contact @zachtheyek on Slack (critical)
+- **Secrets:** Aetherscan uses `SLACK_BOT_TOKEN` for notifications — never commit tokens; use `.env` files
+- **Pre-commit hooks:** [gitleaks](https://github.com/gitleaks/gitleaks) scans for accidental secret commits
+- **Dependencies:** GitHub Dependabot monitors for vulnerable packages
 
 ---
 
