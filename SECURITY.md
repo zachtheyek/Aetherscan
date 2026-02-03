@@ -202,6 +202,5 @@ If a security incident occurs:
 
 ## Contact
 
-- **Security issues**: @zachtheyek on Slack
-- **General questions**: Open a GitHub Discussion or Slack thread
-- **Slack**: [#aetherscan-dev](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
+- **Security issues**: [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack
+- **General questions**: Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
