@@ -176,6 +176,10 @@ Aetherscan/
 | `manager/manager.py`      | Resource lifecycle management (pools, shared memory)       |
 | `logger/`                 | Multi-handler logging with Slack integration               |
 
+> [!WARNING]
+>
+> # TODO: add an architecture section?
+
 ---
 
 ## Pre-commit Hooks
