@@ -457,7 +457,7 @@ For vulnerability reports, secrets management, and security best practices, see 
 **Quick reference:**
 
 - **Report vulnerabilities:** Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label (non-critical) or contact @zachtheyek on Slack (critical)
-- **Secrets:** Aetherscan uses `SLACK_BOT_TOKEN` for notifications — never commit tokens; use `.env` files
+- **Secrets:** Aetherscan uses `SLACK_BOT_TOKEN` for alerts & notifications — never commit tokens; use `.env` files
 - **Pre-commit hooks:** [gitleaks](https://github.com/gitleaks/gitleaks) scans for accidental secret commits
 - **Dependencies:** GitHub Dependabot monitors for vulnerable packages
 
