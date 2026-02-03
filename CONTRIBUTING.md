@@ -104,6 +104,29 @@ git checkout -b feature/my_new_feature
 
 ---
 
+## Issue and PR Guidelines
+
+### Issue Authors
+
+- Automatically assigned as issue assignee
+- Provide clear reproduction steps for bugs
+- Include system information (use `utils/system_info.sh` and append outputs as attachments)
+
+### PR Authors
+
+- Link to the associated issue
+- Provide a clear description of changes
+- Update tests and documentation if applicable
+- Respond to review feedback
+
+### Reviewers
+
+- [`CODEOWNERS`](/CODEOWNERS) are automatically assigned as reviewers
+- Focus on correctness, performance, and maintainability
+- Be constructive and specific in feedback
+
+---
+
 ## Project Structure
 
 ```
@@ -347,36 +370,6 @@ When updating dependencies, ensure all relevant files are synchronized:
 
 > [!TIP]
 > When adding a new Python package, always update `environment.yml` first, then test with a fresh conda environment before committing.
-
----
-
-## Communications
-
-- [**GitHub Discussions**](https://github.com/zachtheyek/Aetherscan/discussions) or [**Slack**](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8): Questions and general development discussions
-- [**GitHub Issues**](https://github.com/zachtheyek/Aetherscan/issues): Actionable bug reports and feature requests
-
----
-
-## Issue and PR Guidelines
-
-### Issue Authors
-
-- Automatically assigned as issue assignee
-- Provide clear reproduction steps for bugs
-- Include system information (use `utils/system_info.sh` and append outputs as attachments)
-
-### PR Authors
-
-- Link to the associated issue
-- Provide a clear description of changes
-- Update tests and documentation if applicable
-- Respond to review feedback
-
-### Reviewers
-
-- [`CODEOWNERS`](/CODEOWNERS) are automatically assigned as reviewers
-- Focus on correctness, performance, and maintainability
-- Be constructive and specific in feedback
 
 ---
 
