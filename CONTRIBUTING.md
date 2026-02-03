@@ -190,9 +190,11 @@ The project uses pre-commit hooks for code quality:
 # .pre-commit-config.yaml hooks:
 - ruff # Linting
 - ruff-format # Formatting
-- pre-commit-hooks # General-purpose safety
+- pre-commit-hooks # General-purpose checks
 - gitleaks # Secret detection
 ```
+
+Once installed using `pre-commit install`, the hooks should run automatically on every commit, and block changes that don't pass all hooks. Note that pre-commit will attempt to automatically fix "simple" issues, so if any hooks are failing, you may simply need to run `git add` and `git commit` again. For more "complex" cases, manual intervention is needed. See the pre-commit messages for details.
 
 ### Running Manually
 
