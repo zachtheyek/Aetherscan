@@ -6,10 +6,6 @@ Thank you for your interest in contributing to Aetherscan! This document describ
 
 ## Getting Started
 
-### AI Usage
-
-The Aetherscan project has strict rules for AI usage. Please see the [AI usage policy](/AI_POLICY.md) before proceeding. **This is very important**.
-
 ### Prerequisites
 
 - Python 3.10+
@@ -32,26 +28,39 @@ conda activate aetherscan
 pre-commit install
 ```
 
+### AI Usage
+
+The Aetherscan project has strict rules for AI usage. Please see the [AI usage policy](/AI_POLICY.md) before proceeding. **This is very important**.
+
+### Code of Conduct
+
+See [`CODE_OF_CONDUCT.md`](/CODE_OF_CONDUCT.md).
+
 ---
 
 ## Contribution Workflow
 
-**All issues are actionable, and all PRs must be tied to an existing issue.**
+> [!TIP]
+> **All issues are actionable, and all PRs must be tied to an existing issue.**
 
 ### 1. Start a Discussion
 
 Before making any changes:
 
-- First check to see if any related issues already exist
+- First check to see if any related PRs, issues, or discussions already exist
 - If not, open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
 
 ### 2. Open an Issue
 
-Once a discussion has reached a well-understood state:
+Once a discussion has reached a well-understood problem statement:
 
-- Open a GitHub Issue using the appropriate template
+- Open a [GitHub Issue](https://github.com/zachtheyek/Aetherscan/issues) using the appropriate template
 - Claude will automatically triage and assign your issue a label
-- Optionally, if you'd like to tackle this PR, make your interest known to the maintainers
+- Optionally, if you'd like to tackle this PR, make your interest known to the maintainers within the issue itself
+
+> [!WARNING]
+>
+> "Drive-by" issues (i.e. issues opened without prior discussions with maintainers) may be closed without review or explanation
 
 ### 3. Create a Feature Branch
 
@@ -69,24 +78,29 @@ git checkout -b feature/my_new_feature
 
 ### 4. Implement Changes
 
-- Follow the code conventions in `pyproject.toml`
-- Write tests for new functionality if applicable
-- Update documentation if needed
 - Keep commits focused and well-described
+- Follow the code conventions in `pyproject.toml` (PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/))
+- Write tests and update documentation if applicable
 
 ### 5. Submit a Pull Request
 
 - Ensure your branch is up-to-date with `master` (use `git rebase`, not `git merge`)
 - All commits must have verified GPG signatures
 - Fill out the PR template completely
-- Link the associated issue
+- Link your PR to the associated issue
+
+> [!WARNING]
+>
+> PRs not tied to an existing issue may be closed without review or explanation
 
 ### 6. Code Review
 
 - PRs require at least one maintainer approval
 - Address review feedback promptly
 - Note: PR approvals are voided when new commits are pushed
-- Claude will automatically provide a code review when the PR is set to "ready for review"
+
+> [!NOTE]
+> Claude will perform an automatic code review when your PR is set to "ready for review". You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
 
 ---
 
@@ -120,19 +134,28 @@ Aetherscan/
 │   └── manager/
 │       ├── __init__.py       # Manager exports
 │       └── manager.py        # Resource lifecycle management
-├── tests/                    # Test suite
-│   └── ...
 ├── docs/                     # Additional documentation
 │   └── ...
+├── tests/                    # Test suite
+│   └── ...
+├── utils/                    # Utility scripts
+│   └── ...
+├── .github/                  # CI/CD workflows
+│   └── ...
+├── .gitignore                # Local gitignore
+├── .pre-commit-config.yaml   # Pre-commit hook configuration
 ├── environment.yml           # Conda dependencies
 ├── pyproject.toml            # Package metadata, ruff config
-├── .pre-commit-config.yaml   # Pre-commit hook configuration
 ├── AGENTS.md                 # AI agent guidelines
+├── AI_POLICY.md              # AI usage policy
+├── CITATION.cff              # Citation metadata
+├── CODE_OF_CONDUCT.md        # Core values guidelines
+├── CODEOWNERS                # Code ownership
 ├── CONTRIBUTING.md           # This file
 ├── KNOWN_ISSUES.md           # Known issues and workarounds
-├── SECURITY.md               # Security policy
 ├── LICENSE                   # Project license
-└── CITATION.cff              # Citation metadata
+├── README.md                 # Project overview, installation & usage guides
+└── SECURITY.md               # Security policy
 ```
 
 ### Module Responsibilities
@@ -144,7 +167,6 @@ Aetherscan/
 | `config.py`               | All configuration dataclasses and defaults                 |
 | `train.py`                | Training orchestration, curriculum learning, checkpointing |
 | `inference.py`            | Model inference, candidate detection                       |
-| `evaluate.py`             | Model evaluation metrics                                   |
 | `preprocessing.py`        | Data preprocessing, normalization                          |
 | `data_generation.py`      | Synthetic signal injection using setigen                   |
 | `models/vae.py`           | Beta-VAE architecture with custom clustering loss          |
@@ -193,7 +215,7 @@ git commit --no-verify -m "message"
 
 ### Ruff Configuration
 
-The project uses Ruff for linting and formatting (see `pyproject.toml`):
+The project uses Ruff for linting and formatting, and follows the PEP-8 style guides with minor relaxations (see `pyproject.toml`):
 
 - **Line length**: 100 characters
 - **Target version**: Python 3.10
@@ -227,9 +249,21 @@ def load_train_data(config: Config) -> tuple[np.ndarray, np.ndarray]:
     ...
 ```
 
+| Element       | Convention  | Example                  |
+| ------------- | ----------- | ------------------------ |
+| Classes       | PascalCase  | `DataGenerator`          |
+| Functions     | snake_case  | `run_training_pipeline`  |
+| Constants     | UPPER_SNAKE | `MAX_RETRIES`            |
+| Private       | \_prefix    | `_init_worker`           |
+| Config fields | snake_case  | `per_replica_batch_size` |
+
 ---
 
 ## Testing
+
+> [!WARNING]
+>
+> # TODO: update this section once test suite is operational
 
 ### Running Tests
 
@@ -272,23 +306,45 @@ def test_config_defaults(config):
 
 ---
 
-## Version Updates
+## New Version Releases
+
+> [!WARNING]
+>
+> # TODO: add tagged releases workflow when available
 
 When releasing a new version, update these files:
 
-| File                         | Location                        | Example                 |
-| ---------------------------- | ------------------------------- | ----------------------- |
-| `pyproject.toml`             | `version = "X.Y.Z"`             | `version = "1.0.0"`     |
-| `src/aetherscan/__init__.py` | `__version__ = "X.Y.Z"`         | `__version__ = "1.0.0"` |
-| `CITATION.cff`               | `version:` and `date-released:` | `version: 1.0.0`        |
+| File                         | Location                                  | Example                                             |
+| ---------------------------- | ----------------------------------------- | --------------------------------------------------- |
+| `pyproject.toml`             | `version = "X.Y.Z"`                       | `version = "1.0.0"`                                 |
+| `src/aetherscan/__init__.py` | `__version__ = "X.Y.Z"`                   | `__version__ = "1.0.0"`                             |
+| `CITATION.cff`               | `version:` and `date-released:`           | `version: 1.0.0` and `date-released: 2026-01-01`    |
+| `SECURITY.md`                | Under "Supported Versions", if applicable | see [`SECURITY.md`](SECURITY.md#supported-versions) |
+
+### Dependency Updates
+
+When updating dependencies, ensure all relevant files are synchronized:
+
+| File                                       | Dependencies                                        | When to Update                                        |
+| ------------------------------------------ | --------------------------------------------------- | ----------------------------------------------------- |
+| `environment.yml`                          | Conda/pip packages (Python, TensorFlow, CUDA, etc.) | Adding/updating any Python or CUDA dependency         |
+| `pyproject.toml`                           | Dev dependencies (ruff), Python version             | Adding dev tools, changing Python version requirement |
+| `.pre-commit-config.yaml`                  | Pre-commit hooks (ruff, gitleaks, pre-commit-hooks) | Updating linter/formatter or adding new hooks         |
+| `README.md`                                | Version badges and system requirements              | Major version changes to Python, TensorFlow, or CUDA  |
+| `CONTRIBUTING.md`                          | Prerequisites section                               | Major version changes to Python, CUDA, or tooling     |
+| `.github/workflows/pre-commit.yml`         | Python version, action versions                     | Changing Python version or updating CI actions        |
+| `.github/workflows/claude*.yml`            | Claude action versions, model specification         | Updating Claude Code action or model                  |
+| `.github/workflows/auto-assign-author.yml` | GitHub action versions                              | Updating GitHub Actions versions                      |
+
+> [!TIP]
+> When adding a new Python package, always update `environment.yml` first, then test with a fresh conda environment before committing.
 
 ---
 
-## Communication
+## Communications
 
-- **Slack**: [#aetherscan-dev](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8) for development discussions
-- **GitHub Issues**: Bug reports and feature requests
-- **GitHub Discussions**: Questions and general discussion
+- [**GitHub Discussions**](https://github.com/zachtheyek/Aetherscan/discussions) or [**Slack**](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8): Questions and general development discussions
+- [**GitHub Issues**](https://github.com/zachtheyek/Aetherscan/issues): Actionable bug reports and feature requests
 
 ---
 
@@ -298,18 +354,18 @@ When releasing a new version, update these files:
 
 - Automatically assigned as issue assignee
 - Provide clear reproduction steps for bugs
-- Include system information (OS, GPU, CUDA version)
+- Include system information (use `utils/system_info.sh` and append outputs as attachments)
 
 ### PR Authors
 
 - Link to the associated issue
 - Provide a clear description of changes
-- Update tests and documentation
+- Update tests and documentation if applicable
 - Respond to review feedback
 
 ### Reviewers
 
-- CODEOWNERS are automatically assigned as reviewers
+- [`CODEOWNERS`](/CODEOWNERS) are automatically assigned as reviewers
 - Focus on correctness, performance, and maintainability
 - Be constructive and specific in feedback
 
@@ -317,7 +373,7 @@ When releasing a new version, update these files:
 
 ## Sensitive Data Warning
 
-**DO NOT commit sensitive information.** Pre-commit hooks scan for secrets using gitleaks, but this is not foolproof.
+**DO NOT commit sensitive information.** Pre-commit hooks scan for secrets using [gitleaks](https://github.com/gitleaks/gitleaks), but this is not foolproof.
 
 Never commit:
 
@@ -333,6 +389,5 @@ If you accidentally commit sensitive data, see [SECURITY.md](SECURITY.md) for re
 ## Questions?
 
 - Check [README.md](README.md) for project overview
-- Check [AGENTS.md](AGENTS.md) for code conventions
 - Check [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for known problems
-- Open a GitHub Discussion for other questions
+- Open a [GitHub Discussions](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8) for other questions
