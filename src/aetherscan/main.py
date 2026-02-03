@@ -285,7 +285,7 @@ def inference_command():
     try:
         results = run_inference_pipeline(
             cadence_data=cadence_data,
-            npy_path=...,
+            npy_path=config.data.test_files[0],  # TODO: Handle multiple test files properly
             strategy=strategy,
             # TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
         )
