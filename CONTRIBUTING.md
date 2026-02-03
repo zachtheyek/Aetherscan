@@ -222,7 +222,7 @@ git commit --no-verify -m "message"
 
 ### Ruff Configuration
 
-The project uses Ruff for linting and formatting, and follows the PEP-8 style guides with minor relaxations (see `pyproject.toml`):
+The project uses [ruff](https://docs.astral.sh/ruff/) for linting and formatting, and follows the PEP-8 style guides with minor relaxations (see `pyproject.toml`):
 
 - **Line length**: 100 characters
 - **Target version**: Python 3.10
@@ -255,6 +255,8 @@ def load_train_data(config: Config) -> tuple[np.ndarray, np.ndarray]:
     """
     ...
 ```
+
+### Naming Conventions
 
 | Element       | Convention  | Example                  |
 | ------------- | ----------- | ------------------------ |
@@ -335,10 +337,10 @@ When updating dependencies, ensure all relevant files are synchronized:
 | File                                       | Dependencies                                        | When to Update                                        |
 | ------------------------------------------ | --------------------------------------------------- | ----------------------------------------------------- |
 | `environment.yml`                          | Conda/pip packages (Python, TensorFlow, CUDA, etc.) | Adding/updating any Python or CUDA dependency         |
-| `pyproject.toml`                           | Dev dependencies (ruff), Python version             | Adding dev tools, changing Python version requirement |
-| `.pre-commit-config.yaml`                  | Pre-commit hooks (ruff, gitleaks, pre-commit-hooks) | Updating linter/formatter or adding new hooks         |
+| `pyproject.toml`                           | Python version, Dev dependencies (ruff)             | Changing Python version requirement, adding dev tools |
 | `README.md`                                | Version badges and system requirements              | Major version changes to Python, TensorFlow, or CUDA  |
 | `CONTRIBUTING.md`                          | Prerequisites section                               | Major version changes to Python, CUDA, or tooling     |
+| `.pre-commit-config.yaml`                  | Pre-commit hooks (ruff, gitleaks, pre-commit-hooks) | Updating linter/formatter or adding new hooks         |
 | `.github/workflows/pre-commit.yml`         | Python version, action versions                     | Changing Python version or updating CI actions        |
 | `.github/workflows/claude*.yml`            | Claude action versions, model specification         | Updating Claude Code action or model                  |
 | `.github/workflows/auto-assign-author.yml` | GitHub action versions                              | Updating GitHub Actions versions                      |
