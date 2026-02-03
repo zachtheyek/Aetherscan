@@ -80,12 +80,7 @@ If you suspect a token has been compromised, rotate immediately:
 2. Select the Aetherscan app
 3. Navigate to "OAuth & Permissions"
 4. Click "Revoke Tokens"
-5. Reinstall the Aetherscan app and generate a new token with the following scopes:
-   a. channels:read
-   b. chat:write
-   c. files:write
-   d. groups:read
-   e. incoming-webhook
+5. Reinstall the Aetherscan app and generate a new token with the following scopes: `channels:read`, `chat:write`, `files:write`, `groups:read`, `incoming-webhook`
 6. Update `SLACK_BOT_TOKEN` in all deployment environments
 7. Verify the new token works: `aetherscan train --help` (should not show Slack errors)
 
