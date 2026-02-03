@@ -100,7 +100,7 @@ git checkout -b feature/my_new_feature
 - Note: PR approvals are voided when new commits are pushed
 
 > [!NOTE]
-> Claude will perform an automatic code review when your PR is set to "ready for review". You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
+> Claude will perform an automatic code review when your PR is first set to "ready for review". You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
 
 ---
 
