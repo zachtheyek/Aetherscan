@@ -360,6 +360,7 @@ class DataPreprocessor:
         return background_array
 
     # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
+    # NOTE: calculate intensity statistics to overlay with training distributions (C' vs C)?
     def load_inference_data(self) -> np.ndarray:
         """
         Load & preprocess data for inference
@@ -539,9 +540,6 @@ class DataPreprocessor:
         logger.info("Applying log normalization")
         for i in range(cadence_array.shape[0]):
             cadence_array[i] = log_norm(cadence_array[i])
-
-            if (i + 1) % 1000 == 0:
-                logger.info(f"Log normalized {i + 1}/{cadence_array.shape[0]} cadences")
 
         # Sanity check: print descriptive stats
         min_val = np.min(cadence_array)

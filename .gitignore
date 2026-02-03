@@ -10,5 +10,5 @@ rzad056.pdf
 # Outputs directory
 outputs/
 
-# Local development environment (for LSP)
-environment_nocuda.yml
+# Temporary docs
+docs/PRESENTATION_OUTLINE.md

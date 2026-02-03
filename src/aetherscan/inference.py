@@ -89,9 +89,10 @@ def prepare_distributed_inf_dataset(
     # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
     # distributing our datasets
     # Alternatively, we could also pad the data instead of trimming
-    n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
-
-    logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
+    # n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
+    #
+    # logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
+    n_inf_trimmed = n_samples
 
     # Sanity check: verify there's enough samples to run inference
     if n_inf_trimmed == 0:

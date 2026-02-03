@@ -174,6 +174,7 @@ class TrainingConfig:
     patience_threshold: int = 3  # consecutive epochs with no improvement
     reduction_factor: float = 0.2  # 20% LR reduction
 
+    # NOTE: should we try an exponential backoff?
     # Fault tolerance params
     max_retries: int = 3
     retry_delay: int = 60  # seconds
@@ -187,7 +188,7 @@ class InferenceConfig:
     encoder_path: str = None
     rf_path: str = None
     config_path: str = None
-    per_replica_batch_size: int = 1728  # Divisible by both 4 & 6 for GPU alignment
+    per_replica_batch_size: int = 2048  # NOTE: come back to this later
     classification_threshold: float = 0.9
 
 

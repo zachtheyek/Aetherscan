@@ -1,4 +1,5 @@
 # NOTE: come back to this later
+# NOTE: make sure slack integration automatically disabled if token or channel not specified (without affecting other parts of the pipeline)
 # BUG: batched slack messages should be colored by the highest priority message (e.g. red if any message in the batch has priority ERROR). currently seeing INFO + WARN + ERROR be colored yellow (WARN)
 # BUG: sometimes certain batched messages that are too long get cut off (even after clicking "show more"). they just end with "..."
 """

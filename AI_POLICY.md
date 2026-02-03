@@ -10,8 +10,6 @@ Aetherscan has strict rules for AI usage:
 
 - **Issues and discussions can use AI assistance but must have a full human-in-the-loop.** This means that any content generated with AI must have been reviewed _and edited_ by a human before submission. AI is very good at being overly verbose and including noise that distracts from the main point. Humans must do their research and trim this down.
 
-These rules do not apply to core maintainers, as they've proven themselves trustworthy to apply good judgement, and may thus use AI tools at their discretion.
-
 ## There are Humans Here
 
 Please remember that Aetherscan is maintained by humans (in fact, just one person at the time of writing).
@@ -22,7 +20,7 @@ In a perfect world, AI would produce high-quality, accurate work every time. But
 
 ## AI is Welcome Here
 
-Aetherscan is written with plenty of AI assistance, and many maintainers embrace AI tools as a productive tool in their workflow. As a project, we welcome AI as a tool!
+Aetherscan is written with plenty of AI assistance, and we embrace AI tools as a productive tool in our workflow. As a project, we welcome AI as a tool!
 
 **Our reason for the strict AI policy is not due to an anti-AI stance**, but instead due to the number of highly unqualified people using AI. It's the people, not the tools, that are the problem.
 
