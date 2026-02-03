@@ -433,7 +433,7 @@ Common startup warnings (CUDA factory registration, TensorRT, CPU optimization m
 - Multiprocessing pool cleanup behavior
 - Slack integration edge cases
 
-If you encounter an issue not listed there, see [Contributing](#contributing-to-aetherscan) for steps on how to report it.
+If you encounter an issue not listed there, see [`CONTRIBUTING.md`](#contributing-to-aetherscan) for steps on how to report it.
 
 ---
 
@@ -450,7 +450,7 @@ pre-commit install
 - Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
 - PRs: Must be linked to an existing issue and pass all hooks
 
-See [CONTRIBUTING.md](/CONTRIBUTING.md) for full guidelines on workflow, project structure, and testing.
+See [`CONTRIBUTING.md`](/CONTRIBUTING.md) for full guidelines on workflow, project structure, and testing.
 
 ---
 
@@ -462,13 +462,13 @@ If you use Aetherscan in your research, please cite it using GitHub's citations 
     <img src="docs/assets/github-citation-button.png" alt="Citations">
 </p>
 
-See [CITATION.cff](CITATION.cff) for details
+See [`CITATION.cff`](CITATION.cff) for details
 
 ---
 
 ## Security
 
-For vulnerability reports, secrets management, and security best practices, see [SECURITY.md](SECURITY.md).
+For vulnerability reports, secrets management, and security best practices, see [`SECURITY.md`](SECURITY.md).
 
 **Quick reference:**
 
