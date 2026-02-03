@@ -258,7 +258,7 @@ class InferencePipeline:
             Dict with inference statistics
         """
         # Sanity check
-        if not (self.encoder or self.rf_model):
+        if not self.encoder or not self.rf_model:
             raise RuntimeError("Encoder and/or Random Forest not initialized")
 
         try:
