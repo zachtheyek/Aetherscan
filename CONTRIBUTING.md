@@ -6,6 +6,10 @@ Thank you for your interest in contributing to Aetherscan! This document describ
 
 ## Getting Started
 
+### AI Usage
+
+The Aetherscan project has strict rules for AI usage. Please see the [AI usage policy](/AI_POLICY.md) before proceeding. **This is very important**.
+
 ### Prerequisites
 
 - Python 3.10+
@@ -24,9 +28,6 @@ cd Aetherscan
 conda env create -f environment.yml
 conda activate aetherscan
 
-# Install in development mode
-pip install -e ".[dev]"
-
 # Install pre-commit hooks
 pre-commit install
 ```
@@ -35,32 +36,32 @@ pre-commit install
 
 ## Contribution Workflow
 
+**All issues are actionable, and all PRs must be tied to an existing issue.**
+
 ### 1. Start a Discussion
 
-Before implementing significant changes:
+Before making any changes:
 
-- **Questions or problems**: Start a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or Slack thread ([#aetherscan-dev](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8))
-- **Feature requests**: Open a GitHub Discussion first to gauge interest
-- **Bug reports**: Check existing issues, then open a new one with reproduction steps
+- First check to see if any related issues already exist
+- If not, open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
 
 ### 2. Open an Issue
 
-Once maintainers have acknowledged your query:
+Once a discussion has reached a well-understood state:
 
 - Open a GitHub Issue using the appropriate template
-- Wait for maintainer approval before starting implementation
-- All PRs must be tied to an existing issue
+- Claude will automatically triage and assign your issue a label
+- Optionally, if you'd like to tackle this PR, make your interest known to the maintainers
 
 ### 3. Create a Feature Branch
 
 Branch naming convention: `category/description`
 
-| Category | Use Case | Example |
-|----------|----------|---------|
-| `feature/` | New functionality | `feature/db_integration` |
-| `hotfix/` | Critical bug fixes | `hotfix/cpu_sampling_rate` |
-| `release/` | Release preparation | `release/aetherscan_1.0.0` |
-| `misc/` | Documentation, tooling | `misc/plot_improvements` |
+| Category   | Use Case           | Example                    |
+| ---------- | ------------------ | -------------------------- |
+| `feature/` | New functionality  | `feature/db_integration`   |
+| `hotfix/`  | Bug fixes          | `hotfix/cpu_sampling_rate` |
+| `misc/`    | Housekeeping tasks | `misc/update_docs`         |
 
 ```bash
 git checkout -b feature/my_new_feature
@@ -68,8 +69,8 @@ git checkout -b feature/my_new_feature
 
 ### 4. Implement Changes
 
-- Follow the code conventions in [AGENTS.md](AGENTS.md)
-- Write tests for new functionality
+- Follow the code conventions in `pyproject.toml`
+- Write tests for new functionality if applicable
 - Update documentation if needed
 - Keep commits focused and well-described
 
@@ -99,14 +100,13 @@ Aetherscan/
 │   ├── cli.py                # Argument parsing, validation
 │   ├── config.py             # Configuration dataclasses
 │   ├── train.py              # Training orchestration
-│   ├── inference.py          # Inference pipeline
-│   ├── evaluate.py           # Evaluation metrics
+│   ├── inference.py          # Inference orchestration
 │   ├── preprocessing.py      # Data preprocessing
 │   ├── data_generation.py    # Synthetic signal injection
 │   ├── models/
 │   │   ├── __init__.py       # Model exports
 │   │   ├── vae.py            # Beta-VAE architecture
-│   │   └── random_forest.py  # RF classifier wrapper
+│   │   └── random_forest.py  # RF classifier
 │   ├── db/
 │   │   ├── __init__.py       # Database exports
 │   │   └── db.py             # SQLite async writer
@@ -121,10 +121,9 @@ Aetherscan/
 │       ├── __init__.py       # Manager exports
 │       └── manager.py        # Resource lifecycle management
 ├── tests/                    # Test suite
-│   ├── test_config.py
-│   ├── test_data_generation.py
 │   └── ...
 ├── docs/                     # Additional documentation
+│   └── ...
 ├── environment.yml           # Conda dependencies
 ├── pyproject.toml            # Package metadata, ruff config
 ├── .pre-commit-config.yaml   # Pre-commit hook configuration
@@ -132,28 +131,28 @@ Aetherscan/
 ├── CONTRIBUTING.md           # This file
 ├── KNOWN_ISSUES.md           # Known issues and workarounds
 ├── SECURITY.md               # Security policy
-├── LICENSE                   # BSD-3-Clause
+├── LICENSE                   # Project license
 └── CITATION.cff              # Citation metadata
 ```
 
 ### Module Responsibilities
 
-| Module | Purpose |
-|--------|---------|
-| `main.py` | CLI entry point, command routing |
-| `cli.py` | Argument parsing, validation, config override |
-| `config.py` | All configuration dataclasses and defaults |
-| `train.py` | Training orchestration, curriculum learning, checkpointing |
-| `inference.py` | Model inference, candidate detection |
-| `evaluate.py` | Model evaluation metrics |
-| `preprocessing.py` | Data preprocessing, normalization |
-| `data_generation.py` | Synthetic signal injection using setigen |
-| `models/vae.py` | Beta-VAE architecture with custom clustering loss |
-| `models/random_forest.py` | Scikit-learn RF wrapper |
-| `db/db.py` | Thread-safe SQLite with async queue-based writes |
-| `monitor/monitor.py` | Background resource monitoring (CPU, RAM, GPU) |
-| `manager/manager.py` | Resource lifecycle management (pools, shared memory) |
-| `logger/` | Multi-handler logging with Slack integration |
+| Module                    | Purpose                                                    |
+| ------------------------- | ---------------------------------------------------------- |
+| `main.py`                 | CLI entry point, command routing                           |
+| `cli.py`                  | Argument parsing, validation, config override              |
+| `config.py`               | All configuration dataclasses and defaults                 |
+| `train.py`                | Training orchestration, curriculum learning, checkpointing |
+| `inference.py`            | Model inference, candidate detection                       |
+| `evaluate.py`             | Model evaluation metrics                                   |
+| `preprocessing.py`        | Data preprocessing, normalization                          |
+| `data_generation.py`      | Synthetic signal injection using setigen                   |
+| `models/vae.py`           | Beta-VAE architecture with custom clustering loss          |
+| `models/random_forest.py` | Scikit-learn RF wrapper                                    |
+| `db/db.py`                | Thread-safe SQLite with async queue-based writes           |
+| `monitor/monitor.py`      | Background resource monitoring (CPU, RAM, GPU)             |
+| `manager/manager.py`      | Resource lifecycle management (pools, shared memory)       |
+| `logger/`                 | Multi-handler logging with Slack integration               |
 
 ---
 
@@ -163,9 +162,9 @@ The project uses pre-commit hooks for code quality:
 
 ```yaml
 # .pre-commit-config.yaml hooks:
-- ruff          # Linting and formatting
-- ruff-format   # Code formatting
-- gitleaks      # Secret detection
+- ruff # Linting and formatting
+- ruff-format # Code formatting
+- gitleaks # Secret detection
 ```
 
 ### Running Manually
@@ -277,11 +276,11 @@ def test_config_defaults(config):
 
 When releasing a new version, update these files:
 
-| File | Location | Example |
-|------|----------|---------|
-| `pyproject.toml` | `version = "X.Y.Z"` | `version = "1.0.0"` |
-| `src/aetherscan/__init__.py` | `__version__ = "X.Y.Z"` | `__version__ = "1.0.0"` |
-| `CITATION.cff` | `version:` and `date-released:` | `version: 1.0.0` |
+| File                         | Location                        | Example                 |
+| ---------------------------- | ------------------------------- | ----------------------- |
+| `pyproject.toml`             | `version = "X.Y.Z"`             | `version = "1.0.0"`     |
+| `src/aetherscan/__init__.py` | `__version__ = "X.Y.Z"`         | `__version__ = "1.0.0"` |
+| `CITATION.cff`               | `version:` and `date-released:` | `version: 1.0.0`        |
 
 ---
 
@@ -321,6 +320,7 @@ When releasing a new version, update these files:
 **DO NOT commit sensitive information.** Pre-commit hooks scan for secrets using gitleaks, but this is not foolproof.
 
 Never commit:
+
 - API keys or tokens (`.env` files)
 - Credentials or passwords
 - Private data files
