@@ -188,8 +188,9 @@ The project uses pre-commit hooks for code quality:
 
 ```yaml
 # .pre-commit-config.yaml hooks:
-- ruff # Linting and formatting
-- ruff-format # Code formatting
+- ruff # Linting
+- ruff-format # Formatting
+- pre-commit-hooks # General-purpose safety
 - gitleaks # Secret detection
 ```
 
