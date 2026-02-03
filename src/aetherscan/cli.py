@@ -26,6 +26,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     # Add commands
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
+    # NOTE: how does the pipeline know which one to use?
     # Train command
     _add_train_arguments(subparsers)
     # Inference command
@@ -370,14 +371,60 @@ def _add_inference_arguments(subparsers):
     """Add inference command arguments to subparser"""
     inf_parser = subparsers.add_parser("inference", help="Execute inference pipeline")
 
-    # TODO: finish adding inference_command args
-    # inf_parser.add_argument('vae_model', type=str, help='Path to VAE encoder model')
-    # inf_parser.add_argument('rf_model', type=str, help='Path to Random Forest model')
-    # inf_parser.add_argument('--config', type=str, help='Path to saved config file')
-    # inf_parser.add_argument('--n-bands', type=int, default=16,
-    #                       help='Number of frequency bands to process')
-    # inf_parser.add_argument('--output', type=str, help='Output file path')
-    # ...
+    # Path arguments
+    inf_parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="Path to data directory (overrides AETHERSCAN_DATA_PATH environment variable)",
+    )
+    inf_parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Path to model directory (overrides AETHERSCAN_MODEL_PATH environment variable)",
+    )
+    inf_parser.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help="Path to output directory (overrides AETHERSCAN_OUTPUT_PATH environment variable)",
+    )
+
+    # Data configuration
+    inf_parser.add_argument(
+        "--test-files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Space-separated list of test data file names to run inference on",
+    )
+
+    # Inference configuration
+    inf_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Classification threshold (default: 0.9)",
+    )
+    inf_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Per-replica batch size for inference (default: 1728)",
+    )
+    inf_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size for preprocessing (default: 10000)",
+    )
+    inf_parser.add_argument(
+        "--save-tag",
+        type=str,
+        default=None,
+        help="Tag for database records (default: timestamp)",
+    )
 
 
 # NOTE: come back to this later
@@ -521,8 +568,14 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     if hasattr(args, "save_tag") and args.save_tag is not None:
         config.checkpoint.save_tag = args.save_tag
 
-    # TODO: finish adding args for inference & evaluate
-    # ...
+    # NOTE: come back to this later
+    # Inference configuration
+    if hasattr(args, "threshold") and args.threshold is not None:
+        config.inference.classification_threshold = args.threshold
+    if hasattr(args, "batch_size") and args.batch_size is not None:
+        config.inference.per_replica_batch_size = args.batch_size
+    if hasattr(args, "chunk_size") and args.chunk_size is not None:
+        config.inference.chunk_size = args.chunk_size
 
 
 # NOTE: should we change validate_args() to validate_config() and run the tests on the final "applied" config singleton? or should we check both separately?
@@ -592,8 +645,8 @@ def validate_args(args: argparse.Namespace) -> None:
     # effective_batch_size is divisible by per_replica_batch_size * num_replicas
     # num_samples_beta_vae * train_val_split is divisible by effective_batch_size
     # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
-    # num_samples_rf is divisible by inference per_replica_batch_size * num_replicas
-    # num_samples_rf is divisible by 2 (for generate_batch)
+    # num_samples_rf is divisible by per_replica_val_batch_size * num_replicas
+    # num_samples_rf is divisible by 2 (for generate_triplet_batch)
     # # how to ensure divisibility for actual n_samples during inference?
     # snr_base, initial_snr_range, final_snr_range > 0
     # initial_snr_range >= final_snr_range

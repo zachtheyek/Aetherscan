@@ -1,3 +1,4 @@
+# NOTE: is there a way to parallelize the CPU-GPU processing (e.g. while GPU is working on training/inference, CPU starts working on data_generation/preprocessing)
 """
 Entry point for Aetherscan Pipeline
 """
@@ -17,11 +18,12 @@ import tensorflow as tf
 from aetherscan.cli import apply_args_to_config, setup_argument_parser, validate_args
 from aetherscan.config import get_config, init_config
 from aetherscan.db import init_db
+from aetherscan.inference import run_inference_pipeline
 from aetherscan.logger import init_logger
 from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
 from aetherscan.preprocessing import DataPreprocessor
-from aetherscan.train import get_latest_tag, train_full_pipeline
+from aetherscan.train import get_latest_tag, run_training_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +104,12 @@ def train_command():
         logger.error(f"Failed to setup GPU strategy: {e}")
         sys.exit(1)
 
-    # Initialize preprocessor & load background data
+    # NOTE: come back to this later (test whether pipeline runs on <4, <6 GPUs, on single GPU, and on CPU. if all is robust, remove no strategy error)
+    if strategy is None:
+        logger.error("No GPU strategy available. Training requires GPU.")
+        sys.exit(1)
+
+    # Initialize preprocessor & load training backgrounds
     # Note, we load this in train_command() to avoid reloading backgrounds on training pipeline retries
     # This gives us faster startup times at the expense of holding onto more memory during training
     # Should be fine since backgrounds only take up low ~10^1 Gb in RAM (benchmarked: Dec '25)
@@ -110,10 +117,10 @@ def train_command():
     # then we should consider moving this into TrainingPipeline proper
     try:
         preprocessor = DataPreprocessor()
-        background_data = preprocessor.load_background_data().astype(np.float32)
+        background_data = preprocessor.load_train_data().astype(np.float32)
         # NOTE: do we need to close preprocessing pools and/or shared memory?
     except Exception as e:
-        logger.error(f"Failed to load backgrounds: {e}")
+        logger.error(f"Failed to load train backgrounds: {e}")
         sys.exit(1)
 
     # Train models with fault tolerance
@@ -134,7 +141,7 @@ def train_command():
                 logger.info(f"Starting training from round {config.checkpoint.start_round}")
 
             # Reinitialize training pipeline on each attempt so no corrupted state is persisted
-            pipeline = train_full_pipeline(background_data=background_data, strategy=strategy)
+            pipeline = run_training_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded
 
@@ -144,7 +151,7 @@ def train_command():
             logger.info("Training interrupted by user")
             raise
 
-        # NOTE: fault tolerance currently only accounts for beta-vae training failure. what about cases when train_random_forest fails and we wish to resume from there? should we add a check where if new round number is greater than specified rounds, skip directly to train RF? how would this look like? what about when save_models or plot_beta_vae_training_progress fails?
+        # NOTE: fault tolerance currently only accounts for beta-vae training failure. what about cases when train_random_forest fails and we wish to resume from there? should we add a check where if new round number is greater than specified rounds, skip directly to train RF? how would this look like? what about when save_models or plot_beta_vae_training_progress fails? should also add a db flag on training retry, such that we can easily filter out "corrupted" data when reading from db (e.g. for plotting). would need to return start_time so we can retain state on retries
         except Exception as e:
             logger.error(f"Training attempt {attempt + 1} failed with error: {e}")
 
@@ -206,72 +213,102 @@ def train_command():
 
     with open(config_path, "w") as f:
         json.dump(config.to_dict(), f, indent=2)
-    logger.info(f"Configuration saved to {config_path}")
+    logger.info(f"Training configuration saved to {config_path}")
 
     logger.info("=" * 60)
     logger.info("Training completed successfully!")
     logger.info("=" * 60)
 
 
-# NOTE: come back to this later
-# def inference_command(args):
-#     """Execute inference command"""
-#     logger.info("Starting inference pipeline...")
-#
-#     # Setup GPU
-#     setup_gpu_config()
-#
-#     # Load configuration
-#     config = Config()
-#
-#     # Load saved config if provided
-#     if args.config:
-#         with open(args.config) as f:
-#             saved_config = json.load(f)
-#             # Update config with saved values
-#             for section_key, section_value in saved_config.items():
-#                 if hasattr(config, section_key) and isinstance(section_value, dict):
-#                     for key, value in section_value.items():
-#                         if hasattr(getattr(config, section_key), key):
-#                             setattr(getattr(config, section_key), key, value)
-#
-#     # Prepare observation files
-#     observation_files = []
-#
-#     # Check for prepared test cadences
-#     test_dir = os.path.join(config.data_path, "testing", "prepared_cadences")
-#     if os.path.exists(test_dir):
-#         # Load prepared cadences
-#         for cadence_idx in range(args.n_bands):
-#             cadence_files = []
-#             for obs_idx in range(6):
-#                 obs_file = os.path.join(test_dir, f"cadence_{cadence_idx:04d}_obs_{obs_idx}.npy")
-#                 if os.path.exists(obs_file):
-#                     cadence_files.append(obs_file)
-#
-#             if len(cadence_files) == 6:
-#                 observation_files.append(cadence_files)
-#
-#     if not observation_files:
-#         logger.error("No observation files found. Please prepare test data first.")
-#         sys.exit(1)
-#
-#     logger.info(f"Found {len(observation_files)} cadences for inference")
-#
-#     # Run inference
-#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-#     output_path = args.output or f"/outputs/seti/detections_{timestamp}.csv"
-#
-#     results = run_inference(config, observation_files, args.vae_model, args.rf_model, output_path)
-#
-#     logger.info(f"Inference completed. Results saved to {output_path}")
-#
-#     # Print summary
-#     if results is not None and not results.empty:
-#         n_total = len(results)
-#         n_high_conf = len(results[results["confidence"] > 0.9])
-#         logger.info(f"Total detections: {n_total}")
-#         logger.info(f"High confidence (>90%): {n_high_conf}")
+# NOTE: we need to load the saved config from the corresponding training run, but when/where should we do that, and how does that play with apply_args_to_config()?
+def inference_command():
+    """Execute inference pipeline with distributed strategy & fault tolerance"""
+    logger.info("=" * 60)
+    logger.info("Starting Aetherscan Inference Pipeline")
+    logger.info("=" * 60)
+
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+
+    # Sanity check
+    if not all(
+        [
+            config.inference.encoder_path,
+            config.inference.rf_path,
+            config.inference.config_path,
+        ]
+    ):
+        logger.error("Encoder, RF, or config path not specified")
+        sys.exit(1)
+
+    # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
+
+    logger.info("Configuration:")
+    logger.info(f"  Files to process: {config.data.test_files}")
+    logger.info(f"  Encoder path: {config.inference.encoder_path}")
+    logger.info(f"  Random Forest path: {config.inference.rf_path}")
+    logger.info(f"  Config path: {config.inference.config_path}")
+    logger.info(f"  Classification threshold: {config.inference.classification_threshold}")
+    logger.info(f"  Data path: {config.data_path}")
+    logger.info(f"  Model path: {config.model_path}")
+    logger.info(f"  Output path: {config.output_path}")
+
+    # Setup GPU strategy
+    try:
+        strategy = setup_gpu_strategy()
+    except Exception as e:
+        logger.error(f"Failed to setup GPU strategy: {e}")
+        sys.exit(1)
+
+    # NOTE: come back to this later (test whether pipeline runs on <4, <6 GPUs, on single GPU, and on CPU. if all is robust, remove no strategy error)
+    if strategy is None:
+        logger.error("No GPU strategy available. Inference requires GPU.")
+        sys.exit(1)
+
+    # NOTE: come back to this later (this is where we convert .h5 into .npy, and then downsample + log norm the .npy data)
+    # NOTE: will this lead to us holding too much data in memory for the sake of inference fault tolerance? should we add some async/back-and-forth design patterns (e.g. preproc X files, inference X files, clear, repeat) to reduce memory pressure? is this the most efficient architecture we can use? add comments about memory/performance trade-offs once inference pipeline complete (see preproc section in train_command())
+    # TODO: implement fault tolerance (should preproc have separate fault tolerance to inference?)
+    # Initialize preprocessor & load inference cadences
+    try:
+        preprocessor = DataPreprocessor()
+        cadence_data = preprocessor.load_inference_data().astype(np.float32)
+        # NOTE: do we need to close preprocessing pools and/or shared memory?
+    except Exception as e:
+        logger.error(f"Failed to load inference cadences: {e}")
+        sys.exit(1)
+
+    # Run inference with fault tolerance
+    logger.info("Starting inference pipeline...")
+
+    # TODO: implement fault tolerance
+    try:
+        results = run_inference_pipeline(
+            cadence_data=cadence_data,
+            npy_path=config.data.test_files[0],  # TODO: Handle multiple test files properly
+            strategy=strategy,
+            # TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
+        )
+    except Exception as e:
+        logger.error(f"Inference failed: {e}")
+        sys.exit(1)
+
+    # NOTE: should we create dedicated (tagged) directories inside output_path to store inference results (plots, configs, etc.)? note, data still written to db regardless
+    # Save inference configuration
+    config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist
+
+    with open(config_path, "w") as f:
+        json.dump(config.to_dict(), f, indent=2)
+    logger.info(f"Inference configuration saved to {config_path}")
+
+    logger.info("=" * 60)
+    logger.info("Inference completed successfully!")
+    logger.info("Summary:")
+    logger.info(f"  Total cadence snippets: {results['n_cadence_snippets']}")
+    logger.info(f"    Processed: {results['n_processed']}")
+    logger.info(f"    Candidates found: {results['n_candidates']}")
+    logger.info("=" * 60)
 
 
 # NOTE: come back to this later
@@ -304,7 +341,7 @@ def train_command():
 #     else:
 #         logger.info("Generating synthetic test data...")
 #         # Load some background for generation
-#         background_data = load_background_data(config)
+#         background_data = load_train_data(config)
 #         generator = DataGenerator(config, background_data[:100])  # Use subset
 #         test_data = generator.generate_test_set()
 #
@@ -435,8 +472,8 @@ def main():
         # Execute command
         if args.command == "train":
             train_command()
-        # elif args.command == "inference":
-        #     inference_command(args)
+        elif args.command == "inference":
+            inference_command()
         # NOTE: come back to this later
         # elif args.command == 'evaluate':
         #     evaluate_command(args)

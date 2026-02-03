@@ -30,7 +30,7 @@ class ManagerConfig:
 
     n_processes: int = cpu_count()  # use all available cores
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
-    # NOTE: should we move chunks_per_worker to TrainingConfig() and make it specific to preproc/data_gen?
+    # NOTE: should we move chunks_per_worker to DataConfig() or TrainingConfig() and make it specific to preproc/data_gen?
     chunks_per_worker: int = 4  # for balancing overhead vs parallelism
     pool_terminate_timeout: float = (
         10.0  # seconds (actual timeout may be 2x this value -- from terminate + join threads)
@@ -91,6 +91,7 @@ class RandomForestConfig:
     seed: int = 11
 
 
+# TODO: make sure the entire pipeline respects DataConfig() values, instead of hard coding
 @dataclass
 class DataConfig:
     """Data processing configuration"""
@@ -102,13 +103,21 @@ class DataConfig:
     freq_resolution: float = 2.7939677238464355  # Hz
     time_resolution: float = 18.25361108  # seconds
 
+    # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
+    # Note the following heuristics/constraints, which only apply to training
+    # max_backgrounds_per_file = max_chunks_per_file * background_load_chunk_size
+    # max_backgrounds_total = min(max_backgrounds_per_file * num_files, num_target_backgrounds)
     num_target_backgrounds: int = 45000  # Number of background cadences to load
-    # Note that max backgrounds per file = max_chunks_per_file * background_load_chunk_size
-    # TODO: experiment with larger chunk sizes (remember to adjust max_chunks_per_file) (how to track chunk processing efficiency)
     background_load_chunk_size: int = (
-        15000  # Maximum cadences to process at once during background loading
+        15000  # Maximum cadences to process at once during load_train_data()
     )
     max_chunks_per_file: int = 1  # Maximum chunks to load from a single file
+
+    # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
+    # We only specify chunk size during inference, since we assume all backgrounds from all files must be loaded
+    inference_background_load_chunk_size: int = (
+        50000  # Maximum cadences to process at once during load_inference_data()
+    )
 
     # Data files
     # Note, Python dataclasses don't allow mutable objects (e.g. lists) to be used as defaults,
@@ -127,6 +136,7 @@ class DataConfig:
         ]
     )
     test_files: list[str] = field(default_factory=lambda: ["real_filtered_LARGE_test_HIP15638.npy"])
+    # TODO: have a new member called inference_files, whose values take precedence over test_files if not None (should still live inside self.data_path). test_files -> .npy, inference_files -> .h5 (add checks in validate_args & inference_command)
 
 
 @dataclass
@@ -142,6 +152,7 @@ class TrainingConfig:
     effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 320
 
+    # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
     )
@@ -152,6 +163,7 @@ class TrainingConfig:
     final_snr_range: int = 10
     curriculum_schedule: str = "exponential"  # "linear", "exponential", "step"
     exponential_decay_rate: float = -3.0  # How quickly schedule should progress from easy to hard (must be <0) (more negative = less easy rounds & more hard rounds)
+    # TODO: generalize this to receive a step schedule (as a list/dict?) validate that len(list/dict) is divisible by num_training_rounds
     step_easy_rounds: int = 5  # Number of rounds with easy signals
     step_hard_rounds: int = 15  # Number of rounds with challenging signals
 
@@ -171,13 +183,12 @@ class TrainingConfig:
 class InferenceConfig:
     """Inference configuration"""
 
-    per_replica_batch_size: int = 320
-
-    # NOTE: come back to this later
-    # classification_threshold: float = 0.5
-    # batch_size: int = 4048
-    # max_drift_rate: float = 10.0  # Hz/s
-    # overlap search
+    # TODO: have a startup function that sets encoder_path, rf_path, and config_path using load_dir & load_tag if either/both are None
+    encoder_path: str = None
+    rf_path: str = None
+    config_path: str = None
+    per_replica_batch_size: int = 1728  # Divisible by both 4 & 6 for GPU alignment
+    classification_threshold: float = 0.9
 
 
 @dataclass
@@ -356,6 +367,7 @@ class Config:
                 "num_target_backgrounds": self.data.num_target_backgrounds,
                 "background_load_chunk_size": self.data.background_load_chunk_size,
                 "max_chunks_per_file": self.data.max_chunks_per_file,
+                "inference_background_load_chunk_size": self.data.inference_background_load_chunk_size,
                 "train_files": self.data.train_files,
                 "test_files": self.data.test_files,
             },
@@ -385,11 +397,11 @@ class Config:
                 "retry_delay": self.training.retry_delay,
             },
             "inference": {
+                "encoder_path": self.inference.encoder_path,
+                "rf_path": self.inference.rf_path,
+                "config_path": self.inference.config_path,
                 "per_replica_batch_size": self.inference.per_replica_batch_size,
-                # NOTE: come back to this later
-                # "classification_threshold": self.inference.classification_threshold,
-                # "batch_size": self.inference.batch_size,
-                # "max_drift_rate": self.inference.max_drift_rate,
+                "classification_threshold": self.inference.classification_threshold,
             },
             "checkpoint": {
                 "load_dir": self.checkpoint.load_dir,
