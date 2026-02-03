@@ -194,7 +194,7 @@ The project uses pre-commit hooks for code quality:
 - gitleaks # Secret detection
 ```
 
-Once installed using `pre-commit install`, the hooks should run automatically on every commit, and block changes that don't pass all hooks. Note that pre-commit will attempt to automatically fix "simple" issues, so if any hooks are failing, you may simply need to run `git add` and `git commit` again. For more "complex" cases, manual intervention is needed. See the pre-commit messages for details.
+Once installed using `pre-commit install`, the hooks should run automatically on every commit, and block changes that don't pass all hooks. Note that pre-commit will attempt to automatically fix "simple" issues, so if any hooks are failing, you may just need to run `git add` and `git commit` again. For more "complex" cases, manual intervention is needed. See the pre-commit messages for details.
 
 ### Running Manually
 
