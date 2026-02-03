@@ -6,10 +6,10 @@ This document describes security practices and procedures for the Aetherscan pro
 
 ## Supported Versions
 
-| Version | Supported | Notes |
-|---------|-----------|-------|
-| 0.1.x   | Yes       | Current development version |
-| < 0.1   | No        | Pre-release, not supported |
+| Version | Supported | Notes                       |
+| ------- | --------- | --------------------------- |
+| 1.x.x   | Yes       | Current development version |
+| 0.x.x   | No        | Pre-release, not supported  |
 
 ---
 
@@ -19,7 +19,7 @@ If you discover a security vulnerability in Aetherscan:
 
 ### For Non-Critical Issues
 
-1. Open a [GitHub Issue](https://github.com/zachtheyek/Aetherscan/issues) with the "security" label
+1. Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label
 2. Provide a clear description of the vulnerability
 3. Include steps to reproduce if applicable
 4. Suggest a fix if you have one
@@ -29,13 +29,13 @@ If you discover a security vulnerability in Aetherscan:
 For vulnerabilities that could expose sensitive data or allow unauthorized access:
 
 1. **Do NOT open a public issue**
-2. Email the maintainers directly at: xiaoxiyek1.5@gmail.com
+2. Contact Zach directly on Slack or via email
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
    - Potential impact
    - Suggested remediation (if any)
-4. Allow 48-72 hours for initial response
+4. Allow up to 48-72 hours for initial response
 5. Work with maintainers on coordinated disclosure
 
 ---
@@ -46,10 +46,9 @@ For vulnerabilities that could expose sensitive data or allow unauthorized acces
 
 Aetherscan uses the following secrets that must be protected:
 
-| Secret | Environment Variable | Purpose |
-|--------|---------------------|---------|
-| Slack Bot Token | `SLACK_BOT_TOKEN` | Slack alerts and notifications |
-| GCP Token | `GOOGLE_APPLICATION_CREDENTIALS` | Cloud storage access (if configured) |
+| Secret          | Environment Variable | Purpose                        |
+| --------------- | -------------------- | ------------------------------ |
+| Slack Bot Token | `SLACK_BOT_TOKEN`    | Slack alerts and notifications |
 
 ### Best Practices
 
@@ -62,7 +61,7 @@ Aetherscan uses the following secrets that must be protected:
    - Production tokens should be rotated regularly
 
 3. **Store secrets securely**
-   - Use a secrets manager (e.g., HashiCorp Vault, AWS Secrets Manager)
+   - Use a secrets manager (e.g., HashiCorp Vault, Google Secrets Manager)
    - Or encrypted environment files with restricted permissions
 
 4. **Audit access regularly**
@@ -78,22 +77,17 @@ If you suspect a token has been compromised, rotate immediately:
 ### Slack Bot Token
 
 1. Go to [Slack API](https://api.slack.com/apps)
-2. Select your Aetherscan app
+2. Select the Aetherscan app
 3. Navigate to "OAuth & Permissions"
-4. Click "Rotate Token"
-5. Update `SLACK_BOT_TOKEN` in all deployment environments
-6. Verify the new token works: `aetherscan train --help` (should not show Slack errors)
-
-### GCP Service Account
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Navigate to IAM & Admin > Service Accounts
-3. Select the Aetherscan service account
-4. Click "Keys" > "Add Key" > "Create new key"
-5. Download the new JSON key file
-6. Update `GOOGLE_APPLICATION_CREDENTIALS` to point to the new file
-7. Delete the old key from GCP console
-8. Securely delete the old key file from local storage
+4. Click "Revoke Tokens"
+5. Reinstall the Aetherscan app and generate a new token with the following scopes:
+   a. channels:read
+   b. chat:write
+   c. files:write
+   d. groups:read
+   e. incoming-webhook
+6. Update `SLACK_BOT_TOKEN` in all deployment environments
+7. Verify the new token works: `aetherscan train --help` (should not show Slack errors)
 
 ---
 
@@ -104,7 +98,7 @@ The project uses [gitleaks](https://github.com/gitleaks/gitleaks) as a pre-commi
 ### What It Scans For
 
 - API keys and tokens
-- AWS credentials
+- GCP/AWS credentials
 - Private keys (RSA, DSA, etc.)
 - Generic secrets patterns
 - High-entropy strings
@@ -129,6 +123,7 @@ gitleaks detect --source . --log-opts="HEAD~10..HEAD"
 If gitleaks flags a non-secret (e.g., a test fixture):
 
 1. Add the specific file/line to `.gitleaksignore`:
+
    ```
    # .gitleaksignore
    tests/fixtures/mock_data.py:42
@@ -169,26 +164,8 @@ safety check
 
 ## Data Security
 
-### Training Data
-
-- Training data files (`.npy`, `.h5`) should be stored on secure, access-controlled storage
-- Do not commit training data to the repository
-- Use checksums to verify data integrity
-
-### Model Files
-
-- Trained model files (`.keras`, `.joblib`) may contain information about training data
-- Store models securely; do not expose to unauthorized users
-- Consider model encryption for production deployments
-
-### Database
-
-- The SQLite database (`aetherscan.db`) contains:
-  - Training metrics (non-sensitive)
-  - Inference results (potentially sensitive if pointing to observation targets)
-  - System resource usage (non-sensitive)
-- Store database files on encrypted storage in production
-- Implement access controls to limit who can read the database
+- All training & model data are publicly disclosed via relevant channels (e.g. [Ma et al. 2023](https://arxiv.org/abs/2301.12670)), and made readily available via the [Breakthrough Listen Open Data Archive](https://breakthroughinitiatives.org/opendatasearch)
+- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers not made available to the public
 
 ---
 
@@ -230,6 +207,6 @@ If a security incident occurs:
 
 ## Contact
 
-- **Security issues**: xiaoxiyek1.5@gmail.com
-- **General questions**: Open a GitHub Discussion
+- **Security issues**: @zachtheyek on Slack
+- **General questions**: Open a GitHub Discussion or Slack thread
 - **Slack**: [#aetherscan-dev](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
