@@ -426,15 +426,6 @@ options:
 
 For a comprehensive list of known issues, limitations, and workarounds, see [`KNOWN_ISSUES.md`](/KNOWN_ISSUES.md).
 
-Common startup warnings (CUDA factory registration, TensorRT, CPU optimization messages) are benign and can be safely ignored. The document also covers:
-
-- Data generation performance bottlenecks
-- Resource monitoring accuracy limitations
-- Multiprocessing pool cleanup behavior
-- Slack integration edge cases
-
-If you encounter an issue not listed there, see [`CONTRIBUTING.md`](#contributing-to-aetherscan) for steps on how to report it.
-
 ---
 
 ## Contributing To Aetherscan
