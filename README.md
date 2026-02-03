@@ -116,7 +116,8 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 > [!NOTE]
 > The following section will omit writing the inline environment variables for brevity.
 > As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`.
-> TODO: update README once local builds with `pip install -e .` are working as expected.
+>
+> # TODO: update README once local builds with `pip install -e .` are working as expected.
 
 ### Training
 
