@@ -525,7 +525,7 @@ def create_true_double(
     # Select a random SNR from the given range
     snr = random.random() * snr_range + snr_base
 
-    # NOTE: small but nonzero probability for "infinite" (long-running) loops
+    # Note, small but nonzero probability for "infinite" (long-running) loops
     # Retry signal injection until we get valid non-intersecting signals
     while True:
         # Inject RFI
