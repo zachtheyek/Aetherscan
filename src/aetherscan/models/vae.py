@@ -419,11 +419,26 @@ def build_encoder(
 def build_decoder(
     latent_dim: int = 8, dense_size: int = 512, kernel_size: tuple[int, int] = (3, 3)
 ) -> keras.Model:
-    """Build decoder network - exact mirror of encoder"""
+    """Build decoder network - exact mirror of encoder
+
+    Encoder progression (filters, stride):
+        Layer 1: 16, s=2  -> (16,512,1)  to (8,256,16)
+        Layer 2: 16, s=1  -> (8,256,16)  to (8,256,16)
+        Layer 3: 32, s=2  -> (8,256,16)  to (4,128,32)
+        Layer 4: 32, s=1  -> (4,128,32)  to (4,128,32)
+        Layer 5: 32, s=1  -> (4,128,32)  to (4,128,32)
+        Layer 6: 64, s=2  -> (4,128,32)  to (2,64,64)
+        Layer 7: 64, s=1  -> (2,64,64)   to (2,64,64)
+        Layer 8: 128, s=1 -> (2,64,64)   to (2,64,128)
+        Layer 9: 256, s=2 -> (2,64,128)  to (1,32,256)
+
+    Decoder mirrors this in reverse order, outputting the filter count
+    that matches the INPUT to each corresponding encoder layer.
+    """
 
     latent_inputs = keras.Input(shape=(latent_dim,), name="decoder_input")
 
-    # Dense layers with regularization
+    # Dense layers with regularization (mirrors encoder's flatten + dense)
     x = layers.Dense(
         dense_size,
         activation="relu",
@@ -434,7 +449,7 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(latent_inputs)
 
-    # Reshape to start transposed convolutions
+    # Reshape to start transposed convolutions (matches encoder's final conv output)
     x = layers.Dense(
         1 * 32 * 256,
         activation="relu",
@@ -448,24 +463,12 @@ def build_decoder(
     x = layers.Reshape((1, 32, 256))(x)
 
     # Transposed convolutions (exact reverse of encoder)
-    x = layers.Conv2DTranspose(
-        256,
-        kernel_size,
-        activation="relu",
-        strides=2,
-        padding="same",
-        kernel_initializer=HeNormal(),
-        bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
-    )(x)
-
+    # Mirror of encoder layer 9 (256, s=2): (1,32,256) -> (2,64,128)
     x = layers.Conv2DTranspose(
         128,
         kernel_size,
         activation="relu",
-        strides=1,
+        strides=2,
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
@@ -474,6 +477,7 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(x)
 
+    # Mirror of encoder layer 8 (128, s=1): (2,64,128) -> (2,64,64)
     x = layers.Conv2DTranspose(
         64,
         kernel_size,
@@ -487,23 +491,11 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(x)
 
+    # Mirror of encoder layer 7 (64, s=1): (2,64,64) -> (2,64,64)
     x = layers.Conv2DTranspose(
         64,
         kernel_size,
         activation="relu",
-        strides=2,
-        padding="same",
-        kernel_initializer=HeNormal(),
-        bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
-    )(x)
-
-    x = layers.Conv2DTranspose(
-        32,
-        kernel_size,
-        activation="relu",
         strides=1,
         padding="same",
         kernel_initializer=HeNormal(),
@@ -513,19 +505,7 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(x)
 
-    x = layers.Conv2DTranspose(
-        32,
-        kernel_size,
-        activation="relu",
-        strides=1,
-        padding="same",
-        kernel_initializer=HeNormal(),
-        bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
-    )(x)
-
+    # Mirror of encoder layer 6 (64, s=2): (2,64,64) -> (4,128,32)
     x = layers.Conv2DTranspose(
         32,
         kernel_size,
@@ -539,8 +519,9 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(x)
 
+    # Mirror of encoder layer 5 (32, s=1): (4,128,32) -> (4,128,32)
     x = layers.Conv2DTranspose(
-        16,
+        32,
         kernel_size,
         activation="relu",
         strides=1,
@@ -552,6 +533,21 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(x)
 
+    # Mirror of encoder layer 4 (32, s=1): (4,128,32) -> (4,128,32)
+    x = layers.Conv2DTranspose(
+        32,
+        kernel_size,
+        activation="relu",
+        strides=1,
+        padding="same",
+        kernel_initializer=HeNormal(),
+        bias_initializer=Zeros(),
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
+    )(x)
+
+    # Mirror of encoder layer 3 (32, s=2): (4,128,32) -> (8,256,16)
     x = layers.Conv2DTranspose(
         16,
         kernel_size,
@@ -565,11 +561,27 @@ def build_decoder(
         bias_regularizer=l2(0.01),
     )(x)
 
+    # Mirror of encoder layer 2 (16, s=1): (8,256,16) -> (8,256,16)
+    x = layers.Conv2DTranspose(
+        16,
+        kernel_size,
+        activation="relu",
+        strides=1,
+        padding="same",
+        kernel_initializer=HeNormal(),
+        bias_initializer=Zeros(),
+        activity_regularizer=l1(0.001),
+        kernel_regularizer=l2(0.01),
+        bias_regularizer=l2(0.01),
+    )(x)
+
+    # Mirror of encoder layer 1 (16, s=2): (8,256,16) -> (16,512,1)
     # Output layer with sigmoid activation
     decoder_outputs = layers.Conv2DTranspose(
         1,
         kernel_size,
         activation="sigmoid",
+        strides=2,
         padding="same",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
