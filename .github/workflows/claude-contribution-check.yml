@@ -1,0 +1,102 @@
+# Enforce contribution rules: PRs need linked issues, issues need prior discussions
+name: Claude Contribution Check
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  contribution-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Contribution Check
+        uses: anthropics/claude-code-action@6c61301d8e1ee91bef7b65172f93462bbb216394 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            EVENT: ${{ github.event_name }}
+            ACTION: ${{ github.event.action }}
+
+            You are a contribution compliance checker. Your job is to verify that contributions follow the project's workflow rules.
+
+            ## If this is a pull_request event:
+
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR TITLE: ${{ github.event.pull_request.title }}
+            PR BODY: ${{ github.event.pull_request.body }}
+            PR AUTHOR: ${{ github.event.pull_request.user.login }}
+
+            Check if this PR has a formally linked issue using the GitHub GraphQL API:
+            ```bash
+            gh api graphql -f query='
+              query {
+                repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
+                  pullRequest(number: ${{ github.event.pull_request.number }}) {
+                    closingIssuesReferences(first: 5) {
+                      nodes { number title }
+                    }
+                  }
+                }
+              }
+            '
+            ```
+
+            If NO linked issues are found:
+            1. Add the label `needs-issue` to the PR: `gh pr edit ${{ github.event.pull_request.number }} --add-label "needs-issue"`
+            2. Post a polite warning comment on the PR explaining that all PRs must be linked to an existing issue (via `Closes #N` or `Fixes #N` in the PR body, or via the "Development" sidebar). Reference the CONTRIBUTING.md guidelines.
+
+            If linked issues ARE found, verify correctness:
+            1. View each linked issue (`gh issue view <number>`) and check that its title/description plausibly relates to the PR's title, description, and stated changes.
+            2. If a linked issue appears unrelated to the PR (e.g. the PR is about fixing a typo but the linked issue is about a performance optimization), post a friendly comment noting the potential mismatch and asking the author to verify the correct issue is linked.
+            3. If the PR body mentions issue numbers (e.g. "Related to #10") that are NOT formally linked via closing keywords, post a friendly reminder suggesting the author use `Closes #N` or `Fixes #N` to create a formal link.
+            4. If all linked issues are relevant and correctly linked — do nothing, the PR is compliant.
+
+            ## If this is an issues event:
+
+            ISSUE NUMBER: ${{ github.event.issue.number }}
+            ISSUE TITLE: ${{ github.event.issue.title }}
+            ISSUE BODY: ${{ github.event.issue.body }}
+            ISSUE AUTHOR: ${{ github.event.issue.user.login }}
+
+            Search for related GitHub Discussions that may have preceded this issue:
+            ```bash
+            gh search issues --type discussion --repo ${{ github.repository }} "<relevant keywords from issue title>"
+            ```
+
+            Note that the repository's issue templates provide a designated "Discussion links" section for authors to link to relevant discussions in the issue body. These may be a good starting point, though you shouldn't assume they're 100% accurate due to the potential for human error.
+
+            If NO related discussions are found:
+            1. Add the label `needs-discussion` to the issue: `gh issue edit ${{ github.event.issue.number }} --add-label "needs-discussion"`
+            2. Post a friendly reminder comment explaining that issues should be preceded by a GitHub Discussion or Slack thread (per CONTRIBUTING.md). This is a gentle nudge, not a hard block.
+            3. If the original issue body didn't include a Slack thread link under "Discussion links", add a note towards the end of your reminder stating that if the discussion happened on Slack rather than GitHub Discussions, this reminder may be safely ignored, but the issue author should link to the relevant Slack threads in the original issue body.
+            4. If the original issue body DID include a Slack thread link under "Discussion links", do not assign the `needs-discussion` label, or post the reminder comment. Assume the issue is compliant.
+
+            If related discussions ARE found, but the original issue body has incorrect/incomplete links:
+            1. Post a friendly reminder comment suggesting the issue author modify the original issue body with the correct links, then link to the correct links that you found.
+
+            If all related discussions found match the issues linked in the original issue body — do nothing, the issue is compliant.
+
+            ## Important:
+            - Be concise in your comments (2-3 sentences max)
+            - Create the `needs-issue` or `needs-discussion` labels if they don't already exist
+            - Do NOT close or reject any PRs or issues — only warn and label
+
+          claude_args: |
+            --allowedTools "Bash(gh issue:*),Bash(gh pr:*),Bash(gh search:*),Bash(gh label:*),Bash(gh api:*)"
+            --model opus

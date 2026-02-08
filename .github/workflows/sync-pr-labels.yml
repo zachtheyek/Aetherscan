@@ -1,0 +1,168 @@
+# Automatically sync labels from linked issues to PRs
+name: Sync PR Labels
+
+on:
+  pull_request:
+    types: [opened, edited]
+  # Re-sync when an issue gets labeled (e.g. by triage) after a PR already linked it
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+jobs:
+  sync-labels-from-pr:
+    # Only run on pull_request events
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync labels from linked issues to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const EXCLUDED_LABELS = new Set(['needs-issue', 'needs-discussion']);
+            const pr = context.payload.pull_request;
+
+            // Use GraphQL to get formally linked issues (via "Development" sidebar)
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 10) {
+                      nodes {
+                        number
+                        labels(first: 20) {
+                          nodes {
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const result = await github.graphql(query, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: pr.number,
+            });
+
+            const linkedIssues = result.repository.pullRequest.closingIssuesReferences.nodes;
+
+            if (linkedIssues.length === 0) {
+              core.info('No linked issues found — skipping label sync.');
+              return;
+            }
+
+            // Collect unique labels from all linked issues, excluding workflow-managed labels
+            const labelsToAdd = new Set();
+            for (const issue of linkedIssues) {
+              core.info(`Found linked issue #${issue.number}`);
+              for (const label of issue.labels.nodes) {
+                if (!EXCLUDED_LABELS.has(label.name)) {
+                  labelsToAdd.add(label.name);
+                }
+              }
+            }
+
+            if (labelsToAdd.size === 0) {
+              core.info('Linked issues have no syncable labels — nothing to do.');
+              return;
+            }
+
+            // Get existing PR labels to avoid redundant API calls
+            const existingLabels = new Set(pr.labels.map(l => l.name));
+            const newLabels = [...labelsToAdd].filter(l => !existingLabels.has(l));
+
+            if (newLabels.length === 0) {
+              core.info('All issue labels already present on PR — nothing to do.');
+              return;
+            }
+
+            // Add labels to the PR (additive only)
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: newLabels,
+            });
+
+            core.info(`Added labels to PR: ${newLabels.join(', ')}`);
+
+  sync-labels-from-issue:
+    # Only run on issues events (e.g. when triage labels an issue after a PR already linked it)
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync new label to PRs that link this issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const EXCLUDED_LABELS = new Set(['needs-issue', 'needs-discussion']);
+            const issueNumber = context.payload.issue.number;
+            const newLabel = context.payload.label.name;
+
+            if (EXCLUDED_LABELS.has(newLabel)) {
+              core.info(`Label "${newLabel}" is excluded from syncing — skipping.`);
+              return;
+            }
+
+            // Find open PRs that formally link to this issue
+            const query = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequests(states: OPEN, first: 50) {
+                    nodes {
+                      number
+                      closingIssuesReferences(first: 10) {
+                        nodes {
+                          number
+                        }
+                      }
+                      labels(first: 20) {
+                        nodes {
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const result = await github.graphql(query, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const openPRs = result.repository.pullRequests.nodes;
+
+            for (const pr of openPRs) {
+              const linksToThisIssue = pr.closingIssuesReferences.nodes.some(
+                issue => issue.number === issueNumber
+              );
+
+              if (!linksToThisIssue) continue;
+
+              const alreadyHasLabel = pr.labels.nodes.some(l => l.name === newLabel);
+              if (alreadyHasLabel) {
+                core.info(`PR #${pr.number} already has label "${newLabel}" — skipping.`);
+                continue;
+              }
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: [newLabel],
+              });
+
+              core.info(`Added label "${newLabel}" to PR #${pr.number}`);
+            }

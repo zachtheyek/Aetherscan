@@ -24,10 +24,9 @@ jobs:
           fetch-depth: 0
 
       - name: Run Claude Documentation Analysis
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@6c61301d8e1ee91bef7b65172f93462bbb216394 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -68,6 +67,7 @@ jobs:
                  - Summary of changes that require documentation
                  - Specific files that need updates
                  - Suggested changes or additions
+                 - Tag @claude with instructions to open a PR with the specified updates
 
             5. If no documentation updates are needed, do not create an issue.
                Only create an issue if there are meaningful documentation gaps.
