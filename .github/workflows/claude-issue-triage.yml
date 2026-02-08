@@ -1,4 +1,4 @@
-# Auto triage every new issue
+# Auto triage & label every new issue
 name: Claude Issue Triage
 
 on:
@@ -49,5 +49,5 @@ jobs:
             Your only responsibilities are to triage the current issue. Do not do anything that is not within this job scope.
 
           claude_args: |
-            --allowedTools "Bash(gh issue:*),Bash(gh search:*)"
+            --allowedTools "Bash(gh issue:*),Bash(gh search:*),Read,Glob,Grep"
             --model opus

@@ -1,4 +1,5 @@
 # Enforce contribution rules: PRs need linked issues, issues need prior discussions
+# Handles both existence & correctness
 name: Claude Contribution Check
 
 on:
@@ -94,9 +95,8 @@ jobs:
 
             ## Important:
             - Be concise in your comments (2-3 sentences max)
-            - Create the `needs-issue` or `needs-discussion` labels if they don't already exist
             - Do NOT close or reject any PRs or issues — only warn and label
 
           claude_args: |
-            --allowedTools "Bash(gh issue:*),Bash(gh pr:*),Bash(gh search:*),Bash(gh label:*),Bash(gh api:*)"
+            --allowedTools "Bash(gh issue:*),Bash(gh pr:*),Bash(gh search:*),Bash(gh label:*),Bash(gh api:*),Read,Glob,Grep"
             --model opus
