@@ -159,8 +159,8 @@ safety check
 
 ## Data Security
 
-- All training & model data are publicly disclosed via relevant channels (e.g. [Ma et al. 2023](https://arxiv.org/abs/2301.12670)), and made readily available via the [Breakthrough Listen Open Data Archive](https://breakthroughinitiatives.org/opendatasearch)
-- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers not made available to the public
+- All training & model data are publicly disclosed via relevant channels (e.g. [Ma et al. 2023](https://arxiv.org/abs/2301.12670)), and made available via the [Breakthrough Listen Open Data Archive](https://breakthroughinitiatives.org/opendatasearch)
+- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers not made available to the public. Contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack to discuss further
 
 ---
 
