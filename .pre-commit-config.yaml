@@ -34,8 +34,8 @@ repos:
       - id: trailing-whitespace
       # Check for private keys (vulnerability)
       - id: detect-private-key
-      # NOTE: this will cause merge commits to fail on github actions (safe to ignore)
-      # Blocks commits directly to master branch
+      # Blocks commits directly to master branch (local guardrail only)
+      # Skipped in CI on master via SKIP env var in pre-commit.yml
       - id: no-commit-to-branch
         args: ["--branch", "master"]
 
