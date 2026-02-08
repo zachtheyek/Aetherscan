@@ -115,7 +115,7 @@ ruff check src/ && ruff format src/
 
 ## Pull Request Guidelines
 
-PRs must have an associated issue. If an issue doesn't yet exist for your PR, create the issue first, then link it to the PR with `Closes #N` or `Fixes #N` in the PR body. Do NOT rely on simply mentioning `#N` in the PR body
+PRs must have an associated issue. If an issue doesn't yet exist for your PR, create the issue first using one of the templates in `.github/ISSUE_TEMPLATE/`, then link it to the PR with `Closes #N` or `Fixes #N` in the PR body. Do NOT rely on simply mentioning `#N` in the PR body.
 
 ---
 
