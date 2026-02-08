@@ -3,8 +3,7 @@ name: Feature request
 about: Suggest an idea for this project
 title: "[FEATURE]"
 labels: enhancement
-assignees: ''
-
+assignees: ""
 ---
 
 **Is your feature request related to a problem? Please describe.**
@@ -18,3 +17,6 @@ A clear and concise description of any alternative solutions or features you've 
 
 **Additional context**
 Add any other context or screenshots about the feature request here.
+
+**Discussion links**
+All issues are required to have at least one prior discussion with a maintainer, either via GitHub discussions or Slack (as per CONTRIBUTING.md). Please link to the associated discussion here for future reference
