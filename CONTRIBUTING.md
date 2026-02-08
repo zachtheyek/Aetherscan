@@ -50,6 +50,9 @@ Before making any changes:
 - First check to see if any related PRs, issues, or discussions already exist
 - If not, open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
 
+> [!TIP]
+> Consider asking @claude whether your query has any existing PRs, issues, or discussions
+
 ### 2. Open an Issue
 
 Once a discussion has reached a well-understood problem statement:
@@ -59,18 +62,18 @@ Once a discussion has reached a well-understood problem statement:
 - Optionally, if you'd like to tackle this PR, make your interest known to the maintainers within the issue itself
 
 > [!WARNING]
->
 > "Drive-by" issues (i.e. issues opened without prior discussions with maintainers) may be closed without review or explanation
 
 ### 3. Create a Feature Branch
 
 Branch naming convention: `category/description`
 
-| Category   | Use Case           | Example                    |
-| ---------- | ------------------ | -------------------------- |
-| `feature/` | New functionality  | `feature/db_integration`   |
-| `hotfix/`  | Bug fixes          | `hotfix/cpu_sampling_rate` |
-| `misc/`    | Housekeeping tasks | `misc/update_docs`         |
+| Category   | Use Case                      | Example                     |
+| ---------- | ----------------------------- | --------------------------- |
+| `feature/` | New functionality             | `feature/db_integration`    |
+| `hotfix/`  | Bug fixes                     | `hotfix/cpu_sampling_rate`  |
+| `misc/`    | Housekeeping tasks            | `misc/update_docs`          |
+| `claude/`  | Reserved for Claude assistant | `claude/fix_typo_in_readme` |
 
 ```bash
 git checkout -b feature/my_new_feature
@@ -87,11 +90,13 @@ git checkout -b feature/my_new_feature
 - Ensure your branch is up-to-date with `master` (use `git rebase`, not `git merge`)
 - All commits must have verified GPG signatures
 - Fill out the PR template completely
-- Link your PR to the associated issue
+- Link your PR to the associated issue using GitHub's **"Development" sidebar** or by including `Closes #N` / `Fixes #N` in the PR body. This creates a formal link that enables automatic label syncing
 
 > [!WARNING]
->
 > PRs not tied to an existing issue may be closed without review or explanation
+
+> [!NOTE]
+> Labels from linked issues are automatically synced to PRs. Claude also checks that PRs have linked issues and that issues have prior discussions — non-compliant contributions will receive a warning comment and label.
 
 ### 6. Code Review
 
