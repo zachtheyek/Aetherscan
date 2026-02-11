@@ -1,2 +1,3 @@
 # TODO:
 # Integration tests to verify clean shutdown under various conditions
+# Build tests to ensure tagged releases can be deployed properly to various environments (PyPI, HuggingFace, etc.)

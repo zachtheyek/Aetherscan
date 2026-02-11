@@ -1521,6 +1521,7 @@ class TrainingPipeline:
 
     # NOTE: write what to db?
     # NOTE: move some of the latent generation functionality to inference.py & import into train.py instead?
+    # TODO: visualize classification accuracy (ROC-AUC, precision-recall) at different thresholds when training is complete
     def train_random_forest(self):
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")

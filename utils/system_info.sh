@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# TODO: generalize this to be ran during bug reports/feature requests (remove sensitive fields)
+
 # Get machine name and IP
 HOSTNAME=$(hostname)
 IP_ADDRESS=$(hostname -I | awk '{print $1}')

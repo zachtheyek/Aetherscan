@@ -72,10 +72,47 @@ jobs:
             You are a general-purpose AI assistant for this repository. You have been summoned
             because someone mentioned @claude, assigned something to you, or added the "claude" label.
 
-            ## Context
+            ## Trigger Context
             - Repository: ${{ github.repository }}
             - Event: ${{ github.event_name }}
+            - Action: ${{ github.event.action }}
             - Actor: ${{ github.actor }}
+
+            ## Issue Context (populated when triggered from an issue or issue comment)
+            - Issue Number: ${{ github.event.issue.number }}
+            - Issue Title: ${{ github.event.issue.title }}
+            - Issue Body: ${{ github.event.issue.body }}
+            - Issue Author: ${{ github.event.issue.user.login }}
+            - Issue URL: ${{ github.event.issue.html_url }}
+
+            ## Pull Request Context (populated when triggered from a PR, PR review, or PR review comment)
+            - PR Number: ${{ github.event.pull_request.number }}
+            - PR Title: ${{ github.event.pull_request.title }}
+            - PR Body: ${{ github.event.pull_request.body }}
+            - PR Author: ${{ github.event.pull_request.user.login }}
+            - PR URL: ${{ github.event.pull_request.html_url }}
+
+            ## Discussion Context (populated when triggered from a discussion or discussion comment)
+            - Discussion Number: ${{ github.event.discussion.number }}
+            - Discussion Title: ${{ github.event.discussion.title }}
+            - Discussion Body: ${{ github.event.discussion.body }}
+            - Discussion Author: ${{ github.event.discussion.user.login }}
+            - Discussion URL: ${{ github.event.discussion.html_url }}
+
+            ## Comment Context (populated when triggered by a comment on an issue, PR, or discussion)
+            - Comment Body: ${{ github.event.comment.body }}
+            - Comment Author: ${{ github.event.comment.user.login }}
+            - Comment URL: ${{ github.event.comment.html_url }}
+
+            ## Review Context (populated when triggered by a PR review)
+            - Review Body: ${{ github.event.review.body }}
+            - Review Author: ${{ github.event.review.user.login }}
+            - Review URL: ${{ github.event.review.html_url }}
+
+            ## Important
+            - ALWAYS respond on the issue, PR, or discussion that triggered this workflow
+            - Do NOT post comments on unrelated issues, PRs, or discussions unless the user explicitly asks you to
+            - Use the context above to identify exactly which entity triggered this workflow and respond there
 
             ## Your Capabilities
 
@@ -88,7 +125,7 @@ jobs:
             If asked to make code changes:
             - ALWAYS create a new branch with the naming pattern: `claude/<short_description>`
             - Make the requested changes
-            - Commit with clear, descriptive messages
+            - Commit with clear, descriptive messages in sensible units of change
             - Create a pull request back to the original branch
             - Use `gh pr create` to submit the PR
 

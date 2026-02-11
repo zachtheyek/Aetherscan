@@ -30,4 +30,4 @@ Run `utils/system_info.sh` and append the outputs as attachments
 Add any other context about the problem here.
 
 **Discussion links**
-All issues are required to have at least one prior discussion with a maintainer, either via GitHub discussions or Slack (as per CONTRIBUTING.md). Please link to the associated discussion here for future reference
+All issues are required to have at least one prior discussion with a maintainer, either via GitHub discussions or Slack (as per CONTRIBUTING.md). Please link to the associated discussion(s) here for future reference

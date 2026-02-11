@@ -1,4 +1,5 @@
 # Analyze merged PRs and suggest documentation updates
+# Creates new issue & instructs Claude assistant to create PR
 name: Claude Update Docs
 
 on:
@@ -61,7 +62,7 @@ jobs:
 
             4. If documentation updates are needed:
                - Create a new GitHub issue with the label "documentation"
-               - Title: "Documentation Update Needed: [brief description]"
+               - Title: "[DOCUMENTATION]: <brief description>"
                - Body should include:
                  - Reference to the merged PR (#${{ github.event.pull_request.number }})
                  - Summary of changes that require documentation

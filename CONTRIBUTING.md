@@ -6,6 +6,10 @@ Thank you for your interest in contributing to Aetherscan! This document describ
 
 ## Getting Started
 
+### AI Usage
+
+The Aetherscan project has strict rules for AI usage. Please see the [AI usage policy](/AI_POLICY.md) before proceeding. **This is very important**.
+
 ### Prerequisites
 
 - Python 3.10+
@@ -27,108 +31,6 @@ conda activate aetherscan
 # Install pre-commit hooks
 pre-commit install
 ```
-
-### AI Usage
-
-The Aetherscan project has strict rules for AI usage. Please see the [AI usage policy](/AI_POLICY.md) before proceeding. **This is very important**.
-
-### Code of Conduct
-
-Basically just don't be an asshole. See [`CODE_OF_CONDUCT.md`](/CODE_OF_CONDUCT.md).
-
----
-
-## Contribution Workflow
-
-> [!TIP]
-> **All issues are actionable, and all PRs must be tied to an existing issue.**
-
-### 1. Start a Discussion
-
-Before making any changes:
-
-- First check to see if any related PRs, issues, or discussions already exist
-- If not, open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
-
-> [!TIP]
-> Consider asking @claude whether your query has any existing PRs, issues, or discussions
-
-### 2. Open an Issue
-
-Once a discussion has reached a well-understood problem statement:
-
-- Open a [GitHub Issue](https://github.com/zachtheyek/Aetherscan/issues) using the appropriate template
-- Claude will automatically triage and assign your issue a label
-- Optionally, if you'd like to tackle this PR, make your interest known to the maintainers within the issue itself
-
-> [!WARNING]
-> "Drive-by" issues (i.e. issues opened without prior discussions with maintainers) may be closed without review or explanation
-
-### 3. Create a Feature Branch
-
-Branch naming convention: `category/description`
-
-| Category   | Use Case                      | Example                     |
-| ---------- | ----------------------------- | --------------------------- |
-| `feature/` | New functionality             | `feature/db_integration`    |
-| `hotfix/`  | Bug fixes                     | `hotfix/cpu_sampling_rate`  |
-| `misc/`    | Housekeeping tasks            | `misc/update_docs`          |
-| `claude/`  | Reserved for Claude assistant | `claude/fix_typo_in_readme` |
-
-```bash
-git checkout -b feature/my_new_feature
-```
-
-### 4. Implement Changes
-
-- Keep commits focused and well-described
-- Follow the code conventions in `pyproject.toml` (PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/))
-- Write tests and update documentation if applicable
-
-### 5. Submit a Pull Request
-
-- Ensure your branch is up-to-date with `master` (use `git rebase`, not `git merge`)
-- All commits must have verified GPG signatures
-- Fill out the PR template completely
-- Link your PR to the associated issue using GitHub's **"Development" sidebar** or by including `Closes #N` / `Fixes #N` in the PR body. This creates a formal link that enables automatic label syncing
-
-> [!WARNING]
-> PRs not tied to an existing issue may be closed without review or explanation
-
-> [!NOTE]
-> Labels from linked issues are automatically synced to PRs. Claude also checks that PRs have linked issues and that issues have prior discussions — non-compliant contributions will receive a warning comment and label.
-
-### 6. Code Review
-
-- PRs require at least one maintainer approval
-- Address review feedback promptly
-- Note: PR approvals are voided when new commits are pushed
-
-> [!NOTE]
-> Claude will perform an automatic code review when your PR is first set to "ready for review". You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
-
----
-
-## Issue and PR Guidelines
-
-### Issue Authors
-
-- Automatically assigned as issue assignee
-- Provide clear reproduction steps for bugs
-- Include system information (use `utils/system_info.sh` and append outputs as attachments)
-
-### PR Authors
-
-- Link to the associated issue
-- Provide a clear description of changes
-- Update tests and documentation if applicable
-- Respond to review feedback
-
-### Reviewers
-
-- [`CODEOWNERS`](/CODEOWNERS) are automatically assigned as reviewers
-- Focus on correctness, performance, and maintainability
-- Be constructive and specific in feedback
 
 ---
 
@@ -207,6 +109,82 @@ Aetherscan/
 > [!WARNING]
 >
 > # TODO: add an architecture section?
+
+---
+
+## Contribution Workflow
+
+> [!TIP]
+> **All issues are actionable, and all PRs must be tied to an existing issue.**
+
+### 1. Start a Discussion
+
+Before making any changes:
+
+- First check to see if any related PRs, issues, or discussions already exist
+- If not, open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or [Slack thread](https://breakthroughlisten.slack.com/archives/C0A3CDALQD8)
+
+> [!TIP]
+> Consider asking @claude whether your query has any existing PRs, issues, or discussions
+
+### 2. Open an Issue
+
+Once a discussion has reached a well-understood problem statement:
+
+- Open a [GitHub Issue](https://github.com/zachtheyek/Aetherscan/issues) by filling out the appropriate issue template completely
+- Claude will automatically triage and assign your issue a label
+- Optionally, if you'd like to tackle this PR, make your interest known to the maintainers within the issue itself
+
+> [!WARNING]
+> "Drive-by" issues (i.e. issues opened without prior discussions with maintainers) may be closed without review or explanation
+
+### 3. Create a Feature Branch
+
+Branch naming convention: `category/description`
+
+| Category   | Use Case                      | Example                     |
+| ---------- | ----------------------------- | --------------------------- |
+| `feature/` | New functionality             | `feature/db_integration`    |
+| `hotfix/`  | Bug fixes                     | `hotfix/cpu_sampling_rate`  |
+| `misc/`    | Housekeeping tasks            | `misc/update_docs`          |
+| `claude/`  | Reserved for Claude assistant | `claude/fix_typo_in_readme` |
+
+```bash
+git checkout -b feature/my_new_feature
+```
+
+### 4. Implement Changes
+
+- Keep commits focused and well-described
+- Ensure all pre-commit hooks pass
+- Follow the code conventions in `pyproject.toml` (PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/))
+- Write tests and update documentation if applicable
+
+### 5. Submit a Pull Request
+
+- Ensure your branch is up-to-date with `master` (use `git rebase`, not `git merge`)
+- All commits must have verified GPG signatures
+- Fill out the appropriate PR template completely
+- Link your PR to the associated issue using GitHub's **"Development" sidebar** or by including `Closes #N` / `Fixes #N` in the PR body. This creates a formal link that enables automatic label syncing
+
+> [!WARNING]
+> PRs not tied to an existing issue may be closed without review or explanation
+
+> [!NOTE]
+> Labels from linked issues are automatically synced to PRs. Claude also checks that PRs have linked issues and that issues have prior discussions — non-compliant contributions will receive a warning comment and label.
+
+### 6. Code Review
+
+- PRs require:
+  - all status checks to pass
+  - at least one maintainer approval
+  - all conversations to be resolved
+  - branches to be up to date
+- Address review feedback promptly
+- Note: PR approvals are voided when new commits are pushed
+
+> [!NOTE]
+> Claude will automatically provide an initial code review. You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
 
 ---
 
