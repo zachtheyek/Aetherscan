@@ -1257,6 +1257,66 @@ class Database:
             result_columns = [desc[0] for desc in cursor.description]
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
+    def query_injection_stat_stability(
+        self,
+        stat_name: str | list[str] | None = None,
+        injection_stage: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        SQL-level aggregation of sanitization and clamping rates per round.
+
+        Returns per-round counts for computing sanitization rate (non_finite_count / total_count)
+        and clamping rate (clamped_count / total_count) without fetching all rows.
+
+        Args:
+            stat_name: Stat name filter. Accepts str or list[str].
+            injection_stage: Injection stage filter. Accepts str or list[str].
+            tag: Tag filter. Accepts str or list[str].
+            start_time: Start timestamp (unix time)
+            end_time: End timestamp (unix time)
+
+        Returns:
+            List of dicts with {round_number, total_count, non_finite_count, clamped_count}
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            query = """
+                SELECT round_number,
+                       COUNT(*) as total_count,
+                       SUM(CASE WHEN is_finite = 0 THEN 1 ELSE 0 END) as non_finite_count,
+                       SUM(CASE WHEN slope_clamped = 1 THEN 1 ELSE 0 END) as clamped_count
+                FROM injection_stats WHERE 1=1
+            """
+            params: list = []
+
+            if stat_name:
+                query = self._add_str_filter(query, params, "stat_name", stat_name)
+
+            if injection_stage:
+                query = self._add_str_filter(query, params, "injection_stage", injection_stage)
+
+            if tag:
+                query = self._add_str_filter(query, params, "tag", tag)
+
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            query += " GROUP BY round_number ORDER BY round_number"
+
+            cursor.execute(query, params)
+
+            result_columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+
     def get_db_stats(self) -> dict[str, Any]:
         """Get summary statistics for the database"""
         with self._get_connection() as conn:
