@@ -2298,64 +2298,58 @@ class TrainingPipeline:
         rfi_stats = {}
 
         for stat_name in signal_stats:
-            # Query ETI stats (from true_only_eti and true_eti_rfi)
-            eti_results = []
-            for st in ["true_only_eti", "true_eti_rfi"]:
-                results = self.db.query_injection_stat(
-                    stat_name=f"eti_{stat_name}",
-                    signal_type=st,
-                    tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
-                )
-                eti_results.extend([r["value"] for r in results])
-                del results
-            eti_stats[stat_name] = eti_results
-
-            # Query RFI stats (from false_with_rfi and true_eti_rfi)
-            rfi_results = []
-            for st in ["false_with_rfi", "true_eti_rfi"]:
-                results = self.db.query_injection_stat(
-                    stat_name=f"rfi_{stat_name}",
-                    signal_type=st,
-                    tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
-                )
-                rfi_results.extend([r["value"] for r in results])
-                del results
-            rfi_stats[stat_name] = rfi_results
-
-        # Query background_index values separately for ETI and RFI signal types
-        eti_background_indices = []
-        for st in ["true_only_eti", "true_eti_rfi"]:
+            # Query ETI stats (from true_only_eti and true_eti_rfi) in a single call
             results = self.db.query_injection_stat(
-                stat_name="global_mean",
-                injection_stage="A",
-                signal_type=st,
+                stat_name=f"eti_{stat_name}",
+                signal_type=["true_only_eti", "true_eti_rfi"],
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
+                columns=["value"],
             )
-            eti_background_indices.extend(
-                [r["background_index"] for r in results if r["background_index"] is not None]
-            )
+            eti_stats[stat_name] = [r["value"] for r in results]
             del results
 
-        rfi_background_indices = []
-        for st in ["false_with_rfi", "true_eti_rfi"]:
+            # Query RFI stats (from false_with_rfi and true_eti_rfi) in a single call
             results = self.db.query_injection_stat(
-                stat_name="global_mean",
-                injection_stage="A",
-                signal_type=st,
+                stat_name=f"rfi_{stat_name}",
+                signal_type=["false_with_rfi", "true_eti_rfi"],
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
+                columns=["value"],
             )
-            rfi_background_indices.extend(
-                [r["background_index"] for r in results if r["background_index"] is not None]
-            )
+            rfi_stats[stat_name] = [r["value"] for r in results]
             del results
+
+        # Query background_index values for ETI and RFI signal types in single calls
+        results = self.db.query_injection_stat(
+            stat_name="global_mean",
+            injection_stage="A",
+            signal_type=["true_only_eti", "true_eti_rfi"],
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+            columns=["background_index"],
+        )
+        eti_background_indices = [
+            r["background_index"] for r in results if r["background_index"] is not None
+        ]
+        del results
+
+        results = self.db.query_injection_stat(
+            stat_name="global_mean",
+            injection_stage="A",
+            signal_type=["false_with_rfi", "true_eti_rfi"],
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+            columns=["background_index"],
+        )
+        rfi_background_indices = [
+            r["background_index"] for r in results if r["background_index"] is not None
+        ]
+        del results
 
         save_path = os.path.join(save_dir, f"injected_signal_characteristics_{tag}.png")
         self._plot_injected_signal_characteristics(
@@ -2400,6 +2394,7 @@ class TrainingPipeline:
                         tag=self.config.checkpoint.save_tag,
                         start_time=self.start_time,
                         end_time=current_time,
+                        columns=["value"],
                     )
                     stats_by_stage[stage][stat_name] = [r["value"] for r in results]
                     del results
@@ -2428,6 +2423,7 @@ class TrainingPipeline:
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
+                    columns=["value"],
                 )
                 values_a = [r["value"] for r in results_a]
                 del results_a
@@ -2440,6 +2436,7 @@ class TrainingPipeline:
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
+                    columns=["value"],
                 )
                 values_b = [r["value"] for r in results_b]
                 del results_b
@@ -2464,6 +2461,7 @@ class TrainingPipeline:
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
+                    columns=["value"],
                 )
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
                 del results
