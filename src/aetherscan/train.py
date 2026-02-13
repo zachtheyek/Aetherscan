@@ -2365,10 +2365,64 @@ class TrainingPipeline:
         del eti_stats, rfi_stats, eti_background_indices, rfi_background_indices
         gc.collect()
 
-        # NOTE: why does query logic happen inside _plot_injection_stability()? should match other plotting functions in plot_injection_stats()
         # Figure 2: Injection stability metrics
+        # Compute sanitization rates per stat using SQL-level aggregation
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        sanitization_rates_by_stat: dict[str, dict[int, float]] = {s: {} for s in intensity_stats}
+
+        # NOTE: should we be computing for all injection stages, instead of just A?
+        for stat_name in intensity_stats:
+            agg_results = self.db.query_injection_stat_stability(
+                stat_name=stat_name,
+                injection_stage="A",
+                tag=self.config.checkpoint.save_tag,
+                start_time=self.start_time,
+                end_time=current_time,
+            )
+            for row in agg_results:
+                round_num = row["round_number"]
+                total = row["total_count"]
+                non_finite = row["non_finite_count"]
+                if round_num is not None and total > 0:
+                    sanitization_rates_by_stat[stat_name][round_num] = non_finite / total
+            del agg_results
+
+        # Compute clamping rate per round using SQL-level aggregation
+        clamping_rates_by_round: dict[int, float] = {}
+        # Slope is the same for all stages. Use stage A and global_mean (W.L.O.G.)
+        clamping_results = self.db.query_injection_stat_stability(
+            stat_name="global_mean",
+            injection_stage="A",
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+        for row in clamping_results:
+            round_num = row["round_number"]
+            total = row["total_count"]
+            clamped = row["clamped_count"]
+            if round_num is not None and total > 0:
+                clamping_rates_by_round[round_num] = clamped / total
+        del clamping_results
+
         save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
-        self._plot_injection_stability(tag, machine_name, save_path)
+        self._plot_injection_stability(
+            sanitization_rates_by_stat,
+            clamping_rates_by_round,
+            tag,
+            machine_name,
+            save_path,
+        )
+
+        del sanitization_rates_by_stat, clamping_rates_by_round
+        gc.collect()
 
         # Figure 3-6: Global intensity distribution (one per signal_type)
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
@@ -2624,12 +2678,23 @@ class TrainingPipeline:
 
     def _plot_injection_stability(
         self,
+        sanitization_rates_by_stat: dict[str, dict[int, float]],
+        clamping_rates_by_round: dict[int, float],
         tag: str,
         machine_name: str,
         save_path: str,
     ) -> None:
         """
         Plot injection stability metrics: sanitization rate and clamping rate.
+
+        Pure rendering function — data is queried and computed by plot_injection_stats().
+
+        Args:
+            sanitization_rates_by_stat: Dict mapping stat_name to {round_number: rate}
+            clamping_rates_by_round: Dict mapping round_number to clamping rate
+            tag: Plot tag for filename
+            machine_name: Machine name for plot title
+            save_path: Path to save the plot
 
         Top plot: Sanitization rate per statistic (global_mean, global_median, etc.)
                   - Rate = count(is_finite=0) / total_count per round
@@ -2641,11 +2706,6 @@ class TrainingPipeline:
         Unified legend outside subplots.
         """
         current_time = time.time()
-
-        if self.db is None:
-            raise RuntimeError(
-                "No database instance detected - cannot generate injection stability plot"
-            )
 
         intensity_stats = [
             "global_mean",
@@ -2671,81 +2731,6 @@ class TrainingPipeline:
             "global_skew": "Skewness",
             "global_kurtosis": "Kurtosis",
         }
-
-        # Query all injection stats (including non-finite) to compute sanitization rates
-        # Group by round_number and stat_name
-        sanitization_rates_by_stat: dict[str, dict[int, float]] = {s: {} for s in intensity_stats}
-        clamping_rates_by_round: dict[int, float] = {}
-
-        # Get all unique round numbers first
-        all_results = self.db.query_injection_stat(
-            stat_name="global_mean",
-            injection_stage="A",
-            only_finite=False,
-            tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
-        )
-
-        if not all_results:
-            logger.warning("No injection stats data to plot")
-            return
-
-        round_numbers = sorted({r["round_number"] for r in all_results if r["round_number"]})
-        del all_results
-        gc.collect()
-
-        if not round_numbers:
-            logger.warning("No round numbers found for injection stability plot")
-            return
-
-        # NOTE: should we be computing for all injection stages, instead of just A?
-        # Compute sanitization rate per stat per round
-        for stat_name in intensity_stats:
-            for round_num in round_numbers:
-                # Query all (finite and non-finite) for this stat and round
-                results = self.db.query_injection_stat(
-                    stat_name=stat_name,
-                    injection_stage="A",
-                    start_round_number=round_num,
-                    end_round_number=round_num,
-                    only_finite=False,
-                    tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
-                )
-
-                if results:
-                    total_count = len(results)
-                    non_finite_count = sum(1 for r in results if r.get("is_finite", 1) == 0)
-                    sanitization_rate = non_finite_count / total_count if total_count > 0 else 0.0
-                    sanitization_rates_by_stat[stat_name][round_num] = sanitization_rate
-
-                del results
-
-        # Compute clamping rate per round (using slope_clamped column)
-        for round_num in round_numbers:
-            # Query all samples for this round
-            results = self.db.query_injection_stat(
-                stat_name="global_mean",
-                injection_stage="A",  # Slope is the same for all stages. Use stage A (W.L.O.G.)
-                start_round_number=round_num,
-                end_round_number=round_num,
-                only_finite=False,
-                tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
-            )
-
-            if results:
-                total_count = len(results)
-                clamped_count = sum(1 for r in results if r.get("slope_clamped", 0) == 1)
-                clamping_rate = clamped_count / total_count if total_count > 0 else 0.0
-                clamping_rates_by_round[round_num] = clamping_rate
-
-            del results
-
-        gc.collect()
 
         # Add SNR range shading
         snr_by_round = self._get_snr_by_round(current_time)
@@ -2859,7 +2844,7 @@ class TrainingPipeline:
                 title=f"Injection stability - ({tag}, {machine_name})",
             )
 
-        del sanitization_rates_by_stat, clamping_rates_by_round, snr_by_round
+        del snr_by_round
         gc.collect()
 
     def _plot_global_intensity_distributions(
