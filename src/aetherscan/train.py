@@ -1728,6 +1728,8 @@ class TrainingPipeline:
                 snr_by_round[round_num] = {}
             snr_by_round[round_num]["floor"] = r["value"]
 
+        del floor_results
+
         # Query snr_range_ceil
         ceil_results = self.db.query_training_stat(
             model_name="beta_vae",
@@ -1742,6 +1744,8 @@ class TrainingPipeline:
             if round_num not in snr_by_round:
                 snr_by_round[round_num] = {}
             snr_by_round[round_num]["ceil"] = r["value"]
+
+        del ceil_results
 
         return snr_by_round
 
@@ -2003,6 +2007,9 @@ class TrainingPipeline:
                 title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
             )
 
+        del snr_by_round
+        gc.collect()
+
     def plot_beta_vae_training_stability(self, tag: str | None = None, dir: str | None = None):
         """
         Plot gradient clipping rate and gradient norm statistics.
@@ -2231,6 +2238,9 @@ class TrainingPipeline:
                 title=f"Beta-VAE Training Stability - ({tag}, {machine_name})",
             )
 
+        del history, snr_by_round, epochs
+        gc.collect()
+
     # TODO: move injection plots to data_generation.py & call at end of generate_triplet_batch() (instead of at the end of train_round() & run_training_pipeline())
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
@@ -2361,6 +2371,7 @@ class TrainingPipeline:
         del eti_stats, rfi_stats, eti_background_indices, rfi_background_indices
         gc.collect()
 
+        # NOTE: why does query logic happen inside _plot_injection_stability()? should match other plotting functions in plot_injection_stats()
         # Figure 2: Injection stability metrics
         save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
         self._plot_injection_stability(tag, machine_name, save_path)
@@ -2849,6 +2860,9 @@ class TrainingPipeline:
                 save_path,
                 title=f"Injection stability - ({tag}, {machine_name})",
             )
+
+        del sanitization_rates_by_stat, clamping_rates_by_round, snr_by_round
+        gc.collect()
 
     def _plot_global_intensity_distributions(
         self,
