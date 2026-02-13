@@ -2007,6 +2007,17 @@ class TrainingPipeline:
                 title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
             )
 
+        # NOTE:
+        # del history and del epochs get flagged by ruff as error code F821
+        # that is, ruff flags all references inside nested functions (plot_dual_axis) as undefined
+        # despite plot_dual_axis being called before del
+        # we could try a hacky solution of moving the del statements before plot_dual_axis is defined,
+        # or by assigning history & epochs to local variables inside plot_dual_axis as default params,
+        # capturing the values at definition time and allowing us to dereference the variables in the
+        # outer scope after the function definition
+        # but realistically, the variables will be garbage collected anyways when the frame exits
+        # after the return statement, plus the training_stats arrays are much more manageable wrt
+        # memory compared to injection_stats arrays, so we don't call del on history or epochs
         del snr_by_round
         gc.collect()
 
