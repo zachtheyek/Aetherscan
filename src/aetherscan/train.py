@@ -3009,18 +3009,46 @@ class TrainingPipeline:
             ax = axes[row, col]
 
             all_values = []
+            max_points = self.config.training.plot_subsampling_count
+            outlier_pct = self.config.training.plot_outlier_percentile
+
             for signal_type in signal_types:
                 values_a, values_b = transitions[stat_name].get(signal_type, ([], []))
                 if values_a and values_b:
                     # Ensure equal length (take minimum)
                     min_len = min(len(values_a), len(values_b))
-                    values_a = values_a[:min_len]
-                    values_b = values_b[:min_len]
-                    all_values.extend(values_a)
-                    all_values.extend(values_b)
+                    va = np.array(values_a[:min_len])
+                    vb = np.array(values_b[:min_len])
+                    all_values.extend(values_a[:min_len])
+                    all_values.extend(values_b[:min_len])
+
+                    # Subsample if exceeding max points per series
+                    if len(va) > max_points:
+                        distances = np.abs(va - vb)
+                        threshold = np.percentile(distances, outlier_pct)
+                        outlier_mask = distances >= threshold
+                        normal_mask = ~outlier_mask
+
+                        # Always keep outliers
+                        outlier_indices = np.where(outlier_mask)[0]
+                        normal_indices = np.where(normal_mask)[0]
+
+                        # Subsample normal points to fill remaining budget
+                        remaining = max(0, max_points - len(outlier_indices))
+                        if remaining < len(normal_indices):
+                            sampled_normal = np.random.choice(
+                                normal_indices, size=remaining, replace=False
+                            )
+                            keep_indices = np.concatenate([outlier_indices, sampled_normal])
+                        else:
+                            keep_indices = np.arange(len(va))
+
+                        va = va[keep_indices]
+                        vb = vb[keep_indices]
+
                     ax.scatter(
-                        values_a,
-                        values_b,
+                        va,
+                        vb,
                         alpha=0.12,
                         facecolor=type_colors[signal_type],
                         edgecolor=type_colors[signal_type],
