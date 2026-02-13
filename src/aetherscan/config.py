@@ -179,6 +179,10 @@ class TrainingConfig:
     max_retries: int = 3
     retry_delay: int = 60  # seconds
 
+    # Plot subsampling params
+    plot_subsampling_count: int = 10000  # Max points per series in scatter plots
+    plot_outlier_percentile: float = 99.5  # Always include points beyond this percentile
+
 
 @dataclass
 class InferenceConfig:
@@ -396,6 +400,8 @@ class Config:
                 "reduction_factor": self.training.reduction_factor,
                 "max_retries": self.training.max_retries,
                 "retry_delay": self.training.retry_delay,
+                "plot_subsampling_count": self.training.plot_subsampling_count,
+                "plot_outlier_percentile": self.training.plot_outlier_percentile,
             },
             "inference": {
                 "encoder_path": self.inference.encoder_path,
