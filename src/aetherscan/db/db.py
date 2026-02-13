@@ -780,26 +780,114 @@ class Database:
             )
         )
 
+    # Column whitelists per table (for SQL injection prevention when using column projection)
+    _SYSTEM_RESOURCES_COLUMNS = {
+        "id",
+        "timestamp",
+        "resource_type",
+        "resource_name",
+        "value",
+        "unit",
+        "tag",
+        "metadata",
+    }
+    _INJECTION_STATS_COLUMNS = {
+        "id",
+        "timestamp",
+        "stat_name",
+        "value",
+        "round_number",
+        "chunk_number",
+        "sample_index",
+        "background_index",
+        "signal_class",
+        "signal_type",
+        "injection_stage",
+        "is_finite",
+        "slope_clamped",
+        "tag",
+        "metadata",
+    }
+    _TRAINING_STATS_COLUMNS = {
+        "id",
+        "timestamp",
+        "model_name",
+        "stat_name",
+        "value",
+        "round_number",
+        "epoch_number",
+        "tag",
+        "metadata",
+    }
+    _INFERENCE_RESULTS_COLUMNS = {
+        "id",
+        "timestamp",
+        "npy_path",
+        "snippet_index",
+        "prediction",
+        "confidence",
+        "latent_vector",
+        "target",
+        "session",
+        "cadence_id",
+        "band",
+        "frequency_mhz",
+        "timestamp_observed",
+        "h5_path",
+        "tag",
+        "metadata",
+    }
+
+    @staticmethod
+    def _add_str_filter(
+        query: str,
+        params: list,
+        column: str,
+        value: str | list[str],
+    ) -> str:
+        """Handle str or list[str] filter — = for str, IN for list."""
+        if isinstance(value, list):
+            placeholders = ", ".join("?" for _ in value)
+            query += f" AND {column} IN ({placeholders})"
+            params.extend(value)
+        else:
+            query += f" AND {column} = ?"
+            params.append(value)
+        return query
+
+    @staticmethod
+    def _build_select(table: str, columns: list[str] | None, whitelist: set[str]) -> str:
+        """Build SELECT clause with optional column projection."""
+        if columns is None:
+            return f"SELECT * FROM {table}"
+        # Validate all requested columns against whitelist
+        invalid = set(columns) - whitelist
+        if invalid:
+            raise ValueError(f"Invalid column(s) for {table}: {invalid}")
+        cols = ", ".join(columns)
+        return f"SELECT {cols} FROM {table}"
+
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
-    # NOTE: how to allow str args to be lists & filter accordingly?
     def query_system_resource(
         self,
-        resource_type: str | None = None,
-        resource_name: str | None = None,
-        tag: str | None = None,
+        resource_type: str | list[str] | None = None,
+        resource_name: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Query from system_resources table
 
         Args:
-            resource_type: Type of resource (e.g. 'cpu', 'ram', 'gpu')
-            resource_name: Name of resource (e.g. 'system_total', 'process_tree')
-            tag: Tag for current pipeline run
+            resource_type: Type of resource (e.g. 'cpu', 'ram', 'gpu'). Accepts str or list[str].
+            resource_name: Name of resource (e.g. 'system_total', 'process_tree'). Accepts str or list[str].
+            tag: Tag for current pipeline run. Accepts str or list[str].
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
+            columns: Optional list of columns to select (default: all). Validated against schema.
 
         Returns:
             List of metric dictionaries
@@ -807,24 +895,19 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # WHERE 1=1 is a trick for building dynamic queries
-            # Since it's always true, it does nothing
-            # But it lets us safely add more conditions with AND
-            query = "SELECT * FROM system_resources WHERE 1=1"
+            select = self._build_select("system_resources", columns, self._SYSTEM_RESOURCES_COLUMNS)
+            query = f"{select} WHERE 1=1"
             params = []
 
             # Build the query dynamically based on user-specified conditions
             if resource_type:
-                query += " AND resource_type = ?"
-                params.append(resource_type)
+                query = self._add_str_filter(query, params, "resource_type", resource_type)
 
             if resource_name:
-                query += " AND resource_name = ?"
-                params.append(resource_name)
+                query = self._add_str_filter(query, params, "resource_name", resource_name)
 
             if tag:
-                query += " AND tag = ?"
-                params.append(tag)
+                query = self._add_str_filter(query, params, "tag", tag)
 
             if start_time:
                 query += " AND timestamp >= ?"
@@ -834,23 +917,16 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            # NOTE: removing ORDER BY to reduce indexing costs
-            # Intentionally hard-coded. Update if schema changes
-            # query += " ORDER BY tag, timestamp, resource_type, resource_name"
-
             cursor.execute(query, params)
 
-            # Create a list of column names using query result's metadata
-            columns = [desc[0] for desc in cursor.description]
-            # Pair column names with values and return to user as a dictionary
-            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+            result_columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
-    # NOTE: how to allow str args to be lists & filter accordingly?
     def query_injection_stat(
         self,
-        stat_name: str | None = None,
+        stat_name: str | list[str] | None = None,
         start_round_number: int | None = None,
         end_round_number: int | None = None,
         start_chunk_number: int | None = None,
@@ -859,20 +935,21 @@ class Database:
         end_sample_index: int | None = None,
         start_background_index: int | None = None,
         end_background_index: int | None = None,
-        signal_class: str | None = None,
-        signal_type: str | None = None,
-        injection_stage: str | None = None,
+        signal_class: str | list[str] | None = None,
+        signal_type: str | list[str] | None = None,
+        injection_stage: str | list[str] | None = None,
         only_finite: bool = True,
         only_slope_clamped: bool | None = None,
-        tag: str | None = None,
+        tag: str | list[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Query from injection_stats table
 
         Args:
-            stat_name: Stat name (e.g. global_mean, eti_snr, rfi_drift_rate, num_samples, etc.)
+            stat_name: Stat name (e.g. global_mean, eti_snr, rfi_drift_rate, num_samples, etc.). Accepts str or list[str].
             start_round_number: Start round number
             end_round_number: End round number
             start_chunk_number: Start chunk number
@@ -881,14 +958,15 @@ class Database:
             end_sample_index: End sample index
             start_background_index: Start background index
             end_background_index: End background index
-            signal_class: Signal class (e.g. main, false, true)
-            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
-            injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
+            signal_class: Signal class (e.g. main, false, true). Accepts str or list[str].
+            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi). Accepts str or list[str].
+            injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm). Accepts str or list[str].
             only_finite: If True (default), only return rows where is_finite=1
             only_slope_clamped: If True, only return rows where slope_clamped=1; if False, only where slope_clamped=0; if None (default), no filter
-            tag: Tag for current pipeline run
+            tag: Tag for current pipeline run. Accepts str or list[str].
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
+            columns: Optional list of columns to select (default: all). Validated against schema.
 
         Returns:
             List of metric dictionaries
@@ -896,16 +974,13 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # WHERE 1=1 is a trick for building dynamic queries
-            # Since it's always true, it does nothing
-            # But it lets us safely add more conditions with AND
-            query = "SELECT * FROM injection_stats WHERE 1=1"
+            select = self._build_select("injection_stats", columns, self._INJECTION_STATS_COLUMNS)
+            query = f"{select} WHERE 1=1"
             params = []
 
             # Build the query dynamically based on user-specified conditions
             if stat_name:
-                query += " AND stat_name = ?"
-                params.append(stat_name)
+                query = self._add_str_filter(query, params, "stat_name", stat_name)
 
             if start_round_number:
                 query += " AND round_number >= ?"
@@ -940,16 +1015,13 @@ class Database:
                 params.append(end_background_index)
 
             if signal_class:
-                query += " AND signal_class = ?"
-                params.append(signal_class)
+                query = self._add_str_filter(query, params, "signal_class", signal_class)
 
             if signal_type:
-                query += " AND signal_type = ?"
-                params.append(signal_type)
+                query = self._add_str_filter(query, params, "signal_type", signal_type)
 
             if injection_stage:
-                query += " AND injection_stage = ?"
-                params.append(injection_stage)
+                query = self._add_str_filter(query, params, "injection_stage", injection_stage)
 
             if only_finite:
                 query += " AND is_finite = 1"
@@ -959,8 +1031,7 @@ class Database:
                 params.append(1 if only_slope_clamped else 0)
 
             if tag:
-                query += " AND tag = ?"
-                params.append(tag)
+                query = self._add_str_filter(query, params, "tag", tag)
 
             if start_time:
                 query += " AND timestamp >= ?"
@@ -970,45 +1041,40 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            # NOTE: removing ORDER BY to reduce indexing costs
-            # Intentionally hard-coded. Update if schema changes
-            # query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
-
             cursor.execute(query, params)
 
-            # Create a list of column names using query result's metadata
-            columns = [desc[0] for desc in cursor.description]
-            # Pair column names with values and return to user as a dictionary
-            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+            result_columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
-    # NOTE: how to allow str args to be lists & filter accordingly?
     def query_training_stat(
         self,
-        model_name: str | None = None,
-        stat_name: str | None = None,
+        model_name: str | list[str] | None = None,
+        stat_name: str | list[str] | None = None,
         start_round_number: int | None = None,
         end_round_number: int | None = None,
         start_epoch_number: int | None = None,
         end_epoch_number: int | None = None,
-        tag: str | None = None,
+        tag: str | list[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Query from training_stats table
 
         Args:
-            model_name: Model name (e.g. 'beta_vae', 'rf')
-            stat_name: Stat name (e.g. 'total_loss', 'reconstruction_loss', 'learning_rate')
+            model_name: Model name (e.g. 'beta_vae', 'rf'). Accepts str or list[str].
+            stat_name: Stat name (e.g. 'total_loss', 'reconstruction_loss', 'learning_rate'). Accepts str or list[str].
             start_round_number: Start round number
             end_round_number: End round number
             start_epoch_number: Start epoch number
             end_epoch_number: End epoch number
-            tag: Tag for current pipeline run
+            tag: Tag for current pipeline run. Accepts str or list[str].
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
+            columns: Optional list of columns to select (default: all). Validated against schema.
 
         Returns:
             List of metric dictionaries
@@ -1016,20 +1082,16 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # WHERE 1=1 is a trick for building dynamic queries
-            # Since it's always true, it does nothing
-            # But it lets us safely add more conditions with AND
-            query = "SELECT * FROM training_stats WHERE 1=1"
+            select = self._build_select("training_stats", columns, self._TRAINING_STATS_COLUMNS)
+            query = f"{select} WHERE 1=1"
             params = []
 
             # Build the query dynamically based on user-specified conditions
             if model_name:
-                query += " AND model_name = ?"
-                params.append(model_name)
+                query = self._add_str_filter(query, params, "model_name", model_name)
 
             if stat_name:
-                query += " AND stat_name = ?"
-                params.append(stat_name)
+                query = self._add_str_filter(query, params, "stat_name", stat_name)
 
             if start_round_number:
                 query += " AND round_number >= ?"
@@ -1048,8 +1110,7 @@ class Database:
                 params.append(end_epoch_number)
 
             if tag:
-                query += " AND tag = ?"
-                params.append(tag)
+                query = self._add_str_filter(query, params, "tag", tag)
 
             if start_time:
                 query += " AND timestamp >= ?"
@@ -1059,63 +1120,58 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            # NOTE: removing ORDER BY to reduce indexing costs
-            # Intentionally hard-coded. Update if schema changes
-            # query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
-
             cursor.execute(query, params)
 
-            # Create a list of column names using query result's metadata
-            columns = [desc[0] for desc in cursor.description]
-            # Pair column names with values and return to user as a dictionary
-            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+            result_columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
-    # NOTE: how to allow str args to be lists & filter accordingly?
     def query_inference_result(
         self,
-        npy_path: str | None = None,
+        npy_path: str | list[str] | None = None,
         start_snippet_index: int | None = None,
         end_snippet_index: int | None = None,
         prediction: int | None = None,
         min_confidence: float | None = None,
         max_confidence: float | None = None,
-        target: str | None = None,
-        session: str | None = None,
+        target: str | list[str] | None = None,
+        session: str | list[str] | None = None,
         cadence_id: int | None = None,
-        band: str | None = None,
+        band: str | list[str] | None = None,
         min_frequency_mhz: float | None = None,
         max_frequency_mhz: float | None = None,
         start_timestamp_observed: float | None = None,
         end_timestamp_observed: float | None = None,
-        h5_path: str | None = None,
-        tag: str | None = None,
+        h5_path: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Query from inference_results table
 
         Args:
-            npy_path: Path to the .npy file containing the snippet
+            npy_path: Path to the .npy file containing the snippet. Accepts str or list[str].
             start_snippet_index: Start snippet index
             end_snippet_index: End snippet index
             prediction: Classification prediction (0=RFI, 1=candidate)
             min_confidence: Minimum confidence threshold
             max_confidence: Maximum confidence threshold
-            target: Observation target name (e.g. "HIP110750")
-            session: Observing session identifier (e.g. "AGBT18A_999_103")
+            target: Observation target name (e.g. "HIP110750"). Accepts str or list[str].
+            session: Observing session identifier (e.g. "AGBT18A_999_103"). Accepts str or list[str].
             cadence_id: Cadence ID from the observation (e.g. "24777")
-            band: Frequency band (e.g. "L", "S", "C", "X")
+            band: Frequency band (e.g. "L", "S", "C", "X"). Accepts str or list[str].
             min_frequency_mhz: Minimum center frequency in MHz
             max_frequency_mhz: Maximum center frequency in MHz
             start_timestamp_observed: Start observation timestamp (unix time)
             end_timestamp_observed: End observation timestamp (unix time)
-            h5_path: Path to the source HDF5 file
-            tag: Tag for current pipeline run
+            h5_path: Path to the source HDF5 file. Accepts str or list[str].
+            tag: Tag for current pipeline run. Accepts str or list[str].
             start_time: Start timestamp (unix time)
             end_time: End timestamp (unix time)
+            columns: Optional list of columns to select (default: all). Validated against schema.
 
         Returns:
             List of result dictionaries
@@ -1123,16 +1179,15 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # WHERE 1=1 is a trick for building dynamic queries
-            # Since it's always true, it does nothing
-            # But it lets us safely add more conditions with AND
-            query = "SELECT * FROM inference_results WHERE 1=1"
+            select = self._build_select(
+                "inference_results", columns, self._INFERENCE_RESULTS_COLUMNS
+            )
+            query = f"{select} WHERE 1=1"
             params = []
 
             # Build the query dynamically based on user-specified conditions
             if npy_path:
-                query += " AND npy_path = ?"
-                params.append(npy_path)
+                query = self._add_str_filter(query, params, "npy_path", npy_path)
 
             if start_snippet_index is not None:
                 query += " AND snippet_index >= ?"
@@ -1155,20 +1210,17 @@ class Database:
                 params.append(max_confidence)
 
             if target:
-                query += " AND target = ?"
-                params.append(target)
+                query = self._add_str_filter(query, params, "target", target)
 
             if session:
-                query += " AND session = ?"
-                params.append(session)
+                query = self._add_str_filter(query, params, "session", session)
 
             if cadence_id is not None:
                 query += " AND cadence_id = ?"
                 params.append(cadence_id)
 
             if band:
-                query += " AND band = ?"
-                params.append(band)
+                query = self._add_str_filter(query, params, "band", band)
 
             if min_frequency_mhz is not None:
                 query += " AND frequency_mhz >= ?"
@@ -1187,12 +1239,10 @@ class Database:
                 params.append(end_timestamp_observed)
 
             if h5_path:
-                query += " AND h5_path = ?"
-                params.append(h5_path)
+                query = self._add_str_filter(query, params, "h5_path", h5_path)
 
             if tag:
-                query += " AND tag = ?"
-                params.append(tag)
+                query = self._add_str_filter(query, params, "tag", tag)
 
             if start_time:
                 query += " AND timestamp >= ?"
@@ -1204,10 +1254,8 @@ class Database:
 
             cursor.execute(query, params)
 
-            # Create a list of column names using query result's metadata
-            columns = [desc[0] for desc in cursor.description]
-            # Pair column names with values and return to user as a dictionary
-            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+            result_columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     def get_db_stats(self) -> dict[str, Any]:
         """Get summary statistics for the database"""
