@@ -839,25 +839,12 @@ class Database:
     }
 
     @staticmethod
-    def _add_str_filter(
-        query: str,
-        params: list,
-        column: str,
-        value: str | list[str],
-    ) -> str:
-        """Handle str or list[str] filter — = for str, IN for list."""
-        if isinstance(value, list):
-            placeholders = ", ".join("?" for _ in value)
-            query += f" AND {column} IN ({placeholders})"
-            params.extend(value)
-        else:
-            query += f" AND {column} = ?"
-            params.append(value)
-        return query
-
-    @staticmethod
     def _build_select(table: str, columns: list[str] | None, whitelist: set[str]) -> str:
-        """Build SELECT clause with optional column projection."""
+        """
+        Build SELECT clause with optional column projection
+        Use SELECT * if no columns provided; Use SELECT col_1, ..., col_n if columns provided
+        Validates columns exist in table from whitelist. Raise ValueError if any column is invalid
+        """
         if columns is None:
             return f"SELECT * FROM {table}"
         # Validate all requested columns against whitelist
@@ -866,6 +853,26 @@ class Database:
             raise ValueError(f"Invalid column(s) for {table}: {invalid}")
         cols = ", ".join(columns)
         return f"SELECT {cols} FROM {table}"
+
+    @staticmethod
+    def _add_str_filter(
+        query: str,
+        params: list,
+        column: str,
+        value: str | list[str],
+    ) -> str:
+        """
+        Handle str or list[str] filter
+        Use = for str; Use IN for list
+        """
+        if isinstance(value, list):
+            placeholders = ", ".join("?" for _ in value)
+            query += f" AND {column} IN ({placeholders})"
+            params.extend(value)
+        else:
+            query += f" AND {column} = ?"
+            params.append(value)
+        return query
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
@@ -896,6 +903,10 @@ class Database:
             cursor = conn.cursor()
 
             select = self._build_select("system_resources", columns, self._SYSTEM_RESOURCES_COLUMNS)
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
             query = f"{select} WHERE 1=1"
             params = []
 
@@ -917,9 +928,15 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # Intentionally hard-coded. Update if schema changes
+            # query += " ORDER BY tag, timestamp, resource_type, resource_name"
+
             cursor.execute(query, params)
 
+            # Create a list of column names using query result's metadata
             result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
@@ -975,6 +992,10 @@ class Database:
             cursor = conn.cursor()
 
             select = self._build_select("injection_stats", columns, self._INJECTION_STATS_COLUMNS)
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
             query = f"{select} WHERE 1=1"
             params = []
 
@@ -1041,9 +1062,83 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # Intentionally hard-coded. Update if schema changes
+            # query += " ORDER BY tag, signal_class, signal_type, round_number, chunk_number, sample_index, stat_name"
+
             cursor.execute(query, params)
 
+            # Create a list of column names using query result's metadata
             result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+
+    def query_injection_stat_stability(
+        self,
+        stat_name: str | list[str] | None = None,
+        injection_stage: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        SQL-level aggregation of injection_stats sanitization and clamping rates.
+
+        Preferred over calling query_injection_stat() & performing Python-level aggregation,
+        since SQLite's internal operations (native C) are inherently faster thanPython's object
+        creation & iteration
+
+        Returns per-round counts for computing sanitization rate (non_finite_count / total_count)
+        and clamping rate (clamped_count / total_count) without fetching all rows.
+
+        Args:
+            stat_name: Stat name filter. Accepts str or list[str].
+            injection_stage: Injection stage filter. Accepts str or list[str].
+            tag: Tag filter. Accepts str or list[str].
+            start_time: Start timestamp (unix time)
+            end_time: End timestamp (unix time)
+
+        Returns:
+            List of dicts with {round_number, total_count, non_finite_count, clamped_count}
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            query = """
+                SELECT
+                    round_number,
+                    COUNT(*) as total_count,
+                    SUM(CASE WHEN is_finite = 0 THEN 1 ELSE 0 END) as non_finite_count,
+                    SUM(CASE WHEN slope_clamped = 1 THEN 1 ELSE 0 END) as clamped_count
+                FROM injection_stats
+                WHERE 1=1
+            """
+            params: list = []
+
+            if stat_name:
+                query = self._add_str_filter(query, params, "stat_name", stat_name)
+
+            if injection_stage:
+                query = self._add_str_filter(query, params, "injection_stage", injection_stage)
+
+            if tag:
+                query = self._add_str_filter(query, params, "tag", tag)
+
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            query += " GROUP BY round_number ORDER BY round_number"
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
@@ -1083,6 +1178,10 @@ class Database:
             cursor = conn.cursor()
 
             select = self._build_select("training_stats", columns, self._TRAINING_STATS_COLUMNS)
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
             query = f"{select} WHERE 1=1"
             params = []
 
@@ -1120,9 +1219,15 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            # NOTE: removing ORDER BY to reduce indexing costs
+            # Intentionally hard-coded. Update if schema changes
+            # query += " ORDER BY tag, model_name, round_number, epoch_number, stat_name"
+
             cursor.execute(query, params)
 
+            # Create a list of column names using query result's metadata
             result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
@@ -1182,6 +1287,10 @@ class Database:
             select = self._build_select(
                 "inference_results", columns, self._INFERENCE_RESULTS_COLUMNS
             )
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
             query = f"{select} WHERE 1=1"
             params = []
 
@@ -1252,69 +1361,13 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
-            cursor.execute(query, params)
-
-            result_columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
-
-    def query_injection_stat_stability(
-        self,
-        stat_name: str | list[str] | None = None,
-        injection_stage: str | list[str] | None = None,
-        tag: str | list[str] | None = None,
-        start_time: float | None = None,
-        end_time: float | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        SQL-level aggregation of sanitization and clamping rates per round.
-
-        Returns per-round counts for computing sanitization rate (non_finite_count / total_count)
-        and clamping rate (clamped_count / total_count) without fetching all rows.
-
-        Args:
-            stat_name: Stat name filter. Accepts str or list[str].
-            injection_stage: Injection stage filter. Accepts str or list[str].
-            tag: Tag filter. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-
-        Returns:
-            List of dicts with {round_number, total_count, non_finite_count, clamped_count}
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-
-            query = """
-                SELECT round_number,
-                       COUNT(*) as total_count,
-                       SUM(CASE WHEN is_finite = 0 THEN 1 ELSE 0 END) as non_finite_count,
-                       SUM(CASE WHEN slope_clamped = 1 THEN 1 ELSE 0 END) as clamped_count
-                FROM injection_stats WHERE 1=1
-            """
-            params: list = []
-
-            if stat_name:
-                query = self._add_str_filter(query, params, "stat_name", stat_name)
-
-            if injection_stage:
-                query = self._add_str_filter(query, params, "injection_stage", injection_stage)
-
-            if tag:
-                query = self._add_str_filter(query, params, "tag", tag)
-
-            if start_time:
-                query += " AND timestamp >= ?"
-                params.append(start_time)
-
-            if end_time:
-                query += " AND timestamp <= ?"
-                params.append(end_time)
-
-            query += " GROUP BY round_number ORDER BY round_number"
+            # NOTE: hard-coded ORDER BY? add template index to init_db
 
             cursor.execute(query, params)
 
+            # Create a list of column names using query result's metadata
             result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     def get_db_stats(self) -> dict[str, Any]:
