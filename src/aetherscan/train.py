@@ -1823,6 +1823,7 @@ class TrainingPipeline:
                     alpha=0.7,
                 )
 
+    # NOTE: combine with plot_beta_vae_training_stability() into plot_training_stats(), similar to plot_injection_stats()?
     def plot_beta_vae_loss_curves(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
@@ -2021,6 +2022,7 @@ class TrainingPipeline:
         del snr_by_round
         gc.collect()
 
+    # NOTE: combine with plot_beta_vae_loss_curves() into plot_training_stats(), similar to plot_injection_stats()?
     def plot_beta_vae_training_stability(self, tag: str | None = None, dir: str | None = None):
         """
         Plot gradient clipping rate and gradient norm statistics.
@@ -2253,9 +2255,10 @@ class TrainingPipeline:
         gc.collect()
 
     # TODO: move injection plots to data_generation.py & call at end of generate_triplet_batch() (instead of at the end of train_round() & run_training_pipeline())
+    # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
-        Plot injection statistics for bias/leakage detection.
+        Plot injection statistics for bias/leakage analysis.
 
         Generates 8 figures:
         - 1 injected signal characteristics
@@ -2335,8 +2338,8 @@ class TrainingPipeline:
 
         # Query background_index values for ETI and RFI signal types in single calls
         results = self.db.query_injection_stat(
-            stat_name="global_mean",
-            injection_stage="A",
+            stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
+            injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
             signal_type=["true_only_eti", "true_eti_rfi"],
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
@@ -2349,8 +2352,8 @@ class TrainingPipeline:
         del results
 
         results = self.db.query_injection_stat(
-            stat_name="global_mean",
-            injection_stage="A",
+            stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
+            injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
             signal_type=["false_with_rfi", "true_eti_rfi"],
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
@@ -2388,11 +2391,10 @@ class TrainingPipeline:
         ]
         sanitization_rates_by_stat: dict[str, dict[int, float]] = {s: {} for s in intensity_stats}
 
-        # NOTE: should we be computing for all injection stages, instead of just A?
         for stat_name in intensity_stats:
             agg_results = self.db.query_injection_stat_stability(
                 stat_name=stat_name,
-                injection_stage="A",
+                injection_stage="A",  # NOTE: why are we only computing for A? only works if we assume sanitization happens evenly for all stages per cadence (is this always true?)
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -2401,16 +2403,17 @@ class TrainingPipeline:
                 round_num = row["round_number"]
                 total = row["total_count"]
                 non_finite = row["non_finite_count"]
-                if round_num is not None and total > 0:
-                    sanitization_rates_by_stat[stat_name][round_num] = non_finite / total
+                if round_num is not None:
+                    sanitization_rates_by_stat[stat_name][round_num] = (
+                        non_finite / total if total > 0 else 0.0
+                    )
             del agg_results
 
         # Compute clamping rate per round using SQL-level aggregation
         clamping_rates_by_round: dict[int, float] = {}
-        # Slope is the same for all stages. Use stage A and global_mean (W.L.O.G.)
         clamping_results = self.db.query_injection_stat_stability(
-            stat_name="global_mean",
-            injection_stage="A",
+            stat_name="global_mean",  # Slope is the same for all stats. Use "global_mean" to reduce rows queried
+            injection_stage="A",  # Slope is the same for all stages. Use "A" to reduce rows queried
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -2419,8 +2422,8 @@ class TrainingPipeline:
             round_num = row["round_number"]
             total = row["total_count"]
             clamped = row["clamped_count"]
-            if round_num is not None and total > 0:
-                clamping_rates_by_round[round_num] = clamped / total
+            if round_num is not None:
+                clamping_rates_by_round[round_num] = clamped / total if total > 0 else 0.0
         del clamping_results
 
         save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
@@ -2549,11 +2552,7 @@ class TrainingPipeline:
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate signal characteristics grid with GridSpec layout.
-
-        Top 2 rows: 6 signal stats in 3x2 grid
-        Bottom row: Background plates spanning full width with ETI/RFI overlapping histograms
-        """
+        """Generate signal characteristics grid with GridSpec layout."""
         signal_stats = [
             "snr",
             "drift_rate",
@@ -2695,27 +2694,7 @@ class TrainingPipeline:
         machine_name: str,
         save_path: str,
     ) -> None:
-        """
-        Plot injection stability metrics: sanitization rate and clamping rate.
-
-        Pure rendering function — data is queried and computed by plot_injection_stats().
-
-        Args:
-            sanitization_rates_by_stat: Dict mapping stat_name to {round_number: rate}
-            clamping_rates_by_round: Dict mapping round_number to clamping rate
-            tag: Plot tag for filename
-            machine_name: Machine name for plot title
-            save_path: Path to save the plot
-
-        Top plot: Sanitization rate per statistic (global_mean, global_median, etc.)
-                  - Rate = count(is_finite=0) / total_count per round
-                  - Multiple lines, one per statistic type
-
-        Bottom plot: Slope clamping rate per round
-                  - Rate = count(slope_clamped=1) / total_count per round
-
-        Unified legend outside subplots.
-        """
+        """Plot injection stability metrics: sanitization rate and clamping rate."""
         current_time = time.time()
 
         intensity_stats = [
@@ -2977,7 +2956,14 @@ class TrainingPipeline:
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate 2x3 scatter plot grid showing A→B transitions."""
+        """
+        Generate 2x3 scatter plot grid showing A→B transitions.
+
+        Uses subsampling by absolute distance (grouped by stat_name, signal_type) to avoid rendering
+        all individual points via ax.scatter().
+        Specifically, plots will include all points beyond outlier_pct. If num_points < max_points,
+        we randomly sample without replacement from the remaining points to make up the difference
+        """
         intensity_stats = [
             "global_mean",
             "global_median",
@@ -3008,9 +2994,12 @@ class TrainingPipeline:
             "true_eti_rfi": "ETI + RFI",
         }
 
+        max_points = self.config.training.plot_injection_subsampling_count
+        outlier_pct = self.config.training.plot_injection_outlier_percentile
+
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"A→B Global Intensity Biases ({tag}, {machine_name})",
+            f"A→B Global Intensity Biases — Subsampled {max_points} pts, {outlier_pct} pct ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
@@ -3019,9 +3008,7 @@ class TrainingPipeline:
             row, col = idx // 3, idx % 3
             ax = axes[row, col]
 
-            all_values = []
-            max_points = self.config.training.plot_subsampling_count
-            outlier_pct = self.config.training.plot_outlier_percentile
+            min_val, max_val = np.inf, -np.inf
 
             for signal_type in signal_types:
                 values_a, values_b = transitions[stat_name].get(signal_type, ([], []))
@@ -3030,8 +3017,6 @@ class TrainingPipeline:
                     min_len = min(len(values_a), len(values_b))
                     va = np.array(values_a[:min_len])
                     vb = np.array(values_b[:min_len])
-                    all_values.extend(values_a[:min_len])
-                    all_values.extend(values_b[:min_len])
 
                     # Subsample if exceeding max points per series
                     if len(va) > max_points:
@@ -3057,6 +3042,9 @@ class TrainingPipeline:
                         va = va[keep_indices]
                         vb = vb[keep_indices]
 
+                    min_val = min(min_val, va.min(), vb.min())
+                    max_val = max(max_val, va.max(), vb.max())
+
                     ax.scatter(
                         va,
                         vb,
@@ -3068,8 +3056,7 @@ class TrainingPipeline:
                     )
 
             # Add diagonal reference line
-            if all_values:
-                min_val, max_val = min(all_values), max(all_values)
+            if min_val < np.inf and max_val > -np.inf:
                 ax.plot([min_val, max_val], [min_val, max_val], "k--", alpha=0.5, linewidth=1)
 
             ax.set_title(
