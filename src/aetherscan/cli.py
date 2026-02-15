@@ -249,6 +249,21 @@ def _add_train_arguments(subparsers):
         help="Maximum cadences to process at once during synthetic signal injection (must be divisible by 4)",
     )
     train_parser.add_argument(
+        "--plot-injection-subsampling-count",
+        type=int,
+        default=None,
+        # NOTE: come back to this later
+        help="",
+    )
+    train_parser.add_argument(
+        "--plot-injection-outlier-percentile",
+        type=float,
+        default=None,
+        # NOTE: come back to this later
+        help="",
+    )
+
+    train_parser.add_argument(
         "--snr-base",
         type=int,
         default=None,
