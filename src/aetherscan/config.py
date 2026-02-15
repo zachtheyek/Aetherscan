@@ -152,9 +152,18 @@ class TrainingConfig:
     effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
     per_replica_val_batch_size: int = 320
 
+    # Signal injection params
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
+    )
+    # TODO: tune to include sufficient info without bottlenecking training
+    plot_injection_subsampling_count: int = (
+        100000  # Max points per series in injection_stats scatter plots
+    )
+    # TODO: tune to include sufficient info without bottlenecking training
+    plot_injection_outlier_percentile: float = (
+        99.0  # Always include injection_stats points beyond this percentile
     )
 
     # Curriculum learning params
@@ -178,10 +187,6 @@ class TrainingConfig:
     # Fault tolerance params
     max_retries: int = 3
     retry_delay: int = 60  # seconds
-
-    # Plot subsampling params
-    plot_subsampling_count: int = 10000  # Max points per series in scatter plots
-    plot_outlier_percentile: float = 99.5  # Always include points beyond this percentile
 
 
 @dataclass
@@ -386,6 +391,8 @@ class Config:
                 "effective_batch_size": self.training.effective_batch_size,
                 "per_replica_val_batch_size": self.training.per_replica_val_batch_size,
                 "signal_injection_chunk_size": self.training.signal_injection_chunk_size,
+                "plot_injection_subsampling_count": self.training.plot_injection_subsampling_count,
+                "plot_injection_outlier_percentile": self.training.plot_injection_outlier_percentile,
                 "snr_base": self.training.snr_base,
                 "initial_snr_range": self.training.initial_snr_range,
                 "final_snr_range": self.training.final_snr_range,
@@ -400,8 +407,6 @@ class Config:
                 "reduction_factor": self.training.reduction_factor,
                 "max_retries": self.training.max_retries,
                 "retry_delay": self.training.retry_delay,
-                "plot_subsampling_count": self.training.plot_subsampling_count,
-                "plot_outlier_percentile": self.training.plot_outlier_percentile,
             },
             "inference": {
                 "encoder_path": self.inference.encoder_path,
