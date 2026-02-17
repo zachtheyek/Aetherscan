@@ -866,6 +866,8 @@ class Database:
         Use = for str; Use IN for list
         """
         if isinstance(value, list):
+            if not value:
+                return query
             placeholders = ", ".join("?" for _ in value)
             query += f" AND {column} IN ({placeholders})"
             params.extend(value)
@@ -920,11 +922,11 @@ class Database:
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
-            if start_time:
+            if start_time is not None:
                 query += " AND timestamp >= ?"
                 params.append(start_time)
 
-            if end_time:
+            if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
@@ -1003,19 +1005,19 @@ class Database:
             if stat_name:
                 query = self._add_str_filter(query, params, "stat_name", stat_name)
 
-            if start_round_number:
+            if start_round_number is not None:
                 query += " AND round_number >= ?"
                 params.append(start_round_number)
 
-            if end_round_number:
+            if end_round_number is not None:
                 query += " AND round_number <= ?"
                 params.append(end_round_number)
 
-            if start_chunk_number:
+            if start_chunk_number is not None:
                 query += " AND chunk_number >= ?"
                 params.append(start_chunk_number)
 
-            if end_chunk_number:
+            if end_chunk_number is not None:
                 query += " AND chunk_number <= ?"
                 params.append(end_chunk_number)
 
@@ -1054,11 +1056,11 @@ class Database:
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
-            if start_time:
+            if start_time is not None:
                 query += " AND timestamp >= ?"
                 params.append(start_time)
 
-            if end_time:
+            if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
@@ -1124,11 +1126,11 @@ class Database:
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
-            if start_time:
+            if start_time is not None:
                 query += " AND timestamp >= ?"
                 params.append(start_time)
 
-            if end_time:
+            if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
@@ -1192,30 +1194,30 @@ class Database:
             if stat_name:
                 query = self._add_str_filter(query, params, "stat_name", stat_name)
 
-            if start_round_number:
+            if start_round_number is not None:
                 query += " AND round_number >= ?"
                 params.append(start_round_number)
 
-            if end_round_number:
+            if end_round_number is not None:
                 query += " AND round_number <= ?"
                 params.append(end_round_number)
 
-            if start_epoch_number:
+            if start_epoch_number is not None:
                 query += " AND epoch_number >= ?"
                 params.append(start_epoch_number)
 
-            if end_epoch_number:
+            if end_epoch_number is not None:
                 query += " AND epoch_number <= ?"
                 params.append(end_epoch_number)
 
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
-            if start_time:
+            if start_time is not None:
                 query += " AND timestamp >= ?"
                 params.append(start_time)
 
-            if end_time:
+            if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
@@ -1353,11 +1355,11 @@ class Database:
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
-            if start_time:
+            if start_time is not None:
                 query += " AND timestamp >= ?"
                 params.append(start_time)
 
-            if end_time:
+            if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
