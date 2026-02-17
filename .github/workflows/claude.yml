@@ -176,5 +176,5 @@ jobs:
             - For code changes, always work on a `claude/*` branch, never commit directly to master
 
           claude_args: |
-            --allowedTools "Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh pr create:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh search:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git checkout:*),Bash(git fetch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),mcp__github_inline_comment__create_inline_comment,Edit,Write,Read,Glob,Grep"
+            --allowedTools "Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh pr create:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh search:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git checkout:*),Bash(git fetch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(pip:*),Bash(pre-commit:*),Bash(ruff:*),mcp__github_inline_comment__create_inline_comment,Edit,Write,Read,Glob,Grep"
             --model opus
