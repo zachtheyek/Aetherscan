@@ -28,6 +28,7 @@ jobs:
         uses: anthropics/claude-code-action@6c61301d8e1ee91bef7b65172f93462bbb216394 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "claude[bot]"
           prompt: |
             REPO: ${{ github.repository }}
             ISSUE NUMBER: ${{ github.event.issue.number }}
@@ -36,18 +37,17 @@ jobs:
             AUTHOR: ${{ github.event.issue.user.login }}
 
             Analyze this new issue and:
-            1. Determine if it's a bug report, feature request, or question
-            2. Assess priority (critical, high, medium, low)
-            3. Suggest appropriate labels
-            4. Check if it duplicates existing issues
-
-            Based on your analysis, add the appropriate labels using:
-            `gh issue edit [number] --add-label "label1,label2"`
+            1. First, discover the available labels: `gh label list --json name,description`
+            2. Determine if it's a bug report, feature request, or question
+            3. Assess priority (critical, high, medium, low)
+            4. Apply the appropriate labels from the available set using:
+               `gh issue edit [number] --add-label "label1,label2"`
+            5. Check if it duplicates existing issues using `gh search issues`
 
             If it appears to be a duplicate, post a comment mentioning the original issue.
 
             Your only responsibilities are to triage the current issue. Do not do anything that is not within this job scope.
 
           claude_args: |
-            --allowedTools "Bash(gh issue:*),Bash(gh search:*),Read,Glob,Grep"
+            --allowedTools "Bash(gh issue:*),Bash(gh search:*),Bash(gh label:*),Read,Glob,Grep"
             --model opus

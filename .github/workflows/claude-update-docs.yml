@@ -61,7 +61,9 @@ jobs:
                - docs/* (tutorials, guides, API docs)
 
             4. If documentation updates are needed:
-               - Create a new GitHub issue with the label "documentation"
+               - First check for existing documentation issues to avoid duplicates:
+                 `gh issue list --label "documentation" --state open`
+               - If no existing issue covers the same updates, create a new GitHub issue with the label "documentation"
                - Title: "[DOCUMENTATION]: <brief description>"
                - Body should include:
                  - Reference to the merged PR (#${{ github.event.pull_request.number }})

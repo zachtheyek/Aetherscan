@@ -2835,7 +2835,6 @@ class TrainingPipeline:
             )
 
         del snr_by_round
-        gc.collect()
 
     def _plot_global_intensity_distributions(
         self,

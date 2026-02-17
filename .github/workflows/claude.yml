@@ -125,14 +125,29 @@ jobs:
             If asked to make code changes:
             - ALWAYS create a new branch with the naming pattern: `claude/<short_description>`
             - Make the requested changes
+            - Run pre-commit hooks before committing (see below)
             - Commit with clear, descriptive messages in sensible units of change
             - Create a pull request back to the original branch
             - Use `gh pr create` to submit the PR
+
+            #### Pre-commit hooks
+            This repo uses pre-commit hooks for linting (ruff), formatting (ruff-format),
+            secret detection (gitleaks), and other checks. Before committing, install and
+            run them:
+            ```
+            pip install pre-commit ruff
+            pre-commit run --all-files
+            ```
+            If pre-commit reports auto-fixable issues (e.g. ruff formatting, trailing whitespace),
+            it will fix them in place — stage the fixes and proceed with your commit.
+            If pre-commit reports errors that require manual fixes, address them before committing.
 
             Example workflow for code changes:
             ```
             git checkout -b claude/fix_typo_in_readme
             # make changes
+            pip install pre-commit ruff
+            pre-commit run --all-files
             git add -A
             git commit -m "Fix typo in README"
             git push -u origin claude/fix_typo_in_readme
@@ -176,5 +191,5 @@ jobs:
             - For code changes, always work on a `claude/*` branch, never commit directly to master
 
           claude_args: |
-            --allowedTools "Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh pr create:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh search:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),mcp__github_inline_comment__create_inline_comment,Edit,Write,Read,Glob,Grep"
+            --allowedTools "Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh pr create:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh search:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git checkout:*),Bash(git fetch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(pip install:*),Bash(pre-commit:*),Bash(ruff:*),mcp__github_inline_comment__create_inline_comment,Edit,Write,Read,Glob,Grep"
             --model opus
