@@ -252,15 +252,13 @@ def _add_train_arguments(subparsers):
         "--plot-injection-subsampling-count",
         type=int,
         default=None,
-        # NOTE: come back to this later
-        help="",
+        help="Max points per stat name, per signal type, for A→B intensity bias scatter plots. Outliers are prioritized, with the difference made up from randomly sampling without replacement the remaining points",
     )
     train_parser.add_argument(
         "--plot-injection-outlier-percentile",
         type=float,
         default=None,
-        # NOTE: come back to this later
-        help="",
+        help="Threshold for points to always be included in A→B intensity bias scatter plots",
     )
 
     train_parser.add_argument(
