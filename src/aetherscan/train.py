@@ -1728,6 +1728,8 @@ class TrainingPipeline:
                 snr_by_round[round_num] = {}
             snr_by_round[round_num]["floor"] = r["value"]
 
+        del floor_results
+
         # Query snr_range_ceil
         ceil_results = self.db.query_training_stat(
             model_name="beta_vae",
@@ -1742,6 +1744,8 @@ class TrainingPipeline:
             if round_num not in snr_by_round:
                 snr_by_round[round_num] = {}
             snr_by_round[round_num]["ceil"] = r["value"]
+
+        del ceil_results
 
         return snr_by_round
 
@@ -1819,6 +1823,7 @@ class TrainingPipeline:
                     alpha=0.7,
                 )
 
+    # NOTE: combine with plot_beta_vae_training_stability() into plot_training_stats(), similar to plot_injection_stats()?
     def plot_beta_vae_loss_curves(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
@@ -2003,6 +2008,21 @@ class TrainingPipeline:
                 title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
             )
 
+        # NOTE:
+        # del history and del epochs get flagged by ruff as error code F821
+        # that is, ruff flags all references inside nested functions (plot_dual_axis) as undefined
+        # despite plot_dual_axis being called before del
+        # we could try a hacky solution of moving the del statements before plot_dual_axis is defined,
+        # or by assigning history & epochs to local variables inside plot_dual_axis as default params,
+        # capturing the values at definition time and allowing us to dereference the variables in the
+        # outer scope after the function definition
+        # but realistically, the variables will be garbage collected anyways when the frame exits
+        # after the return statement, plus the training_stats arrays are much more manageable wrt
+        # memory compared to injection_stats arrays, so we don't call del on history or epochs
+        del snr_by_round
+        gc.collect()
+
+    # NOTE: combine with plot_beta_vae_loss_curves() into plot_training_stats(), similar to plot_injection_stats()?
     def plot_beta_vae_training_stability(self, tag: str | None = None, dir: str | None = None):
         """
         Plot gradient clipping rate and gradient norm statistics.
@@ -2231,10 +2251,14 @@ class TrainingPipeline:
                 title=f"Beta-VAE Training Stability - ({tag}, {machine_name})",
             )
 
+        del history, snr_by_round, epochs
+        gc.collect()
+
     # TODO: move injection plots to data_generation.py & call at end of generate_triplet_batch() (instead of at the end of train_round() & run_training_pipeline())
+    # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
-        Plot injection statistics for bias/leakage detection.
+        Plot injection statistics for bias/leakage analysis.
 
         Generates 8 figures:
         - 1 injected signal characteristics
@@ -2288,64 +2312,58 @@ class TrainingPipeline:
         rfi_stats = {}
 
         for stat_name in signal_stats:
-            # Query ETI stats (from true_only_eti and true_eti_rfi)
-            eti_results = []
-            for st in ["true_only_eti", "true_eti_rfi"]:
-                results = self.db.query_injection_stat(
-                    stat_name=f"eti_{stat_name}",
-                    signal_type=st,
-                    tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
-                )
-                eti_results.extend([r["value"] for r in results])
-                del results
-            eti_stats[stat_name] = eti_results
-
-            # Query RFI stats (from false_with_rfi and true_eti_rfi)
-            rfi_results = []
-            for st in ["false_with_rfi", "true_eti_rfi"]:
-                results = self.db.query_injection_stat(
-                    stat_name=f"rfi_{stat_name}",
-                    signal_type=st,
-                    tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
-                )
-                rfi_results.extend([r["value"] for r in results])
-                del results
-            rfi_stats[stat_name] = rfi_results
-
-        # Query background_index values separately for ETI and RFI signal types
-        eti_background_indices = []
-        for st in ["true_only_eti", "true_eti_rfi"]:
+            # Query ETI stats (from true_only_eti and true_eti_rfi) in a single call
             results = self.db.query_injection_stat(
-                stat_name="global_mean",
-                injection_stage="A",
-                signal_type=st,
+                stat_name=f"eti_{stat_name}",
+                signal_type=["true_only_eti", "true_eti_rfi"],
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
+                columns=["value"],
             )
-            eti_background_indices.extend(
-                [r["background_index"] for r in results if r["background_index"] is not None]
-            )
+            eti_stats[stat_name] = [r["value"] for r in results]
             del results
 
-        rfi_background_indices = []
-        for st in ["false_with_rfi", "true_eti_rfi"]:
+            # Query RFI stats (from false_with_rfi and true_eti_rfi) in a single call
             results = self.db.query_injection_stat(
-                stat_name="global_mean",
-                injection_stage="A",
-                signal_type=st,
+                stat_name=f"rfi_{stat_name}",
+                signal_type=["false_with_rfi", "true_eti_rfi"],
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
+                columns=["value"],
             )
-            rfi_background_indices.extend(
-                [r["background_index"] for r in results if r["background_index"] is not None]
-            )
+            rfi_stats[stat_name] = [r["value"] for r in results]
             del results
+
+        # Query background_index values for ETI and RFI signal types in single calls
+        results = self.db.query_injection_stat(
+            stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
+            injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
+            signal_type=["true_only_eti", "true_eti_rfi"],
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+            columns=["background_index"],
+        )
+        eti_background_indices = [
+            r["background_index"] for r in results if r["background_index"] is not None
+        ]
+        del results
+
+        results = self.db.query_injection_stat(
+            stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
+            injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
+            signal_type=["false_with_rfi", "true_eti_rfi"],
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+            columns=["background_index"],
+        )
+        rfi_background_indices = [
+            r["background_index"] for r in results if r["background_index"] is not None
+        ]
+        del results
 
         save_path = os.path.join(save_dir, f"injected_signal_characteristics_{tag}.png")
         self._plot_injected_signal_characteristics(
@@ -2362,8 +2380,63 @@ class TrainingPipeline:
         gc.collect()
 
         # Figure 2: Injection stability metrics
+        # Compute sanitization rates per stat using SQL-level aggregation
+        intensity_stats = [
+            "global_mean",
+            "global_median",
+            "global_std",
+            "global_mad",
+            "global_skew",
+            "global_kurtosis",
+        ]
+        sanitization_rates_by_stat: dict[str, dict[int, float]] = {s: {} for s in intensity_stats}
+
+        for stat_name in intensity_stats:
+            agg_results = self.db.query_injection_stat_stability(
+                stat_name=stat_name,
+                injection_stage="A",  # NOTE: why are we only computing for A? only works if we assume sanitization happens evenly for all stages per cadence (is this always true?)
+                tag=self.config.checkpoint.save_tag,
+                start_time=self.start_time,
+                end_time=current_time,
+            )
+            for row in agg_results:
+                round_num = row["round_number"]
+                total = row["total_count"]
+                non_finite = row["non_finite_count"]
+                if round_num is not None:
+                    sanitization_rates_by_stat[stat_name][round_num] = (
+                        non_finite / total if total > 0 else 0.0
+                    )
+            del agg_results
+
+        # Compute clamping rate per round using SQL-level aggregation
+        clamping_rates_by_round: dict[int, float] = {}
+        clamping_results = self.db.query_injection_stat_stability(
+            stat_name="global_mean",  # Slope is the same for all stats. Use "global_mean" to reduce rows queried
+            injection_stage="A",  # Slope is the same for all stages. Use "A" to reduce rows queried
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+        for row in clamping_results:
+            round_num = row["round_number"]
+            total = row["total_count"]
+            clamped = row["clamped_count"]
+            if round_num is not None:
+                clamping_rates_by_round[round_num] = clamped / total if total > 0 else 0.0
+        del clamping_results
+
         save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
-        self._plot_injection_stability(tag, machine_name, save_path)
+        self._plot_injection_stability(
+            sanitization_rates_by_stat,
+            clamping_rates_by_round,
+            tag,
+            machine_name,
+            save_path,
+        )
+
+        del sanitization_rates_by_stat, clamping_rates_by_round
+        gc.collect()
 
         # Figure 3-6: Global intensity distribution (one per signal_type)
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
@@ -2389,6 +2462,7 @@ class TrainingPipeline:
                         tag=self.config.checkpoint.save_tag,
                         start_time=self.start_time,
                         end_time=current_time,
+                        columns=["value"],
                     )
                     stats_by_stage[stage][stat_name] = [r["value"] for r in results]
                     del results
@@ -2417,6 +2491,7 @@ class TrainingPipeline:
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
+                    columns=["value"],
                 )
                 values_a = [r["value"] for r in results_a]
                 del results_a
@@ -2429,6 +2504,7 @@ class TrainingPipeline:
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
+                    columns=["value"],
                 )
                 values_b = [r["value"] for r in results_b]
                 del results_b
@@ -2453,6 +2529,7 @@ class TrainingPipeline:
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
+                    columns=["value"],
                 )
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
                 del results
@@ -2475,11 +2552,7 @@ class TrainingPipeline:
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate signal characteristics grid with GridSpec layout.
-
-        Top 2 rows: 6 signal stats in 3x2 grid
-        Bottom row: Background plates spanning full width with ETI/RFI overlapping histograms
-        """
+        """Generate signal characteristics grid with GridSpec layout."""
         signal_stats = [
             "snr",
             "drift_rate",
@@ -2615,28 +2688,14 @@ class TrainingPipeline:
 
     def _plot_injection_stability(
         self,
+        sanitization_rates_by_stat: dict[str, dict[int, float]],
+        clamping_rates_by_round: dict[int, float],
         tag: str,
         machine_name: str,
         save_path: str,
     ) -> None:
-        """
-        Plot injection stability metrics: sanitization rate and clamping rate.
-
-        Top plot: Sanitization rate per statistic (global_mean, global_median, etc.)
-                  - Rate = count(is_finite=0) / total_count per round
-                  - Multiple lines, one per statistic type
-
-        Bottom plot: Slope clamping rate per round
-                  - Rate = count(slope_clamped=1) / total_count per round
-
-        Unified legend outside subplots.
-        """
+        """Plot injection stability metrics: sanitization rate and clamping rate."""
         current_time = time.time()
-
-        if self.db is None:
-            raise RuntimeError(
-                "No database instance detected - cannot generate injection stability plot"
-            )
 
         intensity_stats = [
             "global_mean",
@@ -2662,81 +2721,6 @@ class TrainingPipeline:
             "global_skew": "Skewness",
             "global_kurtosis": "Kurtosis",
         }
-
-        # Query all injection stats (including non-finite) to compute sanitization rates
-        # Group by round_number and stat_name
-        sanitization_rates_by_stat: dict[str, dict[int, float]] = {s: {} for s in intensity_stats}
-        clamping_rates_by_round: dict[int, float] = {}
-
-        # Get all unique round numbers first
-        all_results = self.db.query_injection_stat(
-            stat_name="global_mean",
-            injection_stage="A",
-            only_finite=False,
-            tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
-        )
-
-        if not all_results:
-            logger.warning("No injection stats data to plot")
-            return
-
-        round_numbers = sorted({r["round_number"] for r in all_results if r["round_number"]})
-        del all_results
-        gc.collect()
-
-        if not round_numbers:
-            logger.warning("No round numbers found for injection stability plot")
-            return
-
-        # NOTE: should we be computing for all injection stages, instead of just A?
-        # Compute sanitization rate per stat per round
-        for stat_name in intensity_stats:
-            for round_num in round_numbers:
-                # Query all (finite and non-finite) for this stat and round
-                results = self.db.query_injection_stat(
-                    stat_name=stat_name,
-                    injection_stage="A",
-                    start_round_number=round_num,
-                    end_round_number=round_num,
-                    only_finite=False,
-                    tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
-                )
-
-                if results:
-                    total_count = len(results)
-                    non_finite_count = sum(1 for r in results if r.get("is_finite", 1) == 0)
-                    sanitization_rate = non_finite_count / total_count if total_count > 0 else 0.0
-                    sanitization_rates_by_stat[stat_name][round_num] = sanitization_rate
-
-                del results
-
-        # Compute clamping rate per round (using slope_clamped column)
-        for round_num in round_numbers:
-            # Query all samples for this round
-            results = self.db.query_injection_stat(
-                stat_name="global_mean",
-                injection_stage="A",  # Slope is the same for all stages. Use stage A (W.L.O.G.)
-                start_round_number=round_num,
-                end_round_number=round_num,
-                only_finite=False,
-                tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
-            )
-
-            if results:
-                total_count = len(results)
-                clamped_count = sum(1 for r in results if r.get("slope_clamped", 0) == 1)
-                clamping_rate = clamped_count / total_count if total_count > 0 else 0.0
-                clamping_rates_by_round[round_num] = clamping_rate
-
-            del results
-
-        gc.collect()
 
         # Add SNR range shading
         snr_by_round = self._get_snr_by_round(current_time)
@@ -2849,6 +2833,9 @@ class TrainingPipeline:
                 save_path,
                 title=f"Injection stability - ({tag}, {machine_name})",
             )
+
+        del snr_by_round
+        gc.collect()
 
     def _plot_global_intensity_distributions(
         self,
@@ -2969,7 +2956,14 @@ class TrainingPipeline:
         machine_name: str,
         save_path: str,
     ) -> None:
-        """Generate 2x3 scatter plot grid showing A→B transitions."""
+        """
+        Generate 2x3 scatter plot grid showing A→B transitions.
+
+        Uses subsampling by absolute distance (grouped by stat_name, signal_type) to avoid rendering
+        all individual points via ax.scatter().
+        Specifically, plots will include all points beyond outlier_pct. If num_points < max_points,
+        we randomly sample without replacement from the remaining points to make up the difference
+        """
         intensity_stats = [
             "global_mean",
             "global_median",
@@ -3000,9 +2994,12 @@ class TrainingPipeline:
             "true_eti_rfi": "ETI + RFI",
         }
 
+        max_points = self.config.training.plot_injection_subsampling_count
+        outlier_pct = self.config.training.plot_injection_outlier_percentile
+
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"A→B Global Intensity Biases ({tag}, {machine_name})",
+            f"A→B Global Intensity Biases — Subsampled {max_points} pts, {outlier_pct} pct ({tag}, {machine_name})",
             fontsize=16,
             fontweight="bold",
         )
@@ -3011,19 +3008,46 @@ class TrainingPipeline:
             row, col = idx // 3, idx % 3
             ax = axes[row, col]
 
-            all_values = []
+            min_val, max_val = np.inf, -np.inf
+
             for signal_type in signal_types:
                 values_a, values_b = transitions[stat_name].get(signal_type, ([], []))
                 if values_a and values_b:
                     # Ensure equal length (take minimum)
                     min_len = min(len(values_a), len(values_b))
-                    values_a = values_a[:min_len]
-                    values_b = values_b[:min_len]
-                    all_values.extend(values_a)
-                    all_values.extend(values_b)
+                    va = np.array(values_a[:min_len])
+                    vb = np.array(values_b[:min_len])
+
+                    # Subsample if exceeding max points per series
+                    if len(va) > max_points:
+                        distances = np.abs(va - vb)
+                        threshold = np.percentile(distances, outlier_pct)
+                        outlier_mask = distances >= threshold
+                        normal_mask = ~outlier_mask
+
+                        # Always keep outliers
+                        outlier_indices = np.where(outlier_mask)[0]
+                        normal_indices = np.where(normal_mask)[0]
+
+                        # Subsample normal points to fill remaining budget
+                        remaining = max(0, max_points - len(outlier_indices))
+                        if remaining < len(normal_indices):
+                            sampled_normal = np.random.choice(
+                                normal_indices, size=remaining, replace=False
+                            )
+                            keep_indices = np.concatenate([outlier_indices, sampled_normal])
+                        else:
+                            keep_indices = np.arange(len(va))
+
+                        va = va[keep_indices]
+                        vb = vb[keep_indices]
+
+                    min_val = min(min_val, va.min(), vb.min())
+                    max_val = max(max_val, va.max(), vb.max())
+
                     ax.scatter(
-                        values_a,
-                        values_b,
+                        va,
+                        vb,
                         alpha=0.12,
                         facecolor=type_colors[signal_type],
                         edgecolor=type_colors[signal_type],
@@ -3032,8 +3056,7 @@ class TrainingPipeline:
                     )
 
             # Add diagonal reference line
-            if all_values:
-                min_val, max_val = min(all_values), max(all_values)
+            if min_val < np.inf and max_val > -np.inf:
                 ax.plot([min_val, max_val], [min_val, max_val], "k--", alpha=0.5, linewidth=1)
 
             ax.set_title(
