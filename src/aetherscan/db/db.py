@@ -844,6 +844,10 @@ class Database:
         Build SELECT clause with optional column projection
         Use SELECT * if no columns provided; Use SELECT col_1, ..., col_n if columns provided
         Validates columns exist in table from whitelist. Raise ValueError if any column is invalid
+
+        Note that this API is not meant for public consumption, and should never be called with
+        user input! Since `table` is interpolated directly, this represents a possible SQL injection
+        vector
         """
         if columns is None:
             return f"SELECT * FROM {table}"
@@ -864,6 +868,12 @@ class Database:
         """
         Handle str or list[str] filter
         Use = for str; Use IN for list
+
+        Note that this is an asymmetric API:
+            params (list -> mutable) is modified in place,
+            query (str -> immutable) is returned as a new value.
+        A cleaner approach would be to either return both (query, params), or modify both in-place
+        However, functionally, this method is correct as is, and should be noted by the caller
         """
         if isinstance(value, list):
             if not value:
