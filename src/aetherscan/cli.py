@@ -555,6 +555,16 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and args.signal_injection_chunk_size is not None
     ):
         config.training.signal_injection_chunk_size = args.signal_injection_chunk_size
+    if (
+        hasattr(args, "plot_injection_subsampling_count")
+        and args.plot_injection_subsampling_count is not None
+    ):
+        config.training.plot_injection_subsampling_count = args.plot_injection_subsampling_count
+    if (
+        hasattr(args, "plot_injection_outlier_percentile")
+        and args.plot_injection_outlier_percentile is not None
+    ):
+        config.training.plot_injection_outlier_percentile = args.plot_injection_outlier_percentile
     if hasattr(args, "snr_base") and args.snr_base is not None:
         config.training.snr_base = args.snr_base
     if hasattr(args, "initial_snr_range") and args.initial_snr_range is not None:

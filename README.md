@@ -327,11 +327,10 @@ options:
                         Max points per stat name, per signal type, for A→B
                         intensity bias scatter plots. Outliers are prioritized,
                         with the difference made up from randomly sampling
-                        without replacement the remaining points (default:
-                        100000)
+                        without replacement the remaining points
   --plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE
                         Threshold for points to always be included in A→B
-                        intensity bias scatter plots (default: 99.0)
+                        intensity bias scatter plots
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning
                         (minimum SNR difficulty level)
   --initial-snr-range INITIAL_SNR_RANGE
