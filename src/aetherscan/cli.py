@@ -252,15 +252,13 @@ def _add_train_arguments(subparsers):
         "--plot-injection-subsampling-count",
         type=int,
         default=None,
-        # NOTE: come back to this later
-        help="",
+        help="Max points per stat name, per signal type, for A→B intensity bias scatter plots. Outliers are prioritized, with the difference made up from randomly sampling without replacement the remaining points",
     )
     train_parser.add_argument(
         "--plot-injection-outlier-percentile",
         type=float,
         default=None,
-        # NOTE: come back to this later
-        help="",
+        help="Threshold for points to always be included in A→B intensity bias scatter plots",
     )
 
     train_parser.add_argument(
@@ -557,6 +555,16 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and args.signal_injection_chunk_size is not None
     ):
         config.training.signal_injection_chunk_size = args.signal_injection_chunk_size
+    if (
+        hasattr(args, "plot_injection_subsampling_count")
+        and args.plot_injection_subsampling_count is not None
+    ):
+        config.training.plot_injection_subsampling_count = args.plot_injection_subsampling_count
+    if (
+        hasattr(args, "plot_injection_outlier_percentile")
+        and args.plot_injection_outlier_percentile is not None
+    ):
+        config.training.plot_injection_outlier_percentile = args.plot_injection_outlier_percentile
     if hasattr(args, "snr_base") and args.snr_base is not None:
         config.training.snr_base = args.snr_base
     if hasattr(args, "initial_snr_range") and args.initial_snr_range is not None:

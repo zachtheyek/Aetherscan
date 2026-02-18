@@ -216,6 +216,8 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--effective-batch-size EFFECTIVE_BATCH_SIZE]
               [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
               [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
+              [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
+              [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
               [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
               [--final-snr-range FINAL_SNR_RANGE]
               [--curriculum-schedule CURRICULUM_SCHEDULE]
@@ -321,6 +323,14 @@ options:
   --signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE
                         Maximum cadences to process at once during synthetic
                         signal injection (must be divisible by 4)
+  --plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT
+                        Max points per stat name, per signal type, for A→B
+                        intensity bias scatter plots. Outliers are prioritized,
+                        with the difference made up from randomly sampling
+                        without replacement the remaining points
+  --plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE
+                        Threshold for points to always be included in A→B
+                        intensity bias scatter plots
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning
                         (minimum SNR difficulty level)
   --initial-snr-range INITIAL_SNR_RANGE
