@@ -1220,6 +1220,7 @@ class DataGenerator:
         all_main = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
         all_false = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
         all_true = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+        all_labels = np.empty(n_samples, dtype="U20")
 
         for chunk_idx in range(n_chunks):
             chunk_size = min(max_chunk_size, n_samples - chunk_idx * max_chunk_size)
@@ -1486,10 +1487,20 @@ class DataGenerator:
 
             chunk_true = np.concatenate([half_true_single, half_true_double], axis=0)
 
+            # Build per-cadence labels for this chunk
+            chunk_labels = np.array(
+                ["false_no_signal"] * quarter
+                + ["false_with_rfi"] * quarter
+                + ["true_only_eti"] * quarter
+                + ["true_eti_rfi"] * (chunk_size - 3 * quarter),
+                dtype="U20",
+            )
+
             # Store chunks directly into output array
             all_main[start_idx:end_idx] = chunk_main
             all_false[start_idx:end_idx] = chunk_false
             all_true[start_idx:end_idx] = chunk_true
+            all_labels[start_idx:end_idx] = chunk_labels
 
             # Clean up chunk data immediately
             del (
@@ -1499,7 +1510,7 @@ class DataGenerator:
                 quarter_true_double,
             )
             del half_false_no_signal, half_false_with_rfi, half_true_single, half_true_double
-            del chunk_main, chunk_false, chunk_true
+            del chunk_main, chunk_false, chunk_true, chunk_labels
             del stats_main_false_no_signal, stats_main_false_with_rfi
             del stats_main_true_only_eti, stats_main_true_eti_rfi
             del stats_false_no_signal, stats_false_with_rfi
@@ -1509,7 +1520,12 @@ class DataGenerator:
             logger.info(f"Chunk {chunk_idx + 1} complete, memory cleared")
 
         # Create result dictionary with references to pre-allocated arrays
-        result = {"concatenated": all_main, "false": all_false, "true": all_true}
+        result = {
+            "concatenated": all_main,
+            "false": all_false,
+            "true": all_true,
+            "labels": all_labels,
+        }
 
         # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
         # Sanity check: verify post-injection data normalization
