@@ -168,10 +168,10 @@ class TrainingConfig:
 
     # Latent space visualization params
     latent_viz_num_cadences_per_type: int = (
-        200  # Cadences per signal type for viz batch (total = 4×)
+        250  # Cadences per signal type for viz batch (total = 4×)
     )
     latent_viz_step_interval: int = 10  # Capture snapshot every N training steps
-    latent_viz_gif_duration_ms: int = 500  # Milliseconds per frame in output GIF
+    latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
     # Curriculum learning params
     snr_base: int = 10
