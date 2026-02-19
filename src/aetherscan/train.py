@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -25,6 +26,9 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+import umap
+from PIL import Image
+from sklearn.decomposition import PCA
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -360,6 +364,7 @@ def prepare_distributed_train_dataset(
     num_replicas: int,
     strategy: tf.distribute.Strategy,
     shuffle: bool = True,
+    labels: np.ndarray | None = None,
 ) -> dict:
     """
     Prepare distributed datasets for training & validation
@@ -374,11 +379,12 @@ def prepare_distributed_train_dataset(
         num_replicas: Number of replicas in strategy
         strategy: TensorFlow distribution strategy
         shuffle: Whether to shuffle training data
+        labels: Optional per-cadence signal type labels (e.g. from generate_triplet_batch)
 
     Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
-              accumulation_steps, val_steps, _train_holder, _val_holder}
+              accumulation_steps, val_steps, _train_holder, _val_holder, val_labels}
              Train/val distributed datasets, number of samples in each, number of steps for each
-              (including accumulation sub-steps), and DataHoldedr references for each
+              (including accumulation sub-steps), DataHolder references for each, and val labels
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -412,6 +418,8 @@ def prepare_distributed_train_dataset(
     val_true = data["true"][val_start:val_end]
     val_false = data["false"][val_start:val_end]
     val_holder = DataHolder(val_concat, val_true, val_false)
+
+    val_labels = labels[val_start:val_end] if labels is not None else None
 
     # Create generator functions for memory-efficient data loading
     def train_generator():
@@ -527,6 +535,7 @@ def prepare_distributed_train_dataset(
         "val_steps": val_steps,
         "_train_holder": train_holder,
         "_val_holder": val_holder,
+        "val_labels": val_labels,
     }
 
 
@@ -893,6 +902,108 @@ class TrainingPipeline:
 
         return current_lr
 
+    def _prepare_latent_viz_batch(self, val_holder, val_labels):
+        """
+        Subsample validation set by signal type for latent space visualization.
+
+        Selects `latent_viz_num_cadences_per_type` cadences per signal type from the
+        validation holder, storing the subsampled batch and labels as instance attributes.
+        """
+        n_per_type = self.config.training.latent_viz_num_cadences_per_type
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+
+        selected_indices = []
+        selected_labels = []
+
+        for stype in signal_types:
+            type_indices = np.where(val_labels == stype)[0]
+            if len(type_indices) < n_per_type:
+                logger.warning(
+                    f"Only {len(type_indices)} cadences for {stype} in val set "
+                    f"(requested {n_per_type}), using all available"
+                )
+                sampled = type_indices
+            else:
+                sampled = np.random.choice(type_indices, size=n_per_type, replace=False)
+            selected_indices.append(sampled)
+            selected_labels.extend([stype] * len(sampled))
+
+        all_indices = np.concatenate(selected_indices)
+
+        # Access val_holder data with lock
+        with val_holder._lock:
+            if val_holder._cleared:
+                logger.warning("Val holder cleared before viz batch preparation")
+                self._latent_viz_batch = None
+                self._latent_viz_labels = None
+                return
+            self._latent_viz_batch = val_holder.concat[all_indices].copy()
+
+        self._latent_viz_labels = np.array(selected_labels, dtype="U20")
+
+        logger.info(
+            f"Prepared latent viz batch: {len(all_indices)} cadences "
+            f"({len(selected_indices[0])} per type × {len(signal_types)} types)"
+        )
+
+    def _capture_latent_snapshot(self, round_idx, epoch, step, snr_base, snr_range):
+        """
+        Run encoder on viz batch and write latent vectors to DB.
+
+        Processes the viz batch through the encoder, extracts z_mean,
+        and writes one row per cadence to the latent_snapshots table.
+        """
+        if self._latent_viz_batch is None:
+            return
+
+        n_cadences = self._latent_viz_batch.shape[0]
+        num_obs = self._latent_viz_batch.shape[1]  # 6
+
+        # Reshape for encoder: (N*6, 16, 512, 1) — add channel dim
+        encoder_input = self._latent_viz_batch.reshape(
+            n_cadences * num_obs,
+            self._latent_viz_batch.shape[2],
+            self._latent_viz_batch.shape[3],
+        )
+        # Add channel dimension for Conv2D
+        encoder_input = np.expand_dims(encoder_input, axis=-1)
+
+        # Process in chunks to avoid GPU OOM
+        chunk_size = 1024
+        z_mean_parts = []
+        for i in range(0, len(encoder_input), chunk_size):
+            chunk = tf.constant(encoder_input[i : i + chunk_size], dtype=tf.float32)
+            z_mean_chunk, _, _ = self.vae.encoder(chunk, training=False)
+            z_mean_parts.append(tf.stop_gradient(z_mean_chunk).numpy())
+
+        z_mean_np = np.concatenate(z_mean_parts, axis=0)
+        del encoder_input, z_mean_parts
+
+        # Reshape back to per-cadence: (N, 6, latent_dim)
+        latent_dim = z_mean_np.shape[-1]
+        z_mean_per_cadence = z_mean_np.reshape(n_cadences, num_obs, latent_dim)
+        del z_mean_np
+
+        # Write to DB
+        timestamp = time.time()
+        tag = self.config.checkpoint.save_tag
+        for cadence_idx in range(n_cadences):
+            latent_vector_list = np.round(z_mean_per_cadence[cadence_idx], 8).tolist()
+            self.db.write_latent_snapshot(
+                round_number=round_idx + 1,
+                epoch_number=epoch + 1,
+                step_number=step + 1,
+                cadence_index=cadence_idx,
+                signal_type=str(self._latent_viz_labels[cadence_idx]),
+                latent_vector=latent_vector_list,
+                snr_base=snr_base,
+                snr_range=snr_range,
+                tag=tag,
+                timestamp=timestamp,
+            )
+
+        del z_mean_per_cadence
+
     def train_beta_vae(self):
         """
         Train beta-VAE with curriculum learning & adaptive LR setup
@@ -959,6 +1070,7 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=True,
+            labels=train_data.get("labels"),
         )
 
         del train_data
@@ -973,17 +1085,31 @@ class TrainingPipeline:
         val_steps = data["val_steps"]
         train_holder = data["_train_holder"]
         val_holder = data["_val_holder"]
+        val_labels = data.get("val_labels")
 
         del data
         gc.collect()
+
+        # Prepare latent space visualization batch from validation data
+        if val_labels is not None:
+            self._prepare_latent_viz_batch(val_holder, val_labels)
+        del val_labels
 
         logger.info(
             f"Initializing training loop with {steps_per_epoch} train steps, {val_steps} val steps"
         )
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
 
+        # Set context for latent snapshot capture (read by _train_epoch -> _capture_latent_snapshot)
+        self._current_round_idx = round_idx
+        self._current_snr_base = snr_base
+        self._current_snr_range = snr_range
+        self._latent_viz_step_interval = self.config.training.latent_viz_step_interval
+
         try:
             for epoch in range(epochs):
+                self._current_epoch = epoch
+
                 logger.info(f"{'-' * 30}")
                 logger.info(f"Epoch {epoch + 1}/{epochs} Start")
 
@@ -1177,6 +1303,9 @@ class TrainingPipeline:
                 dir="checkpoints",
             )
 
+            # Generate latent space GIF (accumulates all rounds so far)
+            self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+
             # Save checkpoint
             self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
@@ -1186,6 +1315,10 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
+            # Clear latent viz batch
+            self._latent_viz_batch = None
+            self._latent_viz_labels = None
+
             # NOTE: should check to make sure holders & datasets exist first
             # Clear intermediate data
             train_holder.clear()
@@ -1300,6 +1433,21 @@ class TrainingPipeline:
                 # Apply accumulated gradients
                 global_norm = self._apply_gradients(accumulated_gradients)
                 epoch_gradient_norms.append(float(global_norm))
+
+                # Capture latent snapshot every N steps
+                if (
+                    hasattr(self, "_latent_viz_step_interval")
+                    and (step + 1) % self._latent_viz_step_interval == 0
+                    and hasattr(self, "_latent_viz_batch")
+                    and self._latent_viz_batch is not None
+                ):
+                    self._capture_latent_snapshot(
+                        self._current_round_idx,
+                        self._current_epoch,
+                        step,
+                        self._current_snr_base,
+                        self._current_snr_range,
+                    )
 
                 for key, loss in step_losses.items():
                     # Average step losses over sub-steps
@@ -3204,6 +3352,278 @@ class TrainingPipeline:
                 title=f"Final global intensity biases - ({tag}, {machine_name})",
             )
 
+    def plot_latent_space_gif(self, tag: str | None = None, dir: str | None = None):
+        """
+        Generate GIFs showing how the latent space evolves during training.
+
+        Produces two GIFs (PCA and UMAP) with 8 color categories (4 signal types × ON/OFF).
+        Queries latent snapshots from DB, fits global DR models, and renders frames with
+        consistent axes.
+
+        Args:
+            tag: Plot tag for filename (defaults to save_tag)
+            dir: Subdirectory (e.g., "checkpoints" for per-round)
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        if dir is not None:
+            save_dir = os.path.join(self.config.output_path, "plots", dir)
+        else:
+            save_dir = os.path.join(self.config.output_path, "plots")
+        os.makedirs(save_dir, exist_ok=True)
+
+        if self.db is None:
+            raise RuntimeError("No database instance detected - cannot generate latent space GIF")
+
+        # Flush database to ensure all latent snapshots are written before plotting
+        logger.info("Flushing database before latent space GIF generation...")
+        if not self.db.flush():
+            logger.warning(
+                "Database flush failed. GIF generation may encounter issues. Proceeding anyways..."
+            )
+        else:
+            logger.info("Database flushed")
+
+        # Step 1: Query distinct snapshot keys
+        snapshot_keys = self.db.query_latent_snapshot_keys(
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+        )
+
+        if not snapshot_keys:
+            logger.warning("No latent snapshots found in database — skipping GIF generation")
+            return
+
+        logger.info(f"Found {len(snapshot_keys)} unique snapshots for GIF generation")
+
+        # Step 1b: Subsample to ~200 frames if too many snapshots
+        max_frames = 200
+        if len(snapshot_keys) > max_frames:
+            # Use log-spaced indices for more detail early in training
+            indices = np.unique(
+                np.logspace(0, np.log10(len(snapshot_keys) - 1), num=max_frames).astype(int)
+            )
+            snapshot_keys = [snapshot_keys[i] for i in indices]
+            logger.info(f"Subsampled to {len(snapshot_keys)} frames (log-spaced)")
+
+        # Step 2: Load selected snapshots and pool latent data
+        all_coords = []  # List of (N_obs, latent_dim) arrays per snapshot
+        all_snapshot_labels = []  # List of (N_obs,) label arrays per snapshot
+        all_snapshot_onoff = []  # List of (N_obs,) ON/OFF arrays per snapshot
+        snapshot_metadata = []  # (round, epoch, step, snr_base, snr_range) per snapshot
+
+        for key in snapshot_keys:
+            rows = self.db.query_latent_snapshots(
+                tag=self.config.checkpoint.save_tag,
+                round_number=key["round_number"],
+                epoch_number=key["epoch_number"],
+                step_number=key["step_number"],
+                columns=["cadence_index", "signal_type", "latent_vector"],
+            )
+
+            if not rows:
+                continue
+
+            # Parse latent vectors and build arrays
+            snapshot_latents = []
+            snapshot_labels = []
+            snapshot_onoff = []
+
+            for row in rows:
+                latent_6x = json.loads(row["latent_vector"])  # (6, latent_dim)
+                for obs_idx, vec in enumerate(latent_6x):
+                    snapshot_latents.append(vec)
+                    snapshot_labels.append(row["signal_type"])
+                    snapshot_onoff.append("ON" if obs_idx % 2 == 0 else "OFF")
+
+            all_coords.append(np.array(snapshot_latents, dtype=np.float32))
+            all_snapshot_labels.append(snapshot_labels)
+            all_snapshot_onoff.append(snapshot_onoff)
+            snapshot_metadata.append(key)
+
+        if not all_coords:
+            logger.warning("No valid latent data loaded — skipping GIF generation")
+            return
+
+        # Pool all latents for global DR fit
+        pooled = np.concatenate(all_coords, axis=0)
+        logger.info(
+            f"Pooled {pooled.shape[0]} latent vectors from {len(all_coords)} snapshots "
+            f"for DR fitting"
+        )
+
+        # Step 3: Fit global DR models
+        pca = PCA(n_components=2, random_state=42).fit(pooled)
+        umap_model = umap.UMAP(n_components=2, random_state=42).fit(pooled)
+        del pooled
+
+        # Step 4: Transform each snapshot and compute global axis limits
+        pca_transformed = []
+        umap_transformed = []
+
+        for coords in all_coords:
+            pca_transformed.append(pca.transform(coords))
+            umap_transformed.append(umap_model.transform(coords))
+
+        del all_coords
+
+        # Compute consistent axis limits with 5% padding
+        def _compute_limits(transformed_list):
+            all_2d = np.concatenate(transformed_list, axis=0)
+            x_min, x_max = all_2d[:, 0].min(), all_2d[:, 0].max()
+            y_min, y_max = all_2d[:, 1].min(), all_2d[:, 1].max()
+            x_pad = (x_max - x_min) * 0.05
+            y_pad = (y_max - y_min) * 0.05
+            return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
+
+        pca_xlim, pca_ylim = _compute_limits(pca_transformed)
+        umap_xlim, umap_ylim = _compute_limits(umap_transformed)
+
+        # Step 5: Generate frames
+        colors = {
+            ("false_no_signal", "ON"): "#90CAF9",
+            ("false_no_signal", "OFF"): "#1565C0",
+            ("false_with_rfi", "ON"): "#FFCC80",
+            ("false_with_rfi", "OFF"): "#E65100",
+            ("true_only_eti", "ON"): "#A5D6A7",
+            ("true_only_eti", "OFF"): "#2E7D32",
+            ("true_eti_rfi", "ON"): "#EF9A9A",
+            ("true_eti_rfi", "OFF"): "#C62828",
+        }
+        display_names = {
+            ("false_no_signal", "ON"): "No Signal ON",
+            ("false_no_signal", "OFF"): "No Signal OFF",
+            ("false_with_rfi", "ON"): "RFI Only ON",
+            ("false_with_rfi", "OFF"): "RFI Only OFF",
+            ("true_only_eti", "ON"): "ETI Only ON",
+            ("true_only_eti", "OFF"): "ETI Only OFF",
+            ("true_eti_rfi", "ON"): "ETI+RFI ON",
+            ("true_eti_rfi", "OFF"): "ETI+RFI OFF",
+        }
+
+        temp_dir = tempfile.mkdtemp(prefix="latent_gif_")
+
+        methods = [
+            ("pca", pca_transformed, pca_xlim, pca_ylim),
+            ("umap", umap_transformed, umap_xlim, umap_ylim),
+        ]
+
+        gif_paths = {}
+
+        for method_name, transformed_list, xlim, ylim in methods:
+            frame_paths = []
+
+            for frame_idx, (coords_2d, labels, onoff, meta) in enumerate(
+                zip(
+                    transformed_list,
+                    all_snapshot_labels,
+                    all_snapshot_onoff,
+                    snapshot_metadata,
+                    strict=True,
+                )
+            ):
+                fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+                # Plot each category
+                labels_arr = np.array(labels)
+                onoff_arr = np.array(onoff)
+
+                for (stype, status), color in colors.items():
+                    mask = (labels_arr == stype) & (onoff_arr == status)
+                    if mask.any():
+                        ax.scatter(
+                            coords_2d[mask, 0],
+                            coords_2d[mask, 1],
+                            c=color,
+                            s=5,
+                            alpha=0.3,
+                            label=display_names[(stype, status)],
+                            rasterized=True,
+                        )
+
+                ax.set_xlim(xlim)
+                ax.set_ylim(ylim)
+
+                snr_base = meta["snr_base"]
+                snr_range = meta["snr_range"]
+                snr_ceil = snr_base + snr_range if snr_base and snr_range else "?"
+                ax.set_title(
+                    f"Latent Space ({method_name.upper()}) — "
+                    f"Round {meta['round_number']}, "
+                    f"Epoch {meta['epoch_number']}, "
+                    f"Step {meta['step_number']} "
+                    f"(SNR: {snr_base}–{snr_ceil})",
+                    fontsize=11,
+                )
+                ax.set_xlabel(f"{method_name.upper()} 1")
+                ax.set_ylabel(f"{method_name.upper()} 2")
+
+                # Legend (only on first frame, carried across)
+                if frame_idx == 0:
+                    ax.legend(
+                        loc="upper right",
+                        fontsize=7,
+                        markerscale=3,
+                        ncol=2,
+                        framealpha=0.8,
+                    )
+                else:
+                    # Recreate legend on every frame for GIF consistency
+                    ax.legend(
+                        loc="upper right",
+                        fontsize=7,
+                        markerscale=3,
+                        ncol=2,
+                        framealpha=0.8,
+                    )
+
+                plt.tight_layout()
+
+                frame_path = os.path.join(temp_dir, f"{method_name}_frame_{frame_idx:05d}.png")
+                fig.savefig(frame_path, dpi=100)
+                plt.close(fig)
+                frame_paths.append(frame_path)
+
+            # Step 6: Assemble GIF
+            gif_filename = f"latent_space_{method_name}_{tag}.gif"
+            gif_path = os.path.join(save_dir, gif_filename)
+
+            frames = [Image.open(p) for p in frame_paths]
+            if frames:
+                frames[0].save(
+                    gif_path,
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=self.config.training.latent_viz_gif_duration_ms,
+                    loop=0,
+                )
+                logger.info(
+                    f"Latent space {method_name.upper()} GIF saved: {gif_path} "
+                    f"({len(frames)} frames)"
+                )
+
+                # Upload to Slack
+                logger_instance = get_logger()
+                if logger_instance:
+                    logger_instance.upload_image_to_slack(
+                        gif_path,
+                        title=f"Latent Space {method_name.upper()} - ({tag})",
+                    )
+
+            # Close PIL images
+            for f in frames:
+                f.close()
+            del frames
+
+            gif_paths[method_name] = gif_path
+
+        # Step 8: Cleanup
+        del pca_transformed, umap_transformed
+        del all_snapshot_labels, all_snapshot_onoff, snapshot_metadata
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
+
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
         if tag is None:
@@ -3347,6 +3767,9 @@ def run_training_pipeline(
 
             # Plot injection stats
             pipeline.plot_injection_stats()
+
+            # Plot latent space GIF
+            pipeline.plot_latent_space_gif()
         except Exception as e:
             logger.error(f"Error in plotting: {e}")
             raise  # Re-raise to propagate error
