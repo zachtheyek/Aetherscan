@@ -1110,9 +1110,6 @@ class TrainingPipeline:
             for epoch in range(epochs):
                 self._current_epoch = epoch
 
-                logger.info(f"{'-' * 30}")
-                logger.info(f"Epoch {epoch + 1}/{epochs} Start")
-
                 # Training
                 epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
                     train_dataset, steps_per_epoch, accumulation_steps, time.time()
@@ -1122,8 +1119,6 @@ class TrainingPipeline:
                 val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
 
                 # Queue db writes (non-blocking) & log results
-                logger.info(f"Epoch {epoch + 1} Complete")
-
                 current_time = time.time()
 
                 if self.db is None:
@@ -1260,6 +1255,7 @@ class TrainingPipeline:
                 # # Increment global step
                 # self.global_step += 1
 
+                logger.info(f"Epoch {epoch + 1}")
                 logger.info(
                     f"Train -- Total: {epoch_losses['total']:.4f}, "
                     f"Recon: {epoch_losses['reconstruction']:.4f}, "
@@ -1285,8 +1281,6 @@ class TrainingPipeline:
 
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
-
-                logger.info(f"Epoch {epoch + 1}/{epochs} End")
 
             # NOTE: combine plot_beta_vae_loss_curves() and plot_beta_vae_training_stability() into plot_training_progress()?
             # Plot loss curves
@@ -1455,18 +1449,6 @@ class TrainingPipeline:
                     step_losses[key] = avg_loss
                     # Accumulate epoch losses over training steps
                     epoch_losses[key] += avg_loss
-
-                # Log progress every 10 steps
-                if (step + 1) % 10 == 0 or (step + 1) == steps_per_epoch:
-                    logger.info(
-                        f"Step {step + 1}/{steps_per_epoch}, "
-                        f"Total: {step_losses['total']:.4f}, "
-                        f"Recon: {step_losses['reconstruction']:.4f}, "
-                        f"KL: {step_losses['kl']:.4f}, "
-                        f"True: {step_losses['true']:.4f}, "
-                        f"False: {step_losses['false']:.4f}, "
-                        f"Gradient norm: {global_norm:.4f} "
-                    )
 
             # Average epoch losses over training steps
             for key in epoch_losses:
