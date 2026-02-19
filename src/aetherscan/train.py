@@ -364,7 +364,6 @@ def prepare_distributed_train_dataset(
     num_replicas: int,
     strategy: tf.distribute.Strategy,
     shuffle: bool = True,
-    labels: np.ndarray | None = None,
 ) -> dict:
     """
     Prepare distributed datasets for training & validation
@@ -379,12 +378,11 @@ def prepare_distributed_train_dataset(
         num_replicas: Number of replicas in strategy
         strategy: TensorFlow distribution strategy
         shuffle: Whether to shuffle training data
-        labels: Optional per-cadence signal type labels (e.g. from generate_triplet_batch)
 
     Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
-              accumulation_steps, val_steps, _train_holder, _val_holder, val_labels}
+              accumulation_steps, val_steps, _train_holder, _val_holder}
              Train/val distributed datasets, number of samples in each, number of steps for each
-              (including accumulation sub-steps), DataHolder references for each, and val labels
+              (including accumulation sub-steps), and DataHoldedr references for each
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -418,8 +416,6 @@ def prepare_distributed_train_dataset(
     val_true = data["true"][val_start:val_end]
     val_false = data["false"][val_start:val_end]
     val_holder = DataHolder(val_concat, val_true, val_false)
-
-    val_labels = labels[val_start:val_end] if labels is not None else None
 
     # Create generator functions for memory-efficient data loading
     def train_generator():
@@ -535,7 +531,6 @@ def prepare_distributed_train_dataset(
         "val_steps": val_steps,
         "_train_holder": train_holder,
         "_val_holder": val_holder,
-        "val_labels": val_labels,
     }
 
 
@@ -902,12 +897,17 @@ class TrainingPipeline:
 
         return current_lr
 
-    def _prepare_latent_viz_batch(self, val_holder, val_labels):
+    def _prepare_latent_viz_batch(self, concat_data, labels):
         """
-        Subsample validation set by signal type for latent space visualization.
+        Subsample the full dataset by signal type for latent space visualization.
 
-        Selects `latent_viz_num_cadences_per_type` cadences per signal type from the
-        validation holder, storing the subsampled batch and labels as instance attributes.
+        Must be called on the full pre-split dataset (not the val set) because
+        the sequential label layout within chunks means the 80/20 train/val split
+        can leave the val set with only the last signal type.
+
+        Args:
+            concat_data: Full concatenated cadences array, shape (n_samples, 6, 16, width_bin)
+            labels: Per-cadence signal type labels, shape (n_samples,)
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
@@ -916,10 +916,13 @@ class TrainingPipeline:
         selected_labels = []
 
         for stype in signal_types:
-            type_indices = np.where(val_labels == stype)[0]
+            type_indices = np.where(labels == stype)[0]
+            if len(type_indices) == 0:
+                logger.warning(f"No cadences for {stype} — skipping this type for viz batch")
+                continue
             if len(type_indices) < n_per_type:
                 logger.warning(
-                    f"Only {len(type_indices)} cadences for {stype} in val set "
+                    f"Only {len(type_indices)} cadences for {stype} "
                     f"(requested {n_per_type}), using all available"
                 )
                 sampled = type_indices
@@ -928,22 +931,19 @@ class TrainingPipeline:
             selected_indices.append(sampled)
             selected_labels.extend([stype] * len(sampled))
 
+        if not selected_indices:
+            logger.warning("No cadences found for any signal type — skipping viz batch")
+            self._latent_viz_batch = None
+            self._latent_viz_labels = None
+            return
+
         all_indices = np.concatenate(selected_indices)
-
-        # Access val_holder data with lock
-        with val_holder._lock:
-            if val_holder._cleared:
-                logger.warning("Val holder cleared before viz batch preparation")
-                self._latent_viz_batch = None
-                self._latent_viz_labels = None
-                return
-            self._latent_viz_batch = val_holder.concat[all_indices].copy()
-
+        self._latent_viz_batch = concat_data[all_indices].copy()
         self._latent_viz_labels = np.array(selected_labels, dtype="U20")
 
         logger.info(
             f"Prepared latent viz batch: {len(all_indices)} cadences "
-            f"({len(selected_indices[0])} per type × {len(signal_types)} types)"
+            f"({n_per_type} per type × {len(signal_types)} types)"
         )
 
     def _capture_latent_snapshot(self, round_idx, epoch, step, snr_base, snr_range):
@@ -1059,6 +1059,14 @@ class TrainingPipeline:
             self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
         )
 
+        # Prepare latent viz batch from full dataset before train/val split
+        # (must happen before del train_data, since labels are sequential within
+        # chunks and the 80/20 split would leave the val tail with only the last type)
+        train_labels = train_data.get("labels")
+        if train_labels is not None:
+            self._prepare_latent_viz_batch(train_data["concatenated"], train_labels)
+        del train_labels
+
         # Distribute training data
         data = prepare_distributed_train_dataset(
             data=train_data,
@@ -1070,7 +1078,6 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=True,
-            labels=train_data.get("labels"),
         )
 
         del train_data
@@ -1085,15 +1092,9 @@ class TrainingPipeline:
         val_steps = data["val_steps"]
         train_holder = data["_train_holder"]
         val_holder = data["_val_holder"]
-        val_labels = data.get("val_labels")
 
         del data
         gc.collect()
-
-        # Prepare latent space visualization batch from validation data
-        if val_labels is not None:
-            self._prepare_latent_viz_batch(val_holder, val_labels)
-        del val_labels
 
         logger.info(
             f"Initializing training loop with {steps_per_epoch} train steps, {val_steps} val steps"
