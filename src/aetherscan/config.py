@@ -166,6 +166,13 @@ class TrainingConfig:
         99.0  # Always include injection_stats points beyond this percentile
     )
 
+    # Latent space visualization params
+    latent_viz_num_cadences_per_type: int = (
+        200  # Cadences per signal type for viz batch (total = 4×)
+    )
+    latent_viz_step_interval: int = 10  # Capture snapshot every N training steps
+    latent_viz_gif_duration_ms: int = 500  # Milliseconds per frame in output GIF
+
     # Curriculum learning params
     snr_base: int = 10
     initial_snr_range: int = 40
@@ -393,6 +400,9 @@ class Config:
                 "signal_injection_chunk_size": self.training.signal_injection_chunk_size,
                 "plot_injection_subsampling_count": self.training.plot_injection_subsampling_count,
                 "plot_injection_outlier_percentile": self.training.plot_injection_outlier_percentile,
+                "latent_viz_num_cadences_per_type": self.training.latent_viz_num_cadences_per_type,
+                "latent_viz_step_interval": self.training.latent_viz_step_interval,
+                "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
                 "snr_base": self.training.snr_base,
                 "initial_snr_range": self.training.initial_snr_range,
                 "final_snr_range": self.training.final_snr_range,
