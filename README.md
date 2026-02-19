@@ -218,6 +218,9 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
               [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
               [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
+              [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
+              [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
+              [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
               [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
               [--final-snr-range FINAL_SNR_RANGE]
               [--curriculum-schedule CURRICULUM_SCHEDULE]
@@ -331,6 +334,15 @@ options:
   --plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE
                         Threshold for points to always be included in A→B
                         intensity bias scatter plots
+  --latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE
+                        Number of cadences per signal type for latent space
+                        visualization batch (total points = 4× this value × 6
+                        observations)
+  --latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL
+                        Capture a latent space snapshot every N training steps
+                        (lower = more snapshots, larger DB)
+  --latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS
+                        Milliseconds per frame in latent space GIF output
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning
                         (minimum SNR difficulty level)
   --initial-snr-range INITIAL_SNR_RANGE

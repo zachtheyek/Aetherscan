@@ -260,6 +260,24 @@ def _add_train_arguments(subparsers):
         default=None,
         help="Threshold for points to always be included in A→B intensity bias scatter plots",
     )
+    train_parser.add_argument(
+        "--latent-viz-num-cadences-per-type",
+        type=int,
+        default=None,
+        help="Number of cadences per signal type for latent space visualization batch (total points = 4× this value × 6 observations)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-step-interval",
+        type=int,
+        default=None,
+        help="Capture a latent space snapshot every N training steps (lower = more snapshots, larger DB)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-gif-duration-ms",
+        type=int,
+        default=None,
+        help="Milliseconds per frame in latent space GIF output",
+    )
 
     train_parser.add_argument(
         "--snr-base",
@@ -565,6 +583,15 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and args.plot_injection_outlier_percentile is not None
     ):
         config.training.plot_injection_outlier_percentile = args.plot_injection_outlier_percentile
+    if (
+        hasattr(args, "latent_viz_num_cadences_per_type")
+        and args.latent_viz_num_cadences_per_type is not None
+    ):
+        config.training.latent_viz_num_cadences_per_type = args.latent_viz_num_cadences_per_type
+    if hasattr(args, "latent_viz_step_interval") and args.latent_viz_step_interval is not None:
+        config.training.latent_viz_step_interval = args.latent_viz_step_interval
+    if hasattr(args, "latent_viz_gif_duration_ms") and args.latent_viz_gif_duration_ms is not None:
+        config.training.latent_viz_gif_duration_ms = args.latent_viz_gif_duration_ms
     if hasattr(args, "snr_base") and args.snr_base is not None:
         config.training.snr_base = args.snr_base
     if hasattr(args, "initial_snr_range") and args.initial_snr_range is not None:
