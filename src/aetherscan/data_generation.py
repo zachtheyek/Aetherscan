@@ -1216,11 +1216,12 @@ class DataGenerator:
 
         logger.info(f"Generating {n_samples} samples in {n_chunks} chunks of max {max_chunk_size}")
 
+        # NOTE: freq & time dims hard-coded here
         # Pre-allocate output arrays
         all_main = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
+        all_labels = np.empty(n_samples, dtype="U20")
         all_false = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
         all_true = np.empty((n_samples, 6, 16, self.width_bin), dtype=np.float32)
-        all_labels = np.empty(n_samples, dtype="U20")
 
         for chunk_idx in range(n_chunks):
             chunk_size = min(max_chunk_size, n_samples - chunk_idx * max_chunk_size)
@@ -1236,8 +1237,10 @@ class DataGenerator:
             chunk_timestamp = time.time()
 
             # Split chunk into equal partitions (for balanced classes)
-            quarter = max(1, chunk_size // 4)
-            half = max(1, chunk_size // 2)
+            # Ceiling division ensures 4*quarter >= chunk_size and 2*half >= chunk_size,
+            # so we always generate enough samples. Excess is randomly discarded after concat.
+            quarter = max(1, -(-chunk_size // 4))
+            half = max(1, -(-chunk_size // 2))
 
             # Pure background (main)
             batch_start = time.time()
@@ -1255,18 +1258,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_main_false_no_signal,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="main",
-                signal_type="false_no_signal",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=quarter,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_main_false_no_signal = time.time() - batch_start
 
             # RFI only (main)
             batch_start = time.time()
@@ -1284,18 +1276,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_main_false_with_rfi,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="main",
-                signal_type="false_with_rfi",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=quarter,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_main_false_with_rfi = time.time() - batch_start
 
             # ETI only (main)
             batch_start = time.time()
@@ -1312,18 +1293,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_main_true_only_eti,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="main",
-                signal_type="true_only_eti",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=quarter,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_main_true_only_eti = time.time() - batch_start
 
             # ETI + RFI (main)
             batch_start = time.time()
@@ -1341,18 +1311,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_main_true_eti_rfi,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="main",
-                signal_type="true_eti_rfi",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=quarter,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_main_true_eti_rfi = time.time() - batch_start
 
             # Concatenate for main training data (collapsed cadences)
             chunk_main = np.concatenate(
@@ -1364,6 +1323,56 @@ class DataGenerator:
                 ],
                 axis=0,
             )
+
+            # Build per-cadence labels for this chunk
+            chunk_labels = np.array(
+                ["false_no_signal"] * quarter
+                + ["false_with_rfi"] * quarter
+                + ["true_only_eti"] * quarter
+                + ["true_eti_rfi"] * quarter,
+                dtype="U20",
+            )
+
+            # Subsample to chunk_size if we generated more than needed (ceiling division remainder)
+            n_generated_main = 4 * quarter
+            if n_generated_main > chunk_size:
+                keep_main = np.sort(
+                    np.random.choice(n_generated_main, size=chunk_size, replace=False)
+                )
+                chunk_main = chunk_main[keep_main]
+                chunk_labels = chunk_labels[keep_main]
+
+                # Filter stats to only include kept samples
+                main_stats_groups = [
+                    (stats_main_false_no_signal, 0),
+                    (stats_main_false_with_rfi, quarter),
+                    (stats_main_true_only_eti, 2 * quarter),
+                    (stats_main_true_eti_rfi, 3 * quarter),
+                ]
+                for stats_ref, offset in main_stats_groups:
+                    type_mask = (keep_main >= offset) & (keep_main < offset + quarter)
+                    kept_indices = keep_main[type_mask] - offset
+                    stats_ref[:] = [stats_ref[i] for i in kept_indices]
+
+            # Write main batch stats (deferred to after subsampling so only kept samples are written)
+            for stats_list, signal_type, duration in [
+                (stats_main_false_no_signal, "false_no_signal", duration_main_false_no_signal),
+                (stats_main_false_with_rfi, "false_with_rfi", duration_main_false_with_rfi),
+                (stats_main_true_only_eti, "true_only_eti", duration_main_true_only_eti),
+                (stats_main_true_eti_rfi, "true_eti_rfi", duration_main_true_eti_rfi),
+            ]:
+                self._write_batch_stats(
+                    stats_list=stats_list,
+                    round_number=round_num,
+                    chunk_number=chunk_idx + 1,
+                    signal_class="main",
+                    signal_type=signal_type,
+                    snr_range_floor=snr_base,
+                    snr_range_ceil=snr_base + snr_range,
+                    num_samples=len(stats_list),
+                    inject_duration=duration,
+                    timestamp=chunk_timestamp,
+                )
 
             # Generate separate true/false non-collapsed cadences for training set diversity
             # Used to calculate clustering loss & train RF
@@ -1384,18 +1393,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_false_no_signal,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="false",
-                signal_type="false_no_signal",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=half,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_false_no_signal = time.time() - batch_start
 
             # RFI only (false)
             batch_start = time.time()
@@ -1413,18 +1411,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_false_with_rfi,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="false",
-                signal_type="false_with_rfi",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=half,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_false_with_rfi = time.time() - batch_start
 
             # ETI only (true)
             batch_start = time.time()
@@ -1441,18 +1428,7 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_true_only_eti,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="true",
-                signal_type="true_only_eti",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=half,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_true_only_eti = time.time() - batch_start
 
             # ETI + RFI (true)
             batch_start = time.time()
@@ -1470,37 +1446,65 @@ class DataGenerator:
                 n_processes=self.n_processes,
                 chunks_per_worker=self.chunks_per_worker,
             )
-            self._write_batch_stats(
-                stats_list=stats_true_eti_rfi,
-                round_number=round_num,
-                chunk_number=chunk_idx + 1,
-                signal_class="true",
-                signal_type="true_eti_rfi",
-                snr_range_floor=snr_base,
-                snr_range_ceil=snr_base + snr_range,
-                num_samples=half,
-                inject_duration=time.time() - batch_start,
-                timestamp=chunk_timestamp,
-            )
+            duration_true_eti_rfi = time.time() - batch_start
 
             chunk_false = np.concatenate([half_false_no_signal, half_false_with_rfi], axis=0)
 
             chunk_true = np.concatenate([half_true_single, half_true_double], axis=0)
 
-            # Build per-cadence labels for this chunk
-            chunk_labels = np.array(
-                ["false_no_signal"] * quarter
-                + ["false_with_rfi"] * quarter
-                + ["true_only_eti"] * quarter
-                + ["true_eti_rfi"] * (chunk_size - 3 * quarter),
-                dtype="U20",
-            )
+            # Subsample to chunk_size if we generated more than needed (ceiling division remainder)
+            n_generated_half = 2 * half
+            if n_generated_half > chunk_size:
+                keep_false = np.sort(
+                    np.random.choice(n_generated_half, size=chunk_size, replace=False)
+                )
+                keep_true = np.sort(
+                    np.random.choice(n_generated_half, size=chunk_size, replace=False)
+                )
+                chunk_false = chunk_false[keep_false]
+                chunk_true = chunk_true[keep_true]
+
+                # Filter stats to only include kept samples
+                # chunk_false layout: [0, half) = no_signal, [half, 2*half) = with_rfi
+                stats_false_no_signal[:] = [
+                    stats_false_no_signal[i] for i in keep_false[keep_false < half]
+                ]
+                stats_false_with_rfi[:] = [
+                    stats_false_with_rfi[i - half] for i in keep_false[keep_false >= half]
+                ]
+                # chunk_true layout: [0, half) = only_eti, [half, 2*half) = eti_rfi
+                stats_true_only_eti[:] = [
+                    stats_true_only_eti[i] for i in keep_true[keep_true < half]
+                ]
+                stats_true_eti_rfi[:] = [
+                    stats_true_eti_rfi[i - half] for i in keep_true[keep_true >= half]
+                ]
+
+            # Write false/true batch stats (deferred to after subsampling)
+            for stats_list, signal_class, signal_type, duration in [
+                (stats_false_no_signal, "false", "false_no_signal", duration_false_no_signal),
+                (stats_false_with_rfi, "false", "false_with_rfi", duration_false_with_rfi),
+                (stats_true_only_eti, "true", "true_only_eti", duration_true_only_eti),
+                (stats_true_eti_rfi, "true", "true_eti_rfi", duration_true_eti_rfi),
+            ]:
+                self._write_batch_stats(
+                    stats_list=stats_list,
+                    round_number=round_num,
+                    chunk_number=chunk_idx + 1,
+                    signal_class=signal_class,
+                    signal_type=signal_type,
+                    snr_range_floor=snr_base,
+                    snr_range_ceil=snr_base + snr_range,
+                    num_samples=len(stats_list),
+                    inject_duration=duration,
+                    timestamp=chunk_timestamp,
+                )
 
             # Store chunks directly into output array
             all_main[start_idx:end_idx] = chunk_main
+            all_labels[start_idx:end_idx] = chunk_labels
             all_false[start_idx:end_idx] = chunk_false
             all_true[start_idx:end_idx] = chunk_true
-            all_labels[start_idx:end_idx] = chunk_labels
 
             # Clean up chunk data immediately
             del (
@@ -1510,7 +1514,7 @@ class DataGenerator:
                 quarter_true_double,
             )
             del half_false_no_signal, half_false_with_rfi, half_true_single, half_true_double
-            del chunk_main, chunk_false, chunk_true, chunk_labels
+            del chunk_main, chunk_labels, chunk_false, chunk_true
             del stats_main_false_no_signal, stats_main_false_with_rfi
             del stats_main_true_only_eti, stats_main_true_eti_rfi
             del stats_false_no_signal, stats_false_with_rfi
@@ -1522,9 +1526,9 @@ class DataGenerator:
         # Create result dictionary with references to pre-allocated arrays
         result = {
             "concatenated": all_main,
+            "labels": all_labels,
             "false": all_false,
             "true": all_true,
-            "labels": all_labels,
         }
 
         # NOTE: is there a more efficient way to do this? these checks currently take a few minutes to complete. should we comment this portion out?
