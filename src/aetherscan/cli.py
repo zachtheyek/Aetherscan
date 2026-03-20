@@ -264,13 +264,13 @@ def _add_train_arguments(subparsers):
         "--latent-viz-num-cadences-per-type",
         type=int,
         default=None,
-        help="Number of cadences per signal type for latent space visualization batch (total points = 4× this value × 6 observations)",
+        help="Number of cadences per signal type for latent space visualization batch (total points = 4× this value × 6 observations per cadence)",
     )
     train_parser.add_argument(
         "--latent-viz-step-interval",
         type=int,
         default=None,
-        help="Capture a latent space snapshot every N training steps (lower = more snapshots, larger DB)",
+        help="Capture a latent space snapshot every N training steps (lower = more snapshots, more DB writes, and larger storage costs)",
     )
     train_parser.add_argument(
         "--latent-viz-gif-duration-ms",
