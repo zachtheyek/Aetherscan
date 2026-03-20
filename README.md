@@ -337,10 +337,11 @@ options:
   --latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE
                         Number of cadences per signal type for latent space
                         visualization batch (total points = 4× this value × 6
-                        observations)
+                        observations per cadence)
   --latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL
                         Capture a latent space snapshot every N training steps
-                        (lower = more snapshots, larger DB)
+                        (lower = more snapshots, more DB writes, and larger
+                        storage costs)",
   --latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS
                         Milliseconds per frame in latent space GIF output
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning
