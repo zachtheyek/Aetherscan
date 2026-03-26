@@ -220,6 +220,7 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
               [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
               [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
+              [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
               [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
               [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
               [--final-snr-range FINAL_SNR_RANGE]
@@ -342,6 +343,10 @@ options:
                         Capture a latent space snapshot every N training steps
                         (lower = more snapshots, more DB writes, and larger
                         storage costs)",
+  --latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES
+                        Maximum number of frames in latent space GIF output
+                        (snapshots beyond this limit are log-subsampled,
+                        prioritizing earlier training steps)
   --latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS
                         Milliseconds per frame in latent space GIF output
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning

@@ -168,9 +168,10 @@ class TrainingConfig:
 
     # Latent space visualization params
     latent_viz_num_cadences_per_type: int = (
-        250  # Cadences per signal type for viz batch (total = 4×)
+        200  # Cadences per signal type for viz batch (total = 4×)
     )
     latent_viz_step_interval: int = 10  # Capture snapshot every N training steps
+    latent_viz_gif_max_frames: int = 200  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
     # Curriculum learning params
@@ -402,6 +403,7 @@ class Config:
                 "plot_injection_outlier_percentile": self.training.plot_injection_outlier_percentile,
                 "latent_viz_num_cadences_per_type": self.training.latent_viz_num_cadences_per_type,
                 "latent_viz_step_interval": self.training.latent_viz_step_interval,
+                "latent_viz_gif_max_frames": self.training.latent_viz_gif_max_frames,
                 "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
                 "snr_base": self.training.snr_base,
                 "initial_snr_range": self.training.initial_snr_range,

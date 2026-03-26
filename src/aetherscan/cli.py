@@ -273,6 +273,12 @@ def _add_train_arguments(subparsers):
         help="Capture a latent space snapshot every N training steps (lower = more snapshots, more DB writes, and larger storage costs)",
     )
     train_parser.add_argument(
+        "--latent-viz-gif-max-frames",
+        type=int,
+        default=None,
+        help="Maximum number of frames in latent space GIF output (snapshots beyond this limit are log-subsampled, prioritizing earlier training steps)",
+    )
+    train_parser.add_argument(
         "--latent-viz-gif-duration-ms",
         type=int,
         default=None,
@@ -590,6 +596,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.latent_viz_num_cadences_per_type = args.latent_viz_num_cadences_per_type
     if hasattr(args, "latent_viz_step_interval") and args.latent_viz_step_interval is not None:
         config.training.latent_viz_step_interval = args.latent_viz_step_interval
+    if hasattr(args, "latent_viz_gif_max_frames") and args.latent_viz_gif_max_frames is not None:
+        config.training.latent_viz_gif_max_frames = args.latent_viz_gif_max_frames
     if hasattr(args, "latent_viz_gif_duration_ms") and args.latent_viz_gif_duration_ms is not None:
         config.training.latent_viz_gif_duration_ms = args.latent_viz_gif_duration_ms
     if hasattr(args, "snr_base") and args.snr_base is not None:
@@ -716,6 +724,8 @@ def validate_args(args: argparse.Namespace) -> None:
     # effective_batch_size is divisible by per_replica_batch_size * num_replicas
     # num_samples_beta_vae * train_val_split is divisible by effective_batch_size
     # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
+    # latent_viz_num_cadences_per_type * 4 <= num_samples_beta_vae * (1 - train_val_split)
+    # latent_viz_num_cadences_per_type * 4 is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by 2 (for generate_triplet_batch)
     # # how to ensure divisibility for actual n_samples during inference?
