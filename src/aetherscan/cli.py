@@ -720,14 +720,14 @@ def validate_args(args: argparse.Namespace) -> None:
     # 0 <= train_val_split <= 1
     # per_replica_batch_size * num_replicas <= effective_batch_size <= num_samples_beta_vae * train_val_split
     # per_replica_val_batch_size * num_replicas <= num_samples_beta_vae * (1 - train_val_split)
-    # inference per_replica_val_batch_size * num_replicas <= num_samples_rf
+    # per_replica_val_batch_size * num_replicas <= num_samples_rf
+    # latent_viz_num_cadences_per_type * 4 <= num_samples_beta_vae * (1 - train_val_split)
     # effective_batch_size is divisible by per_replica_batch_size * num_replicas
     # num_samples_beta_vae * train_val_split is divisible by effective_batch_size
     # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
-    # latent_viz_num_cadences_per_type * 4 <= num_samples_beta_vae * (1 - train_val_split)
-    # latent_viz_num_cadences_per_type * 4 is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by 2 (for generate_triplet_batch)
+    # latent_viz_num_cadences_per_type * 4 is divisible by per_replica_val_batch_size * num_replicas
     # # how to ensure divisibility for actual n_samples during inference?
     # snr_base, initial_snr_range, final_snr_range > 0
     # initial_snr_range >= final_snr_range
