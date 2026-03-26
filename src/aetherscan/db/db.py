@@ -271,6 +271,31 @@ class Database:
                 ON training_stats(tag, timestamp, model_name, stat_name)
             """)
 
+            # Latent snapshots table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS latent_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    model_name TEXT NOT NULL,
+                    round_number INTEGER NOT NULL,
+                    epoch_number INTEGER NOT NULL,
+                    step_number INTEGER NOT NULL,
+                    cadence_index INTEGER NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    latent_vector TEXT NOT NULL,
+                    snr_base INTEGER,
+                    snr_range INTEGER,
+                    tag TEXT,
+                    metadata TEXT
+                )
+            """)
+
+            # Composite index for common filter pattern (tag + timestamp + model_name + round_number + epoch_number + step_number)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_latent_snapshots_filter
+                ON latent_snapshots(tag, timestamp, model_name, round_number, epoch_number, step_number)
+            """)
+
             # Inference results table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS inference_results (
@@ -297,30 +322,6 @@ class Database:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_inference_results_filter
                 ON inference_results(tag, timestamp, confidence, prediction)
-            """)
-
-            # Latent snapshots table (for latent space visualization)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS latent_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    round_number INTEGER NOT NULL,
-                    epoch_number INTEGER NOT NULL,
-                    step_number INTEGER NOT NULL,
-                    cadence_index INTEGER NOT NULL,
-                    signal_type TEXT NOT NULL,
-                    latent_vector TEXT NOT NULL,
-                    snr_base INTEGER,
-                    snr_range INTEGER,
-                    tag TEXT,
-                    metadata TEXT
-                )
-            """)
-
-            # Composite index for common filter pattern (tag + round + epoch + step)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_latent_snapshots_filter
-                ON latent_snapshots(tag, round_number, epoch_number, step_number)
             """)
 
             conn.commit()
@@ -522,8 +523,8 @@ class Database:
                 system_resources_records: list[tuple] = []
                 injection_stats_records: list[tuple] = []
                 training_stats_records: list[tuple] = []
-                inference_results_records: list[tuple] = []
                 latent_snapshots_records: list[tuple] = []
+                inference_results_records: list[tuple] = []
 
                 for table, values in self.buffer:
                     if table == "system_resources":
@@ -532,10 +533,10 @@ class Database:
                         injection_stats_records.append(values)
                     elif table == "training_stats":
                         training_stats_records.append(values)
-                    elif table == "inference_results":
-                        inference_results_records.append(values)
                     elif table == "latent_snapshots":
                         latent_snapshots_records.append(values)
+                    elif table == "inference_results":
+                        inference_results_records.append(values)
 
                 # Bulk insert each table type
                 if system_resources_records:
@@ -571,6 +572,18 @@ class Database:
                         training_stats_records,
                     )
 
+                if latent_snapshots_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO latent_snapshots
+                        (timestamp, model_name, round_number, epoch_number, step_number,
+                         cadence_index, signal_type, latent_vector, snr_base, snr_range, tag,
+                         metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        latent_snapshots_records,
+                    )
+
                 if inference_results_records:
                     cursor.executemany(
                         """
@@ -581,17 +594,6 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_results_records,
-                    )
-
-                if latent_snapshots_records:
-                    cursor.executemany(
-                        """
-                        INSERT INTO latent_snapshots
-                        (timestamp, round_number, epoch_number, step_number, cadence_index,
-                         signal_type, latent_vector, snr_base, snr_range, tag, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        latent_snapshots_records,
                     )
 
                 conn.commit()
@@ -752,6 +754,60 @@ class Database:
         )
 
     # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
+    def write_latent_snapshot(
+        self,
+        model_name: str,
+        round_number: int,
+        epoch_number: int,
+        step_number: int,
+        cadence_index: int,
+        signal_type: str,
+        latent_vector: list[list[float]],
+        snr_base: int | None = None,
+        snr_range: int | None = None,
+        tag: str | None = None,
+        timestamp: float | None = None,
+    ):
+        """
+        Queue write to latent_snapshots table (non-blocking)
+
+        Args:
+            model_name: Model name (e.g. 'beta_vae')
+            round_number: Current training round number
+            epoch_number: Current training epoch number
+            step_number: Current training step number
+            cadence_index: Position within the viz batch (0 to num_cadences-1)
+            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
+            latent_vector: Latent vectors for this cadence, shape (6, latent_dim) as nested list
+            snr_base: Optional SNR base value
+            snr_range: Optional SNR range value
+            tag: Optional tag for current pipeline run
+            timestamp: Optional timestamp (uses current time if not provided)
+        """
+        metadata_json = get_system_metadata()
+        latent_vector_json = json.dumps(latent_vector)
+
+        self.write_queue.put(
+            (
+                "latent_snapshots",
+                (
+                    timestamp or time.time(),
+                    model_name,
+                    round_number,
+                    epoch_number,
+                    step_number,
+                    cadence_index,
+                    signal_type,
+                    latent_vector_json,
+                    snr_base,
+                    snr_range,
+                    tag,
+                    metadata_json,
+                ),
+            )
+        )
+
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
     def write_inference_result(
         self,
         npy_path: str,
@@ -777,7 +833,7 @@ class Database:
             snippet_index: Index of the snippet within the .npy file
             prediction: Classification prediction (0=RFI, 1=candidate)
             confidence: Classification confidence score (0.0 to 1.0)
-            latent_vector: Optional latent vector (6 x 8 features) for later analysis
+            latent_vector: Optional latent vector (6 observations * latent_dim features) for later analysis
             target: Optional observation target name (e.g. "DDO210")
             session: Optional observing session identifier (e.g. "AGBT18A_999_103")
             cadence_id: Optional cadence ID from the observation (e.g. "24777")
@@ -812,56 +868,6 @@ class Database:
                     frequency_mhz,
                     timestamp_observed,
                     h5_path,
-                    tag,
-                    metadata_json,
-                ),
-            )
-        )
-
-    def write_latent_snapshot(
-        self,
-        round_number: int,
-        epoch_number: int,
-        step_number: int,
-        cadence_index: int,
-        signal_type: str,
-        latent_vector: list[list[float]],
-        snr_base: int | None = None,
-        snr_range: int | None = None,
-        tag: str | None = None,
-        timestamp: float | None = None,
-    ):
-        """
-        Queue write to latent_snapshots table (non-blocking)
-
-        Args:
-            round_number: Current training round number
-            epoch_number: Current training epoch number
-            step_number: Current training step number
-            cadence_index: Position within the viz batch (0 to num_cadences-1)
-            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
-            latent_vector: Latent vectors for this cadence, shape (6, latent_dim) as nested list
-            snr_base: Optional SNR base value
-            snr_range: Optional SNR range value
-            tag: Optional tag for current pipeline run
-            timestamp: Optional timestamp (uses current time if not provided)
-        """
-        metadata_json = get_system_metadata()
-        latent_vector_json = json.dumps(latent_vector)
-
-        self.write_queue.put(
-            (
-                "latent_snapshots",
-                (
-                    timestamp or time.time(),
-                    round_number,
-                    epoch_number,
-                    step_number,
-                    cadence_index,
-                    signal_type,
-                    latent_vector_json,
-                    snr_base,
-                    snr_range,
                     tag,
                     metadata_json,
                 ),
@@ -907,6 +913,21 @@ class Database:
         "tag",
         "metadata",
     }
+    _LATENT_SNAPSHOTS_COLUMNS = {
+        "id",
+        "timestamp",
+        "model_name",
+        "round_number",
+        "epoch_number",
+        "step_number",
+        "cadence_index",
+        "signal_type",
+        "latent_vector",
+        "snr_base",
+        "snr_range",
+        "tag",
+        "metadata",
+    }
     _INFERENCE_RESULTS_COLUMNS = {
         "id",
         "timestamp",
@@ -922,20 +943,6 @@ class Database:
         "frequency_mhz",
         "timestamp_observed",
         "h5_path",
-        "tag",
-        "metadata",
-    }
-    _LATENT_SNAPSHOTS_COLUMNS = {
-        "id",
-        "timestamp",
-        "round_number",
-        "epoch_number",
-        "step_number",
-        "cadence_index",
-        "signal_type",
-        "latent_vector",
-        "snr_base",
-        "snr_range",
         "tag",
         "metadata",
     }
@@ -1345,7 +1352,139 @@ class Database:
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
-    # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
+    def query_latent_snapshots(
+        self,
+        model_name: str | list[str] | None = None,
+        round_number: int | None = None,
+        epoch_number: int | None = None,
+        step_number: int | None = None,
+        signal_type: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        columns: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query from latent_snapshots table
+
+        Args:
+            model_name: Model name (e.g. 'beta_vae'). Accepts str or list[str].
+            round_number: Filter by exact round number
+            epoch_number: Filter by exact epoch number
+            step_number: Filter by exact step number
+            signal_type: Signal type filter. Accepts str or list[str].
+            tag: Tag for current pipeline run. Accepts str or list[str].
+            start_time: Start timestamp (unix time)
+            end_time: End timestamp (unix time)
+            columns: Optional list of columns to select (default: all). Validated against schema.
+
+        Returns:
+            List of snapshot dictionaries (latent_vector is JSON string — caller parses with json.loads)
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            select = self._build_select("latent_snapshots", columns, self._LATENT_SNAPSHOTS_COLUMNS)
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
+            query = f"{select} WHERE 1=1"
+            params = []
+
+            # Build the query dynamically based on user-specified conditions
+            if model_name:
+                query = self._add_str_filter(query, params, "model_name", model_name)
+
+            if round_number is not None:
+                query += " AND round_number = ?"
+                params.append(round_number)
+
+            if epoch_number is not None:
+                query += " AND epoch_number = ?"
+                params.append(epoch_number)
+
+            if step_number is not None:
+                query += " AND step_number = ?"
+                params.append(step_number)
+
+            if signal_type:
+                query = self._add_str_filter(query, params, "signal_type", signal_type)
+
+            if tag:
+                query = self._add_str_filter(query, params, "tag", tag)
+
+            if start_time is not None:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time is not None:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            # NOTE: hard-coded ORDER BY? add template index to init_db
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+
+    def query_latent_snapshot_keys(
+        self,
+        tag: str | list[str] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get distinct snapshot keys (model, round, epoch, step, snr_base, snr_range) sorted by progression.
+        Avoids having to load every row from latent_snapshots using query_latent_snapshots()
+
+        Returns:
+            List of dicts with {model_name, round_number, epoch_number, step_number, snr_base, snr_range}
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            query = """
+                SELECT DISTINCT model_name, round_number, epoch_number, step_number, snr_base, snr_range
+                FROM latent_snapshots
+                WHERE 1=1
+            """
+            params: list = []
+
+            # Build the query dynamically based on user-specified conditions
+            if tag:
+                query = self._add_str_filter(query, params, "tag", tag)
+
+            if start_time is not None:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time is not None:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            # This ORDER BY doesn't make full use of idx_latent_snapshots_filter, since the ORDER BY
+            # columns don't follow contiguously in the index
+            # However, as long as both tag & timestamp are present in the query's WHERE clause,
+            # idx_latent_snapshots_filter can still be used to optimize the query
+            # The remaining rows form a small set of DISTINCT keys that aren't expensive for SQLite
+            # to perform a filesort
+            # If you measure a bottleneck in the future, consider adding a second schema index like
+            # (tag, model_name, round_number, epoch_number, step_number, timestamp) and then sorting
+            # the rows in that order
+            query += " ORDER BY model_name, round_number, epoch_number, step_number"
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+
+    # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     def query_inference_result(
         self,
         npy_path: str | list[str] | None = None,
@@ -1484,111 +1623,7 @@ class Database:
             # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
-    def query_latent_snapshots(
-        self,
-        tag: str | list[str] | None = None,
-        round_number: int | None = None,
-        epoch_number: int | None = None,
-        step_number: int | None = None,
-        signal_type: str | list[str] | None = None,
-        start_time: float | None = None,
-        end_time: float | None = None,
-        columns: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Query from latent_snapshots table
-
-        Args:
-            tag: Tag for current pipeline run. Accepts str or list[str].
-            round_number: Filter by exact round number
-            epoch_number: Filter by exact epoch number
-            step_number: Filter by exact step number
-            signal_type: Signal type filter. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-            columns: Optional list of columns to select (default: all). Validated against schema.
-
-        Returns:
-            List of snapshot dictionaries (latent_vector is JSON string — caller parses with json.loads)
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-
-            select = self._build_select("latent_snapshots", columns, self._LATENT_SNAPSHOTS_COLUMNS)
-            query = f"{select} WHERE 1=1"
-            params = []
-
-            if tag:
-                query = self._add_str_filter(query, params, "tag", tag)
-
-            if round_number is not None:
-                query += " AND round_number = ?"
-                params.append(round_number)
-
-            if epoch_number is not None:
-                query += " AND epoch_number = ?"
-                params.append(epoch_number)
-
-            if step_number is not None:
-                query += " AND step_number = ?"
-                params.append(step_number)
-
-            if signal_type:
-                query = self._add_str_filter(query, params, "signal_type", signal_type)
-
-            if start_time is not None:
-                query += " AND timestamp >= ?"
-                params.append(start_time)
-
-            if end_time is not None:
-                query += " AND timestamp <= ?"
-                params.append(end_time)
-
-            cursor.execute(query, params)
-
-            result_columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
-
-    def query_latent_snapshot_keys(
-        self,
-        tag: str | list[str] | None = None,
-        start_time: float | None = None,
-        end_time: float | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Get distinct snapshot keys (round, epoch, step, snr_base, snr_range) sorted by progression.
-
-        Returns:
-            List of dicts with {round_number, epoch_number, step_number, snr_base, snr_range}
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-
-            query = """
-                SELECT DISTINCT round_number, epoch_number, step_number, snr_base, snr_range
-                FROM latent_snapshots
-                WHERE 1=1
-            """
-            params: list = []
-
-            if tag:
-                query = self._add_str_filter(query, params, "tag", tag)
-
-            if start_time is not None:
-                query += " AND timestamp >= ?"
-                params.append(start_time)
-
-            if end_time is not None:
-                query += " AND timestamp <= ?"
-                params.append(end_time)
-
-            query += " ORDER BY round_number, epoch_number, step_number"
-
-            cursor.execute(query, params)
-
-            result_columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
-
+    # NOTE: this call gets expensive as db grows. create a separate schema to track num_rows_added per pipeline run. then count & update as part of db cleanup routine? or use SQLite's dbstat virtual table or periodic ANALYZE?
     def get_db_stats(self) -> dict[str, Any]:
         """Get summary statistics for the database"""
         with self._get_connection() as conn:
@@ -1606,11 +1641,11 @@ class Database:
             cursor.execute("SELECT COUNT(*) FROM training_stats")
             stats["training_stats_row_count"] = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM inference_results")
-            stats["inference_results_row_count"] = cursor.fetchone()[0]
-
             cursor.execute("SELECT COUNT(*) FROM latent_snapshots")
             stats["latent_snapshots_row_count"] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM inference_results")
+            stats["inference_results_row_count"] = cursor.fetchone()[0]
 
             # Time range
             # Use system_resources as proxy
