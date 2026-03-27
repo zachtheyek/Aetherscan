@@ -144,13 +144,13 @@ class TrainingConfig:
     num_training_rounds: int = 20
     epochs_per_round: int = 100
 
-    num_samples_beta_vae: int = 399360
+    num_samples_beta_vae: int = 499200
     num_samples_rf: int = 99840
     train_val_split: float = 0.8
 
     per_replica_batch_size: int = 128
     effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
-    per_replica_val_batch_size: int = 64  # Used for both model validation, viz batch latent generation, and random forest latent generation
+    per_replica_val_batch_size: int = 80  # Used for both model validation, viz batch latent generation, and random forest latent generation
 
     # Signal injection params
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
@@ -168,10 +168,10 @@ class TrainingConfig:
 
     # Latent space visualization params
     latent_viz_num_cadences_per_type: int = (
-        192  # Cadences per signal type for viz batch (total = 4×)
+        240  # Cadences per signal type for viz batch (total = 4×)
     )
     latent_viz_step_interval: int = 10  # Capture snapshot every N training steps
-    latent_viz_gif_max_frames: int = 200  # Max frames in output GIF (log-spaced subsampling)
+    latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
     # Curriculum learning params
