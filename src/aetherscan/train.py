@@ -1744,7 +1744,9 @@ class TrainingPipeline:
 
         return current_lr
 
-    def _distributed_encode(self, dataset, n_steps, encode_fn, n_samples, latent_dim):
+    def _distributed_encode(
+        self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False
+    ):
         """
         Run distributed encoding over a dataset using a provided @tf.function.
 
@@ -1757,6 +1759,7 @@ class TrainingPipeline:
             encode_fn: @tf.function that takes a batch and returns one or more per-replica tensors
             n_samples: Total number of output rows per array
             latent_dim: Latent dimension
+            logging: Whether to log progress (default: False)
 
         Returns:
             List of np.ndarray. Each shape (n_samples, latent_dim).
@@ -1767,7 +1770,7 @@ class TrainingPipeline:
         outputs = None
 
         try:
-            for step in range(n_steps):
+            for _ in range(n_steps):
                 batch = next(iterator)
 
                 # Get per-replica latents for this batch
@@ -1796,9 +1799,9 @@ class TrainingPipeline:
 
                 current_idx += batch_size
 
-                # Log progress every 10 steps or on the final step
-                if (step + 1) % 10 == 0 or (step + 1) == n_steps:
-                    logger.info(f"Encoded step {step + 1}/{n_steps}")
+                # Log progress
+                if logging:
+                    logger.info(f"Finished encoding {n_steps} steps")
 
                 del results
                 gc.collect()
@@ -1927,6 +1930,7 @@ class TrainingPipeline:
                 encode_fn=rf_encode_fn,
                 n_samples=n_inf_trimmed * num_observations,
                 latent_dim=latent_dim,
+                logging=True,
             )
 
             # Train Random Forest classifier
@@ -3903,6 +3907,7 @@ class TrainingPipeline:
             encode_fn=self._viz_encode_fn,
             n_samples=n_padded * num_obs,
             latent_dim=latent_dim,
+            logging=False,
         )
 
         # Truncate padding and reshape to per-cadence: (n_samples, 6, latent_dim)
