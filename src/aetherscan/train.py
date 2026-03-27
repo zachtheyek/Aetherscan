@@ -408,10 +408,11 @@ def prepare_distributed_train_dataset(
         shuffle: Whether to shuffle training data
 
     Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
-              accumulation_steps, val_steps, _train_holder, _val_holder, val_indices}
+              accumulation_steps, val_steps, _train_holder, val_indices}
              Train/val distributed datasets, number of samples in each, number of steps for each
-              (including accumulation sub-steps), TrainDataHolder references for each, and the
-              stratified validation indices into the original data arrays
+              (including accumulation sub-steps), shared TrainDataHolder reference (both generators
+              read from the original arrays via index subsets — no copies), and the stratified
+              validation indices into the original data arrays
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -457,16 +458,11 @@ def prepare_distributed_train_dataset(
 
     logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
 
-    # Prepare data using stratified indices
-    train_concat = data["concatenated"][train_indices]
-    train_true = data["true"][train_indices]
-    train_false = data["false"][train_indices]
-    train_holder = TrainDataHolder(train_concat, train_true, train_false)
-
-    val_concat = data["concatenated"][val_indices]
-    val_true = data["true"][val_indices]
-    val_false = data["false"][val_indices]
-    val_holder = TrainDataHolder(val_concat, val_true, val_false)
+    # Share the original arrays between train and val generators via a single data holder.
+    # The stratified split requires non-contiguous indices, which would force numpy to create
+    # full copies via fancy indexing (~2x peak memory). Instead, both generators read from the
+    # same original arrays using their respective index subsets — zero extra copies.
+    train_holder = TrainDataHolder(data["concatenated"], data["true"], data["false"])
 
     # Create generator functions for memory-efficient data loading
     def train_generator():
@@ -482,7 +478,8 @@ def prepare_distributed_train_dataset(
                 false = train_holder.false
 
             # Work with local references (safe from clearing, no per-sample lock needed)
-            indices = np.arange(len(concat))
+            # Copy train_indices because np.random.shuffle mutates in-place
+            indices = train_indices.copy()
             if shuffle:
                 # Perform global shuffle on each epoch so each pass through the data is unique
                 np.random.shuffle(indices)
@@ -496,24 +493,24 @@ def prepare_distributed_train_dataset(
         while True:  # Make generators infinite to reset state between epochs
             # Acquire lock to check cleared status and capture data references
             # Local references keep data alive even if clear() is called mid-epoch
-            with val_holder._lock:
-                if val_holder._cleared:
+            with train_holder._lock:
+                if train_holder._cleared:
                     return  # Exit if data already cleared
                 # Cache references while holding lock
-                concat = val_holder.concat
-                true = val_holder.true
-                false = val_holder.false
+                concat = train_holder.concat
+                true = train_holder.true
+                false = train_holder.false
 
             # Maintain order on each epoch since shuffling provides no benefits (no gradients
             # are calculated during validation)
-            for idx in range(len(concat)):
+            for idx in val_indices:
                 yield (concat[idx], true[idx], false[idx]), concat[idx]
 
             # Remove cache references to ensure garbage collection in future
             del concat, true, false
 
     # Determine dataset output signature
-    sample_shape = train_concat.shape[1:]
+    sample_shape = data["concatenated"].shape[1:]
     output_signature = (
         (
             tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
@@ -581,7 +578,6 @@ def prepare_distributed_train_dataset(
         "accumulation_steps": accumulation_steps,
         "val_steps": val_steps,
         "_train_holder": train_holder,
-        "_val_holder": val_holder,
         "val_indices": val_indices,  # For train_round() -> _prepare_latent_viz_batch()
     }
 
@@ -1020,6 +1016,11 @@ class TrainingPipeline:
             self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
         )
 
+        # Extract labels before distributing (prepare_distributed_train_dataset keeps the
+        # original arrays alive via a shared train_holder — no copies — so we can free the
+        # dict reference immediately after)
+        train_labels = train_data.get("labels")
+
         # Distribute training data
         data = prepare_distributed_train_dataset(
             data=train_data,
@@ -1032,25 +1033,29 @@ class TrainingPipeline:
             shuffle=True,
         )
 
+        # Free the dict shell (original arrays stay alive via the shared train_holder)
+        del train_data
+        gc.collect()
+
         # Prepare latent viz batch (if it's the first round) using the validation partition.
         # Using held-out data ensures the latent space visualization captures generalization, while
         # persisting the same data across rounds eliminates the effects of distribution shift (from
         # the curriculum schedule)
         if self._latent_viz_batch is None:
-            train_labels = train_data.get("labels")
             if train_labels is not None:
-                val_indices = data["val_indices"]
+                # Use the data holder's original arrays directly with val_indices to avoid creating
+                # an intermediate copy of the entire validation partition
                 self._prepare_latent_viz_batch(
-                    train_data["concatenated"][val_indices],
-                    train_labels[val_indices],
+                    concat_data=data["_train_holder"].concat,
+                    labels=train_labels,
+                    candidate_indices=data["val_indices"],
                 )
-                del train_labels, val_indices
         # On subsequent rounds, the latent viz batch is persisted,
         # but the distributed dataset needs to be rebuilt
         elif self._latent_viz_batch is not None and self._latent_viz_dataset is None:
             self._build_latent_viz_dataset()
 
-        del train_data
+        del train_labels
         gc.collect()
 
         train_dataset = data["train_dataset"]
@@ -1061,7 +1066,6 @@ class TrainingPipeline:
         accumulation_steps = data["accumulation_steps"]
         val_steps = data["val_steps"]
         train_holder = data["_train_holder"]
-        val_holder = data["_val_holder"]
 
         del data
         gc.collect()
@@ -1279,10 +1283,9 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
-            # NOTE: should check to make sure holders & datasets exist first
+            # NOTE: should check to make sure train_holder & datasets exist first
             # Clear intermediate data
             train_holder.clear()
-            val_holder.clear()
             del train_dataset, val_dataset
 
             # Clear latent viz distributed dataset (rebuilt each round)
@@ -3763,7 +3766,7 @@ class TrainingPipeline:
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
 
-    def _prepare_latent_viz_batch(self, concat_data, labels):
+    def _prepare_latent_viz_batch(self, concat_data, labels, candidate_indices=None):
         """
         Subsample cadences from concat_data for latent space visualization
         Will attempt to preserve an equal distribution of distinct values from labels if possible
@@ -3774,28 +3777,39 @@ class TrainingPipeline:
         distribution shift (from the curriculum schedule)
 
         Args:
-            concat_data: Validation-partition cadences array, shape (n_val, 6, 16, width_bin)
-            labels: Per-cadence signal type labels for the validation partition, shape (n_val,)
+            concat_data: Full cadences array, shape (n_total, 6, 16, width_bin)
+            labels: Per-cadence signal type labels, shape (n_total,)
+            candidate_indices: Optional indices into concat_data/labels restricting which
+                samples are eligible (e.g. validation partition indices). If None, all
+                samples are eligible.
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+
+        # Restrict to candidate subset if provided (avoids copying the entire partition)
+        if candidate_indices is not None:
+            candidate_labels = labels[candidate_indices]
+        else:
+            candidate_indices = np.arange(len(labels))
+            candidate_labels = labels
 
         selected_indices = []
         selected_labels = []
 
         for stype in signal_types:
-            type_indices = np.where(labels == stype)[0]
-            if len(type_indices) == 0:
+            type_mask = candidate_labels == stype
+            type_global_indices = candidate_indices[type_mask]
+            if len(type_global_indices) == 0:
                 logger.warning(f"No cadences for {stype} — skipping this type for viz batch")
                 continue
-            if len(type_indices) < n_per_type:
+            if len(type_global_indices) < n_per_type:
                 logger.warning(
-                    f"Only {len(type_indices)} cadences for {stype} "
+                    f"Only {len(type_global_indices)} cadences for {stype} "
                     f"(requested {n_per_type}), using all available"
                 )
-                sampled = type_indices
+                sampled = type_global_indices
             else:
-                sampled = np.random.choice(type_indices, size=n_per_type, replace=False)
+                sampled = np.random.choice(type_global_indices, size=n_per_type, replace=False)
             selected_indices.append(sampled)
             selected_labels.extend([stype] * len(sampled))
 
@@ -3805,8 +3819,9 @@ class TrainingPipeline:
             self._latent_viz_labels = None
             return
 
+        # Fancy indexing already creates a new independent array (no .copy() needed)
         all_indices = np.concatenate(selected_indices)
-        self._latent_viz_batch = concat_data[all_indices].copy()
+        self._latent_viz_batch = concat_data[all_indices]
         self._latent_viz_labels = np.array(selected_labels, dtype="U20")
 
         if len(all_indices) < n_per_type * len(signal_types):
