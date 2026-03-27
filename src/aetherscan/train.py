@@ -1236,13 +1236,13 @@ class TrainingPipeline:
                     f"KL: {epoch_losses['kl']:.4f}, "
                     f"True: {epoch_losses['true']:.4f}, "
                     f"False: {epoch_losses['false']:.4f}, "
-                    f"Duration: {train_duration} "
+                    f"Duration: {train_duration:.2f} "
                 )
                 logger.info(
-                    f"Gradient norm -- Mean: {gradient_norm_mean}, "
-                    f"Std: {gradient_norm_std}, "
-                    f"Max: {gradient_norm_max}, "
-                    f"Clipping rate: {clipping_rate} "
+                    f"Gradient norm -- Mean: {gradient_norm_mean:.4f}, "
+                    f"Std: {gradient_norm_std:.4f}, "
+                    f"Max: {gradient_norm_max:.4f}, "
+                    f"Clipping rate: {clipping_rate:.4f} "
                 )
                 logger.info(
                     f"Val -- Total: {val_losses['total']:.4f}, "
@@ -1250,7 +1250,7 @@ class TrainingPipeline:
                     f"KL: {val_losses['kl']:.4f}, "
                     f"True: {val_losses['true']:.4f}, "
                     f"False: {val_losses['false']:.4f}, "
-                    f"Duration: {val_duration} "
+                    f"Duration: {val_duration:.2f} "
                 )
 
                 # Adaptive learning rate
