@@ -3599,9 +3599,9 @@ class TrainingPipeline:
             f"for UMAP fitting"
         )
 
-        # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz?)
+        # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
         # Fit global UMAP
-        umap_model = umap.UMAP(n_components=2, random_state=42).fit(pooled)
+        umap_model = umap.UMAP(n_components=2, random_state=11).fit(pooled)
 
         del pooled
         gc.collect()
