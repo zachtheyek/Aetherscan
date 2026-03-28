@@ -3599,11 +3599,28 @@ class TrainingPipeline:
             f"for UMAP fitting"
         )
 
-        # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
-        # Fit global UMAP
-        umap_model = umap.UMAP(n_components=2, random_state=11).fit(pooled)
+        # Subsample pooled vectors for UMAP fit (fitting on the full set of pooled vectors is slow;
+        # the subsampled fit generalizes well and remaining vectors are projected via .transform())
+        umap_fit_max = self.config.training.latent_viz_umap_fit_max_samples
+        if pooled.shape[0] > umap_fit_max:
+            # NOTE: use a global config seed instead of hard-coding
+            rng = np.random.default_rng(11)
+            fit_indices = rng.choice(pooled.shape[0], size=umap_fit_max, replace=False)
+            fit_pool = pooled[fit_indices]
+            logger.info(
+                f"Subsampled {fit_pool.shape[0]} / {pooled.shape[0]} latent vectors for UMAP fit"
+            )
+            del fit_indices
+        else:
+            fit_pool = pooled
 
         del pooled
+
+        # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
+        # Fit global UMAP
+        umap_model = umap.UMAP(n_components=2, random_state=11).fit(fit_pool)
+
+        del fit_pool
         gc.collect()
 
         # Transform each snapshot and compute global axis limits

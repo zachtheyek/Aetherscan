@@ -273,6 +273,12 @@ def _add_train_arguments(subparsers):
         help="Capture a latent space snapshot every N training steps (lower = more snapshots, more DB writes, and larger storage costs)",
     )
     train_parser.add_argument(
+        "--latent-viz-umap-fit-max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of pooled latent vectors used to fit the UMAP model (remaining vectors are projected via transform; lower = faster, higher = more faithful embedding)",
+    )
+    train_parser.add_argument(
         "--latent-viz-gif-max-frames",
         type=int,
         default=None,
@@ -596,6 +602,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.latent_viz_num_cadences_per_type = args.latent_viz_num_cadences_per_type
     if hasattr(args, "latent_viz_step_interval") and args.latent_viz_step_interval is not None:
         config.training.latent_viz_step_interval = args.latent_viz_step_interval
+    if (
+        hasattr(args, "latent_viz_umap_fit_max_samples")
+        and args.latent_viz_umap_fit_max_samples is not None
+    ):
+        config.training.latent_viz_umap_fit_max_samples = args.latent_viz_umap_fit_max_samples
     if hasattr(args, "latent_viz_gif_max_frames") and args.latent_viz_gif_max_frames is not None:
         config.training.latent_viz_gif_max_frames = args.latent_viz_gif_max_frames
     if hasattr(args, "latent_viz_gif_duration_ms") and args.latent_viz_gif_duration_ms is not None:

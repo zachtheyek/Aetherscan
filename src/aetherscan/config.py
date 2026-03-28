@@ -171,6 +171,9 @@ class TrainingConfig:
         240  # Cadences per signal type for viz batch (total = 4×)
     )
     latent_viz_step_interval: int = 10  # Capture snapshot every N training steps
+    latent_viz_umap_fit_max_samples: int = (
+        100_000  # Max pooled vectors for UMAP fit (rest are projected via .transform())
+    )
     latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
@@ -403,6 +406,7 @@ class Config:
                 "plot_injection_outlier_percentile": self.training.plot_injection_outlier_percentile,
                 "latent_viz_num_cadences_per_type": self.training.latent_viz_num_cadences_per_type,
                 "latent_viz_step_interval": self.training.latent_viz_step_interval,
+                "latent_viz_umap_fit_max_samples": self.training.latent_viz_umap_fit_max_samples,
                 "latent_viz_gif_max_frames": self.training.latent_viz_gif_max_frames,
                 "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
                 "snr_base": self.training.snr_base,

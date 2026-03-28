@@ -343,6 +343,11 @@ options:
                         Capture a latent space snapshot every N training steps
                         (lower = more snapshots, more DB writes, and larger
                         storage costs)",
+  --latent-viz-umap-fit-max-samples LATENT_VIZ_UMAP_FIT_MAX_SAMPLES
+                        Maximum number of pooled latent vectors used to fit
+                        the UMAP model (remaining vectors are projected via
+                        transform; lower = faster, higher = more faithful
+                        embedding)
   --latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES
                         Maximum number of frames in latent space GIF output
                         (snapshots beyond this limit are log-subsampled,
