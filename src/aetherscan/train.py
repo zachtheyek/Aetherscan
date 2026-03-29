@@ -3601,14 +3601,38 @@ class TrainingPipeline:
 
         # Subsample pooled vectors for UMAP fit (fitting on the full set of pooled vectors is slow;
         # the subsampled fit generalizes well and remaining vectors are projected via .transform())
+        # Stratified by signal_type × ON/OFF (8 classes) for balanced representation
         umap_fit_max = self.config.training.latent_viz_umap_fit_max_samples
         if pooled.shape[0] > umap_fit_max:
+            pooled_labels = np.concatenate(
+                [np.array(lab, dtype="U") for lab in all_snapshot_labels]
+            )
+            pooled_onoff = np.concatenate([np.array(o, dtype="U") for o in all_snapshot_onoff])
+            strata = np.char.add(np.char.add(pooled_labels, "|"), pooled_onoff)
+            del pooled_labels, pooled_onoff
+
             # NOTE: use a global config seed instead of hard-coding
             rng = np.random.default_rng(11)
-            fit_indices = rng.choice(pooled.shape[0], size=umap_fit_max, replace=False)
+            unique_classes = np.unique(strata)
+            per_class = umap_fit_max // len(unique_classes)
+            fit_indices = []
+            for cls in unique_classes:
+                cls_idx = np.nonzero(strata == cls)[0]
+                n_take = min(per_class, len(cls_idx))
+                if n_take < per_class:
+                    logger.warning(
+                        f"Only {n_take} latents for {cls} "
+                        f"(requested {per_class}), using all available"
+                    )
+                fit_indices.append(rng.choice(cls_idx, size=n_take, replace=False))
+            fit_indices = np.concatenate(fit_indices)
+            del strata
+
             fit_pool = pooled[fit_indices]
             logger.info(
-                f"Subsampled {fit_pool.shape[0]} / {pooled.shape[0]} latent vectors for UMAP fit"
+                f"Stratified subsampled {fit_pool.shape[0]} / {pooled.shape[0]} "
+                f"latent vectors for UMAP fit ({len(unique_classes)} classes, "
+                f"~{per_class} per class)"
             )
             del fit_indices
         else:
@@ -3618,6 +3642,9 @@ class TrainingPipeline:
 
         # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
         # Fit global UMAP
+        # Note that by setting random_state, we get a deterministic UMAP fit, at the expense of
+        # single-thread performance (n_jobs=1). This is a hard constraint of the UMAP library.
+        # We compensate by fitting the UMAP model to a stratified subsample of the pooled latents
         umap_model = umap.UMAP(n_components=2, random_state=11).fit(fit_pool)
 
         del fit_pool
@@ -3704,7 +3731,6 @@ class TrainingPipeline:
                             c=color,
                             marker=markers[status],
                             s=5,
-                            alpha=0.3,
                             label=display_names[(stype, status)],
                             rasterized=True,
                         )
@@ -3720,7 +3746,7 @@ class TrainingPipeline:
                     snr_base + snr_range if snr_base is not None and snr_range is not None else "?"
                 )
                 ax.set_title(
-                    f"Latent Space ({method_name.upper()}) — "
+                    f"Beta-VAE Latent Space ({method_name.upper()}) — "
                     f"Round {meta['round_number']}, "
                     f"Epoch {meta['epoch_number']}, "
                     f"Step {meta['step_number']} "
