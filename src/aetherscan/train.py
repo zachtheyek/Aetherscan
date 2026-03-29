@@ -3640,24 +3640,24 @@ class TrainingPipeline:
 
         del pooled
 
-        # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
-        # Fit global UMAP
-        # Note that by setting random_state, we get a deterministic UMAP fit, at the expense of
-        # single-thread performance (n_jobs=1). This is a hard constraint of the UMAP library.
-        # We compensate by fitting the UMAP model to a stratified subsample of the pooled latents
-        umap_model = umap.UMAP(n_components=2, random_state=11).fit(fit_pool)
-
-        del fit_pool
-        gc.collect()
-
-        # Transform each snapshot and compute global axis limits
-        umap_transformed = []
-
-        for coords in all_coords:
-            umap_transformed.append(umap_model.transform(coords))
-
-        del all_coords, umap_model
-        gc.collect()
+        # # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
+        # # Fit global UMAP
+        # # Note that by setting random_state, we get a deterministic UMAP fit, at the expense of
+        # # single-thread performance (n_jobs=1). This is a hard constraint of the UMAP library.
+        # # We compensate by fitting the UMAP model to a stratified subsample of the pooled latents
+        # umap_model = umap.UMAP(n_components=2, random_state=11).fit(fit_pool)
+        #
+        # del fit_pool
+        # gc.collect()
+        #
+        # # Transform each snapshot and compute global axis limits
+        # umap_transformed = []
+        #
+        # for coords in all_coords:
+        #     umap_transformed.append(umap_model.transform(coords))
+        #
+        # del all_coords, umap_model
+        # gc.collect()
 
         # Compute consistent axis limits with 5% padding (streaming min/max to avoid concat)
         def _compute_limits(transformed_list):
@@ -3669,7 +3669,7 @@ class TrainingPipeline:
             y_pad = (y_max - y_min) * 0.05
             return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
 
-        umap_xlim, umap_ylim = _compute_limits(umap_transformed)
+        # umap_xlim, umap_ylim = _compute_limits(umap_transformed)
 
         # Generate frames and assemble GIF
         colors = {
@@ -3697,117 +3697,165 @@ class TrainingPipeline:
         # NOTE: instead of temp_dir, save frames in persistent dir. update dir archiving to handle
         temp_dir = tempfile.mkdtemp(prefix="latent_gif_")
 
-        methods = [
-            ("umap", umap_transformed, umap_xlim, umap_ylim),
-        ]
+        # methods = [
+        #     ("umap", umap_transformed, umap_xlim, umap_ylim),
+        # ]
 
         gif_paths = {}
         duration_ms = self.config.training.latent_viz_gif_duration_ms
 
-        for method_name, transformed_list, xlim, ylim in methods:
-            frame_paths = []
+        # --- Experiment: sweep n_neighbors × min_dist ---
+        n_neighbors_values = [2, 5, 10, 15, 20, 30, 50, 100]
+        min_dist_values = [0.0, 0.1, 0.25, 0.5, 0.8, 0.99]
 
-            for frame_idx, (coords_2d, labels, onoff, meta) in enumerate(
-                zip(
-                    transformed_list,
-                    all_snapshot_labels,
-                    all_snapshot_onoff,
-                    snapshot_metadata,
-                    strict=True,
-                )
-            ):
-                fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        for nn in n_neighbors_values:
+            for md in min_dist_values:
+                logger.info(f"Fitting UMAP with n_neighbors={nn}, min_dist={md}")
+                umap_model = umap.UMAP(
+                    n_components=2,
+                    random_state=11,
+                    n_neighbors=nn,
+                    min_dist=md,
+                ).fit(fit_pool)
 
-                # Plot each category
-                labels_arr = np.array(labels)
-                onoff_arr = np.array(onoff)
+                transformed = []
+                for coords in all_coords:
+                    transformed.append(umap_model.transform(coords))
+                del umap_model
+                gc.collect()
 
-                for (stype, status), color in colors.items():
-                    mask = (labels_arr == stype) & (onoff_arr == status)
-                    if mask.any():
-                        ax.scatter(
-                            coords_2d[mask, 0],
-                            coords_2d[mask, 1],
-                            c=color,
-                            marker=markers[status],
-                            s=5,
-                            label=display_names[(stype, status)],
-                            rasterized=True,
+                xlim, ylim = _compute_limits(transformed)
+
+                method_name = f"umap_nn{nn}_md{md}"
+                display_method = f"UMAP (n_neighbors={nn}, min_dist={md})"
+
+                methods = [
+                    (method_name, display_method, transformed, xlim, ylim),
+                ]
+
+                for method_name, display_method, transformed_list, xlim, ylim in methods:
+                    frame_paths = []
+
+                    for frame_idx, (coords_2d, labels, onoff, meta) in enumerate(
+                        zip(
+                            transformed_list,
+                            all_snapshot_labels,
+                            all_snapshot_onoff,
+                            snapshot_metadata,
+                            strict=True,
+                        )
+                    ):
+                        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+                        # Plot each category
+                        labels_arr = np.array(labels)
+                        onoff_arr = np.array(onoff)
+
+                        for (stype, status), color in colors.items():
+                            mask = (labels_arr == stype) & (onoff_arr == status)
+                            if mask.any():
+                                ax.scatter(
+                                    coords_2d[mask, 0],
+                                    coords_2d[mask, 1],
+                                    c=color,
+                                    marker=markers[status],
+                                    s=5,
+                                    label=display_names[(stype, status)],
+                                    rasterized=True,
+                                )
+
+                        del labels_arr, onoff_arr
+
+                        ax.set_xlim(xlim)
+                        ax.set_ylim(ylim)
+
+                        snr_base = meta["snr_base"]
+                        snr_range = meta["snr_range"]
+                        snr_ceil = (
+                            snr_base + snr_range
+                            if snr_base is not None and snr_range is not None
+                            else "?"
+                        )
+                        # ax.set_title(
+                        #     f"Beta-VAE Latent Space ({method_name.upper()}) — "
+                        #     f"Round {meta['round_number']}, "
+                        #     f"Epoch {meta['epoch_number']}, "
+                        #     f"Step {meta['step_number']} "
+                        #     f"(SNR: {snr_base}–{snr_ceil})",
+                        #     fontsize=11,
+                        # )
+                        # ax.set_xlabel(f"{method_name.upper()} 1")
+                        # ax.set_ylabel(f"{method_name.upper()} 2")
+                        ax.set_title(
+                            f"Beta-VAE Latent Space ({display_method}) — "
+                            f"Round {meta['round_number']}, "
+                            f"Epoch {meta['epoch_number']}, "
+                            f"Step {meta['step_number']} "
+                            f"(SNR: {snr_base}–{snr_ceil})",
+                            fontsize=11,
+                        )
+                        ax.set_xlabel("UMAP 1")
+                        ax.set_ylabel("UMAP 2")
+                        ax.legend(
+                            loc="upper right",
+                            fontsize=7,
+                            markerscale=3,
+                            ncol=2,
+                            framealpha=0.8,
                         )
 
-                del labels_arr, onoff_arr
+                        plt.tight_layout()
 
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
-
-                snr_base = meta["snr_base"]
-                snr_range = meta["snr_range"]
-                snr_ceil = (
-                    snr_base + snr_range if snr_base is not None and snr_range is not None else "?"
-                )
-                ax.set_title(
-                    f"Beta-VAE Latent Space ({method_name.upper()}) — "
-                    f"Round {meta['round_number']}, "
-                    f"Epoch {meta['epoch_number']}, "
-                    f"Step {meta['step_number']} "
-                    f"(SNR: {snr_base}–{snr_ceil})",
-                    fontsize=11,
-                )
-                ax.set_xlabel(f"{method_name.upper()} 1")
-                ax.set_ylabel(f"{method_name.upper()} 2")
-                ax.legend(
-                    loc="upper right",
-                    fontsize=7,
-                    markerscale=3,
-                    ncol=2,
-                    framealpha=0.8,
-                )
-
-                plt.tight_layout()
-
-                frame_path = os.path.join(temp_dir, f"{method_name}_frame_{frame_idx:05d}.png")
-                fig.savefig(frame_path, dpi=100)
-                plt.close(fig)
-                frame_paths.append(frame_path)
-
-            del transformed_list
-
-            # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
-            gif_filename = f"latent_space_{method_name}_{tag}.gif"
-            gif_path = os.path.join(save_dir, gif_filename)
-
-            n_frames = len(frame_paths)
-            if n_frames > 0:
-                with iio.imopen(gif_path, "w", plugin="pillow") as gif_writer:
-                    for frame_path in frame_paths:
-                        frame = iio.imread(frame_path)
-                        gif_writer.write(
-                            frame,
-                            duration=duration_ms,
-                            loop=0,
-                            is_batch=False,
+                        frame_path = os.path.join(
+                            temp_dir, f"{method_name}_frame_{frame_idx:05d}.png"
                         )
-                        del frame
+                        fig.savefig(frame_path, dpi=100)
+                        plt.close(fig)
+                        frame_paths.append(frame_path)
 
-                logger.info(
-                    f"Latent space {method_name.upper()} GIF saved: {gif_path} ({n_frames} frames)"
-                )
+                    del transformed_list
 
-                # Upload to Slack
-                logger_instance = get_logger()
-                if logger_instance:
-                    logger_instance.upload_image_to_slack(
-                        gif_path,
-                        title=f"Latent Space {method_name.upper()} - ({tag})",
-                    )
+                    # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
+                    gif_filename = f"latent_space_{method_name}_{tag}.gif"
+                    gif_path = os.path.join(save_dir, gif_filename)
 
-            del frame_paths
-            gc.collect()
+                    n_frames = len(frame_paths)
+                    if n_frames > 0:
+                        with iio.imopen(gif_path, "w", plugin="pillow") as gif_writer:
+                            for frame_path in frame_paths:
+                                frame = iio.imread(frame_path)
+                                gif_writer.write(
+                                    frame,
+                                    duration=duration_ms,
+                                    loop=0,
+                                    is_batch=False,
+                                )
+                                del frame
 
-            gif_paths[method_name] = gif_path
+                        logger.info(
+                            f"Latent space {method_name.upper()} GIF saved: "
+                            f"{gif_path} ({n_frames} frames)"
+                        )
+
+                        # Upload to Slack
+                        logger_instance = get_logger()
+                        if logger_instance:
+                            logger_instance.upload_image_to_slack(
+                                gif_path,
+                                title=f"Latent Space {display_method} - ({tag})",
+                            )
+
+                    del frame_paths
+                    gc.collect()
+
+                    gif_paths[method_name] = gif_path
+
+                del transformed
+                gc.collect()
 
         # Cleanup
-        del umap_transformed
+        del fit_pool, all_coords
+        # del umap_transformed
         del all_snapshot_labels, all_snapshot_onoff, snapshot_metadata
         # NOTE: temp_dir isn't cleaned on exception (should use try/finally or tempfile.TemporaryDirectory() with context manager)
         shutil.rmtree(temp_dir, ignore_errors=True)
