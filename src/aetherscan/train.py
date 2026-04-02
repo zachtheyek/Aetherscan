@@ -3679,10 +3679,9 @@ class TrainingPipeline:
         gif_paths = {}
         duration_ms = self.config.training.latent_viz_gif_duration_ms
 
-        # NOTE: let user specify which combinations to use via config.py or cli flags
         # NOTE: how do we store final UMAP model params for later use (e.g. during inference results viz)
-        n_neighbors_values = [2, 5, 10, 15, 20, 30, 50, 100]
-        min_dist_values = [0.0, 0.1, 0.25, 0.5, 0.8, 0.99]
+        n_neighbors_values = self.config.training.latent_viz_umap_n_neighbors
+        min_dist_values = self.config.training.latent_viz_umap_min_dist
 
         for nn in n_neighbors_values:
             for md in min_dist_values:
