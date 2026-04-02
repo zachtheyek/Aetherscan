@@ -3753,11 +3753,12 @@ class TrainingPipeline:
                         ax.set_xlim(xlim)
                         ax.set_ylim(ylim)
 
-                        snr_base = meta["snr_base"]
-                        snr_range = meta["snr_range"]
-                        snr_ceil = (
-                            snr_base + snr_range
-                            if snr_base is not None and snr_range is not None
+                        meta_snr_base = meta["snr_base"]
+                        meta_snr_range = meta["snr_range"]
+                        meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
+                        meta_snr_ceil = (
+                            meta_snr_base + meta_snr_range
+                            if meta_snr_base is not None and meta_snr_range is not None
                             else "?"
                         )
                         ax.set_title(
@@ -3765,7 +3766,7 @@ class TrainingPipeline:
                             f"Round {meta['round_number']}, "
                             f"Epoch {meta['epoch_number']}, "
                             f"Step {meta['step_number']} "
-                            f"(SNR: {snr_base}–{snr_ceil})",
+                            f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
                             fontsize=11,
                         )
                         ax.set_xlabel("UMAP 1")
