@@ -1799,12 +1799,12 @@ class TrainingPipeline:
 
                 current_idx += batch_size
 
-                # Log progress
-                if logging:
-                    logger.info(f"Finished encoding {n_steps} steps")
-
                 del results
                 gc.collect()
+
+            # Log progress
+            if logging:
+                logger.info(f"Finished encoding {n_steps} steps")
         finally:
             # NOTE: should check to make sure iterator exists first
             del iterator
