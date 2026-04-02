@@ -220,6 +220,8 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
               [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
               [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
+              [--latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]]
+              [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
               [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
               [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
               [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
@@ -348,6 +350,14 @@ options:
                         the UMAP model (remaining vectors are projected via
                         transform; lower = faster, higher = more faithful
                         embedding)
+  --latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]
+                        UMAP n_neighbors values to sweep for latent space
+                        visualization (e.g., --latent-viz-umap-n-neighbors
+                        5 15 30 50)
+  --latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]
+                        UMAP min_dist values to sweep for latent space
+                        visualization (e.g., --latent-viz-umap-min-dist
+                        0.0 0.1 0.5)
   --latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES
                         Maximum number of frames in latent space GIF output
                         (snapshots beyond this limit are log-subsampled,

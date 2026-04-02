@@ -279,6 +279,20 @@ def _add_train_arguments(subparsers):
         help="Maximum number of pooled latent vectors used to fit the UMAP model (remaining vectors are projected via transform; lower = faster, higher = more faithful embedding)",
     )
     train_parser.add_argument(
+        "--latent-viz-umap-n-neighbors",
+        type=int,
+        nargs="+",
+        default=None,
+        help="UMAP n_neighbors values to sweep for latent space visualization (e.g., --latent-viz-umap-n-neighbors 5 15 30 50)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-umap-min-dist",
+        type=float,
+        nargs="+",
+        default=None,
+        help="UMAP min_dist values to sweep for latent space visualization (e.g., --latent-viz-umap-min-dist 0.0 0.1 0.5)",
+    )
+    train_parser.add_argument(
         "--latent-viz-gif-max-frames",
         type=int,
         default=None,
@@ -607,6 +621,13 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and args.latent_viz_umap_fit_max_samples is not None
     ):
         config.training.latent_viz_umap_fit_max_samples = args.latent_viz_umap_fit_max_samples
+    if (
+        hasattr(args, "latent_viz_umap_n_neighbors")
+        and args.latent_viz_umap_n_neighbors is not None
+    ):
+        config.training.latent_viz_umap_n_neighbors = args.latent_viz_umap_n_neighbors
+    if hasattr(args, "latent_viz_umap_min_dist") and args.latent_viz_umap_min_dist is not None:
+        config.training.latent_viz_umap_min_dist = args.latent_viz_umap_min_dist
     if hasattr(args, "latent_viz_gif_max_frames") and args.latent_viz_gif_max_frames is not None:
         config.training.latent_viz_gif_max_frames = args.latent_viz_gif_max_frames
     if hasattr(args, "latent_viz_gif_duration_ms") and args.latent_viz_gif_duration_ms is not None:
