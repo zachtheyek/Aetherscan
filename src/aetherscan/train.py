@@ -1271,6 +1271,7 @@ class TrainingPipeline:
                 dir="checkpoints",
             )
 
+            # NOTE: commented out to save compute. a final latent space gif at the end of training should suffice
             # Generate latent space GIF
             # self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
