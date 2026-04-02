@@ -1272,7 +1272,7 @@ class TrainingPipeline:
             )
 
             # Generate latent space GIF
-            self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+            # self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
             # Save checkpoint
             self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
@@ -3640,25 +3640,6 @@ class TrainingPipeline:
 
         del pooled
 
-        # # NOTE: come back to this later (what hyperparams are we using for UMAP? how do we store the final UMAP model params for use later -- e.g. in inference.py's results viz? use a global config seed instead of hard-coding?)
-        # # Fit global UMAP
-        # # Note that by setting random_state, we get a deterministic UMAP fit, at the expense of
-        # # single-thread performance (n_jobs=1). This is a hard constraint of the UMAP library.
-        # # We compensate by fitting the UMAP model to a stratified subsample of the pooled latents
-        # umap_model = umap.UMAP(n_components=2, random_state=11).fit(fit_pool)
-        #
-        # del fit_pool
-        # gc.collect()
-        #
-        # # Transform each snapshot and compute global axis limits
-        # umap_transformed = []
-        #
-        # for coords in all_coords:
-        #     umap_transformed.append(umap_model.transform(coords))
-        #
-        # del all_coords, umap_model
-        # gc.collect()
-
         # Compute consistent axis limits with 5% padding (streaming min/max to avoid concat)
         def _compute_limits(transformed_list):
             x_min = min(t[:, 0].min() for t in transformed_list)
@@ -3668,8 +3649,6 @@ class TrainingPipeline:
             x_pad = (x_max - x_min) * 0.05
             y_pad = (y_max - y_min) * 0.05
             return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
-
-        # umap_xlim, umap_ylim = _compute_limits(umap_transformed)
 
         # Generate frames and assemble GIF
         colors = {
@@ -3697,20 +3676,24 @@ class TrainingPipeline:
         # NOTE: instead of temp_dir, save frames in persistent dir. update dir archiving to handle
         temp_dir = tempfile.mkdtemp(prefix="latent_gif_")
 
-        # methods = [
-        #     ("umap", umap_transformed, umap_xlim, umap_ylim),
-        # ]
-
         gif_paths = {}
         duration_ms = self.config.training.latent_viz_gif_duration_ms
 
-        # --- Experiment: sweep n_neighbors × min_dist ---
+        # NOTE: let user specify which combinations to use via config.py or cli flags
+        # NOTE: how do we store final UMAP model params for later use (e.g. during inference results viz)
         n_neighbors_values = [2, 5, 10, 15, 20, 30, 50, 100]
         min_dist_values = [0.0, 0.1, 0.25, 0.5, 0.8, 0.99]
 
         for nn in n_neighbors_values:
             for md in min_dist_values:
                 logger.info(f"Fitting UMAP with n_neighbors={nn}, min_dist={md}")
+
+                # NOTE: use a global config seed instead of hard-coding
+                # Fit UMAP model
+                # Note that by setting random_state, we get a deterministic UMAP fit, at the expense
+                # of single-thread performance (n_jobs=1). This is a hard constraint of the UMAP
+                # library. We compensate by fitting the UMAP model to a stratified subsample of the
+                # pooled latents
                 umap_model = umap.UMAP(
                     n_components=2,
                     random_state=11,
@@ -3718,12 +3701,14 @@ class TrainingPipeline:
                     min_dist=md,
                 ).fit(fit_pool)
 
+                # Transform each snapshot
                 transformed = []
                 for coords in all_coords:
                     transformed.append(umap_model.transform(coords))
                 del umap_model
                 gc.collect()
 
+                # Compute global axis limits
                 xlim, ylim = _compute_limits(transformed)
 
                 method_name = f"umap_nn{nn}_md{md}"
@@ -3776,16 +3761,6 @@ class TrainingPipeline:
                             if snr_base is not None and snr_range is not None
                             else "?"
                         )
-                        # ax.set_title(
-                        #     f"Beta-VAE Latent Space ({method_name.upper()}) — "
-                        #     f"Round {meta['round_number']}, "
-                        #     f"Epoch {meta['epoch_number']}, "
-                        #     f"Step {meta['step_number']} "
-                        #     f"(SNR: {snr_base}–{snr_ceil})",
-                        #     fontsize=11,
-                        # )
-                        # ax.set_xlabel(f"{method_name.upper()} 1")
-                        # ax.set_ylabel(f"{method_name.upper()} 2")
                         ax.set_title(
                             f"Beta-VAE Latent Space ({display_method}) — "
                             f"Round {meta['round_number']}, "
