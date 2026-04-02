@@ -3714,6 +3714,10 @@ class TrainingPipeline:
                 method_name = f"umap_nn{nn}_md{md}"
                 display_method = f"UMAP (n_neighbors={nn}, min_dist={md})"
 
+                # Using a list here is a remnant from when we were testing multiple DR methods
+                # Currently this will always be a single-element list
+                # However, we're choosing not to remove the list wrapper & loop in case we wish to
+                # further explore different DR methods in the future
                 methods = [
                     (method_name, display_method, transformed, xlim, ylim),
                 ]
