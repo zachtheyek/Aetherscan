@@ -174,6 +174,35 @@ class TrainingConfig:
     latent_viz_umap_fit_max_samples: int = (
         100_000  # Max pooled vectors for UMAP fit (rest are projected via .transform())
     )
+    # Note, Python dataclasses don't allow mutable objects (e.g. lists) to be used as defaults,
+    # since Python will create that object once when the class is defined, rather than each time
+    # a new object of that class is instantiated. This means that all instances of that class
+    # would share the same mutable object in memory (i.e. if we modified latent_viz_umap_n_neighbors
+    # in one instance, it would affect all other instances -- a dangerous bug).
+    # The default_factory parameter takes a callable (lambda function) that's called each time a
+    # new instance is created, ensuring each instance gets its own independent list, preventing
+    # the shared-state bug. Note that once created, the list behaves identical to any other list
+    latent_viz_umap_n_neighbors: list[int] = field(
+        # UMAP n_neighbors values to sweep
+        # n_neighbors constrains the size of the local neighborhood UMAP will look at when attempting
+        # to learn the manifold structure of the data. Lower values lead to better local structure,
+        # whereas larger values yield better global structure
+        # - 5: fine-grained local structure
+        # - 15: UMAP default, good baseline
+        # - 30: balanced local/global
+        # - 50: global topology emphasis
+        default_factory=lambda: [5, 15, 30, 50]
+    )
+    latent_viz_umap_min_dist: list[float] = field(
+        # UMAP min_dist values to sweep
+        # min_dist controls how tightly points in the lower-dimensional representation can be packed.
+        # Lower values result in clumpier embeddings (useful for observing clusters), whereas larger
+        # values preserve more of the broad topological structure
+        # - 0.0: maximum cluster tightness
+        # - 0.1: UMAP default, slight breathing room
+        # - 0.5: spread out, reveals continuous gradients
+        default_factory=lambda: [0.0, 0.1, 0.5]
+    )
     latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
@@ -407,6 +436,8 @@ class Config:
                 "latent_viz_num_cadences_per_type": self.training.latent_viz_num_cadences_per_type,
                 "latent_viz_step_interval": self.training.latent_viz_step_interval,
                 "latent_viz_umap_fit_max_samples": self.training.latent_viz_umap_fit_max_samples,
+                "latent_viz_umap_n_neighbors": self.training.latent_viz_umap_n_neighbors,
+                "latent_viz_umap_min_dist": self.training.latent_viz_umap_min_dist,
                 "latent_viz_gif_max_frames": self.training.latent_viz_gif_max_frames,
                 "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
                 "snr_base": self.training.snr_base,
