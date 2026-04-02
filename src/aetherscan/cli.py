@@ -260,6 +260,50 @@ def _add_train_arguments(subparsers):
         default=None,
         help="Threshold for points to always be included in A→B intensity bias scatter plots",
     )
+    train_parser.add_argument(
+        "--latent-viz-num-cadences-per-type",
+        type=int,
+        default=None,
+        help="Number of cadences per signal type for latent space visualization batch (total points = 4× this value × 6 observations per cadence)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-step-interval",
+        type=int,
+        default=None,
+        help="Capture a latent space snapshot every N training steps (lower = more snapshots, more DB writes, and larger storage costs)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-umap-fit-max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of pooled latent vectors used to fit the UMAP model (remaining vectors are projected via transform; lower = faster, higher = more faithful embedding)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-umap-n-neighbors",
+        type=int,
+        nargs="+",
+        default=None,
+        help="UMAP n_neighbors values to sweep for latent space visualization (e.g., --latent-viz-umap-n-neighbors 5 15 30 50)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-umap-min-dist",
+        type=float,
+        nargs="+",
+        default=None,
+        help="UMAP min_dist values to sweep for latent space visualization (e.g., --latent-viz-umap-min-dist 0.0 0.1 0.5)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-gif-max-frames",
+        type=int,
+        default=None,
+        help="Maximum number of frames in latent space GIF output (snapshots beyond this limit are log-subsampled, prioritizing earlier training steps)",
+    )
+    train_parser.add_argument(
+        "--latent-viz-gif-duration-ms",
+        type=int,
+        default=None,
+        help="Milliseconds per frame in latent space GIF output",
+    )
 
     train_parser.add_argument(
         "--snr-base",
@@ -565,6 +609,29 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and args.plot_injection_outlier_percentile is not None
     ):
         config.training.plot_injection_outlier_percentile = args.plot_injection_outlier_percentile
+    if (
+        hasattr(args, "latent_viz_num_cadences_per_type")
+        and args.latent_viz_num_cadences_per_type is not None
+    ):
+        config.training.latent_viz_num_cadences_per_type = args.latent_viz_num_cadences_per_type
+    if hasattr(args, "latent_viz_step_interval") and args.latent_viz_step_interval is not None:
+        config.training.latent_viz_step_interval = args.latent_viz_step_interval
+    if (
+        hasattr(args, "latent_viz_umap_fit_max_samples")
+        and args.latent_viz_umap_fit_max_samples is not None
+    ):
+        config.training.latent_viz_umap_fit_max_samples = args.latent_viz_umap_fit_max_samples
+    if (
+        hasattr(args, "latent_viz_umap_n_neighbors")
+        and args.latent_viz_umap_n_neighbors is not None
+    ):
+        config.training.latent_viz_umap_n_neighbors = args.latent_viz_umap_n_neighbors
+    if hasattr(args, "latent_viz_umap_min_dist") and args.latent_viz_umap_min_dist is not None:
+        config.training.latent_viz_umap_min_dist = args.latent_viz_umap_min_dist
+    if hasattr(args, "latent_viz_gif_max_frames") and args.latent_viz_gif_max_frames is not None:
+        config.training.latent_viz_gif_max_frames = args.latent_viz_gif_max_frames
+    if hasattr(args, "latent_viz_gif_duration_ms") and args.latent_viz_gif_duration_ms is not None:
+        config.training.latent_viz_gif_duration_ms = args.latent_viz_gif_duration_ms
     if hasattr(args, "snr_base") and args.snr_base is not None:
         config.training.snr_base = args.snr_base
     if hasattr(args, "initial_snr_range") and args.initial_snr_range is not None:
@@ -685,12 +752,14 @@ def validate_args(args: argparse.Namespace) -> None:
     # 0 <= train_val_split <= 1
     # per_replica_batch_size * num_replicas <= effective_batch_size <= num_samples_beta_vae * train_val_split
     # per_replica_val_batch_size * num_replicas <= num_samples_beta_vae * (1 - train_val_split)
-    # inference per_replica_val_batch_size * num_replicas <= num_samples_rf
+    # per_replica_val_batch_size * num_replicas <= num_samples_rf
+    # latent_viz_num_cadences_per_type * 4 <= num_samples_beta_vae * (1 - train_val_split)
     # effective_batch_size is divisible by per_replica_batch_size * num_replicas
     # num_samples_beta_vae * train_val_split is divisible by effective_batch_size
     # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by per_replica_val_batch_size * num_replicas
     # num_samples_rf is divisible by 2 (for generate_triplet_batch)
+    # latent_viz_num_cadences_per_type * 4 is divisible by per_replica_val_batch_size * num_replicas
     # # how to ensure divisibility for actual n_samples during inference?
     # snr_base, initial_snr_range, final_snr_range > 0
     # initial_snr_range >= final_snr_range

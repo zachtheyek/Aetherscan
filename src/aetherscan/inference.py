@@ -83,15 +83,13 @@ def prepare_distributed_inf_dataset(
     """
     global_inf_batch_size = per_replica_inf_batch_size * num_replicas
 
-    # NOTE: does trimming/divisibility matter for inference?
-    # Trim datasets to fit batch sizes (prevents uneven batches on final step)
-    # Note, n_samples should already be divisible by effective_batch_size
-    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
-    # distributing our datasets
-    # Alternatively, we could also pad the data instead of trimming
+    # # NOTE: does trimming/divisibility matter for inference?
+    # # Trim datasets to fit batch sizes (prevents uneven batches on final step)
+    # # Note, n_samples should already be divisible by effective_batch_size
+    # # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
+    # # distributing our datasets
+    # # Alternatively, we could also pad the data instead of trimming
     # n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
-    #
-    # logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
     n_inf_trimmed = n_samples
 
     # Sanity check: verify there's enough samples to run inference
@@ -100,8 +98,14 @@ def prepare_distributed_inf_dataset(
             f"Not enough samples ({n_samples}) for global batch size ({per_replica_inf_batch_size} * {num_replicas})"
             f"Reduce per_replica_batch_size or provide more samples"
         )
+    # logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
 
-    # Prepare data
+    # # Randomly subsample to trimmed size (avoids positional bias from slicing the tail)
+    # if n_inf_trimmed < n_samples:
+    #     indices = np.random.choice(n_samples, size=n_inf_trimmed, replace=False)
+    #     inf_data = data[indices]
+    # else:
+    #     inf_data = data[:n_inf_trimmed]
     inf_data = data[:n_inf_trimmed]
     inf_holder = InfDataHolder(inf_data)
 
@@ -139,7 +143,7 @@ def prepare_distributed_inf_dataset(
     inf_dataset = (
         tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
         .batch(global_inf_batch_size, drop_remainder=True)
-        # NOTE: do we need repeat for inf dataset?
+        # NOTE: do we need repeat for inf dataset? run test without repeat & see if anything breaks?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )

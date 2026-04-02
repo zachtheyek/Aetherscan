@@ -218,6 +218,12 @@ usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
               [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
               [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
               [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
+              [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
+              [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
+              [--latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]]
+              [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
+              [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
+              [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
               [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
               [--final-snr-range FINAL_SNR_RANGE]
               [--curriculum-schedule CURRICULUM_SCHEDULE]
@@ -331,6 +337,33 @@ options:
   --plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE
                         Threshold for points to always be included in A→B
                         intensity bias scatter plots
+  --latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE
+                        Number of cadences per signal type for latent space
+                        visualization batch (total points = 4× this value × 6
+                        observations per cadence)
+  --latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL
+                        Capture a latent space snapshot every N training steps
+                        (lower = more snapshots, more DB writes, and larger
+                        storage costs)",
+  --latent-viz-umap-fit-max-samples LATENT_VIZ_UMAP_FIT_MAX_SAMPLES
+                        Maximum number of pooled latent vectors used to fit
+                        the UMAP model (remaining vectors are projected via
+                        transform; lower = faster, higher = more faithful
+                        embedding)
+  --latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]
+                        UMAP n_neighbors values to sweep for latent space
+                        visualization (e.g., --latent-viz-umap-n-neighbors
+                        5 15 30 50)
+  --latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]
+                        UMAP min_dist values to sweep for latent space
+                        visualization (e.g., --latent-viz-umap-min-dist
+                        0.0 0.1 0.5)
+  --latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES
+                        Maximum number of frames in latent space GIF output
+                        (snapshots beyond this limit are log-subsampled,
+                        prioritizing earlier training steps)
+  --latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS
+                        Milliseconds per frame in latent space GIF output
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning
                         (minimum SNR difficulty level)
   --initial-snr-range INITIAL_SNR_RANGE

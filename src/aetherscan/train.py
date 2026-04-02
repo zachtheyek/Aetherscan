@@ -15,16 +15,19 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
 
+import imageio.v3 as iio
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+import umap
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -314,25 +317,25 @@ def check_encoder_trained(encoder, threshold=0.2):
 
 
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
-# Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
+# Allows for explicit dereferencing of large arrays using holder.clear(), which lets
 # Python's garbage collector free up memory on-demand
-# Note, DataHolder.clear() is only useful at the end of an epoch, once indices have been exhausted,
+# Note, holder.clear() is only useful at the end of an epoch, once indices have been exhausted,
 # since the data generators' local caches maintain references to the data until then
 # This is not an issue in our current implementation, where we only clear & reset resources at the
 # end of a round. However, if you require early exit behavior, you may want to remove the _lock and
 # use explicit _cleared() checks instead, which negates the need for local caches (see commit hash
 # 2a404a4). The trade-off being that you're at risk of race conditions if multiple threads attempt
-# to access/clear the DataHolder simultaneously. While this is not the case in our current
+# to access/clear the holder simultaneously. While this is not the case in our current
 # implementation, we opted for a more defensive approach rather than accomodating future design
-# patterns. As well, the data should not be modified once the DataHolder has been initialized to
-# prevent corrupted state in the DataHolder
-# Note, there's a potential deadlock issue with DataHolder's lock contention
+# patterns. As well, the data should not be modified once the holder has been initialized to
+# prevent corrupted state in the holder
+# Note, there's a potential deadlock issue with holder lock contention
 # Since the generators acquire locks at the start of every loop iteration, if TF's prefetch threads
 # (.prefetch(tf.data.AUTOTUNE)) are blocked waiting on this lock while the main thread is trying to
-# call self.data_generator.clear() (which also needs the lock), there could be contention.
+# call holder.clear() (which also needs the lock), there could be contention.
 # This has not been an issue so far, but if you encounter this in the future, pls update this
 # comment with your findings
-class DataHolder:
+class TrainDataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
         self._lock = threading.Lock()
@@ -350,9 +353,38 @@ class DataHolder:
             self.false = None
 
 
+class InfDataHolder:
+    def __init__(self, true, false):
+        self._cleared = False
+        self._lock = threading.Lock()
+        self.true = true
+        self.false = false
+
+    def clear(self):
+        with self._lock:
+            if self._cleared:
+                return
+            self._cleared = True
+            self.true = None
+            self.false = None
+
+
+class VizDataHolder:
+    def __init__(self, concat):
+        self._cleared = False
+        self._lock = threading.Lock()
+        self.concat = concat
+
+    def clear(self):
+        with self._lock:
+            if self._cleared:
+                return
+            self._cleared = True
+            self.concat = None
+
+
 def prepare_distributed_train_dataset(
     data: dict,
-    n_samples: int,
     train_val_split: float,
     per_replica_batch_size: int,
     effective_batch_size: int,
@@ -363,10 +395,10 @@ def prepare_distributed_train_dataset(
 ) -> dict:
     """
     Prepare distributed datasets for training & validation
+    Yields datasets with signature ((concat, true, false), concat)
 
     Args:
         data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
-        n_samples: Number of samples in data
         train_val_split: Split data into train/val sets
         per_replica_batch_size: Batch size per replica for training
         effective_batch_size: Effective batch size across all replicas for training
@@ -376,16 +408,37 @@ def prepare_distributed_train_dataset(
         shuffle: Whether to shuffle training data
 
     Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
-              accumulation_steps, val_steps, _train_holder, _val_holder}
+              accumulation_steps, val_steps, _train_holder, val_indices}
              Train/val distributed datasets, number of samples in each, number of steps for each
-              (including accumulation sub-steps), and DataHoldedr references for each
+              (including accumulation sub-steps), shared TrainDataHolder reference (both generators
+              read from the original arrays via index subsets — no copies), and the stratified
+              validation indices into the original data arrays
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
 
-    # Split into train & val
-    n_train = int(n_samples * train_val_split)
-    n_val = n_samples - n_train
+    # Stratified train/val split to ensure both sets contain proportional representation
+    # of all 4 signal types (false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi).
+    # This is necessary because generate_triplet_batch() arranges labels sequentially within
+    # chunks, so a naive positional split would over-represent later signal types in val.
+    labels = data["labels"]
+    unique_labels = np.unique(labels)
+
+    train_indices = []
+    val_indices = []
+
+    for label in unique_labels:
+        label_indices = np.where(labels == label)[0]
+        np.random.shuffle(label_indices)
+        n_label_train = int(len(label_indices) * train_val_split)
+        train_indices.append(label_indices[:n_label_train])
+        val_indices.append(label_indices[n_label_train:])
+
+    train_indices = np.concatenate(train_indices)
+    val_indices = np.concatenate(val_indices)
+
+    n_train = len(train_indices)
+    n_val = len(val_indices)
 
     # Trim datasets to fit train/val batch sizes (prevents uneven batches on final step)
     # Note, n_train should already be divisible by effective_batch_size and
@@ -397,21 +450,19 @@ def prepare_distributed_train_dataset(
     n_train_trimmed = (n_train // effective_batch_size) * effective_batch_size
     n_val_trimmed = (n_val // global_val_batch_size) * global_val_batch_size
 
+    # Randomly subsample to trimmed size (avoids positional bias from slicing the tail)
+    if n_train_trimmed < n_train:
+        train_indices = np.random.choice(train_indices, size=n_train_trimmed, replace=False)
+    if n_val_trimmed < n_val:
+        val_indices = np.random.choice(val_indices, size=n_val_trimmed, replace=False)
+
     logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
 
-    # Prepare data
-    train_concat = data["concatenated"][:n_train_trimmed]
-    train_true = data["true"][:n_train_trimmed]
-    train_false = data["false"][:n_train_trimmed]
-    train_holder = DataHolder(train_concat, train_true, train_false)
-
-    val_start = n_train
-    val_end = val_start + n_val_trimmed
-
-    val_concat = data["concatenated"][val_start:val_end]
-    val_true = data["true"][val_start:val_end]
-    val_false = data["false"][val_start:val_end]
-    val_holder = DataHolder(val_concat, val_true, val_false)
+    # Share the original arrays between train and val generators via a single data holder.
+    # The stratified split requires non-contiguous indices, which would force numpy to create
+    # full copies via fancy indexing (~2x peak memory). Instead, both generators read from the
+    # same original arrays using their respective index subsets — zero extra copies.
+    train_holder = TrainDataHolder(data["concatenated"], data["true"], data["false"])
 
     # Create generator functions for memory-efficient data loading
     def train_generator():
@@ -427,7 +478,8 @@ def prepare_distributed_train_dataset(
                 false = train_holder.false
 
             # Work with local references (safe from clearing, no per-sample lock needed)
-            indices = np.arange(len(concat))
+            # Copy train_indices because np.random.shuffle mutates in-place
+            indices = train_indices.copy()
             if shuffle:
                 # Perform global shuffle on each epoch so each pass through the data is unique
                 np.random.shuffle(indices)
@@ -441,24 +493,24 @@ def prepare_distributed_train_dataset(
         while True:  # Make generators infinite to reset state between epochs
             # Acquire lock to check cleared status and capture data references
             # Local references keep data alive even if clear() is called mid-epoch
-            with val_holder._lock:
-                if val_holder._cleared:
+            with train_holder._lock:
+                if train_holder._cleared:
                     return  # Exit if data already cleared
                 # Cache references while holding lock
-                concat = val_holder.concat
-                true = val_holder.true
-                false = val_holder.false
+                concat = train_holder.concat
+                true = train_holder.true
+                false = train_holder.false
 
             # Maintain order on each epoch since shuffling provides no benefits (no gradients
             # are calculated during validation)
-            for idx in range(len(concat)):
+            for idx in val_indices:
                 yield (concat[idx], true[idx], false[idx]), concat[idx]
 
             # Remove cache references to ensure garbage collection in future
             del concat, true, false
 
     # Determine dataset output signature
-    sample_shape = train_concat.shape[1:]
+    sample_shape = data["concatenated"].shape[1:]
     output_signature = (
         (
             tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
@@ -487,7 +539,7 @@ def prepare_distributed_train_dataset(
     val_dataset = (
         tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
         .batch(global_val_batch_size, drop_remainder=True)
-        # NOTE: do we need repeat for val dataset?
+        # NOTE: do we need repeat for val dataset? run test without repeat & see if anything breaks?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -526,35 +578,36 @@ def prepare_distributed_train_dataset(
         "accumulation_steps": accumulation_steps,
         "val_steps": val_steps,
         "_train_holder": train_holder,
-        "_val_holder": val_holder,
+        "val_indices": val_indices,  # For train_round() -> _prepare_latent_viz_batch()
     }
 
 
 def prepare_distributed_inf_dataset(
     data: dict,
-    n_samples: int,
     per_replica_inf_batch_size: int,
     num_replicas: int,
     strategy: tf.distribute.Strategy,
 ) -> dict:
     """
     Prepare distributed datasets for inference
+    Yields datasets with signature (true, false)
+
     Note, this function is meant for RF training
     It is different from aetherscan.inference.prepare_distributed_inf_dataset(),
     since we assume signal classes are known ahead of time
 
     Args:
         data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
-        n_samples: Number of samples in data
         per_replica_inf_batch_size: Batch size per replica for inference
         num_replicas: Number of replicas in strategy
         strategy: TensorFlow distribution strategy
 
     Returns: {inf_dataset, n_inf_trimmed, inf_steps, _inf_holder}
              Inference distributed dataset, number of samples, number of steps,
-              and DataHolder reference
+              and InfDataHolder reference
     """
     global_inf_batch_size = per_replica_inf_batch_size * num_replicas
+    n_samples = data["true"].shape[0]
 
     # NOTE: does trimming/divisibility matter for inference?
     # Trim datasets to fit batch sizes (prevents uneven batches on final step)
@@ -566,11 +619,16 @@ def prepare_distributed_inf_dataset(
 
     logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
 
-    # Prepare data
-    inf_concat = data["concatenated"][:n_inf_trimmed]
-    inf_true = data["true"][:n_inf_trimmed]
-    inf_false = data["false"][:n_inf_trimmed]
-    inf_holder = DataHolder(inf_concat, inf_true, inf_false)
+    # Randomly subsample to trimmed size (avoids positional bias from slicing the tail)
+    if n_inf_trimmed < n_samples:
+        indices = np.random.choice(n_samples, size=n_inf_trimmed, replace=False)
+        inf_true = data["true"][indices]
+        inf_false = data["false"][indices]
+    else:
+        inf_true = data["true"][:n_inf_trimmed]
+        inf_false = data["false"][:n_inf_trimmed]
+
+    inf_holder = InfDataHolder(inf_true, inf_false)
 
     # Create generator function for memory-efficient data loading
     def inf_generator():
@@ -581,26 +639,21 @@ def prepare_distributed_inf_dataset(
                 if inf_holder._cleared:
                     return  # Exit if data already cleared
                 # Cache references while holding lock
-                concat = inf_holder.concat
                 true = inf_holder.true
                 false = inf_holder.false
 
             # Maintain order on each epoch since shuffling provides no benefits (no gradients
             # are calculated during inference)
-            for idx in range(len(concat)):
-                yield (concat[idx], true[idx], false[idx]), concat[idx]
+            for idx in range(len(true)):
+                yield true[idx], false[idx]
 
             # Remove cache references for future garbage collection
-            del concat, true, false
+            del true, false
 
     # Determine dataset output signature
-    sample_shape = inf_concat.shape[1:]
+    sample_shape = inf_true.shape[1:]
     output_signature = (
-        (
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-        ),
+        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
         tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
     )
 
@@ -615,7 +668,7 @@ def prepare_distributed_inf_dataset(
     inf_dataset = (
         tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
         .batch(global_inf_batch_size, drop_remainder=True)
-        # NOTE: do we need repeat for inf dataset?
+        # NOTE: do we need repeat for inf dataset? run test without repeat & see if anything breaks?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -639,6 +692,112 @@ def prepare_distributed_inf_dataset(
         "n_inf_trimmed": n_inf_trimmed,
         "inf_steps": inf_steps,
         "_inf_holder": inf_holder,
+    }
+
+
+def prepare_distributed_viz_dataset(
+    concat_data: np.ndarray,
+    per_replica_inf_batch_size: int,
+    num_replicas: int,
+    strategy: tf.distribute.Strategy,
+) -> dict:
+    """
+    Prepare distributed datasets for latent space visualization
+    Yields datasets with signature (concat)
+
+    Args:
+        concat_data: Concatenated cadences array, shape (n_cadences, 6, 16, width_bin)
+        per_replica_inf_batch_size: Batch size per replica for inference
+        num_replicas: Number of replicas in strategy
+        strategy: TensorFlow distribution strategy
+
+    Returns: {viz_dataset, n_padded, n_samples, viz_steps, _viz_holder}
+             Viz distributed dataset, number of padded samples, number of real/unpadded samples,
+              number of steps, and VizDataHolder reference
+    """
+    global_viz_batch_size = per_replica_inf_batch_size * num_replicas
+    n_samples = concat_data.shape[0]
+
+    # NOTE: does padding/divisibility matter for inference?
+    # Pad datasets to fit batch sizes (prevents uneven batches on final step)
+    # Note, n_samples should already be divisible by effective_batch_size
+    # Padding here is just a defensive measure to doubly ensure divisibility before creating &
+    # distributing our datasets
+    # Alternatively, we could also trim the data instead of padding
+    n_padded = int(np.ceil(n_samples / global_viz_batch_size)) * global_viz_batch_size
+
+    if n_padded > n_samples:
+        pad_count = n_padded - n_samples
+        pad_indices = np.random.choice(n_samples, size=pad_count, replace=True)
+        padded_data = np.concatenate([concat_data, concat_data[pad_indices]], axis=0)
+        logger.info(f"Data alignment: Viz {n_samples}→{n_padded} (padded {pad_count})")
+    else:
+        padded_data = concat_data
+        logger.info(f"Data alignment: Viz {n_samples} (no padding needed)")
+
+    viz_holder = VizDataHolder(padded_data)
+
+    # Create generator function for memory-efficient data loading
+    def viz_generator():
+        while True:  # Make generator infinite to reset state between passes
+            # Acquire lock to check cleared status and capture data references
+            # Local references keep data alive even if clear() is called mid-epoch
+            with viz_holder._lock:
+                if viz_holder._cleared:
+                    return  # Exit if data already cleared
+                # Cache references while holding lock
+                concat = viz_holder.concat
+
+            # WARN: DO NOT SHUFFLE viz_generator(), OR ELSE YOU'LL BREAK plot_latent_space_gif()
+            # Maintain order on each epoch since shuffling provides no benefits (no gradients
+            # are calculated during inference)
+            for idx in range(len(concat)):
+                yield concat[idx]
+
+            # Remove cache references for future garbage collection
+            del concat
+
+    # Determine dataset output signature
+    sample_shape = padded_data.shape[1:]
+    output_signature = tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+
+    # Create dataset using generator to reduce GPU memory pressure
+    # Data is kept on CPU & transferred to GPU in batches on-demand
+    # Note that the dataset yields data in batches before being sharded (distributed) across replicas
+    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
+    logger.info(
+        f"Creating infinite dataset from generator with global batch size: {global_viz_batch_size}"
+    )
+
+    viz_dataset = (
+        tf.data.Dataset.from_generator(viz_generator, output_signature=output_signature)
+        .batch(global_viz_batch_size, drop_remainder=True)
+        # NOTE: do we need repeat for viz dataset? run test without repeat & see if anything breaks?
+        .repeat()
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Distribute dataset across GPUs
+    logger.info(f"Distributing dataset across {num_replicas} GPUs")
+
+    viz_dataset_distributed = strategy.experimental_distribute_dataset(viz_dataset)
+
+    # Calculate steps
+    viz_steps = n_padded // global_viz_batch_size
+
+    # Sanity check: verify step sizes are valid before returning
+    if viz_steps < 1:
+        raise ValueError(
+            f"viz_steps < 1: n_padded ({n_padded}) must be >= "
+            f"per_replica_inf_batch_size * num_replicas ({per_replica_inf_batch_size} * {num_replicas})"
+        )
+
+    return {
+        "viz_dataset": viz_dataset_distributed,
+        "n_padded": n_padded,
+        "n_samples": n_samples,
+        "viz_steps": viz_steps,
+        "_viz_holder": viz_holder,
     }
 
 
@@ -672,6 +831,17 @@ class TrainingPipeline:
             self.vae = create_beta_vae_model()
             self._build_optimizer()
 
+        # NOTE: this approach doesn't play well with fault tolerance. rethink later
+        # Latent viz data (prepared once on first round, persisted across rounds)
+        self._latent_viz_batch = None
+        self._latent_viz_labels = None
+        self._latent_viz_dataset = None
+        self._latent_viz_n_padded = None
+        self._latent_viz_n_samples = None
+        self._latent_viz_steps = None
+        self._latent_viz_holder = None
+        self._viz_encode_fn = None
+
         # Initialize RF model as None
         self.rf_model = None
 
@@ -685,12 +855,10 @@ class TrainingPipeline:
 
         except Exception as e:
             logger.error(f"Error loading models from checkpoint: {e}")
-
             logger.info("Resetting config.checkpoint to start training from scratch")
             self.config.checkpoint.load_dir = None
             self.config.checkpoint.load_tag = None
             self.config.checkpoint.start_round = 1
-
             raise  # Re-raise to propagate error
 
         # NOTE: similar to _setup_directories() & archive_directory(), perhaps we need a flag that gets toggled when fault tolerance is triggered, s.t. future reads from the db know to ignore the flagged rows as "archived" from a previous failed training run?
@@ -785,114 +953,6 @@ class TrainingPipeline:
     #     logger.info(f"TensorBoard logs directory: {logs_dir}")
     #     logger.info(f"Initial global_step: {self.global_step}")
 
-    def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
-        """
-        Calculate SNR parameters for curriculum learning
-
-        Args:
-            round_idx: Current training round (0-indexed)
-            total_rounds: Total number of training rounds
-
-        Returns:
-            (snr_base, snr_range) tuple
-        """
-        total_rounds = self.config.training.num_training_rounds
-        snr_base = self.config.training.snr_base
-        initial_snr_range = self.config.training.initial_snr_range
-        final_snr_range = self.config.training.final_snr_range
-        schedule = self.config.training.curriculum_schedule
-
-        # Edge case: use initial snr range if only training for 1 round
-        if total_rounds == 1:
-            return snr_base, initial_snr_range
-
-        # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
-        progress = round_idx / (total_rounds - 1)
-
-        # Linear progression from wide to narrow SNR range
-        if schedule == "linear":
-            current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
-        # Exponential decay - start easy, then get hard quickly
-        elif schedule == "exponential":
-            decay_rate = self.config.training.exponential_decay_rate
-            # Sanity check: validate decay_rate < 0 to avoid division by zero
-            if decay_rate >= 0:
-                raise ValueError(
-                    f"exponential_decay_rate must be < 0 for exponential schedule, got {decay_rate}"
-                )
-            # Normalize exponential to ensure exact endpoints at progress=0 and progress=1
-            decay_factor = (np.exp(decay_rate * progress) - np.exp(decay_rate)) / (
-                1 - np.exp(decay_rate)
-            )
-            current_range = final_snr_range + (initial_snr_range - final_snr_range) * decay_factor
-        # TODO: generalize this to receive a step schedule (as a list/dict?) validate that len(list/dict) is divisible by num_training_rounds
-        # Step function - easy for first part, hard for second part
-        elif schedule == "step":
-            easy_rounds = self.config.training.step_easy_rounds
-            hard_rounds = self.config.training.step_hard_rounds
-            # Sanity check: validate easy_rounds + hard_rounds add up to total_rounds
-            if easy_rounds + hard_rounds != total_rounds:
-                raise ValueError(
-                    f"easy_rounds ({easy_rounds}) + hard_rounds ({hard_rounds}) must equal total_rounds ({total_rounds}), got {easy_rounds + hard_rounds} instead"
-                )
-            if round_idx < easy_rounds:
-                current_range = initial_snr_range
-            elif round_idx - easy_rounds < hard_rounds:
-                current_range = final_snr_range
-            else:
-                raise RuntimeError(
-                    f"round_idx ({round_idx}) exceeded easy_rounds + hard_rounds ({easy_rounds} + {hard_rounds})"
-                )
-        else:
-            raise ValueError(
-                f"'{schedule} is invalid. Accepted values: 'linear', 'exponential', 'step'"
-            )
-
-        return snr_base, int(current_range)
-
-    def _update_learning_rate(self, val_losses):
-        """
-        Robust adaptive learning rate with multiple safeguards
-
-        Note the following heuristic:
-        min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
-          => LR can only reach min_learning_rate during round if above expression is > 0
-          => else LR will reset at start of new round before reaching min_learning_rate
-        """
-
-        current_lr = self.vae.optimizer.learning_rate.numpy()
-        if current_lr <= self.config.training.min_learning_rate:
-            return current_lr
-
-        # Use validation loss for better generalization
-        if not hasattr(self, "best_val_loss"):
-            self.best_val_loss = float("inf")
-            self.patience_counter = 0
-
-        current_val_loss = float(val_losses["total"])
-
-        # Check if validation loss improved
-        if current_val_loss < self.best_val_loss * (1 - self.config.training.min_pct_improvement):
-            self.best_val_loss = current_val_loss
-            self.patience_counter = 0
-        else:
-            self.patience_counter += 1
-
-        # Reduce LR if no meaningful improvement for consecutive epochs
-        if self.patience_counter >= self.config.training.patience_threshold:
-            new_lr = max(
-                current_lr * (1 - self.config.training.reduction_factor),
-                self.config.training.min_learning_rate,
-            )
-
-            self.vae.optimizer.learning_rate.assign(new_lr)
-            self.patience_counter = 0  # Reset counter
-
-            logger.info(f"Reduced learning rate: {current_lr:.2e} -> {new_lr:.2e}")
-            return new_lr
-
-        return current_lr
-
     def train_beta_vae(self):
         """
         Train beta-VAE with curriculum learning & adaptive LR setup
@@ -911,29 +971,37 @@ class TrainingPipeline:
         # NOTE: this approach doesn't play well with fault tolerance. rethink later
         self.start_time = time.time()
 
-        for round_idx in range(start_round - 1, n_rounds):
-            snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
+        try:
+            for round_idx in range(start_round - 1, n_rounds):
+                snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
 
-            logger.info(f"{'=' * 50}")
-            logger.info(f"ROUND {round_idx + 1}/{n_rounds}")
-            logger.info(f"SNR range: {snr_base}-{snr_base + snr_range}")
-            logger.info(f"{'=' * 50}")
+                logger.info(f"{'=' * 50}")
+                logger.info(f"ROUND {round_idx + 1}/{n_rounds}")
+                logger.info(f"SNR range: {snr_base}-{snr_base + snr_range}")
+                logger.info(f"{'=' * 50}")
 
-            # Reset learning rate & adaptive state before new curriculum stage
-            original_lr = self.config.training.base_learning_rate
-            current_lr = self.vae.optimizer.learning_rate.numpy()
-            self.vae.optimizer.learning_rate.assign(original_lr)
+                # Reset learning rate & adaptive state before new curriculum stage
+                original_lr = self.config.training.base_learning_rate
+                current_lr = self.vae.optimizer.learning_rate.numpy()
+                self.vae.optimizer.learning_rate.assign(original_lr)
 
-            if hasattr(self, "best_val_loss"):
-                delattr(self, "best_val_loss")
-            if hasattr(self, "patience_counter"):
-                delattr(self, "patience_counter")
+                if hasattr(self, "best_val_loss"):
+                    delattr(self, "best_val_loss")
+                if hasattr(self, "patience_counter"):
+                    delattr(self, "patience_counter")
 
-            logger.info(f"Curriculum LR reset: {current_lr:.2e} → {original_lr:.2e}")
+                logger.info(f"Curriculum LR reset: {current_lr:.2e} → {original_lr:.2e}")
 
-            self.train_round(
-                round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
-            )
+                self.train_round(
+                    round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
+                )
+        finally:
+            # NOTE: this approach doesn't play well with fault tolerance. rethink later
+            # Free the latent viz batch once all rounds are complete (or on failure)
+            del self._latent_viz_batch, self._latent_viz_labels
+            self._latent_viz_batch = None
+            self._latent_viz_labels = None
+            gc.collect()
 
     def train_round(self, round_idx: int, epochs: int, snr_base: int, snr_range: int):
         """
@@ -948,10 +1016,14 @@ class TrainingPipeline:
             self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
         )
 
+        # Extract labels before distributing (prepare_distributed_train_dataset keeps the
+        # original arrays alive via a shared train_holder — no copies — so we can free the
+        # dict reference immediately after)
+        train_labels = train_data.get("labels")
+
         # Distribute training data
         data = prepare_distributed_train_dataset(
             data=train_data,
-            n_samples=self.config.training.num_samples_beta_vae,
             train_val_split=self.config.training.train_val_split,
             per_replica_batch_size=self.config.training.per_replica_batch_size,
             effective_batch_size=self.config.training.effective_batch_size,
@@ -961,7 +1033,29 @@ class TrainingPipeline:
             shuffle=True,
         )
 
+        # Free the dict shell (original arrays stay alive via the shared train_holder)
         del train_data
+        gc.collect()
+
+        # Prepare latent viz batch (if it's the first round) using the validation partition.
+        # Using held-out data ensures the latent space visualization captures generalization, while
+        # persisting the same data across rounds eliminates the effects of distribution shift (from
+        # the curriculum schedule)
+        if self._latent_viz_batch is None:
+            if train_labels is not None:
+                # Use the data holder's original arrays directly with val_indices to avoid creating
+                # an intermediate copy of the entire validation partition
+                self._prepare_latent_viz_batch(
+                    concat_data=data["_train_holder"].concat,
+                    labels=train_labels,
+                    candidate_indices=data["val_indices"],
+                )
+        # On subsequent rounds, the latent viz batch is persisted,
+        # but the distributed dataset needs to be rebuilt
+        elif self._latent_viz_batch is not None and self._latent_viz_dataset is None:
+            self._build_latent_viz_dataset()
+
+        del train_labels
         gc.collect()
 
         train_dataset = data["train_dataset"]
@@ -972,7 +1066,6 @@ class TrainingPipeline:
         accumulation_steps = data["accumulation_steps"]
         val_steps = data["val_steps"]
         train_holder = data["_train_holder"]
-        val_holder = data["_val_holder"]
 
         del data
         gc.collect()
@@ -984,20 +1077,22 @@ class TrainingPipeline:
 
         try:
             for epoch in range(epochs):
-                logger.info(f"{'-' * 30}")
-                logger.info(f"Epoch {epoch + 1}/{epochs} Start")
-
                 # Training
                 epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
-                    train_dataset, steps_per_epoch, accumulation_steps, time.time()
+                    round_idx,
+                    epoch,
+                    snr_base,
+                    snr_range,
+                    train_dataset,
+                    steps_per_epoch,
+                    accumulation_steps,
+                    time.time(),
                 )
 
                 # Validation
                 val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
 
                 # Queue db writes (non-blocking) & log results
-                logger.info(f"Epoch {epoch + 1} Complete")
-
                 current_time = time.time()
 
                 if self.db is None:
@@ -1134,19 +1229,20 @@ class TrainingPipeline:
                 # # Increment global step
                 # self.global_step += 1
 
+                logger.info(f"Epoch {epoch + 1}")
                 logger.info(
                     f"Train -- Total: {epoch_losses['total']:.4f}, "
                     f"Recon: {epoch_losses['reconstruction']:.4f}, "
                     f"KL: {epoch_losses['kl']:.4f}, "
                     f"True: {epoch_losses['true']:.4f}, "
                     f"False: {epoch_losses['false']:.4f}, "
-                    f"Duration: {train_duration} "
+                    f"Duration: {train_duration:.2f} "
                 )
                 logger.info(
-                    f"Gradient norm -- Mean: {gradient_norm_mean}, "
-                    f"Std: {gradient_norm_std}, "
-                    f"Max: {gradient_norm_max}, "
-                    f"Clipping rate: {clipping_rate} "
+                    f"Gradient norm -- Mean: {gradient_norm_mean:.4f}, "
+                    f"Std: {gradient_norm_std:.4f}, "
+                    f"Max: {gradient_norm_max:.4f}, "
+                    f"Clipping rate: {clipping_rate:.4f} "
                 )
                 logger.info(
                     f"Val -- Total: {val_losses['total']:.4f}, "
@@ -1154,15 +1250,13 @@ class TrainingPipeline:
                     f"KL: {val_losses['kl']:.4f}, "
                     f"True: {val_losses['true']:.4f}, "
                     f"False: {val_losses['false']:.4f}, "
-                    f"Duration: {val_duration} "
+                    f"Duration: {val_duration:.2f} "
                 )
 
                 # Adaptive learning rate
                 self._update_learning_rate(val_losses)
 
-                logger.info(f"Epoch {epoch + 1}/{epochs} End")
-
-            # NOTE: combine plot_beta_vae_loss_curves() and plot_beta_vae_training_stability() into plot_training_progress()?
+            # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
             # Plot loss curves
             self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
@@ -1177,6 +1271,10 @@ class TrainingPipeline:
                 dir="checkpoints",
             )
 
+            # NOTE: commented out to save compute. a final latent space gif at the end of training should suffice
+            # Generate latent space GIF
+            # self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+
             # Save checkpoint
             self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
@@ -1186,11 +1284,20 @@ class TrainingPipeline:
 
         # Run cleanup regardless if round finishes successfully or not
         finally:
-            # NOTE: should check to make sure holders & datasets exist first
+            # NOTE: should check to make sure train_holder & datasets exist first
             # Clear intermediate data
             train_holder.clear()
-            val_holder.clear()
             del train_dataset, val_dataset
+
+            # Clear latent viz distributed dataset (rebuilt each round)
+            if self._latent_viz_holder is not None:
+                self._latent_viz_holder.clear()
+            self._latent_viz_dataset = None
+            self._latent_viz_n_padded = None
+            self._latent_viz_n_samples = None
+            self._latent_viz_steps = None
+            self._latent_viz_holder = None
+            self._viz_encode_fn = None
 
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
@@ -1200,10 +1307,21 @@ class TrainingPipeline:
             # Reset multiprocessing pools in DataGenerator after each round
             # to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
+            logger.info("Reset managed pools")
 
             gc.collect()
 
-    def _train_epoch(self, dataset, steps_per_epoch, accumulation_steps=1, start_time=None):
+    def _train_epoch(
+        self,
+        round_idx,
+        epoch_idx,
+        snr_base,
+        snr_range,
+        dataset,
+        steps_per_epoch,
+        accumulation_steps=1,
+        start_time=None,
+    ):
         """
         Perform a single training epoch with gradient accumulation
         """
@@ -1301,24 +1419,24 @@ class TrainingPipeline:
                 global_norm = self._apply_gradients(accumulated_gradients)
                 epoch_gradient_norms.append(float(global_norm))
 
+                # Capture latent snapshot every N steps, and on the final step
+                is_interval_step = (step + 1) % self.config.training.latent_viz_step_interval == 0
+                is_final_step = (step + 1) == steps_per_epoch
+                if (is_interval_step or is_final_step) and self._latent_viz_dataset is not None:
+                    self._capture_latent_snapshot(
+                        round_idx,
+                        epoch_idx,
+                        step,
+                        snr_base,
+                        snr_range,
+                    )
+
                 for key, loss in step_losses.items():
                     # Average step losses over sub-steps
                     avg_loss = loss / successful_accumulations
                     step_losses[key] = avg_loss
                     # Accumulate epoch losses over training steps
                     epoch_losses[key] += avg_loss
-
-                # Log progress every 10 steps
-                if (step + 1) % 10 == 0 or (step + 1) == steps_per_epoch:
-                    logger.info(
-                        f"Step {step + 1}/{steps_per_epoch}, "
-                        f"Total: {step_losses['total']:.4f}, "
-                        f"Recon: {step_losses['reconstruction']:.4f}, "
-                        f"KL: {step_losses['kl']:.4f}, "
-                        f"True: {step_losses['true']:.4f}, "
-                        f"False: {step_losses['false']:.4f}, "
-                        f"Gradient norm: {global_norm:.4f} "
-                    )
 
             # Average epoch losses over training steps
             for key in epoch_losses:
@@ -1335,7 +1453,7 @@ class TrainingPipeline:
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
-            # NOTE: should check to make sure iterator exist first
+            # NOTE: should check to make sure iterator exists first
             del iterator
             gc.collect()
 
@@ -1375,7 +1493,7 @@ class TrainingPipeline:
 
         # Run cleanup regardless if epoch finishes successfully or not
         finally:
-            # NOTE: should check to make sure iterator exist first
+            # NOTE: should check to make sure iterator exists first
             del iterator
             gc.collect()
 
@@ -1519,8 +1637,183 @@ class TrainingPipeline:
 
         return reduced_losses
 
-    # NOTE: write what to db?
-    # NOTE: move some of the latent generation functionality to inference.py & import into train.py instead?
+    def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
+        """
+        Calculate SNR parameters for curriculum learning
+
+        Args:
+            round_idx: Current training round (0-indexed)
+            total_rounds: Total number of training rounds
+
+        Returns:
+            (snr_base, snr_range) tuple
+        """
+        total_rounds = self.config.training.num_training_rounds
+        snr_base = self.config.training.snr_base
+        initial_snr_range = self.config.training.initial_snr_range
+        final_snr_range = self.config.training.final_snr_range
+        schedule = self.config.training.curriculum_schedule
+
+        # Edge case: use initial snr range if only training for 1 round
+        if total_rounds == 1:
+            return snr_base, initial_snr_range
+
+        # Progress through curriculum: 0.0 (easy) -> 1.0 (hard)
+        progress = round_idx / (total_rounds - 1)
+
+        # Linear progression from wide to narrow SNR range
+        if schedule == "linear":
+            current_range = initial_snr_range - progress * (initial_snr_range - final_snr_range)
+        # Exponential decay - start easy, then get hard quickly
+        elif schedule == "exponential":
+            decay_rate = self.config.training.exponential_decay_rate
+            # Sanity check: validate decay_rate < 0 to avoid division by zero
+            if decay_rate >= 0:
+                raise ValueError(
+                    f"exponential_decay_rate must be < 0 for exponential schedule, got {decay_rate}"
+                )
+            # Normalize exponential to ensure exact endpoints at progress=0 and progress=1
+            decay_factor = (np.exp(decay_rate * progress) - np.exp(decay_rate)) / (
+                1 - np.exp(decay_rate)
+            )
+            current_range = final_snr_range + (initial_snr_range - final_snr_range) * decay_factor
+        # TODO: generalize this to receive a step schedule (as a list/dict?) validate that len(list/dict) is divisible by num_training_rounds
+        # Step function - easy for first part, hard for second part
+        elif schedule == "step":
+            easy_rounds = self.config.training.step_easy_rounds
+            hard_rounds = self.config.training.step_hard_rounds
+            # Sanity check: validate easy_rounds + hard_rounds add up to total_rounds
+            if easy_rounds + hard_rounds != total_rounds:
+                raise ValueError(
+                    f"easy_rounds ({easy_rounds}) + hard_rounds ({hard_rounds}) must equal total_rounds ({total_rounds}), got {easy_rounds + hard_rounds} instead"
+                )
+            if round_idx < easy_rounds:
+                current_range = initial_snr_range
+            elif round_idx - easy_rounds < hard_rounds:
+                current_range = final_snr_range
+            else:
+                raise RuntimeError(
+                    f"round_idx ({round_idx}) exceeded easy_rounds + hard_rounds ({easy_rounds} + {hard_rounds})"
+                )
+        else:
+            raise ValueError(
+                f"'{schedule} is invalid. Accepted values: 'linear', 'exponential', 'step'"
+            )
+
+        return snr_base, int(current_range)
+
+    def _update_learning_rate(self, val_losses):
+        """
+        Robust adaptive learning rate with multiple safeguards
+
+        Note the following heuristic:
+        min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
+          => LR can only reach min_learning_rate during round if above expression is > 0
+          => else LR will reset at start of new round before reaching min_learning_rate
+        """
+
+        current_lr = self.vae.optimizer.learning_rate.numpy()
+        if current_lr <= self.config.training.min_learning_rate:
+            return current_lr
+
+        # Use validation loss for better generalization
+        if not hasattr(self, "best_val_loss"):
+            self.best_val_loss = float("inf")
+            self.patience_counter = 0
+
+        current_val_loss = float(val_losses["total"])
+
+        # Check if validation loss improved
+        if current_val_loss < self.best_val_loss * (1 - self.config.training.min_pct_improvement):
+            self.best_val_loss = current_val_loss
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+
+        # Reduce LR if no meaningful improvement for consecutive epochs
+        if self.patience_counter >= self.config.training.patience_threshold:
+            new_lr = max(
+                current_lr * (1 - self.config.training.reduction_factor),
+                self.config.training.min_learning_rate,
+            )
+
+            self.vae.optimizer.learning_rate.assign(new_lr)
+            self.patience_counter = 0  # Reset counter
+
+            logger.info(f"Reduced learning rate: {current_lr:.2e} -> {new_lr:.2e}")
+            return new_lr
+
+        return current_lr
+
+    def _distributed_encode(
+        self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False
+    ):
+        """
+        Run distributed encoding over a dataset using a provided @tf.function.
+
+        The number of output arrays is inferred from encode_fn's return type on the first step:
+        a single PerReplica tensor produces 1 output, a tuple of PerReplica tensors produces N.
+
+        Args:
+            dataset: Distributed dataset to iterate
+            n_steps: Number of steps to iterate
+            encode_fn: @tf.function that takes a batch and returns one or more per-replica tensors
+            n_samples: Total number of output rows per array
+            latent_dim: Latent dimension
+            logging: Whether to log progress (default: False)
+
+        Returns:
+            List of np.ndarray. Each shape (n_samples, latent_dim).
+        """
+        # Process all batches
+        iterator = iter(dataset)
+        current_idx = 0
+        outputs = None
+
+        try:
+            for _ in range(n_steps):
+                batch = next(iterator)
+
+                # Get per-replica latents for this batch
+                results = encode_fn(batch)
+
+                # Normalize to tuple: a single PerReplica tensor is not a tuple,
+                # while multiple outputs are returned as a tuple of PerReplica tensors
+                if not isinstance(results, tuple):
+                    results = (results,)
+
+                # Lazily allocate output arrays on first step (avoids needing n_outputs param)
+                if outputs is None:
+                    outputs = [
+                        np.empty((n_samples, latent_dim), dtype=np.float32)
+                        for _ in range(len(results))
+                    ]
+
+                # Extract results from each replica and concatenate across all replicas
+                # This avoids the inefficient gather operation with NCCL
+                for i, per_replica in enumerate(results):
+                    local_results = self.strategy.experimental_local_results(per_replica)
+                    batch_np = np.concatenate([r.numpy() for r in local_results], axis=0)
+                    batch_size = batch_np.shape[0]
+                    outputs[i][current_idx : current_idx + batch_size] = batch_np
+                    del local_results, batch_np
+
+                current_idx += batch_size
+
+                del results
+                gc.collect()
+
+            # Log progress
+            if logging:
+                logger.info(f"Finished encoding {n_steps} steps")
+        finally:
+            # NOTE: should check to make sure iterator exists first
+            del iterator
+            gc.collect()
+
+        return outputs
+
+    # NOTE: write what to db? (e.g. accuracy, F1)
     # TODO: visualize classification accuracy (ROC-AUC, precision-recall) at different thresholds when training is complete
     def train_random_forest(self):
         """Train Random Forest"""
@@ -1566,8 +1859,9 @@ class TrainingPipeline:
             logger.warning(f"Could not verify encoder weights status: {e}")
             logger.warning("Proceeding with current encoder weights")
 
-        # NOTE: divide by 2 to compensate for generate_triplet_batch creating n_samples * 2 samples
-        n_samples = self.config.training.num_samples_rf // 2
+        n_samples = (
+            self.config.training.num_samples_rf // 2
+        )  # Divide by 2 to compensate for generate_triplet_batch internally creating n * 2 samples (n true, n false)
         snr_base = self.config.training.snr_base
         snr_range = (
             self.config.training.initial_snr_range
@@ -1586,7 +1880,6 @@ class TrainingPipeline:
         # Prepare distributed dataset for inference
         results = prepare_distributed_inf_dataset(
             data=rf_data,
-            n_samples=n_samples,
             per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
@@ -1605,28 +1898,21 @@ class TrainingPipeline:
 
         logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
 
-        # Pre-allocate latent arrays
-        # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
-        true_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
-        false_latents = np.empty((n_inf_trimmed * num_observations, latent_dim), dtype=np.float32)
-
         # Create distributed inference function
         @tf.function
-        def distributed_encode(batch_data):
+        def rf_encode_fn(batch_data):
             """Encode batch data using distributed strategy"""
 
             def encode_fn(data):
                 """Per-replica encoding step"""
-                x, _ = data
-                true_data = x[1]  # Extract true component
-                false_data = x[2]  # Extract false component
+                # Extract true & false components
+                true_data, false_data = data
 
                 # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
-                batch_size = tf.shape(true_data)[0]
                 true_reshaped = tf.reshape(true_data, [-1, time_bins, width_bin, 1])
                 false_reshaped = tf.reshape(false_data, [-1, time_bins, width_bin, 1])
 
-                # Encode (returns mean, log_var, z)
+                # Encode (returns z_mean, z_log_var, z)
                 _, _, true_z = self.vae.encoder(true_reshaped, training=False)
                 _, _, false_z = self.vae.encoder(false_reshaped, training=False)
 
@@ -1637,39 +1923,16 @@ class TrainingPipeline:
 
             return per_replica_true, per_replica_false
 
-        # Process all batches
-        iterator = iter(inf_dataset)
-        current_idx = 0
-
         try:
-            for step in range(inf_steps):
-                batch = next(iterator)
-
-                # Get per-replica latents for this batch
-                per_replica_true, per_replica_false = distributed_encode(batch)
-
-                # Extract results from each replica and concatenate
-                # This avoids the inefficient gather operation with NCCL
-                true_results = self.strategy.experimental_local_results(per_replica_true)
-                false_results = self.strategy.experimental_local_results(per_replica_false)
-
-                # Concatenate results from all replicas
-                true_batch_np = np.concatenate([t.numpy() for t in true_results], axis=0)
-                false_batch_np = np.concatenate([f.numpy() for f in false_results], axis=0)
-
-                batch_latent_size = true_batch_np.shape[0]
-                true_latents[current_idx : current_idx + batch_latent_size] = true_batch_np
-                false_latents[current_idx : current_idx + batch_latent_size] = false_batch_np
-
-                current_idx += batch_latent_size
-
-                # Log progress
-                if (step + 1) % 10 == 0 or (step + 1) == inf_steps:
-                    logger.info(f"Generated latents for step {step + 1}/{inf_steps}")
-
-                del per_replica_true, true_results, true_batch_np
-                del per_replica_false, false_results, false_batch_np
-                gc.collect()
+            # TEST: make sure this works after refactor
+            true_latents, false_latents = self._distributed_encode(
+                dataset=inf_dataset,
+                n_steps=inf_steps,
+                encode_fn=rf_encode_fn,
+                n_samples=n_inf_trimmed * num_observations,
+                latent_dim=latent_dim,
+                logging=True,
+            )
 
             # Train Random Forest classifier
             self.rf_model.train(true_latents, false_latents)
@@ -1681,9 +1944,6 @@ class TrainingPipeline:
             raise  # Re-raise to propagate error
 
         finally:
-            # NOTE: should check to make sure iterator exist first
-            del iterator
-
             # NOTE: should check to make sure holder & dataset exist first
             # Clear intermediate data
             inf_holder.clear()
@@ -1696,134 +1956,14 @@ class TrainingPipeline:
 
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
+            logger.info("Reset managed pools")
 
             # NOTE: should check to make sure arrays exist first
             del true_latents, false_latents
             gc.collect()
 
-    def _get_snr_by_round(self, current_time: float) -> dict[int, dict[str, float]]:
-        """
-        Query SNR range data from training_stats and return per-round SNR info.
-
-        Returns:
-            Dict mapping round_number to {"floor": x, "ceil": y}
-        """
-        if self.db is None:
-            return {}
-
-        snr_by_round: dict[int, dict[str, float]] = {}
-
-        # Query snr_range_floor
-        floor_results = self.db.query_training_stat(
-            model_name="beta_vae",
-            stat_name="snr_range_floor",
-            tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
-        )
-
-        for r in floor_results:
-            round_num = r["round_number"]
-            if round_num not in snr_by_round:
-                snr_by_round[round_num] = {}
-            snr_by_round[round_num]["floor"] = r["value"]
-
-        del floor_results
-
-        # Query snr_range_ceil
-        ceil_results = self.db.query_training_stat(
-            model_name="beta_vae",
-            stat_name="snr_range_ceil",
-            tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
-        )
-
-        for r in ceil_results:
-            round_num = r["round_number"]
-            if round_num not in snr_by_round:
-                snr_by_round[round_num] = {}
-            snr_by_round[round_num]["ceil"] = r["value"]
-
-        del ceil_results
-
-        return snr_by_round
-
-    def _add_snr_range_shading(
-        self,
-        ax,
-        snr_by_round: dict[int, dict[str, float]],
-        epochs_per_round: int | None = None,
-        use_rounds: bool = False,
-        show_text_annotations: bool = True,
-    ) -> None:
-        """
-        Add transparent background regions showing SNR range per round.
-
-        Args:
-            ax: Matplotlib axis to add shading to
-            snr_by_round: Dict mapping round_number to {"floor": x, "ceil": y}
-            epochs_per_round: Number of epochs per training round (required if use_rounds=False)
-            use_rounds: If True, use round numbers for x-axis; if False, use epochs
-            show_text_annotations: If True, show SNR range text annotations in subplot
-        """
-        if not snr_by_round:
-            return
-
-        if not use_rounds and epochs_per_round is None:
-            raise ValueError("epochs_per_round is required when use_rounds=False")
-
-        # Alternating colors for visual distinction
-        colors = ["#e6f2ff", "#fff2e6"]  # Light blue, light orange
-        hatches = ["//", None]  # Striped for odd idx, solid for even idx
-
-        fontsize, rotation = 10, 0
-
-        for idx, (round_num, snr_info) in enumerate(sorted(snr_by_round.items())):
-            if "floor" not in snr_info or "ceil" not in snr_info:
-                continue
-
-            # Calculate x positions based on use_rounds flag
-            if use_rounds:
-                start_x = round_num - 0.5
-                end_x = round_num + 0.5
-                mid_x = round_num
-            else:
-                start_epoch = (round_num - 1) * epochs_per_round + 1
-                end_epoch = round_num * epochs_per_round
-                start_x = start_epoch - 0.5
-                end_x = end_epoch + 0.5
-                mid_x = (start_epoch + end_epoch) / 2
-
-            # Add shaded region with alternating hatch patterns
-            hatch = hatches[idx % 2]
-            ax.axvspan(
-                start_x,
-                end_x,
-                color=colors[idx % 2],
-                alpha=0.5,
-                zorder=0,
-                hatch=hatch,
-                edgecolor="gray" if hatch else None,
-            )
-
-            # Add SNR text annotation at top of region
-            if show_text_annotations:
-                snr_floor = int(snr_info["floor"])
-                snr_ceil = int(snr_info["ceil"])
-                ax.text(
-                    mid_x,
-                    0.98,
-                    f"SNR: {snr_floor}-{snr_ceil}",
-                    transform=ax.get_xaxis_transform(),
-                    ha="center",
-                    va="top",
-                    fontsize=fontsize,
-                    rotation=rotation,
-                    alpha=0.7,
-                )
-
-    # NOTE: combine with plot_beta_vae_training_stability() into plot_training_stats(), similar to plot_injection_stats()?
+    # TODO: reorder plot methods (def & call sites): train -> latent -> injection
+    # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
     def plot_beta_vae_loss_curves(self, tag: str | None = None, dir: str | None = None):
         """Plot beta-VAE training history"""
         if tag is None:
@@ -2022,7 +2162,8 @@ class TrainingPipeline:
         del snr_by_round
         gc.collect()
 
-    # NOTE: combine with plot_beta_vae_loss_curves() into plot_training_stats(), similar to plot_injection_stats()?
+    # TODO: reorder plot methods (def & call sites): train -> latent -> injection
+    # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
     def plot_beta_vae_training_stability(self, tag: str | None = None, dir: str | None = None):
         """
         Plot gradient clipping rate and gradient norm statistics.
@@ -2254,6 +2395,129 @@ class TrainingPipeline:
         del history, snr_by_round, epochs
         gc.collect()
 
+    def _get_snr_by_round(self, current_time: float) -> dict[int, dict[str, float]]:
+        """
+        Query SNR range data from training_stats and return per-round SNR info.
+
+        Returns:
+            Dict mapping round_number to {"floor": x, "ceil": y}
+        """
+        if self.db is None:
+            return {}
+
+        snr_by_round: dict[int, dict[str, float]] = {}
+
+        # Query snr_range_floor
+        floor_results = self.db.query_training_stat(
+            model_name="beta_vae",
+            stat_name="snr_range_floor",
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        for r in floor_results:
+            round_num = r["round_number"]
+            if round_num not in snr_by_round:
+                snr_by_round[round_num] = {}
+            snr_by_round[round_num]["floor"] = r["value"]
+
+        del floor_results
+
+        # Query snr_range_ceil
+        ceil_results = self.db.query_training_stat(
+            model_name="beta_vae",
+            stat_name="snr_range_ceil",
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+
+        for r in ceil_results:
+            round_num = r["round_number"]
+            if round_num not in snr_by_round:
+                snr_by_round[round_num] = {}
+            snr_by_round[round_num]["ceil"] = r["value"]
+
+        del ceil_results
+
+        return snr_by_round
+
+    def _add_snr_range_shading(
+        self,
+        ax,
+        snr_by_round: dict[int, dict[str, float]],
+        epochs_per_round: int | None = None,
+        use_rounds: bool = False,
+        show_text_annotations: bool = True,
+    ) -> None:
+        """
+        Add transparent background regions showing SNR range per round.
+
+        Args:
+            ax: Matplotlib axis to add shading to
+            snr_by_round: Dict mapping round_number to {"floor": x, "ceil": y}
+            epochs_per_round: Number of epochs per training round (required if use_rounds=False)
+            use_rounds: If True, use round numbers for x-axis; if False, use epochs
+            show_text_annotations: If True, show SNR range text annotations in subplot
+        """
+        if not snr_by_round:
+            return
+
+        if not use_rounds and epochs_per_round is None:
+            raise ValueError("epochs_per_round is required when use_rounds=False")
+
+        # Alternating colors for visual distinction
+        colors = ["#e6f2ff", "#fff2e6"]  # Light blue, light orange
+        hatches = ["//", None]  # Striped for odd idx, solid for even idx
+
+        fontsize, rotation = 10, 0
+
+        for idx, (round_num, snr_info) in enumerate(sorted(snr_by_round.items())):
+            if "floor" not in snr_info or "ceil" not in snr_info:
+                continue
+
+            # Calculate x positions based on use_rounds flag
+            if use_rounds:
+                start_x = round_num - 0.5
+                end_x = round_num + 0.5
+                mid_x = round_num
+            else:
+                start_epoch = (round_num - 1) * epochs_per_round + 1
+                end_epoch = round_num * epochs_per_round
+                start_x = start_epoch - 0.5
+                end_x = end_epoch + 0.5
+                mid_x = (start_epoch + end_epoch) / 2
+
+            # Add shaded region with alternating hatch patterns
+            hatch = hatches[idx % 2]
+            ax.axvspan(
+                start_x,
+                end_x,
+                color=colors[idx % 2],
+                alpha=0.5,
+                zorder=0,
+                hatch=hatch,
+                edgecolor="gray" if hatch else None,
+            )
+
+            # Add SNR text annotation at top of region
+            if show_text_annotations:
+                snr_floor = int(snr_info["floor"])
+                snr_ceil = int(snr_info["ceil"])
+                ax.text(
+                    mid_x,
+                    0.98,
+                    f"SNR: {snr_floor}-{snr_ceil}",
+                    transform=ax.get_xaxis_transform(),
+                    ha="center",
+                    va="top",
+                    fontsize=fontsize,
+                    rotation=rotation,
+                    alpha=0.7,
+                )
+
+    # TODO: reorder plot methods (def & call sites): train -> latent -> injection
     # TODO: move injection plots to data_generation.py & call at end of generate_triplet_batch() (instead of at the end of train_round() & run_training_pipeline())
     # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
@@ -3204,6 +3468,546 @@ class TrainingPipeline:
                 title=f"Final global intensity biases - ({tag}, {machine_name})",
             )
 
+    # NOTE: come back to this later (verify what happens when self._latent_viz_batch and/or self._latent_viz_labels is None)
+    # TODO: reorder plot methods (def & call sites): train -> latent -> injection
+    # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
+    def plot_latent_space_gif(self, tag: str | None = None, dir: str | None = None):
+        """
+        Generate GIF showing how the latent space evolves during training using using UMAP with 8
+        color categories (4 signal types * ON/OFF).
+
+        Args:
+            tag: Plot tag for filename (defaults to save_tag)
+            dir: Subdirectory (e.g., "checkpoints" for per-round)
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        if dir is not None:
+            save_dir = os.path.join(self.config.output_path, "plots", dir)
+        else:
+            save_dir = os.path.join(self.config.output_path, "plots")
+
+        os.makedirs(save_dir, exist_ok=True)  # Create dir if it doesn't exist
+
+        if self.db is None:
+            raise RuntimeError("No database instance detected - cannot generate latent space GIF")
+
+        # Flush database to ensure all latent snapshots are written before plotting
+        logger.info("Flushing database before latent space GIF generation...")
+        if not self.db.flush():
+            logger.warning(
+                "Database flush failed. GIF generation may encounter issues. Proceeding anyways..."
+            )
+        else:
+            logger.info("Database flushed")
+
+        # Query distinct snapshot keys (model, round, epoch, step, snr_base, snr_range)
+        # Sorting already handled on the query side (i.e. in query_latent_snapshot_keys)
+        snapshot_keys = self.db.query_latent_snapshot_keys(
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+        )
+
+        if not snapshot_keys:
+            logger.warning("No latent snapshots found in database — skipping GIF generation")
+            return
+
+        logger.info(f"Found {len(snapshot_keys)} unique snapshots for GIF generation")
+
+        # Subsample to max_frames if too many snapshots
+        # Uses log-spaced indices so earlier training steps (where the most dramatic
+        # latent space changes occur) get higher frame density than later steps
+        # Only works if snapshot_keys is sorted by progression
+        max_frames = self.config.training.latent_viz_gif_max_frames
+        if len(snapshot_keys) > max_frames:
+            n = len(snapshot_keys)
+            # Generate more candidates than needed, then deduplicate to hit max_frames
+            # Log-spacing naturally clusters near index 0, so oversampling + dedup
+            # preserves the early-training bias while filling the frame budget
+            oversample = max_frames
+            indices = set()
+            indices.add(0)  # Always include first snapshot
+            while len(indices) < max_frames:
+                oversample *= 2  # NOTE: is 2 a good choice here?
+                raw = np.logspace(0, np.log10(n - 1), num=oversample).astype(int)
+                indices = {0} | set(raw)
+                del raw
+                if oversample > n * 10:
+                    break  # Safety valve: can't exceed unique indices available
+            # Sort and trim to exactly max_frames
+            indices = sorted(indices)[:max_frames]
+            snapshot_keys = [snapshot_keys[i] for i in indices]
+
+            logger.info(
+                f"Subsampled to {len(snapshot_keys)} frames (log-spaced, max {max_frames}, oversample {oversample})"
+            )
+
+            del indices
+            gc.collect()
+
+        # Load selected snapshots and pool latent data
+        all_coords = []  # List of (N_obs, latent_dim) arrays per snapshot
+        all_snapshot_labels = []  # List of (N_obs,) label arrays per snapshot
+        all_snapshot_onoff = []  # List of (N_obs,) ON/OFF arrays per snapshot
+        snapshot_metadata = []  # (model, round, epoch, step, snr_base, snr_range) per snapshot
+
+        for key in snapshot_keys:
+            rows = self.db.query_latent_snapshots(
+                model_name=key["model_name"],
+                round_number=key["round_number"],
+                epoch_number=key["epoch_number"],
+                step_number=key["step_number"],
+                tag=self.config.checkpoint.save_tag,
+                start_time=self.start_time,
+                columns=["signal_type", "latent_vector"],
+            )
+
+            if not rows:
+                continue
+
+            # Parse latent vectors and build arrays
+            snapshot_latents = []
+            snapshot_labels = []
+            snapshot_onoff = []
+
+            for row in rows:
+                latent_6x = json.loads(row["latent_vector"])  # (6, latent_dim)
+                for obs_idx, vec in enumerate(latent_6x):
+                    snapshot_latents.append(vec)
+                    snapshot_labels.append(row["signal_type"])
+                    snapshot_onoff.append("ON" if obs_idx % 2 == 0 else "OFF")
+
+            all_coords.append(np.array(snapshot_latents, dtype=np.float32))
+            all_snapshot_labels.append(snapshot_labels)
+            all_snapshot_onoff.append(snapshot_onoff)
+            snapshot_metadata.append(key)
+
+            del rows, snapshot_latents, snapshot_labels, snapshot_onoff
+            gc.collect()
+
+        del snapshot_keys
+        gc.collect()
+
+        if not all_coords:
+            logger.warning("No valid latent data loaded — skipping GIF generation")
+            return
+
+        # Pool all latents for global UMAP fit
+        pooled = np.concatenate(all_coords, axis=0)
+        logger.info(
+            f"Pooled {pooled.shape[0]} latent vectors from {len(all_coords)} snapshots "
+            f"for UMAP fitting"
+        )
+
+        # Subsample pooled vectors for UMAP fit (fitting on the full set of pooled vectors is slow;
+        # the subsampled fit generalizes well and remaining vectors are projected via .transform())
+        # Stratified by signal_type × ON/OFF (8 classes) for balanced representation
+        umap_fit_max = self.config.training.latent_viz_umap_fit_max_samples
+        if pooled.shape[0] > umap_fit_max:
+            pooled_labels = np.concatenate(
+                [np.array(lab, dtype="U") for lab in all_snapshot_labels]
+            )
+            pooled_onoff = np.concatenate([np.array(o, dtype="U") for o in all_snapshot_onoff])
+            strata = np.char.add(np.char.add(pooled_labels, "|"), pooled_onoff)
+            del pooled_labels, pooled_onoff
+
+            # NOTE: use a global config seed instead of hard-coding
+            rng = np.random.default_rng(11)
+            unique_classes = np.unique(strata)
+            per_class = umap_fit_max // len(unique_classes)
+            fit_indices = []
+            for cls in unique_classes:
+                cls_idx = np.nonzero(strata == cls)[0]
+                n_take = min(per_class, len(cls_idx))
+                if n_take < per_class:
+                    logger.warning(
+                        f"Only {n_take} latents for {cls} "
+                        f"(requested {per_class}), using all available"
+                    )
+                fit_indices.append(rng.choice(cls_idx, size=n_take, replace=False))
+            fit_indices = np.concatenate(fit_indices)
+            del strata
+
+            fit_pool = pooled[fit_indices]
+            logger.info(
+                f"Stratified subsampled {fit_pool.shape[0]} / {pooled.shape[0]} "
+                f"latent vectors for UMAP fit ({len(unique_classes)} classes, "
+                f"~{per_class} per class)"
+            )
+            del fit_indices
+        else:
+            fit_pool = pooled
+
+        del pooled
+
+        # Compute consistent axis limits with 5% padding (streaming min/max to avoid concat)
+        def _compute_limits(transformed_list):
+            x_min = min(t[:, 0].min() for t in transformed_list)
+            x_max = max(t[:, 0].max() for t in transformed_list)
+            y_min = min(t[:, 1].min() for t in transformed_list)
+            y_max = max(t[:, 1].max() for t in transformed_list)
+            x_pad = (x_max - x_min) * 0.05
+            y_pad = (y_max - y_min) * 0.05
+            return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
+
+        # Generate frames and assemble GIF
+        colors = {
+            ("false_no_signal", "ON"): "#1565C0",
+            ("false_no_signal", "OFF"): "#64B5F6",
+            ("false_with_rfi", "ON"): "#F9A825",
+            ("false_with_rfi", "OFF"): "#FFF176",
+            ("true_only_eti", "ON"): "#2E7D32",
+            ("true_only_eti", "OFF"): "#81C784",
+            ("true_eti_rfi", "ON"): "#C62828",
+            ("true_eti_rfi", "OFF"): "#EF5350",
+        }
+        markers = {"ON": "o", "OFF": "x"}
+        display_names = {
+            ("false_no_signal", "ON"): "No Signal (ON)",
+            ("false_no_signal", "OFF"): "No Signal (OFF)",
+            ("false_with_rfi", "ON"): "RFI Only (ON)",
+            ("false_with_rfi", "OFF"): "RFI Only (OFF)",
+            ("true_only_eti", "ON"): "ETI Only (ON)",
+            ("true_only_eti", "OFF"): "ETI Only (OFF)",
+            ("true_eti_rfi", "ON"): "ETI+RFI (ON)",
+            ("true_eti_rfi", "OFF"): "ETI+RFI (OFF)",
+        }
+
+        # NOTE: instead of temp_dir, save frames in persistent dir. update dir archiving to handle
+        temp_dir = tempfile.mkdtemp(prefix="latent_gif_")
+
+        gif_paths = {}
+        duration_ms = self.config.training.latent_viz_gif_duration_ms
+
+        # NOTE: how do we store final UMAP model params for later use (e.g. during inference results viz)
+        n_neighbors_values = self.config.training.latent_viz_umap_n_neighbors
+        min_dist_values = self.config.training.latent_viz_umap_min_dist
+
+        for nn in n_neighbors_values:
+            for md in min_dist_values:
+                logger.info(f"Fitting UMAP with n_neighbors={nn}, min_dist={md}")
+
+                # NOTE: use a global config seed instead of hard-coding
+                # Fit UMAP model
+                # Note that by setting random_state, we get a deterministic UMAP fit, at the expense
+                # of single-thread performance (n_jobs=1). This is a hard constraint of the UMAP
+                # library. We compensate by fitting the UMAP model to a stratified subsample of the
+                # pooled latents
+                umap_model = umap.UMAP(
+                    n_components=2,
+                    random_state=11,
+                    n_neighbors=nn,
+                    min_dist=md,
+                ).fit(fit_pool)
+
+                # Transform each snapshot
+                transformed = []
+                for coords in all_coords:
+                    transformed.append(umap_model.transform(coords))
+                del umap_model
+                gc.collect()
+
+                # Compute global axis limits
+                xlim, ylim = _compute_limits(transformed)
+
+                method_name = f"umap_nn{nn}_md{md}"
+                display_method = f"UMAP (n_neighbors={nn}, min_dist={md})"
+
+                # Using a list here is a remnant from when we were testing multiple DR methods
+                # Currently this will always be a single-element list
+                # However, we're choosing not to remove the list wrapper & loop in case we wish to
+                # further explore different DR methods in the future
+                methods = [
+                    (method_name, display_method, transformed, xlim, ylim),
+                ]
+
+                for method_name, display_method, transformed_list, xlim, ylim in methods:
+                    frame_paths = []
+
+                    for frame_idx, (coords_2d, labels, onoff, meta) in enumerate(
+                        zip(
+                            transformed_list,
+                            all_snapshot_labels,
+                            all_snapshot_onoff,
+                            snapshot_metadata,
+                            strict=True,
+                        )
+                    ):
+                        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+                        # Plot each category
+                        labels_arr = np.array(labels)
+                        onoff_arr = np.array(onoff)
+
+                        for (stype, status), color in colors.items():
+                            mask = (labels_arr == stype) & (onoff_arr == status)
+                            if mask.any():
+                                ax.scatter(
+                                    coords_2d[mask, 0],
+                                    coords_2d[mask, 1],
+                                    c=color,
+                                    marker=markers[status],
+                                    s=5,
+                                    label=display_names[(stype, status)],
+                                    rasterized=True,
+                                )
+
+                        del labels_arr, onoff_arr
+
+                        ax.set_xlim(xlim)
+                        ax.set_ylim(ylim)
+
+                        meta_snr_base = meta["snr_base"]
+                        meta_snr_range = meta["snr_range"]
+                        meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
+                        meta_snr_ceil = (
+                            meta_snr_base + meta_snr_range
+                            if meta_snr_base is not None and meta_snr_range is not None
+                            else "?"
+                        )
+                        ax.set_title(
+                            f"Beta-VAE Latent Space ({display_method}) — "
+                            f"Round {meta['round_number']}, "
+                            f"Epoch {meta['epoch_number']}, "
+                            f"Step {meta['step_number']} "
+                            f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
+                            fontsize=11,
+                        )
+                        ax.set_xlabel("UMAP 1")
+                        ax.set_ylabel("UMAP 2")
+                        ax.legend(
+                            loc="upper right",
+                            fontsize=7,
+                            markerscale=3,
+                            ncol=2,
+                            framealpha=0.8,
+                        )
+
+                        plt.tight_layout()
+
+                        frame_path = os.path.join(
+                            temp_dir, f"{method_name}_frame_{frame_idx:05d}.png"
+                        )
+                        fig.savefig(frame_path, dpi=100)
+                        plt.close(fig)
+                        frame_paths.append(frame_path)
+
+                    del transformed_list
+
+                    # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
+                    gif_filename = f"latent_space_{method_name}_{tag}.gif"
+                    gif_path = os.path.join(save_dir, gif_filename)
+
+                    n_frames = len(frame_paths)
+                    if n_frames > 0:
+                        with iio.imopen(gif_path, "w", plugin="pillow") as gif_writer:
+                            for frame_path in frame_paths:
+                                frame = iio.imread(frame_path)
+                                gif_writer.write(
+                                    frame,
+                                    duration=duration_ms,
+                                    loop=0,
+                                    is_batch=False,
+                                )
+                                del frame
+
+                        logger.info(
+                            f"Latent space {method_name.upper()} GIF saved: "
+                            f"{gif_path} ({n_frames} frames)"
+                        )
+
+                        # Upload to Slack
+                        logger_instance = get_logger()
+                        if logger_instance:
+                            logger_instance.upload_image_to_slack(
+                                gif_path,
+                                title=f"Latent Space {display_method} - ({tag})",
+                            )
+
+                    del frame_paths
+                    gc.collect()
+
+                    gif_paths[method_name] = gif_path
+
+                del transformed
+                gc.collect()
+
+        # Cleanup
+        del fit_pool, all_coords
+        # del umap_transformed
+        del all_snapshot_labels, all_snapshot_onoff, snapshot_metadata
+        # NOTE: temp_dir isn't cleaned on exception (should use try/finally or tempfile.TemporaryDirectory() with context manager)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
+
+    def _prepare_latent_viz_batch(self, concat_data, labels, candidate_indices=None):
+        """
+        Subsample cadences from concat_data for latent space visualization
+        Will attempt to preserve an equal distribution of distinct values from labels if possible
+
+        Called once on the first round's stratified validation partition and persisted across
+        subsequent rounds. Using held-out data ensures the latent space visualization captures
+        generalization, while persisting the same data across rounds eliminates the effects of
+        distribution shift (from the curriculum schedule)
+
+        Args:
+            concat_data: Full cadences array, shape (n_total, 6, 16, width_bin)
+            labels: Per-cadence signal type labels, shape (n_total,)
+            candidate_indices: Optional indices into concat_data/labels restricting which
+                samples are eligible (e.g. validation partition indices). If None, all
+                samples are eligible.
+        """
+        n_per_type = self.config.training.latent_viz_num_cadences_per_type
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+
+        # Restrict to candidate subset if provided (avoids copying the entire partition)
+        if candidate_indices is not None:
+            candidate_labels = labels[candidate_indices]
+        else:
+            candidate_indices = np.arange(len(labels))
+            candidate_labels = labels
+
+        selected_indices = []
+        selected_labels = []
+
+        for stype in signal_types:
+            type_mask = candidate_labels == stype
+            type_global_indices = candidate_indices[type_mask]
+            if len(type_global_indices) == 0:
+                logger.warning(f"No cadences for {stype} — skipping this type for viz batch")
+                continue
+            if len(type_global_indices) < n_per_type:
+                logger.warning(
+                    f"Only {len(type_global_indices)} cadences for {stype} "
+                    f"(requested {n_per_type}), using all available"
+                )
+                sampled = type_global_indices
+            else:
+                sampled = np.random.choice(type_global_indices, size=n_per_type, replace=False)
+            selected_indices.append(sampled)
+            selected_labels.extend([stype] * len(sampled))
+
+        if not selected_indices:
+            logger.warning("No cadences found for any signal type — skipping viz batch")
+            self._latent_viz_batch = None
+            self._latent_viz_labels = None
+            return
+
+        # Fancy indexing already creates a new independent array (no .copy() needed)
+        all_indices = np.concatenate(selected_indices)
+        self._latent_viz_batch = concat_data[all_indices]
+        self._latent_viz_labels = np.array(selected_labels, dtype="U20")
+
+        if len(all_indices) < n_per_type * len(signal_types):
+            logger.warning(
+                f"Requested {n_per_type} per type * {len(signal_types)} types. "
+                f"Only {len(all_indices)} cadences available in latent viz batch"
+            )
+        else:
+            logger.info(
+                f"Prepared latent viz batch: {len(all_indices)} cadences "
+                f"({n_per_type} per type * {len(signal_types)} types)"
+            )
+
+        # Build distributed dataset
+        self._build_latent_viz_dataset()
+
+    def _build_latent_viz_dataset(self):
+        """Build the distributed viz dataset from the persisted viz batch."""
+        # Prepare distributed dataset for latent viz encoding
+        viz_results = prepare_distributed_viz_dataset(
+            concat_data=self._latent_viz_batch,
+            per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
+            num_replicas=self.strategy.num_replicas_in_sync,
+            strategy=self.strategy,
+        )
+
+        self._latent_viz_dataset = viz_results["viz_dataset"]
+        self._latent_viz_n_padded = viz_results["n_padded"]
+        self._latent_viz_n_samples = viz_results["n_samples"]
+        self._latent_viz_steps = viz_results["viz_steps"]
+        self._latent_viz_holder = viz_results["_viz_holder"]
+        del viz_results
+
+        time_bins = self.config.data.time_bins
+        width_bin = self.config.data.width_bin // self.config.data.downsample_factor
+
+        # Create distributed inference function
+        @tf.function
+        def viz_encode_fn(batch_data):
+            """Encode batch data using distributed strategy"""
+
+            def encode_fn(data):
+                """Per-replica encoding step"""
+                # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
+                reshaped = tf.reshape(data, [-1, time_bins, width_bin, 1])
+
+                # Encode (returns z_mean, z_log_var, z)
+                z_mean, _, _ = self.vae.encoder(reshaped, training=False)
+
+                return z_mean
+
+            # Run encoding on all replicas
+            per_replica_z_mean = self.strategy.run(encode_fn, args=(batch_data,))
+
+            return per_replica_z_mean
+
+        self._viz_encode_fn = viz_encode_fn
+
+    def _capture_latent_snapshot(self, round_idx, epoch, step, snr_base, snr_range):
+        """
+        Run distributed inference on viz batch and write latent vectors to DB.
+
+        Uses the distributed viz dataset and shared _distributed_encode() method to encode
+        cadences across all GPUs, then writes one row per cadence to the latent_snapshots table.
+        """
+        if self._latent_viz_dataset is None:
+            return
+
+        n_padded = self._latent_viz_n_padded
+        n_samples = self._latent_viz_n_samples
+        num_obs = self.config.data.num_observations
+        latent_dim = self.config.beta_vae.latent_dim
+
+        # TEST: make sure this works as expected
+        # Encode all cadences using distributed inference
+        [all_z_mean] = self._distributed_encode(
+            dataset=self._latent_viz_dataset,
+            n_steps=self._latent_viz_steps,
+            encode_fn=self._viz_encode_fn,
+            n_samples=n_padded * num_obs,
+            latent_dim=latent_dim,
+            logging=False,
+        )
+
+        # Truncate padding and reshape to per-cadence: (n_samples, 6, latent_dim)
+        all_z_mean = all_z_mean[: n_samples * num_obs]
+        z_mean_per_cadence = all_z_mean.reshape(n_samples, num_obs, latent_dim)
+        del all_z_mean
+
+        # Write to DB
+        timestamp = time.time()
+        tag = self.config.checkpoint.save_tag
+        for cadence_idx in range(n_samples):
+            # NOTE: 8 decimal precison for stored latents
+            latent_vector_list = np.round(z_mean_per_cadence[cadence_idx], 8).tolist()
+            self.db.write_latent_snapshot(
+                model_name="beta_vae",
+                round_number=round_idx + 1,
+                epoch_number=epoch + 1,
+                step_number=step + 1,
+                cadence_index=cadence_idx,
+                signal_type=str(self._latent_viz_labels[cadence_idx]),
+                latent_vector=latent_vector_list,
+                snr_base=snr_base,
+                snr_range=snr_range,
+                tag=tag,
+                timestamp=timestamp,
+            )
+
+        del z_mean_per_cadence
+
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
         if tag is None:
@@ -3338,7 +4142,7 @@ def run_training_pipeline(
             raise  # Re-raise to propagate error
 
         try:
-            # NOTE: combine plot_beta_vae_loss_curves() and plot_beta_vae_training_stability() into plot_training_progress()?
+            # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
             # Plot loss curves
             pipeline.plot_beta_vae_loss_curves()
 
@@ -3347,6 +4151,9 @@ def run_training_pipeline(
 
             # Plot injection stats
             pipeline.plot_injection_stats()
+
+            # Plot latent space GIF
+            pipeline.plot_latent_space_gif()
         except Exception as e:
             logger.error(f"Error in plotting: {e}")
             raise  # Re-raise to propagate error

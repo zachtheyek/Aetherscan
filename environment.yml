@@ -23,4 +23,6 @@ dependencies:
   - pip:
       - tensorflow==2.16.*
       - setigen
+      - imageio>=2.31.0
+      - umap-learn>=0.5.0
       - slack-sdk>=3.23.0

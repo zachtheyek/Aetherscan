@@ -356,6 +356,7 @@ class SlackHandler(logging.Handler):
             cli_args = sys.argv
         cli_args_str = " ".join(cli_args)
 
+        # NOTE: the command shown does not match the actual command ran (/home/zachy/Aetherscan/src/aetherscan/main.py train --num-training-rounds 1 --max-retries 1 --save-tag test_v0 VS SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src python -m aetherscan.main train --num-training-rounds 1 --max-retries 1 --save-tag test_v0)
         # Build the run summary message
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         summary_lines = [
