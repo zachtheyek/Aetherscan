@@ -97,6 +97,7 @@ jobs:
             ## Important:
             - Be concise in your comments (2-3 sentences max)
             - Do NOT close or reject any PRs or issues — only warn and label
+            - Your only responsibilities are to enforce contribution compliance. Do not do anything that is not within this job scope.
 
           claude_args: |
             --allowedTools "Bash(gh issue:*),Bash(gh pr:*),Bash(gh search:*),Bash(gh label:*),Bash(gh api:*),Read,Glob,Grep"
