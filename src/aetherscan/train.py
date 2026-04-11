@@ -22,12 +22,23 @@ from collections.abc import Callable
 from datetime import datetime
 
 import imageio.v3 as iio
+import joblib
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 import umap
+from sklearn.calibration import calibration_curve
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    auc,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    precision_recall_curve,
+    roc_curve,
+)
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -35,7 +46,20 @@ from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
 from aetherscan.logger import get_logger
-from aetherscan.models import RandomForestModel, Sampling, create_beta_vae_model
+from aetherscan.models import (
+    RandomForestModel,
+    Sampling,
+    create_beta_vae_model,
+    prepare_latent_features,
+)
+
+# SHAP is an optional runtime dep (not pinned in environment.yml). RF SHAP plots
+# early-return with a warning if the import fails so the rest of the training
+# pipeline remains usable.
+try:
+    import shap  # type: ignore
+except ImportError:  # pragma: no cover
+    shap = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -353,22 +377,6 @@ class TrainDataHolder:
             self.false = None
 
 
-class InfDataHolder:
-    def __init__(self, true, false):
-        self._cleared = False
-        self._lock = threading.Lock()
-        self.true = true
-        self.false = false
-
-    def clear(self):
-        with self._lock:
-            if self._cleared:
-                return
-            self._cleared = True
-            self.true = None
-            self.false = None
-
-
 class VizDataHolder:
     def __init__(self, concat):
         self._cleared = False
@@ -408,11 +416,11 @@ def prepare_distributed_train_dataset(
         shuffle: Whether to shuffle training data
 
     Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
-              accumulation_steps, val_steps, _train_holder, val_indices}
+              accumulation_steps, val_steps, _train_holder, train_indices, val_indices}
              Train/val distributed datasets, number of samples in each, number of steps for each
               (including accumulation sub-steps), shared TrainDataHolder reference (both generators
               read from the original arrays via index subsets — no copies), and the stratified
-              validation indices into the original data arrays
+              train/validation indices into the original data arrays
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -578,120 +586,8 @@ def prepare_distributed_train_dataset(
         "accumulation_steps": accumulation_steps,
         "val_steps": val_steps,
         "_train_holder": train_holder,
+        "train_indices": train_indices,  # For train_random_forest() label alignment (shuffle=False)
         "val_indices": val_indices,  # For train_round() -> _prepare_latent_viz_batch()
-    }
-
-
-def prepare_distributed_inf_dataset(
-    data: dict,
-    per_replica_inf_batch_size: int,
-    num_replicas: int,
-    strategy: tf.distribute.Strategy,
-) -> dict:
-    """
-    Prepare distributed datasets for inference
-    Yields datasets with signature (true, false)
-
-    Note, this function is meant for RF training
-    It is different from aetherscan.inference.prepare_distributed_inf_dataset(),
-    since we assume signal classes are known ahead of time
-
-    Args:
-        data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
-        per_replica_inf_batch_size: Batch size per replica for inference
-        num_replicas: Number of replicas in strategy
-        strategy: TensorFlow distribution strategy
-
-    Returns: {inf_dataset, n_inf_trimmed, inf_steps, _inf_holder}
-             Inference distributed dataset, number of samples, number of steps,
-              and InfDataHolder reference
-    """
-    global_inf_batch_size = per_replica_inf_batch_size * num_replicas
-    n_samples = data["true"].shape[0]
-
-    # NOTE: does trimming/divisibility matter for inference?
-    # Trim datasets to fit batch sizes (prevents uneven batches on final step)
-    # Note, n_samples should already be divisible by effective_batch_size
-    # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
-    # distributing our datasets
-    # Alternatively, we could also pad the data instead of trimming
-    n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
-
-    logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
-
-    # Randomly subsample to trimmed size (avoids positional bias from slicing the tail)
-    if n_inf_trimmed < n_samples:
-        indices = np.random.choice(n_samples, size=n_inf_trimmed, replace=False)
-        inf_true = data["true"][indices]
-        inf_false = data["false"][indices]
-    else:
-        inf_true = data["true"][:n_inf_trimmed]
-        inf_false = data["false"][:n_inf_trimmed]
-
-    inf_holder = InfDataHolder(inf_true, inf_false)
-
-    # Create generator function for memory-efficient data loading
-    def inf_generator():
-        while True:  # Make generator infinite to reset state between passes
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
-            with inf_holder._lock:
-                if inf_holder._cleared:
-                    return  # Exit if data already cleared
-                # Cache references while holding lock
-                true = inf_holder.true
-                false = inf_holder.false
-
-            # Maintain order on each epoch since shuffling provides no benefits (no gradients
-            # are calculated during inference)
-            for idx in range(len(true)):
-                yield true[idx], false[idx]
-
-            # Remove cache references for future garbage collection
-            del true, false
-
-    # Determine dataset output signature
-    sample_shape = inf_true.shape[1:]
-    output_signature = (
-        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-    )
-
-    # Create dataset using generator to reduce GPU memory pressure
-    # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the dataset yields data in batches before being sharded (distributed) across replicas
-    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
-    logger.info(
-        f"Creating infinite dataset from generator with global batch size: {global_inf_batch_size}"
-    )
-
-    inf_dataset = (
-        tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
-        .batch(global_inf_batch_size, drop_remainder=True)
-        # NOTE: do we need repeat for inf dataset? run test without repeat & see if anything breaks?
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
-    )
-
-    # Distribute dataset across GPUs
-    logger.info(f"Distributing dataset across {num_replicas} GPUs")
-
-    inf_dataset_distributed = strategy.experimental_distribute_dataset(inf_dataset)
-
-    # Calculate steps
-    inf_steps = n_inf_trimmed // global_inf_batch_size
-
-    # Sanity check: verify step sizes are valid before returning
-    if inf_steps < 1:
-        raise ValueError(
-            f"inf_steps < 1: n_inf_trimmed ({n_inf_trimmed}) must be >= per_replica_inf_batch_size * num_replicas ({per_replica_inf_batch_size} * {num_replicas})"
-        )
-
-    return {
-        "inf_dataset": inf_dataset_distributed,
-        "n_inf_trimmed": n_inf_trimmed,
-        "inf_steps": inf_steps,
-        "_inf_holder": inf_holder,
     }
 
 
@@ -799,6 +695,34 @@ def prepare_distributed_viz_dataset(
         "viz_steps": viz_steps,
         "_viz_holder": viz_holder,
     }
+
+
+def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
+    """
+    Normalize SHAP output across shap versions into a single positive-class ndarray.
+
+    TreeExplainer returns results in several shapes depending on shap version and task:
+    - list [neg, pos] of (n, F) arrays (classic binary classification)
+    - ndarray of shape (n, F, 2) or (n, F, F, 2) (newer shap, last dim is class)
+    - ndarray of shape (n, F) or (n, F, F) (log-loss model_output — single scalar output)
+
+    For log-loss model output, there is only one output, so we return as-is.
+    """
+    if log_loss:
+        if isinstance(values, list):
+            return np.asarray(values[0])
+        return np.asarray(values)
+
+    if isinstance(values, list):
+        return np.asarray(values[1])
+
+    values = np.asarray(values)
+    # (n, F, 2) → (n, F); (n, F, F, 2) → (n, F, F)
+    if values.ndim == 3 and values.shape[-1] == 2:
+        return values[..., 1]
+    if values.ndim == 4 and values.shape[-1] == 2:
+        return values[..., 1]
+    return values
 
 
 class TrainingPipeline:
@@ -1814,9 +1738,8 @@ class TrainingPipeline:
         return outputs
 
     # NOTE: write what to db? (e.g. accuracy, F1)
-    # TODO: visualize classification accuracy (ROC-AUC, precision-recall) at different thresholds when training is complete
     def train_random_forest(self):
-        """Train Random Forest"""
+        """Train Random Forest on a held-out-split dataset and persist eval artifacts."""
         logger.info("Training Random Forest classifier...")
 
         # Initialize RF model
@@ -1859,9 +1782,7 @@ class TrainingPipeline:
             logger.warning(f"Could not verify encoder weights status: {e}")
             logger.warning("Proceeding with current encoder weights")
 
-        n_samples = (
-            self.config.training.num_samples_rf // 2
-        )  # Divide by 2 to compensate for generate_triplet_batch internally creating n * 2 samples (n true, n false)
+        n_samples = self.config.training.num_samples_rf
         snr_base = self.config.training.snr_base
         snr_range = (
             self.config.training.initial_snr_range
@@ -1872,82 +1793,152 @@ class TrainingPipeline:
         time_bins = self.config.data.time_bins
         width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
-        # Generate training data
+        # Generate training data (concatenated is 4-way balanced; labels track per-sample subtype)
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
-
         rf_data = self.data_generator.generate_triplet_batch(n_samples, snr_base, snr_range)
 
-        # Prepare distributed dataset for inference
-        results = prepare_distributed_inf_dataset(
+        # Prepare distributed train+val datasets (stratified split). shuffle=False so the
+        # train generator yields in train_indices order, letting us align encoded features
+        # with data["labels"] deterministically
+        results = prepare_distributed_train_dataset(
             data=rf_data,
-            per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
+            train_val_split=self.config.training.train_val_split,
+            per_replica_batch_size=self.config.training.per_replica_batch_size,
+            effective_batch_size=self.config.training.effective_batch_size,
+            per_replica_val_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
+            shuffle=False,
         )
 
+        rf_subtypes_full = rf_data["labels"]
+
+        # Free the dict shell (original arrays stay alive via the shared train_holder)
         del rf_data
         gc.collect()
 
-        inf_dataset = results["inf_dataset"]
-        n_inf_trimmed = results["n_inf_trimmed"]
-        inf_steps = results["inf_steps"]
-        inf_holder = results["_inf_holder"]
+        train_dataset = results["train_dataset"]
+        val_dataset = results["val_dataset"]
+        n_train_trimmed = results["n_train_trimmed"]
+        n_val_trimmed = results["n_val_trimmed"]
+        train_steps = results["train_steps"]
+        val_steps = results["val_steps"]
+        train_holder = results["_train_holder"]
+        train_indices = results["train_indices"]
+        val_indices = results["val_indices"]
 
         del results
         gc.collect()
 
-        logger.info(f"Generating latents for {n_inf_trimmed} samples using distributed inference")
+        logger.info(
+            f"Generating latents for {n_train_trimmed} train + {n_val_trimmed} val samples "
+            f"using distributed inference"
+        )
 
-        # Create distributed inference function
+        # Create distributed inference function. The train/val datasets yield
+        # ((concat, true, false), concat) — we only need `concat` for RF feature encoding.
         @tf.function
         def rf_encode_fn(batch_data):
-            """Encode batch data using distributed strategy"""
+            """Encode concatenated cadences using distributed strategy"""
 
             def encode_fn(data):
                 """Per-replica encoding step"""
-                # Extract true & false components
-                true_data, false_data = data
+                (concat_data, _, _), _ = data
 
                 # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
-                true_reshaped = tf.reshape(true_data, [-1, time_bins, width_bin, 1])
-                false_reshaped = tf.reshape(false_data, [-1, time_bins, width_bin, 1])
+                concat_reshaped = tf.reshape(concat_data, [-1, time_bins, width_bin, 1])
 
-                # Encode (returns z_mean, z_log_var, z)
-                _, _, true_z = self.vae.encoder(true_reshaped, training=False)
-                _, _, false_z = self.vae.encoder(false_reshaped, training=False)
+                # Encode (returns z_mean, z_log_var, z); matches original behavior (pull z)
+                _, _, concat_z = self.vae.encoder(concat_reshaped, training=False)
 
-                return true_z, false_z
+                return concat_z
 
-            # Run encoding on all replicas
-            per_replica_true, per_replica_false = self.strategy.run(encode_fn, args=(batch_data,))
+            per_replica_concat = self.strategy.run(encode_fn, args=(batch_data,))
+            return per_replica_concat
 
-            return per_replica_true, per_replica_false
+        train_latents = None
+        val_latents = None
 
         try:
-            # TEST: make sure this works after refactor
-            true_latents, false_latents = self._distributed_encode(
-                dataset=inf_dataset,
-                n_steps=inf_steps,
+            [train_latents] = self._distributed_encode(
+                dataset=train_dataset,
+                n_steps=train_steps,
                 encode_fn=rf_encode_fn,
-                n_samples=n_inf_trimmed * num_observations,
+                n_samples=n_train_trimmed * num_observations,
                 latent_dim=latent_dim,
                 logging=True,
             )
 
-            # Train Random Forest classifier
-            self.rf_model.train(true_latents, false_latents)
+            [val_latents] = self._distributed_encode(
+                dataset=val_dataset,
+                n_steps=val_steps,
+                encode_fn=rf_encode_fn,
+                n_samples=n_val_trimmed * num_observations,
+                latent_dim=latent_dim,
+                logging=True,
+            )
 
+            # Derive aligned binary & sub-type labels for train/val splits. With shuffle=False,
+            # the i-th cadence in the encoded train/val array corresponds to train_indices[i] /
+            # val_indices[i] in the original data
+            train_subtype_labels = rf_subtypes_full[train_indices].astype("U20")
+            val_subtype_labels = rf_subtypes_full[val_indices].astype("U20")
+            train_binary_labels = np.array(
+                [s.startswith("true_") for s in train_subtype_labels], dtype=np.int64
+            )
+            val_binary_labels = np.array(
+                [s.startswith("true_") for s in val_subtype_labels], dtype=np.int64
+            )
+
+            # Train Random Forest classifier (passes latent_vectors; model flattens internally)
+            self.rf_model.train(train_latents, train_binary_labels)
             logger.info("Random Forest training complete")
+
+            # Compute flattened features + val probas for downstream plotting
+            train_features = prepare_latent_features(train_latents, num_observations)
+            val_features = prepare_latent_features(val_latents, num_observations)
+            val_probas = self.rf_model.model.predict_proba(val_features)[:, 1].astype(np.float32)
+
+            # Persist a single eval-artifact joblib that every RF plot function consumes
+            tag = self.config.checkpoint.save_tag
+            artifacts = {
+                "train_features": train_features,
+                "train_binary_labels": train_binary_labels,
+                "train_subtype_labels": train_subtype_labels,
+                "val_features": val_features,
+                "val_binary_labels": val_binary_labels,
+                "val_subtype_labels": val_subtype_labels,
+                "val_probas": val_probas,
+                "feature_importances": self.rf_model.model.feature_importances_.astype(np.float32),
+                "snr_base": snr_base,
+                "snr_range": snr_range,
+                "tag": tag,
+            }
+            artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
+            os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+            joblib.dump(artifacts, artifact_path)
+            logger.info(f"Saved RF eval artifacts to {artifact_path}")
+
+            del (
+                artifacts,
+                train_features,
+                val_features,
+                train_subtype_labels,
+                val_subtype_labels,
+                train_binary_labels,
+                val_binary_labels,
+                val_probas,
+            )
+            gc.collect()
 
         except Exception as e:
             logger.error(f"Error in train_random_forest(): {e}")
             raise  # Re-raise to propagate error
 
         finally:
-            # NOTE: should check to make sure holder & dataset exist first
             # Clear intermediate data
-            inf_holder.clear()
-            del inf_dataset
+            train_holder.clear()
+            del train_dataset, val_dataset, rf_subtypes_full, train_indices, val_indices
 
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
@@ -1958,9 +1949,117 @@ class TrainingPipeline:
             self.data_generator.reset_managed_pool()
             logger.info("Reset managed pools")
 
-            # NOTE: should check to make sure arrays exist first
-            del true_latents, false_latents
+            if train_latents is not None:
+                del train_latents
+            if val_latents is not None:
+                del val_latents
             gc.collect()
+
+    def _load_rf_eval_artifacts(self, tag: str | None = None) -> dict:
+        """Load the RF eval-artifacts joblib written by train_random_forest()."""
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+        artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
+        if not os.path.exists(artifact_path):
+            raise FileNotFoundError(
+                f"RF eval artifacts not found at {artifact_path}. "
+                f"train_random_forest() must run before RF plots are generated."
+            )
+        logger.info(f"Loading RF eval artifacts from {artifact_path}")
+        return joblib.load(artifact_path)
+
+    def _compute_or_load_shap_values(self, artifacts: dict) -> dict:
+        """
+        Compute SHAP values for the trained RF (summary, interaction, log-loss decomposition)
+        and cache to disk. Subsequent calls load the cache.
+
+        Returns a dict with keys: shap_values_summary, summary_indices, shap_values_interaction,
+         interaction_indices, shap_values_logloss, expected_value.
+        """
+        tag = artifacts["tag"]
+        shap_path = os.path.join(self.config.model_path, f"rf_shap_values_{tag}.joblib")
+
+        if os.path.exists(shap_path):
+            logger.info(f"Loading cached SHAP values from {shap_path}")
+            return joblib.load(shap_path)
+
+        if shap is None:
+            raise RuntimeError(
+                "shap is not installed — cannot compute RF SHAP values. "
+                "Install shap (e.g. `pip install shap`) or delete calls to the "
+                "plot_rf_shap_* helpers."
+            )
+
+        val_features = artifacts["val_features"]
+        train_features = artifacts["train_features"]
+        val_binary_labels = artifacts["val_binary_labels"]
+        n_val = val_features.shape[0]
+
+        n_summary = min(self.config.training.shap_max_samples_summary, n_val)
+        n_interact = min(self.config.training.shap_max_samples_interaction, n_val)
+
+        rng = np.random.default_rng(self.config.rf.seed)
+        summary_indices = np.sort(rng.choice(n_val, size=n_summary, replace=False))
+        interaction_indices = np.sort(rng.choice(n_val, size=n_interact, replace=False))
+
+        logger.info(
+            f"Computing SHAP summary ({n_summary} samples) and interaction "
+            f"({n_interact} samples) values for RF model"
+        )
+
+        explainer = shap.TreeExplainer(self.rf_model.model)
+
+        summary_vals_raw = explainer.shap_values(val_features[summary_indices])
+        shap_values_summary = _select_positive_class_shap(summary_vals_raw)
+        del summary_vals_raw
+
+        interaction_vals_raw = explainer.shap_interaction_values(val_features[interaction_indices])
+        shap_values_interaction = _select_positive_class_shap(interaction_vals_raw)
+        del interaction_vals_raw
+
+        # Expected value (base value for positive class)
+        ev = explainer.expected_value
+        if isinstance(ev, list | tuple | np.ndarray):
+            ev_arr = np.asarray(ev)
+            expected_value = float(ev_arr[1]) if ev_arr.size > 1 else float(ev_arr.flat[0])
+        else:
+            expected_value = float(ev)
+
+        # Log-loss SHAP decomposition. Uses a background dataset and y_true per sample
+        n_bg = min(1000, train_features.shape[0])
+        bg_indices = rng.choice(train_features.shape[0], size=n_bg, replace=False)
+        background = train_features[bg_indices]
+
+        try:
+            loss_explainer = shap.TreeExplainer(
+                self.rf_model.model, data=background, model_output="log_loss"
+            )
+            loss_vals_raw = loss_explainer.shap_values(
+                val_features[summary_indices], y=val_binary_labels[summary_indices]
+            )
+            shap_values_logloss = _select_positive_class_shap(loss_vals_raw, log_loss=True)
+            del loss_vals_raw, loss_explainer
+        except Exception as e:
+            logger.warning(
+                f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
+                f"loss-monitoring plot will be empty"
+            )
+            shap_values_logloss = np.zeros_like(shap_values_summary)
+
+        del background, bg_indices, explainer
+
+        result = {
+            "shap_values_summary": shap_values_summary.astype(np.float32),
+            "summary_indices": summary_indices,
+            "shap_values_interaction": shap_values_interaction.astype(np.float32),
+            "interaction_indices": interaction_indices,
+            "shap_values_logloss": shap_values_logloss.astype(np.float32),
+            "expected_value": expected_value,
+        }
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(result, shap_path)
+        logger.info(f"Saved SHAP values to {shap_path}")
+        return result
 
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
     # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
@@ -3473,8 +3572,19 @@ class TrainingPipeline:
     # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
     def plot_latent_space_gif(self, tag: str | None = None, dir: str | None = None):
         """
-        Generate GIF showing how the latent space evolves during training using using UMAP with 8
-        color categories (4 signal types * ON/OFF).
+        Generate GIF(s) showing how the latent space evolves during training using UMAP.
+
+        Fits and persists two parallel UMAP projections per (n_neighbors, min_dist) combo:
+          - obs-level: each point is a single observation. The latent space is viewed as
+            (N * num_observations, latent_dim), stratified into 8 classes
+            (4 signal types × ON/OFF). Matches how the VAE sees the data.
+          - cadence-level: each point is a full cadence with its num_observations latent
+            vectors concatenated, shape (N, num_observations * latent_dim), stratified
+            into 4 classes by signal type only. Matches how the RF sees the data.
+
+        Both UMAP models are persisted to disk (joblib) under `{model_path}/umap_{obs,
+        cadence}_nn{nn}_md{md}_{tag}.joblib` so downstream visualizations can reuse them
+        (e.g. `plot_rf_latent_decision_boundary`).
 
         Args:
             tag: Plot tag for filename (defaults to save_tag)
@@ -3546,10 +3656,15 @@ class TrainingPipeline:
             del indices
             gc.collect()
 
-        # Load selected snapshots and pool latent data
-        all_coords = []  # List of (N_obs, latent_dim) arrays per snapshot
-        all_snapshot_labels = []  # List of (N_obs,) label arrays per snapshot
-        all_snapshot_onoff = []  # List of (N_obs,) ON/OFF arrays per snapshot
+        # Load selected snapshots and build two parallel views of the latent data:
+        #   - obs-level: each observation is its own point  → (N * num_observations, latent_dim)
+        #   - cadence-level: all num_observations stacked per cadence → (N, num_observations * latent_dim)
+        num_observations = self.config.data.num_observations
+        all_coords_obs = []  # List of (N_obs, latent_dim) arrays per snapshot
+        all_snapshot_labels_obs = []  # List of (N_obs,) label arrays per snapshot
+        all_snapshot_onoff_obs = []  # List of (N_obs,) ON/OFF arrays per snapshot
+        all_coords_cadence = []  # List of (N_cadences, num_obs*latent_dim) arrays per snapshot
+        all_snapshot_labels_cadence = []  # List of (N_cadences,) label arrays per snapshot
         snapshot_metadata = []  # (model, round, epoch, step, snr_base, snr_range) per snapshot
 
         for key in snapshot_keys:
@@ -3566,51 +3681,71 @@ class TrainingPipeline:
             if not rows:
                 continue
 
-            # Parse latent vectors and build arrays
-            snapshot_latents = []
-            snapshot_labels = []
-            snapshot_onoff = []
+            # Parse latent vectors and build both views
+            obs_latents = []
+            obs_labels = []
+            obs_onoff = []
+            cadence_latents = []
+            cadence_labels = []
 
             for row in rows:
-                latent_6x = json.loads(row["latent_vector"])  # (6, latent_dim)
-                for obs_idx, vec in enumerate(latent_6x):
-                    snapshot_latents.append(vec)
-                    snapshot_labels.append(row["signal_type"])
-                    snapshot_onoff.append("ON" if obs_idx % 2 == 0 else "OFF")
+                latent_stack = json.loads(row["latent_vector"])  # (num_observations, latent_dim)
+                if len(latent_stack) != num_observations:
+                    logger.warning(
+                        f"Row has {len(latent_stack)} observations, expected {num_observations}; "
+                        f"skipping"
+                    )
+                    continue
+                # Cadence-level: concatenate all observations into a single vector.
+                # np.ravel() on a (num_observations, latent_dim) array matches the row-major
+                # flatten used by prepare_latent_features (obs_0_dim_0..obs_0_dim_{d-1},
+                # obs_1_dim_0..., ...), keeping the cadence-level UMAP fit consistent with
+                # the RF feature ordering.
+                cadence_vec = np.asarray(latent_stack, dtype=np.float32).ravel()
+                cadence_latents.append(cadence_vec)
+                cadence_labels.append(row["signal_type"])
+                # Obs-level: one entry per observation, with ON/OFF position preserved
+                for obs_idx, vec in enumerate(latent_stack):
+                    obs_latents.append(vec)
+                    obs_labels.append(row["signal_type"])
+                    obs_onoff.append("ON" if obs_idx % 2 == 0 else "OFF")
 
-            all_coords.append(np.array(snapshot_latents, dtype=np.float32))
-            all_snapshot_labels.append(snapshot_labels)
-            all_snapshot_onoff.append(snapshot_onoff)
+            all_coords_obs.append(np.array(obs_latents, dtype=np.float32))
+            all_snapshot_labels_obs.append(obs_labels)
+            all_snapshot_onoff_obs.append(obs_onoff)
+            all_coords_cadence.append(np.array(cadence_latents, dtype=np.float32))
+            all_snapshot_labels_cadence.append(cadence_labels)
             snapshot_metadata.append(key)
 
-            del rows, snapshot_latents, snapshot_labels, snapshot_onoff
+            del rows, obs_latents, obs_labels, obs_onoff, cadence_latents, cadence_labels
             gc.collect()
 
         del snapshot_keys
         gc.collect()
 
-        if not all_coords:
+        if not all_coords_obs:
             logger.warning("No valid latent data loaded — skipping GIF generation")
             return
 
-        # Pool all latents for global UMAP fit
-        pooled = np.concatenate(all_coords, axis=0)
-        logger.info(
-            f"Pooled {pooled.shape[0]} latent vectors from {len(all_coords)} snapshots "
-            f"for UMAP fitting"
-        )
-
-        # Subsample pooled vectors for UMAP fit (fitting on the full set of pooled vectors is slow;
-        # the subsampled fit generalizes well and remaining vectors are projected via .transform())
-        # Stratified by signal_type × ON/OFF (8 classes) for balanced representation
         umap_fit_max = self.config.training.latent_viz_umap_fit_max_samples
-        if pooled.shape[0] > umap_fit_max:
-            pooled_labels = np.concatenate(
-                [np.array(lab, dtype="U") for lab in all_snapshot_labels]
+
+        def _build_stratified_fit_pool(all_coords, strata_list, mode_label):
+            """
+            Concatenate per-snapshot latent arrays and draw a stratified sample to feed UMAP.fit().
+
+            Fitting UMAP on the full pool is slow; a stratified subsample generalizes well
+            and the remaining vectors are projected through .transform() afterwards.
+            """
+            pooled = np.concatenate(all_coords, axis=0)
+            logger.info(
+                f"Pooled {pooled.shape[0]} {mode_label} latent vectors from "
+                f"{len(all_coords)} snapshots for UMAP fitting"
             )
-            pooled_onoff = np.concatenate([np.array(o, dtype="U") for o in all_snapshot_onoff])
-            strata = np.char.add(np.char.add(pooled_labels, "|"), pooled_onoff)
-            del pooled_labels, pooled_onoff
+
+            if pooled.shape[0] <= umap_fit_max:
+                return pooled
+
+            strata = np.concatenate([np.array(s, dtype="U") for s in strata_list])
 
             # NOTE: use a global config seed instead of hard-coding
             rng = np.random.default_rng(11)
@@ -3622,7 +3757,7 @@ class TrainingPipeline:
                 n_take = min(per_class, len(cls_idx))
                 if n_take < per_class:
                     logger.warning(
-                        f"Only {n_take} latents for {cls} "
+                        f"Only {n_take} {mode_label} latents for {cls} "
                         f"(requested {per_class}), using all available"
                     )
                 fit_indices.append(rng.choice(cls_idx, size=n_take, replace=False))
@@ -3632,14 +3767,27 @@ class TrainingPipeline:
             fit_pool = pooled[fit_indices]
             logger.info(
                 f"Stratified subsampled {fit_pool.shape[0]} / {pooled.shape[0]} "
-                f"latent vectors for UMAP fit ({len(unique_classes)} classes, "
+                f"{mode_label} latent vectors for UMAP fit ({len(unique_classes)} classes, "
                 f"~{per_class} per class)"
             )
-            del fit_indices
-        else:
-            fit_pool = pooled
+            del pooled, fit_indices
+            return fit_pool
 
-        del pooled
+        # Obs-level strata: signal_type × ON/OFF (8 classes)
+        obs_strata_list = [
+            np.char.add(
+                np.char.add(np.array(lab, dtype="U"), "|"),
+                np.array(onoff, dtype="U"),
+            )
+            for lab, onoff in zip(all_snapshot_labels_obs, all_snapshot_onoff_obs, strict=True)
+        ]
+        fit_pool_obs = _build_stratified_fit_pool(all_coords_obs, obs_strata_list, "obs-level")
+        del obs_strata_list
+
+        # Cadence-level strata: signal_type only (4 classes)
+        fit_pool_cadence = _build_stratified_fit_pool(
+            all_coords_cadence, all_snapshot_labels_cadence, "cadence-level"
+        )
 
         # Compute consistent axis limits with 5% padding (streaming min/max to avoid concat)
         def _compute_limits(transformed_list):
@@ -3651,8 +3799,8 @@ class TrainingPipeline:
             y_pad = (y_max - y_min) * 0.05
             return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
 
-        # Generate frames and assemble GIF
-        colors = {
+        # Obs-level palette: 8 categories (signal_type × ON/OFF) with ON/OFF as circle/x
+        obs_colors = {
             ("false_no_signal", "ON"): "#1565C0",
             ("false_no_signal", "OFF"): "#64B5F6",
             ("false_with_rfi", "ON"): "#F9A825",
@@ -3662,8 +3810,8 @@ class TrainingPipeline:
             ("true_eti_rfi", "ON"): "#C62828",
             ("true_eti_rfi", "OFF"): "#EF5350",
         }
-        markers = {"ON": "o", "OFF": "x"}
-        display_names = {
+        obs_markers = {"ON": "o", "OFF": "x"}
+        obs_display_names = {
             ("false_no_signal", "ON"): "No Signal (ON)",
             ("false_no_signal", "OFF"): "No Signal (OFF)",
             ("false_with_rfi", "ON"): "RFI Only (ON)",
@@ -3673,6 +3821,20 @@ class TrainingPipeline:
             ("true_eti_rfi", "ON"): "ETI+RFI (ON)",
             ("true_eti_rfi", "OFF"): "ETI+RFI (OFF)",
         }
+        # Cadence-level palette: 4 categories, kept distinct from the obs palette on
+        # purpose so downstream RF plots can reuse the same colors
+        cadence_colors = {
+            "false_no_signal": "tab:blue",
+            "false_with_rfi": "tab:cyan",
+            "true_only_eti": "tab:red",
+            "true_eti_rfi": "tab:orange",
+        }
+        cadence_display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI+RFI",
+        }
 
         # NOTE: instead of temp_dir, save frames in persistent dir. update dir archiving to handle
         temp_dir = tempfile.mkdtemp(prefix="latent_gif_")
@@ -3680,165 +3842,1493 @@ class TrainingPipeline:
         gif_paths = {}
         duration_ms = self.config.training.latent_viz_gif_duration_ms
 
-        # NOTE: how do we store final UMAP model params for later use (e.g. during inference results viz)
         n_neighbors_values = self.config.training.latent_viz_umap_n_neighbors
         min_dist_values = self.config.training.latent_viz_umap_min_dist
 
+        def _render_frames_and_write_gif(
+            transformed_list,
+            method_name,
+            display_method,
+            xlim,
+            ylim,
+            mode,
+        ):
+            """
+            Render one scatter frame per snapshot and assemble them into a GIF.
+
+            mode="obs"     → 8-category (signal_type × ON/OFF) scatter with circle/x markers
+            mode="cadence" → 4-category (signal_type) scatter with single-marker style
+            """
+            frame_paths = []
+            for frame_idx, meta in enumerate(snapshot_metadata):
+                coords_2d = transformed_list[frame_idx]
+                fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+                if mode == "obs":
+                    labels_arr = np.array(all_snapshot_labels_obs[frame_idx])
+                    onoff_arr = np.array(all_snapshot_onoff_obs[frame_idx])
+                    for (stype, status), color in obs_colors.items():
+                        mask = (labels_arr == stype) & (onoff_arr == status)
+                        if mask.any():
+                            ax.scatter(
+                                coords_2d[mask, 0],
+                                coords_2d[mask, 1],
+                                c=color,
+                                marker=obs_markers[status],
+                                s=5,
+                                label=obs_display_names[(stype, status)],
+                                rasterized=True,
+                            )
+                    del labels_arr, onoff_arr
+                    legend_kwargs = {
+                        "loc": "upper right",
+                        "fontsize": 7,
+                        "markerscale": 3,
+                        "ncol": 2,
+                        "framealpha": 0.8,
+                    }
+                else:  # cadence
+                    labels_arr = np.array(all_snapshot_labels_cadence[frame_idx])
+                    for stype, color in cadence_colors.items():
+                        mask = labels_arr == stype
+                        if mask.any():
+                            ax.scatter(
+                                coords_2d[mask, 0],
+                                coords_2d[mask, 1],
+                                c=color,
+                                marker="o",
+                                s=10,
+                                alpha=0.75,
+                                label=cadence_display_names[stype],
+                                rasterized=True,
+                            )
+                    del labels_arr
+                    legend_kwargs = {
+                        "loc": "upper right",
+                        "fontsize": 8,
+                        "markerscale": 2,
+                        "framealpha": 0.8,
+                    }
+
+                ax.set_xlim(xlim)
+                ax.set_ylim(ylim)
+
+                meta_snr_base = meta["snr_base"]
+                meta_snr_range = meta["snr_range"]
+                meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
+                meta_snr_ceil = (
+                    meta_snr_base + meta_snr_range
+                    if meta_snr_base is not None and meta_snr_range is not None
+                    else "?"
+                )
+                ax.set_title(
+                    f"Beta-VAE Latent Space ({display_method}) — "
+                    f"Round {meta['round_number']}, "
+                    f"Epoch {meta['epoch_number']}, "
+                    f"Step {meta['step_number']} "
+                    f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
+                    fontsize=11,
+                )
+                ax.set_xlabel("UMAP 1")
+                ax.set_ylabel("UMAP 2")
+                ax.legend(**legend_kwargs)
+
+                plt.tight_layout()
+
+                frame_path = os.path.join(temp_dir, f"{method_name}_frame_{frame_idx:05d}.png")
+                fig.savefig(frame_path, dpi=100)
+                plt.close(fig)
+                frame_paths.append(frame_path)
+
+            # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
+            gif_filename = f"latent_space_{method_name}_{tag}.gif"
+            gif_path = os.path.join(save_dir, gif_filename)
+
+            n_frames = len(frame_paths)
+            if n_frames > 0:
+                with iio.imopen(gif_path, "w", plugin="pillow") as gif_writer:
+                    for frame_path in frame_paths:
+                        frame = iio.imread(frame_path)
+                        gif_writer.write(
+                            frame,
+                            duration=duration_ms,
+                            loop=0,
+                            is_batch=False,
+                        )
+                        del frame
+
+                logger.info(
+                    f"Latent space {method_name.upper()} GIF saved: {gif_path} ({n_frames} frames)"
+                )
+
+                # Upload to Slack
+                logger_instance = get_logger()
+                if logger_instance:
+                    logger_instance.upload_image_to_slack(
+                        gif_path,
+                        title=f"Latent Space {display_method} - ({tag})",
+                    )
+
+            del frame_paths
+            gc.collect()
+
+            return gif_path
+
         for nn in n_neighbors_values:
             for md in min_dist_values:
-                logger.info(f"Fitting UMAP with n_neighbors={nn}, min_dist={md}")
-
+                # ---------- Obs-level UMAP ----------
+                logger.info(f"Fitting obs-level UMAP with n_neighbors={nn}, min_dist={md}")
                 # NOTE: use a global config seed instead of hard-coding
-                # Fit UMAP model
-                # Note that by setting random_state, we get a deterministic UMAP fit, at the expense
-                # of single-thread performance (n_jobs=1). This is a hard constraint of the UMAP
-                # library. We compensate by fitting the UMAP model to a stratified subsample of the
-                # pooled latents
-                umap_model = umap.UMAP(
+                # Note that by setting random_state, we get a deterministic UMAP fit, at the
+                # expense of single-thread performance (n_jobs=1). This is a hard constraint of
+                # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
+                umap_obs = umap.UMAP(
                     n_components=2,
                     random_state=11,
                     n_neighbors=nn,
                     min_dist=md,
-                ).fit(fit_pool)
+                ).fit(fit_pool_obs)
 
-                # Transform each snapshot
-                transformed = []
-                for coords in all_coords:
-                    transformed.append(umap_model.transform(coords))
-                del umap_model
+                obs_umap_path = os.path.join(
+                    self.config.model_path, f"umap_obs_nn{nn}_md{md}_{tag}.joblib"
+                )
+                try:
+                    os.makedirs(self.config.model_path, exist_ok=True)
+                    joblib.dump(umap_obs, obs_umap_path)
+                    logger.info(f"Saved obs-level UMAP model: {obs_umap_path}")
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to persist obs-level UMAP model ({obs_umap_path}): {exc}"
+                    )
+
+                transformed_obs = [umap_obs.transform(c) for c in all_coords_obs]
+                del umap_obs
                 gc.collect()
 
-                # Compute global axis limits
-                xlim, ylim = _compute_limits(transformed)
+                xlim_obs, ylim_obs = _compute_limits(transformed_obs)
+                method_name_obs = f"obs_umap_nn{nn}_md{md}"
+                display_method_obs = f"Obs-level UMAP (n_neighbors={nn}, min_dist={md})"
 
-                method_name = f"umap_nn{nn}_md{md}"
-                display_method = f"UMAP (n_neighbors={nn}, min_dist={md})"
+                gif_path_obs = _render_frames_and_write_gif(
+                    transformed_obs,
+                    method_name_obs,
+                    display_method_obs,
+                    xlim_obs,
+                    ylim_obs,
+                    mode="obs",
+                )
+                gif_paths[method_name_obs] = gif_path_obs
 
-                # Using a list here is a remnant from when we were testing multiple DR methods
-                # Currently this will always be a single-element list
-                # However, we're choosing not to remove the list wrapper & loop in case we wish to
-                # further explore different DR methods in the future
-                methods = [
-                    (method_name, display_method, transformed, xlim, ylim),
-                ]
-
-                for method_name, display_method, transformed_list, xlim, ylim in methods:
-                    frame_paths = []
-
-                    for frame_idx, (coords_2d, labels, onoff, meta) in enumerate(
-                        zip(
-                            transformed_list,
-                            all_snapshot_labels,
-                            all_snapshot_onoff,
-                            snapshot_metadata,
-                            strict=True,
-                        )
-                    ):
-                        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-
-                        # Plot each category
-                        labels_arr = np.array(labels)
-                        onoff_arr = np.array(onoff)
-
-                        for (stype, status), color in colors.items():
-                            mask = (labels_arr == stype) & (onoff_arr == status)
-                            if mask.any():
-                                ax.scatter(
-                                    coords_2d[mask, 0],
-                                    coords_2d[mask, 1],
-                                    c=color,
-                                    marker=markers[status],
-                                    s=5,
-                                    label=display_names[(stype, status)],
-                                    rasterized=True,
-                                )
-
-                        del labels_arr, onoff_arr
-
-                        ax.set_xlim(xlim)
-                        ax.set_ylim(ylim)
-
-                        meta_snr_base = meta["snr_base"]
-                        meta_snr_range = meta["snr_range"]
-                        meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
-                        meta_snr_ceil = (
-                            meta_snr_base + meta_snr_range
-                            if meta_snr_base is not None and meta_snr_range is not None
-                            else "?"
-                        )
-                        ax.set_title(
-                            f"Beta-VAE Latent Space ({display_method}) — "
-                            f"Round {meta['round_number']}, "
-                            f"Epoch {meta['epoch_number']}, "
-                            f"Step {meta['step_number']} "
-                            f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
-                            fontsize=11,
-                        )
-                        ax.set_xlabel("UMAP 1")
-                        ax.set_ylabel("UMAP 2")
-                        ax.legend(
-                            loc="upper right",
-                            fontsize=7,
-                            markerscale=3,
-                            ncol=2,
-                            framealpha=0.8,
-                        )
-
-                        plt.tight_layout()
-
-                        frame_path = os.path.join(
-                            temp_dir, f"{method_name}_frame_{frame_idx:05d}.png"
-                        )
-                        fig.savefig(frame_path, dpi=100)
-                        plt.close(fig)
-                        frame_paths.append(frame_path)
-
-                    del transformed_list
-
-                    # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
-                    gif_filename = f"latent_space_{method_name}_{tag}.gif"
-                    gif_path = os.path.join(save_dir, gif_filename)
-
-                    n_frames = len(frame_paths)
-                    if n_frames > 0:
-                        with iio.imopen(gif_path, "w", plugin="pillow") as gif_writer:
-                            for frame_path in frame_paths:
-                                frame = iio.imread(frame_path)
-                                gif_writer.write(
-                                    frame,
-                                    duration=duration_ms,
-                                    loop=0,
-                                    is_batch=False,
-                                )
-                                del frame
-
-                        logger.info(
-                            f"Latent space {method_name.upper()} GIF saved: "
-                            f"{gif_path} ({n_frames} frames)"
-                        )
-
-                        # Upload to Slack
-                        logger_instance = get_logger()
-                        if logger_instance:
-                            logger_instance.upload_image_to_slack(
-                                gif_path,
-                                title=f"Latent Space {display_method} - ({tag})",
-                            )
-
-                    del frame_paths
-                    gc.collect()
-
-                    gif_paths[method_name] = gif_path
-
-                del transformed
+                del transformed_obs
                 gc.collect()
 
-        # Cleanup
-        del fit_pool, all_coords
-        # del umap_transformed
-        del all_snapshot_labels, all_snapshot_onoff, snapshot_metadata
+                # ---------- Cadence-level UMAP ----------
+                logger.info(f"Fitting cadence-level UMAP with n_neighbors={nn}, min_dist={md}")
+                umap_cadence = umap.UMAP(
+                    n_components=2,
+                    random_state=11,
+                    n_neighbors=nn,
+                    min_dist=md,
+                ).fit(fit_pool_cadence)
+
+                cadence_umap_path = os.path.join(
+                    self.config.model_path, f"umap_cadence_nn{nn}_md{md}_{tag}.joblib"
+                )
+                try:
+                    os.makedirs(self.config.model_path, exist_ok=True)
+                    joblib.dump(umap_cadence, cadence_umap_path)
+                    logger.info(f"Saved cadence-level UMAP model: {cadence_umap_path}")
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to persist cadence-level UMAP model ({cadence_umap_path}): {exc}"
+                    )
+
+                transformed_cadence = [umap_cadence.transform(c) for c in all_coords_cadence]
+                del umap_cadence
+                gc.collect()
+
+                xlim_cad, ylim_cad = _compute_limits(transformed_cadence)
+                method_name_cad = f"cadence_umap_nn{nn}_md{md}"
+                display_method_cad = f"Cadence-level UMAP (n_neighbors={nn}, min_dist={md})"
+
+                gif_path_cad = _render_frames_and_write_gif(
+                    transformed_cadence,
+                    method_name_cad,
+                    display_method_cad,
+                    xlim_cad,
+                    ylim_cad,
+                    mode="cadence",
+                )
+                gif_paths[method_name_cad] = gif_path_cad
+
+                del transformed_cadence
+                gc.collect()
+
+        # Cleanup — leave closure-captured variables for Python's scope teardown rather
+        # than `del`ing them here (ruff F821 flags closure refs when the enclosing
+        # scope explicitly deletes the name, even if the closure already ran).
         # NOTE: temp_dir isn't cleaned on exception (should use try/finally or tempfile.TemporaryDirectory() with context manager)
         shutil.rmtree(temp_dir, ignore_errors=True)
+        gc.collect()
+
+    # =============================================================================================
+    # Random Forest visualizations
+    # -----
+    # All RF plot functions consume the eval artifacts joblib written by train_random_forest().
+    # Sub-type color palette (shared across RF cadence-level plots; intentionally distinct from
+    # the obs-level GIF palette since the cadence view collapses the 6 observations):
+    #   false_no_signal → tab:blue
+    #   false_with_rfi  → tab:cyan
+    #   true_only_eti   → tab:red
+    #   true_eti_rfi    → tab:orange
+    # =============================================================================================
+
+    # TODO: plot_rf_snr_sensitivity_curve
+    #
+    # Goal: measure how RF accuracy/precision/recall/F1 degrade as ETI signal SNR
+    # decreases, stratified by true sub-type (true_only_eti vs true_eti_rfi).
+    #
+    # Efficient data generation:
+    #   - Generate a single wide-SNR val set (e.g. snr_base=10, snr_range=40 → SNR
+    #     in [10, 50]) instead of separate runs per SNR level.
+    #   - Per-sample SNR is already tracked: data_generation.batch_create_cadence
+    #     records eti_snr in injection_stats with (tag, round_number, chunk_number,
+    #     sample_index, signal_type, signal_class). Query injection_stats with
+    #     stat_name='eti_snr' filtered to the RF training run's tag and join back
+    #     to val samples by chunk/sample_index.
+    #   - Easier alternative: extend generate_triplet_batch (or add a sibling
+    #     method) to also return per-sample SNR arrays alongside the cadence
+    #     arrays. Avoids any DB join.
+    #
+    # Binning and aggregation:
+    #   - Bin SNR into width-5 bands: [10,15), [15,20), ..., [45,50].
+    #   - For each bin, compute accuracy / precision / recall / F1 / AUC over
+    #     val samples falling in that bin.
+    #   - Use bootstrap (1000 resamples) to compute 95% CI per bin. Plot metric
+    #     mean as a line with shaded CI band.
+    #   - Samples with SNR=23 fall naturally into the [20,25) bin — no
+    #     interpolation needed.
+    #
+    # Sub-type handling:
+    #   - Only true_* sub-types have meaningful eti_snr. False sub-types either
+    #     have no signal or have RFI (not the same SNR concept).
+    #   - Plot 2 lines: one for true_only_eti, one for true_eti_rfi. Optionally
+    #     a third line for "any true" (combined). False sub-types appear as a
+    #     constant horizontal line for false-positive rate at all SNRs.
+    #
+    # Plot layout:
+    #   - 2x2 grid of metric panels (accuracy, precision, recall, F1) vs SNR
+    #     midpoint, with colored lines per sub-type and shaded CI bands.
+    #   - Mark snr_base (training SNR floor) as a vertical reference line.
+
+    def plot_rf_confusion_matrices(self, tag: str | None = None, dir: str | None = None):
+        """
+        Confusion matrices for the RF — binary (true vs false) and by 4-way sub-type.
+        1×2 grid: left is the 2×2 binary matrix with counts + rates, right is the 4×2
+        sub-type matrix showing which sub-types get misclassified and at what rate.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        val_binary = artifacts["val_binary_labels"]
+        val_subtype = artifacts["val_subtype_labels"]
+        val_probas = artifacts["val_probas"]
+        val_preds = (val_probas >= 0.5).astype(np.int64)
+
+        # Binary confusion matrix
+        cm_binary = confusion_matrix(val_binary, val_preds, labels=[0, 1])
+        row_sums = cm_binary.sum(axis=1, keepdims=True)
+        cm_binary_norm = np.divide(
+            cm_binary,
+            row_sums,
+            out=np.zeros_like(cm_binary, dtype=np.float64),
+            where=row_sums > 0,
+        )
+
+        # Sub-type confusion matrix (rows=4 sub-types, cols=binary prediction)
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+        cm_subtype = np.zeros((4, 2), dtype=np.int64)
+        for row_idx, stype in enumerate(signal_types):
+            mask = val_subtype == stype
+            if not mask.any():
+                continue
+            preds_for_type = val_preds[mask]
+            cm_subtype[row_idx, 0] = int(np.sum(preds_for_type == 0))
+            cm_subtype[row_idx, 1] = int(np.sum(preds_for_type == 1))
+        subtype_row_sums = cm_subtype.sum(axis=1, keepdims=True)
+        cm_subtype_norm = np.divide(
+            cm_subtype,
+            subtype_row_sums,
+            out=np.zeros_like(cm_subtype, dtype=np.float64),
+            where=subtype_row_sums > 0,
+        )
+
+        fig = plt.figure(figsize=(14, 6))
+        gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.1], wspace=0.25)
+        ax_binary = fig.add_subplot(gs[0, 0])
+        ax_subtype = fig.add_subplot(gs[0, 1])
+
+        fig.suptitle(
+            f"Random Forest Confusion Matrices ({tag}, {machine_name})",
+            fontsize=15,
+            fontweight="bold",
+        )
+
+        # Binary heatmap
+        ax_binary.imshow(cm_binary_norm, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
+        ax_binary.set_title("Binary (True vs False)", fontsize=12, fontweight="bold")
+        ax_binary.set_xticks([0, 1])
+        ax_binary.set_xticklabels(["Pred False", "Pred True"], fontsize=10)
+        ax_binary.set_yticks([0, 1])
+        ax_binary.set_yticklabels(["True False", "True True"], fontsize=10)
+        for i in range(2):
+            for j in range(2):
+                txt_color = "white" if cm_binary_norm[i, j] > 0.5 else "black"
+                ax_binary.text(
+                    j,
+                    i,
+                    f"{cm_binary[i, j]}\n({cm_binary_norm[i, j] * 100:.1f}%)",
+                    ha="center",
+                    va="center",
+                    color=txt_color,
+                    fontsize=11,
+                    fontweight="bold",
+                )
+
+        # Sub-type heatmap
+        ax_subtype.imshow(cm_subtype_norm, cmap="Oranges", vmin=0.0, vmax=1.0, aspect="auto")
+        ax_subtype.set_title(
+            "By Sub-Type (rows) vs Binary Prediction", fontsize=12, fontweight="bold"
+        )
+        ax_subtype.set_xticks([0, 1])
+        ax_subtype.set_xticklabels(["Pred False", "Pred True"], fontsize=10)
+        ax_subtype.set_yticks(range(4))
+        ax_subtype.set_yticklabels([display_names[s] for s in signal_types], fontsize=10)
+        for i in range(4):
+            for j in range(2):
+                txt_color = "white" if cm_subtype_norm[i, j] > 0.5 else "black"
+                ax_subtype.text(
+                    j,
+                    i,
+                    f"{cm_subtype[i, j]}\n({cm_subtype_norm[i, j] * 100:.1f}%)",
+                    ha="center",
+                    va="center",
+                    color=txt_color,
+                    fontsize=10,
+                    fontweight="bold",
+                )
+
+        plt.tight_layout()
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_confusion_matrices_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_confusion_matrices_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF confusion matrices plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF Confusion Matrices - ({tag}, {machine_name})",
+            )
+
+        del artifacts, cm_binary, cm_binary_norm, cm_subtype, cm_subtype_norm
+        del val_binary, val_subtype, val_probas, val_preds
+        gc.collect()
+
+    def plot_rf_classification_curves(self, tag: str | None = None, dir: str | None = None):
+        """
+        2x2 grid: ROC + AUC, PR + AP, confidence histogram overall, confidence histogram
+        per sub-type.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        val_binary = artifacts["val_binary_labels"]
+        val_subtype = artifacts["val_subtype_labels"]
+        val_probas = artifacts["val_probas"]
+
+        fpr, tpr, roc_thresholds = roc_curve(val_binary, val_probas)
+        roc_auc = auc(fpr, tpr)
+        precision, recall, pr_thresholds = precision_recall_curve(val_binary, val_probas)
+        ap = average_precision_score(val_binary, val_probas)
+
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        subtype_colors = {
+            "false_no_signal": "tab:blue",
+            "false_with_rfi": "tab:cyan",
+            "true_only_eti": "tab:red",
+            "true_eti_rfi": "tab:orange",
+        }
+        display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        fig.suptitle(
+            f"Random Forest Classification Curves ({tag}, {machine_name})",
+            fontsize=15,
+            fontweight="bold",
+        )
+
+        ax_roc, ax_pr = axes[0, 0], axes[0, 1]
+        ax_conf_all, ax_conf_sub = axes[1, 0], axes[1, 1]
+
+        # ROC
+        ax_roc.plot(fpr, tpr, color="tab:red", linewidth=2, label=f"AUC = {roc_auc:.4f}")
+        ax_roc.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=1)
+        for thr in [0.3, 0.5, 0.7, 0.9]:
+            # Find the operating point closest to this threshold
+            idx = int(np.argmin(np.abs(roc_thresholds - thr)))
+            if idx < len(fpr):
+                ax_roc.scatter(fpr[idx], tpr[idx], color="black", s=40, zorder=5)
+                ax_roc.annotate(
+                    f"t={thr:.1f}",
+                    (fpr[idx], tpr[idx]),
+                    textcoords="offset points",
+                    xytext=(5, -10),
+                    fontsize=8,
+                )
+        # Operating points for high recall
+        for target_recall in [0.95, 0.99]:
+            valid = tpr >= target_recall
+            if valid.any():
+                first_idx = int(np.argmax(valid))
+                ax_roc.scatter(
+                    fpr[first_idx], tpr[first_idx], color="tab:green", s=60, marker="*", zorder=6
+                )
+                ax_roc.annotate(
+                    f"recall={target_recall:.2f}",
+                    (fpr[first_idx], tpr[first_idx]),
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                    fontsize=8,
+                    color="tab:green",
+                )
+        ax_roc.set_xlabel("False Positive Rate", fontsize=11)
+        ax_roc.set_ylabel("True Positive Rate", fontsize=11)
+        ax_roc.set_title("ROC Curve", fontsize=13, fontweight="bold")
+        ax_roc.grid(True, alpha=0.3)
+        ax_roc.legend(loc="lower right", fontsize=10)
+        ax_roc.set_xlim(-0.01, 1.01)
+        ax_roc.set_ylim(-0.01, 1.01)
+
+        # PR curve
+        ax_pr.plot(recall, precision, color="tab:blue", linewidth=2, label=f"AP = {ap:.4f}")
+        for thr in [0.3, 0.5, 0.7, 0.9]:
+            idx = int(np.argmin(np.abs(pr_thresholds - thr))) if len(pr_thresholds) else 0
+            if idx < len(precision) - 1:
+                ax_pr.scatter(recall[idx], precision[idx], color="black", s=40, zorder=5)
+                ax_pr.annotate(
+                    f"t={thr:.1f}",
+                    (recall[idx], precision[idx]),
+                    textcoords="offset points",
+                    xytext=(5, -10),
+                    fontsize=8,
+                )
+        ax_pr.set_xlabel("Recall", fontsize=11)
+        ax_pr.set_ylabel("Precision", fontsize=11)
+        ax_pr.set_title("Precision-Recall Curve", fontsize=13, fontweight="bold")
+        ax_pr.grid(True, alpha=0.3)
+        ax_pr.legend(loc="lower left", fontsize=10)
+        ax_pr.set_xlim(-0.01, 1.01)
+        ax_pr.set_ylim(-0.01, 1.01)
+
+        # Overall confidence histogram
+        bins = np.linspace(0.0, 1.0, 40)
+        true_mask = val_binary == 1
+        false_mask = val_binary == 0
+        ax_conf_all.hist(
+            val_probas[true_mask],
+            bins=bins,
+            alpha=0.55,
+            color="tab:red",
+            label="True samples",
+            edgecolor="darkred",
+        )
+        ax_conf_all.hist(
+            val_probas[false_mask],
+            bins=bins,
+            alpha=0.55,
+            color="tab:blue",
+            label="False samples",
+            edgecolor="darkblue",
+        )
+        ax_conf_all.axvline(x=0.5, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax_conf_all.set_xlabel("Predicted P(true)", fontsize=11)
+        ax_conf_all.set_ylabel("Count", fontsize=11)
+        ax_conf_all.set_title("Confidence Distribution (Overall)", fontsize=13, fontweight="bold")
+        ax_conf_all.grid(True, alpha=0.3)
+        ax_conf_all.legend(loc="upper center", fontsize=10)
+
+        # Per-subtype confidence histogram
+        for stype in signal_types:
+            mask = val_subtype == stype
+            if not mask.any():
+                continue
+            ax_conf_sub.hist(
+                val_probas[mask],
+                bins=bins,
+                alpha=0.45,
+                color=subtype_colors[stype],
+                label=display_names[stype],
+                edgecolor=subtype_colors[stype],
+            )
+        ax_conf_sub.axvline(x=0.5, color="black", linestyle="--", linewidth=1, alpha=0.6)
+        ax_conf_sub.set_xlabel("Predicted P(true)", fontsize=11)
+        ax_conf_sub.set_ylabel("Count", fontsize=11)
+        ax_conf_sub.set_title(
+            "Confidence Distribution (Per Sub-Type)", fontsize=13, fontweight="bold"
+        )
+        ax_conf_sub.grid(True, alpha=0.3)
+        ax_conf_sub.legend(loc="upper center", fontsize=9)
+
+        plt.tight_layout()
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_classification_curves_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_classification_curves_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF classification curves plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF Classification Curves - ({tag}, {machine_name})",
+            )
+
+        del artifacts, fpr, tpr, roc_thresholds, precision, recall, pr_thresholds
+        del val_binary, val_subtype, val_probas
+        gc.collect()
+
+    def _rf_feature_names(self) -> list[str]:
+        """Human-readable names for the 48 flattened latent features."""
+        num_obs = self.config.data.num_observations
+        latent_dim = self.config.beta_vae.latent_dim
+        return [f"obs{o}_dim{d}" for o in range(num_obs) for d in range(latent_dim)]
+
+    def plot_rf_shap_summary(self, tag: str | None = None, dir: str | None = None):
+        """
+        SHAP beeswarm summary of the top features driving P(true) predictions.
+        Reveals which flattened latents (obs×dim) push toward true vs false, and the
+        sample-level spread of their contribution.
+        """
+        if shap is None:
+            logger.warning("shap not installed — skipping plot_rf_shap_summary")
+            return
+
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        shap_data = self._compute_or_load_shap_values(artifacts)
+
+        shap_values = shap_data["shap_values_summary"]
+        summary_indices = shap_data["summary_indices"]
+        features_sub = artifacts["val_features"][summary_indices]
+        feature_names = self._rf_feature_names()
+
+        fig = plt.figure(figsize=(10, 10))
+        shap.summary_plot(
+            shap_values,
+            features_sub,
+            feature_names=feature_names,
+            show=False,
+            plot_size=None,
+        )
+        fig = plt.gcf()
+        fig.suptitle(
+            f"Random Forest SHAP Summary ({tag}, {machine_name})",
+            fontsize=14,
+            fontweight="bold",
+            y=1.02,
+        )
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_shap_summary_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(self.config.output_path, "plots", f"rf_shap_summary_{tag}.png")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF SHAP summary plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF SHAP Summary - ({tag}, {machine_name})",
+            )
+
+        del artifacts, shap_data, shap_values, summary_indices, features_sub
+        gc.collect()
+
+    def plot_rf_shap_dependence(self, tag: str | None = None, dir: str | None = None):
+        """
+        Grid of SHAP dependence plots for the top-K features by mean |SHAP|.
+        Each panel plots (feature value) vs (SHAP for that feature) colored by
+        the strongest-interacting feature (auto-detected).
+        """
+        if shap is None:
+            logger.warning("shap not installed — skipping plot_rf_shap_dependence")
+            return
+
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        shap_data = self._compute_or_load_shap_values(artifacts)
+
+        shap_values = shap_data["shap_values_summary"]
+        summary_indices = shap_data["summary_indices"]
+        features_sub = artifacts["val_features"][summary_indices]
+        feature_names = self._rf_feature_names()
+
+        k = self.config.training.shap_top_k_features_dependence
+        mean_abs = np.mean(np.abs(shap_values), axis=0)
+        top_k_idx = np.argsort(mean_abs)[::-1][:k]
+
+        n_cols = 4
+        n_rows = int(np.ceil(k / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        axes_flat = axes.flatten() if n_rows * n_cols > 1 else [axes]
+
+        fig.suptitle(
+            f"Random Forest SHAP Dependence ({tag}, {machine_name})",
+            fontsize=15,
+            fontweight="bold",
+        )
+
+        for panel_idx, feat_idx in enumerate(top_k_idx):
+            ax = axes_flat[panel_idx]
+            try:
+                shap.dependence_plot(
+                    int(feat_idx),
+                    shap_values,
+                    features_sub,
+                    feature_names=feature_names,
+                    ax=ax,
+                    show=False,
+                )
+            except Exception as e:
+                logger.warning(f"Dependence plot failed for feature {feature_names[feat_idx]}: {e}")
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"failed: {feature_names[feat_idx]}",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+            ax.set_title(
+                f"{feature_names[feat_idx]}  |SHAP|={mean_abs[feat_idx]:.4f}",
+                fontsize=11,
+                fontweight="bold",
+            )
+
+        # Turn off unused subplots
+        for panel_idx in range(len(top_k_idx), len(axes_flat)):
+            axes_flat[panel_idx].axis("off")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_shap_dependence_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_shap_dependence_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF SHAP dependence plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF SHAP Dependence - ({tag}, {machine_name})",
+            )
+
+        del artifacts, shap_data, shap_values, summary_indices, features_sub
+        del mean_abs, top_k_idx
+        gc.collect()
+
+    def plot_rf_shap_interactions(self, tag: str | None = None, dir: str | None = None):
+        """
+        Compact summary of SHAP pairwise interaction values across 48×48 feature pairs.
+        Strong off-diagonal entries imply the RF exploits cross-observation structure,
+        which is the behavior we want for SETI cadence analysis.
+        """
+        if shap is None:
+            logger.warning("shap not installed — skipping plot_rf_shap_interactions")
+            return
+
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        shap_data = self._compute_or_load_shap_values(artifacts)
+
+        interaction_values = shap_data["shap_values_interaction"]
+        interaction_indices = shap_data["interaction_indices"]
+        features_sub = artifacts["val_features"][interaction_indices]
+        feature_names = self._rf_feature_names()
+
+        fig = plt.figure(figsize=(12, 12))
+        try:
+            shap.summary_plot(
+                interaction_values,
+                features_sub,
+                feature_names=feature_names,
+                plot_type="compact_dot",
+                show=False,
+                plot_size=None,
+            )
+        except Exception as e:
+            logger.warning(f"SHAP interaction summary_plot failed: {e}; falling back to heatmap")
+            plt.close(fig)
+            fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+            mean_abs_interaction = np.mean(np.abs(interaction_values), axis=0)
+            im = ax.imshow(mean_abs_interaction, cmap="viridis", aspect="auto")
+            ax.set_xticks(range(len(feature_names)))
+            ax.set_yticks(range(len(feature_names)))
+            ax.set_xticklabels(feature_names, rotation=90, fontsize=6)
+            ax.set_yticklabels(feature_names, fontsize=6)
+            plt.colorbar(im, ax=ax, label="mean |SHAP interaction|")
+
+        fig = plt.gcf()
+        fig.suptitle(
+            f"Random Forest SHAP Interactions ({tag}, {machine_name})",
+            fontsize=14,
+            fontweight="bold",
+            y=1.02,
+        )
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_shap_interactions_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_shap_interactions_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF SHAP interactions plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF SHAP Interactions - ({tag}, {machine_name})",
+            )
+
+        del artifacts, shap_data, interaction_values, interaction_indices, features_sub
+        gc.collect()
+
+    def plot_rf_shap_loss_monitoring(self, tag: str | None = None, dir: str | None = None):
+        """
+        Model-monitoring view built on log-loss SHAP decomposition.
+        Left: histogram of total per-sample log loss on val, colored by class —
+        identifies the long tail of high-loss samples worth inspecting.
+        Right: mean log-loss-SHAP per feature split into loss-decreasing (negative)
+        vs loss-increasing (positive) — which features the model uses well vs poorly.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        shap_data = self._compute_or_load_shap_values(artifacts)
+
+        shap_logloss = shap_data["shap_values_logloss"]
+        summary_indices = shap_data["summary_indices"]
+        val_binary = artifacts["val_binary_labels"][summary_indices]
+        val_probas = artifacts["val_probas"][summary_indices]
+        feature_names = self._rf_feature_names()
+
+        eps = 1e-12
+        per_sample_logloss = -(
+            val_binary * np.log(val_probas + eps) + (1 - val_binary) * np.log(1 - val_probas + eps)
+        )
+        mean_logloss_shap = np.mean(shap_logloss, axis=0)
+        loss_increasing_mask = mean_logloss_shap > 0
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig.suptitle(
+            f"Random Forest SHAP Loss Monitoring ({tag}, {machine_name})",
+            fontsize=15,
+            fontweight="bold",
+        )
+
+        ax_hist, ax_bar = axes[0], axes[1]
+
+        bins = np.linspace(0.0, max(float(per_sample_logloss.max()), 1e-3), 40)
+        ax_hist.hist(
+            per_sample_logloss[val_binary == 1],
+            bins=bins,
+            color="tab:red",
+            alpha=0.55,
+            label="True samples",
+            edgecolor="darkred",
+        )
+        ax_hist.hist(
+            per_sample_logloss[val_binary == 0],
+            bins=bins,
+            color="tab:blue",
+            alpha=0.55,
+            label="False samples",
+            edgecolor="darkblue",
+        )
+        ax_hist.set_xlabel("Per-sample log loss", fontsize=11)
+        ax_hist.set_ylabel("Count", fontsize=11)
+        ax_hist.set_title("Per-sample Log Loss", fontsize=13, fontweight="bold")
+        ax_hist.grid(True, alpha=0.3)
+        ax_hist.legend(loc="upper right", fontsize=10)
+
+        order = np.argsort(np.abs(mean_logloss_shap))[::-1]
+        colors_bar = np.where(loss_increasing_mask[order], "tab:red", "tab:green")
+        y_pos = np.arange(len(order))
+        ax_bar.barh(
+            y_pos,
+            mean_logloss_shap[order],
+            color=colors_bar,
+            alpha=0.7,
+            edgecolor="black",
+        )
+        ax_bar.set_yticks(y_pos)
+        ax_bar.set_yticklabels([feature_names[i] for i in order], fontsize=6)
+        ax_bar.axvline(x=0.0, color="black", linewidth=0.8)
+        ax_bar.set_xlabel("Mean SHAP contribution to log loss", fontsize=11)
+        ax_bar.set_title(
+            "Loss-Decreasing (green) vs Loss-Increasing (red)", fontsize=13, fontweight="bold"
+        )
+        ax_bar.invert_yaxis()
+        ax_bar.grid(True, alpha=0.3, axis="x")
+
+        plt.tight_layout()
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_shap_loss_monitoring_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_shap_loss_monitoring_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF SHAP loss monitoring plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF SHAP Loss Monitoring - ({tag}, {machine_name})",
+            )
+
+        del artifacts, shap_data, shap_logloss, per_sample_logloss, mean_logloss_shap
+        gc.collect()
+
+    def plot_rf_shap_explanation_clustering(self, tag: str | None = None, dir: str | None = None):
+        """
+        Supervised clustering on SHAP explanation vectors.
+        UMAP-reduces the (n_summary × 48) SHAP matrix to 2D, then scatters val samples
+        colored by sub-type with marker shape indicating correct/incorrect binary prediction.
+        Optional k-means overlay (k=4) to compare model-reasoning clusters against sub-types.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        shap_data = self._compute_or_load_shap_values(artifacts)
+
+        shap_values = shap_data["shap_values_summary"]
+        summary_indices = shap_data["summary_indices"]
+        val_subtype = artifacts["val_subtype_labels"][summary_indices]
+        val_binary = artifacts["val_binary_labels"][summary_indices]
+        val_probas = artifacts["val_probas"][summary_indices]
+        val_preds = (val_probas >= 0.5).astype(np.int64)
+        correct = val_preds == val_binary
+
+        # NOTE: use a global config seed instead of hard-coding
+        umap_model = umap.UMAP(n_components=2, random_state=11, n_neighbors=15, min_dist=0.1).fit(
+            shap_values
+        )
+        embedding = umap_model.transform(shap_values)
+        del umap_model
+
+        kmeans = KMeans(n_clusters=4, random_state=11, n_init=10)
+        cluster_labels = kmeans.fit_predict(shap_values)
+
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        subtype_colors = {
+            "false_no_signal": "tab:blue",
+            "false_with_rfi": "tab:cyan",
+            "true_only_eti": "tab:red",
+            "true_eti_rfi": "tab:orange",
+        }
+        display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+
+        fig, ax = plt.subplots(1, 1, figsize=(11, 9))
+        fig.suptitle(
+            f"Random Forest SHAP Explanation Clustering ({tag}, {machine_name})",
+            fontsize=14,
+            fontweight="bold",
+        )
+
+        for stype in signal_types:
+            mask_type = val_subtype == stype
+            if not mask_type.any():
+                continue
+            correct_type_mask = mask_type & correct
+            wrong_type_mask = mask_type & (~correct)
+            if correct_type_mask.any():
+                ax.scatter(
+                    embedding[correct_type_mask, 0],
+                    embedding[correct_type_mask, 1],
+                    c=subtype_colors[stype],
+                    marker="o",
+                    s=18,
+                    alpha=0.6,
+                    edgecolor="none",
+                    label=f"{display_names[stype]} (✓)",
+                )
+            if wrong_type_mask.any():
+                ax.scatter(
+                    embedding[wrong_type_mask, 0],
+                    embedding[wrong_type_mask, 1],
+                    c=subtype_colors[stype],
+                    marker="x",
+                    s=28,
+                    alpha=0.8,
+                    label=f"{display_names[stype]} (✗)",
+                )
+
+        # Overlay k-means cluster centroids (in SHAP space, then projected via
+        # nearest-sample lookup to avoid a separate UMAP inverse)
+        for cluster_id in range(4):
+            cluster_mask = cluster_labels == cluster_id
+            if cluster_mask.any():
+                cx = np.mean(embedding[cluster_mask, 0])
+                cy = np.mean(embedding[cluster_mask, 1])
+                ax.scatter(
+                    cx,
+                    cy,
+                    s=250,
+                    marker="P",
+                    facecolor="none",
+                    edgecolor="black",
+                    linewidth=2.0,
+                    zorder=5,
+                )
+                ax.text(
+                    cx,
+                    cy,
+                    f" k{cluster_id}",
+                    fontsize=10,
+                    fontweight="bold",
+                    va="center",
+                )
+
+        ax.set_xlabel("UMAP (SHAP) 1", fontsize=11)
+        ax.set_ylabel("UMAP (SHAP) 2", fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.85)
+
+        plt.tight_layout()
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_shap_explanation_clustering_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_shap_explanation_clustering_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF SHAP explanation clustering plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF SHAP Explanation Clustering - ({tag}, {machine_name})",
+            )
+
+        del artifacts, shap_data, shap_values, embedding, cluster_labels, kmeans
+        gc.collect()
+
+    def plot_rf_calibration_curve(self, tag: str | None = None, dir: str | None = None):
+        """
+        Two stacked subplots:
+        - Top: reliability diagram (quantile-binned). Annotated with Brier score and ECE.
+        - Bottom: histogram of val predicted probabilities (binning denominator).
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        val_binary = artifacts["val_binary_labels"]
+        val_probas = artifacts["val_probas"]
+
+        frac_pos, mean_pred = calibration_curve(
+            val_binary, val_probas, n_bins=10, strategy="quantile"
+        )
+        brier = brier_score_loss(val_binary, val_probas)
+
+        # Expected Calibration Error (ECE) = sum over bins of weight * |conf - acc|
+        bin_edges = np.linspace(0.0, 1.0, 11)
+        ece = 0.0
+        n_total = len(val_probas)
+        for i in range(10):
+            lo, hi = bin_edges[i], bin_edges[i + 1]
+            if i == 9:
+                in_bin = (val_probas >= lo) & (val_probas <= hi)
+            else:
+                in_bin = (val_probas >= lo) & (val_probas < hi)
+            if in_bin.any():
+                bin_conf = float(np.mean(val_probas[in_bin]))
+                bin_acc = float(np.mean(val_binary[in_bin]))
+                ece += (float(in_bin.sum()) / n_total) * abs(bin_conf - bin_acc)
+
+        fig, axes = plt.subplots(2, 1, figsize=(9, 11), gridspec_kw={"height_ratios": [2, 1]})
+        fig.suptitle(
+            f"Random Forest Calibration ({tag}, {machine_name})",
+            fontsize=15,
+            fontweight="bold",
+        )
+
+        ax_rel, ax_hist = axes[0], axes[1]
+
+        ax_rel.plot(
+            [0, 1], [0, 1], color="gray", linestyle="--", linewidth=1.5, label="Perfect calibration"
+        )
+        ax_rel.plot(
+            mean_pred,
+            frac_pos,
+            color="tab:red",
+            marker="o",
+            linewidth=2,
+            markersize=7,
+            label="RF model",
+        )
+        ax_rel.set_xlabel("Mean predicted probability (bin)", fontsize=11)
+        ax_rel.set_ylabel("Fraction of positives (bin)", fontsize=11)
+        ax_rel.set_title("Reliability Diagram", fontsize=13, fontweight="bold")
+        ax_rel.grid(True, alpha=0.3)
+        ax_rel.legend(loc="upper left", fontsize=10)
+        ax_rel.set_xlim(-0.01, 1.01)
+        ax_rel.set_ylim(-0.01, 1.01)
+        ax_rel.text(
+            0.98,
+            0.02,
+            f"Brier = {brier:.4f}\nECE = {ece:.4f}",
+            transform=ax_rel.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=11,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+        )
+
+        ax_hist.hist(
+            val_probas,
+            bins=np.linspace(0.0, 1.0, 40),
+            color="tab:blue",
+            edgecolor="darkblue",
+            alpha=0.7,
+        )
+        ax_hist.set_xlabel("Predicted P(true)", fontsize=11)
+        ax_hist.set_ylabel("Count", fontsize=11)
+        ax_hist.set_title("Predicted Probability Distribution", fontsize=13, fontweight="bold")
+        ax_hist.grid(True, alpha=0.3)
+        ax_hist.set_xlim(-0.01, 1.01)
+
+        plt.tight_layout()
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_calibration_curve_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_calibration_curve_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF calibration curve plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF Calibration Curve - ({tag}, {machine_name})",
+            )
+
+        del artifacts, val_binary, val_probas, frac_pos, mean_pred
+        gc.collect()
+
+    def plot_rf_oob_accuracy_curve(self, tag: str | None = None, dir: str | None = None):
+        """
+        Cumulative ensemble accuracy as a function of tree count, computed on the
+        held-out val set (and a 10% train sample as a sanity baseline). The name
+        keeps "oob" for continuity with the original planning TODO but the honest
+        measurement is against the RF training's held-out val partition rather
+        than true out-of-bag samples.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        val_features = artifacts["val_features"]
+        val_binary = artifacts["val_binary_labels"]
+        train_features = artifacts["train_features"]
+        train_binary = artifacts["train_binary_labels"]
+
+        rng = np.random.default_rng(self.config.rf.seed)
+        n_train_sample = max(1, int(0.1 * train_features.shape[0]))
+        train_sample_idx = rng.choice(train_features.shape[0], size=n_train_sample, replace=False)
+        train_features_sub = train_features[train_sample_idx]
+        train_binary_sub = train_binary[train_sample_idx]
+
+        estimators = self.rf_model.model.estimators_
+        n_trees = len(estimators)
+
+        # Accumulate per-tree predict_proba for positive class.
+        # Running mean after each tree is the ensemble probability; threshold at 0.5.
+        cum_val = np.zeros(val_features.shape[0], dtype=np.float64)
+        cum_train = np.zeros(train_features_sub.shape[0], dtype=np.float64)
+        val_acc = np.empty(n_trees, dtype=np.float64)
+        train_acc = np.empty(n_trees, dtype=np.float64)
+
+        logger.info(
+            f"Computing cumulative RF ensemble accuracy across {n_trees} trees "
+            f"on {val_features.shape[0]} val samples and {n_train_sample} train-sample baseline"
+        )
+
+        for t, tree in enumerate(estimators):
+            tree_val = tree.predict_proba(val_features)[:, 1]
+            tree_train = tree.predict_proba(train_features_sub)[:, 1]
+            cum_val += tree_val
+            cum_train += tree_train
+            val_pred = (cum_val / (t + 1) >= 0.5).astype(np.int64)
+            train_pred = (cum_train / (t + 1) >= 0.5).astype(np.int64)
+            val_acc[t] = float(np.mean(val_pred == val_binary))
+            train_acc[t] = float(np.mean(train_pred == train_binary_sub))
+
+        # Find elbow: first tree after which val_acc stays within 1% of its final value
+        final_val_acc = val_acc[-1]
+        near_final = np.where(val_acc >= final_val_acc - 0.01)[0]
+        elbow_idx = int(near_final[0]) if near_final.size else n_trees - 1
+
+        fig, ax = plt.subplots(1, 1, figsize=(11, 6))
+        fig.suptitle(
+            f"Random Forest Ensemble Accuracy vs Tree Count ({tag}, {machine_name})",
+            fontsize=14,
+            fontweight="bold",
+        )
+        x = np.arange(1, n_trees + 1)
+        ax.plot(x, val_acc, color="tab:red", linewidth=2, label="Val accuracy")
+        ax.plot(
+            x,
+            train_acc,
+            color="tab:blue",
+            linewidth=1.6,
+            linestyle="--",
+            label="Train-10% accuracy",
+        )
+        ax.axvline(
+            x=elbow_idx + 1,
+            color="tab:green",
+            linestyle=":",
+            linewidth=1.5,
+            label=f"Elbow (~{elbow_idx + 1} trees, val acc ≈ {val_acc[elbow_idx]:.4f})",
+        )
+        ax.set_xlabel("Number of trees", fontsize=11)
+        ax.set_ylabel("Cumulative accuracy", fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right", fontsize=10)
+
+        plt.tight_layout()
+
+        if dir is not None:
+            save_path = os.path.join(
+                self.config.output_path, "plots", dir, f"rf_oob_accuracy_curve_{tag}.png"
+            )
+        else:
+            save_path = os.path.join(
+                self.config.output_path, "plots", f"rf_oob_accuracy_curve_{tag}.png"
+            )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF ensemble accuracy curve saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF Ensemble Accuracy vs Trees - ({tag}, {machine_name})",
+            )
+
+        del artifacts, val_features, val_binary, train_features, train_binary
+        del train_features_sub, train_binary_sub, cum_val, cum_train, val_acc, train_acc
+        gc.collect()
+
+    def plot_rf_latent_decision_boundary(self, tag: str | None = None, dir: str | None = None):
+        """
+        For each persisted cadence-level UMAP (one per (n_neighbors, min_dist) combo from
+        plot_latent_space_gif), render a decision-boundary figure:
+          - background: filled contour of RF P(true) on a 2D grid (inverse_transformed to 48D)
+          - foreground: val samples colored by sub-type with correct/✗ markers
+          - overlay: explicit contour at 0.5 for the decision boundary
+        One PNG per (nn, md) combo.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        artifacts = self._load_rf_eval_artifacts(tag)
+        val_features = artifacts["val_features"]
+        val_subtype = artifacts["val_subtype_labels"]
+        val_binary = artifacts["val_binary_labels"]
+        val_probas = artifacts["val_probas"]
+        val_preds = (val_probas >= 0.5).astype(np.int64)
+        correct = val_preds == val_binary
+
+        max_points = self.config.training.rf_decision_boundary_max_points
+        grid_size = self.config.training.rf_decision_boundary_grid_size
+
+        if val_features.shape[0] > max_points:
+            rng = np.random.default_rng(self.config.rf.seed)
+            point_idx = rng.choice(val_features.shape[0], size=max_points, replace=False)
+            pts_features = val_features[point_idx]
+            pts_subtype = val_subtype[point_idx]
+            pts_correct = correct[point_idx]
+        else:
+            pts_features = val_features
+            pts_subtype = val_subtype
+            pts_correct = correct
+
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        subtype_colors = {
+            "false_no_signal": "tab:blue",
+            "false_with_rfi": "tab:cyan",
+            "true_only_eti": "tab:red",
+            "true_eti_rfi": "tab:orange",
+        }
+        display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+
+        n_neighbors_values = self.config.training.latent_viz_umap_n_neighbors
+        min_dist_values = self.config.training.latent_viz_umap_min_dist
+
+        n_generated = 0
+        for nn in n_neighbors_values:
+            for md in min_dist_values:
+                umap_path = os.path.join(
+                    self.config.model_path, f"umap_cadence_nn{nn}_md{md}_{tag}.joblib"
+                )
+                if not os.path.exists(umap_path):
+                    logger.warning(
+                        f"Cadence UMAP model not found: {umap_path} — skipping this combo"
+                    )
+                    continue
+
+                logger.info(f"Rendering decision boundary for (nn={nn}, md={md})")
+                try:
+                    umap_model = joblib.load(umap_path)
+                    embedding = umap_model.transform(pts_features)
+                except Exception as e:
+                    logger.warning(f"Failed to load/transform UMAP at {umap_path}: {e}")
+                    continue
+
+                x_min, x_max = embedding[:, 0].min(), embedding[:, 0].max()
+                y_min, y_max = embedding[:, 1].min(), embedding[:, 1].max()
+                x_pad = (x_max - x_min) * 0.05
+                y_pad = (y_max - y_min) * 0.05
+                x_min, x_max = x_min - x_pad, x_max + x_pad
+                y_min, y_max = y_min - y_pad, y_max + y_pad
+
+                xs = np.linspace(x_min, x_max, grid_size)
+                ys = np.linspace(y_min, y_max, grid_size)
+                xx, yy = np.meshgrid(xs, ys)
+                grid_2d = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
+
+                try:
+                    grid_48d = umap_model.inverse_transform(grid_2d)
+                except Exception as e:
+                    logger.warning(
+                        f"UMAP inverse_transform failed for (nn={nn}, md={md}): {e} — "
+                        f"skipping decision boundary for this combo"
+                    )
+                    continue
+
+                grid_probas = self.rf_model.model.predict_proba(grid_48d)[:, 1]
+                proba_grid = grid_probas.reshape(xx.shape)
+
+                fig, ax = plt.subplots(1, 1, figsize=(11, 9))
+                fig.suptitle(
+                    f"Random Forest Decision Boundary (nn={nn}, md={md}) — ({tag}, {machine_name})",
+                    fontsize=13,
+                    fontweight="bold",
+                )
+
+                contourf = ax.contourf(
+                    xx,
+                    yy,
+                    proba_grid,
+                    levels=np.linspace(0.0, 1.0, 21),
+                    cmap="RdBu_r",
+                    alpha=0.4,
+                )
+                fig.colorbar(contourf, ax=ax, label="P(true)")
+                ax.contour(
+                    xx,
+                    yy,
+                    proba_grid,
+                    levels=[0.5],
+                    colors="black",
+                    linewidths=1.6,
+                )
+
+                for stype in signal_types:
+                    mask_type = pts_subtype == stype
+                    if not mask_type.any():
+                        continue
+                    correct_mask = mask_type & pts_correct
+                    wrong_mask = mask_type & (~pts_correct)
+                    if correct_mask.any():
+                        ax.scatter(
+                            embedding[correct_mask, 0],
+                            embedding[correct_mask, 1],
+                            c=subtype_colors[stype],
+                            marker="o",
+                            s=12,
+                            alpha=0.6,
+                            edgecolor="none",
+                            label=f"{display_names[stype]} (✓)",
+                        )
+                    if wrong_mask.any():
+                        ax.scatter(
+                            embedding[wrong_mask, 0],
+                            embedding[wrong_mask, 1],
+                            c=subtype_colors[stype],
+                            marker="x",
+                            s=22,
+                            alpha=0.9,
+                            label=f"{display_names[stype]} (✗)",
+                        )
+
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(y_min, y_max)
+                ax.set_xlabel("UMAP 1 (cadence)", fontsize=11)
+                ax.set_ylabel("UMAP 2 (cadence)", fontsize=11)
+                ax.legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.85)
+
+                plt.tight_layout()
+
+                filename = f"rf_latent_decision_boundary_nn{nn}_md{md}_{tag}.png"
+                if dir is not None:
+                    save_path = os.path.join(self.config.output_path, "plots", dir, filename)
+                else:
+                    save_path = os.path.join(self.config.output_path, "plots", filename)
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                plt.savefig(save_path, dpi=300, bbox_inches="tight")
+                plt.close(fig)
+                logger.info(f"RF decision boundary plot saved to: {save_path}")
+
+                logger_instance = get_logger()
+                if logger_instance:
+                    logger_instance.upload_image_to_slack(
+                        save_path,
+                        title=f"RF Decision Boundary (nn={nn}, md={md}) - ({tag}, {machine_name})",
+                    )
+
+                n_generated += 1
+
+        if n_generated == 0:
+            logger.warning(
+                "plot_rf_latent_decision_boundary: no figures generated — check that "
+                "plot_latent_space_gif has run and persisted cadence-level UMAP models"
+            )
+
+        del artifacts, val_features, val_subtype, val_binary, val_probas, val_preds, correct
+        del pts_features, pts_subtype, pts_correct
         gc.collect()
 
     def _prepare_latent_viz_batch(self, concat_data, labels, candidate_indices=None):
@@ -4167,6 +5657,28 @@ def run_training_pipeline(
             pipeline.rf_model = None  # Avoid saving incomplete RF model state
             _safe_call(pipeline.save_models, "save_models")
             raise  # Re-raise to propagate error
+
+        # Random Forest visualizations. All plots consume the eval-artifact joblib
+        # persisted by train_random_forest(); each is wrapped in _safe_call so one
+        # failure (e.g. an optional dep like SHAP missing) doesn't kill the others.
+        # plot_rf_latent_decision_boundary relies on the cadence-level UMAP joblibs
+        # written by plot_latent_space_gif above, so ordering matters.
+        _safe_call(pipeline.plot_rf_confusion_matrices, "plot_rf_confusion_matrices")
+        _safe_call(pipeline.plot_rf_classification_curves, "plot_rf_classification_curves")
+        _safe_call(pipeline.plot_rf_shap_summary, "plot_rf_shap_summary")
+        _safe_call(pipeline.plot_rf_shap_dependence, "plot_rf_shap_dependence")
+        _safe_call(pipeline.plot_rf_shap_interactions, "plot_rf_shap_interactions")
+        _safe_call(pipeline.plot_rf_shap_loss_monitoring, "plot_rf_shap_loss_monitoring")
+        _safe_call(
+            pipeline.plot_rf_shap_explanation_clustering,
+            "plot_rf_shap_explanation_clustering",
+        )
+        _safe_call(pipeline.plot_rf_calibration_curve, "plot_rf_calibration_curve")
+        _safe_call(pipeline.plot_rf_oob_accuracy_curve, "plot_rf_oob_accuracy_curve")
+        _safe_call(
+            pipeline.plot_rf_latent_decision_boundary,
+            "plot_rf_latent_decision_boundary",
+        )
 
         try:
             # Save final models
