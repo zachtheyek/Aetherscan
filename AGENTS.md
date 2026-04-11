@@ -46,7 +46,7 @@ ruff check src/ && ruff format src/
 - **Distributed training/inference**: All TensorFlow model ops must occur within `strategy.scope()`
 - **Thread-safe singletons**: `Config`, `Database`, `ResourceManager` — always use `get_config()`, `get_db()`, `get_manager()` accessors
 - **Shared memory**: Inter-process data via `manager.create_shared_memory()` — cleanup handled by ResourceManager
-- **`TrainDataHolder` / `InfDataHolder` / `VizDataHolder`**: Specialized data wrappers (with lock) for training, inference, and visualization batches respectively
+- **`TrainDataHolder` / `VizDataHolder` / `InfDataHolder`**: Specialized data wrappers (with lock) for training+validation (`train.py`), visualization (`train.py`), and inference-only (`inference.py`) batches respectively. RF training also uses `TrainDataHolder` via `prepare_distributed_train_dataset` — there is no separate `InfDataHolder` in `train.py`
 
 ---
 
