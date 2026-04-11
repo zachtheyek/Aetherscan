@@ -206,6 +206,19 @@ class TrainingConfig:
     latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
+    # Random forest visualization params
+    shap_max_samples_summary: int = 5000  # Samples for SHAP summary/dependence computation
+    shap_max_samples_interaction: int = (
+        1500  # Samples for SHAP interaction values (O(F^2) per sample)
+    )
+    shap_top_k_features_dependence: int = 8  # Number of dependence plot panels
+    rf_decision_boundary_grid_size: int = (
+        150  # Grid resolution for decision boundary contour (grid_size x grid_size)
+    )
+    rf_decision_boundary_max_points: int = (
+        5000  # Subsample val points for decision boundary plot legibility
+    )
+
     # Curriculum learning params
     snr_base: int = 10
     initial_snr_range: int = 40
@@ -440,6 +453,11 @@ class Config:
                 "latent_viz_umap_min_dist": self.training.latent_viz_umap_min_dist,
                 "latent_viz_gif_max_frames": self.training.latent_viz_gif_max_frames,
                 "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
+                "shap_max_samples_summary": self.training.shap_max_samples_summary,
+                "shap_max_samples_interaction": self.training.shap_max_samples_interaction,
+                "shap_top_k_features_dependence": self.training.shap_top_k_features_dependence,
+                "rf_decision_boundary_grid_size": self.training.rf_decision_boundary_grid_size,
+                "rf_decision_boundary_max_points": self.training.rf_decision_boundary_max_points,
                 "snr_base": self.training.snr_base,
                 "initial_snr_range": self.training.initial_snr_range,
                 "final_snr_range": self.training.final_snr_range,
