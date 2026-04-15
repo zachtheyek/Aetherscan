@@ -75,26 +75,31 @@ class RandomForestModel:
                 Caller must ensure row i..i+num_observations-1 corresponds to cadence i.
             binary_labels: Binary labels shape (n_cadences,) with 0=false, 1=true signal.
         """
+        # Prepare features
         features = prepare_latent_features(latent_vectors, self.config.data.num_observations)
 
+        # Sanity check: make sure length of feature & label arrays are aligned
         if features.shape[0] != binary_labels.shape[0]:
             raise ValueError(
                 f"Feature/label count mismatch: {features.shape[0]} vs {binary_labels.shape[0]}"
             )
 
+        # Shuffle data
         features, binary_labels = shuffle(features, binary_labels, random_state=self.config.rf.seed)
         logger.info(f"Prepared {features.shape[0]} training samples")
 
+        # Start training
         logger.info("Training Random Forest classifier...")
         self.model.fit(features, binary_labels)
         self.is_trained = True
 
-        importances = self.model.feature_importances_
-        logger.info(
-            f"Feature importance stats - Mean: {np.mean(importances):.4f}, "
-            f"Std: {np.std(importances):.4f}"
-        )
-        logger.info(f"Feature importance: \n{importances}")
+        # NOTE: come back to this later
+        # importances = self.model.feature_importances_
+        # logger.info(
+        #     f"Feature importance stats - Mean: {np.mean(importances):.4f}, "
+        #     f"Std: {np.std(importances):.4f}"
+        # )
+        # logger.info(f"Feature importance: \n{importances}")
 
     def predict_proba(self, latent_vectors: np.ndarray) -> np.ndarray:
         """

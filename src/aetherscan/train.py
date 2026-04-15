@@ -586,7 +586,7 @@ def prepare_distributed_train_dataset(
         "accumulation_steps": accumulation_steps,
         "val_steps": val_steps,
         "_train_holder": train_holder,
-        "train_indices": train_indices,  # For train_random_forest() label alignment (shuffle=False)
+        "train_indices": train_indices,  # For train_random_forest() label alignment (not shuffled)
         "val_indices": val_indices,  # For train_round() -> _prepare_latent_viz_batch()
     }
 
@@ -697,6 +697,7 @@ def prepare_distributed_viz_dataset(
     }
 
 
+# NOTE: come back to this later
 def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
     """
     Normalize SHAP output across shap versions into a single positive-class ndarray.
@@ -1739,7 +1740,7 @@ class TrainingPipeline:
 
     # NOTE: write what to db? (e.g. accuracy, F1)
     def train_random_forest(self):
-        """Train Random Forest on a held-out-split dataset and persist eval artifacts."""
+        """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
 
         # Initialize RF model
@@ -1797,12 +1798,14 @@ class TrainingPipeline:
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
         rf_data = self.data_generator.generate_triplet_batch(n_samples, snr_base, snr_range)
 
+        # NOTE: come back to this later (then why do we shuffle during beta-VAE training?)
         # Prepare distributed train+val datasets (stratified split). shuffle=False so the
         # train generator yields in train_indices order, letting us align encoded features
         # with data["labels"] deterministically
         results = prepare_distributed_train_dataset(
             data=rf_data,
             train_val_split=self.config.training.train_val_split,
+            # NOTE: come back to this later (does it make sense to do gradient accumulation here?)
             per_replica_batch_size=self.config.training.per_replica_batch_size,
             effective_batch_size=self.config.training.effective_batch_size,
             per_replica_val_batch_size=self.config.training.per_replica_val_batch_size,
@@ -1811,6 +1814,7 @@ class TrainingPipeline:
             shuffle=False,
         )
 
+        # NOTE: come back to this later
         rf_subtypes_full = rf_data["labels"]
 
         # Free the dict shell (original arrays stay alive via the shared train_holder)
@@ -1835,11 +1839,10 @@ class TrainingPipeline:
             f"using distributed inference"
         )
 
-        # Create distributed inference function. The train/val datasets yield
-        # ((concat, true, false), concat) — we only need `concat` for RF feature encoding.
+        # Create distributed inference function
         @tf.function
         def rf_encode_fn(batch_data):
-            """Encode concatenated cadences using distributed strategy"""
+            """Encode batch data using distributed strategy"""
 
             def encode_fn(data):
                 """Per-replica encoding step"""
@@ -1848,7 +1851,7 @@ class TrainingPipeline:
                 # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
                 concat_reshaped = tf.reshape(concat_data, [-1, time_bins, width_bin, 1])
 
-                # Encode (returns z_mean, z_log_var, z); matches original behavior (pull z)
+                # Encode (returns z_mean, z_log_var, z)
                 _, _, concat_z = self.vae.encoder(concat_reshaped, training=False)
 
                 return concat_z
@@ -1878,6 +1881,7 @@ class TrainingPipeline:
                 logging=True,
             )
 
+            # NOTE: come back to this later (why do we only keep true_ labels?)
             # Derive aligned binary & sub-type labels for train/val splits. With shuffle=False,
             # the i-th cadence in the encoded train/val array corresponds to train_indices[i] /
             # val_indices[i] in the original data
@@ -1894,11 +1898,13 @@ class TrainingPipeline:
             self.rf_model.train(train_latents, train_binary_labels)
             logger.info("Random Forest training complete")
 
+            # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for?)
             # Compute flattened features + val probas for downstream plotting
             train_features = prepare_latent_features(train_latents, num_observations)
             val_features = prepare_latent_features(val_latents, num_observations)
             val_probas = self.rf_model.model.predict_proba(val_features)[:, 1].astype(np.float32)
 
+            # NOTE: come back to this later (what is this artifact for? is it handled properly by archiving functions on startup?)
             # Persist a single eval-artifact joblib that every RF plot function consumes
             tag = self.config.checkpoint.save_tag
             artifacts = {
@@ -1909,6 +1915,7 @@ class TrainingPipeline:
                 "val_binary_labels": val_binary_labels,
                 "val_subtype_labels": val_subtype_labels,
                 "val_probas": val_probas,
+                # NOTE: come back to this later (why are we storing feature importances?)
                 "feature_importances": self.rf_model.model.feature_importances_.astype(np.float32),
                 "snr_base": snr_base,
                 "snr_range": snr_range,
@@ -1919,6 +1926,7 @@ class TrainingPipeline:
             joblib.dump(artifacts, artifact_path)
             logger.info(f"Saved RF eval artifacts to {artifact_path}")
 
+            # NOTE: come back to this later (are we dereferencing the correct things? can we instead write things to db instead of storing in memory?)
             del (
                 artifacts,
                 train_features,
@@ -1936,9 +1944,12 @@ class TrainingPipeline:
             raise  # Re-raise to propagate error
 
         finally:
+            # NOTE: should check to make sure holder & dataset exist first
             # Clear intermediate data
             train_holder.clear()
-            del train_dataset, val_dataset, rf_subtypes_full, train_indices, val_indices
+            del train_dataset, val_dataset
+            # NOTE: come back to this later (why are these dereferenced in finally instead of main code block?)
+            del rf_subtypes_full, train_indices, val_indices
 
             # Force TensorFlow to release internal references to datasets/iterators
             # This prevents generator closures from accumulating in memory between rounds
@@ -1949,12 +1960,14 @@ class TrainingPipeline:
             self.data_generator.reset_managed_pool()
             logger.info("Reset managed pools")
 
+            # NOTE: is this the right way to check if arrays exist before dereferencing?
             if train_latents is not None:
                 del train_latents
             if val_latents is not None:
                 del val_latents
             gc.collect()
 
+    # NOTE: come back to this later
     def _load_rf_eval_artifacts(self, tag: str | None = None) -> dict:
         """Load the RF eval-artifacts joblib written by train_random_forest()."""
         if tag is None:
@@ -1968,6 +1981,7 @@ class TrainingPipeline:
         logger.info(f"Loading RF eval artifacts from {artifact_path}")
         return joblib.load(artifact_path)
 
+    # NOTE: come back to this later
     def _compute_or_load_shap_values(self, artifacts: dict) -> dict:
         """
         Compute SHAP values for the trained RF (summary, interaction, log-loss decomposition)
@@ -3723,6 +3737,7 @@ class TrainingPipeline:
         del snapshot_keys
         gc.collect()
 
+        # NOTE: come back to this later (why are we only checking all_coords_obs and not all_coords_cadence?)
         if not all_coords_obs:
             logger.warning("No valid latent data loaded — skipping GIF generation")
             return
@@ -3799,7 +3814,8 @@ class TrainingPipeline:
             y_pad = (y_max - y_min) * 0.05
             return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
 
-        # Obs-level palette: 8 categories (signal_type × ON/OFF) with ON/OFF as circle/x
+        # NOTE: come back to this later
+        # Obs-level palette: 8 categories (signal_type × ON/OFF) with ON/OFF as triangle/x
         obs_colors = {
             ("false_no_signal", "ON"): "#1565C0",
             ("false_no_signal", "OFF"): "#64B5F6",
@@ -3810,7 +3826,7 @@ class TrainingPipeline:
             ("true_eti_rfi", "ON"): "#C62828",
             ("true_eti_rfi", "OFF"): "#EF5350",
         }
-        obs_markers = {"ON": "o", "OFF": "x"}
+        obs_markers = {"ON": "^", "OFF": "x"}
         obs_display_names = {
             ("false_no_signal", "ON"): "No Signal (ON)",
             ("false_no_signal", "OFF"): "No Signal (OFF)",
@@ -3821,11 +3837,13 @@ class TrainingPipeline:
             ("true_eti_rfi", "ON"): "ETI+RFI (ON)",
             ("true_eti_rfi", "OFF"): "ETI+RFI (OFF)",
         }
+
+        # NOTE: come back to this later (change colors, add markers. potentially need to change _render_frames_and_write_gif: docstring & collapse mode arg?)
         # Cadence-level palette: 4 categories, kept distinct from the obs palette on
         # purpose so downstream RF plots can reuse the same colors
         cadence_colors = {
             "false_no_signal": "tab:blue",
-            "false_with_rfi": "tab:cyan",
+            "false_with_rfi": "tab:green",
             "true_only_eti": "tab:red",
             "true_eti_rfi": "tab:orange",
         }
@@ -3856,7 +3874,7 @@ class TrainingPipeline:
             """
             Render one scatter frame per snapshot and assemble them into a GIF.
 
-            mode="obs"     → 8-category (signal_type × ON/OFF) scatter with circle/x markers
+            mode="obs"     → 8-category (signal_type × ON/OFF) scatter with triangle/x markers
             mode="cadence" → 4-category (signal_type) scatter with single-marker style
             """
             frame_paths = []
@@ -3875,7 +3893,8 @@ class TrainingPipeline:
                                 coords_2d[mask, 1],
                                 c=color,
                                 marker=obs_markers[status],
-                                s=5,
+                                s=10,
+                                alpha=0.75,
                                 label=obs_display_names[(stype, status)],
                                 rasterized=True,
                             )
@@ -3922,15 +3941,13 @@ class TrainingPipeline:
                     else "?"
                 )
                 ax.set_title(
-                    f"Beta-VAE Latent Space ({display_method}) — "
+                    f"Beta-VAE Latent Space: {display_method} — "
                     f"Round {meta['round_number']}, "
                     f"Epoch {meta['epoch_number']}, "
                     f"Step {meta['step_number']} "
                     f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
                     fontsize=11,
                 )
-                ax.set_xlabel("UMAP 1")
-                ax.set_ylabel("UMAP 2")
                 ax.legend(**legend_kwargs)
 
                 plt.tight_layout()
@@ -3976,7 +3993,7 @@ class TrainingPipeline:
 
         for nn in n_neighbors_values:
             for md in min_dist_values:
-                # ---------- Obs-level UMAP ----------
+                # Obs-level UMAP
                 logger.info(f"Fitting obs-level UMAP with n_neighbors={nn}, min_dist={md}")
                 # NOTE: use a global config seed instead of hard-coding
                 # Note that by setting random_state, we get a deterministic UMAP fit, at the
@@ -4007,7 +4024,7 @@ class TrainingPipeline:
 
                 xlim_obs, ylim_obs = _compute_limits(transformed_obs)
                 method_name_obs = f"obs_umap_nn{nn}_md{md}"
-                display_method_obs = f"Obs-level UMAP (n_neighbors={nn}, min_dist={md})"
+                display_method_obs = f"Obs-level UMAP (n_neighbors: {nn}, min_dist: {md})"
 
                 gif_path_obs = _render_frames_and_write_gif(
                     transformed_obs,
@@ -4022,8 +4039,12 @@ class TrainingPipeline:
                 del transformed_obs
                 gc.collect()
 
-                # ---------- Cadence-level UMAP ----------
+                # Cadence-level UMAP
                 logger.info(f"Fitting cadence-level UMAP with n_neighbors={nn}, min_dist={md}")
+                # NOTE: use a global config seed instead of hard-coding
+                # Note that by setting random_state, we get a deterministic UMAP fit, at the
+                # expense of single-thread performance (n_jobs=1). This is a hard constraint of
+                # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
                 umap_cadence = umap.UMAP(
                     n_components=2,
                     random_state=11,
@@ -4049,7 +4070,7 @@ class TrainingPipeline:
 
                 xlim_cad, ylim_cad = _compute_limits(transformed_cadence)
                 method_name_cad = f"cadence_umap_nn{nn}_md{md}"
-                display_method_cad = f"Cadence-level UMAP (n_neighbors={nn}, min_dist={md})"
+                display_method_cad = f"Cadence-level UMAP (n_neighbors: {nn}, min_dist: {md})"
 
                 gif_path_cad = _render_frames_and_write_gif(
                     transformed_cadence,
@@ -4071,6 +4092,7 @@ class TrainingPipeline:
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
 
+    # NOTE: come back to this later
     # =============================================================================================
     # Random Forest visualizations
     # -----
@@ -5658,6 +5680,7 @@ def run_training_pipeline(
             _safe_call(pipeline.save_models, "save_models")
             raise  # Re-raise to propagate error
 
+        # NOTE: come back to this later
         # Random Forest visualizations. All plots consume the eval-artifact joblib
         # persisted by train_random_forest(); each is wrapped in _safe_call so one
         # failure (e.g. an optional dep like SHAP missing) doesn't kill the others.

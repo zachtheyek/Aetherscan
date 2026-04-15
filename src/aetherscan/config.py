@@ -145,7 +145,7 @@ class TrainingConfig:
     epochs_per_round: int = 100
 
     num_samples_beta_vae: int = 499200
-    num_samples_rf: int = 99840
+    num_samples_rf: int = 99840  # NOTE: come back to this later
     train_val_split: float = 0.8
 
     per_replica_batch_size: int = 128
@@ -206,7 +206,7 @@ class TrainingConfig:
     latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
-    # Random forest visualization params
+    # RF visualization params
     shap_max_samples_summary: int = 5000  # Samples for SHAP summary/dependence computation
     shap_max_samples_interaction: int = (
         1500  # Samples for SHAP interaction values (O(F^2) per sample)
