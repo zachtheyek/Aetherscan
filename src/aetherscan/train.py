@@ -1857,6 +1857,7 @@ class TrainingPipeline:
         val_latents = None
 
         try:
+            # NOTE: this is a workaround resulting from using prepare_distributed_train_dataset(), which was originally meant for the beta-VAE only
             # train_steps accounts for gradient accumulation (each "step" = accumulation_steps
             # sub-batches), but _distributed_encode fetches one batch per step. Multiply by
             # accumulation_steps so we iterate over the full training set.
