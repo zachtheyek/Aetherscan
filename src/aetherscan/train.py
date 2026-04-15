@@ -27,6 +27,7 @@ import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
+import shap
 import tensorflow as tf
 import umap
 from sklearn.calibration import calibration_curve
@@ -52,14 +53,6 @@ from aetherscan.models import (
     create_beta_vae_model,
     prepare_latent_features,
 )
-
-# SHAP is an optional runtime dep (not pinned in environment.yml). RF SHAP plots
-# early-return with a warning if the import fails so the rest of the training
-# pipeline remains usable.
-try:
-    import shap  # type: ignore
-except ImportError:  # pragma: no cover
-    shap = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -1826,6 +1819,7 @@ class TrainingPipeline:
         n_train_trimmed = results["n_train_trimmed"]
         n_val_trimmed = results["n_val_trimmed"]
         train_steps = results["train_steps"]
+        accumulation_steps = results["accumulation_steps"]
         val_steps = results["val_steps"]
         train_holder = results["_train_holder"]
         train_indices = results["train_indices"]
@@ -1863,9 +1857,14 @@ class TrainingPipeline:
         val_latents = None
 
         try:
+            # train_steps accounts for gradient accumulation (each "step" = accumulation_steps
+            # sub-batches), but _distributed_encode fetches one batch per step. Multiply by
+            # accumulation_steps so we iterate over the full training set.
+            train_encode_steps = train_steps * accumulation_steps
+
             [train_latents] = self._distributed_encode(
                 dataset=train_dataset,
-                n_steps=train_steps,
+                n_steps=train_encode_steps,
                 encode_fn=rf_encode_fn,
                 n_samples=n_train_trimmed * num_observations,
                 latent_dim=latent_dim,
@@ -1996,13 +1995,6 @@ class TrainingPipeline:
         if os.path.exists(shap_path):
             logger.info(f"Loading cached SHAP values from {shap_path}")
             return joblib.load(shap_path)
-
-        if shap is None:
-            raise RuntimeError(
-                "shap is not installed — cannot compute RF SHAP values. "
-                "Install shap (e.g. `pip install shap`) or delete calls to the "
-                "plot_rf_shap_* helpers."
-            )
 
         val_features = artifacts["val_features"]
         train_features = artifacts["train_features"]
@@ -4377,7 +4369,7 @@ class TrainingPipeline:
         ax_pr.set_ylabel("Precision", fontsize=11)
         ax_pr.set_title("Precision-Recall Curve", fontsize=13, fontweight="bold")
         ax_pr.grid(True, alpha=0.3)
-        ax_pr.legend(loc="lower left", fontsize=10)
+        ax_pr.legend(loc="lower right", fontsize=10)
         ax_pr.set_xlim(-0.01, 1.01)
         ax_pr.set_ylim(-0.01, 1.01)
 
@@ -4468,10 +4460,6 @@ class TrainingPipeline:
         Reveals which flattened latents (obs×dim) push toward true vs false, and the
         sample-level spread of their contribution.
         """
-        if shap is None:
-            logger.warning("shap not installed — skipping plot_rf_shap_summary")
-            return
-
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
@@ -4529,10 +4517,6 @@ class TrainingPipeline:
         Each panel plots (feature value) vs (SHAP for that feature) colored by
         the strongest-interacting feature (auto-detected).
         """
-        if shap is None:
-            logger.warning("shap not installed — skipping plot_rf_shap_dependence")
-            return
-
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
@@ -4625,10 +4609,6 @@ class TrainingPipeline:
         Strong off-diagonal entries imply the RF exploits cross-observation structure,
         which is the behavior we want for SETI cadence analysis.
         """
-        if shap is None:
-            logger.warning("shap not installed — skipping plot_rf_shap_interactions")
-            return
-
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
