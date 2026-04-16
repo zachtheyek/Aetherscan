@@ -3894,8 +3894,8 @@ class TrainingPipeline:
                     del labels_arr, onoff_arr
                     legend_kwargs = {
                         "loc": "upper right",
-                        "fontsize": 7,
-                        "markerscale": 3,
+                        "fontsize": 8,
+                        "markerscale": 2,
                         "ncol": 2,
                         "framealpha": 0.8,
                     }
