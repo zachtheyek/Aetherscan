@@ -211,7 +211,9 @@ class TrainingConfig:
     shap_max_samples_interaction: int = (
         1500  # Samples for SHAP interaction values (O(F^2) per sample)
     )
-    shap_top_k_features_dependence: int = 8  # Number of dependence plot panels
+    shap_top_k_features_dependence: int = (
+        48  # Number of dependence plot panels (all 6 obs * 8 dims by default)
+    )
     rf_decision_boundary_grid_size: int = (
         150  # Grid resolution for decision boundary contour (grid_size x grid_size)
     )
