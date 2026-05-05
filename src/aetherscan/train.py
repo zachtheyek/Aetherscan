@@ -8,6 +8,7 @@ gradient accumulation, and model checkpointing
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import glob
 import json
@@ -690,16 +691,19 @@ def prepare_distributed_viz_dataset(
     }
 
 
-# NOTE: come back to this later
 def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
     """
     Normalize SHAP output across shap versions into a single positive-class ndarray.
 
-    TreeExplainer returns results in several shapes depending on shap version and task:
-    - list [neg, pos] of (n, F) arrays (classic binary classification)
-    - ndarray of shape (n, F, 2) or (n, F, F, 2) (newer shap, last dim is class)
-    - ndarray of shape (n, F) or (n, F, F) (log-loss model_output — single scalar output)
+    TreeExplainer historically returns results in several shapes depending on shap version & task:
+    - classic binary classification:
+        list [neg, pos] of (n, F) arrays
+    - newer shap, last axis is class:
+        ndarray of shape (n, F, 2) for values, or (n, F, F, 2) for interactions
+    - log-loss model_output — single scalar output:
+        ndarray of shape (n, F) or (n, F, F)
 
+    This helper picks the positive-class slice in all cases.
     For log-loss model output, there is only one output, so we return as-is.
     """
     if log_loss:
@@ -717,6 +721,24 @@ def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
     if values.ndim == 4 and values.shape[-1] == 2:
         return values[..., 1]
     return values
+
+
+@contextlib.contextmanager
+def _silence_stderr():
+    """
+    Redirect stderr to /dev/null for the duration of the block.
+
+    SHAP's TreeExplainer drives a tqdm progress bar that writes to stderr. The
+    project-wide logger.py replaces sys.stderr with a StreamToLogger at ERROR
+    level, so every progress-bar refresh becomes an ERROR record and is forwarded
+    to Slack — flooding the channel and triggering SSL EOFs from the webhook.
+
+    Python exceptions still propagate normally (they don't go through stderr
+    text), so wrapping a block in this context manager only suppresses the
+    tqdm output, not legitimate errors.
+    """
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+        yield
 
 
 class TrainingPipeline:
@@ -1731,7 +1753,7 @@ class TrainingPipeline:
 
         return outputs
 
-    # NOTE: write what to db? (e.g. accuracy, F1)
+    # NOTE: write what to db? (e.g. accuracy, F1). should we move all joblib read/writes to db read/writes?
     def train_random_forest(self):
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
@@ -1791,14 +1813,15 @@ class TrainingPipeline:
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
         rf_data = self.data_generator.generate_triplet_batch(n_samples, snr_base, snr_range)
 
-        # NOTE: come back to this later (then why do we shuffle during beta-VAE training?)
         # Prepare distributed train+val datasets (stratified split). shuffle=False so the
         # train generator yields in train_indices order, letting us align encoded features
         # with data["labels"] deterministically
+        # Note that we use the same prepare_distributed_train_dataset() call, with the same training
+        # batch sizes as the beta-VAE, for convenience. We account for the gradient accumulation
+        # baked into train_steps later in train_encode_steps
         results = prepare_distributed_train_dataset(
             data=rf_data,
             train_val_split=self.config.training.train_val_split,
-            # NOTE: come back to this later (does it make sense to do gradient accumulation here?)
             per_replica_batch_size=self.config.training.per_replica_batch_size,
             effective_batch_size=self.config.training.effective_batch_size,
             per_replica_val_batch_size=self.config.training.per_replica_val_batch_size,
@@ -1857,10 +1880,11 @@ class TrainingPipeline:
         val_latents = None
 
         try:
-            # NOTE: this is a workaround resulting from using prepare_distributed_train_dataset(), which was originally meant for the beta-VAE only
             # train_steps accounts for gradient accumulation (each "step" = accumulation_steps
             # sub-batches), but _distributed_encode fetches one batch per step. Multiply by
             # accumulation_steps so we iterate over the full training set.
+            # Note that this is a workaround resulting from using prepare_distributed_train_dataset(),
+            # which was originally designed with only the beta-VAE in mind
             train_encode_steps = train_steps * accumulation_steps
 
             [train_latents] = self._distributed_encode(
@@ -1881,7 +1905,6 @@ class TrainingPipeline:
                 logging=True,
             )
 
-            # NOTE: come back to this later (why do we only keep true_ labels?)
             # Derive aligned binary & sub-type labels for train/val splits. With shuffle=False,
             # the i-th cadence in the encoded train/val array corresponds to train_indices[i] /
             # val_indices[i] in the original data
@@ -1898,7 +1921,7 @@ class TrainingPipeline:
             self.rf_model.train(train_latents, train_binary_labels)
             logger.info("Random Forest training complete")
 
-            # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for?)
+            # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for? why are we calling model.predict_proba directly? is it better to have a wrapper here? could we modify the return signature of predict_proba to return both features & probabilities?)
             # Compute flattened features + val probas for downstream plotting
             train_features = prepare_latent_features(train_latents, num_observations)
             val_features = prepare_latent_features(val_latents, num_observations)
@@ -1967,7 +1990,6 @@ class TrainingPipeline:
                 del val_latents
             gc.collect()
 
-    # NOTE: come back to this later
     def _load_rf_eval_artifacts(self, tag: str | None = None) -> dict:
         """Load the RF eval-artifacts joblib written by train_random_forest()."""
         if tag is None:
@@ -1981,14 +2003,28 @@ class TrainingPipeline:
         logger.info(f"Loading RF eval artifacts from {artifact_path}")
         return joblib.load(artifact_path)
 
-    # NOTE: come back to this later
     def _compute_or_load_shap_values(self, artifacts: dict) -> dict:
         """
         Compute SHAP values for the trained RF (summary, interaction, log-loss decomposition)
         and cache to disk. Subsequent calls load the cache.
 
-        Returns a dict with keys: shap_values_summary, summary_indices, shap_values_interaction,
-         interaction_indices, shap_values_logloss, expected_value.
+        Returns a dict with keys:
+            shap_values_summary ->
+                SHAP values for the positive class (true signal) on a sampled subset of val.
+                Drives summary, dependence, and log-loss plots.
+            summary_indices ->
+                Which val rows the summary subset corresponds to.
+                Needed to look up matching features/labels.
+            shap_values_interaction ->
+                Pairwise interaction values.
+                Diagonal = main effect, off-diagonal = pure interaction between feature pairs.
+            interaction_indices ->
+                Which val rows the interaction subset corresponds to.
+            shap_values_logloss ->
+                SHAP values that decompose log loss instead of P(true).
+                Computed with model_output="log_loss" plus a background dataset and per-sample y.
+                Negative entries = feature reduced loss, positive = feature increased loss.
+            expected_value
         """
         tag = artifacts["tag"]
         shap_path = os.path.join(self.config.model_path, f"rf_shap_values_{tag}.joblib")
@@ -1997,14 +2033,15 @@ class TrainingPipeline:
             logger.info(f"Loading cached SHAP values from {shap_path}")
             return joblib.load(shap_path)
 
-        val_features = artifacts["val_features"]
         train_features = artifacts["train_features"]
+        val_features = artifacts["val_features"]
         val_binary_labels = artifacts["val_binary_labels"]
         n_val = val_features.shape[0]
 
         n_summary = min(self.config.training.shap_max_samples_summary, n_val)
         n_interact = min(self.config.training.shap_max_samples_interaction, n_val)
 
+        # NOTE: use a global config seed instead of hard-coding
         rng = np.random.default_rng(self.config.rf.seed)
         summary_indices = np.sort(rng.choice(n_val, size=n_summary, replace=False))
         interaction_indices = np.sort(rng.choice(n_val, size=n_interact, replace=False))
@@ -2014,47 +2051,57 @@ class TrainingPipeline:
             f"({n_interact} samples) values for RF model"
         )
 
-        explainer = shap.TreeExplainer(self.rf_model.model)
+        # NOTE: come back to this later (is this the right way to extract SHAP summary/interaction values? what's the difference between summary vs interaction? what is _select_positive_class_shap() for?)
+        # _silence_stderr() suppresses SHAP's tqdm progress bar (which writes to
+        # stderr and would otherwise flood Slack via the StreamToLogger redirect).
+        # Real exceptions still propagate; only stderr text is dropped.
+        with _silence_stderr():
+            explainer = shap.TreeExplainer(self.rf_model.model)
 
-        summary_vals_raw = explainer.shap_values(val_features[summary_indices])
-        shap_values_summary = _select_positive_class_shap(summary_vals_raw)
-        del summary_vals_raw
+            summary_vals_raw = explainer.shap_values(val_features[summary_indices])
+            shap_values_summary = _select_positive_class_shap(summary_vals_raw)
+            del summary_vals_raw
 
-        interaction_vals_raw = explainer.shap_interaction_values(val_features[interaction_indices])
-        shap_values_interaction = _select_positive_class_shap(interaction_vals_raw)
-        del interaction_vals_raw
-
-        # Expected value (base value for positive class)
-        ev = explainer.expected_value
-        if isinstance(ev, list | tuple | np.ndarray):
-            ev_arr = np.asarray(ev)
-            expected_value = float(ev_arr[1]) if ev_arr.size > 1 else float(ev_arr.flat[0])
-        else:
-            expected_value = float(ev)
-
-        # Log-loss SHAP decomposition. Uses a background dataset and y_true per sample
-        n_bg = min(1000, train_features.shape[0])
-        bg_indices = rng.choice(train_features.shape[0], size=n_bg, replace=False)
-        background = train_features[bg_indices]
-
-        try:
-            loss_explainer = shap.TreeExplainer(
-                self.rf_model.model, data=background, model_output="log_loss"
+            interaction_vals_raw = explainer.shap_interaction_values(
+                val_features[interaction_indices]
             )
-            loss_vals_raw = loss_explainer.shap_values(
-                val_features[summary_indices], y=val_binary_labels[summary_indices]
-            )
-            shap_values_logloss = _select_positive_class_shap(loss_vals_raw, log_loss=True)
-            del loss_vals_raw, loss_explainer
-        except Exception as e:
-            logger.warning(
-                f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
-                f"loss-monitoring plot will be empty"
-            )
-            shap_values_logloss = np.zeros_like(shap_values_summary)
+            shap_values_interaction = _select_positive_class_shap(interaction_vals_raw)
+            del interaction_vals_raw
+
+            # NOTE: come back to this later (what is SHAP EV?)
+            # Expected value (base value for positive class)
+            ev = explainer.expected_value
+            if isinstance(ev, list | tuple | np.ndarray):
+                ev_arr = np.asarray(ev)
+                expected_value = float(ev_arr[1]) if ev_arr.size > 1 else float(ev_arr.flat[0])
+            else:
+                expected_value = float(ev)
+
+            # NOTE: come back to this later (what is log-loss SHAP? why does it require a subset of training data? why is min n_bg hard-coded to 1000? why do we need a separate loss_explainer? what does model_output="log_loss" mean? what happens if shap_values_logloss is zeroes?)
+            # Log-loss SHAP decomposition. Uses a background dataset and y_true per sample
+            n_bg = min(1000, train_features.shape[0])
+            bg_indices = rng.choice(train_features.shape[0], size=n_bg, replace=False)
+            background = train_features[bg_indices]
+
+            try:
+                loss_explainer = shap.TreeExplainer(
+                    self.rf_model.model, data=background, model_output="log_loss"
+                )
+                loss_vals_raw = loss_explainer.shap_values(
+                    val_features[summary_indices], y=val_binary_labels[summary_indices]
+                )
+                shap_values_logloss = _select_positive_class_shap(loss_vals_raw, log_loss=True)
+                del loss_vals_raw, loss_explainer
+            except Exception as e:
+                logger.warning(
+                    f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
+                    f"loss-monitoring plot will be empty"
+                )
+                shap_values_logloss = np.zeros_like(shap_values_summary)
 
         del background, bg_indices, explainer
 
+        # NOTE: come back to this later (what does any of this mean?)
         result = {
             "shap_values_summary": shap_values_summary.astype(np.float32),
             "summary_indices": summary_indices,
@@ -4092,10 +4139,10 @@ class TrainingPipeline:
     # All RF plot functions consume the eval artifacts joblib written by train_random_forest().
     # Sub-type color palette (shared across RF cadence-level plots; intentionally distinct from
     # the obs-level GIF palette since the cadence view collapses the 6 observations):
-    #   false_no_signal → tab:blue
-    #   false_with_rfi  → tab:cyan
-    #   true_only_eti   → tab:red
-    #   true_eti_rfi    → tab:orange
+    #   false_no_signal → blue
+    #   false_with_rfi  → green
+    #   true_only_eti   → red
+    #   true_eti_rfi    → orange
     # =============================================================================================
 
     # TODO: plot_rf_snr_sensitivity_curve
@@ -4138,9 +4185,9 @@ class TrainingPipeline:
 
     def plot_rf_confusion_matrices(self, tag: str | None = None, dir: str | None = None):
         """
-        Confusion matrices for the RF — binary (true vs false) and by 4-way sub-type.
-        1×2 grid: left is the 2×2 binary matrix with counts + rates, right is the 4×2
-        sub-type matrix showing which sub-types get misclassified and at what rate.
+        Confusion matrices for the RF — binary (true vs false) and 4-way sub-type.
+        1×2 grid: left is the 2×2 binary matrix, right is the 4×2 sub-type matrix.
+        Both with counts + rates.
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -4152,6 +4199,7 @@ class TrainingPipeline:
         val_binary = artifacts["val_binary_labels"]
         val_subtype = artifacts["val_subtype_labels"]
         val_probas = artifacts["val_probas"]
+        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
         val_preds = (val_probas >= 0.5).astype(np.int64)
 
         # Binary confusion matrix
@@ -4201,11 +4249,11 @@ class TrainingPipeline:
 
         # Binary heatmap
         ax_binary.imshow(cm_binary_norm, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
-        ax_binary.set_title("Binary (True vs False)", fontsize=12, fontweight="bold")
+        ax_binary.set_title("Binary", fontsize=12, fontweight="bold")
         ax_binary.set_xticks([0, 1])
         ax_binary.set_xticklabels(["Pred False", "Pred True"], fontsize=10)
         ax_binary.set_yticks([0, 1])
-        ax_binary.set_yticklabels(["True False", "True True"], fontsize=10)
+        ax_binary.set_yticklabels(["Actual False", "Actual True"], fontsize=10)
         for i in range(2):
             for j in range(2):
                 txt_color = "white" if cm_binary_norm[i, j] > 0.5 else "black"
@@ -4222,9 +4270,7 @@ class TrainingPipeline:
 
         # Sub-type heatmap
         ax_subtype.imshow(cm_subtype_norm, cmap="Oranges", vmin=0.0, vmax=1.0, aspect="auto")
-        ax_subtype.set_title(
-            "By Sub-Type (rows) vs Binary Prediction", fontsize=12, fontweight="bold"
-        )
+        ax_subtype.set_title("Sub-Type", fontsize=12, fontweight="bold")
         ax_subtype.set_xticks([0, 1])
         ax_subtype.set_xticklabels(["Pred False", "Pred True"], fontsize=10)
         ax_subtype.set_yticks(range(4))
@@ -4292,10 +4338,10 @@ class TrainingPipeline:
 
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
         subtype_colors = {
-            "false_no_signal": "tab:blue",
-            "false_with_rfi": "tab:cyan",
-            "true_only_eti": "tab:red",
-            "true_eti_rfi": "tab:orange",
+            "false_no_signal": "blue",
+            "false_with_rfi": "green",
+            "true_only_eti": "red",
+            "true_eti_rfi": "orange",
         }
         display_names = {
             "false_no_signal": "No Signal",
@@ -4314,6 +4360,7 @@ class TrainingPipeline:
         ax_roc, ax_pr = axes[0, 0], axes[0, 1]
         ax_conf_all, ax_conf_sub = axes[1, 0], axes[1, 1]
 
+        # NOTE: come back to this later (what do the annotations mean?)
         # ROC
         ax_roc.plot(fpr, tpr, color="tab:red", linewidth=2, label=f"AUC = {roc_auc:.4f}")
         ax_roc.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=1)
@@ -4383,7 +4430,7 @@ class TrainingPipeline:
             bins=bins,
             alpha=0.55,
             color="tab:red",
-            label="True samples",
+            label="True",
             edgecolor="darkred",
         )
         ax_conf_all.hist(
@@ -4391,13 +4438,13 @@ class TrainingPipeline:
             bins=bins,
             alpha=0.55,
             color="tab:blue",
-            label="False samples",
+            label="False",
             edgecolor="darkblue",
         )
         ax_conf_all.axvline(x=0.5, color="black", linestyle="--", linewidth=1, alpha=0.6)
         ax_conf_all.set_xlabel("Predicted P(true)", fontsize=11)
         ax_conf_all.set_ylabel("Count", fontsize=11)
-        ax_conf_all.set_title("Confidence Distribution (Overall)", fontsize=13, fontweight="bold")
+        ax_conf_all.set_title("Confidence Distribution (Binary)", fontsize=13, fontweight="bold")
         ax_conf_all.grid(True, alpha=0.3)
         ax_conf_all.legend(loc="upper center", fontsize=10)
 
@@ -4417,9 +4464,7 @@ class TrainingPipeline:
         ax_conf_sub.axvline(x=0.5, color="black", linestyle="--", linewidth=1, alpha=0.6)
         ax_conf_sub.set_xlabel("Predicted P(true)", fontsize=11)
         ax_conf_sub.set_ylabel("Count", fontsize=11)
-        ax_conf_sub.set_title(
-            "Confidence Distribution (Per Sub-Type)", fontsize=13, fontweight="bold"
-        )
+        ax_conf_sub.set_title("Confidence Distribution (Sub-Type)", fontsize=13, fontweight="bold")
         ax_conf_sub.grid(True, alpha=0.3)
         ax_conf_sub.legend(loc="upper center", fontsize=9)
 
@@ -4450,15 +4495,26 @@ class TrainingPipeline:
         gc.collect()
 
     def _rf_feature_names(self) -> list[str]:
-        """Human-readable names for the 48 flattened latent features."""
+        """Human-readable names for the 48 flattened latent features.
+
+        Naming follows the cadence convention from data_generation.py: even-indexed
+        observations are ON, odd-indexed are OFF. Each ON/OFF pair is numbered 1..3.
+        Example for 6 obs / 8 dims: ON-1_dim-0 ... ON-1_dim-7, OFF-1_dim-0 ... OFF-3_dim-7.
+        """
         num_obs = self.config.data.num_observations
         latent_dim = self.config.beta_vae.latent_dim
-        return [f"obs{o}_dim{d}" for o in range(num_obs) for d in range(latent_dim)]
+        names = []
+        for o in range(num_obs):
+            kind = "ON" if o % 2 == 0 else "OFF"
+            pair_idx = o // 2 + 1
+            for d in range(latent_dim):
+                names.append(f"{kind}-{pair_idx}_dim-{d}")
+        return names
 
     def plot_rf_shap_summary(self, tag: str | None = None, dir: str | None = None):
         """
         SHAP beeswarm summary of the top features driving P(true) predictions.
-        Reveals which flattened latents (obs×dim) push toward true vs false, and the
+        Reveals which flattened latents (obs×dim) matter most, their directionality, and the
         sample-level spread of their contribution.
         """
         if tag is None:
@@ -4475,13 +4531,14 @@ class TrainingPipeline:
         features_sub = artifacts["val_features"][summary_indices]
         feature_names = self._rf_feature_names()
 
-        fig = plt.figure(figsize=(10, 10))
+        fig = plt.figure(figsize=(10, 14))
         shap.summary_plot(
             shap_values,
             features_sub,
             feature_names=feature_names,
             show=False,
             plot_size=None,
+            max_display=len(feature_names),
         )
         fig = plt.gcf()
         fig.suptitle(
@@ -4536,7 +4593,8 @@ class TrainingPipeline:
         mean_abs = np.mean(np.abs(shap_values), axis=0)
         top_k_idx = np.argsort(mean_abs)[::-1][:k]
 
-        n_cols = 4
+        # Use a wider grid (8 cols) when plotting many features so panels stay readable
+        n_cols = 8 if k > 16 else 4
         n_rows = int(np.ceil(k / n_cols))
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
         axes_flat = axes.flatten() if n_rows * n_cols > 1 else [axes]
@@ -4606,9 +4664,11 @@ class TrainingPipeline:
 
     def plot_rf_shap_interactions(self, tag: str | None = None, dir: str | None = None):
         """
-        Compact summary of SHAP pairwise interaction values across 48×48 feature pairs.
-        Strong off-diagonal entries imply the RF exploits cross-observation structure,
-        which is the behavior we want for SETI cadence analysis.
+        Compact summary of SHAP pairwise interaction values across n×n feature pairs.
+        The diagonal is the main effect (same as SHAP summary). Off-diagonals are pure interaction
+        effects. Strong off-diagonal entries imply the RF exploits cross-observation structure
+        within a cadence, whereas weak off-diagonal entries imply the RF is relying on
+        per-observation features alone.
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -4624,7 +4684,7 @@ class TrainingPipeline:
         features_sub = artifacts["val_features"][interaction_indices]
         feature_names = self._rf_feature_names()
 
-        fig = plt.figure(figsize=(12, 12))
+        fig = plt.figure(figsize=(12, 16))
         try:
             shap.summary_plot(
                 interaction_values,
@@ -4633,6 +4693,7 @@ class TrainingPipeline:
                 plot_type="compact_dot",
                 show=False,
                 plot_size=None,
+                max_display=len(feature_names),
             )
         except Exception as e:
             logger.warning(f"SHAP interaction summary_plot failed: {e}; falling back to heatmap")
@@ -4677,6 +4738,7 @@ class TrainingPipeline:
         del artifacts, shap_data, interaction_values, interaction_indices, features_sub
         gc.collect()
 
+    # NOTE: come back to this later (why is this plot missing? update docstring)
     def plot_rf_shap_loss_monitoring(self, tag: str | None = None, dir: str | None = None):
         """
         Model-monitoring view built on log-loss SHAP decomposition.
@@ -4740,7 +4802,8 @@ class TrainingPipeline:
         ax_hist.legend(loc="upper right", fontsize=10)
 
         order = np.argsort(np.abs(mean_logloss_shap))[::-1]
-        colors_bar = np.where(loss_increasing_mask[order], "tab:red", "tab:green")
+        # matplotlib's barh() rejects ndarrays of color strings; pass a Python list instead
+        colors_bar = ["tab:red" if m else "tab:green" for m in loss_increasing_mask[order]]
         y_pos = np.arange(len(order))
         ax_bar.barh(
             y_pos,
@@ -4789,6 +4852,8 @@ class TrainingPipeline:
         Supervised clustering on SHAP explanation vectors.
         UMAP-reduces the (n_summary × 48) SHAP matrix to 2D, then scatters val samples
         colored by sub-type with marker shape indicating correct/incorrect binary prediction.
+        Cadences cluster together when the model reasons about them similarly, even if their
+        latents look different.
         Optional k-means overlay (k=4) to compare model-reasoning clusters against sub-types.
         """
         if tag is None:
@@ -4805,9 +4870,11 @@ class TrainingPipeline:
         val_subtype = artifacts["val_subtype_labels"][summary_indices]
         val_binary = artifacts["val_binary_labels"][summary_indices]
         val_probas = artifacts["val_probas"][summary_indices]
+        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
         val_preds = (val_probas >= 0.5).astype(np.int64)
         correct = val_preds == val_binary
 
+        # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
         # NOTE: use a global config seed instead of hard-coding
         umap_model = umap.UMAP(n_components=2, random_state=11, n_neighbors=15, min_dist=0.1).fit(
             shap_values
@@ -4815,15 +4882,17 @@ class TrainingPipeline:
         embedding = umap_model.transform(shap_values)
         del umap_model
 
+        # NOTE: come back to this later (are these values of n_clusters & n_init appropriate always?)
+        # NOTE: use a global config seed instead of hard-coding
         kmeans = KMeans(n_clusters=4, random_state=11, n_init=10)
         cluster_labels = kmeans.fit_predict(shap_values)
 
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
         subtype_colors = {
-            "false_no_signal": "tab:blue",
-            "false_with_rfi": "tab:cyan",
-            "true_only_eti": "tab:red",
-            "true_eti_rfi": "tab:orange",
+            "false_no_signal": "blue",
+            "false_with_rfi": "green",
+            "true_only_eti": "red",
+            "true_eti_rfi": "orange",
         }
         display_names = {
             "false_no_signal": "No Signal",
@@ -4887,7 +4956,8 @@ class TrainingPipeline:
                 ax.text(
                     cx,
                     cy,
-                    f" k{cluster_id}",
+                    # NOTE: come back to this later (is this enough spacing?)
+                    f"    k{cluster_id}",
                     fontsize=10,
                     fontweight="bold",
                     va="center",
@@ -4939,6 +5009,7 @@ class TrainingPipeline:
         val_binary = artifacts["val_binary_labels"]
         val_probas = artifacts["val_probas"]
 
+        # NOTE: come back to this later (what does brier score & ECE mean exactly?)
         frac_pos, mean_pred = calibration_curve(
             val_binary, val_probas, n_bins=10, strategy="quantile"
         )
@@ -4961,7 +5032,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 1, figsize=(9, 11), gridspec_kw={"height_ratios": [2, 1]})
         fig.suptitle(
-            f"Random Forest Calibration ({tag}, {machine_name})",
+            f"Random Forest Calibration Curve ({tag}, {machine_name})",
             fontsize=15,
             fontweight="bold",
         )
@@ -5036,13 +5107,10 @@ class TrainingPipeline:
         del artifacts, val_binary, val_probas, frac_pos, mean_pred
         gc.collect()
 
-    def plot_rf_oob_accuracy_curve(self, tag: str | None = None, dir: str | None = None):
+    def plot_rf_ensemble_accuracy_curve(self, tag: str | None = None, dir: str | None = None):
         """
         Cumulative ensemble accuracy as a function of tree count, computed on the
-        held-out val set (and a 10% train sample as a sanity baseline). The name
-        keeps "oob" for continuity with the original planning TODO but the honest
-        measurement is against the RF training's held-out val partition rather
-        than true out-of-bag samples.
+        held-out val set (and a subsample of the train set as a sanity baseline).
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -5051,12 +5119,14 @@ class TrainingPipeline:
         machine_name = json.loads(metadata_json).get("machine_name")
 
         artifacts = self._load_rf_eval_artifacts(tag)
-        val_features = artifacts["val_features"]
-        val_binary = artifacts["val_binary_labels"]
         train_features = artifacts["train_features"]
         train_binary = artifacts["train_binary_labels"]
+        val_features = artifacts["val_features"]
+        val_binary = artifacts["val_binary_labels"]
 
+        # NOTE: use a global config seed instead of hard-coding
         rng = np.random.default_rng(self.config.rf.seed)
+        # NOTE: come back to this later (parametrize 10% hold-out in config.py)
         n_train_sample = max(1, int(0.1 * train_features.shape[0]))
         train_sample_idx = rng.choice(train_features.shape[0], size=n_train_sample, replace=False)
         train_features_sub = train_features[train_sample_idx]
@@ -5065,6 +5135,7 @@ class TrainingPipeline:
         estimators = self.rf_model.model.estimators_
         n_trees = len(estimators)
 
+        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
         # Accumulate per-tree predict_proba for positive class.
         # Running mean after each tree is the ensemble probability; threshold at 0.5.
         cum_val = np.zeros(val_features.shape[0], dtype=np.float64)
@@ -5106,14 +5177,14 @@ class TrainingPipeline:
             color="tab:blue",
             linewidth=1.6,
             linestyle="--",
-            label="Train-10% accuracy",
+            label="Train-subsample accuracy (baseline)",
         )
         ax.axvline(
             x=elbow_idx + 1,
             color="tab:green",
             linestyle=":",
             linewidth=1.5,
-            label=f"Elbow (~{elbow_idx + 1} trees, val acc ≈ {val_acc[elbow_idx]:.4f})",
+            label=f"Elbow: {elbow_idx + 1} trees (val acc ≈ {val_acc[elbow_idx]:.4f})",
         )
         ax.set_xlabel("Number of trees", fontsize=11)
         ax.set_ylabel("Cumulative accuracy", fontsize=11)
@@ -5163,9 +5234,10 @@ class TrainingPipeline:
 
         artifacts = self._load_rf_eval_artifacts(tag)
         val_features = artifacts["val_features"]
-        val_subtype = artifacts["val_subtype_labels"]
         val_binary = artifacts["val_binary_labels"]
+        val_subtype = artifacts["val_subtype_labels"]
         val_probas = artifacts["val_probas"]
+        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
         val_preds = (val_probas >= 0.5).astype(np.int64)
         correct = val_preds == val_binary
 
@@ -5173,6 +5245,7 @@ class TrainingPipeline:
         grid_size = self.config.training.rf_decision_boundary_grid_size
 
         if val_features.shape[0] > max_points:
+            # NOTE: use a global config seed instead of hard-coding
             rng = np.random.default_rng(self.config.rf.seed)
             point_idx = rng.choice(val_features.shape[0], size=max_points, replace=False)
             pts_features = val_features[point_idx]
@@ -5185,10 +5258,10 @@ class TrainingPipeline:
 
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
         subtype_colors = {
-            "false_no_signal": "tab:blue",
-            "false_with_rfi": "tab:cyan",
-            "true_only_eti": "tab:red",
-            "true_eti_rfi": "tab:orange",
+            "false_no_signal": "blue",
+            "false_with_rfi": "green",
+            "true_only_eti": "red",
+            "true_eti_rfi": "orange",
         }
         display_names = {
             "false_no_signal": "No Signal",
@@ -5299,8 +5372,8 @@ class TrainingPipeline:
 
                 ax.set_xlim(x_min, x_max)
                 ax.set_ylim(y_min, y_max)
-                ax.set_xlabel("UMAP 1 (cadence)", fontsize=11)
-                ax.set_ylabel("UMAP 2 (cadence)", fontsize=11)
+                ax.set_xlabel("UMAP 1", fontsize=11)
+                ax.set_ylabel("UMAP 2", fontsize=11)
                 ax.legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.85)
 
                 plt.tight_layout()
@@ -5678,7 +5751,7 @@ def run_training_pipeline(
             "plot_rf_shap_explanation_clustering",
         )
         _safe_call(pipeline.plot_rf_calibration_curve, "plot_rf_calibration_curve")
-        _safe_call(pipeline.plot_rf_oob_accuracy_curve, "plot_rf_oob_accuracy_curve")
+        _safe_call(pipeline.plot_rf_ensemble_accuracy_curve, "plot_rf_ensemble_accuracy_curve")
         _safe_call(
             pipeline.plot_rf_latent_decision_boundary,
             "plot_rf_latent_decision_boundary",
