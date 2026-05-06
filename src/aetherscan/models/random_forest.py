@@ -93,14 +93,6 @@ class RandomForestModel:
         self.model.fit(features, binary_labels)
         self.is_trained = True
 
-        # NOTE: come back to this later
-        # importances = self.model.feature_importances_
-        # logger.info(
-        #     f"Feature importance stats - Mean: {np.mean(importances):.4f}, "
-        #     f"Std: {np.std(importances):.4f}"
-        # )
-        # logger.info(f"Feature importance: \n{importances}")
-
     def predict_proba(self, latent_vectors: np.ndarray) -> np.ndarray:
         """
         Predict binary probabilities given some input latent cadences
