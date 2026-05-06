@@ -5725,8 +5725,15 @@ def run_training_pipeline(
 
 
 def _safe_call(func: Callable, name: str, args: tuple | None = None) -> None:
-    """Best-effort execution during error cleanup."""
+    """
+    Invoke a callable, log-and-swallow any exception.
+
+    Used as the primary dispatch for the RF diagnostic plot methods so a single
+    failure (e.g. an optional dependency like SHAP missing, an interaction-value
+    fallback) cannot take down the rest of the pipeline. Also used opportunistically
+    during error cleanup where a best-effort call is still worth attempting.
+    """
     try:
         func(*args) if args else func()
     except Exception as e:
-        logger.warning(f"Failed to execute {name} during cleanup: {e}")
+        logger.warning(f"Failed to execute {name}: {e}")
