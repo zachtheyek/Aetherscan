@@ -4899,18 +4899,36 @@ class TrainingPipeline:
         val_preds = artifacts["val_preds"][summary_indices]
         correct = val_preds == val_binary
 
+        # SHAP-space UMAP + KMeans persisted alongside the SHAP cache so re-runs
+        # of just this plot (without retraining) reproduce the same cluster
+        # layout. Unlike the cadence-level UMAP that plot_latent_space_gif fits
+        # on raw latents, this projection is over the (n_summary × 48) SHAP
+        # matrix, so it lives in its own joblib.
         # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
         # NOTE: use a global config seed instead of hard-coding
-        umap_model = umap.UMAP(n_components=2, random_state=11, n_neighbors=15, min_dist=0.1).fit(
-            shap_values
-        )
-        embedding = umap_model.transform(shap_values)
-        del umap_model
-
-        # NOTE: come back to this later (are these values of n_clusters & n_init appropriate always?)
-        # NOTE: use a global config seed instead of hard-coding
-        kmeans = KMeans(n_clusters=4, random_state=11, n_init=10)
-        cluster_labels = kmeans.fit_predict(shap_values)
+        clustering_path = os.path.join(self.config.model_path, f"rf_shap_clustering_{tag}.joblib")
+        if os.path.exists(clustering_path):
+            logger.info(f"Loading cached SHAP clustering from {clustering_path}")
+            cached = joblib.load(clustering_path)
+            embedding = cached["embedding"]
+            cluster_labels = cached["cluster_labels"]
+        else:
+            logger.info("Fitting SHAP-space UMAP + KMeans on summary SHAP values")
+            umap_model = umap.UMAP(
+                n_components=2, random_state=11, n_neighbors=15, min_dist=0.1
+            ).fit(shap_values)
+            embedding = umap_model.transform(shap_values)
+            # NOTE: come back to this later (are these values of n_clusters & n_init appropriate always?)
+            # NOTE: use a global config seed instead of hard-coding
+            kmeans = KMeans(n_clusters=4, random_state=11, n_init=10)
+            cluster_labels = kmeans.fit_predict(shap_values)
+            os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+            joblib.dump(
+                {"embedding": embedding, "cluster_labels": cluster_labels},
+                clustering_path,
+            )
+            logger.info(f"Saved SHAP clustering to {clustering_path}")
+            del umap_model, kmeans
 
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
         subtype_colors = {
@@ -5015,7 +5033,7 @@ class TrainingPipeline:
                 title=f"RF SHAP Explanation Clustering - ({tag}, {machine_name})",
             )
 
-        del artifacts, shap_data, shap_values, embedding, cluster_labels, kmeans
+        del artifacts, shap_data, shap_values, embedding, cluster_labels
         gc.collect()
 
     def plot_rf_calibration_curve(self, tag: str | None = None, dir: str | None = None):
