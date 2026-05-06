@@ -1990,6 +1990,7 @@ class TrainingPipeline:
                 del val_latents
             gc.collect()
 
+    # NOTE: performance issues -- repeated artifact deserialization (Each of the 10 RF plot methods independently calls _load_rf_eval_artifacts(), and the 5 SHAP plots additionally call _compute_or_load_shap_values() (which loads artifacts again). This means the same large numpy arrays are deserialized from disk 10-15 times during a single pipeline run. Not a blocker since the data is disk-cached, but loading once and passing as a parameter (or caching on self) would be a straightforward win.)
     def _load_rf_eval_artifacts(self, tag: str | None = None) -> dict:
         """Load the RF eval-artifacts joblib written by train_random_forest()."""
         if tag is None:
