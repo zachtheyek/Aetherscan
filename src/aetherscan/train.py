@@ -1954,10 +1954,15 @@ class TrainingPipeline:
             logger.info("Random Forest training complete")
 
             # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for? why are we calling model.predict_proba directly? is it better to have a wrapper here? could we modify the return signature of predict_proba to return both features & probabilities?)
-            # Compute flattened features + val probas for downstream plotting
+            # Compute flattened features + val probas/preds for downstream plotting.
+            # val_preds is taken directly from the model (sklearn predict() uses argmax —
+            # equivalent to thresholding val_probas at 0.5 for the binary classifier, but
+            # sourced from the model so plots don't have to rederive it with a hard-coded
+            # threshold and risk drifting from the model's own decision rule).
             train_features = prepare_latent_features(train_latents, num_observations)
             val_features = prepare_latent_features(val_latents, num_observations)
             val_probas = self.rf_model.model.predict_proba(val_features)[:, 1].astype(np.float32)
+            val_preds = self.rf_model.model.predict(val_features).astype(np.int64)
 
             # NOTE: come back to this later (what is this artifact for? is it handled properly by archiving functions on startup?)
             # Persist a single eval-artifact joblib that every RF plot function consumes
@@ -1970,6 +1975,7 @@ class TrainingPipeline:
                 "val_binary_labels": val_binary_labels,
                 "val_subtype_labels": val_subtype_labels,
                 "val_probas": val_probas,
+                "val_preds": val_preds,
                 # NOTE: come back to this later (why are we storing feature importances?)
                 "feature_importances": self.rf_model.model.feature_importances_.astype(np.float32),
                 "snr_base": snr_base,
@@ -1991,6 +1997,7 @@ class TrainingPipeline:
                 train_binary_labels,
                 val_binary_labels,
                 val_probas,
+                val_preds,
             )
             gc.collect()
 
@@ -4182,8 +4189,7 @@ class TrainingPipeline:
         val_binary = artifacts["val_binary_labels"]
         val_subtype = artifacts["val_subtype_labels"]
         val_probas = artifacts["val_probas"]
-        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
-        val_preds = (val_probas >= 0.5).astype(np.int64)
+        val_preds = artifacts["val_preds"]
 
         # Binary confusion matrix
         cm_binary = confusion_matrix(val_binary, val_preds, labels=[0, 1])
@@ -4852,9 +4858,7 @@ class TrainingPipeline:
         summary_indices = shap_data["summary_indices"]
         val_subtype = artifacts["val_subtype_labels"][summary_indices]
         val_binary = artifacts["val_binary_labels"][summary_indices]
-        val_probas = artifacts["val_probas"][summary_indices]
-        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
-        val_preds = (val_probas >= 0.5).astype(np.int64)
+        val_preds = artifacts["val_preds"][summary_indices]
         correct = val_preds == val_binary
 
         # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
@@ -5136,6 +5140,7 @@ class TrainingPipeline:
             tree_train = tree.predict_proba(train_features_sub)[:, 1]
             cum_val += tree_val
             cum_train += tree_train
+            # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
             val_pred = (cum_val / (t + 1) >= 0.5).astype(np.int64)
             train_pred = (cum_train / (t + 1) >= 0.5).astype(np.int64)
             val_acc[t] = float(np.mean(val_pred == val_binary))
@@ -5219,9 +5224,7 @@ class TrainingPipeline:
         val_features = artifacts["val_features"]
         val_binary = artifacts["val_binary_labels"]
         val_subtype = artifacts["val_subtype_labels"]
-        val_probas = artifacts["val_probas"]
-        # NOTE: come back to this later (use flexible threshold, not hard-coded 0.5? in fact, wouldn't it be better to store the preds from rf.py itself rather than storing the probas and trying to figure it out after the fact?)
-        val_preds = (val_probas >= 0.5).astype(np.int64)
+        val_preds = artifacts["val_preds"]
         correct = val_preds == val_binary
 
         max_points = self.config.training.rf_decision_boundary_max_points
@@ -5386,7 +5389,7 @@ class TrainingPipeline:
                 "plot_latent_space_gif has run and persisted cadence-level UMAP models"
             )
 
-        del artifacts, val_features, val_subtype, val_binary, val_probas, val_preds, correct
+        del artifacts, val_features, val_subtype, val_binary, val_preds, correct
         del pts_features, pts_subtype, pts_correct
         gc.collect()
 
