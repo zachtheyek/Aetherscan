@@ -792,6 +792,14 @@ class TrainingPipeline:
         # Initialize RF model as None
         self.rf_model = None
 
+        # In-memory caches for RF eval artifacts and SHAP values, keyed by tag.
+        # All ten RF plots consume the same eval-artifact joblib (and the five SHAP
+        # plots additionally share a SHAP-values joblib); without these caches each
+        # plot would deserialize the same large arrays from disk independently.
+        # Cleared by _clear_rf_caches() at the end of run_training_pipeline().
+        self._rf_artifacts_cache: dict[str, dict] = {}
+        self._rf_shap_cache: dict[str, dict] = {}
+
         try:
             # Load models from checkpoints if provided
             if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
@@ -2029,11 +2037,20 @@ class TrainingPipeline:
                 del val_latents
             gc.collect()
 
-    # NOTE: performance issues -- repeated artifact deserialization (Each of the 10 RF plot methods independently calls _load_rf_eval_artifacts(), and the 5 SHAP plots additionally call _compute_or_load_shap_values() (which loads artifacts again). This means the same large numpy arrays are deserialized from disk 10-15 times during a single pipeline run. Not a blocker since the data is disk-cached, but loading once and passing as a parameter (or caching on self) would be a straightforward win.)
     def _load_rf_eval_artifacts(self, tag: str | None = None) -> dict:
-        """Load the RF eval-artifacts joblib written by train_random_forest()."""
+        """
+        Load the RF eval-artifacts joblib written by train_random_forest().
+
+        Memoized on self by tag — a single pipeline run produces ten RF plots
+        and we only want to deserialize the (large) features/probas/preds
+        arrays once. _clear_rf_caches() drops the cache after all plots run.
+        """
         if tag is None:
             tag = self.config.checkpoint.save_tag
+
+        if tag in self._rf_artifacts_cache:
+            return self._rf_artifacts_cache[tag]
+
         artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
         if not os.path.exists(artifact_path):
             raise FileNotFoundError(
@@ -2041,7 +2058,9 @@ class TrainingPipeline:
                 f"train_random_forest() must run before RF plots are generated."
             )
         logger.info(f"Loading RF eval artifacts from {artifact_path}")
-        return joblib.load(artifact_path)
+        artifacts = joblib.load(artifact_path)
+        self._rf_artifacts_cache[tag] = artifacts
+        return artifacts
 
     def _compute_or_load_shap_values(self, artifacts: dict) -> dict:
         """
@@ -2067,11 +2086,17 @@ class TrainingPipeline:
             expected_value
         """
         tag = artifacts["tag"]
+
+        if tag in self._rf_shap_cache:
+            return self._rf_shap_cache[tag]
+
         shap_path = os.path.join(self.config.model_path, f"rf_shap_values_{tag}.joblib")
 
         if os.path.exists(shap_path):
             logger.info(f"Loading cached SHAP values from {shap_path}")
-            return joblib.load(shap_path)
+            cached = joblib.load(shap_path)
+            self._rf_shap_cache[tag] = cached
+            return cached
 
         train_features = artifacts["train_features"]
         val_features = artifacts["val_features"]
@@ -2153,7 +2178,20 @@ class TrainingPipeline:
         os.makedirs(os.path.dirname(shap_path), exist_ok=True)
         joblib.dump(result, shap_path)
         logger.info(f"Saved SHAP values to {shap_path}")
+        self._rf_shap_cache[tag] = result
         return result
+
+    def _clear_rf_caches(self) -> None:
+        """Drop in-memory RF eval-artifact and SHAP caches to free memory."""
+        if self._rf_artifacts_cache:
+            logger.info(
+                f"Clearing RF eval-artifact cache ({len(self._rf_artifacts_cache)} entries)"
+            )
+            self._rf_artifacts_cache.clear()
+        if self._rf_shap_cache:
+            logger.info(f"Clearing RF SHAP cache ({len(self._rf_shap_cache)} entries)")
+            self._rf_shap_cache.clear()
+        gc.collect()
 
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
     # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
@@ -5742,6 +5780,11 @@ def run_training_pipeline(
             pipeline.plot_rf_latent_decision_boundary,
             "plot_rf_latent_decision_boundary",
         )
+
+        # All RF plots are done — drop the shared eval-artifact / SHAP caches
+        # so the (large) features arrays they hold don't hang around through
+        # save_models() and final teardown.
+        pipeline._clear_rf_caches()
 
         try:
             # Save final models
