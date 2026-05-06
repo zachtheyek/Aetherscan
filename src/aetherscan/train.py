@@ -735,10 +735,17 @@ def _silence_stderr():
 
     Python exceptions still propagate normally (they don't go through stderr
     text), so wrapping a block in this context manager only suppresses the
-    tqdm output, not legitimate errors.
+    tqdm output, not legitimate errors. Note however that any C-level warnings
+    emitted by underlying libraries (sklearn tree internals, etc.) are also
+    silenced; the debug-level enter/exit logs make this visible in the log
+    record so an unexpectedly silent stretch can be traced back here.
     """
-    with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
-        yield
+    logger.debug("Entering _silence_stderr() — stderr redirected to /dev/null")
+    try:
+        with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+            yield
+    finally:
+        logger.debug("Exiting _silence_stderr() — stderr restored")
 
 
 class TrainingPipeline:
