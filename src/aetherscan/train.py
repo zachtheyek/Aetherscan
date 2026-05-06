@@ -1750,6 +1750,22 @@ class TrainingPipeline:
                 del results
                 gc.collect()
 
+            # Drift guard: the train/val datasets returned by
+            # prepare_distributed_train_dataset() are .repeat()-ed, so the iterator
+            # never terminates on its own — the caller's n_steps is the only thing
+            # that bounds the encode loop. If n_steps undercounts (e.g. the
+            # accumulation-step convention in prepare_distributed_train_dataset
+            # changes and train_random_forest's `train_steps * accumulation_steps`
+            # math falls out of sync), we silently leave trailing rows of `outputs`
+            # uninitialized. Fail loudly here so downstream plots don't consume
+            # garbage. Overcounts are caught earlier by the slice-assignment.
+            if current_idx != n_samples:
+                raise RuntimeError(
+                    f"_distributed_encode produced {current_idx} samples, expected "
+                    f"{n_samples} (n_steps={n_steps}). Step-counting drift between "
+                    f"caller and prepare_distributed_train_dataset()."
+                )
+
             # Log progress
             if logging:
                 logger.info(f"Finished encoding {n_steps} steps")
@@ -1891,7 +1907,16 @@ class TrainingPipeline:
             # sub-batches), but _distributed_encode fetches one batch per step. Multiply by
             # accumulation_steps so we iterate over the full training set.
             # Note that this is a workaround resulting from using prepare_distributed_train_dataset(),
-            # which was originally designed with only the beta-VAE in mind
+            # which was originally designed with only the beta-VAE in mind. _distributed_encode
+            # asserts current_idx == n_samples after the loop, so any future drift in
+            # prepare_distributed_train_dataset's step-counting convention will fail loudly
+            # rather than silently encode the wrong number of cadences.
+            #
+            # Disjointness contract: the train and val passes below read from the same
+            # TrainDataHolder backing arrays via train_indices / val_indices, which are
+            # built by stratified per-label split + np.random.choice subsampling — disjoint
+            # by construction. The .repeat()-ed datasets cannot leak across splits because
+            # each generator only yields rows from its own index subset.
             train_encode_steps = train_steps * accumulation_steps
 
             [train_latents] = self._distributed_encode(
