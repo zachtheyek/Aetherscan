@@ -4132,57 +4132,7 @@ class TrainingPipeline:
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
 
-    # NOTE: come back to this later
-    # =============================================================================================
-    # Random Forest visualizations
-    # -----
-    # All RF plot functions consume the eval artifacts joblib written by train_random_forest().
-    # Sub-type color palette (shared across RF cadence-level plots; intentionally distinct from
-    # the obs-level GIF palette since the cadence view collapses the 6 observations):
-    #   false_no_signal → blue
-    #   false_with_rfi  → green
-    #   true_only_eti   → red
-    #   true_eti_rfi    → orange
-    # =============================================================================================
-
-    # TODO: plot_rf_snr_sensitivity_curve
-    #
-    # Goal: measure how RF accuracy/precision/recall/F1 degrade as ETI signal SNR
-    # decreases, stratified by true sub-type (true_only_eti vs true_eti_rfi).
-    #
-    # Efficient data generation:
-    #   - Generate a single wide-SNR val set (e.g. snr_base=10, snr_range=40 → SNR
-    #     in [10, 50]) instead of separate runs per SNR level.
-    #   - Per-sample SNR is already tracked: data_generation.batch_create_cadence
-    #     records eti_snr in injection_stats with (tag, round_number, chunk_number,
-    #     sample_index, signal_type, signal_class). Query injection_stats with
-    #     stat_name='eti_snr' filtered to the RF training run's tag and join back
-    #     to val samples by chunk/sample_index.
-    #   - Easier alternative: extend generate_triplet_batch (or add a sibling
-    #     method) to also return per-sample SNR arrays alongside the cadence
-    #     arrays. Avoids any DB join.
-    #
-    # Binning and aggregation:
-    #   - Bin SNR into width-5 bands: [10,15), [15,20), ..., [45,50].
-    #   - For each bin, compute accuracy / precision / recall / F1 / AUC over
-    #     val samples falling in that bin.
-    #   - Use bootstrap (1000 resamples) to compute 95% CI per bin. Plot metric
-    #     mean as a line with shaded CI band.
-    #   - Samples with SNR=23 fall naturally into the [20,25) bin — no
-    #     interpolation needed.
-    #
-    # Sub-type handling:
-    #   - Only true_* sub-types have meaningful eti_snr. False sub-types either
-    #     have no signal or have RFI (not the same SNR concept).
-    #   - Plot 2 lines: one for true_only_eti, one for true_eti_rfi. Optionally
-    #     a third line for "any true" (combined). False sub-types appear as a
-    #     constant horizontal line for false-positive rate at all SNRs.
-    #
-    # Plot layout:
-    #   - 2x2 grid of metric panels (accuracy, precision, recall, F1) vs SNR
-    #     midpoint, with colored lines per sub-type and shaded CI bands.
-    #   - Mark snr_base (training SNR floor) as a vertical reference line.
-
+    # TODO: implement plot_rf_snr_sensitivity_curve()
     def plot_rf_confusion_matrices(self, tag: str | None = None, dir: str | None = None):
         """
         Confusion matrices for the RF — binary (true vs false) and 4-way sub-type.
