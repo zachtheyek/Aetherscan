@@ -145,7 +145,7 @@ class TrainingConfig:
     epochs_per_round: int = 100
 
     num_samples_beta_vae: int = 499200
-    num_samples_rf: int = 99840
+    num_samples_rf: int = 99840  # NOTE: come back to this later
     train_val_split: float = 0.8
 
     per_replica_batch_size: int = 128
@@ -205,6 +205,21 @@ class TrainingConfig:
     )
     latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
+
+    # RF visualization params
+    shap_max_samples_summary: int = 5000  # Samples for SHAP summary/dependence computation
+    shap_max_samples_interaction: int = (
+        1500  # Samples for SHAP interaction values (O(F^2) per sample)
+    )
+    shap_top_k_features_dependence: int = (
+        48  # Number of dependence plot panels (all 6 obs * 8 dims by default)
+    )
+    rf_decision_boundary_grid_size: int = (
+        150  # Grid resolution for decision boundary contour (grid_size x grid_size)
+    )
+    rf_decision_boundary_max_points: int = (
+        5000  # Subsample val points for decision boundary plot legibility
+    )
 
     # Curriculum learning params
     snr_base: int = 10
@@ -440,6 +455,11 @@ class Config:
                 "latent_viz_umap_min_dist": self.training.latent_viz_umap_min_dist,
                 "latent_viz_gif_max_frames": self.training.latent_viz_gif_max_frames,
                 "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
+                "shap_max_samples_summary": self.training.shap_max_samples_summary,
+                "shap_max_samples_interaction": self.training.shap_max_samples_interaction,
+                "shap_top_k_features_dependence": self.training.shap_top_k_features_dependence,
+                "rf_decision_boundary_grid_size": self.training.rf_decision_boundary_grid_size,
+                "rf_decision_boundary_max_points": self.training.rf_decision_boundary_max_points,
                 "snr_base": self.training.snr_base,
                 "initial_snr_range": self.training.initial_snr_range,
                 "final_snr_range": self.training.final_snr_range,

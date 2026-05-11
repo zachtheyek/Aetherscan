@@ -66,50 +66,32 @@ class RandomForestModel:
 
         self.is_trained = False
 
-    def prepare_training_data(
-        self, true_latents: np.ndarray, false_latents: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Prepare training data for Random Forest
-        Combines true/false features, generates labels, and shuffles data
-        """
-        # Prepare features
-        true_features = prepare_latent_features(true_latents, self.config.data.num_observations)
-        false_features = prepare_latent_features(false_latents, self.config.data.num_observations)
-
-        # Combine features
-        features = np.concatenate([true_features, false_features], axis=0)
-
-        # Create labels
-        labels = np.concatenate(
-            [np.ones(true_features.shape[0]), np.zeros(false_features.shape[0])]
-        )
-
-        # Shuffle data
-        features, labels = shuffle(features, labels, random_state=self.config.rf.seed)
-
-        logger.info(f"Prepared {features.shape[0]} training samples")
-
-        return features, labels
-
-    def train(self, true_latents: np.ndarray, false_latents: np.ndarray):
+    def train(self, latent_vectors: np.ndarray, binary_labels: np.ndarray):
         """
         Train the Random Forest model
+
+        Args:
+            latent_vectors: Latent vectors shape (n_cadences * num_observations, latent_dim).
+                Caller must ensure row i..i+num_observations-1 corresponds to cadence i.
+            binary_labels: Binary labels shape (n_cadences,) with 0=false, 1=true signal.
         """
-        features, labels = self.prepare_training_data(true_latents, false_latents)
+        # Prepare features
+        features = prepare_latent_features(latent_vectors, self.config.data.num_observations)
 
+        # Sanity check: make sure length of feature & label arrays are aligned
+        if features.shape[0] != binary_labels.shape[0]:
+            raise ValueError(
+                f"Feature/label count mismatch: {features.shape[0]} vs {binary_labels.shape[0]}"
+            )
+
+        # Shuffle data
+        features, binary_labels = shuffle(features, binary_labels, random_state=self.config.rf.seed)
+        logger.info(f"Prepared {features.shape[0]} training samples")
+
+        # Start training
         logger.info("Training Random Forest classifier...")
-        self.model.fit(features, labels)
+        self.model.fit(features, binary_labels)
         self.is_trained = True
-
-        # TODO: rethink RF visualizations (how to visualize RF training progress?) (return feature importance & create plots in train.py? or create directly from here? in evaluation.py?)
-        # Log feature importances
-        importances = self.model.feature_importances_
-        logger.info(
-            f"Feature importance stats - Mean: {np.mean(importances):.4f}, "
-            f"Std: {np.std(importances):.4f}"
-        )
-        logger.info(f"Feature importance: \n{importances}")
 
     def predict_proba(self, latent_vectors: np.ndarray) -> np.ndarray:
         """

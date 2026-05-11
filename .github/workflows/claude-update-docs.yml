@@ -1,3 +1,4 @@
+# TODO: do a proper audit of ALL the docs in this repo -- their contents & purpose, and craft a comprehensive prompt for this workflow to make sure ALL docs are kept up-to-date on each merged PR
 # Analyze merged PRs and suggest documentation updates
 # Creates new issue & instructs Claude assistant to create PR
 name: Claude Update Docs
