@@ -46,6 +46,14 @@ jobs:
 
             If it appears to be a duplicate, post a comment mentioning the original issue.
 
+            ## Label restrictions
+            Do NOT apply the "claude" label during triage. That label is a control
+            signal reserved for human users who want to manually summon @claude on
+            an existing issue — adding it here re-triggers the `claude.yml`
+            assistant workflow on top of any `@claude` mention already present in
+            the issue body, producing duplicate PRs. Stick to categorization labels
+            (bug, enhancement, documentation, question, priority levels, etc.).
+
             Your only responsibilities are to triage the current issue. Do not do anything that is not within this job scope.
 
           claude_args: |
