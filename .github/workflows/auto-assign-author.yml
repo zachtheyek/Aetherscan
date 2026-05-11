@@ -21,22 +21,31 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const actor = context.payload.sender.login;
+            const sender = context.payload.sender;
 
-            if (context.eventName === "issues") {
-              await github.rest.issues.addAssignees({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.issue.number,
-                assignees: [actor],
-              });
+            // GitHub's REST API does not support assigning bot/agent accounts
+            // (e.g. GitHub Apps, Copilot/Claude agents) via App installation
+            // tokens, so skip the assignment when the sender is not a human user.
+            if (sender.type !== "User") {
+              core.info(`Skipping assignment: sender ${sender.login} has type "${sender.type}"`);
+              return;
             }
 
-            if (context.eventName === "pull_request") {
+            const issueNumber = context.eventName === "issues"
+              ? context.payload.issue.number
+              : context.payload.pull_request.number;
+
+            try {
               await github.rest.issues.addAssignees({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                assignees: [actor],
+                issue_number: issueNumber,
+                assignees: [sender.login],
               });
+            } catch (error) {
+              // Defense-in-depth: if GitHub still rejects the assignment (e.g.
+              // an agent identity slips past the type check above), log it
+              // rather than failing the workflow — the issue/PR was created
+              // successfully and assignment is a non-critical convenience.
+              core.warning(`Could not assign ${sender.login}: ${error.message}`);
             }
