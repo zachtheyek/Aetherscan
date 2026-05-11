@@ -1963,14 +1963,16 @@ class TrainingPipeline:
 
             # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for? why are we calling model.predict_proba directly? is it better to have a wrapper here? could we modify the return signature of predict_proba to return both features & probabilities?)
             # Compute flattened features + val probas/preds for downstream plotting.
-            # val_preds is taken directly from the model (sklearn predict() uses argmax —
-            # equivalent to thresholding val_probas at 0.5 for the binary classifier, but
-            # sourced from the model so plots don't have to rederive it with a hard-coded
-            # threshold and risk drifting from the model's own decision rule).
+            # val_preds is thresholded at inference.classification_threshold so the
+            # confusion matrix, SHAP correct/incorrect markers, and decision-boundary
+            # markers all reflect the model's deployment operating point — not
+            # sklearn's argmax default (implicitly 0.5 for the binary RF), which
+            # would understate FN / overstate TP relative to production behavior.
             train_features = prepare_latent_features(train_latents, num_observations)
             val_features = prepare_latent_features(val_latents, num_observations)
             val_probas = self.rf_model.model.predict_proba(val_features)[:, 1].astype(np.float32)
-            val_preds = self.rf_model.model.predict(val_features).astype(np.int64)
+            classification_threshold = self.config.inference.classification_threshold
+            val_preds = (val_probas >= classification_threshold).astype(np.int64)
 
             # NOTE: come back to this later (what is this artifact for? is it handled properly by archiving functions on startup?)
             # Persist a single eval-artifact joblib that every RF plot function consumes
@@ -1984,6 +1986,7 @@ class TrainingPipeline:
                 "val_subtype_labels": val_subtype_labels,
                 "val_probas": val_probas,
                 "val_preds": val_preds,
+                "classification_threshold": classification_threshold,
                 # NOTE: come back to this later (why are we storing feature importances?)
                 "feature_importances": self.rf_model.model.feature_importances_.astype(np.float32),
                 "snr_base": snr_base,
@@ -4228,6 +4231,7 @@ class TrainingPipeline:
         val_subtype = artifacts["val_subtype_labels"]
         val_probas = artifacts["val_probas"]
         val_preds = artifacts["val_preds"]
+        classification_threshold = artifacts["classification_threshold"]
 
         # Binary confusion matrix
         cm_binary = confusion_matrix(val_binary, val_preds, labels=[0, 1])
@@ -4269,7 +4273,7 @@ class TrainingPipeline:
         ax_subtype = fig.add_subplot(gs[0, 1])
 
         fig.suptitle(
-            f"Random Forest Confusion Matrices ({tag}, {machine_name})",
+            f"Random Forest Confusion Matrices (t={classification_threshold:.2f}, {tag}, {machine_name})",
             fontsize=15,
             fontweight="bold",
         )
@@ -4897,6 +4901,7 @@ class TrainingPipeline:
         val_subtype = artifacts["val_subtype_labels"][summary_indices]
         val_binary = artifacts["val_binary_labels"][summary_indices]
         val_preds = artifacts["val_preds"][summary_indices]
+        classification_threshold = artifacts["classification_threshold"]
         correct = val_preds == val_binary
 
         # SHAP-space UMAP + KMeans persisted alongside the SHAP cache so re-runs
@@ -4904,8 +4909,6 @@ class TrainingPipeline:
         # layout. Unlike the cadence-level UMAP that plot_latent_space_gif fits
         # on raw latents, this projection is over the (n_summary × 48) SHAP
         # matrix, so it lives in its own joblib.
-        # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
-        # NOTE: use a global config seed instead of hard-coding
         clustering_path = os.path.join(self.config.model_path, f"rf_shap_clustering_{tag}.joblib")
         if os.path.exists(clustering_path):
             logger.info(f"Loading cached SHAP clustering from {clustering_path}")
@@ -4914,6 +4917,8 @@ class TrainingPipeline:
             cluster_labels = cached["cluster_labels"]
         else:
             logger.info("Fitting SHAP-space UMAP + KMeans on summary SHAP values")
+            # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
+            # NOTE: use a global config seed instead of hard-coding
             umap_model = umap.UMAP(
                 n_components=2, random_state=11, n_neighbors=15, min_dist=0.1
             ).fit(shap_values)
@@ -4946,7 +4951,7 @@ class TrainingPipeline:
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 9))
         fig.suptitle(
-            f"Random Forest SHAP Explanation Clustering ({tag}, {machine_name})",
+            f"Random Forest SHAP Explanation Clustering (t={classification_threshold:.2f}, {tag}, {machine_name})",
             fontsize=14,
             fontweight="bold",
         )
@@ -5281,6 +5286,7 @@ class TrainingPipeline:
         val_binary = artifacts["val_binary_labels"]
         val_subtype = artifacts["val_subtype_labels"]
         val_preds = artifacts["val_preds"]
+        classification_threshold = artifacts["classification_threshold"]
         correct = val_preds == val_binary
 
         max_points = self.config.training.rf_decision_boundary_max_points
@@ -5361,7 +5367,8 @@ class TrainingPipeline:
 
                 fig, ax = plt.subplots(1, 1, figsize=(11, 9))
                 fig.suptitle(
-                    f"Random Forest Decision Boundary (nn={nn}, md={md}) — ({tag}, {machine_name})",
+                    f"Random Forest Decision Boundary (nn={nn}, md={md}, "
+                    f"t={classification_threshold:.2f}) — ({tag}, {machine_name})",
                     fontsize=13,
                     fontweight="bold",
                 )
@@ -5375,11 +5382,16 @@ class TrainingPipeline:
                     alpha=0.4,
                 )
                 fig.colorbar(contourf, ax=ax, label="P(true)")
+                # Decision-boundary contour drawn at the deployment threshold (not the
+                # symmetric 0.5 midpoint) so the black line on the figure matches the
+                # rule the model will actually be deployed with — and is consistent
+                # with the correct/wrong markers below, which are also derived at this
+                # threshold.
                 ax.contour(
                     xx,
                     yy,
                     proba_grid,
-                    levels=[0.5],
+                    levels=[classification_threshold],
                     colors="black",
                     linewidths=1.6,
                 )
