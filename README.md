@@ -28,6 +28,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 - **Curriculum-based training regime** — Progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with constant backoff ensure graceful recovery from transient failures.
 - **Multiprocess-accelerated data pipelines with zero-copy parallelism** — Preprocessing and data generation modules execute in parallel worker pools, while shared memory architecture enables inter-process communication without serialization overhead. Custom SIGTERM handlers in workers ensure proper resource cleanup even during interruptions.
 - **Infrastructure services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack webhooks), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
+- **Random Forest diagnostic visualization suite** — Training automatically produces ten diagnostic plots covering model interpretability (SHAP summary, dependence, interactions, loss monitoring, and explanation clustering), calibration, confusion matrices (binary + 4-way subtype), ROC/PR/confidence curves, ensemble accuracy curves, and latent decision boundaries. Built on [SHAP](https://github.com/shap/shap) for model-agnostic explanations, with graceful degradation if SHAP is not installed.
 
 ---
 
@@ -73,6 +74,9 @@ cd Aetherscan
 conda env create -f environment.yml
 conda activate aetherscan
 ```
+
+> [!NOTE]
+> `shap>=0.43.0` is included in `environment.yml` for RF diagnostic visualizations. SHAP is soft-optional — if uninstalled, SHAP-specific plots are skipped gracefully while the rest of the pipeline continues.
 
 **3. Set environment variables**
 
@@ -154,6 +158,44 @@ aetherscan inference \
     --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
     --classification-threshold 0.9
 ```
+
+---
+
+## Training Outputs
+
+A training run (`aetherscan train`) produces the following artifacts in the output directory:
+
+**Model files**
+- `vae_encoder_<tag>.keras` / `vae_decoder_<tag>.keras` — Trained VAE encoder and decoder
+- `random_forest_<tag>.joblib` — Trained Random Forest classifier
+- `config_<tag>.json` — Config snapshot for reproducibility
+
+**RF evaluation artifacts**
+- `rf_eval_artifacts_<tag>.joblib` — Cached evaluation data (predictions, labels, probabilities) used by the diagnostic visualization suite
+- `rf_shap_values_<tag>.joblib` — Cached SHAP values for model interpretability plots
+
+**Diagnostic plots** (ten PNGs, generated automatically)
+- Confusion matrices (binary + 4-way subtype classification)
+- ROC, precision-recall, and confidence distribution curves
+- SHAP summary, dependence, interaction, loss monitoring, and explanation clustering plots
+- Calibration curve and ensemble accuracy curve
+- Latent decision boundary visualization
+
+**Latent space visualizations**
+- Dual UMAP joblibs (observation-level + cadence-level) per `(n_neighbors, min_dist)` combo
+- Animated GIFs showing latent space evolution across training steps
+
+### RF Visualization Config
+
+Five config fields control RF diagnostic plot behavior. These are not CLI-exposed but can be set programmatically via `get_config()`:
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `shap_max_samples_summary` | 5000 | Max samples for SHAP summary/dependence computation |
+| `shap_max_samples_interaction` | 1500 | Max samples for SHAP interaction values (O(F^2) per sample) |
+| `shap_top_k_features_dependence` | 48 | Number of SHAP dependence plot panels |
+| `rf_decision_boundary_grid_size` | 150 | Grid resolution for decision boundary contour |
+| `rf_decision_boundary_max_points` | 5000 | Max validation points for decision boundary plot |
 
 ---
 
