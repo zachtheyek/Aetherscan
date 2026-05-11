@@ -27,6 +27,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 - **Cadence-aware clustering loss** — The composite loss combines standard beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimic traditional signal locality filters.
 - **Curriculum-based training regime** — Progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with constant backoff ensure graceful recovery from transient failures.
 - **Multiprocess-accelerated data pipelines with zero-copy parallelism** — Preprocessing and data generation modules execute in parallel worker pools, while shared memory architecture enables inter-process communication without serialization overhead. Custom SIGTERM handlers in workers ensure proper resource cleanup even during interruptions.
+- **RF diagnostic visualization suite** — Training automatically produces ten diagnostic plots: SHAP-based model interpretability (summary, dependence, interactions, loss monitoring, explanation clustering), calibration curves, confusion matrices (binary + 4-way subtype), ROC/PR/confidence curves, ensemble accuracy curves, and latent decision boundaries. All plots are wrapped in `_safe_call` so a single failure cannot take down the pipeline.
 - **Infrastructure services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack webhooks), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
 
 ---
@@ -73,6 +74,9 @@ cd Aetherscan
 conda env create -f environment.yml
 conda activate aetherscan
 ```
+
+> [!NOTE]
+> `shap>=0.43.0` is included in `environment.yml` for SHAP-based model interpretability plots. SHAP is soft-optional: if uninstalled, the five SHAP-specific diagnostic plots are skipped gracefully while all other plots and pipeline stages continue normally.
 
 **3. Set environment variables**
 
@@ -139,6 +143,29 @@ aetherscan train \
     --load-tag round_10 \
     --save-tag test_v1
 ```
+
+### Training Outputs
+
+A training run produces the following artifacts in addition to the saved model files:
+
+**Serialized artifacts** (saved to `--model-path`):
+- `rf_eval_artifacts_<tag>.joblib` — cached RF evaluation data (val labels, features, probabilities) used by the diagnostic plots
+- `rf_shap_values_<tag>.joblib` — cached SHAP values (summary, interaction, log-loss decomposition) to avoid expensive recomputation
+
+**Diagnostic plots** (saved to `--output-path/plots/`):
+- `rf_confusion_matrices_<tag>.png` — binary (true vs false) and 4-way subtype confusion matrices
+- `rf_classification_curves_<tag>.png` — ROC, PR, and confidence histogram curves
+- `rf_shap_summary_<tag>.png` — SHAP beeswarm summary of top features driving predictions
+- `rf_shap_dependence_<tag>.png` — SHAP dependence plots for top-K features by mean |SHAP|
+- `rf_shap_interactions_<tag>.png` — pairwise SHAP interaction values (main effects on diagonal)
+- `rf_shap_loss_monitoring_<tag>.png` — log-loss SHAP decomposition for model monitoring
+- `rf_shap_explanation_clustering_<tag>.png` — UMAP + KMeans clustering of SHAP explanation vectors
+- `rf_calibration_curve_<tag>.png` — reliability diagram with Brier score and ECE
+- `rf_oob_accuracy_curve_<tag>.png` — cumulative ensemble accuracy vs tree count
+- `rf_latent_decision_boundary_nn<N>_md<D>_<tag>.png` — RF decision boundary overlaid on cadence-level UMAP (one per `(n_neighbors, min_dist)` combo)
+
+**Latent space visualizations** (saved to `--output-path/plots/`):
+- Dual UMAP joblibs (observation-level + cadence-level) per `(n_neighbors, min_dist)` combo
 
 ### Inference
 
@@ -420,6 +447,18 @@ options:
                         final_vX, round_XX, test_vX. Current timestamp used
                         (YYYYMMDD_HHMMSS) if none specified
 ```
+
+### RF Diagnostic Config Fields
+
+The following fields control the RF diagnostic visualization suite. They are not CLI-exposed but can be set programmatically via `get_config()`:
+
+| Field | Default | Description |
+| ----- | ------- | ----------- |
+| `shap_max_samples_summary` | 5000 | Max samples for SHAP summary/dependence computation |
+| `shap_max_samples_interaction` | 1500 | Max samples for SHAP interaction values (O(F²) per sample) |
+| `shap_top_k_features_dependence` | 48 | Number of SHAP dependence panels (default = all 6 obs × 8 latent dims) |
+| `rf_decision_boundary_grid_size` | 150 | Grid resolution for decision boundary contour (grid_size × grid_size) |
+| `rf_decision_boundary_max_points` | 5000 | Max val points rendered on the decision boundary plot |
 
 ### Inference Command Help
 
