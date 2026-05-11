@@ -1987,8 +1987,6 @@ class TrainingPipeline:
                 "val_probas": val_probas,
                 "val_preds": val_preds,
                 "classification_threshold": classification_threshold,
-                # NOTE: come back to this later (why are we storing feature importances?)
-                "feature_importances": self.rf_model.model.feature_importances_.astype(np.float32),
                 "snr_base": snr_base,
                 "snr_range": snr_range,
                 "tag": tag,
