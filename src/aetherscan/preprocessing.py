@@ -9,12 +9,16 @@ Uses multiprocessing and shared memory to process data in parallel
 from __future__ import annotations
 
 import contextlib
+import csv
 import gc
 import logging
 import os
 import signal
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 
+import hdf5plugin  # noqa: F401  # registers bitshuffle codec with h5py at import time
 import numpy as np
 from skimage.transform import downscale_local_mean
 
@@ -138,6 +142,115 @@ def _downsample_worker(args):
     else:
         logger.warning("No global chunk data available")
         return None
+
+
+@dataclass
+class CadenceGroup:
+    """One cadence's worth of observations grouped from a CSV."""
+
+    key: tuple  # the group-by column values
+    h5_paths: list[str]  # observation .h5 paths, in row order
+    csv_path: str  # source CSV
+    expected_obs: int
+    is_valid: bool  # True iff len(h5_paths) == expected_obs
+
+
+@dataclass
+class CadenceResult:
+    """Output of processing one cadence."""
+
+    npy_path: str
+    h5_paths: list[str]
+    key: tuple
+    n_hits: int
+    metadata_path: str  # sibling .pkl with hit details
+
+
+@dataclass
+class CadenceHit:
+    """A single energy detection hit on an ON-source observation."""
+
+    fine_channel: int  # absolute fine-channel index into the full spectrum
+    statistic: float  # D'Agostino-Pearson statistic
+    pvalue: float
+    frequency_mhz: float = field(default=float("nan"))
+
+
+def group_observations_from_csv(
+    csv_path: str,
+    group_by_cols: list[str],
+    h5_path_col: str,
+    expected_obs: int = 6,
+) -> tuple[list[CadenceGroup], list[CadenceGroup]]:
+    """
+    Group rows of a CSV into cadences.
+
+    Rows are grouped by the joint value of `group_by_cols` (rows are assumed
+    already ordered correctly within each group in the source CSV). The function
+    is column-agnostic: it never assumes specific column names beyond what the
+    caller provides.
+
+    Args:
+        csv_path: path to CSV
+        group_by_cols: columns whose joint value defines cadence membership
+        h5_path_col: column containing the .h5 file path for that observation
+        expected_obs: required number of observations per cadence (typically 6)
+
+    Returns:
+        (valid_groups, flagged_groups) — flagged groups have wrong obs count.
+
+    Raises:
+        FileNotFoundError: if csv_path doesn't exist.
+        KeyError: if any column in group_by_cols + [h5_path_col] is missing.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    required_cols = list(group_by_cols) + [h5_path_col]
+
+    groups: OrderedDict[tuple, list[str]] = OrderedDict()
+
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        available = reader.fieldnames or []
+
+        missing = [c for c in required_cols if c not in available]
+        if missing:
+            raise KeyError(
+                f"CSV {csv_path} is missing required column(s): {missing}. "
+                f"Available columns: {available}"
+            )
+
+        for row in reader:
+            key = tuple(row[c] for c in group_by_cols)
+            groups.setdefault(key, []).append(row[h5_path_col])
+
+    valid: list[CadenceGroup] = []
+    flagged: list[CadenceGroup] = []
+    for key, h5_paths in groups.items():
+        is_valid = len(h5_paths) == expected_obs
+        cg = CadenceGroup(
+            key=key,
+            h5_paths=h5_paths,
+            csv_path=csv_path,
+            expected_obs=expected_obs,
+            is_valid=is_valid,
+        )
+        (valid if is_valid else flagged).append(cg)
+
+    if flagged:
+        sample = [(g.key, len(g.h5_paths)) for g in flagged[:5]]
+        logger.warning(
+            f"Found {len(flagged)} cadence group(s) in {csv_path} with obs count != "
+            f"{expected_obs}; flagged and skipped. First {len(sample)}: {sample}"
+        )
+
+    logger.info(
+        f"Grouped {csv_path}: {len(valid)} valid cadence(s), {len(flagged)} flagged "
+        f"(expected_obs={expected_obs})"
+    )
+
+    return valid, flagged
 
 
 class DataPreprocessor:
