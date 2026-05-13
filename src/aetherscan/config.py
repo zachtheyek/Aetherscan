@@ -136,7 +136,11 @@ class DataConfig:
         ]
     )
     test_files: list[str] = field(default_factory=lambda: ["real_filtered_LARGE_test_HIP15638.npy"])
-    # TODO: have a new member called inference_files, whose values take precedence over test_files if not None (should still live inside self.data_path). test_files -> .npy, inference_files -> .h5 (add checks in validate_args & inference_command)
+    # Each entry is a CSV path (resolved via get_inference_file_path) whose rows
+    # describe individual .h5 observations to be grouped into cadences.
+    # If non-None, takes precedence over test_files during inference and triggers
+    # the energy detection preprocessing pipeline.
+    inference_files: list[str] | None = field(default_factory=lambda: None)
 
 
 @dataclass
@@ -255,6 +259,34 @@ class InferenceConfig:
     per_replica_batch_size: int = 2048  # NOTE: come back to this later
     classification_threshold: float = 0.9
 
+    # Energy detection preprocessing
+    cadence_group_by_cols: list[str] = field(
+        default_factory=lambda: ["Target", "Session", "Band", "Cadence ID"]
+    )
+    cadence_h5_path_col: str = ".h5 path"
+    cadence_expected_obs: int = 6  # observations per cadence (ABACAD)
+
+    coarse_channel_width: int = 1048576
+    parallel_coarse_chans: int = 28
+    spline_order: int = 16
+    detection_window_size: int = 256
+    detection_step_size: int = 128
+    stat_threshold: float = 2048.0
+    stamp_width: int = 4096
+
+    overlap_search: bool = False
+    overlap_fraction: float = 0.5
+
+    # Placeholder for future drop logic — wired but inert
+    discard_side_channels: bool = False
+    side_channel_count: int = 0
+
+    preprocess_output_dir: str | None = None  # defaults to <output_path>/preprocessed at runtime
+
+    # Fault tolerance (mirrors TrainingConfig)
+    max_retries: int = 3
+    retry_delay: int = 60  # seconds
+
 
 @dataclass
 class CheckpointConfig:
@@ -357,6 +389,10 @@ class Config:
         """Get full path for test data file"""
         return os.path.join(self.data_path, "testing", filename)
 
+    def get_inference_file_path(self, filename: str) -> str:
+        """Get full path for inference CSV file"""
+        return os.path.join(self.data_path, "inference", filename)
+
     def get_file_subset(self, filename: str) -> tuple[int | None, int | None]:
         """Get subset parameters for a file (start, end indices)"""
         # Option to define subsets for specific files to manage memory usage
@@ -435,6 +471,7 @@ class Config:
                 "inference_background_load_chunk_size": self.data.inference_background_load_chunk_size,
                 "train_files": self.data.train_files,
                 "test_files": self.data.test_files,
+                "inference_files": self.data.inference_files,
             },
             "training": {
                 "num_training_rounds": self.training.num_training_rounds,
@@ -481,6 +518,23 @@ class Config:
                 "config_path": self.inference.config_path,
                 "per_replica_batch_size": self.inference.per_replica_batch_size,
                 "classification_threshold": self.inference.classification_threshold,
+                "cadence_group_by_cols": self.inference.cadence_group_by_cols,
+                "cadence_h5_path_col": self.inference.cadence_h5_path_col,
+                "cadence_expected_obs": self.inference.cadence_expected_obs,
+                "coarse_channel_width": self.inference.coarse_channel_width,
+                "parallel_coarse_chans": self.inference.parallel_coarse_chans,
+                "spline_order": self.inference.spline_order,
+                "detection_window_size": self.inference.detection_window_size,
+                "detection_step_size": self.inference.detection_step_size,
+                "stat_threshold": self.inference.stat_threshold,
+                "stamp_width": self.inference.stamp_width,
+                "overlap_search": self.inference.overlap_search,
+                "overlap_fraction": self.inference.overlap_fraction,
+                "discard_side_channels": self.inference.discard_side_channels,
+                "side_channel_count": self.inference.side_channel_count,
+                "preprocess_output_dir": self.inference.preprocess_output_dir,
+                "max_retries": self.inference.max_retries,
+                "retry_delay": self.inference.retry_delay,
             },
             "checkpoint": {
                 "load_dir": self.checkpoint.load_dir,
