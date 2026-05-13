@@ -620,10 +620,16 @@ class DataPreprocessor:
 
     # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
     # NOTE: calculate intensity statistics to overlay with training distributions (C' vs C)?
-    def load_inference_data(self) -> np.ndarray:
+    def load_inference_data(self, override_filepaths: list[str] | None = None) -> np.ndarray:
         """
         Load & preprocess data for inference
         Uses parallel processing to load, downsample, and log-normalize the data
+
+        Args:
+            override_filepaths: If provided, iterate these absolute paths directly
+                instead of resolving config.data.test_files via get_test_file_path.
+                Used by find_hits() to chain per-cadence .npy outputs into inference
+                without monkey-patching paths.
 
         Returns:
             Array of preprocessed cadences with shape (n, 6, 16, width_bin_downsampled)
@@ -642,9 +648,16 @@ class DataPreprocessor:
 
         all_cadences = []
 
-        for filename in self.config.data.test_files:
-            filepath = self.config.get_test_file_path(filename)
+        if override_filepaths is not None:
+            # Iterate absolute paths directly (e.g. per-cadence .npy outputs from find_hits)
+            file_iter = [(os.path.basename(p), p) for p in override_filepaths]
+        else:
+            file_iter = [
+                (filename, self.config.get_test_file_path(filename))
+                for filename in self.config.data.test_files
+            ]
 
+        for filename, filepath in file_iter:
             if not os.path.exists(filepath):
                 logger.warning(f"File not found: {filepath}")
                 continue
