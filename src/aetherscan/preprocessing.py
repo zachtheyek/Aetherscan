@@ -13,6 +13,7 @@ import csv
 import gc
 import logging
 import os
+import pickle
 import signal
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -827,6 +828,453 @@ class DataPreprocessor:
 
         return cadence_array
 
-    # TODO: complete find_hits function to perform DC spike removal, bandpass filtering, and energy detection. should take .h5 filepaths as input, then write hits into (n, 6, 16, 4096) shaped .npy files (to data_path? output_path?). have boolean flag overlap_search as arg. if true, write additional cadence snippets +/- 50% in frequency from the actual hit to the .npy file. parametrize overlap amount to InferenceConfig().
-    def find_hits(self):
-        pass
+    def find_hits(self) -> list[CadenceResult]:
+        """
+        Convert raw .h5 cadence observations into (n_hits, 6, 16, stamp_width) .npy snippets.
+
+        Driven by CSVs in config.data.inference_files. Each CSV is grouped into
+        cadences via group_observations_from_csv() and processed sequentially.
+        Within each cadence, energy detection runs on ON-source files (positions
+        0, 2, 4 in ABACAD); stamps are extracted from all 6 observations at hit
+        frequencies.
+
+        Each cadence produces one .npy file on disk as soon as it's ready
+        (periodic checkpointing). On retry, cadences whose output already exists
+        are skipped.
+
+        Returns:
+            List of CadenceResult, one per successfully processed (or already
+            cached) cadence.
+        """
+        inference_files = self.config.data.inference_files
+        if not inference_files:
+            logger.warning("find_hits() called with no inference_files configured")
+            return []
+
+        # Resolve output directory
+        output_dir = self.config.inference.preprocess_output_dir or os.path.join(
+            self.config.output_path, "preprocessed"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Preprocessing output directory: {output_dir}")
+
+        group_by_cols = self.config.inference.cadence_group_by_cols
+        h5_path_col = self.config.inference.cadence_h5_path_col
+        expected_obs = self.config.inference.cadence_expected_obs
+
+        results: list[CadenceResult] = []
+
+        for csv_filename in inference_files:
+            csv_path = self.config.get_inference_file_path(csv_filename)
+            logger.info(f"Processing inference CSV: {csv_path}")
+
+            try:
+                valid_groups, flagged_groups = group_observations_from_csv(
+                    csv_path=csv_path,
+                    group_by_cols=group_by_cols,
+                    h5_path_col=h5_path_col,
+                    expected_obs=expected_obs,
+                )
+            except (FileNotFoundError, KeyError) as e:
+                logger.error(f"Failed to group CSV {csv_path}: {e}")
+                continue
+
+            logger.info(
+                f"CSV {csv_filename}: {len(valid_groups)} valid, {len(flagged_groups)} flagged"
+            )
+
+            csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
+
+            for group in valid_groups:
+                npy_filename = self._cadence_npy_filename(csv_stem, group.key)
+                npy_path = os.path.join(output_dir, npy_filename)
+
+                if os.path.exists(npy_path):
+                    # Resume path: rebuild a minimal CadenceResult from the existing file
+                    metadata_path = self._cadence_metadata_path(npy_path)
+                    try:
+                        existing = np.load(npy_path, mmap_mode="r")
+                        n_hits = existing.shape[0]
+                        del existing
+                    except Exception as e:
+                        logger.warning(
+                            f"Existing .npy at {npy_path} could not be inspected ({e}); "
+                            f"reprocessing cadence"
+                        )
+                    else:
+                        logger.info(
+                            f"Skipping cadence {group.key}: {npy_path} already exists "
+                            f"({n_hits} hits)"
+                        )
+                        results.append(
+                            CadenceResult(
+                                npy_path=npy_path,
+                                h5_paths=group.h5_paths,
+                                key=group.key,
+                                n_hits=n_hits,
+                                metadata_path=metadata_path,
+                            )
+                        )
+                        continue
+
+                try:
+                    cadence_result = self._process_cadence(group, npy_path)
+                except Exception as e:
+                    # Single-cadence failures should not abort the whole CSV;
+                    # the retry loop at the inference_command level handles broader recovery
+                    logger.error(f"Failed to process cadence {group.key}: {e}")
+                    continue
+
+                if cadence_result is not None:
+                    results.append(cadence_result)
+
+        logger.info(f"find_hits completed: {len(results)} cadence .npy files available")
+        return results
+
+    @staticmethod
+    def _cadence_npy_filename(csv_stem: str, key: tuple) -> str:
+        """Build a deterministic filename for a cadence group's .npy output."""
+        # Sanitize: replace path separators and whitespace in key components
+        safe_parts = [
+            str(part).replace(os.sep, "_").replace(" ", "_").replace("/", "_") for part in key
+        ]
+        return f"{csv_stem}_{'_'.join(safe_parts)}.npy"
+
+    @staticmethod
+    def _cadence_metadata_path(npy_path: str) -> str:
+        """Return the sibling .pkl path for a cadence's metadata."""
+        return os.path.splitext(npy_path)[0] + ".pkl"
+
+    def _process_cadence(self, group: CadenceGroup, npy_path: str) -> CadenceResult | None:
+        """
+        Run energy detection on one cadence and write its stamp .npy.
+
+        Energy detection runs only on ON-source observations (positions 0, 2, 4
+        in ABACAD order). Hits define the frequency slices extracted from all 6
+        observations.
+
+        Args:
+            group: validated CadenceGroup (len(h5_paths) == expected_obs)
+            npy_path: target output path (already absolute)
+
+        Returns:
+            CadenceResult on success, or None if no hits survived.
+        """
+        coarse_channel_width = self.config.inference.coarse_channel_width
+        parallel_chans = self.config.inference.parallel_coarse_chans
+        spl_order = self.config.inference.spline_order
+        window_size = self.config.inference.detection_window_size
+        step_size = self.config.inference.detection_step_size
+        stat_threshold = self.config.inference.stat_threshold
+        stamp_width = self.config.inference.stamp_width
+        overlap_search = self.config.inference.overlap_search
+        overlap_fraction = self.config.inference.overlap_fraction
+        time_bins = self.config.data.time_bins
+        n_processes = self.config.manager.n_processes
+
+        # Read header / metadata from the first ON-source file
+        on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
+        primary_h5 = on_source_paths[0]
+
+        with h5py.File(primary_h5, "r") as hf:
+            header = {k: hf["data"].attrs[k] for k in hf["data"].attrs}
+            data_shape = hf["data"].shape
+
+        n_chans = int(header.get("nchans", data_shape[-1]))
+        foff = float(header["foff"])
+        fch1 = float(header["fch1"])
+        n_time_avail = int(data_shape[0])
+
+        if n_time_avail < time_bins:
+            logger.warning(
+                f"Cadence {group.key}: primary file has only {n_time_avail} time bins, "
+                f"expected >= {time_bins}; skipping"
+            )
+            return None
+
+        num_blocks = n_chans // (coarse_channel_width * parallel_chans)
+        if num_blocks == 0:
+            logger.warning(
+                f"Cadence {group.key}: n_chans={n_chans} is smaller than one block "
+                f"({coarse_channel_width * parallel_chans}); skipping"
+            )
+            return None
+
+        block_width = coarse_channel_width * parallel_chans
+        logger.info(
+            f"Cadence {group.key}: n_chans={n_chans}, num_blocks={num_blocks}, "
+            f"block_width={block_width}, ON-source files={len(on_source_paths)}"
+        )
+
+        # Aggregate hits across all ON-source files
+        all_hits: list[tuple] = []  # (abs_idx, stat, p)
+
+        for on_source_idx, on_h5 in enumerate(on_source_paths):
+            logger.info(
+                f"Cadence {group.key}: running energy detection on ON-source "
+                f"{on_source_idx + 1}/{len(on_source_paths)}: {on_h5}"
+            )
+
+            for block_num in range(num_blocks):
+                block_offset = block_num * block_width
+                logger.info(
+                    f"  Block {block_num + 1}/{num_blocks} "
+                    f"(coarse {block_num * parallel_chans}..{(block_num + 1) * parallel_chans - 1})"
+                )
+
+                block_data = self._read_block(
+                    on_h5, block_num, parallel_chans, coarse_channel_width, n_processes
+                )
+
+                # Slice to first time_bins
+                block_data = block_data[:time_bins]
+
+                # In-place DC spike removal
+                _remove_dc_spike(block_data, coarse_channel_width, parallel_chans)
+
+                # _drop_side_channels(block_data, side_channel_count, coarse_channel_width)
+
+                cleaned_block = self._remove_block_bandpass(
+                    block_data, parallel_chans, coarse_channel_width, spl_order, n_processes
+                )
+
+                # Free original block memory; we only need the cleaned residuals downstream
+                del block_data
+
+                block_hits = self._threshold_block_hits(
+                    cleaned_block,
+                    parallel_chans,
+                    coarse_channel_width,
+                    window_size,
+                    step_size,
+                    stat_threshold,
+                    block_offset,
+                    n_processes,
+                )
+
+                all_hits.extend(block_hits)
+
+                del cleaned_block
+                gc.collect()
+
+        logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
+
+        # Deduplicate: greedy merge of any pair within stamp_width // 2
+        merged_hits = self._deduplicate_hits(all_hits, stamp_width)
+        logger.info(
+            f"Cadence {group.key}: {len(merged_hits)} hits after deduplication "
+            f"(stamp_width={stamp_width})"
+        )
+
+        if not merged_hits:
+            logger.info(f"Cadence {group.key}: no hits survived; skipping")
+            return None
+
+        # Build the stamp centers (optionally including overlap offsets)
+        stamp_centers: list[tuple[int, float, float]] = []
+        offsets = [0]
+        if overlap_search:
+            offset_mag = int(overlap_fraction * stamp_width)
+            offsets = [-offset_mag, 0, offset_mag]
+
+        half = stamp_width // 2
+        for hit in merged_hits:
+            abs_idx, stat, pval = hit
+            for offset in offsets:
+                center = abs_idx + offset
+                start = center - half
+                end = center + half
+                if start < 0 or end > n_chans:
+                    continue
+                stamp_centers.append((start, stat, pval))
+
+        if not stamp_centers:
+            logger.info(f"Cadence {group.key}: no valid in-bounds stamps; skipping")
+            return None
+
+        # Extract stamps for all 6 observations (sequential per file, no pool)
+        cadence_stamps = np.zeros(
+            (len(stamp_centers), len(group.h5_paths), time_bins, stamp_width), dtype=np.float32
+        )
+
+        for obs_idx, obs_h5 in enumerate(group.h5_paths):
+            with h5py.File(obs_h5, "r") as hf:
+                for stamp_idx, (start, _, _) in enumerate(stamp_centers):
+                    end = start + stamp_width
+                    cadence_stamps[stamp_idx, obs_idx] = hf["data"][:time_bins, 0, start:end]
+
+        # Write the .npy and the sibling metadata
+        np.save(npy_path, cadence_stamps)
+
+        metadata_path = self._cadence_metadata_path(npy_path)
+        # Per-stamp frequency = center bin's frequency, computed from header's fch1/foff
+        stamp_freqs_mhz = [float(fch1 + foff * (start + half)) for start, _, _ in stamp_centers]
+        stamp_stats = [float(s) for _, s, _ in stamp_centers]
+        stamp_pvals = [float(p) for _, _, p in stamp_centers]
+
+        metadata = {
+            "key": group.key,
+            "csv_path": group.csv_path,
+            "h5_paths": group.h5_paths,
+            "header": header,
+            "stamp_starts": [int(start) for start, _, _ in stamp_centers],
+            "stamp_width": stamp_width,
+            "stamp_frequencies_mhz": stamp_freqs_mhz,
+            "stamp_statistics": stamp_stats,
+            "stamp_pvalues": stamp_pvals,
+            "overlap_search": overlap_search,
+            "overlap_fraction": overlap_fraction if overlap_search else None,
+        }
+        with open(metadata_path, "wb") as f:
+            pickle.dump(metadata, f)
+
+        gc.collect()
+
+        logger.info(
+            f"Cadence {group.key}: wrote {cadence_stamps.shape[0]} stamps -> "
+            f"{npy_path} (metadata: {metadata_path})"
+        )
+
+        return CadenceResult(
+            npy_path=npy_path,
+            h5_paths=group.h5_paths,
+            key=group.key,
+            n_hits=cadence_stamps.shape[0],
+            metadata_path=metadata_path,
+        )
+
+    def _read_block(
+        self,
+        h5_path: str,
+        block_num: int,
+        parallel_chans: int,
+        coarse_channel_width: int,
+        n_processes: int,
+    ) -> np.ndarray:
+        """Read parallel_chans coarse channels in parallel and concatenate."""
+        args_list = [
+            (h5_path, ch, coarse_channel_width)
+            for ch in range(block_num * parallel_chans, (block_num + 1) * parallel_chans)
+        ]
+
+        # The read worker doesn't need shared memory; create a plain pool
+        if n_processes > 1:
+            pool = self.manager.create_pool(
+                n_processes=min(parallel_chans, n_processes),
+                name=f"DataPreproc_read_block_{block_num}",
+            )
+            try:
+                results = pool.map(_read_coarse_channel_worker, args_list)
+            finally:
+                self.manager.close_pool(pool)
+        else:
+            results = [_read_coarse_channel_worker(a) for a in args_list]
+
+        return np.concatenate(results, axis=1)
+
+    def _remove_block_bandpass(
+        self,
+        block_data: np.ndarray,
+        parallel_chans: int,
+        coarse_channel_width: int,
+        spl_order: int,
+        n_processes: int,
+    ) -> np.ndarray:
+        """Spline-fit + subtract bandpass per coarse channel, return cleaned block."""
+        args_list = [(ch, coarse_channel_width, spl_order) for ch in range(parallel_chans)]
+
+        if n_processes > 1:
+            shm = self.manager.create_shared_memory(
+                size=block_data.nbytes,
+                name="DataPreproc_bandpass_block",
+            )
+            shared = np.ndarray(block_data.shape, dtype=block_data.dtype, buffer=shm.buf)
+            shared[:] = block_data[:]
+
+            pool = self.manager.create_pool(
+                n_processes=min(parallel_chans, n_processes),
+                name="DataPreproc_bandpass_block",
+                initializer=_init_worker,
+                initargs=(shm.name, block_data.shape, block_data.dtype),
+            )
+            try:
+                results = pool.map(_remove_bandpass_worker, args_list)
+            finally:
+                del shared
+                self.manager.close_shared_memory(shm)
+                self.manager.close_pool(pool)
+        else:
+            global _GLOBAL_CHUNK_DATA
+            _GLOBAL_CHUNK_DATA = block_data
+            results = [_remove_bandpass_worker(a) for a in args_list]
+            _GLOBAL_CHUNK_DATA = None
+
+        return np.concatenate(results, axis=1)
+
+    def _threshold_block_hits(
+        self,
+        cleaned_block: np.ndarray,
+        parallel_chans: int,
+        coarse_channel_width: int,
+        window_size: int,
+        step_size: int,
+        stat_threshold: float,
+        block_offset: int,
+        n_processes: int,
+    ) -> list[tuple]:
+        """Sliding-window normality test across one cleaned block, return all hits."""
+        args_list = [
+            (ch, coarse_channel_width, window_size, step_size, stat_threshold, block_offset)
+            for ch in range(parallel_chans)
+        ]
+
+        if n_processes > 1:
+            shm = self.manager.create_shared_memory(
+                size=cleaned_block.nbytes,
+                name="DataPreproc_threshold_block",
+            )
+            shared = np.ndarray(cleaned_block.shape, dtype=cleaned_block.dtype, buffer=shm.buf)
+            shared[:] = cleaned_block[:]
+
+            pool = self.manager.create_pool(
+                n_processes=min(parallel_chans, n_processes),
+                name="DataPreproc_threshold_block",
+                initializer=_init_worker,
+                initargs=(shm.name, cleaned_block.shape, cleaned_block.dtype),
+            )
+            try:
+                results = pool.map(_threshold_hits_worker, args_list)
+            finally:
+                del shared
+                self.manager.close_shared_memory(shm)
+                self.manager.close_pool(pool)
+        else:
+            global _GLOBAL_CHUNK_DATA
+            _GLOBAL_CHUNK_DATA = cleaned_block
+            results = [_threshold_hits_worker(a) for a in args_list]
+            _GLOBAL_CHUNK_DATA = None
+
+        flat: list[tuple] = []
+        for r in results:
+            flat.extend(r)
+        return flat
+
+    @staticmethod
+    def _deduplicate_hits(hits: list[tuple], stamp_width: int) -> list[tuple]:
+        """
+        Greedy merge of hits whose centers are within stamp_width // 2,
+        keeping the one with the higher statistic.
+        """
+        if not hits:
+            return []
+        sorted_hits = sorted(hits, key=lambda h: h[0])
+        half = stamp_width // 2
+        merged: list[tuple] = [sorted_hits[0]]
+        for h in sorted_hits[1:]:
+            prev = merged[-1]
+            if h[0] - prev[0] < half:
+                if h[1] > prev[1]:
+                    merged[-1] = h
+            else:
+                merged.append(h)
+        return merged
