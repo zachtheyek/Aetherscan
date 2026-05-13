@@ -18,8 +18,10 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 
+import h5py
 import hdf5plugin  # noqa: F401  # registers bitshuffle codec with h5py at import time
 import numpy as np
+from scipy import interpolate, stats
 from skimage.transform import downscale_local_mean
 
 from aetherscan.config import get_config
@@ -142,6 +144,149 @@ def _downsample_worker(args):
     else:
         logger.warning("No global chunk data available")
         return None
+
+
+# --- Energy detection helpers & workers ---
+
+
+def _remove_dc_spike(
+    block_data: np.ndarray, coarse_channel_width: int, n_coarse_channels: int
+) -> None:
+    """
+    Interpolate over the 2-bin DC spike at the center of each coarse channel, in place.
+
+    Mirrors preprocess_fine.py:72-75 from the reference implementation.
+
+    Args:
+        block_data: shape (time_bins, n_coarse_channels * coarse_channel_width)
+        coarse_channel_width: fine channels per coarse channel
+        n_coarse_channels: number of coarse channels in block_data
+    """
+    half_chan = coarse_channel_width // 2
+    for i in range(n_coarse_channels):
+        dc_ind = i * coarse_channel_width + half_chan
+        block_data[:, dc_ind] = (block_data[:, dc_ind + 1] + block_data[:, dc_ind - 3]) / 2
+        block_data[:, dc_ind - 1] = (block_data[:, dc_ind + 2] + block_data[:, dc_ind - 2]) / 2
+
+
+def _fit_channel_bandpass(
+    integrated_channel: np.ndarray, channel_width: int, spl_order: int
+) -> np.ndarray:
+    """
+    Fit a spline bandpass to a time-integrated coarse channel.
+
+    Mirrors utils.py:17-22 from the reference implementation.
+
+    Args:
+        integrated_channel: 1-D array of shape (channel_width,), time-integrated
+        channel_width: fine channels per coarse channel
+        spl_order: spline order (higher = more knots = finer fit)
+
+    Returns:
+        1-D bandpass fit of shape (channel_width,)
+    """
+    x = np.arange(channel_width)
+    knots = np.arange(0, channel_width, channel_width // spl_order + 1)
+    spl = interpolate.splrep(x, integrated_channel, t=knots[1:])
+    return interpolate.splev(x, spl)
+
+
+def _read_coarse_channel_worker(args: tuple) -> np.ndarray:
+    """
+    Worker: read one coarse channel from an .h5 file.
+
+    Workers open their own h5py.File (h5py file handles are fork-unsafe to share).
+
+    Args:
+        args: (h5_path, channel_index, coarse_channel_width)
+
+    Returns:
+        ndarray of shape (time_bins, coarse_channel_width)
+    """
+    h5_path, channel_index, coarse_channel_width = args
+    start = channel_index * coarse_channel_width
+    end = (channel_index + 1) * coarse_channel_width
+    with h5py.File(h5_path, "r") as hf:
+        return hf["data"][:, 0, start:end]
+
+
+def _remove_bandpass_worker(args: tuple) -> np.ndarray:
+    """
+    Worker: subtract the per-coarse-channel spline bandpass from one coarse channel.
+
+    Reads its slice from _GLOBAL_CHUNK_DATA (a (time_bins, n_coarse*width) view of
+    the current block's shared memory).
+
+    Args:
+        args: (channel_index, coarse_channel_width, spl_order)
+
+    Returns:
+        Bandpass-cleaned slice of shape (time_bins, coarse_channel_width)
+    """
+    channel_index, coarse_channel_width, spl_order = args
+
+    if _GLOBAL_CHUNK_DATA is None:
+        logger.warning("No global chunk data available for bandpass removal")
+        return np.zeros((0, coarse_channel_width))
+
+    start = channel_index * coarse_channel_width
+    end = (channel_index + 1) * coarse_channel_width
+    channel = _GLOBAL_CHUNK_DATA[:, start:end]
+    integrated_channel = np.mean(channel, axis=0)
+    fit = _fit_channel_bandpass(integrated_channel, coarse_channel_width, spl_order)
+    return channel - fit
+
+
+def _threshold_hits_worker(args: tuple) -> list[tuple]:
+    """
+    Worker: slide a window across one coarse channel and emit hits above threshold.
+
+    The window is run through scipy.stats.normaltest (D'Agostino-Pearson).
+    Reads its slice from _GLOBAL_CHUNK_DATA (cleaned residuals for this block).
+
+    Args:
+        args: (channel_index, coarse_channel_width, window_size, step_size,
+               stat_threshold, block_offset)
+            block_offset is added to the returned absolute index so callers see
+            indices in the full spectrum rather than block-relative.
+
+    Returns:
+        List of (absolute_fine_channel_index, statistic, pvalue) tuples.
+    """
+    (
+        channel_index,
+        coarse_channel_width,
+        window_size,
+        step_size,
+        stat_threshold,
+        block_offset,
+    ) = args
+
+    if _GLOBAL_CHUNK_DATA is None:
+        logger.warning("No global chunk data available for hit thresholding")
+        return []
+
+    start = channel_index * coarse_channel_width
+    end = (channel_index + 1) * coarse_channel_width
+    channel = _GLOBAL_CHUNK_DATA[:, start:end]
+
+    hits: list[tuple] = []
+    for i in range(0, coarse_channel_width - window_size, step_size):
+        window = channel[:, i : i + window_size]
+        s, p = stats.normaltest(window.flatten())
+        if s > stat_threshold:
+            abs_idx = block_offset + channel_index * coarse_channel_width + i
+            hits.append((abs_idx, float(s), float(p)))
+
+    return hits
+
+
+# def _drop_side_channels(
+#     block_data: np.ndarray, side_channel_count: int, coarse_channel_width: int
+# ) -> None:
+#     """Zero out the leading/trailing side_channel_count coarse channels of a block.
+#     Reserved for future use — leave as-is until the energy-profile criterion is defined."""
+#     pass
 
 
 @dataclass
