@@ -31,53 +31,92 @@ logger = logging.getLogger(__name__)
 
 # NOTE: split this into strategy.py? have config option & cli flag to set single-GPU, multi-GPU, multi-node strategy. test thoroughly for each option
 # NOTE: how to only run on specific GPUs, rather than all GPUs?
+def _warmup_collective(strategy):
+    """Trigger a tiny cross-device reduction to surface NCCL failures at setup time.
+
+    MirroredStrategy construction with NcclAllReduce never fails on its own — NCCL
+    errors only surface on the first actual collective. Doing a 1-element reduce
+    here lets us catch (and fall back from) NCCL failures before training starts,
+    rather than mid-epoch.
+    """
+
+    @tf.function
+    def _per_replica():
+        return tf.constant(1.0)
+
+    per_replica_value = strategy.run(_per_replica)
+    _ = strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_value, axis=None)
+
+
 def setup_gpu_strategy():
     """Configure GPU memory growth, memory limits, multi-GPU strategy with load balancing & async allocator"""
 
-    os.environ["TF_GPU_ALLOCATOR"] = (
-        "cuda_malloc_async"  # Prevent memory fragmentation within each GPU
-    )
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+
+    # Both env vars are read lazily by TF when GPU memory is first allocated, so we set
+    # them before the first tf.config.* call below.
+    if config.gpu.use_async_allocator:
+        # Prevent memory fragmentation within each GPU.
+        os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+    else:
+        # Explicitly clear so a previous run's env doesn't leak in.
+        os.environ.pop("TF_GPU_ALLOCATOR", None)
+
     os.environ["TF_ENABLE_GPU_GARBAGE_COLLECTION"] = (
         "true"  # Aggressive cleanup of intermediate tensors
     )
 
     gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        try:
-            # Set equal memory limits for all GPUs
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-                tf.config.experimental.set_virtual_device_configuration(
+    if not gpus:
+        logger.warning("No GPUs detected, running on CPU")
+        return None
+
+    try:
+        for gpu in gpus:
+            # set_memory_growth stayed under tf.config.experimental in TF 2.17.
+            tf.config.experimental.set_memory_growth(gpu, True)
+            # set_logical_device_configuration is the stable replacement for the
+            # deprecated experimental.set_virtual_device_configuration.
+            # When per_gpu_memory_limit_mb is None we skip this call entirely and
+            # rely on memory-growth only (recommended default on 96 GB Blackwell cards).
+            if config.gpu.per_gpu_memory_limit_mb is not None:
+                tf.config.set_logical_device_configuration(
                     gpu,
                     [
-                        tf.config.experimental.VirtualDeviceConfiguration(memory_limit=14000)
-                    ],  # 14GiB limit per GPU
+                        tf.config.LogicalDeviceConfiguration(
+                            memory_limit=config.gpu.per_gpu_memory_limit_mb
+                        )
+                    ],
                 )
 
-            # Set distributed strategy to prevent uneven GPU memory usage
-            try:
-                # Primary choice: NCCL for NVIDIA GPUs
-                strategy = tf.distribute.MirroredStrategy(
-                    cross_device_ops=tf.distribute.NcclAllReduce(num_packs=2)
-                )
-                logger.info("Using NcclAllReduce for optimal NVIDIA GPU performance")
+        num_packs = config.gpu.nccl_num_packs
 
-            except Exception as e:
-                # Fallback: HierarchicalCopyAllReduce
-                logger.warning(f"NCCL failed ({e}), using HierarchicalCopyAllReduce")
-                strategy = tf.distribute.MirroredStrategy(
-                    cross_device_ops=tf.distribute.HierarchicalCopyAllReduce(num_packs=2)
-                )
+        # Try NCCL first; fall back to HierarchicalCopyAllReduce only if the
+        # warmup all-reduce actually fails. NCCL 2.25.1 is the first NCCL with
+        # official sm_120 (Blackwell) support, so this path is especially load-bearing
+        # on the Blackwell cluster.
+        try:
+            strategy = tf.distribute.MirroredStrategy(
+                cross_device_ops=tf.distribute.NcclAllReduce(num_packs=num_packs)
+            )
+            _warmup_collective(strategy)
+            logger.info("Using NcclAllReduce for optimal NVIDIA GPU performance")
+        except Exception as e:
+            logger.warning(
+                f"NCCL warmup all-reduce failed ({e}), falling back to HierarchicalCopyAllReduce"
+            )
+            strategy = tf.distribute.MirroredStrategy(
+                cross_device_ops=tf.distribute.HierarchicalCopyAllReduce(num_packs=num_packs)
+            )
+            _warmup_collective(strategy)
 
-            logger.info(f"Distributed strategy: {strategy.num_replicas_in_sync} GPUs")
-            return strategy
+        logger.info(f"Distributed strategy: {strategy.num_replicas_in_sync} GPUs")
+        return strategy
 
-        except RuntimeError as e:
-            logger.error(f"GPU configuration error: {e}")
-            return None
-
-    else:
-        logger.warning("No GPUs detected, running on CPU")
+    except RuntimeError as e:
+        logger.error(f"GPU configuration error: {e}")
         return None
 
 

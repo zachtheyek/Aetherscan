@@ -48,6 +48,31 @@ class MonitorConfig:
 
 
 @dataclass
+class GPUConfig:
+    """GPU runtime configuration
+
+    Tunable per machine. Defaults are tuned for the Blackwell workstation
+    (5x RTX PRO 6000, 96 GB each): memory-growth-only allocation, NCCL collectives
+    with num_packs=2, and the cuda_malloc_async allocator to prevent fragmentation.
+    Override via CLI flags (--gpu-memory-limit-mb / --nccl-num-packs / --no-async-allocator)
+    when running on machines with smaller GPUs (e.g. set --gpu-memory-limit-mb 14000
+    to reproduce the legacy Ampere A4000 behavior).
+    """
+
+    # Per-GPU memory cap in MiB. None means memory-growth-only (recommended on Blackwell).
+    # When set, TF allocates a fixed logical device of this size per physical GPU.
+    per_gpu_memory_limit_mb: int | None = None
+
+    # num_packs for the NCCL / HierarchicalCopy all-reduce. Lower (1) reduces latency
+    # for tiny tensors; higher (4+) can help bandwidth on >4-GPU topologies.
+    nccl_num_packs: int = 2
+
+    # Toggle for TF_GPU_ALLOCATOR=cuda_malloc_async. Disable as a workaround for
+    # OOM bugs reported in NGC 25.02 multi-GPU workloads.
+    use_async_allocator: bool = True
+
+
+@dataclass
 class LoggerConfig:
     """Logger configuration"""
 
@@ -353,6 +378,7 @@ class Config:
         self.db = DBConfig()
         self.manager = ManagerConfig()
         self.monitor = MonitorConfig()
+        self.gpu = GPUConfig()
         self.logger = LoggerConfig()
         self.beta_vae = BetaVAEConfig()
         self.rf = RandomForestConfig()
@@ -438,6 +464,11 @@ class Config:
                 "stop_monitor_timeout": self.monitor.stop_monitor_timeout,
                 "monitor_interval": self.monitor.monitor_interval,
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
+            },
+            "gpu": {
+                "per_gpu_memory_limit_mb": self.gpu.per_gpu_memory_limit_mb,
+                "nccl_num_packs": self.gpu.nccl_num_packs,
+                "use_async_allocator": self.gpu.use_async_allocator,
             },
             "logger": {
                 "console_level": self.logger.console_level,
