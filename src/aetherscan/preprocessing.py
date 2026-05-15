@@ -11,9 +11,9 @@ from __future__ import annotations
 import contextlib
 import csv
 import gc
+import json
 import logging
 import os
-import pickle
 import re
 import signal
 from collections import OrderedDict
@@ -331,7 +331,7 @@ class CadenceResult:
     h5_paths: list[str]  # Same as in CadenceGroup
     key: tuple  # Same as in CadenceGroup
     n_hits: int
-    metadata_path: str  # Sibling .pkl with hit details
+    metadata_path: str  # Sibling .json with hit details
 
 
 # NOTE: come back to this later
@@ -987,8 +987,29 @@ class DataPreprocessor:
 
     @staticmethod
     def _cadence_metadata_path(npy_path: str) -> str:
-        """Return the sibling .pkl path for a cadence's metadata."""
-        return os.path.splitext(npy_path)[0] + ".pkl"
+        """Return the sibling .json path for a cadence's metadata."""
+        return os.path.splitext(npy_path)[0] + ".json"
+
+    @staticmethod
+    def _to_json_safe(obj):
+        """
+        Coerce h5py / numpy values into JSON-native types.
+
+        h5py attributes can be bytes, numpy scalars, or numpy arrays — none of
+        which json.dump handles by default. Walk the structure once and
+        convert leaf nodes; everything else passes through.
+        """
+        if isinstance(obj, dict):
+            return {str(k): DataPreprocessor._to_json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [DataPreprocessor._to_json_safe(v) for v in obj]
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        if isinstance(obj, np.ndarray):
+            return DataPreprocessor._to_json_safe(obj.tolist())
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+        return obj
 
     # NOTE: come back to this later (does a cadence snippet get created if only 1 of the ON observations crosses the threshold, or all 3? should probably be all 3 as of now since models are trained on signals that don't yet drift out of frame?)
     def _process_cadence(self, group: CadenceGroup, npy_path: str) -> CadenceResult | None:
@@ -1188,8 +1209,8 @@ class DataPreprocessor:
             "overlap_fraction": overlap_fraction if overlap_search else None,
         }
         tmp_metadata_path = metadata_path + ".tmp"
-        with open(tmp_metadata_path, "wb") as f:
-            pickle.dump(metadata, f)
+        with open(tmp_metadata_path, "w") as f:
+            json.dump(self._to_json_safe(metadata), f, indent=2)
         os.replace(tmp_metadata_path, metadata_path)
 
         gc.collect()
