@@ -1,3 +1,7 @@
+# Ampere (A4000) conda environment.
+# Kept in API lockstep with the NGC TF 25.02 container that targets the Blackwell
+# cluster (see aetherscan.def + requirements-container.txt): same TF/Keras/NumPy
+# major versions so checkpoints and @tf.function tracing behave identically.
 # TODO: test with fresh conda install on train & inference
 name: aetherscan
 channels:
@@ -6,25 +10,25 @@ channels:
   - nvidia
 dependencies:
   - python=3.10
-  - numpy=1.23.*
-  - scipy=1.11.*
-  - scikit-learn=1.3.*
-  - scikit-image=0.21.*
-  - astropy=5.3.*
-  - matplotlib=3.7.*
-  - joblib=1.3.*
-  - h5py=3.9.*
+  - numpy=1.26.*
+  - scipy=1.13.*
+  - scikit-learn=1.5.*
+  - scikit-image=0.24.*
+  - astropy=6.1.*
+  - matplotlib=3.9.*
+  - joblib=1.4.*
+  - h5py=3.11.*
   - hdf5plugin
-  - psutil=5.9.*
-  - pytest=7.4.*
+  - psutil=6.0.*
+  - pytest=8.2.*
   - ipykernel
-  - nvidia::cuda-runtime=12.2.*
-  - cudnn=8.9.*
+  - nvidia::cuda-runtime=12.5.*
+  - cudnn=9.3.*
   - pip
   - pip:
-      - tensorflow==2.16.*
+      - tensorflow==2.17.*
       - setigen
-      - imageio>=2.31.0
-      - umap-learn>=0.5.0
-      - shap>=0.43.0
-      - slack-sdk>=3.23.0
+      - imageio>=2.34.0
+      - umap-learn>=0.5.6
+      - shap>=0.46.0
+      - slack-sdk>=3.31.0

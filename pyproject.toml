@@ -18,7 +18,10 @@ maintainers = [
 ]
 description = "Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale"
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.10 covers the Ampere conda env; 3.12 covers the NGC TF 25.02 container used
+# on the Blackwell cluster. Upper bound is exclusive — TF 2.17 wheels do not yet
+# target 3.13.
+requires-python = ">=3.10,<3.13"
 dependencies = [
     # TODO: sync with environment.yml files (include for uv)
 ]
@@ -36,9 +39,10 @@ keywords = [
 ]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",  # TODO: update development status on v1 release
-    "Programming Language :: Python :: 3.10",  # TODO: test on later python versions?
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
     "Operating System :: Unix",
-    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",  # TODO: test on later cuda versions?
+    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.8",
     "License :: OSI Approved :: BSD License",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
