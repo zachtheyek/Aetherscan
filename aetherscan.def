@@ -1,0 +1,45 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+
+# Aetherscan container recipe.
+#
+# Compatible with both Apptainer (>=1.3) and SingularityCE (>=4.0). Build it on
+# the target cluster so the resulting .sif uses that cluster's native runtime:
+#
+#   # Apptainer (Ampere cluster, 1.4.5):
+#   apptainer build aetherscan-ngc25.02.sif aetherscan.def
+#
+#   # SingularityCE (Blackwell cluster, 4.1.1):
+#   singularity build aetherscan-ngc25.02.sif aetherscan.def
+#
+# The NGC TensorFlow 25.02 base image ships TF 2.17 with CUDA 12.8 and the
+# Blackwell-ready kernels (sm_120). NVIDIA has announced 25.02 as the final NGC
+# TF container; if Aetherscan ever needs to migrate off it, swap the `From:`
+# line and re-test.
+
+%files
+    requirements-container.txt /tmp/requirements-container.txt
+
+%post
+    # Install pip extras layered onto the NGC base.
+    pip install --no-cache-dir -r /tmp/requirements-container.txt
+
+%environment
+    # Prevent the container from picking up host-side Python packages, which
+    # would otherwise shadow the carefully-pinned versions inside the image.
+    export PYTHONNOUSERSITE=1
+    # Quieten TF startup noise; INFO+ still prints, only the C++ INFO floodgate closes.
+    export TF_CPP_MIN_LOG_LEVEL=1
+
+%labels
+    Maintainer Zach Yek <xiaoxiyek1.5@gmail.com>
+    Project    Aetherscan
+    Base       nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+    TF         2.17
+    CUDA       12.8
+    Purpose    Blackwell (sm_120) + Ampere (sm_86) GPU support for Aetherscan
+
+%help
+    Aetherscan runtime image (TF 2.17 / CUDA 12.8 / Python 3.12).
+    Use scripts/run-container.sh from the repo root to launch commands:
+        ./scripts/run-container.sh python -m aetherscan.main train --save-tag test_v1
