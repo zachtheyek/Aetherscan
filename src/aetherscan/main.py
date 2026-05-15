@@ -295,29 +295,41 @@ def inference_command():
     max_retries = config.inference.max_retries
     retry_delay = config.inference.retry_delay
     results = None
+    # Cache cadence_data across retry attempts: once preprocessing + loading
+    # succeeds, an inference-only failure shouldn't trigger a re-load /
+    # re-downsample / re-log-norm pass. Mirrors how train_command loads
+    # background_data once outside its retry loop.
+    cadence_data: np.ndarray | None = None
+    npy_path_for_logging: str | None = None
 
     for attempt in range(max_retries):
         try:
             logger.info(f"Inference attempt: {attempt + 1}/{max_retries}")
 
-            # Preprocessing stage (energy detection + stamp extraction)
-            if config.data.inference_files is not None:
-                cadence_results = preprocessor.find_hits()
-                if not cadence_results:
-                    logger.error("No cadence results produced by preprocessing")
-                    sys.exit(1)
-                npy_paths = [cr.npy_path for cr in cadence_results]
-                logger.info(
-                    f"Preprocessing produced {len(npy_paths)} cadence .npy file(s); "
-                    f"loading into inference"
-                )
-                cadence_data = preprocessor.load_inference_data(
-                    override_filepaths=npy_paths
-                ).astype(np.float32)
-                npy_path_for_logging = npy_paths[0]
+            # Preprocessing + load stage. Skipped on retry if a previous attempt
+            # already produced cadence_data (i.e. only the inference stage failed).
+            if cadence_data is None:
+                if config.data.inference_files is not None:
+                    cadence_results = preprocessor.find_hits()
+                    if not cadence_results:
+                        logger.error("No cadence results produced by preprocessing")
+                        sys.exit(1)
+                    npy_paths = [cr.npy_path for cr in cadence_results]
+                    logger.info(
+                        f"Preprocessing produced {len(npy_paths)} cadence .npy file(s); "
+                        f"loading into inference"
+                    )
+                    cadence_data = preprocessor.load_inference_data(
+                        override_filepaths=npy_paths
+                    ).astype(np.float32)
+                    npy_path_for_logging = npy_paths[0]
+                else:
+                    cadence_data = preprocessor.load_inference_data().astype(np.float32)
+                    npy_path_for_logging = config.data.test_files[0]
             else:
-                cadence_data = preprocessor.load_inference_data().astype(np.float32)
-                npy_path_for_logging = config.data.test_files[0]
+                logger.info(
+                    "Reusing cadence_data from previous attempt (skipping preprocessing + load)"
+                )
 
             # NOTE: come back to this later (inference-stage resume should skip cadences already in the DB. not yet implemented)
             # Inference stage
