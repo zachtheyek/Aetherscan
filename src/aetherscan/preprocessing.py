@@ -1115,6 +1115,14 @@ class DataPreprocessor:
             logger.info(f"Cadence {group.key}: no valid in-bounds stamps; skipping")
             return None
 
+        # Sort stamps by start index before extraction. With overlap_search the raw
+        # order is hit-interleaved (hit1-off, hit1, hit1+off, hit2-off, ...), so
+        # neighboring hits can produce out-of-order starts. Reads against
+        # bitshuffle-compressed .h5 files are dominated by chunk decompression cost;
+        # sequential start order gives the OS / hdf5 chunk cache a chance to reuse a
+        # decompressed chunk across adjacent stamps instead of redecompressing it.
+        stamp_centers.sort(key=lambda s: s[0])
+
         # Extract stamps for all 6 observations (sequential per file, no pool)
         cadence_stamps = np.zeros(
             (len(stamp_centers), len(group.h5_paths), time_bins, stamp_width), dtype=np.float32
