@@ -933,6 +933,9 @@ class DataPreprocessor:
                             f"Existing .npy at {npy_path} could not be inspected ({e}); "
                             f"reprocessing cadence"
                         )
+                        # Fall through (no continue) to the _process_cadence call
+                        # below so a corrupted .npy gets regenerated rather than
+                        # silently skipped.
                     else:
                         logger.info(
                             f"Skipping cadence {group.key}: {npy_path} already exists "
