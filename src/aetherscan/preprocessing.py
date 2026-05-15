@@ -271,6 +271,13 @@ def _threshold_hits_worker(args: tuple) -> list[tuple]:
     end = (channel_index + 1) * coarse_channel_width
     channel = _GLOBAL_CHUNK_DATA[:, start:end]
 
+    # TODO: profile on HPC and consider vectorizing. With default config this loop
+    # runs ~8190 windows per coarse channel × parallel_chans × num_blocks × 3
+    # ON-source files per cadence. scipy.stats.normaltest copies + flattens each
+    # window and re-derives skew/kurtosis via separate scipy calls. A stride_tricks
+    # view over the cleaned block followed by vectorized scipy.stats.skew /
+    # kurtosis (with axis arg) would replace the Python loop with a few large
+    # ndarray ops and could be substantially faster end-to-end.
     hits: list[tuple] = []
     for i in range(0, coarse_channel_width - window_size, step_size):
         window = channel[:, i : i + window_size]
