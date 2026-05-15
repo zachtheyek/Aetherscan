@@ -164,6 +164,12 @@ def _remove_dc_spike(
     half_chan = coarse_channel_width // 2
     for i in range(n_coarse_channels):
         dc_ind = i * coarse_channel_width + half_chan
+        # The two replacements are asymmetric on purpose: dc_ind pulls from
+        # (+1, -3) and dc_ind-1 from (+2, -2). This matches the reference
+        # implementation byte-for-byte (FX196/SETI-Energy-Detection
+        # preprocess_fine.py:72-75) — the bins immediately around the spike
+        # are themselves contaminated, so the offsets reach across the spike
+        # to clean neighbors on both sides.
         block_data[:, dc_ind] = (block_data[:, dc_ind + 1] + block_data[:, dc_ind - 3]) / 2
         block_data[:, dc_ind - 1] = (block_data[:, dc_ind + 2] + block_data[:, dc_ind - 2]) / 2
 
