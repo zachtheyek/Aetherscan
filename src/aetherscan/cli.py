@@ -456,7 +456,7 @@ def _add_inference_arguments(subparsers):
         type=str,
         nargs="+",
         default=None,
-        help="Space-separated list of CSV file names describing .h5 observations to group into cadences (resolved against <data-path>/inference/). If provided, triggers the energy detection preprocessing pipeline and takes precedence over --test-files",
+        help="Space-separated list of inference catalog file names (e.g. complete_cadences_catalog.csv). Expects .h5 filepaths to individual observations, and sufficient metadata for recovering cadence groupings. If provided, triggers the energy detection preprocessing pipeline and takes precedence over --test-files",
     )
 
     # Inference configuration
@@ -497,7 +497,7 @@ def _add_inference_arguments(subparsers):
         type=str,
         nargs="+",
         default=None,
-        help="Space-separated list of CSV column names whose joint value defines cadence membership (e.g., Target Session Band 'Cadence ID')",
+        help="Space-separated list of CSV column names whose joint value defines cadence membership (e.g., Target Session Band 'Cadence ID' Frequency)",
     )
     inf_parser.add_argument(
         "--cadence-h5-path-col",
@@ -569,7 +569,7 @@ def _add_inference_arguments(subparsers):
         "--preprocess-output-dir",
         type=str,
         default=None,
-        help="Directory for per-cadence .npy outputs from preprocessing (default: <output-path>/preprocessed)",
+        help="Directory for per-cadence .npy outputs from preprocessing",
     )
     inf_parser.add_argument(
         "--max-retries",
@@ -819,6 +819,7 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.stat_threshold = args.stat_threshold
     if hasattr(args, "stamp_width") and args.stamp_width is not None:
         config.inference.stamp_width = args.stamp_width
+    # NOTE: come back to this later (wtf does this comment mean?)
     # overlap_search is a store_true flag; only override when explicitly set
     if hasattr(args, "overlap_search") and args.overlap_search:
         config.inference.overlap_search = args.overlap_search
@@ -932,27 +933,28 @@ def validate_args(args: argparse.Namespace) -> None:
     #     if <validation_condition>:
     #         errors.append("Error message explaining the problem")
 
-    # Energy detection preprocessing checks
-    # If inference_files is provided, cadence_group_by_cols must be non-empty.
-    # Per-CSV column-existence checks are deferred to runtime (CSVs aren't loaded here).
-    # stamp_width == width_bin is validated at runtime in inference_command, where both
-    # are resolved together.
-    if hasattr(args, "inference_files") and args.inference_files is not None:
-        group_cols = getattr(args, "cadence_group_by_cols", None)
-        # If the user didn't pass --cadence-group-by-cols, the dataclass default kicks in
-        # (a non-empty list). Only fail if the user explicitly provided an empty list.
-        if group_cols is not None and len(group_cols) == 0:
-            errors.append(
-                "--cadence-group-by-cols must be non-empty when --inference-files is provided"
-            )
-
-    if hasattr(args, "detection_window_size") and args.detection_window_size is not None:
-        stamp_width = getattr(args, "stamp_width", None)
-        if stamp_width is not None and args.detection_window_size > stamp_width:
-            errors.append(
-                f"--detection-window-size ({args.detection_window_size}) must be "
-                f"<= --stamp-width ({stamp_width})"
-            )
+    # NOTE: come back to this later (are runtime checks properly implemented? does config defaults kick in before cli args are applied? if some but not all csvs are invalid, do we still process valid csvs & throw errors for the invalid ones with proper checkpointing, or do we fail loudly & immediately? are these checks comprehensive for energy detection + inference modules, e.g. overlap_fraction between 0 & 1?)
+    # # Energy detection preprocessing checks
+    # # If inference_files is provided, cadence_group_by_cols must be non-empty.
+    # # Per-CSV column-existence checks are deferred to runtime (CSVs aren't loaded here).
+    # # stamp_width == width_bin is validated at runtime in inference_command, where both
+    # # are resolved together.
+    # if hasattr(args, "inference_files") and args.inference_files is not None:
+    #     group_cols = getattr(args, "cadence_group_by_cols", None)
+    #     # If the user didn't pass --cadence-group-by-cols, the dataclass default kicks in
+    #     # (a non-empty list). Only fail if the user explicitly provided an empty list.
+    #     if group_cols is not None and len(group_cols) == 0:
+    #         errors.append(
+    #             "--cadence-group-by-cols must be non-empty when --inference-files is provided"
+    #         )
+    #
+    # if hasattr(args, "detection_window_size") and args.detection_window_size is not None:
+    #     stamp_width = getattr(args, "stamp_width", None)
+    #     if stamp_width is not None and args.detection_window_size > stamp_width:
+    #         errors.append(
+    #             f"--detection-window-size ({args.detection_window_size}) must be "
+    #             f"<= --stamp-width ({stamp_width})"
+    #         )
 
     # Throw an error if any validation fails
     if errors:

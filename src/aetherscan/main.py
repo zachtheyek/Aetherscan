@@ -284,6 +284,8 @@ def inference_command():
         logger.error("No GPU strategy available. Inference requires GPU.")
         sys.exit(1)
 
+    # NOTE: come back to this later (does fault tolerance work properly with inference?)
+    # NOTE: come back to this later (should we add some async/back-and-forth design patterns -- e.g. preproc X files, inference X files, clear, repeat -- to reduce memory pressure? is this the most efficient architecture we can use? add comments about memory/performance trade-offs once inference pipeline complete (see preproc section in train_command())
     # Run preprocessing + inference with fault tolerance.
     # Recovery is state-based, not checkpoint-based: find_hits() writes per-cadence
     # .npy files as it goes and skips any whose .npy already exists, so simply
@@ -317,11 +319,11 @@ def inference_command():
                 cadence_data = preprocessor.load_inference_data().astype(np.float32)
                 npy_path_for_logging = config.data.test_files[0]
 
-            # Inference stage. NOTE: inference-stage resume (skipping cadences already
-            # in the DB) is mentioned in the plan but deferred to a follow-up.
+            # NOTE: come back to this later (inference-stage resume should skip cadences already in the DB. not yet implemented)
+            # Inference stage
             results = run_inference_pipeline(
                 cadence_data=cadence_data,
-                npy_path=npy_path_for_logging,
+                npy_path=npy_path_for_logging,  # TODO: handle multiple test_files properly
                 strategy=strategy,
                 # TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
             )
@@ -342,7 +344,7 @@ def inference_command():
                 logger.error(f"Exceeded max retries ({max_retries}). Final error: {e}")
                 sys.exit(1)
 
-    # NOTE: should we create dedicated (tagged) directories inside output_path to store inference results (plots, configs, etc.)? note, data still written to db regardless
+    # NOTE: come back to this later (should we create dedicated (tagged) directories inside output_path to store inference results (plots, configs, etc.)? note, data still written to db regardless)
     # Save inference configuration
     config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 
 import h5py
+
+# NOTE: come back to this later (why noqa: F401? what's the difference between h5py & hdf5plugin?)
 import hdf5plugin  # noqa: F401  # registers bitshuffle codec with h5py at import time
 import numpy as np
 from scipy import interpolate, stats
@@ -147,16 +149,12 @@ def _downsample_worker(args):
         return None
 
 
-# --- Energy detection helpers & workers ---
-
-
+# NOTE: come back to this later (mirrors preprocess_fine.py:72-75 from the reference implementation)
 def _remove_dc_spike(
     block_data: np.ndarray, coarse_channel_width: int, n_coarse_channels: int
 ) -> None:
     """
     Interpolate over the 2-bin DC spike at the center of each coarse channel, in place.
-
-    Mirrors preprocess_fine.py:72-75 from the reference implementation.
 
     Args:
         block_data: shape (time_bins, n_coarse_channels * coarse_channel_width)
@@ -170,13 +168,12 @@ def _remove_dc_spike(
         block_data[:, dc_ind - 1] = (block_data[:, dc_ind + 2] + block_data[:, dc_ind - 2]) / 2
 
 
+# NOTE: come back to this later (mirrors utils.py:17-22 from the reference implementation.)
 def _fit_channel_bandpass(
     integrated_channel: np.ndarray, channel_width: int, spl_order: int
 ) -> np.ndarray:
     """
     Fit a spline bandpass to a time-integrated coarse channel.
-
-    Mirrors utils.py:17-22 from the reference implementation.
 
     Args:
         integrated_channel: 1-D array of shape (channel_width,), time-integrated
@@ -192,6 +189,7 @@ def _fit_channel_bandpass(
     return interpolate.splev(x, spl)
 
 
+# NOTE: come back to this later
 def _read_coarse_channel_worker(args: tuple) -> np.ndarray:
     """
     Worker: read one coarse channel from an .h5 file.
@@ -211,6 +209,7 @@ def _read_coarse_channel_worker(args: tuple) -> np.ndarray:
         return hf["data"][:, 0, start:end]
 
 
+# NOTE: come back to this later
 def _remove_bandpass_worker(args: tuple) -> np.ndarray:
     """
     Worker: subtract the per-coarse-channel spline bandpass from one coarse channel.
@@ -238,6 +237,7 @@ def _remove_bandpass_worker(args: tuple) -> np.ndarray:
     return channel - fit
 
 
+# NOTE: come back to this later
 def _threshold_hits_worker(args: tuple) -> list[tuple]:
     """
     Worker: slide a window across one coarse channel and emit hits above threshold.
@@ -282,6 +282,7 @@ def _threshold_hits_worker(args: tuple) -> list[tuple]:
     return hits
 
 
+# NOTE: come back to this later
 # def _drop_side_channels(
 #     block_data: np.ndarray, side_channel_count: int, coarse_channel_width: int
 # ) -> None:
@@ -294,24 +295,26 @@ def _threshold_hits_worker(args: tuple) -> list[tuple]:
 class CadenceGroup:
     """One cadence's worth of observations grouped from a CSV."""
 
-    key: tuple  # the group-by column values
-    h5_paths: list[str]  # observation .h5 paths, in row order
-    csv_path: str  # source CSV
+    key: tuple  # The group-by column values
+    h5_paths: list[str]  # Observation .h5 paths, in row order
+    csv_path: str  # Source CSV
     expected_obs: int
     is_valid: bool  # True iff len(h5_paths) == expected_obs
 
 
+# NOTE: come back to this later (what does metadata_path store exactly?)
 @dataclass
 class CadenceResult:
     """Output of processing one cadence."""
 
     npy_path: str
-    h5_paths: list[str]
-    key: tuple
+    h5_paths: list[str]  # Same as in CadenceGroup
+    key: tuple  # Same as in CadenceGroup
     n_hits: int
-    metadata_path: str  # sibling .pkl with hit details
+    metadata_path: str  # Sibling .pkl with hit details
 
 
+# NOTE: come back to this later
 @dataclass
 class CadenceHit:
     """A single energy detection hit on an ON-source observation."""
@@ -322,6 +325,7 @@ class CadenceHit:
     frequency_mhz: float = field(default=float("nan"))
 
 
+# NOTE: come back to this later (add sorting functionality to sort rows in csv after grouping, e.g. via timestamp metadata from filenames? edge case where multiple 6-cadence observations of the same target & with the same grouping params, but differed by time, e.g. t=X to t=X+ε, then t=Y to t=Y+σ, for some small numbers ε and σ, and where X and Y are far apart from each other. add a way to distinguish these cases from problematic cases where we actually want to invalidate a cadence with a weird number of grouped observations, e.g. if multiple of 6 and enough of a gap between X and Y, then count as separate cadences?)
 def group_observations_from_csv(
     csv_path: str,
     group_by_cols: list[str],
@@ -360,6 +364,7 @@ def group_observations_from_csv(
         reader = csv.DictReader(f)
         available = reader.fieldnames or []
 
+        # NOTE: come back to this later (does this fail for all if one csv has missing columns, or does it skip the invalid csvs and continue processing the valid ones? is proper downstream checkpointing implemented in the latter case?)
         missing = [c for c in required_cols if c not in available]
         if missing:
             raise KeyError(
@@ -841,6 +846,7 @@ class DataPreprocessor:
 
         return cadence_array
 
+    # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
     def find_hits(self) -> list[CadenceResult]:
         """
         Convert raw .h5 cadence observations into (n_hits, 6, 16, stamp_width) .npy snippets.
@@ -944,6 +950,7 @@ class DataPreprocessor:
         logger.info(f"find_hits completed: {len(results)} cadence .npy files available")
         return results
 
+    # NOTE: come back to this later (ensure filenames are structured similarly as in train_files & test_files)
     @staticmethod
     def _cadence_npy_filename(csv_stem: str, key: tuple) -> str:
         """Build a deterministic filename for a cadence group's .npy output."""
@@ -958,6 +965,7 @@ class DataPreprocessor:
         """Return the sibling .pkl path for a cadence's metadata."""
         return os.path.splitext(npy_path)[0] + ".pkl"
 
+    # NOTE: come back to this later (does a cadence snippet get created if only 1 of the ON observations crosses the threshold, or all 3? should probably be all 3 as of now since models are trained on signals that don't yet drift out of frame?)
     def _process_cadence(self, group: CadenceGroup, npy_path: str) -> CadenceResult | None:
         """
         Run energy detection on one cadence and write its stamp .npy.
@@ -998,6 +1006,7 @@ class DataPreprocessor:
         fch1 = float(header["fch1"])
         n_time_avail = int(data_shape[0])
 
+        # NOTE: come back to this later (why do we only check if n_time_avail < time_bins? what happens if n_time_avail > time_bins?)
         if n_time_avail < time_bins:
             logger.warning(
                 f"Cadence {group.key}: primary file has only {n_time_avail} time bins, "
@@ -1072,6 +1081,7 @@ class DataPreprocessor:
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
+        # NOTE: come back to this later (what's the trade-off for doing dedup vs not? e.g. lower storage & compute, but higher FNR or lower DR sensitivity?)
         # Deduplicate: greedy merge of any pair within stamp_width // 2
         merged_hits = self._deduplicate_hits(all_hits, stamp_width)
         logger.info(
@@ -1170,13 +1180,15 @@ class DataPreprocessor:
             for ch in range(block_num * parallel_chans, (block_num + 1) * parallel_chans)
         ]
 
+        # NOTE: come back to this later (is this correct?)
         # The read worker doesn't need shared memory; create a plain pool
         if n_processes > 1:
             pool = self.manager.create_pool(
                 n_processes=min(parallel_chans, n_processes),
-                name=f"DataPreproc_read_block_{block_num}",
+                name=f"DataPreproc_read_block_{block_num}",  # NOTE: come back to this later
             )
             try:
+                # NOTE: come back to this later (is pool.map correct here?)
                 results = pool.map(_read_coarse_channel_worker, args_list)
             finally:
                 self.manager.close_pool(pool)
@@ -1185,6 +1197,7 @@ class DataPreprocessor:
 
         return np.concatenate(results, axis=1)
 
+    # NOTE: come back to this later
     def _remove_block_bandpass(
         self,
         block_data: np.ndarray,
@@ -1199,14 +1212,14 @@ class DataPreprocessor:
         if n_processes > 1:
             shm = self.manager.create_shared_memory(
                 size=block_data.nbytes,
-                name="DataPreproc_bandpass_block",
+                name="DataPreproc_bandpass_block",  # NOTE: come back to this later
             )
             shared = np.ndarray(block_data.shape, dtype=block_data.dtype, buffer=shm.buf)
             shared[:] = block_data[:]
 
             pool = self.manager.create_pool(
                 n_processes=min(parallel_chans, n_processes),
-                name="DataPreproc_bandpass_block",
+                name="DataPreproc_bandpass_block",  # NOTE: come back to this later
                 initializer=_init_worker,
                 initargs=(shm.name, block_data.shape, block_data.dtype),
             )
@@ -1224,6 +1237,7 @@ class DataPreprocessor:
 
         return np.concatenate(results, axis=1)
 
+    # NOTE: come back to this later
     def _threshold_block_hits(
         self,
         cleaned_block: np.ndarray,
@@ -1244,14 +1258,14 @@ class DataPreprocessor:
         if n_processes > 1:
             shm = self.manager.create_shared_memory(
                 size=cleaned_block.nbytes,
-                name="DataPreproc_threshold_block",
+                name="DataPreproc_threshold_block",  # NOTE: come back to this later
             )
             shared = np.ndarray(cleaned_block.shape, dtype=cleaned_block.dtype, buffer=shm.buf)
             shared[:] = cleaned_block[:]
 
             pool = self.manager.create_pool(
                 n_processes=min(parallel_chans, n_processes),
-                name="DataPreproc_threshold_block",
+                name="DataPreproc_threshold_block",  # NOTE: come back to this later
                 initializer=_init_worker,
                 initargs=(shm.name, cleaned_block.shape, cleaned_block.dtype),
             )
@@ -1272,6 +1286,7 @@ class DataPreprocessor:
             flat.extend(r)
         return flat
 
+    # NOTE: come back to this later (what's the trade-off for doing dedup vs not? e.g. lower storage & compute, but higher FNR or lower DR sensitivity?)
     @staticmethod
     def _deduplicate_hits(hits: list[tuple], stamp_width: int) -> list[tuple]:
         """
