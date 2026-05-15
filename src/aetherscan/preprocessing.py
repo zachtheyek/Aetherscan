@@ -1156,8 +1156,14 @@ class DataPreprocessor:
                     end = start + stamp_width
                     cadence_stamps[stamp_idx, obs_idx] = hf["data"][:time_bins, 0, start:end]
 
-        # Write the .npy and the sibling metadata
-        np.save(npy_path, cadence_stamps)
+        # Write the .npy and the sibling metadata atomically. A process kill
+        # mid-write must not leave a corrupt file at the canonical path —
+        # find_hits' resume path treats the existence of npy_path as proof of
+        # a complete write. We achieve that by writing to a .tmp sibling first
+        # then os.replace()-ing it onto the canonical name.
+        tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
+        np.save(tmp_npy_path, cadence_stamps)
+        os.replace(tmp_npy_path, npy_path)
 
         metadata_path = self._cadence_metadata_path(npy_path)
         # Per-stamp frequency = center bin's frequency, computed from header's fch1/foff
@@ -1178,8 +1184,10 @@ class DataPreprocessor:
             "overlap_search": overlap_search,
             "overlap_fraction": overlap_fraction if overlap_search else None,
         }
-        with open(metadata_path, "wb") as f:
+        tmp_metadata_path = metadata_path + ".tmp"
+        with open(tmp_metadata_path, "wb") as f:
             pickle.dump(metadata, f)
+        os.replace(tmp_metadata_path, metadata_path)
 
         gc.collect()
 
