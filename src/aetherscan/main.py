@@ -324,6 +324,12 @@ def inference_command():
                     ).astype(np.float32)
                     npy_path_for_logging = npy_paths[0]
                 else:
+                    if not config.data.test_files:
+                        logger.error(
+                            "Neither --inference-files nor --test-files is configured; "
+                            "nothing to load for inference"
+                        )
+                        sys.exit(1)
                     cadence_data = preprocessor.load_inference_data().astype(np.float32)
                     npy_path_for_logging = config.data.test_files[0]
             else:
