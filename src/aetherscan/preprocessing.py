@@ -190,6 +190,12 @@ def _fit_channel_bandpass(
         1-D bandpass fit of shape (channel_width,)
     """
     x = np.arange(channel_width)
+    # Interior knots must lie strictly inside (x[0], x[-1]); knots[1:] drops the
+    # leading 0, which satisfies that constraint for the default config
+    # (channel_width=1048576, spl_order=16). A pathological config with very
+    # small channel_width relative to spl_order could produce a knots array
+    # that violates the constraint — splrep would raise then. The defaults
+    # used in InferenceConfig are safe.
     knots = np.arange(0, channel_width, channel_width // spl_order + 1)
     spl = interpolate.splrep(x, integrated_channel, t=knots[1:])
     return interpolate.splev(x, spl)
