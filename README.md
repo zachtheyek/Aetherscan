@@ -152,7 +152,15 @@ aetherscan inference \
     --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
     --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
     --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
-    --classification-threshold 0.9
+    --classification-threshold 0.99
+
+# Run inference from raw .h5 files (energy detection preprocessing)
+aetherscan inference \
+    --inference-files complete_cadences_catalog.csv \
+    --encoder-path /path/to/vae_encoder.keras \
+    --rf-path /path/to/random_forest.joblib \
+    --config-path /path/to/config.json \
+    --save-tag run_v1
 ```
 
 ---
@@ -429,10 +437,26 @@ The Aetherscan inference pipeline exposes the following CLI flags to the user:
 usage:  inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                   [--output-path OUTPUT_PATH]
                   [--test-files TEST_FILES [TEST_FILES ...]]
+                  [--inference-files INFERENCE_FILES [INFERENCE_FILES ...]]
                   [--encoder-path ENCODER_PATH] [--rf-path RF_PATH]
                   [--config-path CONFIG_PATH]
                   [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
                   [--classification-threshold CLASSIFICATION_THRESHOLD]
+                  [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
+                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
+                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
+                  [--coarse-channel-width COARSE_CHANNEL_WIDTH]
+                  [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
+                  [--spline-order SPLINE_ORDER]
+                  [--detection-window-size DETECTION_WINDOW_SIZE]
+                  [--detection-step-size DETECTION_STEP_SIZE]
+                  [--stat-threshold STAT_THRESHOLD]
+                  [--stamp-width STAMP_WIDTH]
+                  [--overlap-search | --no-overlap-search]
+                  [--overlap-fraction OVERLAP_FRACTION]
+                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
+                  [--max-retries MAX_RETRIES]
+                  [--retry-delay RETRY_DELAY]
                   [--save-tag SAVE_TAG]
 
 options:
@@ -449,6 +473,13 @@ options:
   --test-files TEST_FILES [TEST_FILES ...]
                         Space-separated list of testing data file names (e.g.,
                         real_filtered_LARGE_test_HIP15638.npy)
+  --inference-files INFERENCE_FILES [INFERENCE_FILES ...]
+                        Space-separated list of inference catalog file names
+                        (e.g. complete_cadences_catalog.csv). Expects .h5
+                        filepaths to individual observations, and sufficient
+                        metadata for recovering cadence groupings. If
+                        provided, triggers the energy detection preprocessing
+                        pipeline and takes precedence over --test-files
   --encoder-path ENCODER_PATH
                         Path to trained VAE encoder model file (.keras)
   --rf-path RF_PATH     Path to trained Random Forest model file (.joblib)
@@ -459,6 +490,52 @@ options:
                         Batch size per GPU/device replica during inference
   --classification-threshold CLASSIFICATION_THRESHOLD
                         Classification threshold for candidate detection
+  --cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]
+                        Space-separated list of CSV column names whose joint
+                        value defines cadence membership (e.g., Target Session
+                        Band 'Cadence ID' Frequency)
+  --cadence-h5-path-col CADENCE_H5_PATH_COL
+                        CSV column containing the .h5 file path for each
+                        observation (default: '.h5 path')
+  --cadence-expected-obs CADENCE_EXPECTED_OBS
+                        Required number of observations per cadence (default:
+                        6 for ABACAD)
+  --coarse-channel-width COARSE_CHANNEL_WIDTH
+                        Number of fine channels per coarse channel (default:
+                        1048576)
+  --parallel-coarse-chans PARALLEL_COARSE_CHANS
+                        Number of coarse channels to process in parallel per
+                        block (default: 28)
+  --spline-order SPLINE_ORDER
+                        Spline order for bandpass fitting (default: 16)
+  --detection-window-size DETECTION_WINDOW_SIZE
+                        Sliding window size in fine channels for normality
+                        test (default: 256)
+  --detection-step-size DETECTION_STEP_SIZE
+                        Step size in fine channels for sliding window
+                        (default: 128)
+  --stat-threshold STAT_THRESHOLD
+                        D'Agostino-Pearson statistic threshold for hit
+                        detection (default: 2048.0)
+  --stamp-width STAMP_WIDTH
+                        Width in fine channels of the extracted stamp around
+                        each hit (default: 4096; must equal --width-bin)
+  --overlap-search, --no-overlap-search
+                        Additionally extract stamps offset by
+                        ±overlap_fraction*stamp_width around each hit. Pass
+                        --no-overlap-search to disable when the config default
+                        is True.
+  --overlap-fraction OVERLAP_FRACTION
+                        Fractional offset (relative to stamp_width) for
+                        overlap-search stamps (default: 0.5)
+  --preprocess-output-dir PREPROCESS_OUTPUT_DIR
+                        Directory for per-cadence .npy outputs from
+                        preprocessing
+  --max-retries MAX_RETRIES
+                        Maximum number of retry attempts for inference
+                        (including preprocessing) on failure
+  --retry-delay RETRY_DELAY
+                        Delay in seconds between inference retry attempts
   --save-tag SAVE_TAG   Tag for current pipeline run. Current timestamp used
                         (YYYYMMDD_HHMMSS) if none specified
 ```
