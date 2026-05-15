@@ -712,9 +712,7 @@ def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
         values = np.asarray(values)
         # newer shap preserves the class axis even for model_output="log_loss":
         # (n, F, 2) → (n, F); (n, F, F, 2) → (n, F, F)
-        if values.ndim == 3 and values.shape[-1] == 2:
-            return values[..., 1]
-        if values.ndim == 4 and values.shape[-1] == 2:
+        if values.ndim >= 3 and values.shape[-1] == 2:
             return values[..., 1]
         return values
 
@@ -723,9 +721,7 @@ def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
 
     values = np.asarray(values)
     # (n, F, 2) → (n, F); (n, F, F, 2) → (n, F, F)
-    if values.ndim == 3 and values.shape[-1] == 2:
-        return values[..., 1]
-    if values.ndim == 4 and values.shape[-1] == 2:
+    if values.ndim >= 3 and values.shape[-1] == 2:
         return values[..., 1]
     return values
 
