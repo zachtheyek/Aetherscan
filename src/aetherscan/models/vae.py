@@ -21,6 +21,7 @@ from aetherscan.config import get_config
 logger = logging.getLogger(__name__)
 
 
+@keras.saving.register_keras_serializable(package="aetherscan")
 class Sampling(layers.Layer):
     """
     Sampling layer for Beta-VAE using reparameterization trick
@@ -38,8 +39,10 @@ class Sampling(layers.Layer):
         batch = tf.shape(z_mean)[0]
         dim = tf.shape(z_mean)[1]
 
-        # Sample random noise from a standard normal N(0, 1) with same shape as z_mean
-        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        # Sample random noise from a standard normal N(0, 1) with same shape as z_mean.
+        # tf.random.normal is the stable canonical API; tf.keras.backend.random_normal was
+        # removed/deprecated in Keras 3 (shipped in TF 2.16+) and had inconsistent graph/seed semantics.
+        epsilon = tf.random.normal(shape=(batch, dim))
 
         # Compute latent vector using reparameterization
         # Equivalent to sampling from N(z_mean, exp(z_log_var))
