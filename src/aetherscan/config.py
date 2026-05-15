@@ -143,9 +143,7 @@ class DataConfig:
     # describe individual .h5 observations to be grouped into cadences.
     # If non-None, takes precedence over test_files during inference and triggers
     # the energy detection preprocessing pipeline.
-    inference_files: list[str] | None = field(
-        default_factory=lambda: ["complete_cadences_catalog.csv"]
-    )
+    inference_files: list[str] | None = field(default_factory=lambda: None)
 
 
 @dataclass
