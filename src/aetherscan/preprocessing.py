@@ -1240,8 +1240,12 @@ class DataPreprocessor:
         else:
             global _GLOBAL_CHUNK_DATA
             _GLOBAL_CHUNK_DATA = block_data
-            results = [_remove_bandpass_worker(a) for a in args_list]
-            _GLOBAL_CHUNK_DATA = None
+            try:
+                results = [_remove_bandpass_worker(a) for a in args_list]
+            finally:
+                # Always clear the global, even if a worker raised, so subsequent
+                # calls in the same process don't see stale state
+                _GLOBAL_CHUNK_DATA = None
 
         return np.concatenate(results, axis=1)
 
@@ -1286,8 +1290,12 @@ class DataPreprocessor:
         else:
             global _GLOBAL_CHUNK_DATA
             _GLOBAL_CHUNK_DATA = cleaned_block
-            results = [_threshold_hits_worker(a) for a in args_list]
-            _GLOBAL_CHUNK_DATA = None
+            try:
+                results = [_threshold_hits_worker(a) for a in args_list]
+            finally:
+                # Always clear the global, even if a worker raised, so subsequent
+                # calls in the same process don't see stale state
+                _GLOBAL_CHUNK_DATA = None
 
         flat: list[tuple] = []
         for r in results:
