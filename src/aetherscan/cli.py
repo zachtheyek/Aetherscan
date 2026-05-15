@@ -555,9 +555,9 @@ def _add_inference_arguments(subparsers):
     )
     inf_parser.add_argument(
         "--overlap-search",
-        action="store_true",
-        default=False,
-        help="If set, additionally extract stamps offset by ±overlap_fraction*stamp_width around each hit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Additionally extract stamps offset by ±overlap_fraction*stamp_width around each hit. Pass --no-overlap-search to disable when the config default is True.",
     )
     inf_parser.add_argument(
         "--overlap-fraction",
@@ -819,9 +819,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.stat_threshold = args.stat_threshold
     if hasattr(args, "stamp_width") and args.stamp_width is not None:
         config.inference.stamp_width = args.stamp_width
-    # NOTE: come back to this later (wtf does this comment mean?)
-    # overlap_search is a store_true flag; only override when explicitly set
-    if hasattr(args, "overlap_search") and args.overlap_search:
+    # overlap_search uses argparse.BooleanOptionalAction with default=None so that
+    # the CLI can express "leave the config default" (omit), "force on"
+    # (--overlap-search), and "force off" (--no-overlap-search). The `is not None`
+    # guard preserves the config default when the user passes neither.
+    if hasattr(args, "overlap_search") and args.overlap_search is not None:
         config.inference.overlap_search = args.overlap_search
     if hasattr(args, "overlap_fraction") and args.overlap_fraction is not None:
         config.inference.overlap_fraction = args.overlap_fraction
