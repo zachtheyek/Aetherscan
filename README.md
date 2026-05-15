@@ -8,8 +8,8 @@
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License"></a>
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10-blue.svg" alt="Python"></a>
-    <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.16-orange.svg" alt="TensorFlow"></a>
-    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.2-green.svg" alt="CUDA"></a>
+    <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.17-orange.svg" alt="TensorFlow"></a>
+    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.5%E2%80%9312.8-green.svg" alt="CUDA"></a>
   </p>
 </p>
 
@@ -35,19 +35,23 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### System Requirements
 
-Aetherscan's _default_ configs have been tested on machines with the following _minimum_ specifications:
+Aetherscan supports two deployment paths off the same source tree, depending on GPU generation:
 
-**Training**
-
-- Ubuntu 24.04
-- 1x NVIDIA GPU, 9GB VRAM, CUDA 12.2
-- 400 GB RAM
-
-**Inference**
+**Ampere GPUs (sm_86, e.g. RTX A4000) — conda env**
 
 - Ubuntu 24.04
-- 1x NVIDIA GPU, 12GB VRAM, CUDA 12.2
-- 150 GB RAM
+- 1x NVIDIA GPU, CUDA 12.5+ driver
+- ≥9 GB VRAM (training) / ≥12 GB VRAM (inference)
+- ≥400 GB RAM (training) / ≥150 GB RAM (inference)
+- Python 3.10 (managed by conda)
+
+**Blackwell GPUs (sm_120, e.g. RTX PRO 6000) — NGC container**
+
+- Ubuntu 24.04
+- 1x NVIDIA GPU, CUDA 12.8 driver (≥570)
+- ≥400 GB RAM
+- Apptainer 1.3+ or SingularityCE 4.0+ (Python 3.12 lives inside the container)
+- See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full runbook
 
 As the software matures, more detailed system requirements will be made available to the user.
 
@@ -59,6 +63,9 @@ As the software matures, more detailed system requirements will be made availabl
 > [!NOTE]
 > Aetherscan currently only supports running from source.
 > Installation via pip and containerized distributions will be made available in a later release.
+
+> [!NOTE]
+> The conda steps below target Ampere GPUs. For Blackwell GPUs, build the NGC TF 2.17 container with `apptainer build aetherscan-ngc25.02.sif aetherscan.def` (or `singularity build ...`) and run the pipeline via `./scripts/run-container.sh`. See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full walkthrough.
 
 **1. Clone the repository**
 
