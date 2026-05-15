@@ -14,6 +14,7 @@ import gc
 import logging
 import os
 import pickle
+import re
 import signal
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -976,10 +977,12 @@ class DataPreprocessor:
     @staticmethod
     def _cadence_npy_filename(csv_stem: str, key: tuple) -> str:
         """Build a deterministic filename for a cadence group's .npy output."""
-        # Sanitize: replace path separators and whitespace in key components
-        safe_parts = [
-            str(part).replace(os.sep, "_").replace(" ", "_").replace("/", "_") for part in key
-        ]
+        # Sanitize each key component via an allowlist: only word chars, dash, and
+        # dot survive — everything else collapses to underscore. This is broader
+        # than just stripping path separators / whitespace: CSV column values can
+        # carry quotes, control chars, shell metacharacters, or path-traversal
+        # sequences (e.g. "..") that would otherwise leak through.
+        safe_parts = [re.sub(r"[^\w\-.]+", "_", str(part)) for part in key]
         return f"{csv_stem}_{'_'.join(safe_parts)}.npy"
 
     @staticmethod
