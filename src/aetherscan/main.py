@@ -245,6 +245,20 @@ def inference_command():
 
     # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
 
+    # If inference_files is set, the energy detection preprocessing pipeline runs
+    # before inference; stamp_width must match the downstream width_bin so the
+    # extracted (n_hits, 6, 16, stamp_width) tensor is shaped correctly for the
+    # downsample + log-norm path.
+    if (
+        config.data.inference_files is not None
+        and config.inference.stamp_width != config.data.width_bin
+    ):
+        logger.error(
+            f"inference.stamp_width ({config.inference.stamp_width}) must equal "
+            f"data.width_bin ({config.data.width_bin}) when --inference-files is set"
+        )
+        sys.exit(1)
+
     logger.info("Configuration:")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
@@ -252,7 +266,10 @@ def inference_command():
     logger.info(f"  Encoder path: {config.inference.encoder_path}")
     logger.info(f"  Random Forest path: {config.inference.rf_path}")
     logger.info(f"  Config path: {config.inference.config_path}")
-    logger.info(f"  Files to process: {config.data.test_files}")
+    if config.data.inference_files is not None:
+        logger.info(f"  Inference CSVs to process: {config.data.inference_files}")
+    else:
+        logger.info(f"  Files to process: {config.data.test_files}")
     logger.info(f"  Classification threshold: {config.inference.classification_threshold}")
 
     # Setup GPU strategy
@@ -267,34 +284,85 @@ def inference_command():
         logger.error("No GPU strategy available. Inference requires GPU.")
         sys.exit(1)
 
-    # NOTE: come back to this later (this is where we convert .h5 into .npy, and then downsample + log norm the .npy data)
-    # NOTE: will this lead to us holding too much data in memory for the sake of inference fault tolerance? should we add some async/back-and-forth design patterns (e.g. preproc X files, inference X files, clear, repeat) to reduce memory pressure? is this the most efficient architecture we can use? add comments about memory/performance trade-offs once inference pipeline complete (see preproc section in train_command())
-    # TODO: implement fault tolerance (should preproc have separate fault tolerance to inference?)
-    # Initialize preprocessor & load inference cadences
-    try:
-        preprocessor = DataPreprocessor()
-        cadence_data = preprocessor.load_inference_data().astype(np.float32)
-        # NOTE: do we need to close preprocessing pools and/or shared memory?
-    except Exception as e:
-        logger.error(f"Failed to load inference cadences: {e}")
-        sys.exit(1)
+    # NOTE: come back to this later (does fault tolerance work properly with inference?)
+    # NOTE: come back to this later (should we add some async/back-and-forth design patterns -- e.g. preproc X files, inference X files, clear, repeat -- to reduce memory pressure? is this the most efficient architecture we can use? add comments about memory/performance trade-offs once inference pipeline complete (see preproc section in train_command())
+    # Run preprocessing + inference with fault tolerance.
+    # Recovery is state-based, not checkpoint-based: find_hits() writes per-cadence
+    # .npy files as it goes and skips any whose .npy already exists, so simply
+    # retrying resumes from where the last attempt died. No checkpoint metadata
+    # is needed for the preprocessing stage.
+    preprocessor = DataPreprocessor()
+    max_retries = config.inference.max_retries
+    retry_delay = config.inference.retry_delay
+    results = None
+    # Cache cadence_data across retry attempts: once preprocessing + loading
+    # succeeds, an inference-only failure shouldn't trigger a re-load /
+    # re-downsample / re-log-norm pass. Mirrors how train_command loads
+    # background_data once outside its retry loop.
+    cadence_data: np.ndarray | None = None
+    npy_path_for_logging: str | None = None
 
-    # Run inference with fault tolerance
-    logger.info("Starting inference pipeline...")
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Inference attempt: {attempt + 1}/{max_retries}")
 
-    # TODO: implement fault tolerance
-    try:
-        results = run_inference_pipeline(
-            cadence_data=cadence_data,
-            npy_path=config.data.test_files[0],  # TODO: Handle multiple test files properly
-            strategy=strategy,
-            # TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
-        )
-    except Exception as e:
-        logger.error(f"Inference failed: {e}")
-        sys.exit(1)
+            # Preprocessing + load stage. Skipped on retry if a previous attempt
+            # already produced cadence_data (i.e. only the inference stage failed).
+            if cadence_data is None:
+                if config.data.inference_files is not None:
+                    cadence_results = preprocessor.find_hits()
+                    if not cadence_results:
+                        logger.error("No cadence results produced by preprocessing")
+                        sys.exit(1)
+                    npy_paths = [cr.npy_path for cr in cadence_results]
+                    logger.info(
+                        f"Preprocessing produced {len(npy_paths)} cadence .npy file(s); "
+                        f"loading into inference"
+                    )
+                    cadence_data = preprocessor.load_inference_data(
+                        override_filepaths=npy_paths
+                    ).astype(np.float32)
+                    npy_path_for_logging = npy_paths[0]
+                else:
+                    if not config.data.test_files:
+                        logger.error(
+                            "Neither --inference-files nor --test-files is configured; "
+                            "nothing to load for inference"
+                        )
+                        sys.exit(1)
+                    cadence_data = preprocessor.load_inference_data().astype(np.float32)
+                    npy_path_for_logging = config.data.test_files[0]
+            else:
+                logger.info(
+                    "Reusing cadence_data from previous attempt (skipping preprocessing + load)"
+                )
 
-    # NOTE: should we create dedicated (tagged) directories inside output_path to store inference results (plots, configs, etc.)? note, data still written to db regardless
+            # NOTE: come back to this later (inference-stage resume should skip cadences already in the DB. not yet implemented)
+            # Inference stage
+            results = run_inference_pipeline(
+                cadence_data=cadence_data,
+                npy_path=npy_path_for_logging,  # TODO: handle multiple test_files properly
+                strategy=strategy,
+                # TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
+            )
+            break  # success
+
+        except KeyboardInterrupt:
+            # Don't retry on user interruption; re-raise to propagate traceback
+            logger.info("Inference interrupted by user")
+            raise
+
+        except Exception as e:
+            logger.error(f"Inference attempt {attempt + 1} failed with error: {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                gc.collect()
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Exceeded max retries ({max_retries}). Final error: {e}")
+                sys.exit(1)
+
+    # NOTE: come back to this later (should we create dedicated (tagged) directories inside output_path to store inference results (plots, configs, etc.)? note, data still written to db regardless)
     # Save inference configuration
     config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist

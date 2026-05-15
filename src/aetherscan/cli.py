@@ -451,6 +451,13 @@ def _add_inference_arguments(subparsers):
         default=None,
         help="Space-separated list of testing data file names (e.g., real_filtered_LARGE_test_HIP15638.npy)",
     )
+    inf_parser.add_argument(
+        "--inference-files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Space-separated list of inference catalog file names (e.g. complete_cadences_catalog.csv). Expects .h5 filepaths to individual observations, and sufficient metadata for recovering cadence groupings. If provided, triggers the energy detection preprocessing pipeline and takes precedence over --test-files",
+    )
 
     # Inference configuration
     inf_parser.add_argument(
@@ -482,6 +489,99 @@ def _add_inference_arguments(subparsers):
         type=float,
         default=None,
         help="Classification threshold for candidate detection",
+    )
+
+    # Energy detection preprocessing
+    inf_parser.add_argument(
+        "--cadence-group-by-cols",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Space-separated list of CSV column names whose joint value defines cadence membership (e.g., Target Session Band 'Cadence ID' Frequency)",
+    )
+    inf_parser.add_argument(
+        "--cadence-h5-path-col",
+        type=str,
+        default=None,
+        help="CSV column containing the .h5 file path for each observation (default: '.h5 path')",
+    )
+    inf_parser.add_argument(
+        "--cadence-expected-obs",
+        type=int,
+        default=None,
+        help="Required number of observations per cadence (default: 6 for ABACAD)",
+    )
+    inf_parser.add_argument(
+        "--coarse-channel-width",
+        type=int,
+        default=None,
+        help="Number of fine channels per coarse channel (default: 1048576)",
+    )
+    inf_parser.add_argument(
+        "--parallel-coarse-chans",
+        type=int,
+        default=None,
+        help="Number of coarse channels to process in parallel per block (default: 28)",
+    )
+    inf_parser.add_argument(
+        "--spline-order",
+        type=int,
+        default=None,
+        help="Spline order for bandpass fitting (default: 16)",
+    )
+    inf_parser.add_argument(
+        "--detection-window-size",
+        type=int,
+        default=None,
+        help="Sliding window size in fine channels for normality test (default: 256)",
+    )
+    inf_parser.add_argument(
+        "--detection-step-size",
+        type=int,
+        default=None,
+        help="Step size in fine channels for sliding window (default: 128)",
+    )
+    inf_parser.add_argument(
+        "--stat-threshold",
+        type=float,
+        default=None,
+        help="D'Agostino-Pearson statistic threshold for hit detection (default: 2048.0)",
+    )
+    inf_parser.add_argument(
+        "--stamp-width",
+        type=int,
+        default=None,
+        help="Width in fine channels of the extracted stamp around each hit (default: 4096; must equal --width-bin)",
+    )
+    inf_parser.add_argument(
+        "--overlap-search",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Additionally extract stamps offset by ±overlap_fraction*stamp_width around each hit. Pass --no-overlap-search to disable when the config default is True.",
+    )
+    inf_parser.add_argument(
+        "--overlap-fraction",
+        type=float,
+        default=None,
+        help="Fractional offset (relative to stamp_width) for overlap-search stamps (default: 0.5)",
+    )
+    inf_parser.add_argument(
+        "--preprocess-output-dir",
+        type=str,
+        default=None,
+        help="Directory for per-cadence .npy outputs from preprocessing",
+    )
+    inf_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Maximum number of retry attempts for inference (including preprocessing) on failure",
+    )
+    inf_parser.add_argument(
+        "--retry-delay",
+        type=int,
+        default=None,
+        help="Delay in seconds between inference retry attempts",
     )
 
     # Checkpoint configuration
@@ -572,6 +672,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.data.train_files = args.train_files
     if hasattr(args, "test_files") and args.test_files is not None:
         config.data.test_files = args.test_files
+    if hasattr(args, "inference_files") and args.inference_files is not None:
+        config.data.inference_files = args.inference_files
 
     # Training configuration
     if hasattr(args, "num_training_rounds") and args.num_training_rounds is not None:
@@ -656,9 +758,17 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.patience_threshold = args.patience_threshold
     if hasattr(args, "lr_reduction_factor") and args.lr_reduction_factor is not None:
         config.training.reduction_factor = args.lr_reduction_factor
-    if hasattr(args, "max_retries") and args.max_retries is not None:
+    if (
+        hasattr(args, "max_retries")
+        and args.max_retries is not None
+        and getattr(args, "command", None) == "train"
+    ):
         config.training.max_retries = args.max_retries
-    if hasattr(args, "retry_delay") and args.retry_delay is not None:
+    if (
+        hasattr(args, "retry_delay")
+        and args.retry_delay is not None
+        and getattr(args, "command", None) == "train"
+    ):
         config.training.retry_delay = args.retry_delay
 
     # Checkpoint configuration
@@ -687,6 +797,50 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and getattr(args, "command", None) == "inference"
     ):
         config.inference.per_replica_batch_size = args.per_replica_batch_size
+
+    # Energy detection preprocessing
+    if hasattr(args, "cadence_group_by_cols") and args.cadence_group_by_cols is not None:
+        config.inference.cadence_group_by_cols = args.cadence_group_by_cols
+    if hasattr(args, "cadence_h5_path_col") and args.cadence_h5_path_col is not None:
+        config.inference.cadence_h5_path_col = args.cadence_h5_path_col
+    if hasattr(args, "cadence_expected_obs") and args.cadence_expected_obs is not None:
+        config.inference.cadence_expected_obs = args.cadence_expected_obs
+    if hasattr(args, "coarse_channel_width") and args.coarse_channel_width is not None:
+        config.inference.coarse_channel_width = args.coarse_channel_width
+    if hasattr(args, "parallel_coarse_chans") and args.parallel_coarse_chans is not None:
+        config.inference.parallel_coarse_chans = args.parallel_coarse_chans
+    if hasattr(args, "spline_order") and args.spline_order is not None:
+        config.inference.spline_order = args.spline_order
+    if hasattr(args, "detection_window_size") and args.detection_window_size is not None:
+        config.inference.detection_window_size = args.detection_window_size
+    if hasattr(args, "detection_step_size") and args.detection_step_size is not None:
+        config.inference.detection_step_size = args.detection_step_size
+    if hasattr(args, "stat_threshold") and args.stat_threshold is not None:
+        config.inference.stat_threshold = args.stat_threshold
+    if hasattr(args, "stamp_width") and args.stamp_width is not None:
+        config.inference.stamp_width = args.stamp_width
+    # overlap_search uses argparse.BooleanOptionalAction with default=None so that
+    # the CLI can express "leave the config default" (omit), "force on"
+    # (--overlap-search), and "force off" (--no-overlap-search). The `is not None`
+    # guard preserves the config default when the user passes neither.
+    if hasattr(args, "overlap_search") and args.overlap_search is not None:
+        config.inference.overlap_search = args.overlap_search
+    if hasattr(args, "overlap_fraction") and args.overlap_fraction is not None:
+        config.inference.overlap_fraction = args.overlap_fraction
+    if hasattr(args, "preprocess_output_dir") and args.preprocess_output_dir is not None:
+        config.inference.preprocess_output_dir = args.preprocess_output_dir
+    if (
+        hasattr(args, "max_retries")
+        and args.max_retries is not None
+        and getattr(args, "command", None) == "inference"
+    ):
+        config.inference.max_retries = args.max_retries
+    if (
+        hasattr(args, "retry_delay")
+        and args.retry_delay is not None
+        and getattr(args, "command", None) == "inference"
+    ):
+        config.inference.retry_delay = args.retry_delay
 
 
 # NOTE: should we change validate_args() to validate_config() and run the tests on the final "applied" config singleton? or should we check both separately?
@@ -780,6 +934,29 @@ def validate_args(args: argparse.Namespace) -> None:
     # if hasattr(args, "some_param") and args.some_param is not None:
     #     if <validation_condition>:
     #         errors.append("Error message explaining the problem")
+
+    # NOTE: come back to this later (are runtime checks properly implemented? does config defaults kick in before cli args are applied? if some but not all csvs are invalid, do we still process valid csvs & throw errors for the invalid ones with proper checkpointing, or do we fail loudly & immediately? are these checks comprehensive for energy detection + inference modules, e.g. overlap_fraction between 0 & 1?)
+    # # Energy detection preprocessing checks
+    # # If inference_files is provided, cadence_group_by_cols must be non-empty.
+    # # Per-CSV column-existence checks are deferred to runtime (CSVs aren't loaded here).
+    # # stamp_width == width_bin is validated at runtime in inference_command, where both
+    # # are resolved together.
+    # if hasattr(args, "inference_files") and args.inference_files is not None:
+    #     group_cols = getattr(args, "cadence_group_by_cols", None)
+    #     # If the user didn't pass --cadence-group-by-cols, the dataclass default kicks in
+    #     # (a non-empty list). Only fail if the user explicitly provided an empty list.
+    #     if group_cols is not None and len(group_cols) == 0:
+    #         errors.append(
+    #             "--cadence-group-by-cols must be non-empty when --inference-files is provided"
+    #         )
+    #
+    # if hasattr(args, "detection_window_size") and args.detection_window_size is not None:
+    #     stamp_width = getattr(args, "stamp_width", None)
+    #     if stamp_width is not None and args.detection_window_size > stamp_width:
+    #         errors.append(
+    #             f"--detection-window-size ({args.detection_window_size}) must be "
+    #             f"<= --stamp-width ({stamp_width})"
+    #         )
 
     # Throw an error if any validation fails
     if errors:
