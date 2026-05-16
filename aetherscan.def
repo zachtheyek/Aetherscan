@@ -18,11 +18,16 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 # line and re-test.
 
 %files
-    requirements-container.txt /tmp/requirements-container.txt
+    # Stage to /opt rather than /tmp: Singularity bind-mounts the host's /tmp
+    # over the container's /tmp during %post (so the host's noexec/nodev
+    # constraints don't break temp use), which would hide files placed in /tmp
+    # by %files. /opt is part of every NGC TF base image and is stable.
+    requirements-container.txt /opt/aetherscan-requirements.txt
 
 %post
     # Install pip extras layered onto the NGC base.
-    pip install --no-cache-dir -r /tmp/requirements-container.txt
+    pip install --no-cache-dir -r /opt/aetherscan-requirements.txt
+    rm -f /opt/aetherscan-requirements.txt
 
 %environment
     # Prevent the container from picking up host-side Python packages, which
