@@ -38,6 +38,36 @@ Build takes ~15 minutes and produces a ~15 GB `.sif`. The recipe pulls `nvcr.io/
 > [!NOTE]
 > A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch.
 
+#### Build-time gotchas on hardened HPC nodes
+
+Locked-down clusters typically need three things adjusted before `singularity build` will succeed as an unprivileged user. Work through them in order:
+
+**`FATAL: --remote, --fakeroot, or the proot command are required to build this source as a non-root user`**
+
+SingularityCE 4.x requires fakeroot mappings (or `proot`, or `--remote`) for non-root builds. Have the cluster admin enable fakeroot once:
+
+```bash
+sudo singularity config fakeroot --add $USER
+```
+
+Then build with `singularity build --fakeroot ...`. If admin help isn't available, build on a machine where you do have fakeroot (e.g. the Apptainer cluster, which usually has it pre-configured), then `scp` the resulting `.sif` over — the SIF format is portable between Apptainer and SingularityCE.
+
+**`FATAL: 'noexec' mount option set on /tmp, temporary root filesystem won't be usable at this location`**
+
+The build's temporary root filesystem needs `exec` permissions, and many HPC nodes harden `/tmp` with `noexec`. Point Singularity at scratch storage instead:
+
+```bash
+mkdir -p /datax/scratch/$USER/singularity-tmp /datax/scratch/$USER/singularity-cache
+export SINGULARITY_TMPDIR=/datax/scratch/$USER/singularity-tmp
+export SINGULARITY_CACHEDIR=/datax/scratch/$USER/singularity-cache
+```
+
+`TMPDIR` needs ~15 GB free; `CACHEDIR` caches Docker base-layer blobs (a few GB, persists across rebuilds — keep it). Worth adding to `~/.bashrc` if you rebuild often.
+
+**Build fails in `%post` with `Could not open requirements file: /tmp/...`**
+
+A symptom of Singularity bind-mounting the host's `/tmp` over the container's `/tmp` during `%post`, which hides files placed there by `%files`. Already fixed in [`aetherscan.def`](../aetherscan.def) — we stage to `/opt/` instead. If you hit this, you're on an old revision of the branch; `git pull` and rebuild.
+
 ### 2. Verify the image (canary)
 
 ```bash
