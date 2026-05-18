@@ -12,10 +12,10 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 #   # SingularityCE (Blackwell cluster, 4.1.1):
 #   singularity build aetherscan-ngc25.02.sif aetherscan.def
 #
-# The NGC TensorFlow 25.02 base image ships TF 2.17 with CUDA 12.8 and the
-# Blackwell-ready kernels (sm_120). NVIDIA has announced 25.02 as the final NGC
-# TF container; if Aetherscan ever needs to migrate off it, swap the `From:`
-# line and re-test.
+# The NGC TensorFlow 25.02 base image ships TF 2.17 with Python 3.12, CUDA 12.8,
+# cuDNN 9.7.1, NCCL 2.25.1, and the Blackwell-ready kernels (sm_120). NVIDIA has
+# announced 25.02 as the final NGC TF container; if Aetherscan ever needs to
+# migrate off it, swap the `From:` line and re-test.
 
 %files
     # Stage to /opt rather than /tmp: Singularity bind-mounts the host's /tmp
@@ -41,10 +41,13 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
     Project    Aetherscan
     Base       nvcr.io/nvidia/tensorflow:25.02-tf2-py3
     TF         2.17
+    Python     3.12
     CUDA       12.8
+    cuDNN      9.7.1
+    NCCL       2.25.1
     Purpose    Blackwell (sm_120) + Ampere (sm_86) GPU support for Aetherscan
 
 %help
-    Aetherscan runtime image (TF 2.17 / CUDA 12.8 / Python 3.12).
+    Aetherscan runtime image (TF 2.17 / Python 3.12 / CUDA 12.8).
     Use scripts/run-container.sh from the repo root to launch commands:
         ./scripts/run-container.sh python -m aetherscan.main train --save-tag test_v1
