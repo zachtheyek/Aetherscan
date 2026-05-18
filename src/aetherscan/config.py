@@ -91,20 +91,15 @@ class RandomForestConfig:
     seed: int = 11
 
 
+# NOTE: verify that our current GPU config gracefully handles cases where the node has a single GPU (vs multiple)
+# TODO: add a way to specify (either number or name) the specific GPUs on a system we wish to use (currently defaults to all available). extend to cli.py too
+# TODO: run performance benchmarks using different num_gpus on a single node (and in future, multi-node as well)
 @dataclass
 class GPUConfig:
     """GPU runtime configuration"""
 
-    # Per-GPU memory cap in MiB. None means memory-growth-only (recommended on Blackwell).
-    # When set, TF allocates a fixed logical device of this size per physical GPU.
     per_gpu_memory_limit_mb: int | None = None
-
-    # num_packs for the NCCL / HierarchicalCopy all-reduce. Lower (1) reduces latency
-    # for tiny tensors; higher (4+) can help bandwidth on >4-GPU topologies.
     nccl_num_packs: int = 2
-
-    # Toggle for TF_GPU_ALLOCATOR=cuda_malloc_async. Disable as a workaround for
-    # OOM bugs reported in NGC 25.02 multi-GPU workloads.
     use_async_allocator: bool = True
 
 

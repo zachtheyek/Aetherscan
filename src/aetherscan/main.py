@@ -29,8 +29,10 @@ from aetherscan.train import get_latest_tag, run_training_pipeline
 logger = logging.getLogger(__name__)
 
 
-# NOTE: split this into strategy.py? have config option & cli flag to set single-GPU, multi-GPU, multi-node strategy. test thoroughly for each option
-# NOTE: how to only run on specific GPUs, rather than all GPUs?
+# NOTE: verify that our current GPU config gracefully handles cases where the node has a single GPU (vs multiple)
+# TODO: run performance benchmarks using different num_gpus on a single node (and in future, multi-node as well)
+# TODO: add a way to specify (either number or name) the specific GPUs on a system we wish to use (currently defaults to all available). extend to cli.py too
+# TEST: make sure this works, especially with _build_optimizer() in train.py (do they conflict? is one unnecessary vs the other?)
 def _warmup_collective(strategy):
     """Trigger a tiny cross-device reduction to surface NCCL failures at setup time.
 
@@ -64,9 +66,8 @@ def setup_gpu_strategy():
         # Explicitly clear so a previous run's env doesn't leak in.
         os.environ.pop("TF_GPU_ALLOCATOR", None)
 
-    os.environ["TF_ENABLE_GPU_GARBAGE_COLLECTION"] = (
-        "true"  # Aggressive cleanup of intermediate tensors
-    )
+    # Enable aggressive cleanup of intermediate tensors
+    os.environ["TF_ENABLE_GPU_GARBAGE_COLLECTION"] = "true"
 
     gpus = tf.config.list_physical_devices("GPU")
     if not gpus:
@@ -77,11 +78,11 @@ def setup_gpu_strategy():
         for gpu in gpus:
             # set_memory_growth stayed under tf.config.experimental in TF 2.17.
             tf.config.experimental.set_memory_growth(gpu, True)
-            # set_logical_device_configuration is the stable replacement for the
-            # deprecated experimental.set_virtual_device_configuration.
             # When per_gpu_memory_limit_mb is None we skip this call entirely and
             # rely on memory-growth only (recommended default on 96 GB Blackwell cards).
             if config.gpu.per_gpu_memory_limit_mb is not None:
+                # set_logical_device_configuration is the stable replacement for the
+                # deprecated experimental.set_virtual_device_configuration.
                 tf.config.set_logical_device_configuration(
                     gpu,
                     [
@@ -93,6 +94,7 @@ def setup_gpu_strategy():
 
         num_packs = config.gpu.nccl_num_packs
 
+        # Set distributed strategy to prevent uneven VRAM usage
         # Try NCCL first; fall back to HierarchicalCopyAllReduce only if the
         # warmup all-reduce actually fails. NCCL 2.25.1 is the first NCCL with
         # official sm_120 (Blackwell) support, so this path is especially load-bearing
