@@ -1,8 +1,7 @@
-# TODO: test with fresh conda install on train & inference
-# Ampere architecture conda environment.
-# Kept in API lockstep with the NGC TF 25.02 container that targets the Blackwell
-# cluster (see aetherscan.def + requirements-container.txt): same TF/Keras/NumPy
-# major versions so checkpoints and @tf.function tracing behave identically.
+# Ampere cluster conda environment
+# Version ranges should be kept in lockstep with NGC TF 25.02 container that targets
+# the Blackwell cluster (see aetherscan.def + requirements-container.txt)
+
 name: aetherscan
 channels:
   - conda-forge

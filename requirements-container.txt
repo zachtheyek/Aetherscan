@@ -1,14 +1,8 @@
 # Pip-only extras layered into the NGC TensorFlow 25.02 base image
-# (nvcr.io/nvidia/tensorflow:25.02-tf2-py3 already ships numpy, scipy, scikit-learn,
-# matplotlib, pandas, h5py, psutil, pytest, and tensorflow 2.17).
-#
-# IMPORTANT: every dep is upper-bounded. TF 2.17 requires numpy<2.0,>=1.26, and
-# unbounded >= constraints let pip resolve transitive deps (notably astropy 7.x,
-# scikit-learn 1.8.x, numba 0.65+) that drag numpy up to 2.x. The container build
-# succeeds but TF crashes at runtime on the numpy ABI break.
-#
-# Keep version ranges in lockstep with environment.yml so the Ampere conda and
-# Blackwell container paths run the same API surface.
+# (nvcr.io/nvidia/tensorflow:25.02-tf2-py3 already ships with numpy, scipy,
+# scikit-learn, matplotlib, pandas, h5py, psutil, pytest, and tensorflow 2.17).
+# Version ranges should be kept in lockstep with conda environment that targets the
+# Ampere cluster (see environment.yml)
 
 # Foundational deps -- already present in the NGC base; pinning here prevents
 # transitive bumps from upgrading them past TF 2.17's supported range.
