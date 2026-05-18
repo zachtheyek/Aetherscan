@@ -1,8 +1,8 @@
-# Ampere (A4000) conda environment.
+# TODO: test with fresh conda install on train & inference
+# Ampere architecture conda environment.
 # Kept in API lockstep with the NGC TF 25.02 container that targets the Blackwell
 # cluster (see aetherscan.def + requirements-container.txt): same TF/Keras/NumPy
 # major versions so checkpoints and @tf.function tracing behave identically.
-# TODO: test with fresh conda install on train & inference
 name: aetherscan
 channels:
   - conda-forge
@@ -28,7 +28,11 @@ dependencies:
   - pip:
       - tensorflow==2.17.*
       - setigen
-      - imageio>=2.34.0
-      - umap-learn>=0.5.6
-      - shap>=0.46.0
-      - slack-sdk>=3.31.0
+      # Upper-bound the remaining extras: without these caps, a fresh `conda env
+      # create` could resolve to versions that transitively require numpy 2.x
+      # (e.g. shap 0.51, umap-learn 0.5.12+), which would break TF 2.17. Mirrors
+      # the same pins in requirements-container.txt.
+      - imageio>=2.34.0,<3
+      - umap-learn>=0.5.6,<0.6
+      - shap>=0.46.0,<0.47
+      - slack-sdk>=3.31.0,<4
