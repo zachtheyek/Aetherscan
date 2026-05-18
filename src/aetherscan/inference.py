@@ -19,7 +19,7 @@ import tensorflow as tf
 
 from aetherscan.config import get_config
 from aetherscan.db import get_db
-from aetherscan.models import RandomForestModel, Sampling
+from aetherscan.models import RandomForestModel
 
 logger = logging.getLogger(__name__)
 
@@ -218,9 +218,7 @@ class InferencePipeline:
             # Load encoder within strategy scope
             logger.info(f"Loading encoder from {encoder_path} within strategy scope")
             with self.strategy.scope():
-                self.encoder = tf.keras.models.load_model(
-                    encoder_path, custom_objects={"Sampling": Sampling}
-                )
+                self.encoder = tf.keras.models.load_model(encoder_path)
             logger.info("Encoder loaded successfully")
         except Exception as e:
             logger.error(f"Error loading encoder: {e}")

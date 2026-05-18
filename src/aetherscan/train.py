@@ -50,7 +50,6 @@ from aetherscan.db import get_db, get_system_metadata
 from aetherscan.logger import get_logger
 from aetherscan.models import (
     RandomForestModel,
-    Sampling,
     create_beta_vae_model,
     prepare_latent_features,
 )
@@ -5704,12 +5703,8 @@ class TrainingPipeline:
             logger.info(f"Loading models from {base_dir} with tag '{tag}'")
 
             # Load encoder & decoder
-            checkpoint_encoder = tf.keras.models.load_model(
-                encoder_path, custom_objects={"Sampling": Sampling}
-            )
-            checkpoint_decoder = tf.keras.models.load_model(
-                decoder_path, custom_objects={"Sampling": Sampling}
-            )
+            checkpoint_encoder = tf.keras.models.load_model(encoder_path)
+            checkpoint_decoder = tf.keras.models.load_model(decoder_path)
 
             # Transfer weights
             self.vae.encoder.set_weights(checkpoint_encoder.get_weights())
