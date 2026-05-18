@@ -48,31 +48,6 @@ class MonitorConfig:
 
 
 @dataclass
-class GPUConfig:
-    """GPU runtime configuration
-
-    Tunable per machine. Defaults are tuned for the Blackwell workstation
-    (5x RTX PRO 6000, 96 GB each): memory-growth-only allocation, NCCL collectives
-    with num_packs=2, and the cuda_malloc_async allocator to prevent fragmentation.
-    Override via CLI flags (--gpu-memory-limit-mb / --nccl-num-packs / --no-async-allocator)
-    when running on machines with smaller GPUs (e.g. set --gpu-memory-limit-mb 14000
-    to reproduce the legacy Ampere A4000 behavior).
-    """
-
-    # Per-GPU memory cap in MiB. None means memory-growth-only (recommended on Blackwell).
-    # When set, TF allocates a fixed logical device of this size per physical GPU.
-    per_gpu_memory_limit_mb: int | None = None
-
-    # num_packs for the NCCL / HierarchicalCopy all-reduce. Lower (1) reduces latency
-    # for tiny tensors; higher (4+) can help bandwidth on >4-GPU topologies.
-    nccl_num_packs: int = 2
-
-    # Toggle for TF_GPU_ALLOCATOR=cuda_malloc_async. Disable as a workaround for
-    # OOM bugs reported in NGC 25.02 multi-GPU workloads.
-    use_async_allocator: bool = True
-
-
-@dataclass
 class LoggerConfig:
     """Logger configuration"""
 
@@ -114,6 +89,23 @@ class RandomForestConfig:
     max_features: str = "sqrt"  # Random feature selection (sqrt, log2, float)
     n_jobs: int = -1  # Number of parallel jobs to run (-1 = use all available CPU cores)
     seed: int = 11
+
+
+@dataclass
+class GPUConfig:
+    """GPU runtime configuration"""
+
+    # Per-GPU memory cap in MiB. None means memory-growth-only (recommended on Blackwell).
+    # When set, TF allocates a fixed logical device of this size per physical GPU.
+    per_gpu_memory_limit_mb: int | None = None
+
+    # num_packs for the NCCL / HierarchicalCopy all-reduce. Lower (1) reduces latency
+    # for tiny tensors; higher (4+) can help bandwidth on >4-GPU topologies.
+    nccl_num_packs: int = 2
+
+    # Toggle for TF_GPU_ALLOCATOR=cuda_malloc_async. Disable as a workaround for
+    # OOM bugs reported in NGC 25.02 multi-GPU workloads.
+    use_async_allocator: bool = True
 
 
 # TODO: make sure the entire pipeline respects DataConfig() values, instead of hard coding
@@ -378,10 +370,10 @@ class Config:
         self.db = DBConfig()
         self.manager = ManagerConfig()
         self.monitor = MonitorConfig()
-        self.gpu = GPUConfig()
         self.logger = LoggerConfig()
         self.beta_vae = BetaVAEConfig()
         self.rf = RandomForestConfig()
+        self.gpu = GPUConfig()
         self.data = DataConfig()
         self.training = TrainingConfig()
         self.inference = InferenceConfig()
@@ -465,11 +457,6 @@ class Config:
                 "monitor_interval": self.monitor.monitor_interval,
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
             },
-            "gpu": {
-                "per_gpu_memory_limit_mb": self.gpu.per_gpu_memory_limit_mb,
-                "nccl_num_packs": self.gpu.nccl_num_packs,
-                "use_async_allocator": self.gpu.use_async_allocator,
-            },
             "logger": {
                 "console_level": self.logger.console_level,
                 "file_level": self.logger.file_level,
@@ -496,6 +483,11 @@ class Config:
                 "max_features": self.rf.max_features,
                 "n_jobs": self.rf.n_jobs,
                 "seed": self.rf.seed,
+            },
+            "gpu": {
+                "per_gpu_memory_limit_mb": self.gpu.per_gpu_memory_limit_mb,
+                "nccl_num_packs": self.gpu.nccl_num_packs,
+                "use_async_allocator": self.gpu.use_async_allocator,
             },
             "data": {
                 "num_observations": self.data.num_observations,

@@ -390,8 +390,29 @@ def _add_train_arguments(subparsers):
         help="Delay in seconds between retry attempts after training failure",
     )
 
-    # GPU configuration (shared with inference parser via _add_gpu_arguments)
-    _add_gpu_arguments(train_parser)
+    # GPU configuration
+    # Defaults are kept at None so the GPUConfig dataclass defaults (config.py) survive
+    # when the user doesn't pass a flag — this is what lets the same source tree run
+    # unchanged on Ampere (--gpu-memory-limit-mb 14000) and Blackwell (no flag →
+    # memory-growth only).
+    train_parser.add_argument(
+        "--gpu-memory-limit-mb",
+        type=int,
+        default=None,
+        help="Per-GPU memory cap in MiB. Omit to use memory-growth only (recommended on Blackwell's 96 GB cards). Set to e.g. 14000 to reproduce the legacy Ampere A4000 cap.",
+    )
+    train_parser.add_argument(
+        "--nccl-num-packs",
+        type=int,
+        default=None,
+        help="num_packs for NCCL/HierarchicalCopy all-reduce (default: 2). Lower (1) reduces tiny-tensor latency; higher (4+) can help bandwidth on >4-GPU topologies. Only meaningfully impacts gradient all-reduce during training.",
+    )
+    train_parser.add_argument(
+        "--async-allocator",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
+    )
 
     # Checkpoint configuration
     train_parser.add_argument(
@@ -587,8 +608,23 @@ def _add_inference_arguments(subparsers):
         help="Delay in seconds between inference retry attempts",
     )
 
-    # GPU configuration (shared with train parser via _add_gpu_arguments)
-    _add_gpu_arguments(inf_parser)
+    # GPU configuration
+    # --nccl-num-packs is intentionally omitted: inference uses strategy.run +
+    # experimental_local_results without cross-device collectives, so num_packs is a
+    # dead knob here. Defaults are kept at None so the GPUConfig dataclass defaults
+    # survive when the user doesn't pass a flag.
+    inf_parser.add_argument(
+        "--gpu-memory-limit-mb",
+        type=int,
+        default=None,
+        help="Per-GPU memory cap in MiB. Omit to use memory-growth only (recommended on Blackwell's 96 GB cards). Set to e.g. 14000 to reproduce the legacy Ampere A4000 cap.",
+    )
+    inf_parser.add_argument(
+        "--async-allocator",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
+    )
 
     # Checkpoint configuration
     inf_parser.add_argument(
@@ -596,34 +632,6 @@ def _add_inference_arguments(subparsers):
         type=str,
         default=None,
         help="Tag for current pipeline run. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
-    )
-
-
-def _add_gpu_arguments(parser):
-    """Add GPU configuration arguments shared by train + inference subparsers.
-
-    Wires the GPUConfig dataclass (config.py) onto the CLI. Defaults are kept at
-    None so the dataclass defaults survive when the user doesn't pass a flag —
-    this is what lets the same source tree run unchanged on Ampere
-    (--gpu-memory-limit-mb 14000) and Blackwell (no flag → memory-growth only).
-    """
-    parser.add_argument(
-        "--gpu-memory-limit-mb",
-        type=int,
-        default=None,
-        help="Per-GPU memory cap in MiB. Omit to use memory-growth only (recommended on Blackwell's 96 GB cards). Set to e.g. 14000 to reproduce the legacy Ampere A4000 cap.",
-    )
-    parser.add_argument(
-        "--nccl-num-packs",
-        type=int,
-        default=None,
-        help="num_packs for NCCL/HierarchicalCopy all-reduce (default: 2). Lower (1) reduces tiny-tensor latency; higher (4+) can help bandwidth on >4-GPU topologies.",
-    )
-    parser.add_argument(
-        "--async-allocator",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
     )
 
 
@@ -805,7 +813,9 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     ):
         config.training.retry_delay = args.retry_delay
 
-    # GPU configuration (shared by train + inference)
+    # GPU configuration (--gpu-memory-limit-mb and --async-allocator live on both
+    # train + inference parsers; --nccl-num-packs is train-only because inference uses
+    # strategy.run without cross-device collectives).
     if hasattr(args, "gpu_memory_limit_mb") and args.gpu_memory_limit_mb is not None:
         config.gpu.per_gpu_memory_limit_mb = args.gpu_memory_limit_mb
     if hasattr(args, "nccl_num_packs") and args.nccl_num_packs is not None:
