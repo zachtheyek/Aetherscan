@@ -52,6 +52,10 @@ tmux send-keys -t "$C" 'htop' C-m
 tmux send-keys -t "$D" 'conda activate aetherscan' C-m
 tmux send-keys -t "$D" "$PSUTIL_CMD" C-m
 
+# Put focus back on the htop pane so that's what's active when the user
+# later switches to this window (split-window leaves the new pane focused).
+tmux select-pane -t "$C"
+
 # ───── Window 3: nvidia-smi ─────
 tmux new-window -t "$SESSION" -n nvidia-smi
 tmux send-keys -t "$SESSION:nvidia-smi" 'watch -n 1 nvidia-smi' C-m
