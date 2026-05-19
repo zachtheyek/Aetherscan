@@ -21,8 +21,10 @@ dependencies:
   - joblib>=1.4,<2
   # setuptools provides pkg_resources, which blimpy (transitive via setigen)
   # imports at module load. Recent pip / Python releases dropped setuptools
-  # from the bootstrap, so we install it explicitly here.
-  - setuptools>=70
+  # from the bootstrap, so we install it explicitly. Upper-bound at <81 because
+  # setuptools 81 removed pkg_resources as a vendored submodule -- revisit
+  # once blimpy migrates off pkg_resources (upstream issue).
+  - setuptools>=70,<81
   # Conda-only deps (the NGC base image already ships h5py / psutil / pytest /
   # cudnn / cuda-runtime so requirements-container.txt doesn't pin them).
   - h5py=3.11.*

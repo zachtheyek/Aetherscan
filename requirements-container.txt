@@ -22,6 +22,8 @@ slack-sdk>=3.31.0,<4
 python-dotenv>=1.0,<2
 # setuptools provides pkg_resources, which blimpy (transitive via setigen)
 # imports at module load. Recent pip / Python releases dropped setuptools
-# from the bootstrap, so we install it explicitly here.
-setuptools>=70
+# from the bootstrap, so we install it explicitly. Upper-bound at <81 because
+# setuptools 81 removed pkg_resources as a vendored submodule -- revisit
+# once blimpy migrates off pkg_resources (upstream issue).
+setuptools>=70,<81
 setigen
