@@ -10,7 +10,7 @@ If you encounter an issue not listed here:
 2. If new, open a discussion with:
    - Clear description of the problem
    - Steps to reproduce
-   - System information (use `utils/system_info.sh` and append outputs as attachments)
+   - System information (use `utils/get_system_info.sh` and append outputs as attachments)
    - Relevant log outputs
    - Configuration used
 

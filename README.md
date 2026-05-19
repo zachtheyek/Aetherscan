@@ -65,7 +65,7 @@ As the software matures, more detailed system requirements will be made availabl
 > Installation via pip and containerized distributions will be made available in a later release.
 
 > [!NOTE]
-> The conda steps below target Ampere GPUs. For Blackwell GPUs, build the NGC TF 2.17 container with `apptainer build aetherscan-ngc25.02.sif aetherscan.def` (or `singularity build ...`) and run the pipeline via `./utils/run-container.sh`. See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full walkthrough.
+> The conda steps below target Ampere GPUs. For Blackwell GPUs, build the NGC TF 2.17 container with `apptainer build aetherscan-ngc25.02.sif aetherscan.def` (or `singularity build ...`) and run the pipeline via `./utils/run_container.sh`. See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full walkthrough.
 
 **1. Clone the repository**
 

@@ -24,7 +24,7 @@ A clear and concise description of what you expected to happen.
 If applicable, add screenshots to help explain your problem.
 
 **System information**
-Run `utils/system_info.sh` and append the outputs as attachments
+Run `utils/get_system_info.sh` and append the outputs as attachments
 
 **Additional context**
 Add any other context about the problem here.

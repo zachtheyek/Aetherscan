@@ -11,8 +11,8 @@
 # either cluster can build and run the image without code changes.
 #
 # Usage:
-#     ./utils/run-container.sh python -m aetherscan.main train --save-tag test_v1
-#     ./utils/run-container.sh python -m aetherscan.main inference --inference-files <csv>
+#     ./utils/run_container.sh python -m aetherscan.main train --save-tag test_v1
+#     ./utils/run_container.sh python -m aetherscan.main inference --inference-files <csv>
 #
 # Override via env var:
 #     SIF                       Path to the .sif image

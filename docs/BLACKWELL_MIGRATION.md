@@ -71,7 +71,7 @@ A symptom of Singularity bind-mounting the host's `/tmp` over the container's `/
 ### 2. Verify the image (canary)
 
 ```bash
-./utils/run-container.sh python -c "
+./utils/run_container.sh python -c "
 import tensorflow as tf
 print('TF:', tf.__version__, '| CUDA built:', tf.test.is_built_with_cuda())
 gpus = tf.config.list_physical_devices('GPU')
@@ -97,7 +97,7 @@ The conda env was bumped to TF 2.17 / numpy 1.26 / cuDNN 9.3 to match the contai
 ### Blackwell (container, memory-growth only — recommended default)
 
 ```bash
-./utils/run-container.sh \
+./utils/run_container.sh \
     python -m aetherscan.main train \
     --save-tag final_v1
 ```
@@ -118,7 +118,7 @@ The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as 
 
 ```bash
 # Blackwell
-./utils/run-container.sh \
+./utils/run_container.sh \
     python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
@@ -142,7 +142,7 @@ Three flags wire onto `GPUConfig` (in [`src/aetherscan/config.py`](../src/aether
 
 ### `CUDA_ERROR_INVALID_PTX` or `CUDA_ERROR_INVALID_HANDLE` on Blackwell
 
-You're running TF on the host directly, not via the container. The host TF wheel has no sm_120 kernels. Re-run through `./utils/run-container.sh`.
+You're running TF on the host directly, not via the container. The host TF wheel has no sm_120 kernels. Re-run through `./utils/run_container.sh`.
 
 ### `nvidia-smi` works but TF sees 0 GPUs inside the container
 
@@ -154,10 +154,10 @@ The startup warmup all-reduce in `setup_gpu_strategy` should catch most NCCL fai
 
 ```bash
 # Re-run with NCCL debug logs
-NCCL_DEBUG=INFO ./utils/run-container.sh python -m aetherscan.main train ...
+NCCL_DEBUG=INFO ./utils/run_container.sh python -m aetherscan.main train ...
 
 # Or force the hierarchical fallback by lowering num_packs
-./utils/run-container.sh python -m aetherscan.main train --nccl-num-packs 1 ...
+./utils/run_container.sh python -m aetherscan.main train --nccl-num-packs 1 ...
 ```
 
 ### Multi-GPU OOM on Blackwell
@@ -165,7 +165,7 @@ NCCL_DEBUG=INFO ./utils/run-container.sh python -m aetherscan.main train ...
 The NGC 25.02 release notes flag a known multi-GPU OOM under the async allocator. Disable it:
 
 ```bash
-./utils/run-container.sh python -m aetherscan.main train --no-async-allocator ...
+./utils/run_container.sh python -m aetherscan.main train --no-async-allocator ...
 ```
 
 ## Fallback options
