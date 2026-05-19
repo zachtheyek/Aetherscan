@@ -26,10 +26,36 @@
 #                               (default: /datax/scratch/zachy/outputs/aetherscan)
 #     SLACK_BOT_TOKEN           Slack bot token, forwarded into the container
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
+#
+# <repo>/.env is auto-loaded if present, so secrets set by "source .env" in the
+# user's shell (the README's recommended workflow — bare KEY=VALUE lines, no
+# 'export') survive the trip into this child process. Anything already in our
+# exec env (inline VAR=val invocation, real exports) takes precedence over the
+# corresponding .env value.
 
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Load <repo>/.env without clobbering anything already exported in our env.
+# Plain "source .env" with set -a would also work, but it overrides existing
+# values; we want inline VAR=val to win.
+if [[ -f "$REPO/.env" ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+        # Strip trailing CR (Windows line endings), skip blanks + comments.
+        line=${line%$'\r'}
+        [[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
+        # Split on the first '='. Keys without '=' are malformed; skip them.
+        [[ $line != *=* ]] && continue
+        key=${line%%=*}
+        value=${line#*=}
+        [[ -z $key ]] && continue
+        # ${!key+x} is non-empty iff $key is already set in our env (even if
+        # the existing value is empty) — preserves inline + export precedence.
+        [[ -z ${!key+x} ]] && export "$key=$value"
+    done < "$REPO/.env"
+fi
+
 SIF=${SIF:-$REPO/aetherscan-ngc25.02.sif}
 
 # Runtime detection. Prefer apptainer when both are installed (more active

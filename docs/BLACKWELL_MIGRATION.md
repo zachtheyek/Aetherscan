@@ -102,7 +102,7 @@ The conda env was bumped to TF 2.17 / numpy 1.26 / cuDNN 9.3 to match the contai
     --save-tag final_v1
 ```
 
-The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv`, and forwards `SLACK_*` env vars. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB.
+The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv`, and forwards `SLACK_*` env vars. It also auto-loads `<repo>/.env` if present, so `source .env` in your shell (the README's recommended workflow — bare `KEY=VALUE`, no `export`) is enough to get Slack credentials into the container. Anything already in the wrapper's env (inline `VAR=val ./utils/run_container.sh ...` or real exports) wins over the `.env` value for the same key. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB.
 
 ### Ampere (conda, 14 GB cap to match prior behavior)
 
