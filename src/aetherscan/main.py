@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 import tensorflow as tf
+from dotenv import find_dotenv, load_dotenv
 
 from aetherscan.cli import apply_args_to_config, setup_argument_parser, validate_args
 from aetherscan.config import get_config, init_config
@@ -484,6 +485,15 @@ def inference_command():
 
 def main():
     """Main entry point to Aetherscan pipeline"""
+    # Auto-load <repo>/.env (searched upward from CWD) into os.environ so
+    # SLACK_*/AETHERSCAN_* land in the process env before any aetherscan
+    # module reads them — covers the Ampere conda workflow without needing
+    # "source .env" or an inline VAR=val prefix, and harmlessly redundant in
+    # the container workflow (utils/run_container.sh already passes --env for
+    # the same keys, and load_dotenv() by default won't override existing
+    # values). Multiprocess workers spawned later inherit os.environ from us.
+    load_dotenv(find_dotenv())
+
     # Initialize config
     try:
         init_config()
