@@ -6,13 +6,13 @@ Optimize training parameters to satisfy divisibility constraints across multiple
 
 Usage:
   # Use config values as defaults, vary all parameters
-  ./optimize_training_params.py
+  ./utils/find_optimal_configs.py
 
   # Hold certain parameters constant
-  ./optimize_training_params.py --hold-per-replica-batch-size --hold-train-val-split
+  ./utils/find_optimal_configs.py --hold-per-replica-batch-size --hold-train-val-split
 
   # Only allow certain parameters to increase
-  ./optimize_training_params.py --only-increase-effective-batch-size --only-decrease-num-samples-beta-vae
+  ./utils/find_optimal_configs.py --only-increase-effective-batch-size --only-decrease-num-samples-beta-vae
 """
 
 import argparse
