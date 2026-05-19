@@ -3,8 +3,9 @@
 #
 # Auto-detects whether `apptainer` (e.g. Apptainer 1.4.5 on the Ampere cluster)
 # or `singularity` (e.g. SingularityCE 4.1.1 on the Blackwell cluster) is the
-# available runtime, then runs the requested command inside the prebuilt .sif
-# image with GPU passthrough and the standard bind mounts.
+# available runtime (Apptainer preferred when both present), then runs the
+# requested command inside the prebuilt .sif image with GPU passthrough and the
+# standard bind mounts.
 #
 # The two runtimes are CLI-compatible for the flags used here (exec, --nv,
 # --bind, --pwd, --env), and both consume the same aetherscan.def recipe, so
