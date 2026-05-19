@@ -9,13 +9,22 @@ channels:
   - nvidia
 dependencies:
   - python=3.10
-  - numpy=1.26.*
-  - scipy=1.13.*
-  - scikit-learn=1.5.*
-  - scikit-image=0.24.*
-  - astropy=6.1.*
-  - matplotlib=3.9.*
-  - joblib=1.4.*
+  # Foundational deps -- pin ranges identically to requirements-container.txt
+  # so the conda env and the NGC container resolve to the same versions of
+  # everything aetherscan code touches directly.
+  - numpy>=1.26,<2.0
+  - scipy>=1.13,<1.14
+  - scikit-learn>=1.5,<1.6
+  - scikit-image>=0.24,<0.25
+  - astropy>=6.1,<7
+  - matplotlib>=3.9,<3.10
+  - joblib>=1.4,<2
+  # setuptools provides pkg_resources, which blimpy (transitive via setigen)
+  # imports at module load. Recent pip / Python releases dropped setuptools
+  # from the bootstrap, so we install it explicitly here.
+  - setuptools>=70
+  # Conda-only deps (the NGC base image already ships h5py / psutil / pytest /
+  # cudnn / cuda-runtime so requirements-container.txt doesn't pin them).
   - h5py=3.11.*
   - hdf5plugin
   - psutil=6.0.*
@@ -27,7 +36,7 @@ dependencies:
   - pip:
       - tensorflow==2.17.*
       - setigen
-      - imageio>=2.34.0,<3
+      - imageio>=2.34,<3
       - umap-learn>=0.5.6,<0.6
       - shap>=0.46.0,<0.47
       - slack-sdk>=3.31.0,<4
