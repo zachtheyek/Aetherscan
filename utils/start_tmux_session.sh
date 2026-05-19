@@ -34,7 +34,6 @@ tmux send-keys -t "$TOP" 'conda activate aetherscan' C-m
 tmux send-keys -t "$TOP" 'export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' C-m
 tmux send-keys -t "$TOP" 'export TF_CPP_MIN_LOG_LEVEL=1' C-m
 tmux send-keys -t "$TOP" 'cd Aetherscan/' C-m
-tmux send-keys -t "$TOP" 'source .env' C-m
 
 # Top pane stays full-width; A is bottom-left, B is bottom-right.
 A=$(tmux split-window -v -t "$TOP" -P -F '#{pane_id}')
