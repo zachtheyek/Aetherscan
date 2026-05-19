@@ -486,7 +486,7 @@ def inference_command():
 def main():
     """Main entry point to Aetherscan pipeline"""
     # Auto-load <repo>/.env (searched upward from CWD) into os.environ so
-    # SLACK_*/AETHERSCAN_* land in the process env before any aetherscan
+    # environment variables land in the process env before any aetherscan
     # module reads them — covers the Ampere conda workflow without needing
     # "source .env" or an inline VAR=val prefix, and harmlessly redundant in
     # the container workflow (utils/run_container.sh already passes --env for
