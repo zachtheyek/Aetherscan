@@ -14,8 +14,7 @@ outputs/
 # Temporary docs
 docs/PRESENTATION_OUTLINE.md
 
-# Container artifacts (built locally per-cluster via apptainer/singularity build,
-# regenerate from aetherscan.def instead of committing)
+# Container artifacts
 *.sif
 
 
