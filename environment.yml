@@ -1,12 +1,19 @@
 # Ampere cluster conda environment
 # Version ranges should be kept in lockstep with NGC TF 25.02 container that targets
 # the Blackwell cluster (see aetherscan.def + requirements-container.txt)
+#
+# CUDA / cuDNN / NCCL come from the tensorflow[and-cuda] pip extra rather than
+# conda packages. The TF 2.17 wheel is ABI-tied to a specific CUDA stack
+# (CUDA 12.3 runtime, cuDNN 9.1, NCCL 2.21.5) -- mixing in newer conda-forge
+# versions (e.g. cuda-runtime=12.5 / cudnn=9.3) causes TF to silently fail GPU
+# detection and fall back to CPU. Letting pip resolve the matching nvidia-*
+# wheels via [and-cuda] guarantees a working stack and matches the wheel
+# Aetherscan is tested against in CI.
 
 name: aetherscan
 channels:
   - conda-forge
   - defaults
-  - nvidia
 dependencies:
   - python=3.10
   # Foundational deps -- pin ranges identically to requirements-container.txt
@@ -25,18 +32,19 @@ dependencies:
   # setuptools 81 removed pkg_resources as a vendored submodule -- revisit
   # once blimpy migrates off pkg_resources (upstream issue).
   - setuptools>=70,<81
-  # Conda-only deps (the NGC base image already ships h5py / psutil / pytest /
-  # cudnn / cuda-runtime so requirements-container.txt doesn't pin them).
+  # Conda-only deps (the NGC base image already ships h5py / psutil / pytest
+  # so requirements-container.txt doesn't pin them).
   - h5py=3.11.*
   - hdf5plugin
   - psutil=6.0.*
   - pytest=8.2.*
   - ipykernel
-  - nvidia::cuda-runtime=12.5.*
-  - cudnn=9.3.*
   - pip
   - pip:
-      - tensorflow==2.17.*
+      # [and-cuda] pulls nvidia-cuda-runtime-cu12 12.3.x, nvidia-cudnn-cu12 9.1.x,
+      # nvidia-nccl-cu12 2.21.x, etc. -- the exact ABI the TF 2.17 wheel was built
+      # against. Driver requirement: NVIDIA driver >= 525.60 on the host.
+      - tensorflow[and-cuda]==2.17.*
       - setigen
       - imageio>=2.34,<3
       - umap-learn>=0.5.6,<0.6
