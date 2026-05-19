@@ -81,23 +81,27 @@ conda env create -f environment.yml
 conda activate aetherscan
 ```
 
-**3. Set environment variables**
+**3. Configure secrets and paths (optional)**
 
-```bash
-# (Recommended) from .env file — see SECURITY.md
-source .env
-```
+Aetherscan auto-loads `<repo>/.env` into `os.environ` at pipeline startup (via [python-dotenv](https://pypi.org/project/python-dotenv/) in `main.py`), so the recommended path is to put secrets and any path overrides in a `.env` file at the repo root and forget about it — no `source .env` or inline prefix needed, and multiprocess worker pools still inherit the values via `os.environ`. See [`SECURITY.md`](SECURITY.md) for guidance on keeping `.env` out of git.
 
-```bash
-# (Alternative) manual configuration
-
-# If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
-# Note, CLI flags (--data-path, --model-path, --output-path) overrides environment variables
-export AETHERSCAN_DATA_PATH="/path/to/data"
-export AETHERSCAN_MODEL_PATH="/path/to/models"
-export AETHERSCAN_OUTPUT_PATH="/path/to/outputs"
+```ini
+# <repo>/.env  — bare KEY=VALUE, no quoting, no "export"
 
 # If none specified, Slack integration is automatically disabled
+SLACK_BOT_TOKEN=your-slack-bot-token
+SLACK_CHANNEL=your-slack-channel
+
+# If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
+# Note, CLI flags (--data-path, --model-path, --output-path) override these
+AETHERSCAN_DATA_PATH=/path/to/data
+AETHERSCAN_MODEL_PATH=/path/to/models
+AETHERSCAN_OUTPUT_PATH=/path/to/outputs
+```
+
+If you'd rather set them directly in your shell (skipping `.env`), `export` works equivalently and takes precedence over `.env` for any keys it sets — useful for one-off overrides:
+
+```bash
 export SLACK_BOT_TOKEN="your-slack-bot-token"
 export SLACK_CHANNEL="your-slack-channel"
 ```
@@ -105,12 +109,11 @@ export SLACK_CHANNEL="your-slack-channel"
 **4. Run pipeline**
 
 ```bash
-# Use inline environment variables to create a temporary environment frame that applies to the current command and subsequent descendants
-# Necessary for proper parent→child environment inheritance in multiprocess worker pools
-SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
-  python -m aetherscan.main {train|inference} \
+PYTHONPATH=src python -m aetherscan.main {train|inference} \
   --save-tag final_v1
 ```
+
+`PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` step. No inline `KEY=VALUE` prefix is needed for Slack credentials — the `.env` auto-load runs before any worker process is spawned, so `os.environ` inheritance to multiprocess pools is automatic.
 
 ---
 
@@ -121,8 +124,7 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 > Non-development workflows should avoid directly calling other scripts/modules.
 
 > [!NOTE]
-> The following section will omit writing the inline environment variables for brevity.
-> As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`.
+> The following section shortens `PYTHONPATH=src python -m aetherscan.main` to simply `aetherscan` for brevity.
 >
 > # TODO: update README once local builds with `pip install -e .` are working as expected.
 
