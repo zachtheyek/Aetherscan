@@ -15,7 +15,7 @@ outputs/
 docs/PRESENTATION_OUTLINE.md
 
 # Container artifacts (built locally per-cluster via apptainer/singularity build,
-# ~15 GB each; regenerate from aetherscan.def instead of committing)
+# regenerate from aetherscan.def instead of committing)
 *.sif
 
 
