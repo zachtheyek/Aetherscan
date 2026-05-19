@@ -17,10 +17,12 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 # Long python one-liner kept verbatim via single-quoted heredoc (no expansion).
+# Keep this on a SINGLE line — the heredoc preserves any literal newline, and
+# tmux send-keys passes it through as Enter, which breaks the `-c "..."` quoted
+# arg mid-f-string ("SyntaxError: unterminated string literal").
 PSUTIL_CMD=$(
     cat <<'EOF'
-python -c "import psutil, time; [print(f'CPU: {psutil.cpu_percent()}%, MEM: {psutil.virtual_memo
-ry().percent}%') or time.sleep(1) for _ in iter(int,1)]"
+python -c "import psutil, time; [print(f'CPU: {psutil.cpu_percent()}%, MEM: {psutil.virtual_memory().percent}%') or time.sleep(1) for _ in iter(int,1)]"
 EOF
 )
 
