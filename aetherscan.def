@@ -49,5 +49,5 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 
 %help
     Aetherscan runtime image (Python 3.12 / TF 2.17 / CUDA 12.8).
-    Use scripts/run-container.sh from the repo root to launch commands, e.g.:
-        ./scripts/run-container.sh python -m aetherscan.main train --save-tag test_v1
+    Use utils/run-container.sh from the repo root to launch commands, e.g.:
+        ./utils/run-container.sh python -m aetherscan.main train --save-tag test_v1
