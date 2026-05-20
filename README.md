@@ -345,7 +345,7 @@ At runtime, the singleton `Config` instance can be accessed via `get_config()` a
 
 ### Top-Level Help
 
-Aetherscan dispatches to one of two subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main --help` (container) or `PYTHONPATH=src python -m aetherscan.main --help` (source).
+Aetherscan dispatches to one of two subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py top` (container) or `PYTHONPATH=src python utils/print_cli_help.py top` (source).
 
 ```
 usage: [-h] {train,inference} ...
@@ -354,18 +354,17 @@ Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade
 DL pipeline for SETI @ scale
 
 positional arguments:
-  {train,inference}
-                        Command to execute
-    train               Execute training pipeline
-    inference           Execute inference pipeline
+  {train,inference}  Command to execute
+    train            Execute training pipeline
+    inference        Execute inference pipeline
 
 options:
-  -h, --help            show this help message and exit
+  -h, --help         show this help message and exit
 ```
 
 ### Train Command Help
 
-The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main train --help` (container) or `PYTHONPATH=src python -m aetherscan.main train --help` (source).
+The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py train` (container) or `PYTHONPATH=src python utils/print_cli_help.py train` (source).
 
 ```
 usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
@@ -617,7 +616,7 @@ options:
 
 ### Inference Command Help
 
-The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main inference --help` (container) or `PYTHONPATH=src python -m aetherscan.main inference --help` (source).
+The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py inference` (container) or `PYTHONPATH=src python utils/print_cli_help.py inference` (source).
 
 ```
 usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
