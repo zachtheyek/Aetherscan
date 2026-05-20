@@ -797,7 +797,7 @@ See [`CITATION.cff`](CITATION.cff) for details
 
 ## Security
 
-For vulnerability reports, secrets management, and security best practices, see [`SECURITY.md`](SECURITY.md).
+For vulnerability reports, incident response, secrets management, and security best practices, see [`SECURITY.md`](SECURITY.md).
 
 **Quick reference:**
 
