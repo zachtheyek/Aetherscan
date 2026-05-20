@@ -61,7 +61,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 
 > [!WARNING]
 >
-> # TODO: update system requirements after proper benchmarking
+> # TODO: update system requirements after proper benchmarking (`docs/benchmarks.md`?)
 
 ### Run From Container
 
