@@ -345,18 +345,20 @@ At runtime, the singleton `Config` instance can be accessed via `get_config()` a
 
 ### Top-Level Help
 
-Aetherscan supports both training and inference, invoked using the first positional argument.
+Aetherscan dispatches to one of three subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main --help` (container) or `PYTHONPATH=src python -m aetherscan.main --help` (source).
 
 ```
-usage: [-h] {train,inference} ...
+usage: [-h] {train,inference,evaluate} ...
 
-Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale
+Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade
+DL pipeline for SETI @ scale
 
 positional arguments:
-  {train,inference}
+  {train,inference,evaluate}
                         Command to execute
     train               Execute training pipeline
     inference           Execute inference pipeline
+    evaluate            Execute evaluation pipeline
 
 options:
   -h, --help            show this help message and exit
@@ -364,56 +366,59 @@ options:
 
 ### Train Command Help
 
-The Aetherscan training pipeline exposes the following CLI flags to the user:
+The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main train --help` (container) or `PYTHONPATH=src python -m aetherscan.main train --help` (source).
 
 ```
-usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
-              [--output-path OUTPUT_PATH] [--vae-latent-dim VAE_LATENT_DIM]
-              [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
-              [--vae-kernel-size VAE_KERNEL_SIZE VAE_KERNEL_SIZE]
-              [--vae-beta VAE_BETA] [--vae-alpha VAE_ALPHA]
-              [--rf-n-estimators RF_N_ESTIMATORS]
-              [--rf-bootstrap RF_BOOTSTRAP]
-              [--rf-max-features RF_MAX_FEATURES] [--rf-n-jobs RF_N_JOBS]
-              [--rf-seed RF_SEED] [--num-observations NUM_OBSERVATIONS]
-              [--width-bin WIDTH_BIN] [--downsample-factor DOWNSAMPLE_FACTOR]
-              [--time-bins TIME_BINS] [--freq-resolution FREQ_RESOLUTION]
-              [--time-resolution TIME_RESOLUTION]
-              [--num-target-backgrounds NUM_TARGET_BACKGROUNDS]
-              [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
-              [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
-              [--train-files TRAIN_FILES [TRAIN_FILES ...]]
-              [--num-training-rounds NUM_TRAINING_ROUNDS]
-              [--epochs-per-round EPOCHS_PER_ROUND]
-              [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
-              [--num-samples-rf NUM_SAMPLES_RF]
-              [--train-val-split TRAIN_VAL_SPLIT]
-              [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
-              [--effective-batch-size EFFECTIVE_BATCH_SIZE]
-              [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
-              [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
-              [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
-              [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
-              [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
-              [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
-              [--latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]]
-              [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
-              [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
-              [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
-              [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
-              [--final-snr-range FINAL_SNR_RANGE]
-              [--curriculum-schedule CURRICULUM_SCHEDULE]
-              [--exponential-decay-rate EXPONENTIAL_DECAY_RATE]
-              [--step-easy-rounds STEP_EASY_ROUNDS]
-              [--step-hard-rounds STEP_HARD_ROUNDS]
-              [--base-learning-rate BASE_LEARNING_RATE]
-              [--min-learning-rate MIN_LEARNING_RATE]
-              [--min-pct-improvement MIN_PCT_IMPROVEMENT]
-              [--patience-threshold PATIENCE_THRESHOLD]
-              [--lr-reduction-factor LR_REDUCTION_FACTOR]
-              [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
-              [--load-dir LOAD_DIR] [--load-tag LOAD_TAG]
-              [--start-round START_ROUND] [--save-tag SAVE_TAG]
+usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+             [--output-path OUTPUT_PATH] [--vae-latent-dim VAE_LATENT_DIM]
+             [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
+             [--vae-kernel-size VAE_KERNEL_SIZE VAE_KERNEL_SIZE]
+             [--vae-beta VAE_BETA] [--vae-alpha VAE_ALPHA]
+             [--rf-n-estimators RF_N_ESTIMATORS] [--rf-bootstrap RF_BOOTSTRAP]
+             [--rf-max-features RF_MAX_FEATURES] [--rf-n-jobs RF_N_JOBS]
+             [--rf-seed RF_SEED] [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
+             [--nccl-num-packs NCCL_NUM_PACKS]
+             [--async-allocator | --no-async-allocator]
+             [--num-observations NUM_OBSERVATIONS] [--width-bin WIDTH_BIN]
+             [--downsample-factor DOWNSAMPLE_FACTOR] [--time-bins TIME_BINS]
+             [--freq-resolution FREQ_RESOLUTION]
+             [--time-resolution TIME_RESOLUTION]
+             [--num-target-backgrounds NUM_TARGET_BACKGROUNDS]
+             [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
+             [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
+             [--train-files TRAIN_FILES [TRAIN_FILES ...]]
+             [--num-training-rounds NUM_TRAINING_ROUNDS]
+             [--epochs-per-round EPOCHS_PER_ROUND]
+             [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
+             [--num-samples-rf NUM_SAMPLES_RF]
+             [--train-val-split TRAIN_VAL_SPLIT]
+             [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
+             [--effective-batch-size EFFECTIVE_BATCH_SIZE]
+             [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
+             [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
+             [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
+             [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
+             [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
+             [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
+             [--latent-viz-umap-fit-max-samples LATENT_VIZ_UMAP_FIT_MAX_SAMPLES]
+             [--latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]]
+             [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
+             [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
+             [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
+             [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
+             [--final-snr-range FINAL_SNR_RANGE]
+             [--curriculum-schedule CURRICULUM_SCHEDULE]
+             [--exponential-decay-rate EXPONENTIAL_DECAY_RATE]
+             [--step-easy-rounds STEP_EASY_ROUNDS]
+             [--step-hard-rounds STEP_HARD_ROUNDS]
+             [--base-learning-rate BASE_LEARNING_RATE]
+             [--min-learning-rate MIN_LEARNING_RATE]
+             [--min-pct-improvement MIN_PCT_IMPROVEMENT]
+             [--patience-threshold PATIENCE_THRESHOLD]
+             [--lr-reduction-factor LR_REDUCTION_FACTOR]
+             [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
+             [--load-dir LOAD_DIR] [--load-tag LOAD_TAG]
+             [--start-round START_ROUND] [--save-tag SAVE_TAG]
 
 options:
   -h, --help            show this help message and exit
@@ -452,6 +457,20 @@ options:
                         Number of parallel jobs for random forest training (-1
                         uses all CPU cores)
   --rf-seed RF_SEED     Random seed for random forest reproducibility
+  --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
+                        Per-GPU memory cap in MiB. Omit to use memory-growth-
+                        only (recommended on Blackwell). Set for TF to
+                        allocate a fixed logical device of a given size per
+                        physical GPU (e.g. 14000)
+  --nccl-num-packs NCCL_NUM_PACKS
+                        num_packs for NCCL/HierarchicalCopy all-reduce. Lower
+                        values (e.g. 1) reduces tiny-tensor latency; higher
+                        values (e.g. >=4) can help bandwidth on >4-GPU
+                        topologies.
+  --async-allocator, --no-async-allocator
+                        Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default:
+                        enabled). Pass --no-async-allocator as a workaround
+                        for NGC 25.02 multi-GPU OOM bugs.
   --num-observations NUM_OBSERVATIONS
                         Number of observations per cadence snippet (e.g., 6
                         for 3 ON + 3 OFF)
@@ -507,9 +526,9 @@ options:
                         signal injection (must be divisible by 4)
   --plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT
                         Max points per stat name, per signal type, for A→B
-                        intensity bias scatter plots. Outliers are prioritized,
-                        with the difference made up from randomly sampling
-                        without replacement the remaining points
+                        intensity bias scatter plots. Outliers are
+                        prioritized, with the difference made up from randomly
+                        sampling without replacement the remaining points
   --plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE
                         Threshold for points to always be included in A→B
                         intensity bias scatter plots
@@ -520,7 +539,7 @@ options:
   --latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL
                         Capture a latent space snapshot every N training steps
                         (lower = more snapshots, more DB writes, and larger
-                        storage costs)",
+                        storage costs)
   --latent-viz-umap-fit-max-samples LATENT_VIZ_UMAP_FIT_MAX_SAMPLES
                         Maximum number of pooled latent vectors used to fit
                         the UMAP model (remaining vectors are projected via
@@ -528,12 +547,12 @@ options:
                         embedding)
   --latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]
                         UMAP n_neighbors values to sweep for latent space
-                        visualization (e.g., --latent-viz-umap-n-neighbors
-                        5 15 30 50)
+                        visualization (e.g., --latent-viz-umap-n-neighbors 5
+                        15 30 50)
   --latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]
                         UMAP min_dist values to sweep for latent space
-                        visualization (e.g., --latent-viz-umap-min-dist
-                        0.0 0.1 0.5)
+                        visualization (e.g., --latent-viz-umap-min-dist 0.0
+                        0.1 0.5)
   --latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES
                         Maximum number of frames in latent space GIF output
                         (snapshots beyond this limit are log-subsampled,
@@ -599,33 +618,33 @@ options:
 
 ### Inference Command Help
 
-The Aetherscan inference pipeline exposes the following CLI flags to the user:
+The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main inference --help` (container) or `PYTHONPATH=src python -m aetherscan.main inference --help` (source).
 
 ```
-usage:  inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
-                  [--output-path OUTPUT_PATH]
-                  [--test-files TEST_FILES [TEST_FILES ...]]
-                  [--inference-files INFERENCE_FILES [INFERENCE_FILES ...]]
-                  [--encoder-path ENCODER_PATH] [--rf-path RF_PATH]
-                  [--config-path CONFIG_PATH]
-                  [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
-                  [--classification-threshold CLASSIFICATION_THRESHOLD]
-                  [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
-                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
-                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
-                  [--coarse-channel-width COARSE_CHANNEL_WIDTH]
-                  [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
-                  [--spline-order SPLINE_ORDER]
-                  [--detection-window-size DETECTION_WINDOW_SIZE]
-                  [--detection-step-size DETECTION_STEP_SIZE]
-                  [--stat-threshold STAT_THRESHOLD]
-                  [--stamp-width STAMP_WIDTH]
-                  [--overlap-search | --no-overlap-search]
-                  [--overlap-fraction OVERLAP_FRACTION]
-                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
-                  [--max-retries MAX_RETRIES]
-                  [--retry-delay RETRY_DELAY]
-                  [--save-tag SAVE_TAG]
+usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+                 [--output-path OUTPUT_PATH]
+                 [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
+                 [--async-allocator | --no-async-allocator]
+                 [--test-files TEST_FILES [TEST_FILES ...]]
+                 [--inference-files INFERENCE_FILES [INFERENCE_FILES ...]]
+                 [--encoder-path ENCODER_PATH] [--rf-path RF_PATH]
+                 [--config-path CONFIG_PATH]
+                 [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
+                 [--classification-threshold CLASSIFICATION_THRESHOLD]
+                 [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
+                 [--cadence-h5-path-col CADENCE_H5_PATH_COL]
+                 [--cadence-expected-obs CADENCE_EXPECTED_OBS]
+                 [--coarse-channel-width COARSE_CHANNEL_WIDTH]
+                 [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
+                 [--spline-order SPLINE_ORDER]
+                 [--detection-window-size DETECTION_WINDOW_SIZE]
+                 [--detection-step-size DETECTION_STEP_SIZE]
+                 [--stat-threshold STAT_THRESHOLD] [--stamp-width STAMP_WIDTH]
+                 [--overlap-search | --no-overlap-search]
+                 [--overlap-fraction OVERLAP_FRACTION]
+                 [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
+                 [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
+                 [--save-tag SAVE_TAG]
 
 options:
   -h, --help            show this help message and exit
@@ -638,6 +657,15 @@ options:
   --output-path OUTPUT_PATH
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
+  --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
+                        Per-GPU memory cap in MiB. Omit to use memory-growth-
+                        only (recommended on Blackwell). Set for TF to
+                        allocate a fixed logical device of a given size per
+                        physical GPU (e.g. 14000)
+  --async-allocator, --no-async-allocator
+                        Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default:
+                        enabled). Pass --no-async-allocator as a workaround
+                        for NGC 25.02 multi-GPU OOM bugs.
   --test-files TEST_FILES [TEST_FILES ...]
                         Space-separated list of testing data file names (e.g.,
                         real_filtered_LARGE_test_HIP15638.npy)
