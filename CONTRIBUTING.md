@@ -16,9 +16,14 @@ Aetherscan supports two install paths off the same source tree; you only need th
 
 - **NGC container path (canonical, both clusters)** — Apptainer 1.4+ or SingularityCE 4.1+, plus an NVIDIA GPU with driver ≥570 (Blackwell) or ≥550 (Ampere via CUDA forward compatibility). Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container.
 - **Conda env (alternative, Ampere only)** — Conda or Mamba, Python 3.10, CUDA 12.4+ driver, NVIDIA Ampere GPU.
-- **Both paths** — Git with GPG signing configured; [pre-commit](https://pre-commit.com/); [tmux](https://github.com/tmux/tmux)
 
 See [`README.md`](README.md#system-requirements) for the full system requirements matrix.
+
+Contributors should additionally have the following:
+
+- Git with GPG signing configured
+- [pre-commit](https://pre-commit.com/)
+- [tmux](https://github.com/tmux/tmux)
 
 ### Development Setup
 
@@ -76,18 +81,18 @@ See [`README.md`](README.md#installation) for the full walkthrough including `.e
 ```
 Aetherscan/
 ├── src/aetherscan/             # Main package
-│   ├── __init__.py             # Package initialization, version
-│   ├── main.py                 # Entry point, command dispatch, GPU strategy setup
+│   ├── __init__.py             # Package initialization
+│   ├── main.py                 # Entry point, command dispatch
 │   ├── cli.py                  # Argument parsing, validation, config override
-│   ├── config.py               # Configuration dataclasses
+│   ├── config.py               # Configuration defaults
 │   ├── train.py                # Training orchestration
 │   ├── inference.py            # Inference orchestration
-│   ├── preprocessing.py        # Data preprocessing + energy detection
+│   ├── preprocessing.py        # Data preprocessing
 │   ├── data_generation.py      # Synthetic signal injection
 │   ├── models/
 │   │   ├── __init__.py         # Model exports
 │   │   ├── vae.py              # Beta-VAE architecture
-│   │   └── random_forest.py    # RF classifier
+│   │   └── random_forest.py    # RF architecture
 │   ├── db/
 │   │   ├── __init__.py         # Database exports
 │   │   └── db.py               # SQLite async writer
@@ -101,30 +106,29 @@ Aetherscan/
 │   └── manager/
 │       ├── __init__.py         # Manager exports
 │       └── manager.py          # Resource lifecycle management
-├── docs/                       # Runbooks and guides
-│   └── BLACKWELL_MIGRATION.md  # Container + dual-cluster migration runbook
+├── docs/                       # Documentation (placeholder; no docs yet)
 ├── tests/                      # Test suite (placeholder; no tests yet)
 ├── utils/                      # Utility scripts
-│   ├── run_container.sh             # Apptainer/SingularityCE auto-detecting wrapper
-│   ├── start_tmux_session.sh        # Monitoring tmux session helper
-│   ├── print_cli_help.py            # README CLI Reference regen helper
-│   ├── find_optimal_configs.py      # Per-host config sweep
-│   ├── verify_train_test_files.py   # Training/test data sanity check
-│   └── get_system_info.sh           # System info dump (for bug reports)
-├── .github/                    # CI/CD workflows, issue templates, CODEOWNERS, etc.
+│   ├── run_container.sh             # Apptainer/SingularityCE wrapper
+│   ├── start_tmux_session.sh        # tmux session template helper
+│   ├── print_cli_help.py            # CLI reference regen helper
+│   ├── find_optimal_configs.py      # Per-host config helper
+│   ├── verify_train_test_files.py   # Data sanity check helper
+│   └── get_system_info.sh           # System info helper
+├── .github/                    # CI/CD workflows, issue templates, etc.
 ├── .gitignore                  # Local gitignore
 ├── .pre-commit-config.yaml     # Pre-commit hook configuration
-├── aetherscan.def              # Apptainer/SingularityCE build recipe for the NGC container
-├── requirements-container.txt  # Pip extras layered into the NGC container
-├── environment.yml             # Conda dependencies (Ampere conda env path)
+├── aetherscan.def              # Apptainer/SingularityCE build recipe (NGC container)
+├── requirements-container.txt  # Pip extras layered into NGC container
+├── environment.yml             # Conda dependencies
 ├── pyproject.toml              # Package metadata, ruff config
 ├── AGENTS.md                   # AI agent guidelines
 ├── AI_POLICY.md                # AI usage policy
 ├── CITATION.cff                # Citation metadata
 ├── CODE_OF_CONDUCT.md          # Core values guidelines
 ├── CODEOWNERS                  # Code ownership
-├── CONTRIBUTING.md             # This file
-├── KNOWN_ISSUES.md             # Known issues and workarounds
+├── CONTRIBUTING.md             # Contributing guidelines
+├── KNOWN_ISSUES.md             # Catalog of known issues and workarounds
 ├── LICENSE                     # Project license
 ├── README.md                   # Project overview, installation & usage guides
 └── SECURITY.md                 # Security policy
@@ -141,7 +145,7 @@ Aetherscan/
 | `inference.py`            | Model inference, candidate detection                                   |
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
-| `models/vae.py`           | Beta-VAE architecture with custom clustering loss                      |
+| `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
 | `models/random_forest.py` | Scikit-learn RF wrapper                                                |
 | `db/db.py`                | Thread-safe SQLite with async queue-based writes                       |
 | `monitor/monitor.py`      | Background resource monitoring (CPU, RAM, GPU)                         |
@@ -223,30 +227,16 @@ git checkout -b feature/my_new_feature
   - all conversations to be resolved
   - branches to be up to date
 - Address review feedback promptly
-- Note: PR approvals are voided when new commits are pushed
+- PR approvals are voided when new commits are pushed
 
 > [!NOTE]
 > Claude will automatically provide an initial code review. You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
-
-### 7. After Merge
-
-Once your PR is merged, delete the remote feature branch from `origin` so the branch list stays clean. Either:
-
-```bash
-# CLI
-git push origin --delete <branchname>
-```
-
-…or click the **"Delete branch"** button GitHub shows on the merged PR page. Locally, you can also prune the tracking ref with `git fetch --prune`.
-
-> [!TIP]
-> If the repository's **Settings → General → Pull Requests → Automatically delete head branches** option is enabled, GitHub does this for you on merge and this step becomes a no-op.
 
 ---
 
 ## Pre-commit Hooks
 
-The project uses pre-commit hooks for code quality:
+This project uses pre-commit hooks for code quality:
 
 ```yaml
 # .pre-commit-config.yaml hooks:
@@ -256,7 +246,7 @@ The project uses pre-commit hooks for code quality:
 - gitleaks # Secret detection
 ```
 
-Once installed using `pre-commit install`, the hooks should automatically run on every commit, and block changes that don't pass every hook. Note that pre-commit will attempt to fix "simple" issues, so if any hooks are failing, you may just need to run `git add` and `git commit` again. For more "complex" cases, manual intervention is needed. See the pre-commit messages for details.
+Once installed using `pre-commit install`, the hooks should automatically run on every commit, and block changes that don't pass every hook. Pre-commit will attempt to fix "simple" issues, so if any hooks are failing, you may just need to run `git add` and `git commit` again. For more "complex" cases, manual intervention is needed. See the pre-commit messages for details.
 
 ### Running Manually
 
@@ -284,43 +274,139 @@ git commit --no-verify -m "message"
 
 ### Ruff Configuration
 
-The project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting, and follows PEP-8 with minor relaxations. The full configuration lives in [`pyproject.toml`](pyproject.toml) under `[tool.ruff]`; highlights below.
+This project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting, and follows [PEP-8](https://peps.python.org/pep-0008/) with minor relaxations. The full configuration lives in [`pyproject.toml`](pyproject.toml) under `[tool.ruff]`; highlights below.
 
-- **Line length**: 100 characters (formatter wraps; `E501` is intentionally ignored so wrapping is the formatter's job, not the linter's)
 - **Target version**: Python 3.10 (lowest common denominator across the conda 3.10 path and the container 3.12 path)
+- **Line length**: 100 characters (formatter wraps; `E501` is intentionally ignored so wrapping is the formatter's job, not the linter's)
+- **Enabled rule families**: PEP-8 (`E`, `W`), pyflakes (`F`), isort (`I`), pep8-naming (`N`), pyupgrade (`UP`), bugbear (`B`), comprehensions (`C4`), simplify (`SIM`), pylint (`PL`)
+- **Notable allowances**: unused vars (`F841`), many-param functions (`PLR0913`), and magic-number comparisons (`PLR2004`) are permitted intentionally
+- **Per-file ignores**: `F401` (unused imports) is allowed in every `__init__.py`
+- **Import sorting**: isort-compatible, with `aetherscan` declared as the only first-party namespace
 - **Quote style**: Double quotes
 - **Indentation**: 4 spaces
-- **Import sorting**: isort-compatible, with `aetherscan` declared as the only first-party namespace
-- **Enabled rule families**: PEP-8 (`E`, `W`), pyflakes (`F`), isort (`I`), pep8-naming (`N`), pyupgrade (`UP`), bugbear (`B`), comprehensions (`C4`), simplify (`SIM`), pylint (`PL`)
-- **Notable allowances**: unused vars (`F841`), many-param functions (`PLR0913`), and magic-number comparisons (`PLR2004`) are permitted intentionally; a few `PLR0911/12/15` and `PLW0603` ignores are tracked as temporary in `pyproject.toml`
-- **Per-file ignores**: `F401` (unused imports) is allowed in every `__init__.py`
 
 ### Key Style Rules
 
+> [!TIP]
+> Most of these are enforced automatically by ruff (lint) and ruff-format. The list below highlights the patterns you'll see throughout the codebase and what new code should match.
+
+#### Modern Python typing
+
+Every module starts with `from __future__ import annotations` so type expressions are stringified at import time (lets us use modern syntax under the 3.10 target). Use **PEP 604 unions** (`X | None`) instead of `Optional[X]` and **PEP 585 generics** (`list[int]`, `dict[str, float]`, `tuple[X, ...]`) instead of `typing.List` / `typing.Dict`. Annotate both arguments and return types on function signatures.
+
 ```python
-# Good: Type hints with future annotations
 from __future__ import annotations
 
-def process_data(data: np.ndarray, config: Config) -> dict[str, float]:
-    ...
-
-# Good: Descriptive variable names
-num_training_rounds = config.training.num_training_rounds
-per_replica_batch_size = config.training.per_replica_batch_size
-
-# Good: Docstrings for public functions
-def load_train_data(config: Config) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load training data from configured files.
-
-    Args:
-        config: Configuration object with data paths
-
-    Returns:
-        Tuple of (backgrounds, labels) arrays
-    """
+def load_inference_data(
+    self, override_filepaths: list[str] | None = None
+) -> np.ndarray:
     ...
 ```
+
+`ruff`'s `UP` (pyupgrade) family enforces these idioms; `from typing import List, Dict, Optional, Tuple, ...` will be flagged and auto-fixed.
+
+#### Module and function docstrings
+
+Short, plain prose. No Sphinx / Google / Numpy-style section markers — describe what the module or function does and any non-obvious design choice. One-line docstrings are fine for self-evident helpers; expand only when behavior isn't clear from the signature.
+
+```python
+"""
+Inference orchestration for Aetherscan Pipeline
+Implements distributed model inference and candidate detection.
+Supports distributed datasets & latent generation
+"""
+```
+
+```python
+def _warmup_collective(strategy):
+    """Trigger a tiny cross-device reduction to surface NCCL failures at setup time."""
+    ...
+```
+
+#### Inline comment markers
+
+Five markers are used consistently across the codebase — they are grep-friendly entry points for things still in flight or worth thinking about:
+
+| Marker     | Use for                                                          |
+| ---------- | ---------------------------------------------------------------- |
+| `# TODO:`  | Concrete, actionable work item                                   |
+| `# NOTE:`  | Clarification, rationale, or question worth coming back to       |
+| `# FIXME:` | Known issue you don't have time to fix right now                 |
+| `# BUG:`   | Known bug, often paired with a workaround in the next lines      |
+| `# TEST:`  | Behavior that needs verifying (informal test plan, no suite yet) |
+
+Prefer `# NOTE:` over `# TODO:` when there's no obvious action — the latter implies someone owes follow-through.
+
+#### Logging
+
+Get a module-level logger named after the module and use f-strings for messages. Avoid bare `print()` outside of one-off scripts under `utils/`.
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+logger.info(f"Loaded {len(backgrounds)} backgrounds from {path}")
+logger.warning(f"NCCL warmup failed ({e}), falling back to HierarchicalCopy")
+```
+
+The Slack handler attaches automatically when `SLACK_BOT_TOKEN` is set in the env, so anything you log at `INFO+` may also surface in Slack — keep messages information-dense and free of secrets.
+
+#### Config singleton access
+
+`config.py` exposes a thread-safe singleton via `get_config()`. The None-guard is the canonical idiom: the getter is annotated as `Config | None` (so type checkers don't complain at the call site), but in practice it's only `None` if `init_config()` hasn't run yet — which is a programming error.
+
+```python
+from aetherscan.config import get_config
+
+config = get_config()
+if config is None:
+    raise ValueError("get_config() returned None")
+
+batch_size = config.training.per_replica_batch_size
+```
+
+#### Dataclass mutable defaults
+
+Always use `field(default_factory=...)` for mutable defaults — a bare `[...]` default is shared across every instance of the dataclass, which is a Python footgun and a real source of bugs:
+
+```python
+# Good
+train_files: list[str] = field(
+    default_factory=lambda: [
+        "real_filtered_LARGE_HIP110750.npy",
+        "real_filtered_LARGE_HIP13402.npy",
+    ]
+)
+
+# Bad: shared mutable state across instances
+train_files: list[str] = ["real_filtered_LARGE_HIP110750.npy", ...]
+```
+
+`ruff`'s `B` (bugbear) family will flag the bad form.
+
+#### Retry / error-handling pattern
+
+Pipeline retry loops follow a consistent shape: catch `KeyboardInterrupt` separately and re-raise so traceback propagates, log the exception with `logger.error`, decide whether to retry or `sys.exit(1)`, and `time.sleep(retry_delay)` before the next attempt. The pattern lives in `train_command` and `inference_command` if you need a reference.
+
+```python
+for attempt in range(max_retries):
+    try:
+        ...
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        raise
+    except Exception as e:
+        logger.error(f"Attempt {attempt + 1} failed: {e}")
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay)
+        else:
+            sys.exit(1)
+```
+
+#### Variable naming
+
+Prefer descriptive, full-word names: `num_training_rounds`, `per_replica_batch_size`, `coarse_channel_width` — not `n`, `bs`, `ccw`. Single-letter names are reserved for tight loops, math expressions, and array indexing. See the [Naming Conventions](#naming-conventions) table below for the casing rules.
 
 ### Naming Conventions
 
