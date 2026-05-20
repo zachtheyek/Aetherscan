@@ -154,7 +154,7 @@ Aetherscan/
 
 > [!WARNING]
 >
-> # TODO: add an architecture section?
+> # TODO: add an architecture section? (`docs/architecture.md`?)
 
 ---
 
