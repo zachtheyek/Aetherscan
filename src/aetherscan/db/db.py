@@ -75,12 +75,11 @@ def get_system_metadata() -> str:
 
 class Database:
     """
-    Thread-safe SQLite database for storing data with asynchronous queue-based writes.
+    Thread-safe SQLite database with asynchronous queue-based writes.
 
-    Architecture:
-    - Multiple threads/processes send data to a shared queue
-    - Single writer thread consumes from queue and writes to SQLite periodically
-    - Eliminates concurrent write issues and SQLITE_BUSY errors
+    Multiple threads/processes push records to a shared queue; a single background writer thread
+    drains it and commits to SQLite at a configured interval. Serializing writes through one
+    thread eliminates SQLITE_BUSY contention that would otherwise arise from concurrent writers.
     """
 
     _instance = None  # Stores singleton instance
@@ -148,12 +147,9 @@ class Database:
     @classmethod
     def _reset(cls):
         """
-        Teardown hook for thread-safe singleton
-        Resets the db instance to None
-
-        WARNING: Only use for testing or cleanup after shutdown.
-        Calling this while the database is active will cause issues.
-        Should only be called after stop() has completed.
+        Teardown hook for the thread-safe singleton — discards the cached instance so the next
+        constructor call yields a fresh one. Only safe to call after stop() has completed; calling
+        it while the database is active leaves live threads holding a stale reference.
         """
         # Acquire lock to prevent race conditions
         with cls._lock:
@@ -371,19 +367,11 @@ class Database:
 
     def flush(self, timeout: float | None = None) -> bool:
         """
-        Block until all queued writes are flushed to database.
+        Block until queued writes are drained to the database.
 
-        This method ensures data consistency by waiting for all pending writes
-        to complete before returning. Use this before any operation that reads
-        from the database and expects to see recently written data.
-
-        Args:
-            timeout: Maximum time to wait for flush completion (seconds).
-                     If None, uses the default configured flush_timeout.
-
-        Returns:
-            True if flush completed successfully, False if timed out or
-            shutdown was initiated during the wait.
+        Returns False on timeout or if shutdown is initiated mid-wait. A None timeout falls back
+        to the configured flush_timeout. Call before any read that needs to observe writes still
+        sitting in the queue.
         """
         if timeout is None:
             timeout = self.flush_timeout
@@ -612,15 +600,11 @@ class Database:
         timestamp: float | None = None,
     ):
         """
-        Queue write to system_resources table (non-blocking)
+        Queue a non-blocking write to system_resources.
 
-        Args:
-            resource_type: Type of resource (e.g. 'cpu', 'ram', 'gpu')
-            resource_name: Name of resource (e.g. 'system_total', 'process_tree')
-            value: Resource value
-            unit: Optional unit of measurement (e.g. 'percent', 'MB')
-            tag: Optional tag for current pipeline run
-            timestamp: Optional timestamp when resource was logged (uses current time if not provided)
+        resource_type takes broad categories like 'cpu', 'ram', 'gpu'; resource_name takes
+        finer sub-labels like 'system_total' or 'process_tree'. unit is a free-form label
+        ('percent', 'MB', etc.). Timestamp defaults to current wall time if omitted.
         """
         metadata_json = get_system_metadata()
 
@@ -656,21 +640,15 @@ class Database:
         timestamp: float | None = None,
     ):
         """
-        Queue write to injection_stats table (non-blocking)
+        Queue a non-blocking write to injection_stats.
 
-        Args:
-            stat_name: Stat name (e.g. global_mean, eti_snr, rfi_drift_rate, num_samples, etc.)
-            value: Stat value
-            round_number: Optional current training round number
-            chunk_number: Optional current injection chunk number
-            sample_index: Optional sample index within batch (0 to N-1)
-            background_index: Optional index of background plate used for this sample
-            signal_class: Optional signal class (e.g. main, false, true)
-            signal_type: Optional signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
-            injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm)
-            slope_clamped: Optional per-sample flag indicating if slope was clamped during injection
-            tag: Optional tag for current pipeline run
-            timestamp: Optional timestamp when stat was logged (uses current time if not provided)
+        stat_name labels the metric (global_mean, eti_snr, rfi_drift_rate, num_samples, etc.).
+        signal_class is one of {main, false, true}; signal_type is one of
+        {false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi}; injection_stage is one of
+        {A (pre-inj pre-norm), B (post-inj pre-norm), C (post-inj post-norm)}. Non-finite values
+        are coerced to 0.0 with is_finite=0 so queries can drop them via the default only_finite
+        filter — this is required because the schema's NOT NULL constraint forbids storing NaN/Inf
+        directly. Timestamp defaults to current wall time.
         """
         metadata_json = get_system_metadata()
 
@@ -724,16 +702,10 @@ class Database:
         timestamp: float | None = None,
     ):
         """
-        Queue write to training_stats table (non-blocking)
+        Queue a non-blocking write to training_stats.
 
-        Args:
-            model_name: Model name (e.g. 'beta_vae', 'rf')
-            stat_name: Stat name (e.g. 'total_loss', 'reconstruction_loss', 'learning_rate')
-            value: Stat value
-            round_number: Optional current training round number
-            epoch_number: Optional current training epoch number
-            tag: Optional tag for current pipeline run
-            timestamp: Optional timestamp when stat was logged (uses current time if not provided)
+        model_name labels the model ('beta_vae', 'rf'); stat_name labels the metric ('total_loss',
+        'reconstruction_loss', 'learning_rate', etc.). Timestamp defaults to current wall time.
         """
         metadata_json = get_system_metadata()
 
@@ -769,20 +741,12 @@ class Database:
         timestamp: float | None = None,
     ):
         """
-        Queue write to latent_snapshots table (non-blocking)
+        Queue a non-blocking write to latent_snapshots.
 
-        Args:
-            model_name: Model name (e.g. 'beta_vae')
-            round_number: Current training round number
-            epoch_number: Current training epoch number
-            step_number: Current training step number
-            cadence_index: Position within the viz batch (0 to num_cadences-1)
-            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi)
-            latent_vector: Latent vectors for this cadence, shape (6, latent_dim) as nested list
-            snr_base: Optional SNR base value
-            snr_range: Optional SNR range value
-            tag: Optional tag for current pipeline run
-            timestamp: Optional timestamp (uses current time if not provided)
+        cadence_index is the position within the viz batch (0 to num_cadences-1). signal_type is
+        one of {false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi}. latent_vector is a
+        nested list of shape (6, latent_dim), serialized to JSON before storage. Timestamp defaults
+        to current wall time.
         """
         metadata_json = get_system_metadata()
         latent_vector_json = json.dumps(latent_vector)
@@ -826,23 +790,14 @@ class Database:
         timestamp: float | None = None,
     ):
         """
-        Queue write to inference_results table (non-blocking)
+        Queue a non-blocking write to inference_results.
 
-        Args:
-            npy_path: Path to the .npy file containing the snippet (e.g. "real_filtered_LARGE_test_HIP15638.npy")
-            snippet_index: Index of the snippet within the .npy file
-            prediction: Classification prediction (0=RFI, 1=candidate)
-            confidence: Classification confidence score (0.0 to 1.0)
-            latent_vector: Optional latent vector (6 observations * latent_dim features) for later analysis
-            target: Optional observation target name (e.g. "DDO210")
-            session: Optional observing session identifier (e.g. "AGBT18A_999_103")
-            cadence_id: Optional cadence ID from the observation (e.g. "24777")
-            band: Optional frequency band (e.g. "L", "S", "C", "X")
-            frequency_mhz: Optional center frequency in MHz
-            timestamp_observed: Optional timestamp when observation was made (unix time)
-            h5_path: Optional path to the source HDF5 file
-            tag: Optional tag for current pipeline run
-            timestamp: Optional timestamp when result was logged (uses current time if not provided)
+        prediction is 0 (RFI) or 1 (candidate); confidence is in [0.0, 1.0]. latent_vector, when
+        provided, is a (6 * latent_dim,) array that gets serialized to JSON for later analysis.
+        target, session, cadence_id, band, frequency_mhz, timestamp_observed, and h5_path carry
+        the observational provenance (e.g. target='DDO210', session='AGBT18A_999_103', band='L').
+        Timestamp defaults to current wall time (distinct from timestamp_observed, which is the
+        original observation time).
         """
         metadata_json = get_system_metadata()
 
@@ -1007,18 +962,12 @@ class Database:
         columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Query from system_resources table
+        Query rows from system_resources as a list of dicts.
 
-        Args:
-            resource_type: Type of resource (e.g. 'cpu', 'ram', 'gpu'). Accepts str or list[str].
-            resource_name: Name of resource (e.g. 'system_total', 'process_tree'). Accepts str or list[str].
-            tag: Tag for current pipeline run. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-            columns: Optional list of columns to select (default: all). Validated against schema.
-
-        Returns:
-            List of metric dictionaries
+        resource_type, resource_name, and tag accept either a single value (= filter) or a list
+        (IN filter). start_time/end_time bound the timestamp range (unix time, inclusive on both
+        ends). columns lets callers project a subset of fields; values are validated against
+        _SYSTEM_RESOURCES_COLUMNS to block SQL injection through column names.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1084,30 +1033,16 @@ class Database:
         columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Query from injection_stats table
+        Query rows from injection_stats as a list of dicts.
 
-        Args:
-            stat_name: Stat name (e.g. global_mean, eti_snr, rfi_drift_rate, num_samples, etc.). Accepts str or list[str].
-            start_round_number: Start round number
-            end_round_number: End round number
-            start_chunk_number: Start chunk number
-            end_chunk_number: End chunk number
-            start_sample_index: Start sample index
-            end_sample_index: End sample index
-            start_background_index: Start background index
-            end_background_index: End background index
-            signal_class: Signal class (e.g. main, false, true). Accepts str or list[str].
-            signal_type: Signal type (e.g. false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi). Accepts str or list[str].
-            injection_stage: Optional injection stage (e.g. A: pre-inj pre-norm, B: post-inj pre-norm, C: post-inj post-norm). Accepts str or list[str].
-            only_finite: If True (default), only return rows where is_finite=1
-            only_slope_clamped: If True, only return rows where slope_clamped=1; if False, only where slope_clamped=0; if None (default), no filter
-            tag: Tag for current pipeline run. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-            columns: Optional list of columns to select (default: all). Validated against schema.
-
-        Returns:
-            List of metric dictionaries
+        String filters (stat_name, signal_class, signal_type, injection_stage, tag) accept either
+        a single value (= filter) or a list (IN filter). signal_class is one of {main, false, true};
+        signal_type is one of {false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi};
+        injection_stage is one of {A=pre-inj pre-norm, B=post-inj pre-norm, C=post-inj post-norm}.
+        start_*/end_* pairs bound the corresponding integer column. only_finite (default True)
+        drops rows where the stored value was non-finite at write time; only_slope_clamped, when
+        not None, filters by the slope_clamped flag. columns is validated against
+        _INJECTION_STATS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1203,24 +1138,13 @@ class Database:
         end_time: float | None = None,
     ) -> list[dict[str, Any]]:
         """
-        SQL-level aggregation of injection_stats sanitization and clamping rates.
+        Per-round aggregation of injection_stats for sanitization and clamping rates.
 
-        Preferred over calling query_injection_stat() & performing Python-level aggregation,
-        since SQLite's internal operations (native C) are inherently faster thanPython's object
-        creation & iteration
-
-        Returns per-round counts for computing sanitization rate (non_finite_count / total_count)
-        and clamping rate (clamped_count / total_count) without fetching all rows.
-
-        Args:
-            stat_name: Stat name filter. Accepts str or list[str].
-            injection_stage: Injection stage filter. Accepts str or list[str].
-            tag: Tag filter. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-
-        Returns:
-            List of dicts with {round_number, total_count, non_finite_count, clamped_count}
+        Returns dicts of {round_number, total_count, non_finite_count, clamped_count} so callers
+        can compute sanitization rate (non_finite_count / total_count) and clamping rate
+        (clamped_count / total_count) without fetching every row. Preferred over
+        query_injection_stat + Python-side aggregation: SQLite's native COUNT/SUM in C beats
+        materializing rows into Python dicts and iterating. String filters accept str or list[str].
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1278,22 +1202,11 @@ class Database:
         columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Query from training_stats table
+        Query rows from training_stats as a list of dicts.
 
-        Args:
-            model_name: Model name (e.g. 'beta_vae', 'rf'). Accepts str or list[str].
-            stat_name: Stat name (e.g. 'total_loss', 'reconstruction_loss', 'learning_rate'). Accepts str or list[str].
-            start_round_number: Start round number
-            end_round_number: End round number
-            start_epoch_number: Start epoch number
-            end_epoch_number: End epoch number
-            tag: Tag for current pipeline run. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-            columns: Optional list of columns to select (default: all). Validated against schema.
-
-        Returns:
-            List of metric dictionaries
+        model_name, stat_name, and tag accept either a single value (= filter) or a list
+        (IN filter). start_*/end_* pairs bound the corresponding integer column (inclusive).
+        columns is validated against _TRAINING_STATS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1365,21 +1278,12 @@ class Database:
         columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Query from latent_snapshots table
+        Query rows from latent_snapshots as a list of dicts.
 
-        Args:
-            model_name: Model name (e.g. 'beta_vae'). Accepts str or list[str].
-            round_number: Filter by exact round number
-            epoch_number: Filter by exact epoch number
-            step_number: Filter by exact step number
-            signal_type: Signal type filter. Accepts str or list[str].
-            tag: Tag for current pipeline run. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-            columns: Optional list of columns to select (default: all). Validated against schema.
-
-        Returns:
-            List of snapshot dictionaries (latent_vector is JSON string — caller parses with json.loads)
+        model_name, signal_type, and tag accept either a single value (= filter) or a list
+        (IN filter). round_number/epoch_number/step_number are exact-match filters (no range
+        variant). The returned latent_vector field is a JSON string — callers parse it with
+        json.loads. columns is validated against _LATENT_SNAPSHOTS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1438,11 +1342,9 @@ class Database:
         end_time: float | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Get distinct snapshot keys (model, round, epoch, step, snr_base, snr_range) sorted by progression.
-        Avoids having to load every row from latent_snapshots using query_latent_snapshots()
-
-        Returns:
-            List of dicts with {model_name, round_number, epoch_number, step_number, snr_base, snr_range}
+        Distinct snapshot keys (model_name, round_number, epoch_number, step_number, snr_base,
+        snr_range) sorted by training progression. Avoids the cost of loading every row through
+        query_latent_snapshots() when the caller only needs the set of available keys.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1508,31 +1410,13 @@ class Database:
         columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Query from inference_results table
+        Query rows from inference_results as a list of dicts.
 
-        Args:
-            npy_path: Path to the .npy file containing the snippet. Accepts str or list[str].
-            start_snippet_index: Start snippet index
-            end_snippet_index: End snippet index
-            prediction: Classification prediction (0=RFI, 1=candidate)
-            min_confidence: Minimum confidence threshold
-            max_confidence: Maximum confidence threshold
-            target: Observation target name (e.g. "HIP110750"). Accepts str or list[str].
-            session: Observing session identifier (e.g. "AGBT18A_999_103"). Accepts str or list[str].
-            cadence_id: Cadence ID from the observation (e.g. "24777")
-            band: Frequency band (e.g. "L", "S", "C", "X"). Accepts str or list[str].
-            min_frequency_mhz: Minimum center frequency in MHz
-            max_frequency_mhz: Maximum center frequency in MHz
-            start_timestamp_observed: Start observation timestamp (unix time)
-            end_timestamp_observed: End observation timestamp (unix time)
-            h5_path: Path to the source HDF5 file. Accepts str or list[str].
-            tag: Tag for current pipeline run. Accepts str or list[str].
-            start_time: Start timestamp (unix time)
-            end_time: End timestamp (unix time)
-            columns: Optional list of columns to select (default: all). Validated against schema.
-
-        Returns:
-            List of result dictionaries
+        String filters (npy_path, target, session, band, h5_path, tag) accept either a single
+        value (= filter) or a list (IN filter). prediction is exact-match (0=RFI, 1=candidate).
+        start_*/end_*/min_*/max_* pairs bound the corresponding numeric column (inclusive).
+        timestamp_observed is the original observation time (distinct from the write-time
+        timestamp). columns is validated against _INFERENCE_RESULTS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
