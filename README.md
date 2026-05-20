@@ -140,6 +140,8 @@ The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so the
 
 The `utils/run_container.sh` wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
 
+See the [Usage Examples](#usage-examples) section below for further ways to invoke the Aetherscan pipeline.
+
 ### Run From Source
 
 > [!NOTE]
@@ -173,8 +175,7 @@ The repo ships a convenience script that instantiates a four-window tmux session
 Idempotent — re-running attaches to the existing session instead of recreating it.
 
 > [!Note]
-> If you skip the tmux helper, it's recommended to run these two exports manually before launching the pipeline
-> `utils/start_tmux_session.sh`'s pipeline pane sets them for you, and without them you may hit TF library-loading issues or noisy startup logs:
+> If you skip the tmux helper, it's recommended to run these two exports manually before launching the pipeline — the script's pipeline pane sets them for you, and without them you may hit TF library-loading issues or noisy startup logs:
 
 ```bash
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
@@ -183,7 +184,7 @@ export TF_CPP_MIN_LOG_LEVEL=1
 
 **4. Configure secrets and paths (optional)**
 
-Same `.env` file format and precedence rules as [Run From Container step 4](#run-from-container). Two differences on this path:
+Same `.env` file format and precedence rules as [Run From Container](#run-from-container) step 4. Two differences on this path:
 
 - `<repo>/.env` is loaded directly into `os.environ` at the top of `main.py` via [python-dotenv](https://pypi.org/project/python-dotenv/) — no wrapper script in the loop — so **every** key in `.env` is visible to the pipeline, not just the subset the container wrapper forwards via `--env`.
 - No host→container bind mounts, so `AETHERSCAN_*` paths only need to exist when the pipeline actually accesses them, not at startup.
@@ -198,6 +199,8 @@ PYTHONPATH=src python -m aetherscan.main {train|inference} \
 ```
 
 `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` step. No inline `KEY=VALUE` prefix is needed for Slack credentials — the `.env` auto-load runs before any worker process is spawned, so `os.environ` inheritance to multiprocess pools is automatic.
+
+See the [Usage Examples](#usage-examples) section below for further ways to invoke the Aetherscan pipeline.
 
 ---
 
