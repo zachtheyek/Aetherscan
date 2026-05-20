@@ -43,7 +43,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 - ≥1x NVIDIA GPU:
   - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.4) via CUDA forward compatibility
-- ≥9 GB combined VRAM (training) / ≥12 GB combined VRAM (inference)
+- ≥12 GB combined VRAM (training) / ≥9 GB combined VRAM (inference)
 - ≥150 GB RAM (training) / ≥100 GB RAM (inference)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full runbook
@@ -88,7 +88,7 @@ Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you ma
 **3. Set up monitoring dashboards in tmux (optional)**
 
 > [!Tip]
-> Future pipeline runs should proceed from the current step (3) onward
+> Subsequent pipeline runs may proceed from the current step (3) onward
 
 The repo ships a convenience script that instantiates a four-window tmux session for monitoring system resources (`htop` + a CPU/MEM ticker), GPU state (`watch nvidia-smi`), shared memory buffers (`watch ls /dev/shm`), and models/outputs dirs (`watch tree`):
 
@@ -162,7 +162,7 @@ conda activate aetherscan
 **3. Set up monitoring dashboards in tmux (optional)**
 
 > [!Tip]
-> Future pipeline runs should proceed from the current step (3) onward
+> Subsequent pipeline runs may proceed from the current step (3) onward
 
 The repo ships a convenience script that instantiates a four-window tmux session for monitoring system resources (`htop` + a CPU/MEM ticker), GPU state (`watch nvidia-smi`), shared memory buffers (`watch ls /dev/shm`), and models/outputs dirs (`watch tree`):
 
@@ -172,7 +172,9 @@ The repo ships a convenience script that instantiates a four-window tmux session
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
 
-If you skip the tmux helper, it's recommended to run these two exports manually before launching the pipeline — the script's pipeline pane sets them for you, and without them you may hit TF library-loading issues or noisy startup logs:
+> [!Note]
+> If you skip the tmux helper, it's recommended to run these two exports manually before launching the pipeline
+> `utils/start_tmux_session.sh`'s pipeline pane sets them for you, and without them you may hit TF library-loading issues or noisy startup logs:
 
 ```bash
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CONDA_PREFIX/lib:$LD_LIBRARY_PATH

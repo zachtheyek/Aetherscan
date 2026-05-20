@@ -16,13 +16,13 @@ Aetherscan supports two install paths off the same source tree; you only need th
 
 - **NGC container path (canonical, both clusters)** — Apptainer 1.4+ or SingularityCE 4.1+, plus an NVIDIA GPU with driver ≥570 (Blackwell) or ≥550 (Ampere via CUDA forward compatibility). Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container.
 - **Conda env (alternative, Ampere only)** — Conda or Mamba, Python 3.10, CUDA 12.4+ driver, NVIDIA Ampere GPU.
-- **Both paths** — Git with GPG signing configured; [pre-commit](https://pre-commit.com/) (`pip install pre-commit` or `brew install pre-commit`); [tmux](https://github.com/tmux/tmux) for the optional monitoring dashboards helper at `utils/start_tmux_session.sh`.
+- **Both paths** — Git with GPG signing configured; [pre-commit](https://pre-commit.com/); [tmux](https://github.com/tmux/tmux)
 
 See [`README.md`](README.md#system-requirements) for the full system requirements matrix.
 
 ### Development Setup
 
-Pick whichever install path matches your dev environment, then install the pre-commit hooks.
+Pick whichever install path matches your dev environment.
 
 **Container path** (canonical; works on both clusters):
 
@@ -35,9 +35,13 @@ singularity build aetherscan-ngc25.02.sif aetherscan.def
 # or:
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 
-# Optional: launch the monitoring tmux session (attaches at the end;
-# subsequent commands run in the pipeline pane)
+# Launch tmux session
+# All subsequent commands should be ran in the top pane of the pipeline
+# window (in focus on startup)
 ./utils/start_tmux_session.sh
+
+# Install pre-commit hooks
+pre-commit install
 
 # Sanity check
 ./utils/run_container.sh python utils/print_cli_help.py top
@@ -50,21 +54,17 @@ git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
 conda env create -f environment.yml
-conda activate aetherscan
 
-# Optional: launch the monitoring tmux session (attaches at the end;
-# subsequent commands run in the pipeline pane, which has conda + the
-# TF env vars already set)
+# Launch tmux session
+# All subsequent commands should be ran in the top pane of the pipeline
+# window (in focus on startup)
 ./utils/start_tmux_session.sh
+
+# Install pre-commit hooks
+pre-commit install
 
 # Sanity check
 PYTHONPATH=src python utils/print_cli_help.py top
-```
-
-**Pre-commit hooks** (required for both paths):
-
-```bash
-pre-commit install
 ```
 
 See [`README.md`](README.md#installation) for the full walkthrough including `.env` configuration and how to launch the pipeline.
