@@ -59,6 +59,10 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 > [!NOTE]
 > There are no plans to support non-Nvidia GPUs
 
+> [!WARNING]
+>
+> # TODO: update system requirements after proper benchmarking
+
 ### Run From Container
 
 > [!NOTE]
@@ -759,13 +763,21 @@ For a list of known issues, limitations, and workarounds, see [`KNOWN_ISSUES.md`
 Contributions are welcome! Quick start:
 
 ```bash
-# Install pre-commit hooks
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+
+singularity build aetherscan-ngc25.02.sif aetherscan.def
+# or:
+apptainer build aetherscan-ngc25.02.sif aetherscan.def
+
+./utils/start_tmux_session.sh
+
 pre-commit install
 ```
 
-- Code style: PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/) (see pyproject.toml)
-- Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
 - PRs: Must be linked to an existing issue and pass all hooks
+- Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
+- Code style: PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/) (see pyproject.toml)
 
 See [`CONTRIBUTING.md`](/CONTRIBUTING.md) for full guidelines on workflow, project structure, and testing.
 
