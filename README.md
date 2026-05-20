@@ -9,7 +9,7 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License"></a>
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10-blue.svg" alt="Python"></a>
     <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.17-orange.svg" alt="TensorFlow"></a>
-    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.5%E2%80%9312.8-green.svg" alt="CUDA"></a>
+    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.4%E2%80%9312.8-green.svg" alt="CUDA"></a>
   </p>
 </p>
 
