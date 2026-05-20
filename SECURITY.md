@@ -9,7 +9,6 @@ This document describes security practices and procedures for the Aetherscan pro
 | Version | Supported | Notes                       |
 | ------- | --------- | --------------------------- |
 | 1.x.x   | Yes       | Current development version |
-| 0.x.x   | No        | Pre-release, not supported  |
 
 ---
 
@@ -82,7 +81,7 @@ If you suspect a token has been compromised, rotate immediately:
 4. Click "Revoke Tokens"
 5. Reinstall the Aetherscan app and generate a new token with the following scopes: `channels:read`, `chat:write`, `files:write`, `groups:read`, `incoming-webhook`
 6. Update `SLACK_BOT_TOKEN` in all deployment environments
-7. Verify the new token works: `aetherscan train --help` (should not show Slack errors)
+7. Verify the new token works: `PYTHONPATH=src python utils/print_cli_help.py train` (should not show Slack errors)
 
 ---
 
@@ -159,31 +158,8 @@ safety check
 
 ## Data Security
 
-- All training & model data are publicly disclosed via relevant channels (e.g. [Ma et al. 2023](https://arxiv.org/abs/2301.12670)), and made available via the [Breakthrough Listen Open Data Archive](https://breakthroughinitiatives.org/opendatasearch)
-- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers not made available to the public. Contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack to discuss further
-
----
-
-## Secure Deployment
-
-### Recommendations
-
-1. **Run with least privilege**
-   - Don't run as root
-   - Use dedicated service accounts
-
-2. **Network isolation**
-   - Training nodes should have limited network access
-   - Only allow outbound connections to Slack API (if used)
-
-3. **Container security** (if using Docker)
-   - Use non-root user in container
-   - Scan images for vulnerabilities
-   - Don't mount sensitive host directories
-
-4. **Logging**
-   - Enable audit logging for production systems
-   - Monitor for unusual patterns (high error rates, unexpected access)
+- All major outputs (e.g. model weights, source code, search results, training/inference data, etc.) are publicly disclosed and made available via the appropriate channels (e.g. HuggingFace, GitHub, publications, [Breakthrough Listen's Open Data Archive](https://breakthroughinitiatives.org/opendatasearch), etc.)
+- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers and not made available to the public. Contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack to discuss further
 
 ---
 
