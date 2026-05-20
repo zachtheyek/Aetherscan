@@ -16,6 +16,14 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 # cuDNN 9.7.1, NCCL 2.25.1, and the Blackwell-ready kernels (sm_120). NVIDIA has
 # announced 25.02 as the final NGC TF container; if Aetherscan ever needs to
 # migrate off it, swap the `From:` line and re-test.
+#
+# Host driver requirements:
+#   - Blackwell cluster: driver >=570 (native CUDA 12.8 support).
+#   - Ampere cluster:    driver >=550 (host CUDA 12.4) works via CUDA forward
+#                        compatibility -- the NGC base ships cuda-compat-12-8,
+#                        which --nv layers in so TF sees the container's CUDA
+#                        12.8 stack without needing a host driver upgrade.
+#                        Verified on driver 550.78 + A4000 (6 GPUs detected).
 
 %files
     # Stage to /opt rather than /tmp: Singularity bind-mounts the host's /tmp
@@ -48,6 +56,9 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
     Purpose    Blackwell (sm_120) + Ampere (sm_86) GPU support for Aetherscan
 
 %help
-    Aetherscan runtime image (Python 3.12 / TF 2.17 / CUDA 12.8).
+    Aetherscan runtime image (Python 3.12 / TF 2.17 / CUDA 12.8). Runs on both
+    Blackwell (sm_120, driver >=570) and Ampere (sm_86, driver >=550 via CUDA
+    forward compatibility) -- one recipe, both clusters.
+
     Use utils/run_container.sh from the repo root to launch commands, e.g.:
         ./utils/run_container.sh python -m aetherscan.main train --save-tag test_v1

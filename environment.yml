@@ -1,6 +1,12 @@
-# Ampere cluster conda environment
-# Version ranges should be kept in lockstep with NGC TF 25.02 container that targets
-# the Blackwell cluster (see aetherscan.def + requirements-container.txt)
+# Ampere cluster conda environment (alternative install path).
+#
+# The canonical runtime on BOTH Ampere and Blackwell is the NGC 25.02 container
+# (see aetherscan.def). This conda env is kept as an alternative for users who
+# can't or don't want to use containers on Ampere -- it gets feature parity at
+# the application level but uses a different CUDA stack underneath (see below).
+#
+# Version ranges should be kept in lockstep with the NGC TF 25.02 container
+# (see aetherscan.def + requirements-container.txt).
 #
 # CUDA / cuDNN / NCCL come from the tensorflow[and-cuda] pip extra rather than
 # conda packages. The TF 2.17 wheel is ABI-tied to a specific CUDA stack
