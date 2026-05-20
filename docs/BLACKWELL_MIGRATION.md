@@ -4,10 +4,10 @@ This runbook covers running Aetherscan on the new Blackwell (RTX PRO 6000) works
 
 ## TL;DR
 
-| Cluster   | GPU                  | Compute capability | Runtime                                                                       |
-| --------- | -------------------- | ------------------ | ----------------------------------------------------------------------------- |
-| Ampere    | NVIDIA RTX A4000     | sm_86              | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.5 + cuDNN 9.3)       |
-| Blackwell | NVIDIA RTX PRO 6000  | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8) |
+| Cluster   | GPU                 | Compute capability | Runtime                                                                       |
+| --------- | ------------------- | ------------------ | ----------------------------------------------------------------------------- |
+| Ampere    | NVIDIA RTX A4000    | sm_86              | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.5 + cuDNN 9.3)       |
+| Blackwell | NVIDIA RTX PRO 6000 | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8) |
 
 Both paths run TF 2.17 with Keras 3 so `@tf.function` tracing, `.keras` checkpoint format, and optimizer state are interchangeable.
 
@@ -33,7 +33,7 @@ cd /path/to/Aetherscan
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~15 minutes and produces a ~15 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
+Build takes ~15 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
 
 > [!NOTE]
 > A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch.
@@ -132,11 +132,11 @@ The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as 
 
 Three flags wire onto `GPUConfig` (in [`src/aetherscan/config.py`](../src/aetherscan/config.py)). All accept the dataclass default when omitted:
 
-| Flag                       | Default       | Notes                                                                                                                            |
-| -------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `--gpu-memory-limit-mb`    | unset (None)  | Per-GPU memory cap in MiB. Unset = memory growth only. Set to `14000` on Ampere to match legacy behavior.                        |
-| `--nccl-num-packs`         | `2`           | num_packs for NCCL/HierarchicalCopy all-reduce. Try `1` or `4` if NCCL is unstable on a 5-GPU Blackwell NVLink topology.         |
-| `--async-allocator` / `--no-async-allocator` | enabled       | Toggles `TF_GPU_ALLOCATOR=cuda_malloc_async`. Disable as a workaround for the NGC 25.02 multi-GPU OOM bug.                       |
+| Flag                                         | Default      | Notes                                                                                                                    |
+| -------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `--gpu-memory-limit-mb`                      | unset (None) | Per-GPU memory cap in MiB. Unset = memory growth only. Set to `14000` on Ampere to match legacy behavior.                |
+| `--nccl-num-packs`                           | `2`          | num_packs for NCCL/HierarchicalCopy all-reduce. Try `1` or `4` if NCCL is unstable on a 5-GPU Blackwell NVLink topology. |
+| `--async-allocator` / `--no-async-allocator` | enabled      | Toggles `TF_GPU_ALLOCATOR=cuda_malloc_async`. Disable as a workaround for the NGC 25.02 multi-GPU OOM bug.               |
 
 ## Debugging
 
