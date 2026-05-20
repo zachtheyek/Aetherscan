@@ -327,13 +327,13 @@ def _warmup_collective(strategy):
 
 Five markers are used consistently across the codebase — they are grep-friendly entry points for things still in flight or worth thinking about:
 
-| Marker     | Use for                                                          |
-| ---------- | ---------------------------------------------------------------- |
-| `# TODO:`  | Concrete, actionable work item                                   |
-| `# NOTE:`  | Clarification, rationale, or question worth coming back to       |
-| `# FIXME:` | Known issue you don't have time to fix right now                 |
-| `# BUG:`   | Known bug, often paired with a workaround in the next lines      |
-| `# TEST:`  | Behavior that needs verifying (informal test plan, no suite yet) |
+| Marker    | Use for                                                          |
+| --------- | ---------------------------------------------------------------- |
+| `# TODO:` | Concrete, actionable work item                                   |
+| `# NOTE:` | Clarification, rationale, or question worth coming back to       |
+| `# FIX:`  | Known issue you don't have time to fix right now                 |
+| `# BUG:`  | Known bug, often paired with a workaround in the next lines      |
+| `# TEST:` | Behavior that needs verifying (informal test plan, no suite yet) |
 
 Prefer `# NOTE:` over `# TODO:` when there's no obvious action — the latter implies someone owes follow-through.
 
