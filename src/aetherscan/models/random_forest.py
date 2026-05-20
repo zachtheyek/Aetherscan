@@ -20,8 +20,12 @@ logger = logging.getLogger(__name__)
 
 def prepare_latent_features(latent_vectors: np.ndarray, num_observations: int = 6) -> np.ndarray:
     """
-    Prepare latent vectors for Random Forest input
-    Recombines the latent vectors into their original 6-observation cadence pattern
+    Reshape per-observation latent vectors of shape (num_cadences * num_observations, latent_dim)
+    into per-cadence features of shape (num_cadences, num_observations * latent_dim), so each
+    cadence's 6 latents are concatenated into a single feature row for the RF.
+
+    Caller must keep row i..i+num_observations-1 grouped as cadence i. Raises ValueError if the
+    row count isn't divisible by num_observations.
     """
     # Expected shape: (num_cadences * num_observations, latent_dim)
     num_latents = latent_vectors.shape[0]
@@ -68,12 +72,11 @@ class RandomForestModel:
 
     def train(self, latent_vectors: np.ndarray, binary_labels: np.ndarray):
         """
-        Train the Random Forest model
-
-        Args:
-            latent_vectors: Latent vectors shape (n_cadences * num_observations, latent_dim).
-                Caller must ensure row i..i+num_observations-1 corresponds to cadence i.
-            binary_labels: Binary labels shape (n_cadences,) with 0=false, 1=true signal.
+        Fit the Random Forest on `latent_vectors` of shape
+        (n_cadences * num_observations, latent_dim) and `binary_labels` of shape (n_cadences,)
+        (0 = false, 1 = true signal). latent_vectors must be grouped so row
+        i..i+num_observations-1 corresponds to cadence i — this is what
+        prepare_latent_features expects.
         """
         # Prepare features
         features = prepare_latent_features(latent_vectors, self.config.data.num_observations)
@@ -95,7 +98,9 @@ class RandomForestModel:
 
     def predict_proba(self, latent_vectors: np.ndarray) -> np.ndarray:
         """
-        Predict binary probabilities given some input latent cadences
+        Predict per-class probabilities for each cadence; returns shape (n_cadences, 2) with
+        columns [P(class=0), P(class=1)]. latent_vectors follows the same grouped layout as
+        train().
         """
         if not self.is_trained:
             logger.warning("Making predictions with untrained model")
@@ -105,7 +110,8 @@ class RandomForestModel:
 
     def predict(self, latent_vectors: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
-        Predict binary classes given some input latent cadences
+        Binary class predictions: 1 where P(class=1) > threshold, else 0. Returns shape
+        (n_cadences,) int array.
         """
         probas = self.predict_proba(latent_vectors)
         return (probas[:, 1] > threshold).astype(int)
@@ -114,9 +120,9 @@ class RandomForestModel:
         self, latent_vectors: np.ndarray, threshold: float = 0.5
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Predict binary classes given some input latent cadences
-        Returns 1 if probability of true signal > threshold, else 0
-        Also outputs confidence score (predicted probability of output class)
+        Like predict(), but also returns per-cadence confidence (the probability of the predicted
+        class — so high for confident negatives too, not just confident positives). Returns
+        (predictions, confidences), each of shape (n_cadences,).
         """
         probas = self.predict_proba(latent_vectors)
         predictions = (probas[:, 1] > threshold).astype(int)
