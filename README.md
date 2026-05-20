@@ -95,9 +95,6 @@ The repo ships a convenience script that lays out a four-window tmux session nam
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
 
-> [!NOTE]
-> The script's pipeline pane runs `conda activate aetherscan` by default (tuned for the source install path). On the container path that line is a no-op error you can ignore — the monitoring panes still work, and you launch the pipeline by typing `./utils/run_container.sh python -m aetherscan.main ...` in the top pane. Edit the script if you'd prefer the error not show up.
-
 **4. Configure secrets and paths (optional)**
 
 Aetherscan reads secrets and path overrides from a `.env` file at the repo root. [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into its own environment before launching the container and forwards the relevant keys via `--env`, so no `source .env` or inline prefix is needed.
@@ -161,7 +158,7 @@ conda activate aetherscan
 
 **3. Set up monitoring dashboards in tmux (optional)**
 
-The repo ships a convenience script that lays out a four-window tmux session named `aetherscan` — pipeline pane (with `conda activate aetherscan` and the TF `LD_LIBRARY_PATH` pre-set, ready for `python -m aetherscan.main ...`), plus monitoring panes for `htop` + a CPU/MEM ticker, `watch nvidia-smi`, `watch ls /dev/shm`, and `watch tree` over the models and outputs dirs:
+The repo ships a convenience script that lays out a four-window tmux session named `aetherscan` — pipeline pane on top, plus monitoring panes for `htop` + a CPU/MEM ticker, `watch nvidia-smi`, `watch ls /dev/shm`, and `watch tree` over the models and outputs dirs:
 
 ```bash
 ./utils/start_tmux_session.sh
