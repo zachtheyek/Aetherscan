@@ -13,12 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def setup_argument_parser() -> argparse.ArgumentParser:
-    """
-    Create and configure the argument parser for Aetherscan CLI
-
-    Returns:
-        Configured ArgumentParser instance
-    """
+    """Build the top-level Aetherscan argparse parser with `train` and `inference` subcommands."""
     parser = argparse.ArgumentParser(
         description="Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale"
     )
@@ -626,12 +621,9 @@ def _add_inference_arguments(subparsers):
 
 # NOTE: how to ensure only train_parser/inf_parser args get applied depending on whether train/inference is ran?
 def apply_args_to_config(args: argparse.Namespace) -> None:
-    """
-    Override config values with CLI arguments
-
-    Args:
-        args: Parsed CLI arguments
-    """
+    """Mutate the singleton config in place with any non-None overrides from the parsed CLI
+    namespace. Only attributes actually present on `args` are considered; missing ones fall back
+    to the config defaults."""
     config = get_config()
     if config is None:
         raise ValueError("get_config() returned None")
@@ -877,18 +869,10 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
 # NOTE: should we change validate_args() to validate_config() and run the tests on the final "applied" config singleton? or should we check both separately?
 def validate_args(args: argparse.Namespace) -> None:
     """
-    Validate parsed arguments are compatible with downstream pipeline
-
-    Does handle:
-      - logic constraints (e.g., divisible by X, within range Y, etc.)
-      - cross-param relationships (e.g., A requires B, etc.)
-      - semantic validation (e.g., file exists, etc.)
-
-    Does not handle:
-      - syntax & type validity (handled by parser.parse_args() in main.py:main())
-
-    Args:
-        args: Parsed CLI arguments
+    Run semantic and cross-param validation on the parsed CLI namespace before it is applied to
+    the config — checks divisibility/range constraints, A-requires-B relationships, and
+    existence of referenced files. Syntax and type checks are not handled here; those run
+    earlier in parser.parse_args() (called from main.py:main).
     """
     errors = []
 
