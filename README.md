@@ -87,16 +87,16 @@ Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you ma
 
 **3. Set up monitoring dashboards in tmux (optional)**
 
-The repo ships a convenience script that lays out a four-window tmux session named `aetherscan` — pipeline pane on top, plus monitoring panes for `htop` + a CPU/MEM ticker, `watch nvidia-smi`, `watch ls /dev/shm`, and `watch tree` over the models and outputs dirs:
+> [!Tip]
+> Future pipeline runs should proceed from the current step (3) onward
+
+The repo ships a convenience script that instantiates a four-window tmux session for monitoring system resources (`htop` + a CPU/MEM ticker), GPU state (`watch nvidia-smi`), shared memory buffers (`watch ls /dev/shm`), and models/outputs dirs (`watch tree`):
 
 ```bash
 ./utils/start_tmux_session.sh
 ```
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
-
-> [!Tip]
-> Future pipeline runs should proceed from the current step (3) onward
 
 **4. Configure secrets and paths (optional)**
 
@@ -161,16 +161,16 @@ conda activate aetherscan
 
 **3. Set up monitoring dashboards in tmux (optional)**
 
-The repo ships a convenience script that lays out a four-window tmux session named `aetherscan` — pipeline pane on top, plus monitoring panes for `htop` + a CPU/MEM ticker, `watch nvidia-smi`, `watch ls /dev/shm`, and `watch tree` over the models and outputs dirs:
+> [!Tip]
+> Future pipeline runs should proceed from the current step (3) onward
+
+The repo ships a convenience script that instantiates a four-window tmux session for monitoring system resources (`htop` + a CPU/MEM ticker), GPU state (`watch nvidia-smi`), shared memory buffers (`watch ls /dev/shm`), and models/outputs dirs (`watch tree`):
 
 ```bash
 ./utils/start_tmux_session.sh
 ```
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
-
-> [!Tip]
-> Future pipeline runs should proceed from the current step (3) onward
 
 **4. Configure secrets and paths (optional)**
 
