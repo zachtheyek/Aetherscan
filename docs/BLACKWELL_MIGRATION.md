@@ -1,21 +1,27 @@
 # Blackwell GPU Migration Runbook
 
-This runbook covers running Aetherscan on the new Blackwell (RTX PRO 6000) workstation alongside the existing Ampere (A4000) cluster. The pipeline source tree is identical on both machines; the difference is the runtime: a conda env on Ampere, an NVIDIA NGC container on Blackwell.
+This runbook covers running Aetherscan on the new Blackwell (RTX PRO 6000) workstation alongside the existing Ampere (A4000) cluster. The pipeline source tree is identical on both machines, and as of [`aetherscan.def`](../aetherscan.def) the NGC container is the canonical runtime on both clusters — one recipe builds and runs on each. The conda env from before the migration is kept as an alternative install path on Ampere.
 
 ## TL;DR
 
-| Cluster   | GPU                 | Compute capability | Runtime                                                                       |
-| --------- | ------------------- | ------------------ | ----------------------------------------------------------------------------- |
-| Ampere    | NVIDIA RTX A4000    | sm_86              | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.5 + cuDNN 9.3)       |
-| Blackwell | NVIDIA RTX PRO 6000 | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8) |
+| Cluster   | GPU                 | Compute capability | Canonical runtime                                                             | Alternative                                                  |
+| --------- | ------------------- | ------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Ampere    | NVIDIA RTX A4000    | sm_86              | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (via CUDA forward compat on driver 550.78) | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.3)  |
+| Blackwell | NVIDIA RTX PRO 6000 | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8) | —                                                            |
 
-Both paths run TF 2.17 with Keras 3 so `@tf.function` tracing, `.keras` checkpoint format, and optimizer state are interchangeable.
+All paths run TF 2.17 with Keras 3 so `@tf.function` tracing, `.keras` checkpoint format, and optimizer state are interchangeable.
 
 ## Why a container on Blackwell
 
 TensorFlow's prebuilt CUDA kernels target compute capabilities through sm_90. On Blackwell (sm_120) the JIT compiler tries to lower its baked-in PTX and fails with `CUDA_ERROR_INVALID_PTX` → `CUDA_ERROR_INVALID_HANDLE`. This is reproduced across TF 2.16–2.20 and tf-nightly.
 
 NVIDIA's NGC TensorFlow 25.02 container is the only published path that ships sm_120-ready kernels (and is officially the final NGC TF release). It bundles TF 2.17, CUDA 12.8, cuDNN 9.7.1, Python 3.12, and NCCL 2.25.1.
+
+## Why the same container also works on Ampere
+
+The container's CUDA 12.8 runtime is newer than the Ampere host's driver supports natively (driver 550.78 caps at CUDA 12.4), but the NGC base ships `cuda-compat-12-8` and `--nv` layers it into the container's library path. TF resolves against the compat libs, the host driver still services GPU ioctls, and sm_86 kernels run unmodified — no host driver upgrade needed, no separate recipe. Verified by `tf.config.list_physical_devices('GPU')` returning all 6 A4000s on the Ampere cluster.
+
+Forward compatibility is a CUDA feature, not a TF feature, so the same trick will keep working as long as Ampere stays within the CUDA 12.x family. If the Ampere driver is ever rolled back below 550, fall back to the conda env (which uses TF's bundled CUDA 12.3 stack and only needs driver ≥525).
 
 ## One-time setup
 
@@ -81,30 +87,39 @@ with tf.device('/GPU:0'):
 "
 ```
 
-Expected on Blackwell: 5 GPUs listed, finite sum, no `PTX` warnings.
+Expected on Blackwell: 5 GPUs listed, finite sum, no `PTX` warnings. Expected on Ampere: 6 GPUs listed, finite sum, the three benign `cuFFT/cuDNN/cuBLAS` "already registered" lines from NGC's CUDA plugin loader (ignore them).
 
-### 3. Ampere conda env (unchanged workflow)
+### 3. Ampere conda env (alternative path)
+
+Only needed if the container path is unavailable (e.g. no Apptainer/Singularity on the host, or driver <550 blocks forward compat).
 
 ```bash
 conda env create -f environment.yml
 conda activate aetherscan
 ```
 
-The conda env was bumped to TF 2.17 / numpy 1.26 / cuDNN 9.3 to match the container's API surface. If a stale `aetherscan` env exists, remove it first (`conda remove -n aetherscan --all`) — pip can't downgrade some pinned packages in place.
+The conda env was bumped to TF 2.17 / numpy 1.26 to match the container's API surface; under the hood it uses TF's bundled CUDA 12.3 / cuDNN 9.1 stack rather than the container's 12.8 / 9.7.1. If a stale `aetherscan` env exists, remove it first (`conda remove -n aetherscan --all`) — pip can't downgrade some pinned packages in place.
 
 ## Running the pipeline
 
-### Blackwell (container, memory-growth only — recommended default)
+### Container (Blackwell or Ampere — recommended default)
 
 ```bash
+# Blackwell — memory-growth only, full 96 GB per GPU
 ./utils/run_container.sh \
     python -m aetherscan.main train \
     --save-tag final_v1
+
+# Ampere — same wrapper, 14 GB cap to match the A4000s' prior behavior
+./utils/run_container.sh \
+    python -m aetherscan.main train \
+    --gpu-memory-limit-mb 14000 \
+    --save-tag final_v1
 ```
 
-The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv`, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB.
+The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv`, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB; on Ampere, pass `--gpu-memory-limit-mb 14000` to preserve the legacy A4000 cap.
 
-### Ampere (conda, 14 GB cap to match prior behavior)
+### Conda (Ampere only, alternative path)
 
 ```bash
 PYTHONPATH=src python -m aetherscan.main train \
@@ -114,10 +129,9 @@ PYTHONPATH=src python -m aetherscan.main train \
 
 The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as the source of truth. Setting it preserves the original behavior on the A4000s.
 
-### Inference (either machine)
+### Inference (either cluster)
 
 ```bash
-# Blackwell
 ./utils/run_container.sh \
     python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
@@ -125,7 +139,8 @@ The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as 
     --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
     --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json
 
-# Ampere — same args, but invoke without the wrapper and pass --gpu-memory-limit-mb 14000
+# Add --gpu-memory-limit-mb 14000 when running on Ampere (container or conda).
+# For the Ampere conda alternative, drop the run_container.sh wrapper and prepend PYTHONPATH=src.
 ```
 
 ## New CLI flags
@@ -146,7 +161,12 @@ You're running TF on the host directly, not via the container. The host TF wheel
 
 ### `nvidia-smi` works but TF sees 0 GPUs inside the container
 
-The `--nv` flag is missing or the host's NVIDIA driver is older than the container's CUDA needs. Driver must be ≥570 for CUDA 12.8 / NGC 25.02. Check with `nvidia-smi` (look at "Driver Version") on the host.
+The `--nv` flag is missing or the host's NVIDIA driver is too old for the container's CUDA stack. Driver requirements:
+
+- **Blackwell**: ≥570 (native CUDA 12.8 support).
+- **Ampere**: ≥550 — works via CUDA forward compatibility (NGC ships `cuda-compat-12-8`). Drivers in the 525–549 range will fall back to the conda env path.
+
+Check with `nvidia-smi` (look at "Driver Version") on the host.
 
 ### NCCL hangs or all-reduce errors mid-training
 
@@ -185,7 +205,8 @@ If NGC 25.02 keeps misbehaving, escalate in this order:
 2. `--nccl-num-packs 1` or `4` (5-GPU NVLink topology is unusual).
 3. Rebuild against NGC 25.01 — same TF, one minor back; catches 25.02 regressions. Update the `From:` line in `aetherscan.def`.
 4. Single-GPU fallback on Blackwell — one 96 GB card still beats 5x A4000 aggregate for correctness validation.
-5. Build TF 2.22 from source with sm_86 + sm_120 targets (1–2 days of build-system wrestling; unifies the wheel for both clusters but defers the conda/container split).
+5. Fall back to the Ampere conda env for any work that doesn't need Blackwell. With the container as the canonical runtime on both clusters, the conda env is now a fallback rather than a parallel workflow.
+6. Build TF 2.22 from source with sm_86 + sm_120 targets (1–2 days of build-system wrestling). Mostly obsolete now that one container runs on both clusters via forward compat; keep as a last resort if NGC 25.02 ever becomes unsupportable.
 
 ## Cross-machine checkpoint interop
 

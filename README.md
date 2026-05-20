@@ -35,23 +35,25 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### System Requirements
 
-Aetherscan supports two deployment paths off the same source tree, depending on GPU generation:
+Aetherscan supports two install paths off the same source tree. The NGC container is the canonical runtime on both clusters; the conda env is kept as an alternative for users who can't or don't want to use containers on Ampere.
 
-**Ampere GPUs (sm_86, e.g. RTX A4000) — conda env**
+**NGC container (canonical, runs on both clusters)**
+
+- Ubuntu 24.04
+- 1x NVIDIA GPU:
+  - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
+  - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.4) via CUDA forward compatibility
+- ≥9 GB VRAM (training) / ≥12 GB VRAM (inference)
+- ≥400 GB RAM (training) / ≥150 GB RAM (inference)
+- Apptainer 1.3+ or SingularityCE 4.0+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
+- See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full runbook
+
+**Conda env (alternative, Ampere only)**
 
 - Ubuntu 24.04
 - 1x NVIDIA GPU, CUDA 12.5+ driver
-- ≥9 GB VRAM (training) / ≥12 GB VRAM (inference)
-- ≥400 GB RAM (training) / ≥150 GB RAM (inference)
+- VRAM / RAM same as above
 - Python 3.10 (managed by conda)
-
-**Blackwell GPUs (sm_120, e.g. RTX PRO 6000) — NGC container**
-
-- Ubuntu 24.04
-- 1x NVIDIA GPU, CUDA 12.8 driver (≥570)
-- ≥400 GB RAM
-- Apptainer 1.3+ or SingularityCE 4.0+ (Python 3.12 lives inside the container)
-- See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full runbook
 
 As the software matures, more detailed system requirements will be made available to the user.
 
@@ -65,7 +67,7 @@ As the software matures, more detailed system requirements will be made availabl
 > Installation via pip and containerized distributions will be made available in a later release.
 
 > [!NOTE]
-> The conda steps below target Ampere GPUs. For Blackwell GPUs, build the NGC TF 2.17 container with `apptainer build aetherscan-ngc25.02.sif aetherscan.def` (or `singularity build ...`) and run the pipeline via `./utils/run_container.sh`. See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full walkthrough.
+> The conda steps below are the alternative Ampere-only install path. The canonical runtime on both clusters is the NGC TF 2.17 container — build it with `apptainer build aetherscan-ngc25.02.sif aetherscan.def` (or `singularity build ...`) and run the pipeline via `./utils/run_container.sh`. See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full walkthrough.
 
 **1. Clone the repository**
 
