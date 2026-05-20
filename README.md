@@ -56,6 +56,9 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 - VRAM / RAM same as above
 - Python 3.10 / TF 2.17 (managed by conda)
 
+> [!NOTE]
+> There are no plans to support non-Nvidia GPUs
+
 ### Run From Container
 
 > [!NOTE]
@@ -170,51 +173,135 @@ PYTHONPATH=src python -m aetherscan.main {train|inference} \
 > Non-development workflows should avoid directly calling other scripts/modules.
 
 > [!NOTE]
-> The following section shortens `PYTHONPATH=src python -m aetherscan.main` to simply `aetherscan` for brevity.
->
-> # TODO: update README once local builds with `pip install -e .` are working as expected.
+> Each scenario below is shown twice — first with the container wrapper (canonical), then with the conda-env source invocation (alternative). CLI flags are identical between the two; only the launcher differs.
 
 ### Training
 
-```bash
-# Default training run
-aetherscan train
+**Default training run**
 
-# Training with custom parameters
-aetherscan train \
+```bash
+# Container (canonical)
+./utils/run_container.sh python -m aetherscan.main train
+
+# Source (Ampere conda env)
+PYTHONPATH=src python -m aetherscan.main train
+```
+
+**Training with custom parameters**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main train \
     --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
     --num-training-rounds 20 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
     --save-tag test_v1
 
-# Resume from checkpoint
-aetherscan train \
+# Source
+PYTHONPATH=src python -m aetherscan.main train \
+    --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
+    --num-training-rounds 20 \
+    --epochs-per-round 100 \
+    --curriculum-schedule exponential \
+    --save-tag test_v1
+```
+
+**Resume from checkpoint**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main train \
+    --load-dir checkpoints \
+    --load-tag round_10 \
+    --save-tag test_v1
+
+# Source
+PYTHONPATH=src python -m aetherscan.main train \
     --load-dir checkpoints \
     --load-tag round_10 \
     --save-tag test_v1
 ```
 
-### Inference
+**Training with an explicit per-GPU memory cap (e.g. to match prior Ampere behavior)**
 
 ```bash
-# Default inference run
-aetherscan inference
+# Container
+./utils/run_container.sh python -m aetherscan.main train \
+    --gpu-memory-limit-mb 14000 \
+    --save-tag test_v1
 
-# Run inference with custom parameters
-aetherscan inference \
+# Source
+PYTHONPATH=src python -m aetherscan.main train \
+    --gpu-memory-limit-mb 14000 \
+    --save-tag test_v1
+```
+
+### Inference
+
+**Default inference run**
+
+```bash
+# Container (canonical)
+./utils/run_container.sh python -m aetherscan.main inference
+
+# Source (Ampere conda env)
+PYTHONPATH=src python -m aetherscan.main inference
+```
+
+**Inference on a pre-processed `.npy` file**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
     --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
     --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
     --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
     --classification-threshold 0.99
 
-# Run inference from raw .h5 files (energy detection preprocessing)
-aetherscan inference \
+# Source
+PYTHONPATH=src python -m aetherscan.main inference \
+    --test-files real_filtered_LARGE_test_HIP15638.npy \
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
+    --classification-threshold 0.99
+```
+
+**Inference from raw `.h5` files (energy detection preprocessing)**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json \
+    --save-tag run_v1
+
+# Source
+PYTHONPATH=src python -m aetherscan.main inference \
+    --inference-files complete_cadences_catalog.csv \
+    --encoder-path /path/to/vae_encoder.keras \
+    --rf-path /path/to/random_forest.joblib \
+    --config-path /path/to/config.json \
+    --save-tag run_v1
+```
+
+**Inference with NCCL / async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main inference \
+    --nccl-num-packs 1 \
+    --no-async-allocator \
+    --save-tag run_v1
+
+# Source
+PYTHONPATH=src python -m aetherscan.main inference \
+    --nccl-num-packs 1 \
+    --no-async-allocator \
     --save-tag run_v1
 ```
 
