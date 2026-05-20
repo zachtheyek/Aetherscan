@@ -95,6 +95,9 @@ The repo ships a convenience script that lays out a four-window tmux session nam
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
 
+> [!Tip]
+> Future pipeline runs should proceed from the current step (3) onward
+
 **4. Configure secrets and paths (optional)**
 
 Aetherscan reads secrets and path overrides from a `.env` file at the repo root. [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into its own environment before launching the container and forwards the relevant keys via `--env`, so no `source .env` or inline prefix is needed.
@@ -165,6 +168,9 @@ The repo ships a convenience script that lays out a four-window tmux session nam
 ```
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
+
+> [!Tip]
+> Future pipeline runs should proceed from the current step (3) onward
 
 **4. Configure secrets and paths (optional)**
 
