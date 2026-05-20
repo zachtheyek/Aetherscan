@@ -29,6 +29,10 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
+            ## Role
+            A pull request has just been merged to master. Your task is to analyze the changes and determine if any documentation needs to be updated.
+
+            ## Context
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
             PR TITLE: ${{ github.event.pull_request.title }}
@@ -36,10 +40,7 @@ jobs:
             AUTHOR: ${{ github.event.pull_request.user.login }}
             MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
 
-            A pull request has just been merged to master. Your task is to analyze the changes and determine if any documentation needs to be updated.
-
-            ## Steps:
-
+            ## Task
             1. First, get the diff of the merged PR:
                `gh pr diff ${{ github.event.pull_request.number }}`
 
@@ -106,9 +107,6 @@ jobs:
             5. If no documentation updates are needed, do not create an issue.
                Only create an issue if there are meaningful documentation gaps.
 
-            Use `gh issue create` to create issues when needed.
-            Be specific about what documentation changes are required.
-
             ## Available tools
             PR inspection:
             - `gh pr diff` to retrieve the merged PR's diff (the primary signal for what to analyze in Step 1)
@@ -120,6 +118,10 @@ jobs:
 
             Code exploration:
             - `Read`, `Glob`, `Grep` to inspect README.md, AGENTS.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and any source files referenced by the cli.py ↔ README contract above
+
+            ## Guidelines
+            - Be specific about what documentation changes are required.
+            - Your only responsibilities are to determine whether any documentation needs to be updated after the merged PR. Do not do anything that is not within this job scope.
 
           claude_args: |
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
