@@ -4,10 +4,10 @@ This runbook covers running Aetherscan on the new Blackwell (RTX PRO 6000) works
 
 ## TL;DR
 
-| Cluster   | GPU                 | Compute capability | Canonical runtime                                                             | Alternative                                                  |
-| --------- | ------------------- | ------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| Ampere    | NVIDIA RTX A4000    | sm_86              | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (via CUDA forward compat on driver 550.78) | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.3)  |
-| Blackwell | NVIDIA RTX PRO 6000 | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8) | —                                                            |
+| Cluster   | GPU                 | Compute capability | Canonical runtime                                                                                  | Alternative                                                 |
+| --------- | ------------------- | ------------------ | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Ampere    | NVIDIA RTX A4000    | sm_86              | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (via CUDA forward compat on driver 550.78) | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.3) |
+| Blackwell | NVIDIA RTX PRO 6000 | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8)                      | —                                                           |
 
 All paths run TF 2.17 with Keras 3 so `@tf.function` tracing, `.keras` checkpoint format, and optimizer state are interchangeable.
 
@@ -39,7 +39,7 @@ cd /path/to/Aetherscan
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~15 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
+Build takes ~8 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
 
 > [!NOTE]
 > A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch.
