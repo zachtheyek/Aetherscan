@@ -533,9 +533,6 @@ def main():
             train_command()
         elif args.command == "inference":
             inference_command()
-        # NOTE: come back to this later
-        # elif args.command == 'evaluate':
-        #     evaluate_command(args)
         else:
             # Print help message & exit if no valid command provided
             parser.print_help()

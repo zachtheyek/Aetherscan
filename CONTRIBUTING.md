@@ -82,7 +82,6 @@ Aetherscan/
 │   ├── config.py               # Configuration dataclasses
 │   ├── train.py                # Training orchestration
 │   ├── inference.py            # Inference orchestration
-│   ├── evaluate.py             # Evaluation pipeline (stub; not yet wired)
 │   ├── preprocessing.py        # Data preprocessing + energy detection
 │   ├── data_generation.py      # Synthetic signal injection
 │   ├── models/
@@ -140,7 +139,6 @@ Aetherscan/
 | `config.py`               | All configuration dataclasses and defaults                             |
 | `train.py`                | Training orchestration, curriculum learning, checkpointing             |
 | `inference.py`            | Model inference, candidate detection                                   |
-| `evaluate.py`             | Evaluation pipeline (stub; not yet dispatched from `main.py`)          |
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
 | `models/vae.py`           | Beta-VAE architecture with custom clustering loss                      |
