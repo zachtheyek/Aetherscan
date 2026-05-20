@@ -28,12 +28,17 @@ jobs:
           allowed_bots: "claude[bot]"
           track_progress: true
           prompt: |
+            ## Role
+            You are an automated code reviewer for the pull request below. Provide feedback on the changes — do not modify them.
+
+            ## Context
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
             PR TITLE: ${{ github.event.pull_request.title }}
             PR BODY: ${{ github.event.pull_request.body }}
             PR AUTHOR: ${{ github.event.pull_request.user.login }}
 
+            ## Task
             Please review this pull request and provide feedback on:
             - Code quality and best practices
             - Potential bugs or issues
