@@ -81,7 +81,7 @@ jobs:
             gh search issues --type discussion --repo ${{ github.repository }} "<relevant keywords from issue title>"
             ```
 
-            Note that the repository's issue templates provide a designated "Discussion links" section for authors to link to relevant discussions in the issue body. These may be a good starting point, though you shouldn't assume they're 100% accurate due to the potential for human error.
+            Note that the repository's issue templates provide a designated "Discussion links" section for authors to link to relevant discussions in the issue body. These may be a good starting point, though you shouldn't assume they're always accurate due to the potential for human error.
 
             If NO related discussions are found:
             1. Add the label `needs-discussion` to the issue: `gh issue edit ${{ github.event.issue.number }} --add-label "needs-discussion"`
@@ -94,11 +94,30 @@ jobs:
 
             If all related discussions found match the issues linked in the original issue body — do nothing, the issue is compliant.
 
+            ## Available tools
+            GitHub API:
+            - `gh api graphql` to query a PR's formally linked issues via `closingIssuesReferences` (the only reliable way to detect `Closes #N` / `Fixes #N` style links)
+
+            PR interaction (pull_request events):
+            - `gh pr edit --add-label` to apply the `needs-issue` label when a PR has no linked issue
+            - `gh pr comment` to post the missing-issue warning or a relevance-mismatch reminder
+
+            Issue interaction (issues events, plus `gh issue view` on PR events):
+            - `gh issue view` to inspect each linked issue referenced by a PR and check its relevance to the PR's stated changes
+            - `gh issue edit --add-label` to apply the `needs-discussion` label when a new issue lacks a prior discussion
+            - `gh issue comment` to post the missing-discussion reminder or a links-correction nudge
+
+            Search:
+            - `gh search issues --type discussion` to find prior GitHub Discussions related to a newly opened issue
+
+            Code exploration:
+            - `Read`, `Glob`, `Grep` to consult CONTRIBUTING.md, issue templates, or other repo context when assessing compliance
+
             ## Important:
             - Be concise in your comments (2-3 sentences max)
             - Do NOT close or reject any PRs or issues — only warn and label
             - Your only responsibilities are to enforce contribution compliance. Do not do anything that is not within this job scope.
 
           claude_args: |
-            --allowedTools "Bash(gh issue:*),Bash(gh pr:*),Bash(gh search:*),Bash(gh label:*),Bash(gh api:*),Read,Glob,Grep"
+            --allowedTools "Bash(gh api:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh search:*),Read,Glob,Grep"
             --model opus
