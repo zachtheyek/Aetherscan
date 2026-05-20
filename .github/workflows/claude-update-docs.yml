@@ -1,4 +1,3 @@
-# TODO: do a proper audit of ALL the docs in this repo -- their contents & purpose, and craft a comprehensive prompt for this workflow to make sure ALL docs are kept up-to-date on each merged PR
 # Analyze merged PRs and suggest documentation updates
 # Creates new issue & instructs Claude assistant to create PR
 name: Claude Update Docs
@@ -37,8 +36,7 @@ jobs:
             AUTHOR: ${{ github.event.pull_request.user.login }}
             MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
 
-            A pull request has just been merged to master. Your task is to analyze the changes
-            and determine if any documentation needs to be updated.
+            A pull request has just been merged to master. Your task is to analyze the changes and determine if any documentation needs to be updated.
 
             ## Steps:
 
@@ -53,12 +51,14 @@ jobs:
                - New dependencies
                - Changes to installation/setup process
                - Changes to usage patterns
+               - etc.
 
             3. Check the following documentation files for potential updates needed:
                - README.md (project overview, installation, usage)
                - AGENTS.md (AI agent instructions and context)
                - CONTRIBUTING.md (contribution guidelines)
                - KNOWN_ISSUES.md (known issues, FAQ)
+               - SECURITY.md (security best practices)
                - docs/* (tutorials, guides, API docs)
 
                Known tight source ↔ doc contracts (treat each as a single staleness signal):
@@ -109,6 +109,18 @@ jobs:
             Use `gh issue create` to create issues when needed.
             Be specific about what documentation changes are required.
 
+            ## Available tools
+            PR inspection:
+            - `gh pr diff` to retrieve the merged PR's diff (the primary signal for what to analyze in Step 1)
+            - `gh pr view` to look up additional PR metadata (labels, comments, reviewers) if needed beyond the variables interpolated above
+
+            Issue interaction:
+            - `gh issue list --label "documentation" --state open` to check for an already-open documentation issue before filing a new one (Step 4 duplicate guard)
+            - `gh issue create` to file a new `[DOCUMENTATION]: <…>` issue tagging @claude when meaningful doc gaps are identified
+
+            Code exploration:
+            - `Read`, `Glob`, `Grep` to inspect README.md, AGENTS.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and any source files referenced by the cli.py ↔ README contract above
+
           claude_args: |
-            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue create:*),Bash(gh issue list:*),Read,Glob,Grep"
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
             --model opus
