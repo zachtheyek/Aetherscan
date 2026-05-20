@@ -28,8 +28,7 @@
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
 #
 # <repo>/.env is auto-loaded if present, so secrets set by "source .env" in the
-# user's shell (the README's recommended workflow — bare KEY=VALUE lines, no
-# 'export') survive the trip into this child process. Anything already in our
+# user's shell survive the trip into this child process. Anything already in our
 # exec env (inline VAR=val invocation, real exports) takes precedence over the
 # corresponding .env value.
 
@@ -53,7 +52,7 @@ if [[ -f "$REPO/.env" ]]; then
         # ${!key+x} is non-empty iff $key is already set in our env (even if
         # the existing value is empty) — preserves inline + export precedence.
         [[ -z ${!key+x} ]] && export "$key=$value"
-    done < "$REPO/.env"
+    done <"$REPO/.env"
 fi
 
 SIF=${SIF:-$REPO/aetherscan-ngc25.02.sif}
