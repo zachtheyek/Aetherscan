@@ -479,16 +479,10 @@ class ResourceManager:
         initargs: tuple = (),
     ) -> Pool:
         """
-        Create and register a managed pool
-
-        Args:
-            n_processes: Number of worker processes
-            name: Descriptive name for debugging
-            initializer: Worker initialization function
-            initargs: Arguments for initializer
-
-        Returns:
-            Multiprocessing Pool instance
+        Construct a multiprocessing.Pool with `n_processes` workers and register it for
+        lifecycle tracking; returns the raw Pool. `name` is a debugging label that surfaces in
+        manager logs and stats. `initializer` and `initargs` are forwarded to Pool() so each
+        worker runs that setup function at startup (commonly used to attach shared memory).
         """
         pool = Pool(processes=n_processes, initializer=initializer, initargs=initargs)
 
@@ -521,14 +515,10 @@ class ResourceManager:
 
     def create_shared_memory(self, size: int, name: str = "unnamed") -> SharedMemory:
         """
-        Create and register a managed shared memory
-
-        Args:
-            size: Size in bytes
-            name: Descriptive name for debugging
-
-        Returns:
-            SharedMemory instance
+        Allocate a POSIX shared-memory block of `size` bytes and register it for lifecycle
+        tracking; returns the raw SharedMemory. `name` is a debugging label that surfaces in
+        manager logs and stats (the OS-assigned shm name is separate and available via
+        shm.name).
         """
         shm = SharedMemory(create=True, size=size)
 

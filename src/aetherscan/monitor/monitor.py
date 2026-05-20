@@ -36,18 +36,13 @@ logger = logging.getLogger(__name__)
 # https://github.com/zachtheyek/Aetherscan/issues/12
 def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
     """
-    Get total CPU and RAM usage for a process and all child processes.
-    This captures multiprocessing workers spawned by Pool() calls.
+    Sum CPU and RAM usage across `process` and its descendants (the multiprocessing pool
+    workers it spawned), returning {cpu_percent, ram_percent, ram_bytes, ram_gb}.
 
-    Args:
-        process: psutil.Process object of the main process to track
-
-    Returns:
-        Dictionary containing:
-        - cpu_percent: CPU usage as percentage of total system CPU (0-100)
-        - ram_percent: RAM usage as percentage of total system RAM (0-100)
-        - ram_bytes: Total RAM usage in bytes (PSS - Proportional Set Size)
-        - ram_gb: Total RAM usage in gigabytes
+    cpu_percent is normalized against the system core count (0-100). ram_bytes uses PSS
+    (Proportional Set Size) rather than RSS so shared pages aren't double-counted across the
+    process tree — summing RSS would let the total exceed system RAM. Dead children that vanish
+    mid-iteration are silently skipped.
     """
     try:
         # Get all processes in tree (main + children)
@@ -229,12 +224,8 @@ class ResourceMonitor:
             self.gpu_names = []
 
     def _get_process_tree_stats(self):
-        """
-        Get total CPU and RAM usage for main process and all child processes.
-
-        Returns:
-            tuple: (cpu_percent_total, ram_percent)
-        """
+        """Convenience wrapper returning (cpu_percent_total, ram_percent) from
+        get_process_tree_stats() against the monitor's own root process."""
         stats = get_process_tree_stats(self.process)
         return stats["cpu_percent"], stats["ram_percent"]
 
