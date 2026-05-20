@@ -73,54 +73,18 @@ cd Aetherscan
 The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime — use whichever is installed on the host. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
 
 ```bash
-# Apptainer (e.g. Ampere cluster running 1.4.5)
-apptainer build aetherscan-ngc25.02.sif aetherscan.def
-
 # SingularityCE (e.g. Blackwell cluster running 4.1.1)
 singularity build aetherscan-ngc25.02.sif aetherscan.def
+
+# Apptainer (e.g. Ampere cluster running v1.4.5)
+apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need `--fakeroot` and to redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
+Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
 
 **3. Configure secrets and paths (optional)**
 
-Identical to the conda path — [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into the container, so anything you put there (Slack tokens, `AETHERSCAN_*` path overrides) reaches the pipeline inside the container without inline prefixes. See the [`.env` block in Run From Source](#run-from-source) for the file format; the keys are the same.
-
-**4. Run pipeline**
-
-```bash
-./utils/run_container.sh python -m aetherscan.main {train|inference} \
-  --save-tag final_v1
-```
-
-The wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
-
-### Run From Source
-
-> [!NOTE]
-> Aetherscan currently only supports running from source.
-> Installation via pip and containerized distributions will be made available in a later release.
-
-> [!NOTE]
-> The conda steps below are the alternative Ampere-only install path. See [Run From Container](#run-from-container) above for the canonical install path on both clusters.
-
-**1. Clone the repository**
-
-```bash
-git clone https://github.com/zachtheyek/Aetherscan.git
-cd Aetherscan
-```
-
-**2. Create conda environment**
-
-```bash
-conda env create -f environment.yml
-conda activate aetherscan
-```
-
-**3. Configure secrets and paths (optional)**
-
-Aetherscan auto-loads `<repo>/.env` into `os.environ` at pipeline startup (via [python-dotenv](https://pypi.org/project/python-dotenv/) in `main.py`), so the recommended path is to put secrets and any path overrides in a `.env` file at the repo root and forget about it — no `source .env` or inline prefix needed, and multiprocess worker pools still inherit the values via `os.environ`. See [`SECURITY.md`](SECURITY.md) for guidance on keeping `.env` out of git.
+Aetherscan reads secrets and path overrides from a `.env` file at the repo root. [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into its own environment before launching the container and forwards the relevant keys via `--env`, so no `source .env` or inline prefix is needed. See [`SECURITY.md`](SECURITY.md) for guidance on keeping `.env` out of git.
 
 ```ini
 # <repo>/.env  — bare KEY=VALUE, no quoting, no "export"
@@ -141,7 +105,47 @@ If you'd rather set them directly in your shell (skipping `.env`), `export` work
 ```bash
 export SLACK_BOT_TOKEN="your-slack-bot-token"
 export SLACK_CHANNEL="your-slack-channel"
+./utils/run_container.sh python -m aetherscan.main train ...
 ```
+
+The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The wrapper forwards `SLACK_*` and `AETHERSCAN_*` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
+
+**4. Run pipeline**
+
+```bash
+./utils/run_container.sh python -m aetherscan.main {train|inference} \
+  --save-tag final_v1
+```
+
+The wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
+
+### Run From Source
+
+> [!NOTE]
+> This is an alternative Ampere-only install path.
+
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+```
+
+**2. Create conda environment**
+
+```bash
+conda env create -f environment.yml
+conda activate aetherscan
+```
+
+**3. Configure secrets and paths (optional)**
+
+Same `.env` file format and precedence rules as [Run From Container step 3](#run-from-container). Two differences on this path:
+
+- `<repo>/.env` is loaded directly into `os.environ` at the top of `main.py` via [python-dotenv](https://pypi.org/project/python-dotenv/) — no wrapper script in the loop — so **every** key in `.env` is visible to the pipeline, not just the subset the container wrapper forwards via `--env`.
+- No host→container bind mounts, so `AETHERSCAN_*` paths only need to exist when the pipeline actually accesses them, not at startup.
+
+Multiprocess worker pools inherit the values via `os.environ` as usual.
 
 **4. Run pipeline**
 
