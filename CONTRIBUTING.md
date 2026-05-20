@@ -12,25 +12,50 @@ The Aetherscan project has strict rules for AI usage. Please see the [AI usage p
 
 ### Prerequisites
 
-- Python 3.10+
-- CUDA 12.2+ with compatible NVIDIA GPU
-- Conda or Mamba for environment management
-- Git with GPG signing configured
+Aetherscan supports two install paths off the same source tree; you only need the prerequisites for the one you plan to use locally:
+
+- **NGC container path (canonical, both clusters)** — Apptainer 1.4+ or SingularityCE 4.1+, plus an NVIDIA GPU with driver ≥570 (Blackwell) or ≥550 (Ampere via CUDA forward compatibility). Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container.
+- **Conda env (alternative, Ampere only)** — Conda or Mamba, Python 3.10, CUDA 12.4+ driver, NVIDIA Ampere GPU.
+- **Both paths** — Git with GPG signing configured; [pre-commit](https://pre-commit.com/) (`pip install pre-commit` or `brew install pre-commit`).
+
+See [`README.md`](README.md#system-requirements) for the full system requirements matrix.
 
 ### Development Setup
 
+Pick whichever install path matches your dev environment, then install the pre-commit hooks.
+
+**Container path** (canonical; works on both clusters):
+
 ```bash
-# Clone the repository
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-# Create and activate environment
+# Build the .sif image with whichever runtime is installed on the host:
+singularity build aetherscan-ngc25.02.sif aetherscan.def
+# or:
+apptainer build aetherscan-ngc25.02.sif aetherscan.def
+
+# Sanity check
+./utils/run_container.sh python utils/print_cli_help.py top
+```
+
+**Conda env path** (alternative, Ampere only):
+
+```bash
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+
 conda env create -f environment.yml
 conda activate aetherscan
+```
 
-# Install pre-commit hooks
+**Pre-commit hooks** (required for both paths):
+
+```bash
 pre-commit install
 ```
+
+See [`README.md`](README.md#installation) for the full walkthrough including `.env` configuration and how to launch the pipeline.
 
 ---
 
@@ -38,73 +63,80 @@ pre-commit install
 
 ```
 Aetherscan/
-├── src/aetherscan/           # Main package
-│   ├── __init__.py           # Package initialization, version
-│   ├── main.py               # Entry point, command dispatch
-│   ├── cli.py                # Argument parsing, validation
-│   ├── config.py             # Configuration dataclasses
-│   ├── train.py              # Training orchestration
-│   ├── inference.py          # Inference orchestration
-│   ├── preprocessing.py      # Data preprocessing
-│   ├── data_generation.py    # Synthetic signal injection
+├── src/aetherscan/             # Main package
+│   ├── __init__.py             # Package initialization, version
+│   ├── main.py                 # Entry point, command dispatch, GPU strategy setup
+│   ├── cli.py                  # Argument parsing, validation, config override
+│   ├── config.py               # Configuration dataclasses
+│   ├── train.py                # Training orchestration
+│   ├── inference.py            # Inference orchestration
+│   ├── evaluate.py             # Evaluation pipeline (stub; not yet wired)
+│   ├── preprocessing.py        # Data preprocessing + energy detection
+│   ├── data_generation.py      # Synthetic signal injection
 │   ├── models/
-│   │   ├── __init__.py       # Model exports
-│   │   ├── vae.py            # Beta-VAE architecture
-│   │   └── random_forest.py  # RF classifier
+│   │   ├── __init__.py         # Model exports
+│   │   ├── vae.py              # Beta-VAE architecture
+│   │   └── random_forest.py    # RF classifier
 │   ├── db/
-│   │   ├── __init__.py       # Database exports
-│   │   └── db.py             # SQLite async writer
+│   │   ├── __init__.py         # Database exports
+│   │   └── db.py               # SQLite async writer
 │   ├── logger/
-│   │   ├── __init__.py       # Logger exports
-│   │   ├── logger.py         # Logging configuration
-│   │   └── slack_handler.py  # Slack integration
+│   │   ├── __init__.py         # Logger exports
+│   │   ├── logger.py           # Logging configuration
+│   │   └── slack_handler.py    # Slack integration
 │   ├── monitor/
-│   │   ├── __init__.py       # Monitor exports
-│   │   └── monitor.py        # Resource monitoring
+│   │   ├── __init__.py         # Monitor exports
+│   │   └── monitor.py          # Resource monitoring
 │   └── manager/
-│       ├── __init__.py       # Manager exports
-│       └── manager.py        # Resource lifecycle management
-├── docs/                     # Additional documentation
-│   └── ...
-├── tests/                    # Test suite
-│   └── ...
-├── utils/                    # Utility scripts
-│   └── ...
-├── .github/                  # CI/CD workflows
-│   └── ...
-├── .gitignore                # Local gitignore
-├── .pre-commit-config.yaml   # Pre-commit hook configuration
-├── environment.yml           # Conda dependencies
-├── pyproject.toml            # Package metadata, ruff config
-├── AGENTS.md                 # AI agent guidelines
-├── AI_POLICY.md              # AI usage policy
-├── CITATION.cff              # Citation metadata
-├── CODE_OF_CONDUCT.md        # Core values guidelines
-├── CODEOWNERS                # Code ownership
-├── CONTRIBUTING.md           # This file
-├── KNOWN_ISSUES.md           # Known issues and workarounds
-├── LICENSE                   # Project license
-├── README.md                 # Project overview, installation & usage guides
-└── SECURITY.md               # Security policy
+│       ├── __init__.py         # Manager exports
+│       └── manager.py          # Resource lifecycle management
+├── docs/                       # Runbooks and guides
+│   └── BLACKWELL_MIGRATION.md  # Container + dual-cluster migration runbook
+├── tests/                      # Test suite (placeholder; no tests yet)
+├── utils/                      # Utility scripts
+│   ├── run_container.sh             # Apptainer/SingularityCE auto-detecting wrapper
+│   ├── start_tmux_session.sh        # Monitoring tmux session helper
+│   ├── print_cli_help.py            # README CLI Reference regen helper
+│   ├── find_optimal_configs.py      # Per-host config sweep
+│   ├── verify_train_test_files.py   # Training/test data sanity check
+│   └── get_system_info.sh           # System info dump (for bug reports)
+├── .github/                    # CI/CD workflows, issue templates, CODEOWNERS, etc.
+├── .gitignore                  # Local gitignore
+├── .pre-commit-config.yaml     # Pre-commit hook configuration
+├── aetherscan.def              # Apptainer/SingularityCE build recipe for the NGC container
+├── requirements-container.txt  # Pip extras layered into the NGC container
+├── environment.yml             # Conda dependencies (Ampere conda env path)
+├── pyproject.toml              # Package metadata, ruff config
+├── AGENTS.md                   # AI agent guidelines
+├── AI_POLICY.md                # AI usage policy
+├── CITATION.cff                # Citation metadata
+├── CODE_OF_CONDUCT.md          # Core values guidelines
+├── CODEOWNERS                  # Code ownership
+├── CONTRIBUTING.md             # This file
+├── KNOWN_ISSUES.md             # Known issues and workarounds
+├── LICENSE                     # Project license
+├── README.md                   # Project overview, installation & usage guides
+└── SECURITY.md                 # Security policy
 ```
 
 ### Module Responsibilities
 
-| Module                    | Purpose                                                    |
-| ------------------------- | ---------------------------------------------------------- |
-| `main.py`                 | CLI entry point, command routing                           |
-| `cli.py`                  | Argument parsing, validation, config override              |
-| `config.py`               | All configuration dataclasses and defaults                 |
-| `train.py`                | Training orchestration, curriculum learning, checkpointing |
-| `inference.py`            | Model inference, candidate detection                       |
-| `preprocessing.py`        | Data preprocessing, normalization                          |
-| `data_generation.py`      | Synthetic signal injection using setigen                   |
-| `models/vae.py`           | Beta-VAE architecture with custom clustering loss          |
-| `models/random_forest.py` | Scikit-learn RF wrapper                                    |
-| `db/db.py`                | Thread-safe SQLite with async queue-based writes           |
-| `monitor/monitor.py`      | Background resource monitoring (CPU, RAM, GPU)             |
-| `manager/manager.py`      | Resource lifecycle management (pools, shared memory)       |
-| `logger/`                 | Multi-handler logging with Slack integration               |
+| Module                    | Purpose                                                                |
+| ------------------------- | ---------------------------------------------------------------------- |
+| `main.py`                 | CLI entry point, command routing, GPU strategy setup (NCCL + fallback) |
+| `cli.py`                  | Argument parsing, validation, config override                          |
+| `config.py`               | All configuration dataclasses and defaults                             |
+| `train.py`                | Training orchestration, curriculum learning, checkpointing             |
+| `inference.py`            | Model inference, candidate detection                                   |
+| `evaluate.py`             | Evaluation pipeline (stub; not yet dispatched from `main.py`)          |
+| `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
+| `data_generation.py`      | Synthetic signal injection using setigen                               |
+| `models/vae.py`           | Beta-VAE architecture with custom clustering loss                      |
+| `models/random_forest.py` | Scikit-learn RF wrapper                                                |
+| `db/db.py`                | Thread-safe SQLite with async queue-based writes                       |
+| `monitor/monitor.py`      | Background resource monitoring (CPU, RAM, GPU)                         |
+| `manager/manager.py`      | Resource lifecycle management (pools, shared memory)                   |
+| `logger/`                 | Multi-handler logging with Slack integration                           |
 
 > [!WARNING]
 >
@@ -186,6 +218,20 @@ git checkout -b feature/my_new_feature
 > [!NOTE]
 > Claude will automatically provide an initial code review. You do not need to address every point raised. Use your own judgement and discuss with a maintainer if you're unsure.
 
+### 7. After Merge
+
+Once your PR is merged, delete the remote feature branch from `origin` so the branch list stays clean. Either:
+
+```bash
+# CLI
+git push origin --delete <branchname>
+```
+
+…or click the **"Delete branch"** button GitHub shows on the merged PR page. Locally, you can also prune the tracking ref with `git fetch --prune`.
+
+> [!TIP]
+> If the repository's **Settings → General → Pull Requests → Automatically delete head branches** option is enabled, GitHub does this for you on merge and this step becomes a no-op.
+
 ---
 
 ## Pre-commit Hooks
@@ -228,12 +274,16 @@ git commit --no-verify -m "message"
 
 ### Ruff Configuration
 
-The project uses [ruff](https://docs.astral.sh/ruff/) for linting and formatting, and follows the PEP-8 style guides with minor relaxations (see `pyproject.toml`):
+The project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting, and follows PEP-8 with minor relaxations. The full configuration lives in [`pyproject.toml`](pyproject.toml) under `[tool.ruff]`; highlights below.
 
-- **Line length**: 100 characters
-- **Target version**: Python 3.10
+- **Line length**: 100 characters (formatter wraps; `E501` is intentionally ignored so wrapping is the formatter's job, not the linter's)
+- **Target version**: Python 3.10 (lowest common denominator across the conda 3.10 path and the container 3.12 path)
 - **Quote style**: Double quotes
-- **Import sorting**: isort-compatible
+- **Indentation**: 4 spaces
+- **Import sorting**: isort-compatible, with `aetherscan` declared as the only first-party namespace
+- **Enabled rule families**: PEP-8 (`E`, `W`), pyflakes (`F`), isort (`I`), pep8-naming (`N`), pyupgrade (`UP`), bugbear (`B`), comprehensions (`C4`), simplify (`SIM`), pylint (`PL`)
+- **Notable allowances**: unused vars (`F841`), many-param functions (`PLR0913`), and magic-number comparisons (`PLR2004`) are permitted intentionally; a few `PLR0911/12/15` and `PLW0603` ignores are tracked as temporary in `pyproject.toml`
+- **Per-file ignores**: `F401` (unused imports) is allowed in every `__init__.py`
 
 ### Key Style Rules
 
@@ -280,45 +330,6 @@ def load_train_data(config: Config) -> tuple[np.ndarray, np.ndarray]:
 >
 > # TODO: update this section once test suite is operational
 
-### Running Tests
-
-```bash
-# All tests
-pytest tests/
-
-# Specific test file
-pytest tests/test_config.py
-
-# With coverage report
-pytest --cov=aetherscan --cov-report=html tests/
-
-# Verbose output
-pytest -v tests/
-```
-
-### Writing Tests
-
-- Place tests in `tests/` directory
-- Use `pytest` fixtures for common setup
-- Mock external dependencies (GPU, Slack, etc.)
-- Use `Config._reset()` in teardown
-
-```python
-import pytest
-from aetherscan.config import Config, init_config
-
-@pytest.fixture
-def config():
-    """Provide fresh config for each test."""
-    cfg = init_config()
-    yield cfg
-    Config._reset()
-
-def test_config_defaults(config):
-    assert config.beta_vae.latent_dim == 8
-    assert config.training.num_training_rounds == 20
-```
-
 ---
 
 ## New Version Releases
@@ -326,33 +337,6 @@ def test_config_defaults(config):
 > [!WARNING]
 >
 > # TODO: add tagged releases workflow when available
-
-When releasing a new version, update these files:
-
-| File                         | Location                                  | Example                                             |
-| ---------------------------- | ----------------------------------------- | --------------------------------------------------- |
-| `pyproject.toml`             | `version = "X.Y.Z"`                       | `version = "1.0.0"`                                 |
-| `src/aetherscan/__init__.py` | `__version__ = "X.Y.Z"`                   | `__version__ = "1.0.0"`                             |
-| `CITATION.cff`               | `version:` and `date-released:`           | `version: 1.0.0` and `date-released: 2026-01-01`    |
-| `SECURITY.md`                | Under "Supported Versions", if applicable | see [`SECURITY.md`](SECURITY.md#supported-versions) |
-
-### Dependency Updates
-
-When updating dependencies, ensure all relevant files are synchronized:
-
-| File                                       | Dependencies                                        | When to Update                                        |
-| ------------------------------------------ | --------------------------------------------------- | ----------------------------------------------------- |
-| `environment.yml`                          | Conda/pip packages (Python, TensorFlow, CUDA, etc.) | Adding/updating any Python or CUDA dependency         |
-| `pyproject.toml`                           | Python version, Dev dependencies (ruff)             | Changing Python version requirement, adding dev tools |
-| `README.md`                                | Version badges and system requirements              | Major version changes to Python, TensorFlow, or CUDA  |
-| `CONTRIBUTING.md`                          | Prerequisites section                               | Major version changes to Python, CUDA, or tooling     |
-| `.pre-commit-config.yaml`                  | Pre-commit hooks (ruff, gitleaks, pre-commit-hooks) | Updating linter/formatter or adding new hooks         |
-| `.github/workflows/pre-commit.yml`         | Python version, action versions                     | Changing Python version or updating CI actions        |
-| `.github/workflows/claude*.yml`            | Claude action versions, model specification         | Updating Claude Code action or model                  |
-| `.github/workflows/auto-assign-author.yml` | GitHub action versions                              | Updating GitHub Actions versions                      |
-
-> [!TIP]
-> When adding a new Python package, always update `environment.yml` first, then test with a fresh conda environment before committing.
 
 ---
 
