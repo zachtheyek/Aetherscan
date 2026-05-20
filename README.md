@@ -738,7 +738,7 @@ options:
 
 ## Known Issues
 
-For a comprehensive list of known issues, limitations, and workarounds, see [`KNOWN_ISSUES.md`](/KNOWN_ISSUES.md).
+For a list of known issues, limitations, and workarounds, see [`KNOWN_ISSUES.md`](/KNOWN_ISSUES.md).
 
 ---
 
