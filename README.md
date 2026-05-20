@@ -172,6 +172,13 @@ The repo ships a convenience script that instantiates a four-window tmux session
 
 Idempotent — re-running attaches to the existing session instead of recreating it.
 
+If you skip the tmux helper, it's recommended to run these two exports manually before launching the pipeline — the script's pipeline pane sets them for you, and without them you may hit TF library-loading issues or noisy startup logs:
+
+```bash
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export TF_CPP_MIN_LOG_LEVEL=1
+```
+
 **4. Configure secrets and paths (optional)**
 
 Same `.env` file format and precedence rules as [Run From Container step 4](#run-from-container). Two differences on this path:
