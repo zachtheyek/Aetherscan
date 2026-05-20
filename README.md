@@ -59,7 +59,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 ### Run From Container
 
 > [!NOTE]
-> This is the canonical install path on both clusters.
+> This is the canonical install path, and the only option for Blackwell clusters
 
 **1. Clone the repository**
 
@@ -84,10 +84,10 @@ Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you ma
 
 **3. Configure secrets and paths (optional)**
 
-Aetherscan reads secrets and path overrides from a `.env` file at the repo root. [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into its own environment before launching the container and forwards the relevant keys via `--env`, so no `source .env` or inline prefix is needed. See [`SECURITY.md`](SECURITY.md) for guidance on keeping `.env` out of git.
+Aetherscan reads secrets and path overrides from a `.env` file at the repo root. [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into its own environment before launching the container and forwards the relevant keys via `--env`, so no `source .env` or inline prefix is needed.
 
 ```ini
-# <repo>/.env  — bare KEY=VALUE, no quoting, no "export"
+# .env example
 
 # If none specified, Slack integration is automatically disabled
 SLACK_BOT_TOKEN=your-slack-bot-token
@@ -100,11 +100,16 @@ AETHERSCAN_MODEL_PATH=/path/to/models
 AETHERSCAN_OUTPUT_PATH=/path/to/outputs
 ```
 
+> [!TIP]
+> See [`SECURITY.md`](SECURITY.md) for guidance on keeping `.env` out of git.
+
 If you'd rather set them directly in your shell (skipping `.env`), `export` works equivalently and takes precedence over `.env` for any keys it sets — useful for one-off overrides:
 
 ```bash
 export SLACK_BOT_TOKEN="your-slack-bot-token"
 export SLACK_CHANNEL="your-slack-channel"
+...
+
 ./utils/run_container.sh python -m aetherscan.main train ...
 ```
 
@@ -122,7 +127,7 @@ The wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptai
 ### Run From Source
 
 > [!NOTE]
-> This is an alternative Ampere-only install path.
+> This is an alternative install path for Ampere clusters
 
 **1. Clone the repository**
 
