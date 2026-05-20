@@ -1,9 +1,8 @@
-# TODO: write docstring
 """
 Inference orchestration for Aetherscan Pipeline
-Implements ...
-Supports distributed datasets & latent generation
-...
+Implements distributed encoding of preprocessed cadence snippets and Random Forest candidate
+classification. Supports distributed datasets, per-replica latent generation, and writing
+predictions / latent vectors to the database for downstream analysis.
 """
 
 from __future__ import annotations
@@ -65,21 +64,14 @@ def prepare_distributed_inf_dataset(
     strategy: tf.distribute.Strategy,
 ) -> dict:
     """
-    Prepare distributed datasets for inference
-    Note, this function is not meant for RF training
-    It is different from aetherscan.train.prepare_distributed_inf_dataset(),
-    since we can't assume signal classes are known ahead of time
+    Build a distributed inference dataset from `data` (shape (n_samples, 6, 16, 512)) and return
+    a dict with the dataset, trimmed sample count, step count, and the InfDataHolder.
 
-    Args:
-        data: ndarray with shape (n_samples, 6, 16, 512)
-        n_samples: Number of samples in data
-        per_replica_inf_batch_size: Batch size per replica for inference
-        num_replicas: Number of replicas in strategy
-        strategy: TensorFlow distribution strategy
-
-    Returns: {inf_dataset, n_inf_trimmed, inf_steps, _inf_holder}
-             Inference distributed dataset, number of samples, number of steps,
-              and DataHolder reference
+    Distinct from train.py's RF-training counterpart: signal classes are not assumed to be known
+    ahead of time, so the dataset yields raw cadences without label channels. Order is preserved
+    (no shuffle) since gradients aren't computed during inference. Currently no trimming is done
+    (n_inf_trimmed == n_samples); the trimming scaffolding is left in place for future
+    divisibility experiments.
     """
     global_inf_batch_size = per_replica_inf_batch_size * num_replicas
 
@@ -175,10 +167,8 @@ class InferencePipeline:
 
     def __init__(self, strategy: tf.distribute.Strategy = None):
         """
-        Initialize inference pipeline.
-
-        Args:
-            strategy: TensorFlow distribution strategy
+        Initialize the inference pipeline with an optional tf.distribute strategy (defaults to
+        the current strategy, i.e. no-op for single-device).
         """
         self.config = get_config()
         if self.config is None:
@@ -206,9 +196,7 @@ class InferencePipeline:
 
     # TODO: implement model loading from HuggingFace (parametrize args to InferenceConfig)
     def init_models(self, encoder_path: str, rf_path: str):
-        """
-        Initialize models within strategy scope
-        """
+        """Load the VAE encoder (inside strategy.scope) and the Random Forest classifier from disk."""
         if not os.path.exists(encoder_path):
             raise FileNotFoundError(f"Encoder not found at {encoder_path}")
         if not os.path.exists(rf_path):
@@ -250,15 +238,13 @@ class InferencePipeline:
         h5_path: str | None = None,
     ) -> dict:
         """
-        Run inference on preprocessed cadence snippets.
+        Run inference on preprocessed cadence snippets (shape (n, 6, 16, 512)) sourced from
+        npy_path, and return {n_cadence_snippets, n_processed, n_candidates}.
 
-        Args:
-            data: Preprocessed cadence snippets, shape (n, 6, 16, 512)
-            npy_path: Source .npy file path containing the cadence snippets
-            ...
-
-        Returns:
-            Dict with inference statistics
+        Encodes each snippet through the VAE encoder under the distribution strategy, then runs
+        the Random Forest classifier on the latents and writes positive predictions to the
+        database (along with the latent vector and observational provenance: target, session,
+        cadence_id, band, frequency_mhz, timestamp_observed, h5_path).
         """
         # Sanity check
         if not self.encoder or not self.rf_model:
@@ -346,7 +332,10 @@ class InferencePipeline:
         n_steps: int,
     ) -> np.ndarray:
         """
-        Encode cadence snippets using distributed strategy.
+        Encode `n_steps` worth of batches from a distributed `dataset` into a pre-allocated
+        latent array of shape (n_samples * num_observations, latent_dim). Per-replica results
+        are gathered via experimental_local_results + np.concatenate (faster than a strategy-level
+        gather over NCCL for the small latent payload).
         """
         # Pre-allocate latent array
         # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
@@ -484,13 +473,11 @@ def run_inference_pipeline(
     h5_path: str | None = None,
 ) -> dict:
     """
-    Complete Aetherscan inference pipeline run
-
-    Args:
-        cadence_data: Array of preprocessed cadences, shape (n, 6, 16, 512)
-        npy_path: Source .npy file path containing the cadence snippets
-        strategy: TensorFlow distribution strategy
-        ...
+    End-to-end inference entry point: build an InferencePipeline under `strategy` and run it
+    against `cadence_data` (shape (n, 6, 16, 512)) sourced from `npy_path`. The optional
+    target/session/cadence_id/band/frequency_mhz/timestamp_observed/h5_path arguments are
+    observational provenance that gets written to the inference_results table for any positive
+    candidates. Returns the {n_cadence_snippets, n_processed, n_candidates} dict from run_inference.
     """
     # Create pipeline
     pipeline = InferencePipeline(strategy=strategy)
