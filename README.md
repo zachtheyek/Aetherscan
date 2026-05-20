@@ -127,6 +127,19 @@ The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so the
 
 The `utils/run_container.sh` wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
 
+**5. Set up monitoring dashboards in tmux (optional)**
+
+The repo ships a convenience script that lays out a four-window tmux session named `aetherscan` — pipeline pane on top, plus monitoring panes for `htop` + a CPU/MEM ticker, `watch nvidia-smi`, `watch ls /dev/shm`, and `watch tree` over the models and outputs dirs:
+
+```bash
+./utils/start_tmux_session.sh
+```
+
+Idempotent — re-running attaches to the existing session instead of recreating it.
+
+> [!NOTE]
+> The script's pipeline pane runs `conda activate aetherscan` by default (tuned for the source install path). On the container path that line is a no-op error you can ignore — the monitoring panes still work, and you launch the pipeline by typing `./utils/run_container.sh python -m aetherscan.main ...` in the top pane. Edit the script if you'd prefer the error not show up.
+
 ### Run From Source
 
 > [!NOTE]
@@ -163,6 +176,16 @@ PYTHONPATH=src python -m aetherscan.main {train|inference} \
 ```
 
 `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` step. No inline `KEY=VALUE` prefix is needed for Slack credentials — the `.env` auto-load runs before any worker process is spawned, so `os.environ` inheritance to multiprocess pools is automatic.
+
+**5. Set up monitoring dashboards in tmux (optional)**
+
+The repo ships a convenience script that lays out a four-window tmux session named `aetherscan` — pipeline pane (with `conda activate aetherscan` and the TF `LD_LIBRARY_PATH` pre-set, ready for `python -m aetherscan.main ...`), plus monitoring panes for `htop` + a CPU/MEM ticker, `watch nvidia-smi`, `watch ls /dev/shm`, and `watch tree` over the models and outputs dirs:
+
+```bash
+./utils/start_tmux_session.sh
+```
+
+Idempotent — re-running attaches to the existing session instead of recreating it.
 
 ---
 
