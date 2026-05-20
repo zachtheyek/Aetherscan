@@ -797,14 +797,14 @@ See [`CITATION.cff`](CITATION.cff) for details
 
 ## Security
 
-For vulnerability reports, incident response, secrets management, and security best practices, see [`SECURITY.md`](SECURITY.md).
+Aetherscan is committed to responsible disclosure. Quick reference:
 
-**Quick reference:**
+- **Report vulnerabilities:** Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label (non-critical) or contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack (critical; expect a response within 48-72h)
+- **Incident response:** Contain compromised credentials immediately, then assess scope, notify affected parties, remediate, and document
+- **Secrets:** Never commit tokens; use `.env` files (gitignored). Rotate immediately if compromised
+- **Automated scanning:** [gitleaks](https://github.com/gitleaks/gitleaks) pre-commit hook blocks accidental secret commits; GitHub Dependabot monitors for vulnerable dependencies
 
-- **Report vulnerabilities:** Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label (non-critical) or contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack (critical)
-- **Secrets:** Never commit tokens; use `.env` files instead
-- **Pre-commit hooks:** [gitleaks](https://github.com/gitleaks/gitleaks) scans for accidental secret commits
-- **Dependencies:** GitHub Dependabot monitors for vulnerable packages
+See [`SECURITY.md`](SECURITY.md) for more details.
 
 ---
 
