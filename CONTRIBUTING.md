@@ -47,6 +47,9 @@ cd Aetherscan
 
 conda env create -f environment.yml
 conda activate aetherscan
+
+# Sanity check
+PYTHONPATH=src python utils/print_cli_help.py top
 ```
 
 **Pre-commit hooks** (required for both paths):
