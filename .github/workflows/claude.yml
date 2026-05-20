@@ -185,6 +185,44 @@ jobs:
             - Grep for text patterns
             - Understand the project structure
 
+            ## Available tools
+            Issue interaction (capability 3, plus context-gathering anywhere):
+            - `gh issue view`, `gh issue list` to read or enumerate issues
+            - `gh issue create` to file new issues (capability 3)
+            - `gh issue edit` to update labels/title/body after creation
+            - `gh issue comment` to post comments on issues
+
+            PR interaction (capabilities 2 and 5):
+            - `gh pr view`, `gh pr list`, `gh pr diff` to read PR context and diffs
+            - `gh pr create` to open the follow-up PR after pushing a `claude/*` branch
+            - `gh pr edit` to update a PR's title / body / labels after opening
+            - `gh pr comment` for top-level PR comments (general feedback or follow-ups)
+            - `mcp__github_inline_comment__create_inline_comment` for inline code review comments on a PR
+
+            GitHub API:
+            - `gh api` for GraphQL queries — most importantly, this is the only way to comment on a GitHub Discussion (use the `addDiscussionComment` mutation), since `gh` has no first-class `gh discussion comment` subcommand
+
+            Search:
+            - `gh search` to look up related issues, PRs, code, commits, or discussions across the repo
+
+            Workflow run analysis (capability 4):
+            - `gh run list` to enumerate recent Actions runs
+            - `gh run view` (including `--log`) to inspect a specific run's details or logs
+
+            Git operations (capability 2):
+            - `git status`, `git diff`, `git log` to inspect working tree, changes, and history
+            - `git fetch`, `git branch`, `git checkout` to set up a `claude/<short_description>` working branch
+            - `git add`, `git commit`, `git push` to land and publish commits
+
+            Local tooling (Pre-commit hooks section):
+            - `pip install` to install `pre-commit` and `ruff` on the runner
+            - `pre-commit` to run the configured hooks before committing
+            - `ruff` to invoke the linter / formatter directly when isolating a hook failure
+
+            File tools (capabilities 1, 2, 6):
+            - `Read`, `Glob`, `Grep` to explore and search the codebase
+            - `Edit`, `Write` to modify files when making code changes
+
             ## Guidelines
             - Be helpful, accurate, and concise
             - When making changes, explain what you're doing and why
@@ -194,5 +232,5 @@ jobs:
             - For code changes, always work on a `claude/*` branch, never commit directly to master
 
           claude_args: |
-            --allowedTools "Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh pr create:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh search:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git checkout:*),Bash(git fetch:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git branch:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(pip install:*),Bash(pre-commit:*),Bash(ruff:*),mcp__github_inline_comment__create_inline_comment,Edit,Write,Read,Glob,Grep"
+            --allowedTools "Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment,Bash(gh api:*),Bash(gh search:*),Bash(gh run list:*),Bash(gh run view:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git fetch:*),Bash(git branch:*),Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(pip install:*),Bash(pre-commit:*),Bash(ruff:*),Read,Glob,Grep,Edit,Write"
             --model opus
