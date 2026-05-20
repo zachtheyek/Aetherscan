@@ -422,67 +422,6 @@ def inference_command():
     logger.info("=" * 60)
 
 
-# NOTE: come back to this later
-# def evaluate_command(args):
-#     """Execute evaluation command"""
-#     logger.info("Starting model evaluation...")
-#
-#     # Setup GPU
-#     setup_gpu_config()
-#
-#     # Load configuration
-#     config = Config()
-#
-#     # Import necessary modules
-#     import tensorflow as tf
-#     from models.random_forest import RandomForestModel
-#
-#     # Load models
-#     logger.info(f"Loading VAE encoder from {args.vae_model}")
-#     vae_encoder = tf.keras.models.load_model(args.vae_model)
-#
-#     logger.info(f"Loading Random Forest from {args.rf_model}")
-#     rf_model = RandomForestModel(config)
-#     rf_model.load(args.rf_model)
-#
-#     # Load or generate test data
-#     if args.test_data:
-#         logger.info(f"Loading test data from {args.test_data}")
-#         test_data = np.load(args.test_data, allow_pickle=True).item()
-#     else:
-#         logger.info("Generating synthetic test data...")
-#         # Load some background for generation
-#         background_data = load_train_data(config)
-#         generator = DataGenerator(config, background_data[:100])  # Use subset
-#         test_data = generator.generate_test_set()
-#
-#     # Evaluate
-#     preprocessor = DataPreprocessor(config)
-#
-#     # Prepare test data
-#     test_true = preprocessor.prepare_batch(test_data['true'])
-#     test_false = preprocessor.prepare_batch(test_data['false'])
-#
-#     # Get predictions
-#     _, _, true_latents = vae_encoder.predict(test_true, batch_size=64)
-#     _, _, false_latents = vae_encoder.predict(test_false, batch_size=64)
-#
-#     true_preds = rf_model.predict(true_latents)
-#     false_preds = rf_model.predict(false_latents)
-#
-#     # Calculate metrics
-#     tpr = np.mean(true_preds == 1)
-#     fpr = np.mean(false_preds == 1)
-#     accuracy = np.mean(np.concatenate([true_preds == 1, false_preds == 0]))
-#
-#     logger.info("="*60)
-#     logger.info("Evaluation Results:")
-#     logger.info(f"  True Positive Rate: {tpr:.3f}")
-#     logger.info(f"  False Positive Rate: {fpr:.3f}")
-#     logger.info(f"  Overall Accuracy: {accuracy:.3f}")
-#     logger.info("="*60)
-
-
 def main():
     """Main entry point to Aetherscan pipeline"""
     # Auto-load <repo>/.env (searched upward from CWD) into os.environ so

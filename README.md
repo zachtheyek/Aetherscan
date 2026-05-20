@@ -345,20 +345,19 @@ At runtime, the singleton `Config` instance can be accessed via `get_config()` a
 
 ### Top-Level Help
 
-Aetherscan dispatches to one of three subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main --help` (container) or `PYTHONPATH=src python -m aetherscan.main --help` (source).
+Aetherscan dispatches to one of two subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python -m aetherscan.main --help` (container) or `PYTHONPATH=src python -m aetherscan.main --help` (source).
 
 ```
-usage: [-h] {train,inference,evaluate} ...
+usage: [-h] {train,inference} ...
 
 Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade
 DL pipeline for SETI @ scale
 
 positional arguments:
-  {train,inference,evaluate}
+  {train,inference}
                         Command to execute
     train               Execute training pipeline
     inference           Execute inference pipeline
-    evaluate            Execute evaluation pipeline
 
 options:
   -h, --help            show this help message and exit

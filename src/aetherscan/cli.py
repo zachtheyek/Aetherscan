@@ -31,8 +31,6 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     _add_train_arguments(subparsers)
     # Inference command
     _add_inference_arguments(subparsers)
-    # Evaluate command
-    _add_evaluate_arguments(subparsers)
 
     return parser
 
@@ -624,18 +622,6 @@ def _add_inference_arguments(subparsers):
         default=None,
         help="Tag for current pipeline run. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
     )
-
-
-# NOTE: come back to this later
-def _add_evaluate_arguments(subparsers):
-    """Add evaluation command arguments to subparser"""
-    eval_parser = subparsers.add_parser("evaluate", help="Execute evaluation pipeline")
-
-    # TODO: finish adding evaluate_command args
-    # eval_parser.add_argument('vae_model', type=str, help='Path to VAE encoder model')
-    # eval_parser.add_argument('rf_model', type=str, help='Path to Random Forest model')
-    # eval_parser.add_argument('--test-data', type=str, help='Path to test data')
-    # ...
 
 
 # NOTE: how to ensure only train_parser/inf_parser args get applied depending on whether train/inference is ran?
