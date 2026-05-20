@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """
-Print canonical argparse --help output for Aetherscan's top-level + train +
-inference subparsers, with clean prog names so the result can be pasted
-verbatim into README.md's `## CLI Reference` section.
+Print canonical argparse --help output for Aetherscan's top-level + train + inference subparsers,
+with clean prog names so the result can be pasted verbatim into README.md's `## CLI Reference`.
 
-This exists because running `python -m aetherscan.main {train,inference} --help`
-emits a less clean prog name (e.g. `main.py train`) than the README expects
-(`train`), and because pinning COLUMNS makes line-wrapping deterministic across
-hosts.
-
-Usage:
-    PYTHONPATH=src python utils/print_cli_help.py [top|train|inference|all]
-
-Default target is "all", which emits all three blocks separated by blank lines.
-
-The script only imports aetherscan.config and aetherscan.cli, both pure-stdlib
-modules, so it does NOT require TensorFlow or the conda env to run.
+Exists because `python -m aetherscan.main {train,inference} --help` emits a less clean prog name
+(e.g. `main.py train`) than the README expects (`train`), and because pinning COLUMNS makes
+line-wrapping deterministic across hosts. Invoke as
+`PYTHONPATH=src python utils/print_cli_help.py [top|train|inference|all]`; the default `all`
+emits all three blocks separated by blank lines. Imports only aetherscan.config and
+aetherscan.cli (both stdlib-only), so it doesn't require TensorFlow or the conda env.
 """
 
 from __future__ import annotations

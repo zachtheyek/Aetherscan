@@ -4,15 +4,9 @@
 """
 Optimize training parameters to satisfy divisibility constraints across multiple replica counts.
 
-Usage:
-  # Use config values as defaults, vary all parameters
-  ./utils/find_optimal_configs.py
-
-  # Hold certain parameters constant
-  ./utils/find_optimal_configs.py --hold-per-replica-batch-size --hold-train-val-split
-
-  # Only allow certain parameters to increase
-  ./utils/find_optimal_configs.py --only-increase-effective-batch-size --only-decrease-num-samples-beta-vae
+Default invocation uses config values as defaults and varies every parameter; flags like
+--hold-<param> pin a parameter at its config value, and --only-increase-<param> /
+--only-decrease-<param> restrict the search direction. See --help for the full flag list.
 """
 
 import argparse
