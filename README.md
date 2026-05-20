@@ -40,25 +40,60 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 **NGC container (canonical, runs on both clusters)**
 
 - Ubuntu 24.04
-- 1x NVIDIA GPU:
+- ≥1x NVIDIA GPU:
   - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.4) via CUDA forward compatibility
-- ≥9 GB VRAM (training) / ≥12 GB VRAM (inference)
-- ≥400 GB RAM (training) / ≥150 GB RAM (inference)
-- Apptainer 1.3+ or SingularityCE 4.0+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
+- ≥9 GB combined VRAM (training) / ≥12 GB combined VRAM (inference)
+- ≥150 GB RAM (training) / ≥100 GB RAM (inference)
+- Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full runbook
 
 **Conda env (alternative, Ampere only)**
 
 - Ubuntu 24.04
-- 1x NVIDIA GPU, CUDA 12.5+ driver
+- ≥1x NVIDIA GPU:
+  - Ampere with CUDA 12.4+ driver
 - VRAM / RAM same as above
-- Python 3.10 (managed by conda)
+- Python 3.10 / TF 2.17 (managed by conda)
 
-As the software matures, more detailed system requirements will be made available to the user.
+### Run From Container
 
-> [!Tip]
-> If you're running into resource bottlenecks, consider adjusting the appropriate config values (e.g. lower `--num-samples-beta-vae` or `--signal-injection-chunk-size` if RAM is the limiting factor).
+> [!NOTE]
+> This is the canonical install path on both clusters.
+
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+```
+
+**2. Build the `.sif` image**
+
+The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime — use whichever is installed on the host. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
+
+```bash
+# Apptainer (e.g. Ampere cluster running 1.4.5)
+apptainer build aetherscan-ngc25.02.sif aetherscan.def
+
+# SingularityCE (e.g. Blackwell cluster running 4.1.1)
+singularity build aetherscan-ngc25.02.sif aetherscan.def
+```
+
+Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need `--fakeroot` and to redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
+
+**3. Configure secrets and paths (optional)**
+
+Identical to the conda path — [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into the container, so anything you put there (Slack tokens, `AETHERSCAN_*` path overrides) reaches the pipeline inside the container without inline prefixes. See the [`.env` block in Run From Source](#run-from-source) for the file format; the keys are the same.
+
+**4. Run pipeline**
+
+```bash
+./utils/run_container.sh python -m aetherscan.main {train|inference} \
+  --save-tag final_v1
+```
+
+The wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
 
 ### Run From Source
 
@@ -67,7 +102,7 @@ As the software matures, more detailed system requirements will be made availabl
 > Installation via pip and containerized distributions will be made available in a later release.
 
 > [!NOTE]
-> The conda steps below are the alternative Ampere-only install path. The canonical runtime on both clusters is the NGC TF 2.17 container — build it with `apptainer build aetherscan-ngc25.02.sif aetherscan.def` (or `singularity build ...`) and run the pipeline via `./utils/run_container.sh`. See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full walkthrough.
+> The conda steps below are the alternative Ampere-only install path. See [Run From Container](#run-from-container) above for the canonical install path on both clusters.
 
 **1. Clone the repository**
 
