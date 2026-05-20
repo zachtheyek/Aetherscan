@@ -31,13 +31,16 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "claude[bot]"
           prompt: |
+            ## Role
+            You are a contribution compliance checker. Your job is to verify that contributions follow the project's workflow rules.
+
+            ## Context
             REPO: ${{ github.repository }}
             EVENT: ${{ github.event_name }}
             ACTION: ${{ github.event.action }}
 
-            You are a contribution compliance checker. Your job is to verify that contributions follow the project's workflow rules.
-
-            ## If this is a pull_request event:
+            ## Task
+            ### If this is a pull_request event:
 
             PR NUMBER: ${{ github.event.pull_request.number }}
             PR TITLE: ${{ github.event.pull_request.title }}
@@ -69,7 +72,7 @@ jobs:
             3. If the PR body mentions issue numbers (e.g. "Related to #10") that are NOT formally linked via closing keywords, post a friendly reminder suggesting the author use `Closes #N` or `Fixes #N` to create a formal link.
             4. If all linked issues are relevant and correctly linked — do nothing, the PR is compliant.
 
-            ## If this is an issues event:
+            ### If this is an issues event:
 
             ISSUE NUMBER: ${{ github.event.issue.number }}
             ISSUE TITLE: ${{ github.event.issue.title }}
@@ -113,7 +116,7 @@ jobs:
             Code exploration:
             - `Read`, `Glob`, `Grep` to consult CONTRIBUTING.md, issue templates, or other repo context when assessing compliance
 
-            ## Important:
+            ## Guidelines
             - Be concise in your comments (2-3 sentences max)
             - Do NOT close or reject any PRs or issues — only warn and label
             - Your only responsibilities are to enforce contribution compliance. Do not do anything that is not within this job scope.
