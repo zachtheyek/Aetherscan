@@ -80,7 +80,7 @@ singularity build aetherscan-ngc25.02.sif aetherscan.def
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
+Build takes ~15 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
 
 **3. Configure secrets and paths (optional)**
 
@@ -101,7 +101,7 @@ AETHERSCAN_OUTPUT_PATH=/path/to/outputs
 ```
 
 > [!TIP]
-> See [`SECURITY.md`](SECURITY.md) for guidance on keeping `.env` out of git.
+> See [`SECURITY.md`](SECURITY.md) for best practices on managing `.env` files.
 
 If you'd rather set them directly in your shell (skipping `.env`), `export` works equivalently and takes precedence over `.env` for any keys it sets — useful for one-off overrides:
 
@@ -113,7 +113,7 @@ export SLACK_CHANNEL="your-slack-channel"
 ./utils/run_container.sh python -m aetherscan.main train ...
 ```
 
-The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The wrapper forwards `SLACK_*` and `AETHERSCAN_*` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
+The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The `utils/run_container.sh` wrapper forwards `SLACK_*` and `AETHERSCAN_*` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
 
 **4. Run pipeline**
 
@@ -122,7 +122,7 @@ The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so the
   --save-tag final_v1
 ```
 
-The wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
+The `utils/run_container.sh` wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
 
 ### Run From Source
 
