@@ -11,7 +11,6 @@ hosts.
 
 Usage:
     PYTHONPATH=src python utils/print_cli_help.py [top|train|inference|all]
-    ./utils/run_container.sh python utils/print_cli_help.py [...]
 
 Default target is "all", which emits all three blocks separated by blank lines.
 

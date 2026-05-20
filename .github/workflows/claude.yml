@@ -230,6 +230,7 @@ jobs:
             - Always test your understanding before making changes
             - Reference AGENTS.md for repository-specific context and guidelines
             - For code changes, always work on a `claude/*` branch, never commit directly to master
+            - Your only responsibilities are to execute on the specific task request that triggered this workflow. Do not do anything that is not within this job scope.
 
           claude_args: |
             --allowedTools "Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment,Bash(gh api:*),Bash(gh search:*),Bash(gh run list:*),Bash(gh run view:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git fetch:*),Bash(git branch:*),Bash(git checkout:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(pip install:*),Bash(pre-commit:*),Bash(ruff:*),Read,Glob,Grep,Edit,Write"
