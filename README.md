@@ -87,7 +87,7 @@ singularity build aetherscan-ngc25.02.sif aetherscan.def
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~8 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
+Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
 
 **3. Set up monitoring dashboards in tmux (optional)**
 

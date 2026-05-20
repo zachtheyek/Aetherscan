@@ -39,7 +39,7 @@ cd /path/to/Aetherscan
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~8 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
+Build takes ~9 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
 
 > [!NOTE]
 > A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch.
