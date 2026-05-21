@@ -117,7 +117,7 @@ The conda env was bumped to TF 2.17 / numpy 1.26 to match the container's API su
     --save-tag final_v1
 ```
 
-The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv`, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB; on Ampere, pass `--gpu-memory-limit-mb 14000` to preserve the legacy A4000 cap.
+The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv` for GPU passthrough, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB; on Ampere, pass `--gpu-memory-limit-mb 14000` to preserve the legacy A4000 cap.
 
 ### Conda (Ampere only, alternative path)
 
@@ -193,7 +193,7 @@ The NGC 25.02 release notes flag a known multi-GPU OOM under the async allocator
 Two warning families fire repeatedly on Blackwell + NGC 25.02 and have no correctness impact. Don't chase them.
 
 - `W gpu_timer.cc:114] Skipping the delay kernel, measurement accuracy will be reduced` — XLA's autotuner normally launches a tiny "delay kernel" before each candidate timing to drain pending GPU work, so measurements are reproducible. TF 2.17's XLA has no delay-kernel implementation registered for sm_120, so the autotuner times without the primer. Picks of fastest kernels become slightly noisier (possibly sub-optimal autotune choices); the kernels themselves still compute correct results. Expect one emission per autotuned fusion — 1000+ lines on a cold start is normal.
-- `'+ptxNN' is not a recognized feature for this target (ignoring feature)` (from LLVM NVPTX) — LLVM expresses CUDA capabilities as feature flags. The container's LLVM was built against CUDA 12.8 (PTX ISA ≤8.4); the host driver (580.x, CUDA 13.0) advertises PTX 8.5. When XLA asks LLVM to enable a newer PTX level, LLVM ignores the flag and falls back to a level it knows. Code still compiles and runs; only a handful of PTX 8.5–only instructions are unavailable. Negligible perf delta, zero correctness impact.
+- `'+ptxNN' is not a recognized feature for this target (ignoring feature)` (from LLVM NVPTX) — LLVM expresses CUDA capabilities as feature flags. The container's LLVM was built against CUDA 12.8 (PTX ISA ≤8.4); the host driver (595.x, CUDA 13.2) advertises PTX 8.5. When XLA asks LLVM to enable a newer PTX level, LLVM ignores the flag and falls back to a level it knows. Code still compiles and runs; only a handful of PTX 8.5–only instructions are unavailable. Negligible perf delta, zero correctness impact.
 
 Bumping `TF_CPP_MIN_LOG_LEVEL=2` in `aetherscan.def`'s `%environment` silences the first family but also suppresses other potentially useful warnings; the LLVM `+ptxNN` line goes straight to stderr and isn't gated by it. The default is to leave both alone.
 
@@ -210,6 +210,7 @@ If NGC 25.02 keeps misbehaving, escalate in this order:
 
 ## Cross-machine checkpoint interop
 
-`.keras` checkpoints written on Ampere load on Blackwell and vice versa (verified through verification step (f) in the original plan). The `Sampling` layer is now registered with `keras.saving.register_keras_serializable(package="aetherscan")` so `keras.models.load_model(...)` resolves it automatically without `custom_objects=`.
+`.keras` checkpoints written on Ampere load on Blackwell and vice versa. The `Sampling` layer is now registered with `keras.utils.register_keras_serializable(package="aetherscan")
+` so `keras.models.load_model(...)` resolves it automatically without `custom_objects=`.
 
 Legacy `.h5` checkpoints from pre-TF-2.16 training runs will NOT load — re-train or re-save to `.keras` first.
