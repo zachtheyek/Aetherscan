@@ -63,7 +63,7 @@ def _detect_num_replicas(args: argparse.Namespace) -> int:
 
 
 def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
-    """Return ``args.<arg_name>`` if present and not None, otherwise ``default`` (config value)."""
+    """Return `args.<arg_name>` if present and not None, otherwise `default` (the config value)."""
     val = getattr(args, arg_name, None)
     return val if val is not None else default
 
@@ -94,9 +94,11 @@ def _add_train_arguments(subparsers):
 
 
 def _add_train_flags_to(parser):
-    """Add all training-mode CLI flags to ``parser``. Pulled out of the subparser wrapper so
-    that utility scripts (e.g., utils/find_optimal_configs.py) can expose the same flag
-    surface without re-declaring every argument."""
+    """
+    Add all training-mode CLI flags to `parser`. Defined separately from the subparser wrapper
+    so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
+    surface without re-declaring every argument.
+    """
 
     # Path arguments (overrides environment variables)
     parser.add_argument(
@@ -507,9 +509,11 @@ def _add_inference_arguments(subparsers):
 
 
 def _add_inference_flags_to(parser):
-    """Add all inference-mode CLI flags to ``parser``. Pulled out of the subparser wrapper so
-    that utility scripts (e.g., utils/find_optimal_configs.py) can expose the same flag
-    surface without re-declaring every argument."""
+    """
+    Add all inference-mode CLI flags to `parser`. Defined separately from the subparser wrapper
+    so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
+    surface without re-declaring every argument.
+    """
 
     # Path arguments
     parser.add_argument(
@@ -949,10 +953,12 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
 
 
 def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> list[ValidationError]:
-    """Collect semantic & cross-param validation failures for the parsed CLI namespace, merging
-    args with config-defaults via :func:`_resolve`. Returns a list rather than raising so that
-    utility scripts (e.g. utils/find_optimal_configs.py) can post-process violations and propose
-    fixes. :func:`validate_args` is the thin wrapper that turns this list into a ValueError."""
+    """
+    Collect semantic and cross-param validation failures for the parsed CLI namespace, merging
+    args with config defaults via _resolve(). Returns a list rather than raising so utility
+    scripts (e.g. utils/find_optimal_configs.py) can post-process violations and propose fixes;
+    validate_args() is the thin wrapper that turns this list into a ValueError.
+    """
 
     init_config()
     config = get_config()
@@ -1605,11 +1611,11 @@ def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> li
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    """Run :func:`collect_validation_errors` and raise ValueError if any errors were found.
-
-    Pre-flight semantic/cross-parameter validation for the parsed CLI namespace, before
-    :func:`apply_args_to_config`. Syntax/type checks are handled earlier by argparse itself
-    in :meth:`ArgumentParser.parse_args` (called from main.py:main).
+    """
+    Pre-flight semantic and cross-parameter validation for the parsed CLI namespace, run before
+    apply_args_to_config(). Delegates to collect_validation_errors() and raises ValueError if
+    any failures came back. Syntax and type checks are handled earlier by argparse itself in
+    ArgumentParser.parse_args (called from main.py:main).
     """
     num_replicas = _detect_num_replicas(args)
     errors = collect_validation_errors(args, num_replicas)
