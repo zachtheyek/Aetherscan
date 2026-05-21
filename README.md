@@ -42,7 +42,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 - Ubuntu 24.04
 - ≥1x NVIDIA GPU:
   - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
-  - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.4) via CUDA forward compatibility
+  - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - ≥12 GB combined VRAM (training) / ≥9 GB combined VRAM (inference)
 - ≥150 GB RAM (training) / ≥100 GB RAM (inference)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
@@ -52,7 +52,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 
 - Ubuntu 24.04
 - ≥1x NVIDIA GPU:
-  - Ampere with CUDA 12.4+ driver
+  - Ampere with CUDA 12.3+ driver
 - VRAM / RAM same as above
 - Python 3.10 / TF 2.17 (managed by conda)
 

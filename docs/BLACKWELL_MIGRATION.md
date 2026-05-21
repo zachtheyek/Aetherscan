@@ -15,7 +15,7 @@ All paths run TF 2.17 with Keras 3 so `@tf.function` tracing, `.keras` checkpoin
 
 TensorFlow's prebuilt CUDA kernels target compute capabilities through sm_90. On Blackwell (sm_120) the JIT compiler tries to lower its baked-in PTX and fails with `CUDA_ERROR_INVALID_PTX` → `CUDA_ERROR_INVALID_HANDLE`. This is reproduced across TF 2.16–2.20 and tf-nightly.
 
-NVIDIA's NGC TensorFlow 25.02 container is the only published path that ships sm_120-ready kernels (and is officially the final NGC TF release). It bundles TF 2.17, CUDA 12.8, cuDNN 9.7.1, Python 3.12, and NCCL 2.25.1.
+NVIDIA's NGC TensorFlow 25.02 container is the only published path that ships sm_120-ready kernels (and is [officially the final NGC TF release](https://docs.nvidia.com/deeplearning/frameworks/tensorflow-release-notes/rel-25-02.html#:~:text=Deprecation%20notice%3A%20After%20the%2025.02%20release%2C%20NVIDIA%20Optimized%20TensorFlow%20containers%20will%20no%20longer%20be%20released.%20Known%20issues%20may%20be%20resolved%20in%20a%20future%20product%20based%20on%20customer%20demand.)). It bundles TF 2.17, CUDA 12.8, cuDNN 9.7.1, Python 3.12, and NCCL 2.25.1.
 
 ## Why the same container also works on Ampere
 
@@ -30,12 +30,12 @@ Forward compatibility is a CUDA feature, not a TF feature, so the same trick wil
 Aetherscan ships a single recipe — [`aetherscan.def`](../aetherscan.def) — that builds with either runtime. Build on the cluster you intend to run on so the image is produced by that cluster's native runtime:
 
 ```bash
-# Blackwell cluster (SingularityCE 4.1.1):
 cd /path/to/Aetherscan
+
+# Blackwell cluster (SingularityCE 4.1.1):
 singularity build aetherscan-ngc25.02.sif aetherscan.def
 
 # Ampere cluster (Apptainer 1.4.5):
-cd /path/to/Aetherscan
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
@@ -56,7 +56,7 @@ SingularityCE 4.x requires fakeroot mappings (or `proot`, or `--remote`) for non
 sudo singularity config fakeroot --add $USER
 ```
 
-Then build with `singularity build --fakeroot ...`. If admin help isn't available, build on a machine where you do have fakeroot (e.g. the Apptainer cluster, which usually has it pre-configured), then `scp` the resulting `.sif` over — the SIF format is portable between Apptainer and SingularityCE.
+Then build with `singularity build --fakeroot ...`. If admin help isn't available, build on a machine where you do have fakeroot (e.g. the Apptainer cluster, which usually has it pre-configured), then `scp` the resulting `.sif` over — the SIF format is usually portable between Apptainer and SingularityCE.
 
 **`FATAL: 'noexec' mount option set on /tmp, temporary root filesystem won't be usable at this location`**
 
