@@ -208,7 +208,7 @@ def _add_train_flags_to(parser):
         "--num-replicas",
         type=int,
         default=None,
-        help="Number of distributed-training replicas (=GPUs) to validate batch/sample divisibility against. If omitted, auto-detected from tf.config.list_physical_devices('GPU') (1 if no GPUs).",
+        help="Number of GPUs to use for the distributed-training strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1. Also drives batch/sample divisibility validation: a value greater than the GPUs actually present on the node will be caught at strategy-configuration time and abort the run.",
     )
 
     # Data configuration
@@ -552,7 +552,7 @@ def _add_inference_flags_to(parser):
         "--num-replicas",
         type=int,
         default=None,
-        help="Number of distributed-inference replicas (=GPUs) used for validating cross-replica constraints. If omitted, auto-detected from tf.config.list_physical_devices('GPU') (1 if no GPUs).",
+        help="Number of GPUs to use for the distributed-inference strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1. Also drives cross-replica validation: a value greater than the GPUs actually present on the node will be caught at strategy-configuration time and abort the run.",
     )
 
     # Data configuration
@@ -757,6 +757,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # guard preserves the config default when the user passes neither
     if hasattr(args, "async_allocator") and args.async_allocator is not None:
         config.gpu.use_async_allocator = args.async_allocator
+    if hasattr(args, "num_replicas") and args.num_replicas is not None:
+        config.gpu.num_replicas = args.num_replicas
 
     # Data configuration
     if hasattr(args, "num_observations") and args.num_observations is not None:
@@ -964,6 +966,24 @@ def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> li
     config = get_config()
     cmd = getattr(args, "command", None)
     errors: list[ValidationError] = []
+
+    # -----------------------------------------------------------------------
+    # COMMON CHECKS (apply regardless of subcommand)
+    # -----------------------------------------------------------------------
+    # --num-replicas must be a positive int (or omitted). 0/negative would silently divide
+    # batch sizes by 0 below and is meaningless at strategy-construction time. Omit the
+    # flag (or set config.gpu.num_replicas=None) to use every available GPU.
+    nr_arg = getattr(args, "num_replicas", None)
+    if nr_arg is not None and nr_arg <= 0:
+        errors.append(
+            ValidationError(
+                field="gpu.num_replicas",
+                current=nr_arg,
+                message=f"--num-replicas must be >= 1 (or omitted to use all available GPUs), got {nr_arg}",
+                fix_kind="clamp_low",
+                min_val=1,
+            )
+        )
 
     # -----------------------------------------------------------------------
     # TRAINING-MODE CHECKS (only meaningful when the train subparser is active)

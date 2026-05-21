@@ -101,6 +101,13 @@ class GPUConfig:
     per_gpu_memory_limit_mb: int | None = None
     nccl_num_packs: int = 2
     use_async_allocator: bool = True
+    # If None, the strategy uses every GPU visible to TF. If set to a positive int N, the
+    # strategy is restricted to the first N physical GPUs (the rest are left untouched for
+    # other workloads on the node). Validated against batch/sample divisibility in cli.py
+    # before being applied; runtime mismatch (N > available GPUs) aborts in
+    # setup_gpu_strategy rather than silently downgrading, so we never propagate batch
+    # sizes that were validated against a different replica count.
+    num_replicas: int | None = None
 
 
 # TODO: make sure the entire pipeline respects DataConfig() values, instead of hard coding
@@ -483,6 +490,7 @@ class Config:
                 "per_gpu_memory_limit_mb": self.gpu.per_gpu_memory_limit_mb,
                 "nccl_num_packs": self.gpu.nccl_num_packs,
                 "use_async_allocator": self.gpu.use_async_allocator,
+                "num_replicas": self.gpu.num_replicas,
             },
             "data": {
                 "num_observations": self.data.num_observations,
