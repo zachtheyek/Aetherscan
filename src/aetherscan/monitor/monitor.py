@@ -540,13 +540,25 @@ class ResourceMonitor:
             for gpu_idx, (gpu_name, metrics) in enumerate(gpu_data.items()):
                 color = colors[gpu_idx]
 
+                # Truncate overly long GPU names (e.g., "NVIDIA RTX PRO 6000
+                # Blackwell Max-Q Workstation Edition") while preserving the
+                # ":<idx>" suffix appended by _collect_gpu_info().
+                # NOTE: cutoff is hard-coded to 20 chars — GPU name parts
+                # longer than this get truncated to 19 chars + "...".
+                # Revisit if this threshold becomes an issue.
+                name_part, sep, idx_part = gpu_name.rpartition(":")
+                if sep and len(name_part) > 20:
+                    display_name = f"{name_part[:19]}...:{idx_part}"
+                else:
+                    display_name = gpu_name
+
                 # Usage (solid line, y1)
                 if "utilization" in metrics:
                     timestamps, values = metrics["utilization"]
                     ax_gpu.plot(
                         timestamps,
                         values,
-                        label=f"{gpu_name} (Usage)",
+                        label=f"{display_name} (Usage)",
                         color=color,
                         linewidth=1.5,
                         alpha=0.9,
@@ -558,7 +570,7 @@ class ResourceMonitor:
                     ax_gpu_mem.plot(
                         timestamps,
                         values,
-                        label=f"{gpu_name} (Memory)",
+                        label=f"{display_name} (Memory)",
                         color=color,
                         linewidth=1.5,
                         alpha=0.6,
