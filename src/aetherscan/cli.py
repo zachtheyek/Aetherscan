@@ -32,23 +32,30 @@ def setup_argument_parser() -> argparse.ArgumentParser:
 
 # TODO: update descriptions
 def _add_train_arguments(subparsers):
-    """Add training command arguments to subparser"""
+    """Register the `train` subcommand and populate it with all training-mode flags."""
     train_parser = subparsers.add_parser("train", help="Execute training pipeline")
+    _add_train_flags_to(train_parser)
+
+
+def _add_train_flags_to(parser):
+    """Add all training-mode CLI flags to ``parser``. Pulled out of the subparser wrapper so
+    that utility scripts (e.g., utils/find_optimal_configs.py) can expose the same flag
+    surface without re-declaring every argument."""
 
     # Path arguments (overrides environment variables)
-    train_parser.add_argument(
+    parser.add_argument(
         "--data-path",
         type=str,
         default=None,
         help="Path to data directory (overrides AETHERSCAN_DATA_PATH environment variable)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--model-path",
         type=str,
         default=None,
         help="Path to model directory (overrides AETHERSCAN_MODEL_PATH environment variable)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -56,32 +63,32 @@ def _add_train_arguments(subparsers):
     )
 
     # BetaVAE model configuration
-    train_parser.add_argument(
+    parser.add_argument(
         "--vae-latent-dim",
         type=int,
         default=None,
         help="Dimensionality of the VAE latent space (bottleneck size)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--vae-dense-layer-size",
         type=int,
         default=None,
         help="Size of dense layer in VAE architecture (should match frequency bins after downsampling)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--vae-kernel-size",
         type=int,
         nargs=2,
         default=None,
         help="Kernel size for Conv2D layers as two integers (e.g., --vae-kernel-size 3 3)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--vae-beta",
         type=float,
         default=None,
         help="Beta coefficient for KL divergence loss term in beta-VAE (controls disentanglement)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--vae-alpha",
         type=float,
         default=None,
@@ -89,31 +96,31 @@ def _add_train_arguments(subparsers):
     )
 
     # Random Forest configuration
-    train_parser.add_argument(
+    parser.add_argument(
         "--rf-n-estimators",
         type=int,
         default=None,
         help="Number of decision trees in the random forest ensemble",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--rf-bootstrap",
         type=lambda x: x.lower() in ("true", "1", "yes"),
         default=None,
         help="Whether to use bootstrap sampling when building trees (enables bagging)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--rf-max-features",
         type=str,
         default=None,
         help="Number of features to consider for splits: 'sqrt', 'log2', or a float (fraction of features)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--rf-n-jobs",
         type=int,
         default=None,
         help="Number of parallel jobs for random forest training (-1 uses all CPU cores)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--rf-seed",
         type=int,
         default=None,
@@ -121,81 +128,87 @@ def _add_train_arguments(subparsers):
     )
 
     # GPU configuration
-    train_parser.add_argument(
+    parser.add_argument(
         "--gpu-memory-limit-mb",
         type=int,
         default=None,
         help="Per-GPU memory cap in MiB. Omit to use memory-growth-only (recommended on Blackwell). Set for TF to allocate a fixed logical device of a given size per physical GPU (e.g. 14000)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--nccl-num-packs",
         type=int,
         default=None,
         help="num_packs for NCCL/HierarchicalCopy all-reduce. Lower values (e.g. 1) reduces tiny-tensor latency; higher values (e.g. >=4) can help bandwidth on >4-GPU topologies.",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--async-allocator",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
     )
+    parser.add_argument(
+        "--num-replicas",
+        type=int,
+        default=None,
+        help="Number of distributed-training replicas (=GPUs) to validate batch/sample divisibility against. If omitted, auto-detected from tf.config.list_physical_devices('GPU') (1 if no GPUs).",
+    )
 
     # Data configuration
-    train_parser.add_argument(
+    parser.add_argument(
         "--num-observations",
         type=int,
         default=None,
         help="Number of observations per cadence snippet (e.g., 6 for 3 ON + 3 OFF)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--width-bin",
         type=int,
         default=None,
         help="Number of frequency bins per observation (spectral resolution)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--downsample-factor",
         type=int,
         default=None,
         help="Downsampling factor for frequency bins (reduces spectral dimension)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--time-bins",
         type=int,
         default=None,
         help="Number of time bins per observation (temporal resolution)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--freq-resolution",
         type=float,
         default=None,
         help="Frequency resolution in Hz (determined by instrument)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--time-resolution",
         type=float,
         default=None,
         help="Time resolution in seconds (determined by instrument)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--num-target-backgrounds",
         type=int,
         default=None,
         help="Number of background (noise-only) cadences to load for training data generation",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--background-load-chunk-size",
         type=int,
         default=None,
         help="Maximum number of background cadences to process at once during loading (memory management)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--max-chunks-per-file",
         type=int,
         default=None,
         help="Maximum number of chunks to load from a single data file (limits per-file contribution)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--train-files",
         type=str,
         nargs="+",
@@ -204,199 +217,199 @@ def _add_train_arguments(subparsers):
     )
 
     # Training configuration
-    train_parser.add_argument(
+    parser.add_argument(
         "--num-training-rounds",
         type=int,
         default=None,
         help="Total number of training rounds in curriculum learning schedule",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--epochs-per-round",
         type=int,
         default=None,
         help="Number of epochs to train the VAE per curriculum learning round",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--num-samples-beta-vae",
         type=int,
         default=None,
         # NOTE: divisible by 4 or num_replicas?
         help="Number of training samples to generate for beta-VAE per round (must be divisible by 4)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--num-samples-rf",
         type=int,
         default=None,
         # NOTE: divisible by 4 or num_replicas?
         help="Number of training samples to generate for random forest (must be divisible by 4)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--train-val-split",
         type=float,
         default=None,
         help="Fraction of data to use for training vs validation (e.g., 0.8 = 80%% train, 20%% val)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--per-replica-batch-size",
         type=int,
         default=None,
         help="Batch size per GPU/device replica during training",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--effective-batch-size",
         type=int,
         default=None,
         help="Effective batch size for gradient accumulation across all replicas",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--per-replica-val-batch-size",
         type=int,
         default=None,
         help="Batch size per GPU/device replica during validation",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--signal-injection-chunk-size",
         type=int,
         default=None,
         # NOTE: divisible by 4 or num_replicas?
         help="Maximum cadences to process at once during synthetic signal injection (must be divisible by 4)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--plot-injection-subsampling-count",
         type=int,
         default=None,
         help="Max points per stat name, per signal type, for A→B intensity bias scatter plots. Outliers are prioritized, with the difference made up from randomly sampling without replacement the remaining points",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--plot-injection-outlier-percentile",
         type=float,
         default=None,
         help="Threshold for points to always be included in A→B intensity bias scatter plots",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-num-cadences-per-type",
         type=int,
         default=None,
         help="Number of cadences per signal type for latent space visualization batch (total points = 4× this value × 6 observations per cadence)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-step-interval",
         type=int,
         default=None,
         help="Capture a latent space snapshot every N training steps (lower = more snapshots, more DB writes, and larger storage costs)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-umap-fit-max-samples",
         type=int,
         default=None,
         help="Maximum number of pooled latent vectors used to fit the UMAP model (remaining vectors are projected via transform; lower = faster, higher = more faithful embedding)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-umap-n-neighbors",
         type=int,
         nargs="+",
         default=None,
         help="UMAP n_neighbors values to sweep for latent space visualization (e.g., --latent-viz-umap-n-neighbors 5 15 30 50)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-umap-min-dist",
         type=float,
         nargs="+",
         default=None,
         help="UMAP min_dist values to sweep for latent space visualization (e.g., --latent-viz-umap-min-dist 0.0 0.1 0.5)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-gif-max-frames",
         type=int,
         default=None,
         help="Maximum number of frames in latent space GIF output (snapshots beyond this limit are log-subsampled, prioritizing earlier training steps)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--latent-viz-gif-duration-ms",
         type=int,
         default=None,
         help="Milliseconds per frame in latent space GIF output",
     )
 
-    train_parser.add_argument(
+    parser.add_argument(
         "--snr-base",
         type=int,
         default=None,
         help="Base signal-to-noise ratio for curriculum learning (minimum SNR difficulty level)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--initial-snr-range",
         type=int,
         default=None,
         help="SNR range for initial (easiest) training rounds (signals sampled from snr_base to snr_base + initial_snr_range)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--final-snr-range",
         type=int,
         default=None,
         help="SNR range for final (hardest) training rounds (signals sampled from snr_base to snr_base + final_snr_range). Ignored if only training for 1 round",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--curriculum-schedule",
         type=str,
         default=None,
         help="Curriculum difficulty progression schedule: 'linear', 'exponential', or 'step'",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--exponential-decay-rate",
         type=float,
         default=None,
         help="Decay rate for exponential curriculum schedule (must be negative; more negative = faster difficulty increase)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--step-easy-rounds",
         type=int,
         default=None,
         help="Number of rounds with easy signals when using step curriculum schedule",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--step-hard-rounds",
         type=int,
         default=None,
         help="Number of rounds with hard signals when using step curriculum schedule",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--base-learning-rate",
         type=float,
         default=None,
         help="Initial learning rate for Adam optimizer",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--min-learning-rate",
         type=float,
         default=None,
         help="Learning rate floor for adaptive learning rate reduction",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--min-pct-improvement",
         type=float,
         default=None,
         help="Minimum fractional validation loss improvement to avoid LR reduction (e.g., 0.001 = 0.1%%)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--patience-threshold",
         type=int,
         default=None,
         help="Number of consecutive epochs without minimum improvement before reducing learning rate",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--lr-reduction-factor",
         type=float,
         default=None,
         help="Multiplicative factor for learning rate reduction (e.g., 0.2 reduces LR by 20%%)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=None,
         help="Maximum number of retry attempts when training fails due to errors",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--retry-delay",
         type=int,
         default=None,
@@ -404,25 +417,25 @@ def _add_train_arguments(subparsers):
     )
 
     # Checkpoint configuration
-    train_parser.add_argument(
+    parser.add_argument(
         "--load-dir",
         type=str,
         default=None,
         help="Subdirectory for checkpoint loading (relative to --model-path)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--load-tag",
         type=str,
         default=None,
         help="Model tag for checkpoint loading. Accepted formats: final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX. If round_XX format used, and --start-round not specified, training will resume from round following loaded checkpoint (i.e., XX + 1)",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--start-round",
         type=int,
         default=None,
         help="Round to begin/resume training from",
     )
-    train_parser.add_argument(
+    parser.add_argument(
         "--save-tag",
         type=str,
         default=None,
@@ -432,23 +445,30 @@ def _add_train_arguments(subparsers):
 
 # TODO: update descriptions
 def _add_inference_arguments(subparsers):
-    """Add inference command arguments to subparser"""
+    """Register the `inference` subcommand and populate it with all inference-mode flags."""
     inf_parser = subparsers.add_parser("inference", help="Execute inference pipeline")
+    _add_inference_flags_to(inf_parser)
+
+
+def _add_inference_flags_to(parser):
+    """Add all inference-mode CLI flags to ``parser``. Pulled out of the subparser wrapper so
+    that utility scripts (e.g., utils/find_optimal_configs.py) can expose the same flag
+    surface without re-declaring every argument."""
 
     # Path arguments
-    inf_parser.add_argument(
+    parser.add_argument(
         "--data-path",
         type=str,
         default=None,
         help="Path to data directory (overrides AETHERSCAN_DATA_PATH environment variable)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--model-path",
         type=str,
         default=None,
         help="Path to model directory (overrides AETHERSCAN_MODEL_PATH environment variable)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -456,28 +476,34 @@ def _add_inference_arguments(subparsers):
     )
 
     # GPU configuration
-    inf_parser.add_argument(
+    parser.add_argument(
         "--gpu-memory-limit-mb",
         type=int,
         default=None,
         help="Per-GPU memory cap in MiB. Omit to use memory-growth-only (recommended on Blackwell). Set for TF to allocate a fixed logical device of a given size per physical GPU (e.g. 14000)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--async-allocator",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
     )
+    parser.add_argument(
+        "--num-replicas",
+        type=int,
+        default=None,
+        help="Number of distributed-inference replicas (=GPUs) used for validating cross-replica constraints. If omitted, auto-detected from tf.config.list_physical_devices('GPU') (1 if no GPUs).",
+    )
 
     # Data configuration
-    inf_parser.add_argument(
+    parser.add_argument(
         "--test-files",
         type=str,
         nargs="+",
         default=None,
         help="Space-separated list of testing data file names (e.g., real_filtered_LARGE_test_HIP15638.npy)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--inference-files",
         type=str,
         nargs="+",
@@ -486,31 +512,31 @@ def _add_inference_arguments(subparsers):
     )
 
     # Inference configuration
-    inf_parser.add_argument(
+    parser.add_argument(
         "--encoder-path",
         type=str,
         default=None,
         help="Path to trained VAE encoder model file (.keras)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--rf-path",
         type=str,
         default=None,
         help="Path to trained Random Forest model file (.joblib)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--config-path",
         type=str,
         default=None,
         help="Path to config file from corresponding training run (.json)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--per-replica-batch-size",
         type=int,
         default=None,
         help="Batch size per GPU/device replica during inference",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--classification-threshold",
         type=float,
         default=None,
@@ -518,92 +544,92 @@ def _add_inference_arguments(subparsers):
     )
 
     # Energy detection preprocessing
-    inf_parser.add_argument(
+    parser.add_argument(
         "--cadence-group-by-cols",
         type=str,
         nargs="+",
         default=None,
         help="Space-separated list of CSV column names whose joint value defines cadence membership (e.g., Target Session Band 'Cadence ID' Frequency)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--cadence-h5-path-col",
         type=str,
         default=None,
         help="CSV column containing the .h5 file path for each observation (default: '.h5 path')",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--cadence-expected-obs",
         type=int,
         default=None,
         help="Required number of observations per cadence (default: 6 for ABACAD)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--coarse-channel-width",
         type=int,
         default=None,
         help="Number of fine channels per coarse channel (default: 1048576)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--parallel-coarse-chans",
         type=int,
         default=None,
         help="Number of coarse channels to process in parallel per block (default: 28)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--spline-order",
         type=int,
         default=None,
         help="Spline order for bandpass fitting (default: 16)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--detection-window-size",
         type=int,
         default=None,
         help="Sliding window size in fine channels for normality test (default: 256)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--detection-step-size",
         type=int,
         default=None,
         help="Step size in fine channels for sliding window (default: 128)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--stat-threshold",
         type=float,
         default=None,
         help="D'Agostino-Pearson statistic threshold for hit detection (default: 2048.0)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--stamp-width",
         type=int,
         default=None,
         help="Width in fine channels of the extracted stamp around each hit (default: 4096; must equal --width-bin)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--overlap-search",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Additionally extract stamps offset by ±overlap_fraction*stamp_width around each hit. Pass --no-overlap-search to disable when the config default is True.",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--overlap-fraction",
         type=float,
         default=None,
         help="Fractional offset (relative to stamp_width) for overlap-search stamps (default: 0.5)",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--preprocess-output-dir",
         type=str,
         default=None,
         help="Directory for per-cadence .npy outputs from preprocessing",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=None,
         help="Maximum number of retry attempts for inference (including preprocessing) on failure",
     )
-    inf_parser.add_argument(
+    parser.add_argument(
         "--retry-delay",
         type=int,
         default=None,
@@ -611,7 +637,7 @@ def _add_inference_arguments(subparsers):
     )
 
     # Checkpoint configuration
-    inf_parser.add_argument(
+    parser.add_argument(
         "--save-tag",
         type=str,
         default=None,
