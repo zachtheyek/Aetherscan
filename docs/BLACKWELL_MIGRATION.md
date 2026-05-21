@@ -214,3 +214,7 @@ If NGC 25.02 keeps misbehaving, escalate in this order:
 ` so `keras.models.load_model(...)` resolves it automatically without `custom_objects=`.
 
 Legacy `.h5` checkpoints from pre-TF-2.16 training runs will NOT load — re-train or re-save to `.keras` first.
+
+## Additional resources
+
+- [TensorFlow-CUDA compatibility matrix](https://www.tensorflow.org/install/source#gpu)
