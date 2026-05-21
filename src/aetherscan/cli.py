@@ -6,10 +6,66 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any
 
-from aetherscan.config import get_config
+from aetherscan.config import get_config, init_config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Validation primitives shared by validate_args() and utility scripts
+# ---------------------------------------------------------------------------
+
+# Accepted formats for --load-tag and --save-tag (cli.py help strings document these)
+_TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
+
+# sklearn's RandomForestClassifier accepts these string values for max_features
+_RF_MAX_FEATURES_STR_VALUES = {"sqrt", "log2"}
+
+# Allowed curriculum schedules (--curriculum-schedule help mentions linear/exponential/step)
+_CURRICULUM_SCHEDULES = {"linear", "exponential", "step"}
+
+
+@dataclass
+class ValidationError:
+    """A single validation failure with enough structure for utility scripts to propose fixes."""
+
+    field: str  # e.g. "training.effective_batch_size"
+    current: Any
+    message: str
+    fix_kind: str  # one of: clamp_low, clamp_high, range, enum, divisibility, file_exists, cross_param, format
+    min_val: Any = None
+    max_val: Any = None
+    allowed: Any = None
+    divisor: Any = None
+    extra: dict = field(default_factory=dict)
+
+
+def _detect_num_replicas(args: argparse.Namespace) -> int:
+    """Return num_replicas from args if provided, else auto-detect via TF GPU count, else 1."""
+    val = getattr(args, "num_replicas", None)
+    if val is not None:
+        return int(val)
+    try:
+        # Lazy import: validate_args() is called early in main() and we don't want to force
+        # the full TF init for CLI parsing failures or for utility scripts that only need
+        # the validation surface.
+        import tensorflow as tf  # noqa: PLC0415
+
+        gpus = tf.config.list_physical_devices("GPU")
+        return max(len(gpus), 1)
+    except Exception:
+        return 1
+
+
+def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
+    """Return ``args.<arg_name>`` if present and not None, otherwise ``default`` (config value)."""
+    val = getattr(args, arg_name, None)
+    return val if val is not None else default
 
 
 def setup_argument_parser() -> argparse.ArgumentParser:
@@ -892,113 +948,672 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.retry_delay = args.retry_delay
 
 
-# NOTE: should we change validate_args() to validate_config() and run the tests on the final "applied" config singleton? or should we check both separately?
+def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> list[ValidationError]:
+    """Collect semantic & cross-param validation failures for the parsed CLI namespace, merging
+    args with config-defaults via :func:`_resolve`. Returns a list rather than raising so that
+    utility scripts (e.g. utils/find_optimal_configs.py) can post-process violations and propose
+    fixes. :func:`validate_args` is the thin wrapper that turns this list into a ValueError."""
+
+    init_config()
+    config = get_config()
+    cmd = getattr(args, "command", None)
+    errors: list[ValidationError] = []
+
+    # -----------------------------------------------------------------------
+    # TRAINING-MODE CHECKS (only meaningful when the train subparser is active)
+    # -----------------------------------------------------------------------
+    if cmd == "train" or hasattr(args, "num_samples_beta_vae"):
+        # ----- Divisibility-by-4 (balanced class generation) -----
+        sic = _resolve(
+            args, "signal_injection_chunk_size", config.training.signal_injection_chunk_size
+        )
+        if sic is not None and sic % 4 != 0:
+            errors.append(
+                ValidationError(
+                    field="training.signal_injection_chunk_size",
+                    current=sic,
+                    message=f"--signal-injection-chunk-size must be divisible by 4 for balanced class generation, got {sic}",
+                    fix_kind="divisibility",
+                    divisor=4,
+                )
+            )
+
+        nsb = _resolve(args, "num_samples_beta_vae", config.training.num_samples_beta_vae)
+        if nsb is not None and nsb % 4 != 0:
+            errors.append(
+                ValidationError(
+                    field="training.num_samples_beta_vae",
+                    current=nsb,
+                    message=f"--num-samples-beta-vae must be divisible by 4 for balanced class generation, got {nsb}",
+                    fix_kind="divisibility",
+                    divisor=4,
+                )
+            )
+
+        nsr = _resolve(args, "num_samples_rf", config.training.num_samples_rf)
+        if nsr is not None and nsr % 4 != 0:
+            errors.append(
+                ValidationError(
+                    field="training.num_samples_rf",
+                    current=nsr,
+                    message=f"--num-samples-rf must be divisible by 4 for balanced class generation, got {nsr}",
+                    fix_kind="divisibility",
+                    divisor=4,
+                )
+            )
+        if nsr is not None and nsr % 2 != 0:
+            errors.append(
+                ValidationError(
+                    field="training.num_samples_rf",
+                    current=nsr,
+                    message=f"--num-samples-rf must be divisible by 2 for generate_triplet_batch, got {nsr}",
+                    fix_kind="divisibility",
+                    divisor=2,
+                )
+            )
+
+        # ----- Format / enum checks -----
+        rfmf = _resolve(args, "rf_max_features", config.rf.max_features)
+        if rfmf is not None and not (
+            rfmf in _RF_MAX_FEATURES_STR_VALUES or isinstance(rfmf, (int, float))
+        ):
+            errors.append(
+                ValidationError(
+                    field="rf.max_features",
+                    current=rfmf,
+                    message=f"--rf-max-features must be one of {sorted(_RF_MAX_FEATURES_STR_VALUES)} or a number, got {rfmf!r}",
+                    fix_kind="enum",
+                    allowed=sorted(_RF_MAX_FEATURES_STR_VALUES),
+                )
+            )
+
+        cs = _resolve(args, "curriculum_schedule", config.training.curriculum_schedule)
+        if cs is not None and cs not in _CURRICULUM_SCHEDULES:
+            errors.append(
+                ValidationError(
+                    field="training.curriculum_schedule",
+                    current=cs,
+                    message=f"--curriculum-schedule must be one of {sorted(_CURRICULUM_SCHEDULES)}, got {cs!r}",
+                    fix_kind="enum",
+                    allowed=sorted(_CURRICULUM_SCHEDULES),
+                )
+            )
+
+        load_tag = _resolve(args, "load_tag", config.checkpoint.load_tag)
+        if load_tag is not None and not _TAG_PATTERN.match(load_tag):
+            errors.append(
+                ValidationError(
+                    field="checkpoint.load_tag",
+                    current=load_tag,
+                    message=f"--load-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {load_tag!r}",
+                    fix_kind="format",
+                )
+            )
+
+        save_tag = _resolve(args, "save_tag", config.checkpoint.save_tag)
+        if save_tag is not None and not _TAG_PATTERN.match(save_tag):
+            errors.append(
+                ValidationError(
+                    field="checkpoint.save_tag",
+                    current=save_tag,
+                    message=f"--save-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {save_tag!r}",
+                    fix_kind="format",
+                )
+            )
+        # Deferred: save_tag uniqueness check requires the DB (init_db runs after validate_args).
+        # Deferred: time_bin & width_bin must match data shape — requires loading actual data files;
+        # validated at runtime by the data loader instead of here.
+
+        # ----- VAE architecture constraint -----
+        wb = _resolve(args, "width_bin", config.data.width_bin)
+        df = _resolve(args, "downsample_factor", config.data.downsample_factor)
+        vds = _resolve(args, "vae_dense_layer_size", config.beta_vae.dense_layer_size)
+        if wb and df and vds is not None:
+            expected = wb // df
+            if vds != expected:
+                errors.append(
+                    ValidationError(
+                        field="beta_vae.dense_layer_size",
+                        current=vds,
+                        message=f"--vae-dense-layer-size ({vds}) must equal width_bin // downsample_factor ({wb} // {df} = {expected})",
+                        fix_kind="range",
+                        min_val=expected,
+                        max_val=expected,
+                    )
+                )
+
+        # ----- RF n_jobs bounds -----
+        rfj = _resolve(args, "rf_n_jobs", config.rf.n_jobs)
+        n_cores = os.cpu_count() or 1
+        if rfj is not None and not (-1 <= rfj <= n_cores):
+            errors.append(
+                ValidationError(
+                    field="rf.n_jobs",
+                    current=rfj,
+                    message=f"--rf-n-jobs must satisfy -1 <= n_jobs <= cpu_count ({n_cores}), got {rfj}",
+                    fix_kind="range",
+                    min_val=-1,
+                    max_val=n_cores,
+                )
+            )
+
+        # ----- File existence: training files -----
+        data_path = _resolve(args, "data_path", config.data_path)
+        train_files = _resolve(args, "train_files", config.data.train_files) or []
+        for f in train_files:
+            full = os.path.join(data_path, f)
+            if not os.path.exists(full):
+                errors.append(
+                    ValidationError(
+                        field="data.train_files",
+                        current=f,
+                        message=f"--train-files: file does not exist on disk: {full}",
+                        fix_kind="file_exists",
+                    )
+                )
+
+        # ----- train_val_split bounds -----
+        tvs = _resolve(args, "train_val_split", config.training.train_val_split)
+        if tvs is not None and not (0 <= tvs <= 1):
+            errors.append(
+                ValidationError(
+                    field="training.train_val_split",
+                    current=tvs,
+                    message=f"--train-val-split must satisfy 0 <= split <= 1, got {tvs}",
+                    fix_kind="range",
+                    min_val=0.0,
+                    max_val=1.0,
+                )
+            )
+
+        # ----- SNR sanity -----
+        snr_base = _resolve(args, "snr_base", config.training.snr_base)
+        snr_init = _resolve(args, "initial_snr_range", config.training.initial_snr_range)
+        snr_fin = _resolve(args, "final_snr_range", config.training.final_snr_range)
+        if snr_base is not None and snr_base <= 0:
+            errors.append(
+                ValidationError(
+                    field="training.snr_base",
+                    current=snr_base,
+                    message=f"--snr-base must be > 0, got {snr_base}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        if snr_init is not None and snr_init <= 0:
+            errors.append(
+                ValidationError(
+                    field="training.initial_snr_range",
+                    current=snr_init,
+                    message=f"--initial-snr-range must be > 0, got {snr_init}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        if snr_fin is not None and snr_fin <= 0:
+            errors.append(
+                ValidationError(
+                    field="training.final_snr_range",
+                    current=snr_fin,
+                    message=f"--final-snr-range must be > 0, got {snr_fin}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        if snr_init is not None and snr_fin is not None and snr_init < snr_fin:
+            errors.append(
+                ValidationError(
+                    field="training.initial_snr_range",
+                    current=snr_init,
+                    message=f"--initial-snr-range ({snr_init}) must be >= --final-snr-range ({snr_fin}) — curriculum schedules from easy to hard",
+                    fix_kind="clamp_low",
+                    min_val=snr_fin,
+                )
+            )
+
+        # ----- Curriculum learning -----
+        edr = _resolve(args, "exponential_decay_rate", config.training.exponential_decay_rate)
+        if edr is not None and edr >= 0:
+            errors.append(
+                ValidationError(
+                    field="training.exponential_decay_rate",
+                    current=edr,
+                    message=f"--exponential-decay-rate must be < 0 (more negative = faster difficulty ramp), got {edr}",
+                    fix_kind="clamp_high",
+                    max_val=-0.01,
+                )
+            )
+
+        ntr = _resolve(args, "num_training_rounds", config.training.num_training_rounds)
+        ser = _resolve(args, "step_easy_rounds", config.training.step_easy_rounds)
+        shr = _resolve(args, "step_hard_rounds", config.training.step_hard_rounds)
+        if ntr is not None and ser is not None and not (0 <= ser <= ntr):
+            errors.append(
+                ValidationError(
+                    field="training.step_easy_rounds",
+                    current=ser,
+                    message=f"--step-easy-rounds must satisfy 0 <= rounds <= num_training_rounds ({ntr}), got {ser}",
+                    fix_kind="range",
+                    min_val=0,
+                    max_val=ntr,
+                )
+            )
+        if ntr is not None and shr is not None and not (0 <= shr <= ntr):
+            errors.append(
+                ValidationError(
+                    field="training.step_hard_rounds",
+                    current=shr,
+                    message=f"--step-hard-rounds must satisfy 0 <= rounds <= num_training_rounds ({ntr}), got {shr}",
+                    fix_kind="range",
+                    min_val=0,
+                    max_val=ntr,
+                )
+            )
+        # step_easy + step_hard only need to sum to num_training_rounds when step schedule is selected
+        if (
+            cs == "step"
+            and ntr is not None
+            and ser is not None
+            and shr is not None
+            and ser + shr != ntr
+        ):
+            errors.append(
+                ValidationError(
+                    field="training.step_easy_rounds",
+                    current=ser,
+                    message=f"--step-easy-rounds + --step-hard-rounds ({ser} + {shr} = {ser + shr}) must equal --num-training-rounds ({ntr}) when curriculum_schedule=step",
+                    fix_kind="cross_param",
+                    extra={"step_hard_rounds": shr, "num_training_rounds": ntr},
+                )
+            )
+
+        # ----- Learning rate / patience / retries -----
+        blr = _resolve(args, "base_learning_rate", config.training.base_learning_rate)
+        mlr = _resolve(args, "min_learning_rate", config.training.min_learning_rate)
+        if blr is not None and mlr is not None and blr < mlr:
+            errors.append(
+                ValidationError(
+                    field="training.base_learning_rate",
+                    current=blr,
+                    message=f"--base-learning-rate ({blr}) must be >= --min-learning-rate ({mlr})",
+                    fix_kind="clamp_low",
+                    min_val=mlr,
+                )
+            )
+        mpi = _resolve(args, "min_pct_improvement", config.training.min_pct_improvement)
+        if mpi is not None and mpi < 0:
+            errors.append(
+                ValidationError(
+                    field="training.min_pct_improvement",
+                    current=mpi,
+                    message=f"--min-pct-improvement must be >= 0, got {mpi}",
+                    fix_kind="clamp_low",
+                    min_val=0.0,
+                )
+            )
+        pt = _resolve(args, "patience_threshold", config.training.patience_threshold)
+        if pt is not None and pt < 1:
+            errors.append(
+                ValidationError(
+                    field="training.patience_threshold",
+                    current=pt,
+                    message=f"--patience-threshold must be >= 1 (must wait at least one epoch before reducing LR), got {pt}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        lrf = _resolve(args, "lr_reduction_factor", config.training.reduction_factor)
+        if lrf is not None and not (0 < lrf < 1):
+            errors.append(
+                ValidationError(
+                    field="training.reduction_factor",
+                    current=lrf,
+                    message=f"--lr-reduction-factor must satisfy 0 < factor < 1 (it's a reduction multiplier), got {lrf}",
+                    fix_kind="range",
+                    min_val=0.01,
+                    max_val=0.99,
+                )
+            )
+        # max_retries / retry_delay (training-scoped)
+        if cmd == "train":
+            mr = _resolve(args, "max_retries", config.training.max_retries)
+            if mr is not None and mr < 0:
+                errors.append(
+                    ValidationError(
+                        field="training.max_retries",
+                        current=mr,
+                        message=f"--max-retries must be >= 0, got {mr}",
+                        fix_kind="clamp_low",
+                        min_val=0,
+                    )
+                )
+            rd = _resolve(args, "retry_delay", config.training.retry_delay)
+            if rd is not None and rd < 0:
+                errors.append(
+                    ValidationError(
+                        field="training.retry_delay",
+                        current=rd,
+                        message=f"--retry-delay must be >= 0, got {rd}",
+                        fix_kind="clamp_low",
+                        min_val=0,
+                    )
+                )
+
+        # ----- Checkpoint start_round -----
+        sr = _resolve(args, "start_round", config.checkpoint.start_round)
+        if sr is not None and ntr is not None and not (1 <= sr <= ntr):
+            errors.append(
+                ValidationError(
+                    field="checkpoint.start_round",
+                    current=sr,
+                    message=f"--start-round must satisfy 1 <= round <= num_training_rounds ({ntr}), got {sr}",
+                    fix_kind="range",
+                    min_val=1,
+                    max_val=ntr,
+                )
+            )
+
+        # ----- Cross-replica batch / sample constraints (need num_replicas) -----
+        prb = _resolve(args, "per_replica_batch_size", config.training.per_replica_batch_size)
+        eb = _resolve(args, "effective_batch_size", config.training.effective_batch_size)
+        prvb = _resolve(
+            args, "per_replica_val_batch_size", config.training.per_replica_val_batch_size
+        )
+        lvc = _resolve(
+            args,
+            "latent_viz_num_cadences_per_type",
+            config.training.latent_viz_num_cadences_per_type,
+        )
+
+        if all(v is not None for v in (prb, eb, prvb, lvc, nsb, nsr, tvs)) and num_replicas >= 1:
+            train_samples = nsb * tvs
+            val_samples = nsb * (1 - tvs)
+            global_train_batch = prb * num_replicas
+            global_val_batch = prvb * num_replicas
+            latent_total = lvc * 4
+
+            if not (global_train_batch <= eb <= train_samples):
+                errors.append(
+                    ValidationError(
+                        field="training.effective_batch_size",
+                        current=eb,
+                        message=f"--effective-batch-size ({eb}) must satisfy per_replica_batch_size * num_replicas ({prb} * {num_replicas} = {global_train_batch}) <= effective_batch_size <= num_samples_beta_vae * train_val_split ({nsb} * {tvs} = {train_samples})",
+                        fix_kind="cross_param",
+                        extra={
+                            "per_replica_batch_size": prb,
+                            "num_replicas": num_replicas,
+                            "num_samples_beta_vae": nsb,
+                            "train_val_split": tvs,
+                        },
+                    )
+                )
+            if global_val_batch > val_samples:
+                errors.append(
+                    ValidationError(
+                        field="training.per_replica_val_batch_size",
+                        current=prvb,
+                        message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_beta_vae * (1 - train_val_split) ({nsb} * {1 - tvs:.4f} = {val_samples})",
+                        fix_kind="cross_param",
+                    )
+                )
+            if global_val_batch > nsr:
+                errors.append(
+                    ValidationError(
+                        field="training.per_replica_val_batch_size",
+                        current=prvb,
+                        message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_rf ({nsr})",
+                        fix_kind="cross_param",
+                    )
+                )
+            if latent_total > val_samples:
+                errors.append(
+                    ValidationError(
+                        field="training.latent_viz_num_cadences_per_type",
+                        current=lvc,
+                        message=f"--latent-viz-num-cadences-per-type * 4 ({lvc} * 4 = {latent_total}) must be <= num_samples_beta_vae * (1 - train_val_split) ({val_samples})",
+                        fix_kind="cross_param",
+                    )
+                )
+            if eb % global_train_batch != 0:
+                errors.append(
+                    ValidationError(
+                        field="training.effective_batch_size",
+                        current=eb,
+                        message=f"--effective-batch-size ({eb}) must be divisible by per_replica_batch_size * num_replicas ({global_train_batch})",
+                        fix_kind="cross_param",
+                        divisor=global_train_batch,
+                    )
+                )
+            # Round to int — train_samples/val_samples come from `nsb * tvs` and `nsb * (1 - tvs)`
+            # which suffer IEEE-754 noise (e.g. 499200 * 0.2 = 99839.999...). Use round() so the
+            # intended sample counts survive the cast.
+            train_samples_i = round(train_samples)
+            val_samples_i = round(val_samples)
+            if train_samples_i % eb != 0:
+                errors.append(
+                    ValidationError(
+                        field="training.num_samples_beta_vae",
+                        current=nsb,
+                        message=f"num_samples_beta_vae * train_val_split ({train_samples_i}) must be divisible by --effective-batch-size ({eb})",
+                        fix_kind="cross_param",
+                        divisor=eb,
+                    )
+                )
+            if val_samples_i % global_val_batch != 0:
+                errors.append(
+                    ValidationError(
+                        field="training.num_samples_beta_vae",
+                        current=nsb,
+                        message=f"num_samples_beta_vae * (1 - train_val_split) ({val_samples_i}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
+                        fix_kind="cross_param",
+                        divisor=global_val_batch,
+                    )
+                )
+            if nsr % global_val_batch != 0:
+                errors.append(
+                    ValidationError(
+                        field="training.num_samples_rf",
+                        current=nsr,
+                        message=f"--num-samples-rf ({nsr}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
+                        fix_kind="cross_param",
+                        divisor=global_val_batch,
+                    )
+                )
+            if latent_total % global_val_batch != 0:
+                errors.append(
+                    ValidationError(
+                        field="training.latent_viz_num_cadences_per_type",
+                        current=lvc,
+                        message=f"--latent-viz-num-cadences-per-type * 4 ({latent_total}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
+                        fix_kind="cross_param",
+                        divisor=global_val_batch,
+                    )
+                )
+
+    # -----------------------------------------------------------------------
+    # INFERENCE-MODE CHECKS
+    # -----------------------------------------------------------------------
+    if cmd == "inference":
+        # ----- Energy detection preprocessing -----
+        inf_files = _resolve(args, "inference_files", config.data.inference_files)
+        if inf_files is not None:
+            group_cols = _resolve(
+                args, "cadence_group_by_cols", config.inference.cadence_group_by_cols
+            )
+            if group_cols is not None and len(group_cols) == 0:
+                errors.append(
+                    ValidationError(
+                        field="inference.cadence_group_by_cols",
+                        current=group_cols,
+                        message="--cadence-group-by-cols must be non-empty when --inference-files is provided",
+                        fix_kind="clamp_low",
+                    )
+                )
+
+        dws = _resolve(args, "detection_window_size", config.inference.detection_window_size)
+        dss = _resolve(args, "detection_step_size", config.inference.detection_step_size)
+        sw = _resolve(args, "stamp_width", config.inference.stamp_width)
+        of = _resolve(args, "overlap_fraction", config.inference.overlap_fraction)
+        ct = _resolve(args, "classification_threshold", config.inference.classification_threshold)
+        sp = _resolve(args, "spline_order", config.inference.spline_order)
+        ccw = _resolve(args, "coarse_channel_width", config.inference.coarse_channel_width)
+        pcc = _resolve(args, "parallel_coarse_chans", config.inference.parallel_coarse_chans)
+        st = _resolve(args, "stat_threshold", config.inference.stat_threshold)
+
+        if dws is not None and sw is not None and dws > sw:
+            errors.append(
+                ValidationError(
+                    field="inference.detection_window_size",
+                    current=dws,
+                    message=f"--detection-window-size ({dws}) must be <= --stamp-width ({sw})",
+                    fix_kind="clamp_high",
+                    max_val=sw,
+                )
+            )
+        if of is not None and not (0 <= of <= 1):
+            errors.append(
+                ValidationError(
+                    field="inference.overlap_fraction",
+                    current=of,
+                    message=f"--overlap-fraction must satisfy 0 <= fraction <= 1, got {of}",
+                    fix_kind="range",
+                    min_val=0.0,
+                    max_val=1.0,
+                )
+            )
+        if ct is not None and not (0 <= ct <= 1):
+            errors.append(
+                ValidationError(
+                    field="inference.classification_threshold",
+                    current=ct,
+                    message=f"--classification-threshold must satisfy 0 <= threshold <= 1, got {ct}",
+                    fix_kind="range",
+                    min_val=0.0,
+                    max_val=1.0,
+                )
+            )
+        if dss is not None and dss <= 0:
+            errors.append(
+                ValidationError(
+                    field="inference.detection_step_size",
+                    current=dss,
+                    message=f"--detection-step-size must be > 0, got {dss}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        if dss is not None and dws is not None and dss > dws:
+            errors.append(
+                ValidationError(
+                    field="inference.detection_step_size",
+                    current=dss,
+                    message=f"--detection-step-size ({dss}) must be <= --detection-window-size ({dws})",
+                    fix_kind="clamp_high",
+                    max_val=dws,
+                )
+            )
+        if sp is not None and sp < 1:
+            errors.append(
+                ValidationError(
+                    field="inference.spline_order",
+                    current=sp,
+                    message=f"--spline-order must be >= 1, got {sp}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        for name, val in [
+            ("coarse_channel_width", ccw),
+            ("parallel_coarse_chans", pcc),
+            ("stat_threshold", st),
+            ("stamp_width", sw),
+        ]:
+            if val is not None and val <= 0:
+                errors.append(
+                    ValidationError(
+                        field=f"inference.{name}",
+                        current=val,
+                        message=f"--{name.replace('_', '-')} must be > 0, got {val}",
+                        fix_kind="clamp_low",
+                        min_val=1,
+                    )
+                )
+
+        # ----- Inference retries -----
+        mr = _resolve(args, "max_retries", config.inference.max_retries)
+        if mr is not None and mr < 0:
+            errors.append(
+                ValidationError(
+                    field="inference.max_retries",
+                    current=mr,
+                    message=f"--max-retries must be >= 0, got {mr}",
+                    fix_kind="clamp_low",
+                    min_val=0,
+                )
+            )
+        rd = _resolve(args, "retry_delay", config.inference.retry_delay)
+        if rd is not None and rd < 0:
+            errors.append(
+                ValidationError(
+                    field="inference.retry_delay",
+                    current=rd,
+                    message=f"--retry-delay must be >= 0, got {rd}",
+                    fix_kind="clamp_low",
+                    min_val=0,
+                )
+            )
+
+        # ----- save_tag format (also valid in inference mode) -----
+        save_tag = _resolve(args, "save_tag", config.checkpoint.save_tag)
+        if save_tag is not None and not _TAG_PATTERN.match(save_tag):
+            errors.append(
+                ValidationError(
+                    field="checkpoint.save_tag",
+                    current=save_tag,
+                    message=f"--save-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {save_tag!r}",
+                    fix_kind="format",
+                )
+            )
+
+        # ----- File existence: test/inference data files -----
+        data_path = _resolve(args, "data_path", config.data_path)
+        test_files = _resolve(args, "test_files", config.data.test_files) or []
+        for f in test_files:
+            full = os.path.join(data_path, f)
+            if not os.path.exists(full):
+                errors.append(
+                    ValidationError(
+                        field="data.test_files",
+                        current=f,
+                        message=f"--test-files: file does not exist on disk: {full}",
+                        fix_kind="file_exists",
+                    )
+                )
+        for f in inf_files or []:
+            full = os.path.join(data_path, f) if not os.path.isabs(f) else f
+            if not os.path.exists(full):
+                errors.append(
+                    ValidationError(
+                        field="data.inference_files",
+                        current=f,
+                        message=f"--inference-files: file does not exist on disk: {full}",
+                        fix_kind="file_exists",
+                    )
+                )
+
+    return errors
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    """Run :func:`collect_validation_errors` and raise ValueError if any errors were found.
+
+    Pre-flight semantic/cross-parameter validation for the parsed CLI namespace, before
+    :func:`apply_args_to_config`. Syntax/type checks are handled earlier by argparse itself
+    in :meth:`ArgumentParser.parse_args` (called from main.py:main).
     """
-    Run semantic and cross-param validation on the parsed CLI namespace before it is applied to
-    the config — checks divisibility/range constraints, A-requires-B relationships, and
-    existence of referenced files. Syntax and type checks are not handled here; those run
-    earlier in parser.parse_args() (called from main.py:main).
-    """
-    errors = []
-
-    # NOTE: comment out temporarily for bla0
-    # # Check: signal-injection-chunk-size must be divisible by 4 (for balanced class generation)
-    # if (
-    #     hasattr(args, "signal_injection_chunk_size")
-    #     and args.signal_injection_chunk_size is not None
-    #     and args.signal_injection_chunk_size % 4 != 0
-    # ):
-    #     errors.append(
-    #         f"--signal-injection-chunk-size must be divisible by 4 for balanced class generation, "
-    #         f"got {args.signal_injection_chunk_size}"
-    #     )
-    #
-    # # Check: num-samples-beta-vae must be divisible by 4 (for balanced class generation)
-    # if (
-    #     hasattr(args, "num_samples_beta_vae")
-    #     and args.num_samples_beta_vae is not None
-    #     and args.num_samples_beta_vae % 4 != 0
-    # ):
-    #     errors.append(
-    #         f"--num-samples-beta-vae must be divisible by 4 for balanced class generation, "
-    #         f"got {args.num_samples_beta_vae}"
-    #     )
-    #
-    # # Check: num-samples-rf must be divisible by 4 (for balanced class generation)
-    # if (
-    #     hasattr(args, "num_samples_rf")
-    #     and args.num_samples_rf is not None
-    #     and args.num_samples_rf % 4 != 0
-    # ):
-    #     errors.append(
-    #         f"--num-samples-rf must be divisible by 4 for balanced class generation, "
-    #         f"got {args.num_samples_rf}"
-    #     )
-
-    # TODO: come back to this later
-    # NOTE: double check if these are correct
-    # rf_max_features, curriculum_schedule, load_tag, save_tag not following the accepted formats
-    # make sure save tag is unique (check db? is db initialized before validate_args()?)
-    # vae_dense_layer_size = freq_resolution // downsample_factor
-    # -1 <= rf_n_jobs <= num_cores
-    # time_bin & width bin match data (randomly sample a few files)
-    # train_files & test_files exist
-    # 0 <= train_val_split <= 1
-    # per_replica_batch_size * num_replicas <= effective_batch_size <= num_samples_beta_vae * train_val_split
-    # per_replica_val_batch_size * num_replicas <= num_samples_beta_vae * (1 - train_val_split)
-    # per_replica_val_batch_size * num_replicas <= num_samples_rf
-    # latent_viz_num_cadences_per_type * 4 <= num_samples_beta_vae * (1 - train_val_split)
-    # effective_batch_size is divisible by per_replica_batch_size * num_replicas
-    # num_samples_beta_vae * train_val_split is divisible by effective_batch_size
-    # num_samples_beta_vae * (1 - train_val_split) is divisible by per_replica_val_batch_size * num_replicas
-    # num_samples_rf is divisible by per_replica_val_batch_size * num_replicas
-    # num_samples_rf is divisible by 2 (for generate_triplet_batch)
-    # latent_viz_num_cadences_per_type * 4 is divisible by per_replica_val_batch_size * num_replicas
-    # # how to ensure divisibility for actual n_samples during inference?
-    # snr_base, initial_snr_range, final_snr_range > 0
-    # initial_snr_range >= final_snr_range
-    # exponential_decay_rate < 0
-    # 0 <= step_easy_rounds, step_hard_rounds <= num_training_rounds
-    # step_easy_rounds + step_hard_rounds = num_training_rounds
-    # base_learning_rate >= min_learning_rate
-    # min_pct_improvement >= 0
-    # patience_threshold >= 0 (1?)
-    # lr_reduction_factor > 0
-    # max_retries >= 0
-    # retry_delay >= 0
-    # start_round < num_training_rounds
-    # do directories specified have to exist? or we assume we'll create them on the fly and handle errors in-flight? (currently train_command, TrainingPipeline(), and load_models() all attempt to handle errors on the fly. is this optimal behavior?)
-    # add tests for other configs (inference, db, monitor, etc.)
-    #
-    # Template for adding more checks:
-    # if hasattr(args, "some_param") and args.some_param is not None:
-    #     if <validation_condition>:
-    #         errors.append("Error message explaining the problem")
-
-    # NOTE: come back to this later (are runtime checks properly implemented? does config defaults kick in before cli args are applied? if some but not all csvs are invalid, do we still process valid csvs & throw errors for the invalid ones with proper checkpointing, or do we fail loudly & immediately? are these checks comprehensive for energy detection + inference modules, e.g. overlap_fraction between 0 & 1?)
-    # # Energy detection preprocessing checks
-    # # If inference_files is provided, cadence_group_by_cols must be non-empty.
-    # # Per-CSV column-existence checks are deferred to runtime (CSVs aren't loaded here).
-    # # stamp_width == width_bin is validated at runtime in inference_command, where both
-    # # are resolved together.
-    # if hasattr(args, "inference_files") and args.inference_files is not None:
-    #     group_cols = getattr(args, "cadence_group_by_cols", None)
-    #     # If the user didn't pass --cadence-group-by-cols, the dataclass default kicks in
-    #     # (a non-empty list). Only fail if the user explicitly provided an empty list.
-    #     if group_cols is not None and len(group_cols) == 0:
-    #         errors.append(
-    #             "--cadence-group-by-cols must be non-empty when --inference-files is provided"
-    #         )
-    #
-    # if hasattr(args, "detection_window_size") and args.detection_window_size is not None:
-    #     stamp_width = getattr(args, "stamp_width", None)
-    #     if stamp_width is not None and args.detection_window_size > stamp_width:
-    #         errors.append(
-    #             f"--detection-window-size ({args.detection_window_size}) must be "
-    #             f"<= --stamp-width ({stamp_width})"
-    #         )
-
-    # Throw an error if any validation fails
+    num_replicas = _detect_num_replicas(args)
+    errors = collect_validation_errors(args, num_replicas)
     if errors:
-        raise ValueError("Invalid arguments detected:\n" + "\n".join(f"  - {e}" for e in errors))
+        raise ValueError(
+            "Invalid arguments detected:\n" + "\n".join(f"  - {e.message}" for e in errors)
+        )
