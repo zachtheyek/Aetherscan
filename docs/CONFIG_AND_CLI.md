@@ -198,8 +198,12 @@ Three things to know:
 
 2. **`num_replicas` is determined ahead of time** by `_detect_num_replicas(args)`:
    `args.num_replicas` if the user passed `--num-replicas`, else
-   `tf.config.list_physical_devices('GPU')` count, else 1. Cross-replica divisibility
-   checks then use this value.
+   `tf.config.list_physical_devices('GPU')` count if TF reports at least one GPU, else
+   `None`. When the value is `None`, `collect_validation_errors` logs a warning and
+   skips the cross-replica divisibility section — the runtime will fail later in
+   `setup_gpu_strategy` if it really needed GPUs. This lets utility scripts
+   (e.g. `find_optimal_configs.py` on a dev box without TF) still produce the
+   non-cross-replica part of the report.
 
 3. **The same mode-gating pattern applies inside validation**:
 

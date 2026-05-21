@@ -16,9 +16,8 @@ from aetherscan.config import get_config, init_config
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Validation primitives shared by validate_args() and utility scripts
-# ---------------------------------------------------------------------------
+# Validation primitives are expressed as global variables and shared by
+# validate_args() and utility scripts
 
 # Accepted formats for --load-tag and --save-tag (cli.py help strings document these)
 _TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
@@ -45,8 +44,18 @@ class ValidationError:
     extra: dict = field(default_factory=dict)
 
 
-def _detect_num_replicas(args: argparse.Namespace) -> int:
-    """Return num_replicas from args if provided, else auto-detect via TF GPU count, else 1."""
+def _detect_num_replicas(args: argparse.Namespace) -> int | None:
+    """Return the replica count to validate cross-replica constraints against.
+
+    Resolution order:
+    1. `args.num_replicas` if the user passed --num-replicas (returned as-is, even if
+       invalid; the <= 0 check in `collect_validation_errors` will flag it separately).
+    2. `len(tf.config.list_physical_devices('GPU'))` if TF is importable and reports at
+       least one GPU.
+    3. None — TF unavailable (e.g. utility scripts on a dev box) or TF reports zero
+       GPUs. Cross-replica checks are skipped in this case with a logged warning;
+       runtime will fail later in setup_gpu_strategy if it really needed a GPU.
+    """
     val = getattr(args, "num_replicas", None)
     if val is not None:
         return int(val)
@@ -57,9 +66,9 @@ def _detect_num_replicas(args: argparse.Namespace) -> int:
         import tensorflow as tf  # noqa: PLC0415
 
         gpus = tf.config.list_physical_devices("GPU")
-        return max(len(gpus), 1)
+        return len(gpus) if gpus else None
     except Exception:
-        return 1
+        return None
 
 
 def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
@@ -77,7 +86,6 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     # Add commands
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-    # NOTE: how does the pipeline know which one to use?
     # Train command
     _add_train_arguments(subparsers)
     # Inference command
@@ -86,13 +94,13 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# TODO: update descriptions
 def _add_train_arguments(subparsers):
     """Register the `train` subcommand and populate it with all training-mode flags."""
     train_parser = subparsers.add_parser("train", help="Execute training pipeline")
     _add_train_flags_to(train_parser)
 
 
+# TODO: update flag help descriptions
 def _add_train_flags_to(parser):
     """
     Add all training-mode CLI flags to `parser`. Defined separately from the subparser wrapper
@@ -187,6 +195,12 @@ def _add_train_flags_to(parser):
 
     # GPU configuration
     parser.add_argument(
+        "--num-replicas",
+        type=int,
+        default=None,
+        help="Number of GPUs to use for the distributed-inference strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1 and <= the number of physical GPUs on your machine.",
+    )
+    parser.add_argument(
         "--gpu-memory-limit-mb",
         type=int,
         default=None,
@@ -203,12 +217,6 @@ def _add_train_flags_to(parser):
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
-    )
-    parser.add_argument(
-        "--num-replicas",
-        type=int,
-        default=None,
-        help="Number of GPUs to use for the distributed-training strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1. Also drives batch/sample divisibility validation: a value greater than the GPUs actually present on the node will be caught at strategy-configuration time and abort the run.",
     )
 
     # Data configuration
@@ -501,13 +509,13 @@ def _add_train_flags_to(parser):
     )
 
 
-# TODO: update descriptions
 def _add_inference_arguments(subparsers):
     """Register the `inference` subcommand and populate it with all inference-mode flags."""
     inf_parser = subparsers.add_parser("inference", help="Execute inference pipeline")
     _add_inference_flags_to(inf_parser)
 
 
+# TODO: update flag help descriptions
 def _add_inference_flags_to(parser):
     """
     Add all inference-mode CLI flags to `parser`. Defined separately from the subparser wrapper
@@ -537,6 +545,12 @@ def _add_inference_flags_to(parser):
 
     # GPU configuration
     parser.add_argument(
+        "--num-replicas",
+        type=int,
+        default=None,
+        help="Number of GPUs to use for the distributed-inference strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1 and <= the number of physical GPUs on your machine.",
+    )
+    parser.add_argument(
         "--gpu-memory-limit-mb",
         type=int,
         default=None,
@@ -547,12 +561,6 @@ def _add_inference_flags_to(parser):
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default: enabled). Pass --no-async-allocator as a workaround for NGC 25.02 multi-GPU OOM bugs.",
-    )
-    parser.add_argument(
-        "--num-replicas",
-        type=int,
-        default=None,
-        help="Number of GPUs to use for the distributed-inference strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1. Also drives cross-replica validation: a value greater than the GPUs actually present on the node will be caught at strategy-configuration time and abort the run.",
     )
 
     # Data configuration
@@ -705,7 +713,6 @@ def _add_inference_flags_to(parser):
     )
 
 
-# NOTE: how to ensure only train_parser/inf_parser args get applied depending on whether train/inference is ran?
 def apply_args_to_config(args: argparse.Namespace) -> None:
     """Mutate the singleton config in place with any non-None overrides from the parsed CLI
     namespace. Only attributes actually present on `args` are considered; missing ones fall back
@@ -747,6 +754,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.rf.seed = args.rf_seed
 
     # GPU configuration
+    if hasattr(args, "num_replicas") and args.num_replicas is not None:
+        config.gpu.num_replicas = args.num_replicas
     if hasattr(args, "gpu_memory_limit_mb") and args.gpu_memory_limit_mb is not None:
         config.gpu.per_gpu_memory_limit_mb = args.gpu_memory_limit_mb
     if hasattr(args, "nccl_num_packs") and args.nccl_num_packs is not None:
@@ -757,8 +766,6 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # guard preserves the config default when the user passes neither
     if hasattr(args, "async_allocator") and args.async_allocator is not None:
         config.gpu.use_async_allocator = args.async_allocator
-    if hasattr(args, "num_replicas") and args.num_replicas is not None:
-        config.gpu.num_replicas = args.num_replicas
 
     # Data configuration
     if hasattr(args, "num_observations") and args.num_observations is not None:
@@ -954,7 +961,9 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.retry_delay = args.retry_delay
 
 
-def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> list[ValidationError]:
+def collect_validation_errors(
+    args: argparse.Namespace, num_replicas: int | None
+) -> list[ValidationError]:
     """
     Collect semantic and cross-param validation failures for the parsed CLI namespace, merging
     args with config defaults via _resolve(). Returns a list rather than raising so utility
@@ -967,9 +976,7 @@ def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> li
     cmd = getattr(args, "command", None)
     errors: list[ValidationError] = []
 
-    # -----------------------------------------------------------------------
     # COMMON CHECKS (apply regardless of subcommand)
-    # -----------------------------------------------------------------------
     # --num-replicas must be a positive int (or omitted). 0/negative would silently divide
     # batch sizes by 0 below and is meaningless at strategy-construction time. Omit the
     # flag (or set config.gpu.num_replicas=None) to use every available GPU.
@@ -985,11 +992,10 @@ def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> li
             )
         )
 
-    # -----------------------------------------------------------------------
     # TRAINING-MODE CHECKS (only meaningful when the train subparser is active)
-    # -----------------------------------------------------------------------
     if cmd == "train" or hasattr(args, "num_samples_beta_vae"):
-        # ----- Divisibility-by-4 (balanced class generation) -----
+        # NOTE: should parametrize num_signal_types = 4 to config.py
+        # Divisibility-by-4 (balanced class generation)
         sic = _resolve(
             args, "signal_injection_chunk_size", config.training.signal_injection_chunk_size
         )
@@ -1351,110 +1357,121 @@ def collect_validation_errors(args: argparse.Namespace, num_replicas: int) -> li
             config.training.latent_viz_num_cadences_per_type,
         )
 
-        if all(v is not None for v in (prb, eb, prvb, lvc, nsb, nsr, tvs)) and num_replicas >= 1:
-            train_samples = nsb * tvs
-            val_samples = nsb * (1 - tvs)
-            global_train_batch = prb * num_replicas
-            global_val_batch = prvb * num_replicas
-            latent_total = lvc * 4
+        if all(v is not None for v in (prb, eb, prvb, lvc, nsb, nsr, tvs)):
+            if num_replicas is None:
+                logger.warning(
+                    "GPU count unknown (no --num-replicas and TF reports 0 GPUs or is "
+                    "unavailable) — skipping cross-replica divisibility checks. Pass "
+                    "--num-replicas explicitly to run them."
+                )
+            elif num_replicas < 1:
+                # The common-checks block already emitted a ValidationError for the
+                # invalid value; just skip the cross-replica section to avoid div-by-zero.
+                pass
+            else:
+                train_samples = nsb * tvs
+                val_samples = nsb * (1 - tvs)
+                global_train_batch = prb * num_replicas
+                global_val_batch = prvb * num_replicas
+                latent_total = lvc * 4
 
-            if not (global_train_batch <= eb <= train_samples):
-                errors.append(
-                    ValidationError(
-                        field="training.effective_batch_size",
-                        current=eb,
-                        message=f"--effective-batch-size ({eb}) must satisfy per_replica_batch_size * num_replicas ({prb} * {num_replicas} = {global_train_batch}) <= effective_batch_size <= num_samples_beta_vae * train_val_split ({nsb} * {tvs} = {train_samples})",
-                        fix_kind="cross_param",
-                        extra={
-                            "per_replica_batch_size": prb,
-                            "num_replicas": num_replicas,
-                            "num_samples_beta_vae": nsb,
-                            "train_val_split": tvs,
-                        },
+                if not (global_train_batch <= eb <= train_samples):
+                    errors.append(
+                        ValidationError(
+                            field="training.effective_batch_size",
+                            current=eb,
+                            message=f"--effective-batch-size ({eb}) must satisfy per_replica_batch_size * num_replicas ({prb} * {num_replicas} = {global_train_batch}) <= effective_batch_size <= num_samples_beta_vae * train_val_split ({nsb} * {tvs} = {train_samples})",
+                            fix_kind="cross_param",
+                            extra={
+                                "per_replica_batch_size": prb,
+                                "num_replicas": num_replicas,
+                                "num_samples_beta_vae": nsb,
+                                "train_val_split": tvs,
+                            },
+                        )
                     )
-                )
-            if global_val_batch > val_samples:
-                errors.append(
-                    ValidationError(
-                        field="training.per_replica_val_batch_size",
-                        current=prvb,
-                        message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_beta_vae * (1 - train_val_split) ({nsb} * {1 - tvs:.4f} = {val_samples})",
-                        fix_kind="cross_param",
+                if global_val_batch > val_samples:
+                    errors.append(
+                        ValidationError(
+                            field="training.per_replica_val_batch_size",
+                            current=prvb,
+                            message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_beta_vae * (1 - train_val_split) ({nsb} * {1 - tvs:.4f} = {val_samples})",
+                            fix_kind="cross_param",
+                        )
                     )
-                )
-            if global_val_batch > nsr:
-                errors.append(
-                    ValidationError(
-                        field="training.per_replica_val_batch_size",
-                        current=prvb,
-                        message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_rf ({nsr})",
-                        fix_kind="cross_param",
+                if global_val_batch > nsr:
+                    errors.append(
+                        ValidationError(
+                            field="training.per_replica_val_batch_size",
+                            current=prvb,
+                            message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_rf ({nsr})",
+                            fix_kind="cross_param",
+                        )
                     )
-                )
-            if latent_total > val_samples:
-                errors.append(
-                    ValidationError(
-                        field="training.latent_viz_num_cadences_per_type",
-                        current=lvc,
-                        message=f"--latent-viz-num-cadences-per-type * 4 ({lvc} * 4 = {latent_total}) must be <= num_samples_beta_vae * (1 - train_val_split) ({val_samples})",
-                        fix_kind="cross_param",
+                if latent_total > val_samples:
+                    errors.append(
+                        ValidationError(
+                            field="training.latent_viz_num_cadences_per_type",
+                            current=lvc,
+                            message=f"--latent-viz-num-cadences-per-type * 4 ({lvc} * 4 = {latent_total}) must be <= num_samples_beta_vae * (1 - train_val_split) ({val_samples})",
+                            fix_kind="cross_param",
+                        )
                     )
-                )
-            if eb % global_train_batch != 0:
-                errors.append(
-                    ValidationError(
-                        field="training.effective_batch_size",
-                        current=eb,
-                        message=f"--effective-batch-size ({eb}) must be divisible by per_replica_batch_size * num_replicas ({global_train_batch})",
-                        fix_kind="cross_param",
-                        divisor=global_train_batch,
+                if eb % global_train_batch != 0:
+                    errors.append(
+                        ValidationError(
+                            field="training.effective_batch_size",
+                            current=eb,
+                            message=f"--effective-batch-size ({eb}) must be divisible by per_replica_batch_size * num_replicas ({global_train_batch})",
+                            fix_kind="cross_param",
+                            divisor=global_train_batch,
+                        )
                     )
-                )
-            # Round to int — train_samples/val_samples come from `nsb * tvs` and `nsb * (1 - tvs)`
-            # which suffer IEEE-754 noise (e.g. 499200 * 0.2 = 99839.999...). Use round() so the
-            # intended sample counts survive the cast.
-            train_samples_i = round(train_samples)
-            val_samples_i = round(val_samples)
-            if train_samples_i % eb != 0:
-                errors.append(
-                    ValidationError(
-                        field="training.num_samples_beta_vae",
-                        current=nsb,
-                        message=f"num_samples_beta_vae * train_val_split ({train_samples_i}) must be divisible by --effective-batch-size ({eb})",
-                        fix_kind="cross_param",
-                        divisor=eb,
+                # Round to int — train_samples/val_samples come from `nsb * tvs` and `nsb * (1 - tvs)`
+                # which suffer IEEE-754 noise (e.g. 499200 * 0.2 = 99839.999...). Use round() so the
+                # intended sample counts survive the cast.
+                train_samples_i = round(train_samples)
+                val_samples_i = round(val_samples)
+                if train_samples_i % eb != 0:
+                    errors.append(
+                        ValidationError(
+                            field="training.num_samples_beta_vae",
+                            current=nsb,
+                            message=f"num_samples_beta_vae * train_val_split ({train_samples_i}) must be divisible by --effective-batch-size ({eb})",
+                            fix_kind="cross_param",
+                            divisor=eb,
+                        )
                     )
-                )
-            if val_samples_i % global_val_batch != 0:
-                errors.append(
-                    ValidationError(
-                        field="training.num_samples_beta_vae",
-                        current=nsb,
-                        message=f"num_samples_beta_vae * (1 - train_val_split) ({val_samples_i}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
-                        fix_kind="cross_param",
-                        divisor=global_val_batch,
+                if val_samples_i % global_val_batch != 0:
+                    errors.append(
+                        ValidationError(
+                            field="training.num_samples_beta_vae",
+                            current=nsb,
+                            message=f"num_samples_beta_vae * (1 - train_val_split) ({val_samples_i}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
+                            fix_kind="cross_param",
+                            divisor=global_val_batch,
+                        )
                     )
-                )
-            if nsr % global_val_batch != 0:
-                errors.append(
-                    ValidationError(
-                        field="training.num_samples_rf",
-                        current=nsr,
-                        message=f"--num-samples-rf ({nsr}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
-                        fix_kind="cross_param",
-                        divisor=global_val_batch,
+                if nsr % global_val_batch != 0:
+                    errors.append(
+                        ValidationError(
+                            field="training.num_samples_rf",
+                            current=nsr,
+                            message=f"--num-samples-rf ({nsr}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
+                            fix_kind="cross_param",
+                            divisor=global_val_batch,
+                        )
                     )
-                )
-            if latent_total % global_val_batch != 0:
-                errors.append(
-                    ValidationError(
-                        field="training.latent_viz_num_cadences_per_type",
-                        current=lvc,
-                        message=f"--latent-viz-num-cadences-per-type * 4 ({latent_total}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
-                        fix_kind="cross_param",
-                        divisor=global_val_batch,
+                if latent_total % global_val_batch != 0:
+                    errors.append(
+                        ValidationError(
+                            field="training.latent_viz_num_cadences_per_type",
+                            current=lvc,
+                            message=f"--latent-viz-num-cadences-per-type * 4 ({latent_total}) must be divisible by per_replica_val_batch_size * num_replicas ({global_val_batch})",
+                            fix_kind="cross_param",
+                            divisor=global_val_batch,
+                        )
                     )
-                )
 
     # -----------------------------------------------------------------------
     # INFERENCE-MODE CHECKS
