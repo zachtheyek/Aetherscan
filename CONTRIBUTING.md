@@ -15,7 +15,7 @@ The Aetherscan project has strict rules for AI usage. Please see the [AI usage p
 Aetherscan supports two install paths off the same source tree; you only need the prerequisites for the one you plan to use locally:
 
 - **NGC container path (canonical, both clusters)** — Apptainer 1.4+ or SingularityCE 4.1+, plus an NVIDIA GPU with driver ≥570 (Blackwell) or ≥550 (Ampere via CUDA forward compatibility). Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container.
-- **Conda env (alternative, Ampere only)** — Conda or Mamba, Python 3.10, CUDA 12.4+ driver, NVIDIA Ampere GPU.
+- **Conda env (alternative, Ampere only)** — Conda or Mamba, Python 3.10, CUDA 12.3+ driver, NVIDIA Ampere GPU.
 
 See [`README.md`](README.md#system-requirements) for the full system requirements matrix.
 
