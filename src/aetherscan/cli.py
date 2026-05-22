@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from itertools import product
 from typing import Any
 
 from aetherscan.config import get_config
@@ -1776,18 +1777,240 @@ def validate_num_replicas_against_hardware(
         )
 
 
+# ---------------------------------------------------------------------------
+# Fix proposal surface — used both by validate_args (to include suggestions in
+# the ValueError message on failure) and by utils/find_optimal_configs.py (to
+# print suggestions to stdout when run directly). Kept here in cli.py rather
+# than utils/ so cli.py can call them without a circular import or sys.path
+# gymnastics, and so the validation + proposal logic stays colocated.
+# ---------------------------------------------------------------------------
+
+# Grid-search ranges for the six interdependent training params that govern
+# how data is divided across replicas, batches, and train/val splits. Most
+# cross-replica violations can't be fixed by clamping one field — the solver
+# below grid-searches these ranges minimizing L1 distance to the current
+# values.
+_SEARCH_RANGES: dict[str, tuple[int, int, int]] = {
+    # (min, max, step)
+    "num_samples_beta_vae": (400_000, 600_000, 10_240),
+    "num_samples_rf": (80_000, 120_000, 2_048),
+    "per_replica_batch_size": (64, 256, 1),
+    "effective_batch_size": (2_048, 6_144, 64),
+    "per_replica_val_batch_size": (256, 768, 1),
+}
+
+_CROSS_PARAM_FIELDS = (
+    "num_samples_beta_vae",
+    "num_samples_rf",
+    "per_replica_batch_size",
+    "effective_batch_size",
+    "per_replica_val_batch_size",
+)
+
+
+def _check_cross_constraints(
+    nsb: int,
+    nsr: int,
+    tvs: float,
+    prb: int,
+    eb: int,
+    prvb: int,
+    num_replicas_list: list[int],
+) -> bool:
+    """Return True iff the six-tuple satisfies all cross-replica constraints for every
+    num_replicas in the list. Mirrors the cross-replica checks in
+    :func:`collect_validation_errors`."""
+    if not (0 <= tvs <= 1):
+        return False
+    if nsr % 2 != 0:
+        return False
+    for nr in num_replicas_list:
+        gtrain = prb * nr
+        gval = prvb * nr
+        # round() rather than int() — `nsb * (1 - tvs)` suffers IEEE-754 noise (e.g.
+        # 499200 * 0.2 = 99839.999...) and int() would truncate to 99839.
+        train_samples = round(nsb * tvs)
+        val_samples = round(nsb * (1 - tvs))
+        if not (gtrain <= eb <= nsb * tvs):
+            return False
+        if gval > nsb * (1 - tvs):
+            return False
+        if gval > nsr:
+            return False
+        if eb % gtrain != 0:
+            return False
+        if train_samples % eb != 0:
+            return False
+        if val_samples % gval != 0:
+            return False
+        if nsr % gval != 0:
+            return False
+    return True
+
+
+def _solve_cross_param_constraints(
+    base: dict[str, int | float],
+    num_replicas_list: list[int],
+    max_candidates: int = 10_000_000,
+) -> dict[str, int | float] | None:
+    """Grid-search the six batch/sample params for a configuration satisfying all
+    cross-replica constraints, minimizing L1 distance from ``base``. Returns None if no
+    solution found within the search ranges or the candidate budget."""
+    if _check_cross_constraints(
+        base["num_samples_beta_vae"],
+        base["num_samples_rf"],
+        base["train_val_split"],
+        base["per_replica_batch_size"],
+        base["effective_batch_size"],
+        base["per_replica_val_batch_size"],
+        num_replicas_list,
+    ):
+        return dict(base)
+
+    ranges: dict[str, list[int]] = {}
+    for f_name in _CROSS_PARAM_FIELDS:
+        lo, hi, step = _SEARCH_RANGES[f_name]
+        ranges[f_name] = list(range(lo, hi + 1, step))
+
+    total = 1
+    for r in ranges.values():
+        total *= len(r)
+    if total > max_candidates:
+        logger.debug(
+            "Cross-param solver search space (%d) exceeds budget (%d); skipping.",
+            total,
+            max_candidates,
+        )
+        return None
+
+    tvs = base["train_val_split"]  # held fixed across the search
+    best: dict[str, int | float] | None = None
+    best_dist = float("inf")
+    for nsb, nsr, prb, eb, prvb in product(
+        ranges["num_samples_beta_vae"],
+        ranges["num_samples_rf"],
+        ranges["per_replica_batch_size"],
+        ranges["effective_batch_size"],
+        ranges["per_replica_val_batch_size"],
+    ):
+        if not _check_cross_constraints(nsb, nsr, tvs, prb, eb, prvb, num_replicas_list):
+            continue
+        dist = (
+            abs(nsb - base["num_samples_beta_vae"])
+            + abs(nsr - base["num_samples_rf"])
+            + abs(prb - base["per_replica_batch_size"])
+            + abs(eb - base["effective_batch_size"])
+            + abs(prvb - base["per_replica_val_batch_size"])
+        )
+        if dist < best_dist:
+            best_dist = dist
+            best = {
+                "num_samples_beta_vae": nsb,
+                "num_samples_rf": nsr,
+                "train_val_split": tvs,
+                "per_replica_batch_size": prb,
+                "effective_batch_size": eb,
+                "per_replica_val_batch_size": prvb,
+            }
+    return best
+
+
+def _round_to_multiple(val: int, divisor: int) -> int:
+    """Round ``val`` to the nearest multiple of ``divisor`` (ties round up)."""
+    q, r = divmod(val, divisor)
+    return divisor * (q if r * 2 < divisor else q + 1)
+
+
+def propose_simple_fix(err: ValidationError) -> object | None:
+    """Suggest a single replacement value for a non-cross-param violation. Returns None when
+    a violation cannot be auto-fixed (e.g. a missing file)."""
+    if err.fix_kind == "clamp_low" and err.min_val is not None:
+        return err.min_val
+    if err.fix_kind == "clamp_high" and err.max_val is not None:
+        return err.max_val
+    if err.fix_kind == "range" and err.min_val is not None and err.max_val is not None:
+        if isinstance(err.current, (int, float)):
+            return max(err.min_val, min(err.current, err.max_val))
+        return err.min_val
+    if err.fix_kind == "enum" and err.allowed:
+        return err.allowed[0]
+    if err.fix_kind == "divisibility" and err.divisor and isinstance(err.current, int):
+        return _round_to_multiple(err.current, err.divisor)
+    return None  # format / file_exists / cross_param handled separately
+
+
+def _format_proposal_value(val: object) -> str:
+    """Format a proposed value for the CLI flag hint shown to the user."""
+    if isinstance(val, float):
+        return f"{val:g}"
+    if isinstance(val, list):
+        return "[" + ", ".join(str(x) for x in val) + "]"
+    return str(val)
+
+
+def _build_suggestion_block(errors: list[ValidationError], num_replicas: int | None) -> str:
+    """Compose the 'Suggested fixes:' block appended to the ValueError message.
+
+    Mirrors the proposer logic in utils/find_optimal_configs.py: simple violations get
+    a per-field replacement value via :func:`propose_simple_fix`; cross-replica
+    violations trigger a single grid search via :func:`_solve_cross_param_constraints`.
+    Returns an empty string if nothing actionable was found.
+    """
+    config = get_config()
+    simple = [e for e in errors if e.fix_kind != "cross_param"]
+    cross = [e for e in errors if e.fix_kind == "cross_param"]
+    proposals: dict[str, object] = {}
+
+    for err in simple:
+        fix = propose_simple_fix(err)
+        if fix is not None:
+            proposals[err.field] = fix
+
+    if cross and num_replicas is not None and config is not None:
+        base = {
+            "num_samples_beta_vae": config.training.num_samples_beta_vae,
+            "num_samples_rf": config.training.num_samples_rf,
+            "train_val_split": config.training.train_val_split,
+            "per_replica_batch_size": config.training.per_replica_batch_size,
+            "effective_batch_size": config.training.effective_batch_size,
+            "per_replica_val_batch_size": config.training.per_replica_val_batch_size,
+        }
+        solution = _solve_cross_param_constraints(base, [num_replicas])
+        if solution is not None:
+            for f_name in _CROSS_PARAM_FIELDS + ("train_val_split",):
+                if solution[f_name] != base[f_name]:
+                    proposals[f"training.{f_name}"] = solution[f_name]
+
+    if not proposals:
+        return ""
+
+    flag_lines: list[str] = []
+    for f_name, value in proposals.items():
+        # Drop the config-section prefix and switch underscores to hyphens.
+        short = f_name.split(".", 1)[-1]
+        flag = "--" + short.replace("_", "-")
+        flag_lines.append(f"      {flag} {_format_proposal_value(value)}")
+
+    body = " \\\n".join(flag_lines)
+    return (
+        "\n\nSuggested fixes (run `python utils/find_optimal_configs.py` for the full "
+        "report):\n" + body
+    )
+
+
 def validate_args(args: argparse.Namespace) -> None:
     """
     Pre-flight semantic and cross-parameter validation for the parsed CLI namespace, run before
     apply_args_to_config(). Delegates to validate_num_replicas_against_hardware() and
-    collect_validation_errors() and raises ValueError if any failures came back. Syntax and
-    type checks are handled earlier by argparse itself in ArgumentParser.parse_args (called
-    from main.py:main).
+    collect_validation_errors() and raises ValueError if any failures came back. On failure
+    the ValueError message includes a list of suggested CLI flags from the same proposer
+    surface that powers utils/find_optimal_configs.py. Syntax and type checks are handled
+    earlier by argparse itself in ArgumentParser.parse_args (called from main.py:main).
     """
     num_replicas = _detect_num_replicas(args)
     validate_num_replicas_against_hardware(args, num_replicas)
     errors = collect_validation_errors(args, num_replicas)
     if errors:
-        raise ValueError(
-            "Invalid arguments detected:\n" + "\n".join(f"  - {e.message}" for e in errors)
-        )
+        violation_block = "\n".join(f"  - {e.message}" for e in errors)
+        suggestions = _build_suggestion_block(errors, num_replicas)
+        raise ValueError(f"Invalid arguments detected:\n{violation_block}{suggestions}")

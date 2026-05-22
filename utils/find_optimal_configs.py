@@ -23,9 +23,6 @@ Examples:
 import argparse
 import os
 import sys
-from functools import reduce
-from itertools import product
-from math import gcd
 
 # Make src/ importable when running directly: utils/find_optimal_configs.py
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,8 +32,10 @@ from aetherscan.cli import (  # noqa: E402
     ValidationError,
     _add_inference_flags_to,
     _add_train_flags_to,
+    _solve_cross_param_constraints,
     apply_args_to_config,
     collect_validation_errors,
+    propose_simple_fix,
 )
 from aetherscan.config import get_config, init_config  # noqa: E402
 
@@ -75,174 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# ---------------------------------------------------------------------------
-# Cross-parameter constraint solver (batch / sample divisibility)
-# ---------------------------------------------------------------------------
-#
-# Six interdependent training parameters control how data is divided across
-# replicas, batches, and train/val splits. Most violations are not fixable by
-# changing a single value — we need to find a coordinated patch. We do this with
-# a bounded grid search minimizing L1 distance to the current values.
-
-_SEARCH_RANGES: dict[str, tuple[int, int, int]] = {
-    # (min, max, step)
-    "num_samples_beta_vae": (400_000, 600_000, 10_240),
-    "num_samples_rf": (80_000, 120_000, 2_048),
-    "per_replica_batch_size": (64, 256, 1),
-    "effective_batch_size": (2_048, 6_144, 64),
-    "per_replica_val_batch_size": (256, 768, 1),
-}
-
-_CROSS_PARAM_FIELDS = (
-    "num_samples_beta_vae",
-    "num_samples_rf",
-    "per_replica_batch_size",
-    "effective_batch_size",
-    "per_replica_val_batch_size",
-)
-
-
-def _lcm(a: int, b: int) -> int:
-    return abs(a * b) // gcd(a, b)
-
-
-def lcm_multiple(numbers: list[int]) -> int:
-    return reduce(_lcm, numbers)
-
-
-def _check_cross_constraints(
-    nsb: int,
-    nsr: int,
-    tvs: float,
-    prb: int,
-    eb: int,
-    prvb: int,
-    num_replicas_list: list[int],
-) -> bool:
-    """Return True iff the six-tuple satisfies all cross-replica constraints for every
-    num_replicas in the list. Mirrors the cross-replica checks in
-    :func:`aetherscan.cli.collect_validation_errors`."""
-    if not (0 <= tvs <= 1):
-        return False
-    if nsr % 2 != 0:
-        return False
-    for nr in num_replicas_list:
-        gtrain = prb * nr
-        gval = prvb * nr
-        # round() rather than int() — `nsb * (1 - tvs)` suffers IEEE-754 noise (e.g.
-        # 499200 * 0.2 = 99839.999...) and int() would truncate to 99839.
-        train_samples = round(nsb * tvs)
-        val_samples = round(nsb * (1 - tvs))
-        if not (gtrain <= eb <= nsb * tvs):
-            return False
-        if gval > nsb * (1 - tvs):
-            return False
-        if gval > nsr:
-            return False
-        if eb % gtrain != 0:
-            return False
-        if train_samples % eb != 0:
-            return False
-        if val_samples % gval != 0:
-            return False
-        if nsr % gval != 0:
-            return False
-    return True
-
-
-def _solve_cross_param_constraints(
-    base: dict[str, int | float],
-    num_replicas_list: list[int],
-    max_candidates: int = 10_000_000,
-) -> dict[str, int | float] | None:
-    """Grid-search the six batch/sample params for a configuration satisfying all
-    cross-replica constraints, minimizing L1 distance from ``base``. Returns None if no
-    solution found within the search ranges or the candidate budget."""
-    if _check_cross_constraints(
-        base["num_samples_beta_vae"],
-        base["num_samples_rf"],
-        base["train_val_split"],
-        base["per_replica_batch_size"],
-        base["effective_batch_size"],
-        base["per_replica_val_batch_size"],
-        num_replicas_list,
-    ):
-        return dict(base)
-
-    ranges: dict[str, list[int]] = {}
-    for field in _CROSS_PARAM_FIELDS:
-        lo, hi, step = _SEARCH_RANGES[field]
-        ranges[field] = list(range(lo, hi + 1, step))
-
-    total = 1
-    for r in ranges.values():
-        total *= len(r)
-    if total > max_candidates:
-        print(
-            f"  [solver] Search space ({total:,}) exceeds budget ({max_candidates:,}); "
-            f"narrow --num-gpus list or accept a coarser fix."
-        )
-        return None
-
-    tvs = base["train_val_split"]  # held fixed across the search
-    best: dict[str, int | float] | None = None
-    best_dist = float("inf")
-    for nsb, nsr, prb, eb, prvb in product(
-        ranges["num_samples_beta_vae"],
-        ranges["num_samples_rf"],
-        ranges["per_replica_batch_size"],
-        ranges["effective_batch_size"],
-        ranges["per_replica_val_batch_size"],
-    ):
-        if not _check_cross_constraints(nsb, nsr, tvs, prb, eb, prvb, num_replicas_list):
-            continue
-        dist = (
-            abs(nsb - base["num_samples_beta_vae"])
-            + abs(nsr - base["num_samples_rf"])
-            + abs(prb - base["per_replica_batch_size"])
-            + abs(eb - base["effective_batch_size"])
-            + abs(prvb - base["per_replica_val_batch_size"])
-        )
-        if dist < best_dist:
-            best_dist = dist
-            best = {
-                "num_samples_beta_vae": nsb,
-                "num_samples_rf": nsr,
-                "train_val_split": tvs,
-                "per_replica_batch_size": prb,
-                "effective_batch_size": eb,
-                "per_replica_val_batch_size": prvb,
-            }
-    return best
-
-
-# ---------------------------------------------------------------------------
-# Per-error fix proposer
-# ---------------------------------------------------------------------------
-
-
-def _round_to_multiple(val: int, divisor: int) -> int:
-    """Round ``val`` to the nearest multiple of ``divisor`` (ties round up)."""
-    q, r = divmod(val, divisor)
-    return divisor * (q if r * 2 < divisor else q + 1)
-
-
-def propose_simple_fix(err: ValidationError) -> object | None:
-    """Suggest a single replacement value for a non-cross-param violation. Returns None when
-    a violation cannot be auto-fixed (e.g. a missing file)."""
-    if err.fix_kind == "clamp_low" and err.min_val is not None:
-        return err.min_val
-    if err.fix_kind == "clamp_high" and err.max_val is not None:
-        return err.max_val
-    if err.fix_kind == "range" and err.min_val is not None and err.max_val is not None:
-        if isinstance(err.current, (int, float)):
-            return max(err.min_val, min(err.current, err.max_val))
-        return err.min_val
-    if err.fix_kind == "enum" and err.allowed:
-        return err.allowed[0]
-    if err.fix_kind == "divisibility" and err.divisor and isinstance(err.current, int):
-        return _round_to_multiple(err.current, err.divisor)
-    return None  # format / file_exists / cross_param handled separately
+# The constraint solver and per-error fix proposer live in
+# src/aetherscan/cli.py — see _check_cross_constraints, _solve_cross_param_constraints,
+# and propose_simple_fix imported above. Keeping them colocated with the
+# validation logic lets validate_args reuse the same proposer surface.
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +126,16 @@ def main() -> int:
     args = parser.parse_args()
 
     num_replicas_list = _parse_num_gpus(args.num_gpus)
-    # If user explicitly passed the subcommand --num-replicas, prefer it
-    if getattr(args, "num_replicas", None) is not None:
-        num_replicas_list = [int(args.num_replicas)]
+    # If user explicitly passed the subcommand --num-replicas, prefer it. Defensively
+    # enforce >=1 here since validate_args() (which now owns that check, see
+    # validate_num_replicas_against_hardware) isn't on this code path.
+    nr_override = getattr(args, "num_replicas", None)
+    if nr_override is not None:
+        if nr_override < 1:
+            raise SystemExit(
+                f"--num-replicas must be >= 1 (or omitted to use --num-gpus), got {nr_override}"
+            )
+        num_replicas_list = [int(nr_override)]
 
     init_config()
     apply_args_to_config(args)
