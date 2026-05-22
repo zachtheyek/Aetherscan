@@ -55,7 +55,9 @@ def _detect_num_replicas(args: argparse.Namespace) -> int | None:
 
     Resolution order:
     1. `args.num_replicas` if the user passed --num-replicas (returned as-is, even if
-       invalid; the <= 0 check in `collect_validation_errors` will flag it separately).
+       invalid; the >= 1 and <= num_gpus checks live in
+       :func:`validate_num_replicas_against_hardware`, which `validate_args` invokes
+       before `collect_validation_errors`).
     2. `config.gpu.num_replicas` if set on the singleton — covers the case where it was
        set programmatically (e.g. a test) or, in inference mode, loaded from the saved
        JSON config before `validate_args` runs.

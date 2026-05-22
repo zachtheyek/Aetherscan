@@ -77,9 +77,22 @@ def setup_gpu_strategy():
 
     # Apply config.gpu.num_replicas. None means "use every visible GPU" (default);
     # a positive int restricts TF to the first N GPUs and leaves the rest untouched
-    # for other workloads. The upstream validate_num_replicas_against_hardware()
-    # already rejected any value > len(gpus), so by the time we get here `requested`
-    # is guaranteed to be None or in [1, total_gpus].
+    # for other workloads (the standard idiom for "use only K of the cluster's M
+    # GPUs" — set_visible_devices below is what wires it up).
+    #
+    # `requested < total_gpus` is a supported configuration, not an error: the user
+    # is deliberately reserving the remaining cards (other workloads, debugging,
+    # single-GPU correctness validation on Blackwell — see docs/BLACKWELL_MIGRATION
+    # fallback option 4). We don't fail or warn — just restrict TF and log which
+    # devices were left out.
+    #
+    # The opposite case (`requested > total_gpus`) is fatal and is rejected upstream
+    # by cli.py:validate_num_replicas_against_hardware. Catching it at validate_args
+    # time (rather than here) means the cross-replica divisibility checks in
+    # collect_validation_errors always run against the same replica count the
+    # strategy will actually use — propagating batch/sample sizes that were
+    # validated against the wrong divisor would silently corrupt training. By the
+    # time we get here `requested` is guaranteed to be None or in [1, total_gpus].
     total_gpus = len(gpus)
     requested = config.gpu.num_replicas
     if requested is not None and requested < total_gpus:
