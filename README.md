@@ -359,6 +359,8 @@ Aetherscan uses a hierarchical configuration system with dataclass-based configs
 
 At runtime, the singleton `Config` instance can be accessed via `get_config()` and modified programmatically.
 
+Read the [docs](/docs/CONFIG_AND_CLI.md) to learn more.
+
 ### Top-Level Help
 
 Aetherscan dispatches to one of two subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py top` (container) or `PYTHONPATH=src python utils/print_cli_help.py top` (source).
