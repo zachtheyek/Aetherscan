@@ -202,8 +202,12 @@ Three things to know:
 
 1. **`collect_validation_errors(args, num_replicas)`** returns a list of structured
    `ValidationError` objects (with `field`, `current`, `message`, `fix_kind`, ...). The
-   thin `validate_args` wrapper turns the list into a `ValueError`. This split exists so
-   `utils/find_optimal_configs.py` can post-process the violations and propose fixes.
+   `validate_args` wrapper turns the list into a `ValueError`, and uses the proposer
+   surface colocated in `cli.py` (`propose_simple_fix`, `_solve_cross_param_constraints`)
+   to append a `Suggested fixes:` block to the message. The standalone
+   [`utils/find_optimal_configs.py`](#diagnosing-config-issues-with-find_optimal_configspy)
+   script exercises the same proposer for ad-hoc "what config would work on N GPUs?"
+   queries.
 
 2. **`num_replicas` is determined ahead of time** by `_detect_num_replicas(args)`:
    `args.num_replicas` if the user passed `--num-replicas`, else
@@ -262,6 +266,46 @@ When adding `--my-new-flag`:
 
 > [!NOTE]
 > Once your PR merges to `master`, the [`claude-update-docs`](../.github/workflows/claude-update-docs.yml) action picks up CLI changes and regenerates the **CLI Reference** section in `README.md` by running `PYTHONPATH=src python utils/print_cli_help.py all`. You don't need to hand-edit the help blocks.
+
+## Diagnosing config issues with `find_optimal_configs.py`
+
+[`utils/find_optimal_configs.py`](../utils/find_optimal_configs.py) is a standalone
+diagnostic that validates the singleton config (defaults plus CLI overrides) against
+`collect_validation_errors` and proposes a coordinated fix for each violation. The
+proposer surface itself lives in `cli.py` (`propose_simple_fix`,
+`_solve_cross_param_constraints`, `_check_cross_constraints`), so the script and
+`validate_args` share the same suggestion logic — the script is just the CLI/printing
+wrapper around it.
+
+**When to reach for it**:
+
+- `validate_args` rejected your config and the inline `Suggested fixes:` block isn't
+  enough — `find_optimal_configs.py` prints the full violation list, the grid-search
+  delta table for cross-replica patches, and every proposed CLI flag.
+- You're exploring ahead of time: "what would work on 4 _and_ 6 GPUs?" Pass
+  `--num-gpus 4,6` and the cross-replica solver finds a six-tuple of batch/sample
+  parameters that satisfies the constraints under both replica counts simultaneously.
+- You're on a dev box without TensorFlow. The script never touches TF — cross-replica
+  divisibility checks run against the `--num-gpus` list directly.
+
+**Why it exists**: many cross-replica violations (e.g. `effective_batch_size` divisible
+by `per_replica_batch_size * num_replicas`) can't be fixed by clamping one field — the
+six interdependent batch/sample params have to move together. The bounded grid search
+minimizes L1 distance to the current values so suggestions stay close to what the user
+asked for.
+
+Examples (from the script's docstring):
+
+```bash
+# Check default config against a 4-GPU setup
+python utils/find_optimal_configs.py --num-gpus 4 train
+
+# Override --effective-batch-size and search for a fix valid on both 4 and 6 GPUs
+python utils/find_optimal_configs.py --num-gpus 4,6 train --effective-batch-size 3072
+
+# Check inference defaults with an invalid --overlap-fraction
+python utils/find_optimal_configs.py inference --overlap-fraction 1.5
+```
 
 ## Auditing for drift
 
