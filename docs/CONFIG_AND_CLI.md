@@ -20,19 +20,29 @@ exist precisely so that one mode's parameters can't silently contaminate the oth
 sys.argv
    │
    ▼
-parse_args()         ── argparse picks one subparser; args.command set
+parse_args()                   ── argparse picks one subparser; args.command set
    │
    ▼
-validate_args(args)  ── raises ValueError on any failure (no mutation)
+apply_saved_config_to_config   ── inference + --config-path only: layers the saved
+   │                              JSON onto the singleton so it becomes the new
+   │                              "defaults" validate_args sees via _resolve
+   ▼
+validate_args(args)            ── raises ValueError on any failure (no mutation)
    │
    ▼
-apply_args_to_config ── writes non-None args onto the Config singleton
-   │
+apply_args_to_config           ── writes non-None args onto the Config singleton
+   │                              (CLI overrides win over saved config)
    ▼
 init_db / setup_gpu_strategy / ...
    │
    ▼
 train_command() | inference_command()
+```
+
+Priority order at the time `validate_args` runs:
+
+```
+defaults  <  saved config (inference + --config-path only)  <  CLI args
 ```
 
 ## The configuration singleton
@@ -197,6 +207,14 @@ developer accidentally writing `config.inference.X` inside `train.py`).
 `validate_args` runs **before** `apply_args_to_config`. It reads `args` and merges with
 config defaults via the `_resolve(args, arg_name, default)` helper, so checks see the
 effective value the pipeline would use even when a flag is omitted.
+
+In inference mode, `apply_saved_config_to_config(args.config_path)` runs immediately
+after `parse_args` and before `validate_args` — so by the time validation kicks in,
+the saved JSON's fields have already become the singleton's "defaults" and `_resolve`
+returns the merged saved+CLI view. This closes the loop on `--config-path`: prior to
+this hook the flag was accepted, stored, and serialized at exit but never actually
+applied at runtime, which meant `validate_args` was checking dataclass defaults rather
+than the values inference would actually use.
 
 Three things to know:
 

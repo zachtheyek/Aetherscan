@@ -5,10 +5,11 @@ CLI argument parsing for Aetherscan Pipeline
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from itertools import product
 from typing import Any
 
@@ -718,6 +719,52 @@ def _add_inference_flags_to(parser):
         default=None,
         help="Tag for current pipeline run. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
     )
+
+
+def apply_saved_config_to_config(config_path: str) -> None:
+    """Layer a saved JSON config (e.g. from a prior training run) onto the singleton.
+
+    Used in inference mode to make `--config-path my_run.json` actually take effect:
+    the saved file's values become the new "defaults" that `validate_args` sees via
+    `_resolve`, and any CLI flags the user also passes will override them in the
+    subsequent `apply_args_to_config` call.
+
+    Priority order ends up as:
+
+        defaults  <  saved config  <  CLI args
+
+    For each top-level key in the JSON the corresponding sub-dataclass on the
+    singleton is located by name (`data`, `inference`, `gpu`, ...) and the saved
+    fields are written via setattr. Unknown keys/fields are skipped to stay
+    forward-compat with newer/older saved configs. Top-level scalar entries
+    (`data_path`, `model_path`, `output_path`) are applied directly.
+
+    Raises `ValueError` if the file is missing or malformed — caught by main.py's
+    wrapper alongside `validate_args` failures.
+    """
+    if not os.path.exists(config_path):
+        raise ValueError(f"--config-path: file does not exist on disk: {config_path}")
+    try:
+        with open(config_path) as f:
+            saved = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--config-path: {config_path} is not valid JSON: {exc}") from exc
+
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+
+    for key, value in saved.items():
+        target = getattr(config, key, None)
+        if target is None:
+            continue
+        if is_dataclass(target) and isinstance(value, dict):
+            for sub_key, sub_val in value.items():
+                if hasattr(target, sub_key):
+                    setattr(target, sub_key, sub_val)
+        else:
+            # Top-level scalar (data_path, model_path, output_path, ...).
+            setattr(config, key, value)
 
 
 def apply_args_to_config(args: argparse.Namespace) -> None:

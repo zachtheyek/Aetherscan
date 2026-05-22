@@ -17,7 +17,12 @@ import numpy as np
 import tensorflow as tf
 from dotenv import find_dotenv, load_dotenv
 
-from aetherscan.cli import apply_args_to_config, setup_argument_parser, validate_args
+from aetherscan.cli import (
+    apply_args_to_config,
+    apply_saved_config_to_config,
+    setup_argument_parser,
+    validate_args,
+)
 from aetherscan.config import get_config, init_config
 from aetherscan.db import init_db
 from aetherscan.inference import run_inference_pipeline
@@ -500,6 +505,23 @@ def main():
         # Here, we simply let the original traceback propagate by re-raising
         # so cleanup handlers still run via atexit
         raise
+
+    # Inference mode: if the user pointed --config-path at a saved JSON config,
+    # layer its values onto the singleton *before* validate_args runs. That way
+    # validate_args sees the merged (saved + CLI) view via _resolve, and any
+    # invariants that involve fields stored in the saved config (e.g. width_bin /
+    # stamp_width / latent_dim / dense_layer_size) are checked against the actual
+    # values inference will use rather than the dataclass defaults. Train mode
+    # is unaffected.
+    if args.command == "inference" and getattr(args, "config_path", None) is not None:
+        try:
+            apply_saved_config_to_config(args.config_path)
+            logger.info(f"Saved config loaded from {args.config_path}")
+        except Exception as e:
+            parser.print_help()
+            logger.error(f"Failed to load saved config: {e}")
+            logger.error("See usage")
+            sys.exit(1)
 
     # Validate arguments (handles everything else parse_args() missed)
     try:
