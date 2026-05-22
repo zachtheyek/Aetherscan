@@ -75,34 +75,23 @@ def setup_gpu_strategy():
         logger.warning("No GPUs detected, running on CPU")
         return None
 
-    # Apply config.gpu.num_replicas: None means "use every visible GPU" (default), a
-    # positive int restricts TF to the first N GPUs and leaves the rest untouched for
-    # other workloads. A value larger than the node's actual GPU count is fatal here
-    # rather than silently downgraded — the upstream validate_args() ran against the
-    # user-supplied num_replicas, so honoring a smaller count at runtime would mean
-    # propagating batch/sample sizes that were validated against the wrong divisor.
+    # Apply config.gpu.num_replicas. None means "use every visible GPU" (default);
+    # a positive int restricts TF to the first N GPUs and leaves the rest untouched
+    # for other workloads. The upstream validate_num_replicas_against_hardware()
+    # already rejected any value > len(gpus), so by the time we get here `requested`
+    # is guaranteed to be None or in [1, total_gpus].
     total_gpus = len(gpus)
     requested = config.gpu.num_replicas
-    if requested is not None:
-        if requested > total_gpus:
-            logger.error(
-                f"--num-replicas={requested} exceeds the number of GPUs available on this "
-                f"node ({total_gpus}). Re-run with --num-replicas <= {total_gpus} (or omit "
-                f"the flag to use all available GPUs). Aborting before strategy "
-                f"construction to avoid propagating batch/sample sizes that were validated "
-                f"against the wrong replica count."
-            )
-            sys.exit(1)
-        if requested < total_gpus:
-            # set_visible_devices must run before any GPU memory-growth or logical-device
-            # call, since those initialize the GPU runtime and freeze the visible set.
-            tf.config.set_visible_devices(gpus[:requested], "GPU")
-            gpus = gpus[:requested]
-            logger.info(
-                f"Restricting TF to {requested} of {total_gpus} GPUs "
-                f"(per config.gpu.num_replicas={requested}); GPUs "
-                f"{list(range(requested, total_gpus))} are left untouched."
-            )
+    if requested is not None and requested < total_gpus:
+        # set_visible_devices must run before any GPU memory-growth or logical-device
+        # call, since those initialize the GPU runtime and freeze the visible set.
+        tf.config.set_visible_devices(gpus[:requested], "GPU")
+        gpus = gpus[:requested]
+        logger.info(
+            f"Restricting TF to {requested} of {total_gpus} GPUs "
+            f"(per config.gpu.num_replicas={requested}); GPUs "
+            f"{list(range(requested, total_gpus))} are left untouched."
+        )
 
     try:
         for gpu in gpus:
@@ -303,32 +292,10 @@ def inference_command():
     if config is None:
         raise ValueError("get_config() returned None")
 
-    # Sanity check
-    if not all(
-        [
-            config.inference.encoder_path,
-            config.inference.rf_path,
-            config.inference.config_path,
-        ]
-    ):
-        logger.error("Encoder, RF, or config path not specified")
-        sys.exit(1)
-
+    # Required artifacts (encoder/rf/config paths) and stamp_width == width_bin
+    # are enforced upstream by collect_validation_errors() in cli.py, so by the
+    # time inference_command() runs those preconditions are guaranteed to hold.
     # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
-
-    # If inference_files is set, the energy detection preprocessing pipeline runs
-    # before inference; stamp_width must match the downstream width_bin so the
-    # extracted (n_hits, 6, 16, stamp_width) tensor is shaped correctly for the
-    # downsample + log-norm path.
-    if (
-        config.data.inference_files is not None
-        and config.inference.stamp_width != config.data.width_bin
-    ):
-        logger.error(
-            f"inference.stamp_width ({config.inference.stamp_width}) must equal "
-            f"data.width_bin ({config.data.width_bin}) when --inference-files is set"
-        )
-        sys.exit(1)
 
     logger.info("Configuration:")
     logger.info(f"  Data path: {config.data_path}")

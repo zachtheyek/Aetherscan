@@ -983,21 +983,11 @@ def collect_validation_errors(
     cmd = getattr(args, "command", None)
     errors: list[ValidationError] = []
 
-    # COMMON CHECKS (apply regardless of subcommand)
-    # --num-replicas must be a positive int (or omitted). 0/negative would silently divide
-    # batch sizes by 0 below and is meaningless at strategy-construction time. Omit the
-    # flag (or set config.gpu.num_replicas=None) to use every available GPU.
-    nr_arg = getattr(args, "num_replicas", None)
-    if nr_arg is not None and nr_arg <= 0:
-        errors.append(
-            ValidationError(
-                field="gpu.num_replicas",
-                current=nr_arg,
-                message=f"--num-replicas must be >= 1 (or omitted to use all available GPUs), got {nr_arg}",
-                fix_kind="clamp_low",
-                min_val=1,
-            )
-        )
+    # --num-replicas validation (>= 1 and <= available GPUs) is performed upstream
+    # by validate_num_replicas_against_hardware(), which validate_args() calls before
+    # collect_validation_errors(). By the time we get here, num_replicas is known to
+    # be a sane positive int (or None on a no-GPU dev box, in which case cross-
+    # replica divisibility checks are skipped further down).
 
     # Checks below are ordered to follow the parser sections in _add_train_flags_to /
     # _add_inference_flags_to, which themselves mirror the sub-dataclass order in
@@ -1356,8 +1346,10 @@ def collect_validation_errors(
                     "--num-replicas explicitly to run them."
                 )
             elif num_replicas < 1:
-                # The common-checks block already emitted a ValidationError for the
-                # invalid value; just skip the cross-replica section to avoid div-by-zero.
+                # validate_num_replicas_against_hardware would have raised before we
+                # got here for a real pipeline invocation. Reachable only via direct
+                # callers (e.g. utils/find_optimal_configs.py) that bypass validate_args;
+                # skip the cross-replica section to avoid div-by-zero.
                 pass
             else:
                 train_samples = nsb * tvs
@@ -1507,6 +1499,36 @@ def collect_validation_errors(
     # INFERENCE-MODE CHECKS — match _add_inference_flags_to layout
     # ============================================================================
     if cmd == "inference":
+        # ----------------------------------------------------- Required inference artifacts
+        # Encoder, RF, and config paths are mandatory for any inference run. Checked
+        # here (rather than in inference_command at runtime) so failures surface during
+        # validate_args and the structured ValidationErrors flow into the helpful-fix
+        # proposer.
+        for arg_name, cfg_attr, flag in (
+            ("encoder_path", "encoder_path", "--encoder-path"),
+            ("rf_path", "rf_path", "--rf-path"),
+            ("config_path", "config_path", "--config-path"),
+        ):
+            path = _resolve(args, arg_name, getattr(config.inference, cfg_attr))
+            if path is None:
+                errors.append(
+                    ValidationError(
+                        field=f"inference.{cfg_attr}",
+                        current=None,
+                        message=f"{flag} is required for inference; pass it on the CLI or set inference.{cfg_attr} in the saved config",
+                        fix_kind="file_exists",
+                    )
+                )
+            elif not os.path.exists(path):
+                errors.append(
+                    ValidationError(
+                        field=f"inference.{cfg_attr}",
+                        current=path,
+                        message=f"{flag}: file does not exist on disk: {path}",
+                        fix_kind="file_exists",
+                    )
+                )
+
         # -------------------------------------------------------------------- Data
         data_path = _resolve(args, "data_path", config.data_path)
         test_files = _resolve(args, "test_files", config.data.test_files) or []
@@ -1549,9 +1571,27 @@ def collect_validation_errors(
             )
 
         # -------------------------------------------- Energy detection preprocessing
-        # NOTE: come back to this later — stamp_width == width_bin is validated at
-        # runtime in inference_command, where both are resolved together.
+        # When inference_files is set the energy-detection pipeline runs before
+        # inference; stamp_width must equal data.width_bin so the extracted
+        # (n_hits, 6, 16, stamp_width) tensor matches the downstream downsample +
+        # log-norm path.
         if inf_files is not None:
+            sw_inf = _resolve(args, "stamp_width", config.inference.stamp_width)
+            wb_inf = _resolve(args, "width_bin", config.data.width_bin)
+            if sw_inf is not None and wb_inf is not None and sw_inf != wb_inf:
+                errors.append(
+                    ValidationError(
+                        field="inference.stamp_width",
+                        current=sw_inf,
+                        message=(
+                            f"--stamp-width ({sw_inf}) must equal --width-bin ({wb_inf}) "
+                            "when --inference-files is set"
+                        ),
+                        fix_kind="range",
+                        min_val=wb_inf,
+                        max_val=wb_inf,
+                    )
+                )
             group_cols = _resolve(
                 args, "cadence_group_by_cols", config.inference.cadence_group_by_cols
             )
@@ -1684,14 +1724,66 @@ def collect_validation_errors(
     return errors
 
 
+def validate_num_replicas_against_hardware(
+    args: argparse.Namespace, num_replicas: int | None
+) -> None:
+    """Fail fast if --num-replicas is invalid against the host's GPU count.
+
+    Two checks live here rather than in `collect_validation_errors`:
+
+    1. `--num-replicas >= 1` — a 0/negative value would silently divide batch sizes
+       by 0 in the cross-replica checks downstream and is meaningless at strategy-
+       construction time.
+    2. `--num-replicas <= len(tf.config.list_physical_devices('GPU'))` — propagating
+       batch/sample sizes validated against the wrong replica count would silently
+       corrupt the run. Used to live in `main.py:setup_gpu_strategy`, but raising it
+       to validate_args time means cross-replica divisibility checks always run
+       against the same replica count the strategy will actually use, and
+       inference_command / train_command can assume their precondition holds.
+
+    Lazy-imports TF for the GPU count so dev boxes / utility scripts (which never
+    call this — they use `collect_validation_errors` directly) don't pay the TF
+    init cost. If TF is unavailable or reports zero GPUs, the GPU-count check is
+    skipped silently — the run will fail later in setup_gpu_strategy anyway.
+
+    Raises ValueError on either failure; caught by main.py's wrapper around
+    validate_args.
+    """
+    nr_arg = getattr(args, "num_replicas", None)
+    if nr_arg is not None and nr_arg <= 0:
+        raise ValueError(
+            f"--num-replicas must be >= 1 (or omitted to use all available GPUs), got {nr_arg}"
+        )
+
+    if num_replicas is None:
+        return
+    try:
+        import tensorflow as tf  # noqa: PLC0415
+
+        gpus = tf.config.list_physical_devices("GPU")
+    except Exception:
+        return
+    if not gpus:
+        return
+    total = len(gpus)
+    if num_replicas > total:
+        raise ValueError(
+            f"--num-replicas={num_replicas} exceeds the number of GPUs available on "
+            f"this node ({total}). Re-run with --num-replicas <= {total} (or omit the "
+            f"flag to use all available GPUs)."
+        )
+
+
 def validate_args(args: argparse.Namespace) -> None:
     """
     Pre-flight semantic and cross-parameter validation for the parsed CLI namespace, run before
-    apply_args_to_config(). Delegates to collect_validation_errors() and raises ValueError if
-    any failures came back. Syntax and type checks are handled earlier by argparse itself in
-    ArgumentParser.parse_args (called from main.py:main).
+    apply_args_to_config(). Delegates to validate_num_replicas_against_hardware() and
+    collect_validation_errors() and raises ValueError if any failures came back. Syntax and
+    type checks are handled earlier by argparse itself in ArgumentParser.parse_args (called
+    from main.py:main).
     """
     num_replicas = _detect_num_replicas(args)
+    validate_num_replicas_against_hardware(args, num_replicas)
     errors = collect_validation_errors(args, num_replicas)
     if errors:
         raise ValueError(
