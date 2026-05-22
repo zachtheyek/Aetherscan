@@ -331,18 +331,16 @@ PYTHONPATH=src python -m aetherscan.main inference \
     --save-tag run_v1
 ```
 
-**Inference with NCCL / async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
+**Inference with async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
 
 ```bash
 # Container
 ./utils/run_container.sh python -m aetherscan.main inference \
-    --nccl-num-packs 1 \
     --no-async-allocator \
     --save-tag run_v1
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
-    --nccl-num-packs 1 \
     --no-async-allocator \
     --save-tag run_v1
 ```
