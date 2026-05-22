@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from aetherscan.config import get_config, init_config
+from aetherscan.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -44,20 +44,29 @@ class ValidationError:
     extra: dict = field(default_factory=dict)
 
 
-# NOTE: come back to this later (why is num_replicas handled differently to the other flags? why do we take the user's input at face value here instead of checking directly whether they're num_replicas value is consistent with our constraints -- 0 <= num_replicas <= num_gpus? what happens when this function returns None, and how is that functionally different from the config specifying None?)
+def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
+    """Return `args.<arg_name>` if present and not None, otherwise `default` (typically the config value at startup time)."""
+    val = getattr(args, arg_name, None)
+    return val if val is not None else default
+
+
 def _detect_num_replicas(args: argparse.Namespace) -> int | None:
     """Return the replica count to validate cross-replica constraints against.
 
     Resolution order:
     1. `args.num_replicas` if the user passed --num-replicas (returned as-is, even if
        invalid; the <= 0 check in `collect_validation_errors` will flag it separately).
-    2. `len(tf.config.list_physical_devices('GPU'))` if TF is importable and reports at
+    2. `config.gpu.num_replicas` if set on the singleton — covers the case where it was
+       set programmatically (e.g. a test) or, in inference mode, loaded from the saved
+       JSON config before `validate_args` runs.
+    3. `len(tf.config.list_physical_devices('GPU'))` if TF is importable and reports at
        least one GPU.
-    3. None — TF unavailable (e.g. utility scripts on a dev box) or TF reports zero
+    4. None — TF unavailable (e.g. utility scripts on a dev box) or TF reports zero
        GPUs. Cross-replica checks are skipped in this case with a logged warning;
-       runtime will fail later in setup_gpu_strategy if it really needed a GPU.
+       runtime will fail later in train_command or inference_command.
     """
-    val = getattr(args, "num_replicas", None)
+    config = get_config()
+    val = _resolve(args, "num_replicas", config.gpu.num_replicas if config else None)
     if val is not None:
         return int(val)
     try:
@@ -70,12 +79,6 @@ def _detect_num_replicas(args: argparse.Namespace) -> int | None:
         return len(gpus) if gpus else None
     except Exception:
         return None
-
-
-def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
-    """Return `args.<arg_name>` if present and not None, otherwise `default` (typically the config value at startup time)."""
-    val = getattr(args, arg_name, None)
-    return val if val is not None else default
 
 
 def setup_argument_parser() -> argparse.ArgumentParser:
@@ -973,8 +976,10 @@ def collect_validation_errors(
     validate_args() is the thin wrapper that turns this list into a ValueError.
     """
 
-    init_config()
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+
     cmd = getattr(args, "command", None)
     errors: list[ValidationError] = []
 
