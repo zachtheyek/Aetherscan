@@ -219,6 +219,9 @@ See the [Usage Examples](#usage-examples) section below for further ways to invo
 
 ### Training
 
+> [!TIP]
+> The examples below cover the most common scenarios. For the full set of available flags, see [Train Command Help](#train-command-help) in the CLI Reference.
+
 **Default training run**
 
 ```bash
@@ -280,6 +283,9 @@ PYTHONPATH=src python -m aetherscan.main train \
 ```
 
 ### Inference
+
+> [!TIP]
+> The examples below cover the most common scenarios. For the full set of available flags, see [Inference Command Help](#inference-command-help) in the CLI Reference.
 
 **Default inference run**
 
