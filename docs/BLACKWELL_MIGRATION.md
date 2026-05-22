@@ -87,7 +87,7 @@ with tf.device('/GPU:0'):
 "
 ```
 
-Expected on Blackwell: 5 GPUs listed, finite sum, no `PTX` warnings. Expected on Ampere: 6 GPUs listed, finite sum, the three benign `cuFFT/cuDNN/cuBLAS` "already registered" lines from NGC's CUDA plugin loader (ignore them).
+Expected: TF 2.17, CUDA built True, GPUs listed, finite sum, no `PTX` warnings, and the three benign `cuFFT/cuDNN/cuBLAS` "already registered" lines from NGC's CUDA plugin loader (ignore them).
 
 ### 3. Ampere conda env (alternative path)
 
