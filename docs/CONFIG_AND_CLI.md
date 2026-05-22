@@ -7,14 +7,14 @@ exist precisely so that one mode's parameters can't silently contaminate the oth
 
 ## TL;DR
 
-| Layer | What it does | Source of truth |
-| --- | --- | --- |
-| `src/aetherscan/config.py` | Defines the `Config` singleton and its sub-dataclasses (`TrainingConfig`, `InferenceConfig`, `GPUConfig`, ...). Holds **every** parameter with a default value. | `Config` instance returned by `get_config()` |
-| `_add_train_flags_to(parser)` / `_add_inference_flags_to(parser)` (cli.py) | Register flags onto a given parser. Reused by the main pipeline and by `utils/find_optimal_configs.py`. | Single source for flag names, types, help text |
-| `setup_argument_parser()` (cli.py) | Builds the top-level parser with `train` and `inference` subparsers and delegates flag registration to the helpers above. | argparse `subparsers` object |
-| `apply_args_to_config(args)` (cli.py) | Mutates the singleton in place with any non-None overrides on `args`. Three patterns (A/B/C) below. | The singleton after this call |
-| `collect_validation_errors(args, num_replicas)` / `validate_args(args)` (cli.py) | Cross-parameter and bounds validation. Returns structured `ValidationError`s; the wrapper raises `ValueError`. | The pre-apply args (validation runs before `apply_args_to_config`) |
-| `train_command()` / `inference_command()` (main.py) | Read their own slice of the singleton and run. | `config.training.*`, `config.inference.*` |
+| Layer                                                                            | What it does                                                                                                                                                    | Source of truth                                                    |
+| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `src/aetherscan/config.py`                                                       | Defines the `Config` singleton and its sub-dataclasses (`TrainingConfig`, `InferenceConfig`, `GPUConfig`, ...). Holds **every** parameter with a default value. | `Config` instance returned by `get_config()`                       |
+| `_add_train_flags_to(parser)` / `_add_inference_flags_to(parser)` (cli.py)       | Register flags onto a given parser. Reused by the main pipeline and by `utils/find_optimal_configs.py`.                                                         | Single source for flag names, types, help text                     |
+| `setup_argument_parser()` (cli.py)                                               | Builds the top-level parser with `train` and `inference` subparsers and delegates flag registration to the helpers above.                                       | argparse `subparsers` object                                       |
+| `apply_args_to_config(args)` (cli.py)                                            | Mutates the singleton in place with any non-None overrides on `args`. Three patterns (A/B/C) below.                                                             | The singleton after this call                                      |
+| `collect_validation_errors(args, num_replicas)` / `validate_args(args)` (cli.py) | Cross-parameter and bounds validation. Returns structured `ValidationError`s; the wrapper raises `ValueError`.                                                  | The pre-apply args (validation runs before `apply_args_to_config`) |
+| `train_command()` / `inference_command()` (main.py)                              | Read their own slice of the singleton and run.                                                                                                                  | `config.training.*`, `config.inference.*`                          |
 
 ```
 sys.argv
@@ -44,19 +44,19 @@ runtime lives somewhere on this object, with a sensible default.
 The sub-dataclasses are grouped by **what subsystem owns the parameter**, not by which
 subcommand uses it:
 
-| Sub-dataclass | Owns |
-| --- | --- |
-| `DBConfig` | SQLite writer timeouts, buffer sizes |
-| `ManagerConfig` | Multiprocessing pool sizing |
-| `MonitorConfig` | Resource-monitor cadence and timeouts |
-| `LoggerConfig` | Console / file / Slack log routing |
-| `BetaVAEConfig` | Beta-VAE model hyperparameters |
-| `RandomForestConfig` | RF classifier hyperparameters |
-| `GPUConfig` | TF strategy: replica count, memory growth, NCCL packs, allocator toggles |
-| `DataConfig` | Data shape, file lists, chunk sizes |
-| `TrainingConfig` | Anything specific to the `train` command — sample counts, batch sizes, LR schedule, curriculum, latent-viz, retries |
-| `InferenceConfig` | Anything specific to the `inference` command — encoder/RF paths, classification threshold, energy-detection preprocessing, retries |
-| `CheckpointConfig` | Load/save tags, start round |
+| Sub-dataclass        | Owns                                                                                                                               |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `DBConfig`           | SQLite writer timeouts, buffer sizes                                                                                               |
+| `ManagerConfig`      | Multiprocessing pool sizing                                                                                                        |
+| `MonitorConfig`      | Resource-monitor cadence and timeouts                                                                                              |
+| `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
+| `BetaVAEConfig`      | Beta-VAE model hyperparameters                                                                                                     |
+| `RandomForestConfig` | RF classifier hyperparameters                                                                                                      |
+| `GPUConfig`          | TF strategy: replica count, memory growth, NCCL packs, allocator toggles                                                           |
+| `DataConfig`         | Data shape, file lists, chunk sizes                                                                                                |
+| `TrainingConfig`     | Anything specific to the `train` command — sample counts, batch sizes, LR schedule, curriculum, latent-viz, retries                |
+| `InferenceConfig`    | Anything specific to the `inference` command — encoder/RF paths, classification threshold, energy-detection preprocessing, retries |
+| `CheckpointConfig`   | Load/save tags, start round                                                                                                        |
 
 Two important consequences:
 
@@ -84,6 +84,15 @@ def _add_train_arguments(subparsers):
 def _add_train_flags_to(parser):
     parser.add_argument("--data-path", type=str, default=None, help="...")
     # ... every train-mode flag, registered on `parser` ...
+
+
+def _add_inference_arguments(subparsers):
+    inf_parser = subparsers.add_parser("inference", help="Execute inference pipeline")
+    _add_inference_flags_to(inf_parser)
+
+def _add_inference_flags_to(parser):
+    parser.add_argument("--data-path", type=str, default=None, help="...")
+    # ... every inference-mode flag, registered on `parser` ...
 ```
 
 The `_add_*_flags_to(parser)` indirection exists so utility scripts (e.g.
@@ -116,8 +125,8 @@ guarantee — argparse simply doesn't add inference-only attributes to a train n
 
 #### Pattern B — shared flag, identical destination
 
-The flag is registered in *both* subparsers (because either mode might want to override
-it), and it routes to the *same* config field.
+The flag is registered in _both_ subparsers (because either mode might want to override
+it), and it routes to the _same_ config field.
 
 Application: same `hasattr` + `None` check; no command guard needed.
 
@@ -137,7 +146,7 @@ Current Pattern B flags:
 
 #### Pattern C — shared flag, divergent destination
 
-The flag is registered in *both* subparsers but the *destination differs* by mode. The
+The flag is registered in _both_ subparsers but the _destination differs_ by mode. The
 same `args.X` value would mean different things for train vs inference.
 
 Application: `hasattr` + `None` + an explicit `args.command` discriminator. The flag
@@ -172,16 +181,16 @@ sub-dataclass (Pattern B) instead.
 
 ## Cross-mode contamination — the four barriers
 
-| # | Barrier | What it prevents |
-| --- | --- | --- |
-| 1 | argparse subparsers | Flags unique to the unchosen mode never appear as attributes on `args` |
-| 2 | `hasattr(args, "X")` guards in `apply_args_to_config` | Even if a future refactor changes which mode owns a flag, an absent attribute is a no-op rather than an `AttributeError` |
-| 3 | `getattr(args, "command", None) == "train" \| "inference"` | The three Pattern C flags route to the correct config section based on mode |
-| 4 | Dataclass namespacing (`config.training.X` vs `config.inference.X`) | Pipeline code physically can't read an inference value as a training one — they have different fully-qualified names |
+| #   | Barrier                                                             | What it prevents                                                                                                         |
+| --- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| 1   | argparse subparsers                                                 | Flags unique to the unchosen mode never appear as attributes on `args`                                                   |
+| 2   | `hasattr(args, "X")` guards in `apply_args_to_config`               | Even if a future refactor changes which mode owns a flag, an absent attribute is a no-op rather than an `AttributeError` |
+| 3   | `getattr(args, "command", None) == "train" \| "inference"`          | The three Pattern C flags route to the correct config section based on mode                                              |
+| 4   | Dataclass namespacing (`config.training.X` vs `config.inference.X`) | Pipeline code physically can't read an inference value as a training one — they have different fully-qualified names     |
 
 Each layer addresses a different failure mode. Together they make cross-mode
 contamination essentially impossible without an explicit code mistake (e.g., a
-developer writing `config.inference.X` inside `train.py`).
+developer accidentally writing `config.inference.X` inside `train.py`).
 
 ## The validation layer
 
