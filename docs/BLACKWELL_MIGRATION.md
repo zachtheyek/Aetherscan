@@ -145,13 +145,14 @@ The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as 
 
 ## New CLI flags
 
-Three flags wire onto `GPUConfig` (in [`src/aetherscan/config.py`](../src/aetherscan/config.py)). All accept the dataclass default when omitted:
+Four flags wire onto `GPUConfig` (in [`src/aetherscan/config.py`](../src/aetherscan/config.py)). All accept the dataclass default when omitted:
 
-| Flag                                         | Default      | Notes                                                                                                                    |
-| -------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `--gpu-memory-limit-mb`                      | unset (None) | Per-GPU memory cap in MiB. Unset = memory growth only. Set to `14000` on Ampere to match legacy behavior.                |
-| `--nccl-num-packs`                           | `2`          | num_packs for NCCL/HierarchicalCopy all-reduce. Try `1` or `4` if NCCL is unstable on a 5-GPU Blackwell NVLink topology. |
-| `--async-allocator` / `--no-async-allocator` | enabled      | Toggles `TF_GPU_ALLOCATOR=cuda_malloc_async`. Disable as a workaround for the NGC 25.02 multi-GPU OOM bug.               |
+| Flag                                         | Default      | Notes                                                                                                                                                                                       |
+| -------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--num-replicas`                             | unset (None) | Number of GPUs to pin TF to. Unset = use every visible GPU. Set to `1` for the single-GPU Blackwell fallback (see [Fallback options](#fallback-options) point 4); must satisfy `1 <= N <= len(physical_devices)`. |
+| `--gpu-memory-limit-mb`                      | unset (None) | Per-GPU memory cap in MiB. Unset = memory growth only. Set to `14000` on Ampere to match legacy behavior.                                                                                   |
+| `--nccl-num-packs`                           | `2`          | num_packs for NCCL/HierarchicalCopy all-reduce. Try `1` or `4` if NCCL is unstable on a 5-GPU Blackwell NVLink topology.                                                                    |
+| `--async-allocator` / `--no-async-allocator` | enabled      | Toggles `TF_GPU_ALLOCATOR=cuda_malloc_async`. Disable as a workaround for the NGC 25.02 multi-GPU OOM bug.                                                                                  |
 
 ## Debugging
 
@@ -204,7 +205,7 @@ If NGC 25.02 keeps misbehaving, escalate in this order:
 1. `--no-async-allocator` (cheapest, often sufficient).
 2. `--nccl-num-packs 1` or `4` (5-GPU NVLink topology is unusual).
 3. Rebuild against NGC 25.01 — same TF, one minor back; catches 25.02 regressions. Update the `From:` line in `aetherscan.def`.
-4. Single-GPU fallback on Blackwell — one 96 GB card still beats 5x A4000 aggregate for correctness validation.
+4. Single-GPU fallback on Blackwell — one 96 GB card still beats 5x A4000 aggregate for correctness validation. Pin to a single GPU with `--num-replicas 1`; TF visibility is restricted to the first physical device and the remaining cards are left untouched for other workloads.
 5. Fall back to the Ampere conda env for any work that doesn't need Blackwell. With the container as the canonical runtime on both clusters, the conda env is now a fallback rather than a parallel workflow.
 6. Build TF 2.22 from source with sm_86 + sm_120 targets (1–2 days of build-system wrestling). Mostly obsolete now that one container runs on both clusters via forward compat; keep as a last resort if NGC 25.02 ever becomes unsupportable.
 
