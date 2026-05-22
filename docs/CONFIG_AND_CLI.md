@@ -260,6 +260,9 @@ When adding `--my-new-flag`:
    `find_optimal_configs.py` can propose a fix.
 5. **Read the field** in the pipeline via `config.<section>.my_new_field`.
 
+> [!NOTE]
+> Once your PR merges to `master`, the [`claude-update-docs`](../.github/workflows/claude-update-docs.yml) action picks up CLI changes and regenerates the **CLI Reference** section in `README.md` by running `PYTHONPATH=src python utils/print_cli_help.py all`. You don't need to hand-edit the help blocks.
+
 ## Auditing for drift
 
 Two quick checks to verify no pattern violations have crept in:
