@@ -357,7 +357,7 @@ Aetherscan uses a hierarchical configuration system with dataclass-based configs
 
 At runtime, the singleton `Config` instance can be accessed via `get_config()` and modified programmatically.
 
-Read the [docs](/docs/CONFIG_AND_CLI.md) to learn more.
+Read [docs/CONFIG_AND_CLI.md](/docs/CONFIG_AND_CLI.md) to learn more.
 
 ### Top-Level Help
 

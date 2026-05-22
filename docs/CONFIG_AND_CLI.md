@@ -217,15 +217,12 @@ Three things to know:
 3. **The same mode-gating pattern applies inside validation**:
 
    ```python
-   if cmd == "train" or hasattr(args, "num_samples_beta_vae"):
+   if cmd == "train":
        # ... train-mode checks ...
 
    if cmd == "inference":
        # ... inference-mode checks ...
    ```
-
-   The `or hasattr(...)` is belt-and-suspenders — it lets `find_optimal_configs.py`
-   route correctly even if its parser someday changes how it sets `args.command`.
 
 ## Runtime dispatch (main.py)
 
@@ -250,10 +247,10 @@ When adding `--my-new-flag`:
 1. **Add the config field**, with a default, on the appropriate sub-dataclass in
    `config.py`. Update `Config.to_dict` so the field appears in serialized configs.
 2. **Register the flag** on the right helper(s) in `cli.py`:
-   - Used only by training → `_add_train_flags_to`
-   - Used only by inference → `_add_inference_flags_to`
-   - Used by both, same destination → both helpers
-   - Used by both, different destinations → both helpers (you're entering Pattern C)
+   - Used only by training → `_add_train_flags_to` (Pattern A)
+   - Used only by inference → `_add_inference_flags_to` (Pattern A)
+   - Used by both, same destination → both helpers (Pattern B)
+   - Used by both, different destinations → both helpers (Pattern C)
 3. **Wire `apply_args_to_config`** using the correct pattern:
    - Pattern A or B: one `hasattr + None` block
    - Pattern C: two blocks, each gated on `args.command`

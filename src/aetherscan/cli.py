@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 # Validation primitives are expressed as global variables and shared by
-# validate_args() and utility scripts
+# validate_args() and utility scripts (e.g. utils/find_optimal_configs.py)
 
 # Accepted formats for --load-tag and --save-tag (cli.py help strings document these)
 _TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
@@ -44,6 +44,7 @@ class ValidationError:
     extra: dict = field(default_factory=dict)
 
 
+# NOTE: come back to this later (why is num_replicas handled differently to the other flags? why do we take the user's input at face value here instead of checking directly whether they're num_replicas value is consistent with our constraints -- 0 <= num_replicas <= num_gpus? what happens when this function returns None, and how is that functionally different from the config specifying None?)
 def _detect_num_replicas(args: argparse.Namespace) -> int | None:
     """Return the replica count to validate cross-replica constraints against.
 
@@ -72,7 +73,7 @@ def _detect_num_replicas(args: argparse.Namespace) -> int | None:
 
 
 def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
-    """Return `args.<arg_name>` if present and not None, otherwise `default` (the config value)."""
+    """Return `args.<arg_name>` if present and not None, otherwise `default` (typically the config value at startup time)."""
     val = getattr(args, arg_name, None)
     return val if val is not None else default
 
