@@ -45,8 +45,13 @@ ENV/
 .nv/
 Session.vim
 
-# Claude configs
-.claude/
+# Claude configs (ignore local state, but track shared skills).
+# `!.claude/` re-includes the dir itself (overriding the global ~/.gitignore_global
+# `.claude/` rule) so git descends into it; `.claude/*` then re-ignores its contents
+# except the shared skills subtree.
+!.claude/
+.claude/*
+!.claude/skills/
 
 # Caches/backups
 .cache/

@@ -115,6 +115,7 @@ Aetherscan/
 │   ├── find_optimal_configs.py      # Per-host config helper
 │   ├── verify_train_test_files.py   # Data sanity check helper
 │   └── get_system_info.sh           # System info helper
+├── .claude/                    # Claude Code config + on-demand skills (skills/aetherscan-repo-context/SKILL.md)
 ├── .github/                    # CI/CD workflows, issue templates, etc.
 ├── .gitignore                  # Local gitignore
 ├── .pre-commit-config.yaml     # Pre-commit hook configuration
@@ -122,7 +123,7 @@ Aetherscan/
 ├── requirements-container.txt  # Pip extras layered into NGC container
 ├── environment.yml             # Conda dependencies
 ├── pyproject.toml              # Package metadata, ruff config
-├── AGENTS.md                   # AI agent guidelines
+├── AGENTS.md                   # Lean always-on agent rules
 ├── AI_POLICY.md                # AI usage policy
 ├── CITATION.cff                # Citation metadata
 ├── CODE_OF_CONDUCT.md          # Core values guidelines
