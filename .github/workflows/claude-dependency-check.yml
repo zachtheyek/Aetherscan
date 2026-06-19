@@ -1,0 +1,181 @@
+# Weekly routine check for outdated / vulnerable dependencies across the repo
+# Opens a single GitHub issue grouping findings by severity (security first)
+# Runs Monday 09:00 MYT (GMT+8) == Monday 01:00 UTC
+name: Claude Dependency Check
+
+on:
+  schedule:
+    # cron is UTC; 01:00 UTC Mon == 09:00 MYT (GMT+8) Mon
+    - cron: "0 1 * * 1"
+  # Allow manual runs (scheduled workflows only fire from the default branch)
+  workflow_dispatch:
+
+jobs:
+  claude-dependency-check:
+    runs-on: ubuntu-latest
+    # Scanning every manifest + querying registries/advisories shouldn't take more than 20 mins
+    # (refine if data shows otherwise)
+    # If Claude continues going down rabbit holes, consider refining the prompt to be more focused
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+
+    steps:
+      # Deterministic week stamp + duplicate-issue guard. Every issue this workflow opens
+      # carries the hidden marker `<!-- aetherscan-dependency-check week=<WEEK> -->`. If one
+      # already exists for this ISO week (cron double-fire or a manual re-run), skip the
+      # Claude step so we never file twice. The WEEK/DATE outputs make the title deterministic.
+      - name: Compute window and check for existing issue
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          WEEK="$(date -u +'%G-W%V')"
+          DATE="$(date -u +'%Y-%m-%d')"
+          echo "week=$WEEK" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          MARKER="<!-- aetherscan-dependency-check week=$WEEK -->"
+          if gh issue list --state open --limit 200 --json body --jq '.[].body' \
+              | grep -qF "$MARKER"; then
+            echo "An open dependency-check issue for $WEEK already exists — skipping Claude step."
+            echo "already_filed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing dependency-check issue for $WEEK — proceeding."
+            echo "already_filed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: actions/checkout@v5
+        with:
+          # Manifests are read from the working tree; no git history needed.
+          fetch-depth: 1
+
+      - name: Run Claude Dependency Check
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            ## Role
+            You are an automated dependency auditor. Once a week you scan every dependency
+            declared in this repository for available updates and known vulnerabilities, then
+            file a single routine issue summarising what you found (security first).
+
+            ## Context
+            REPO: ${{ github.repository }}
+            WEEK: ${{ steps.guard.outputs.week }}   (ISO week being analysed)
+            DATE: ${{ steps.guard.outputs.date }}
+            A deterministic pre-step already confirmed no open dependency-check issue exists
+            for WEEK, so you will not double-file — produce exactly one issue.
+
+            ## Task
+            1. Discover every dependency manifest in the repo (use Glob/Grep; don't assume the
+               list is fixed). The known ones, each a distinct ecosystem:
+               - `environment.yml` — conda packages (note channels) + a nested `pip:` block
+               - `requirements-container.txt` — pip packages
+               - `aetherscan.def` — the container base image (`From: nvcr.io/nvidia/...:<tag>`) plus any apt/pip installs
+               - `pyproject.toml` — build-system requires and tool pins (e.g. ruff)
+               - `.pre-commit-config.yaml` — hook versions (`rev:` per repo)
+               - `.github/workflows/*.yml` — pinned GitHub Action versions (`uses: owner/repo@<sha|tag>`)
+
+            2. For each declared dependency, determine:
+               - **Current vs latest STABLE version.** Consider only final/stable releases.
+                 Ignore pre-releases (alpha / beta / rc / dev) and nightly / experimental builds
+                 when deciding what's available. Resolve per ecosystem: PyPI JSON
+                 (`https://pypi.org/pypi/<pkg>/json`) for pip; the channel's API (e.g. anaconda.org)
+                 for conda; `gh api repos/<owner>/<repo>/releases/latest` (or tags) for GitHub
+                 Actions and pre-commit hooks; the NGC catalog for the container base image (best-effort).
+               - **Update type** — major / minor / patch (semver).
+               - **Recommended target (do NOT chase the bleeding edge).** For security and
+                 stability, don't recommend the absolute latest. The recommended target is the
+                 NEWER (higher version) of these two candidates:
+                   (a) the latest patch of the release line two minor versions below the latest
+                       stable (e.g. latest stable 1.8.x → target the latest 1.6.x); and
+                   (b) the latest stable release that is at least 6 months old.
+                 Still surface the absolute latest stable in the finding, but recommend the target.
+                 EXCEPTION — security overrides the lag: if the recommended target is itself
+                 affected by a known advisory, recommend the minimum version that resolves it,
+                 even if that is newer than the conservative target.
+               - **Respect documented version ceilings / ABI constraints.** Several pins carry
+                 intentional upper bounds with inline comments explaining why (e.g. `numpy<2.0`,
+                 `setuptools<81`, and the whole stack being tied to the NGC TF 2.17 ABI). Read
+                 those comments. Never recommend exceeding a documented ceiling; if a newer
+                 release would cross one, note the constraint instead of recommending the bump.
+               - **Breaking changes** — skim the changelog / release notes (WebFetch/WebSearch) and
+                 summarise anything that affects this repo's usage.
+               - **Security advisories** — known CVEs / vulnerabilities. Query the GitHub Advisory
+                 Database (`gh api graphql` `securityVulnerabilities`, or `gh api /advisories`) and/or
+                 the OSV API (`https://api.osv.dev/v1/query`) for the current pinned version.
+
+            3. Cross-manifest consistency audit. These manifests are intentionally coupled — the
+               files say so in their header comments — and drift between them is its own class of
+               finding (independent of upstream updates):
+               - The **shared application dependencies** must carry IDENTICAL version specifiers in
+                 `environment.yml` and `requirements-container.txt` (numpy, scipy, scikit-learn,
+                 scikit-image, astropy, matplotlib, joblib, setuptools, setigen, imageio,
+                 umap-learn, shap, slack-sdk, python-dotenv). Conda-only deps (h5py, hdf5plugin,
+                 psutil, pytest, ipykernel) are intentionally ABSENT from requirements-container.txt
+                 because the NGC base ships them — that is NOT drift.
+               - The **runtime stack** version must agree across `aetherscan.def` (its `From:` base
+                 image tag and `%labels` for Base / Python / TF / CUDA / cuDNN / NCCL),
+                 `environment.yml` (`tensorflow[and-cuda]==2.17.*`, `python=3.10`), and
+                 `pyproject.toml` (`requires-python`, `[tool.ruff] target-version`, and the Python /
+                 CUDA `classifiers`).
+               Report any specifier that diverges across these manifests as a "manifest drift"
+               finding — this catches the case where one manifest was bumped but its coupled
+               siblings were not.
+
+            4. Prioritise security-related updates. Group the findings by severity —
+               Critical / High / Medium / Low for anything with an advisory, then the remaining
+               plain updates grouped by major / minor / patch, and finally any manifest-drift
+               findings from Step 3.
+
+            5. Open exactly one issue:
+               - **Title** (templated — make clear it's a routine check, include the week, and a
+                 one-line headline of the findings), e.g.:
+                 `[DEPENDENCIES]: Weekly update check (${{ steps.guard.outputs.week }}) — 0 major, 4 minor, 1 security`
+               - **Body** — make the hidden marker the FIRST line so the guard can dedupe re-runs:
+                 `<!-- aetherscan-dependency-check week=${{ steps.guard.outputs.week }} -->`
+                 Then: a one-line note that this is a routine automated weekly dependency check;
+                 the severity-grouped findings; and per dependency: current → recommended target
+                 (with the absolute latest stable noted alongside), update type, breaking-change
+                 notes, and any CVEs (with links). Lead with the security section, and include a
+                 distinct "Manifest drift" section for any Step 3 inconsistencies.
+               - **If everything is already up to date and in sync**, still open the issue but keep
+                 it brief: confirm all dependencies are current, the manifests are consistent, and
+                 state the total number scanned.
+               - Try your best to apply the appropriate labels (e.g. a security label when any CVE
+                 is present); never apply the `claude` label (it re-triggers the assistant workflow).
+
+            ## Available tools
+            Manifest + changelog inspection:
+            - `Read`, `Glob`, `Grep` to enumerate and read dependency manifests and any local docs
+            - `WebFetch` to query PyPI / OSV / changelog and release-note URLs
+            - `WebSearch` to find changelogs, release notes, or advisories not at a known URL
+
+            Version + advisory lookup:
+            - `gh api` for the GitHub Advisory Database (CVEs) and for GitHub Actions / pre-commit hook releases & tags
+
+            Issue interaction:
+            - `gh label list` to discover the repo's labels before choosing which to apply
+            - `gh issue list` to sanity-check for an already-open issue (the pre-step is the primary guard)
+            - `gh issue create` to file the single dependency-check issue
+
+            ## Guidelines
+            - This is a routine, pre-sanctioned weekly maintenance check — the discussion-first rule for ad-hoc issues does not require a separate discussion thread; just say so in the body.
+            - Open exactly one issue, and only this issue. Never modify code, manifests, labels on other issues, or open a PR.
+            - Always include the `<!-- aetherscan-dependency-check week=${{ steps.guard.outputs.week }} -->` marker as the first body line — the deterministic guard relies on it.
+            - Security first: surface CVEs at the top and reflect them in the title headline.
+            - Recommend conservative, proven targets — never the absolute latest, and never a version that crosses a documented ceiling or the NGC TF 2.17 ABI (Step 2). Security advisories override the lag.
+            - Treat cross-manifest drift (Step 3) as a first-class finding, separate from upstream updates.
+            - Never apply the `claude` label. Prefer existing labels; don't invent new ones unless clearly warranted.
+            - Reference AGENTS.md for repository conventions.
+            - Your only responsibility is this weekly dependency audit. Do not do anything outside that scope.
+
+          claude_args: |
+            --allowedTools "Bash(gh api:*),Bash(gh label list:*),Bash(gh issue list:*),Bash(gh issue create:*),WebFetch,WebSearch,Read,Glob,Grep"
+            --model opus
