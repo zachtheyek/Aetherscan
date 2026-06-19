@@ -12,6 +12,9 @@ jobs:
     # Only run when PR is actually merged, not just closed
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    # Analysing one merged diff against the doc set + source↔doc contracts shouldn't take
+    # more than 15 mins (refine if data shows otherwise)
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: write
@@ -19,12 +22,38 @@ jobs:
       id-token: write
 
     steps:
+      # Deterministic duplicate-issue guard: when this workflow files a doc issue it carries
+      # the hidden marker `<!-- aetherscan-update-docs pr=<N> -->`. If one already exists for
+      # this PR (e.g. the merge event was manually re-run), skip the Claude step so we never
+      # file a second issue (and re-trigger a second @claude follow-up PR). Checks all states
+      # since the issue may have been closed once the docs landed.
+      - name: Check for existing documentation issue for this PR
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- aetherscan-update-docs pr=$PR_NUMBER -->"
+          if gh issue list --state all --limit 200 --json body --jq '.[].body' \
+              | grep -qF "$MARKER"; then
+            echo "A documentation issue for PR #$PR_NUMBER already exists — skipping Claude step."
+            echo "already_filed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No documentation issue for PR #$PR_NUMBER — proceeding."
+            echo "already_filed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.guard.outputs.already_filed != 'true'
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
+          # in the allowlist, so a shallow checkout is sufficient.
+          fetch-depth: 1
 
       - name: Run Claude Documentation Analysis
+        if: steps.guard.outputs.already_filed != 'true'
         uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -114,11 +143,15 @@ jobs:
                    it makes a statement in either file factually wrong, flag that too.
 
             4. If documentation updates are needed:
-               - First check for existing documentation issues to avoid duplicates:
-                 `gh issue list --label "documentation" --state open`
+               - A deterministic pre-step already confirmed no doc issue exists for THIS PR
+                 (the re-run guard). Separately, check for a semantically duplicate doc issue
+                 from another PR before filing: `gh issue list --label "documentation" --state open`
                - If no existing issue covers the same updates, create a new GitHub issue with the label "documentation"
                - Title: "[DOCUMENTATION]: <brief description>"
                - Body should include:
+                 - As the FIRST line, the hidden marker (invisible when rendered) so the
+                   deterministic guard can dedupe re-runs of this PR:
+                   `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->`
                  - Reference to the merged PR (#${{ github.event.pull_request.number }})
                  - Summary of changes that require documentation
                  - Specific files that need updates
@@ -158,6 +191,7 @@ jobs:
 
             ## Guidelines
             - Be specific about what documentation changes are required.
+            - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->` marker — the deterministic guard relies on it to skip re-runs.
             - Your only responsibilities are to determine whether any documentation needs to be updated after the merged PR. Do not do anything that is not within this job scope.
 
           claude_args: |
