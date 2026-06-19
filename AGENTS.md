@@ -34,6 +34,7 @@ ruff lint+format, 100-char lines, Python 3.10 target ([`pyproject.toml`](pyproje
 
 - Every PR links an existing issue (`Closes #N`); branch prefixes `feature/`/`hotfix/`/`misc/`/`claude/`; rebase (not merge) onto `master`; commits need **verified GPG signatures**; all pre-commit hooks must pass (ruff-format may rewrite files → `git add` again before re-committing).
 - If you change `cli.py`, regenerate the README CLI Reference: `PYTHONPATH=src python utils/print_cli_help.py all`.
+- Bumping a dependency? Don't jump to the latest — target a proven version per [SECURITY.md](SECURITY.md) (the newer of ~2 minors back / latest stable ≥6 months old; a known advisory on that target overrides the lag). Never cross a documented ceiling (`numpy<2.0`, …) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` in sync.
 - Security: non-critical → GitHub Discussion w/ "security" label; critical → [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack, no public issue. Rotate any leaked token immediately.
 
 ## More detail

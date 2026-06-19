@@ -159,6 +159,19 @@ pip install safety
 safety check
 ```
 
+#### Version Selection Policy
+
+When pinning or bumping a dependency, prefer a proven release over the bleeding edge. Consider only final/stable releases — never pre-releases (alpha / beta / rc / dev) or nightly builds. The default target is the **higher (newer)** of:
+
+- **two minor releases below the latest stable release** (e.g. latest stable `1.8.x` → target the latest patch of `1.6.x`); or
+- **the latest stable release that is at least 6 months old**.
+
+This deliberately trails the newest release: brand-new versions are where regressions and freshly introduced (not-yet-disclosed) vulnerabilities surface, so letting a release "bake" for a couple of minors / six months trades a small amount of currency for stability and a wider window for advisories to come to light.
+
+**Exception — known advisories override the lag.** If the version selected by the rule above is itself affected by a known security advisory, instead pin the **minimum version that resolves the advisory**, even if it is newer than the default target (see _Responding to Vulnerabilities_ below).
+
+These targets are additionally bounded by the project's intentional version ceilings (e.g. `numpy<2.0`, `setuptools<81`) and the NGC TensorFlow 2.17 ABI — never select a version that crosses a documented upper bound. See the header comments in `environment.yml` and `requirements-container.txt` for the rationale behind each ceiling, and keep the coupled manifests (`environment.yml`, `requirements-container.txt`, `aetherscan.def`) in lockstep when bumping a shared dependency.
+
 #### Responding to Vulnerabilities
 
 1. **Critical/High severity**: Update immediately and release a patch
