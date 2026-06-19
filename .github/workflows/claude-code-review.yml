@@ -8,6 +8,9 @@ on:
 jobs:
   claude-code-review:
     runs-on: ubuntu-latest
+    # Reviewing a PR diff with inline comments scales with PR size but shouldn't exceed 20 mins
+    # (refine if data shows otherwise)
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: write

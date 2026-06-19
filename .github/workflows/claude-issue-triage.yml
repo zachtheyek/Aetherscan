@@ -8,10 +8,8 @@ on:
 jobs:
   claude-issue-triage:
     runs-on: ubuntu-latest
-    # Timeout implemented after run 21642589782 failed due to Claude going down a rabbit hole
     # Issue triage shouldn't take more than 5 mins (refine if data shows otherwise)
     # If Claude continues going down rabbit holes, consider refining the prompt to be more focused
-    # See: https://github.com/zachtheyek/Aetherscan/actions/runs/21642589782/job/62386093601
     timeout-minutes: 5
     permissions:
       contents: read

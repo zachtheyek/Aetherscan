@@ -17,6 +17,7 @@ permissions:
 jobs:
   contribution-check:
     runs-on: ubuntu-latest
+    # Contribution check shouldn't take more than 5 mins (refine if data shows otherwise)
     timeout-minutes: 5
 
     steps:
