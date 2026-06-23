@@ -279,10 +279,10 @@ This project uses [ruff](https://docs.astral.sh/ruff/) for both linting and form
 
 - **Target version**: Python 3.10 (lowest common denominator across the conda 3.10 path and the container 3.12 path)
 - **Line length**: 100 characters (formatter wraps; `E501` is intentionally ignored so wrapping is the formatter's job, not the linter's)
-- **Enabled rule families**: PEP-8 (`E`, `W`), pyflakes (`F`), isort (`I`), pep8-naming (`N`), pyupgrade (`UP`), bugbear (`B`), comprehensions (`C4`), simplify (`SIM`), pylint (`PL`)
+- **Enabled rule families**: PEP-8 (`E`, `W`), pyflakes (`F`), isort (`I`), pep8-naming (`N`), pyupgrade (`UP`), bugbear (`B`), comprehensions (`C4`), simplify (`SIM`), pylint (`PL`), flake8-print (`T20`), plus select flake8-logging-format checks (`G001`–`G003`)
 - **Notable allowances**: unused vars (`F841`), many-param functions (`PLR0913`), and magic-number comparisons (`PLR2004`) are permitted intentionally
-- **Per-file ignores**: `F401` (unused imports) is allowed in every `__init__.py`
-- **Import sorting**: isort-compatible, with `aetherscan` declared as the only first-party namespace
+- **Per-file ignores**: `F401` (unused imports) is allowed in every `__init__.py`; `T20` (`print()`) is allowed throughout `utils/` (one-off scripts); and `T201` is allowed in `logger/slack_handler.py` (a logging handler can't log through itself without recursion)
+- **Import sorting**: isort-compatible, with `aetherscan` declared as the only first-party namespace; isort's `required-imports` also makes `from __future__ import annotations` mandatory atop every module (`I002` auto-inserts it)
 - **Quote style**: Double quotes
 - **Indentation**: 4 spaces
 
@@ -304,7 +304,7 @@ def load_inference_data(
     ...
 ```
 
-`ruff`'s `UP` (pyupgrade) family enforces these idioms; `from typing import List, Dict, Optional, Tuple, ...` will be flagged and auto-fixed.
+`ruff`'s `UP` (pyupgrade) family enforces these idioms (`from typing import List, Dict, Optional, Tuple, ...` is flagged and auto-fixed), and isort's `required-imports` setting (`I002`) auto-inserts the `from __future__ import annotations` line in any module missing it.
 
 #### Module and function docstrings
 
@@ -352,6 +352,8 @@ logger.warning(f"NCCL warmup failed ({e}), falling back to HierarchicalCopy")
 ```
 
 The Slack handler attaches automatically when `SLACK_BOT_TOKEN` is set in the env, so anything you log at `INFO+` may also surface in Slack — keep messages information-dense and free of secrets.
+
+`ruff` backs part of this: `T20` rejects bare `print()` in package code (allowed only under `utils/`, plus the self-logging `slack_handler.py`), and `G001`–`G003` reject `%` / `str.format()` / `+` pre-formatted log messages in favour of f-strings. The remaining conventions — module-level placement, the `__name__` logger name, and the no-secrets rule — aren't expressible as ruff rules and are spot-checked by the post-merge style-check workflow instead.
 
 #### Config singleton access
 
