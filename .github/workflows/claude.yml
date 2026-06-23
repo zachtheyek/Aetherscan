@@ -228,7 +228,7 @@ jobs:
             - When making changes, explain what you're doing and why
             - If you're unsure about something, ask for clarification in a comment
             - Always test your understanding before making changes
-            - Reference AGENTS.md for repository-specific context and guidelines
+            - Reference CLAUDE.md for repository-specific context and guidelines
             - For code changes, always work on a `claude/*` branch, never commit directly to master
             - Your only responsibilities are to execute on the specific task request that triggered this workflow. Do not do anything that is not within this job scope.
 

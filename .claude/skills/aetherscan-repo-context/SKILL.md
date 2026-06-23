@@ -7,7 +7,7 @@ description: Deep-dive context for working inside the Aetherscan repo — Breakt
 
 Aetherscan is Breakthrough Listen's first end-to-end production-grade deep-learning pipeline for SETI at scale. It detects anomalies in radio spectrograms with technosignature-like characteristics by pairing a **beta-VAE** (dimensionality reduction / feature extraction) with a **Random Forest** ensemble (candidate detection). It is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) and runs single-node data-parallel distributed training/inference.
 
-> **Scope.** `AGENTS.md` (repo root) holds the lean, always-on rules; this skill is the on-demand deep-dive — read it when a task needs more than the essentials. The authoritative sources are `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, and `docs/`; when this file disagrees with them, they win and this file should be updated. **All paths below are relative to the repository root** (an agent's working directory).
+> **Scope.** `CLAUDE.md` (repo root) holds the lean, always-on rules; this skill is the on-demand deep-dive — read it when a task needs more than the essentials. The authoritative sources are `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, and `docs/`; when this file disagrees with them, they win and this file should be updated. **All paths below are relative to the repository root** (an agent's working directory).
 
 ---
 
@@ -188,7 +188,7 @@ pre-commit run ruff --all-files
 
 Paths relative to the repo root:
 
-- `AGENTS.md` — condensed always-on agent rules (this skill is its deep-dive companion)
+- `CLAUDE.md` — condensed always-on agent rules (this skill is its deep-dive companion)
 - `README.md` — overview, install matrix, usage examples, full CLI reference
 - `CONTRIBUTING.md` — workflow, project structure, code style, pre-commit
 - `SECURITY.md` — security policy, secrets management, token rotation

@@ -143,7 +143,7 @@ jobs:
             - Always include the `<!-- aetherscan-flaky-test-tracker week=${{ steps.guard.outputs.week }} -->` marker as the first body line — the deterministic guard relies on it.
             - Be honest about verification: if you could not run the test locally, say so rather than claiming the fix is verified.
             - Never apply the `claude` label. Prefer existing labels; don't invent new ones unless clearly warranted.
-            - Reference AGENTS.md for repository conventions.
+            - Reference CLAUDE.md for repository conventions.
             - Your only responsibility is this weekly flaky-test audit. Do not do anything outside that scope.
 
           claude_args: |

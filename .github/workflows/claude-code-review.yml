@@ -68,7 +68,7 @@ jobs:
             - `Read`, `Glob`, `Grep` to explore the codebase
 
             ## Guidelines
-            - See AGENTS.md for context about the repository
+            - See CLAUDE.md for context about the repository
             - Only post GitHub comments — don't submit review text as messages
             - Be constructive and helpful in your feedback
             - Your only responsibilities are to review the current PR. Do not do anything that is not within this job scope.

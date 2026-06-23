@@ -123,7 +123,7 @@ Aetherscan/
 ├── requirements-container.txt  # Pip extras layered into NGC container
 ├── environment.yml             # Conda dependencies
 ├── pyproject.toml              # Package metadata, ruff config
-├── AGENTS.md                   # Lean always-on agent rules
+├── CLAUDE.md                   # Lean always-on agent rules
 ├── AI_POLICY.md                # AI usage policy
 ├── CITATION.cff                # Citation metadata
 ├── CODE_OF_CONDUCT.md          # Core values guidelines

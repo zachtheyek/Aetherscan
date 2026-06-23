@@ -61,7 +61,7 @@ jobs:
             - `gh search issues` to detect potential duplicates against existing issues
 
             Code exploration:
-            - `Read`, `Glob`, `Grep` to consult repo context (e.g. AGENTS.md) when categorizing
+            - `Read`, `Glob`, `Grep` to consult repo context (e.g. CLAUDE.md) when categorizing
 
             ## Guidelines
             ### Label restrictions

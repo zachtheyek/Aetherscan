@@ -73,7 +73,7 @@ jobs:
                `gh pr diff ${{ github.event.pull_request.number }}`
                Use `gh pr view ${{ github.event.pull_request.number }}` for any additional
                metadata (labels, files changed) that helps you judge user impact, and
-               `Read`/`Glob`/`Grep` to consult repo context (AGENTS.md, README.md) when
+               `Read`/`Glob`/`Grep` to consult repo context (CLAUDE.md, README.md) when
                deciding what counts as user-visible.
 
             2. Decide whether the change is internal-only. Internal-only means it has no
@@ -113,7 +113,7 @@ jobs:
             - `gh pr comment` to post either the "Internal change — no release note." comment (Step 2) or the release-note draft (Step 4)
 
             Code exploration:
-            - `Read`, `Glob`, `Grep` to consult AGENTS.md, README.md, docs/*, or source files when judging whether a change is user-visible and how to describe it
+            - `Read`, `Glob`, `Grep` to consult CLAUDE.md, README.md, docs/*, or source files when judging whether a change is user-visible and how to describe it
 
             ## Guidelines
             - Post exactly one comment, and only on this PR (#${{ github.event.pull_request.number }}). Never modify code, labels, or the PR itself.
@@ -121,7 +121,7 @@ jobs:
             - One classification only — pick the single best of New / Improved / Fixed / Breaking. Use **Breaking** whenever existing usage, configs, or outputs would change for current users.
             - Write for end users, not maintainers: no file paths, function names, or internal jargon in the entry.
             - When in doubt between internal-only and user-visible, prefer drafting a note — a human curates the changelog and can drop it.
-            - Reference AGENTS.md for repository-specific context.
+            - Reference CLAUDE.md for repository-specific context.
             - Your only responsibility is to draft and post the release note for this merged PR. Do not do anything that is not within this job scope.
 
           claude_args: |

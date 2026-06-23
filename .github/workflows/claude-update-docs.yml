@@ -85,7 +85,7 @@ jobs:
 
             3. Check the following documentation files for potential updates needed:
                - README.md (project overview, installation, usage)
-               - AGENTS.md (lean, always-on AI agent operating rules)
+               - CLAUDE.md (lean, always-on AI agent operating rules)
                - CONTRIBUTING.md (contribution guidelines)
                - KNOWN_ISSUES.md (known issues, FAQ)
                - SECURITY.md (security best practices)
@@ -113,16 +113,16 @@ jobs:
                    block in README.md. Preserve each subsection's intro paragraph
                    (which contains the "Regenerate this output with ..." hint).
 
-               (b) README.md + CONTRIBUTING.md + SECURITY.md + KNOWN_ISSUES.md + docs/* ↔ AGENTS.md +
+               (b) README.md + CONTRIBUTING.md + SECURITY.md + KNOWN_ISSUES.md + docs/* ↔ CLAUDE.md +
                    .claude/skills/aetherscan-repo-context/SKILL.md.
-                   AGENTS.md (lean, always-on operating rules) and the SKILL.md skill
+                   CLAUDE.md (lean, always-on operating rules) and the SKILL.md skill
                    (on-demand deep-dive) are both DERIVED, hand-maintained summaries of
                    the project's canonical docs — they restate the install paths, entry
                    point / run commands, project structure, config & CLI system, code
                    style and naming conventions, contribution workflow, security
                    practices, and known limitations, plus pointers (file paths / section
                    anchors) into all of those docs. The canonical docs always win;
-                   AGENTS.md and the SKILL.md skill must follow them.
+                   CLAUDE.md and the SKILL.md skill must follow them.
 
                    If this PR changed README.md, CONTRIBUTING.md, SECURITY.md,
                    KNOWN_ISSUES.md, or anything under docs/ in any way that alters facts
@@ -134,9 +134,9 @@ jobs:
                    rules, secrets-management / token-rotation / vulnerability-reporting
                    guidance, known issues / limitations / workarounds, or the
                    existence / location / section anchors of any doc they link to — then
-                   AGENTS.md and the SKILL.md skill have very likely drifted. The
+                   CLAUDE.md and the SKILL.md skill have very likely drifted. The
                    follow-up PR must reconcile BOTH files against the updated canonical
-                   docs: update the affected lines (keeping AGENTS.md lean and the
+                   docs: update the affected lines (keeping CLAUDE.md lean and the
                    SKILL.md skill fuller), and do not introduce facts that contradict the
                    canonical docs. A change confined entirely to source code (no edit to
                    any canonical doc) does not trigger this contract on its own — but if
@@ -168,10 +168,10 @@ jobs:
                    Command Help), keeping each subsection's intro paragraph intact.
                  - If the changes touched any canonical doc in contract (b) above
                    (README.md, CONTRIBUTING.md, SECURITY.md, KNOWN_ISSUES.md, or docs/*),
-                   explicitly instruct the follow-up PR to reconcile BOTH AGENTS.md and
+                   explicitly instruct the follow-up PR to reconcile BOTH CLAUDE.md and
                    .claude/skills/aetherscan-repo-context/SKILL.md against the updated canonical
                    docs — listing the specific shared facts that changed — and to keep
-                   AGENTS.md lean and the SKILL.md skill fuller without contradicting the
+                   CLAUDE.md lean and the SKILL.md skill fuller without contradicting the
                    canonical docs.
 
             5. If no documentation updates are needed, do not create an issue.
@@ -187,7 +187,7 @@ jobs:
             - `gh issue create` to file a new `[DOCUMENTATION]: <…>` issue tagging @claude when meaningful doc gaps are identified
 
             Code exploration:
-            - `Read`, `Glob`, `Grep` to inspect README.md, AGENTS.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and any source files referenced by the source ↔ doc contracts above
+            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and any source files referenced by the source ↔ doc contracts above
 
             ## Guidelines
             - Be specific about what documentation changes are required.
