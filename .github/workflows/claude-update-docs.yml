@@ -85,12 +85,12 @@ jobs:
 
             3. Check the following documentation files for potential updates needed:
                - README.md (project overview, installation, usage)
-               - CLAUDE.md (lean, always-on AI agent operating rules)
+               - CLAUDE.md (lean, always-on AI agent operating rules — loaded in full into every Claude Code session; target < 200 lines)
                - CONTRIBUTING.md (contribution guidelines)
                - KNOWN_ISSUES.md (known issues, FAQ)
                - SECURITY.md (security best practices)
                - docs/* (tutorials, guides, API docs)
-               - .claude/skills/aetherscan-repo-context/SKILL.md (on-demand agent deep-dive skill)
+               - .claude/skills/aetherscan-repo-context/SKILL.md (on-demand agent deep-dive skill — loads only when relevant; home for multi-step procedures & part-specific detail)
 
                Known tight source ↔ doc contracts (treat each as a single staleness signal):
 
@@ -124,6 +124,17 @@ jobs:
                    anchors) into all of those docs. The canonical docs always win;
                    CLAUDE.md and the SKILL.md skill must follow them.
 
+                   Division of labor — keep this split sharp when reconciling: CLAUDE.md
+                   is loaded in full into EVERY Claude Code session, so it must stay
+                   lean — target < 200 lines, carrying only bare-essentials always-on
+                   rules (hard rules, core conventions, one-line run/lint commands, and
+                   pointers into the canonical docs). The SKILL.md skill loads ON DEMAND,
+                   so every multi-step procedure (full build/run recipes, token-rotation
+                   steps, regeneration commands, etc.) and any part-specific /
+                   subsystem-specific detail belongs there, NOT in CLAUDE.md. When a fact
+                   must be restated, prefer a terse pointer in CLAUDE.md plus the full
+                   detail in the skill over growing CLAUDE.md past its budget.
+
                    If this PR changed README.md, CONTRIBUTING.md, SECURITY.md,
                    KNOWN_ISSUES.md, or anything under docs/ in any way that alters facts
                    those two files restate or point to — e.g. install/setup steps,
@@ -136,8 +147,9 @@ jobs:
                    existence / location / section anchors of any doc they link to — then
                    CLAUDE.md and the SKILL.md skill have very likely drifted. The
                    follow-up PR must reconcile BOTH files against the updated canonical
-                   docs: update the affected lines (keeping CLAUDE.md lean and the
-                   SKILL.md skill fuller), and do not introduce facts that contradict the
+                   docs: update the affected lines (keeping CLAUDE.md lean — < 200 lines,
+                   essentials only — and putting any multi-step or part-specific detail in
+                   the on-demand SKILL.md skill), and do not introduce facts that contradict the
                    canonical docs. A change confined entirely to source code (no edit to
                    any canonical doc) does not trigger this contract on its own — but if
                    it makes a statement in either file factually wrong, flag that too.
@@ -171,8 +183,9 @@ jobs:
                    explicitly instruct the follow-up PR to reconcile BOTH CLAUDE.md and
                    .claude/skills/aetherscan-repo-context/SKILL.md against the updated canonical
                    docs — listing the specific shared facts that changed — and to keep
-                   CLAUDE.md lean and the SKILL.md skill fuller without contradicting the
-                   canonical docs.
+                   CLAUDE.md lean (< 200 lines, essentials only) while pushing any
+                   multi-step or part-specific detail into the on-demand SKILL.md skill,
+                   without contradicting the canonical docs.
 
             5. If no documentation updates are needed, do not create an issue.
                Only create an issue if there are meaningful documentation gaps.
