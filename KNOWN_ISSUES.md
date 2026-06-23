@@ -251,22 +251,33 @@ The pipeline uses a timeout-based escalation strategy:
 3. `pool.join()` with timeout
 4. Log warning and continue if join times out
 
-If the pipeline hangs completely:
+If the pipeline hangs completely, run [`utils/kill_pipeline.sh`](utils/kill_pipeline.sh)
+from a separate shell on the same machine. It finds the main process and all its
+workers on its own (no PID needed), works for both the container and source run
+modes, and tries a graceful SIGTERM first (letting the `ResourceManager` close
+pools / shared memory) before escalating to SIGKILL:
 
 ```bash
-# Find stuck Python processes
-ps aux | grep aetherscan
+# Graceful stop, escalating to SIGKILL after a timeout (default 30s)
+./utils/kill_pipeline.sh
 
-# Force kill (use PID from above)
-kill -9 <pid>
+# Skip straight to SIGKILL if the process tree is wedged
+./utils/kill_pipeline.sh --force
 
-# Clean up any orphaned shared memory
-# List shared memory segments
-ls /dev/shm/
-
-# Remove orphaned segments (be careful!)
-rm /dev/shm/shm_name_*
+# Preview the process tree without sending any signals
+./utils/kill_pipeline.sh --dry-run
 ```
+
+A forced kill skips `ResourceManager` cleanup, so clean up any orphaned shared
+memory afterwards (the script prints a reminder):
+
+```bash
+# List shared memory segments, then remove stale ones (be careful!)
+ls /dev/shm/
+rm /dev/shm/psm_*
+```
+
+To do it by hand instead: `ps aux | grep aetherscan`, then `kill -9 <pid>`.
 
 ### Status
 
