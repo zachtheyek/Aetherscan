@@ -204,6 +204,15 @@ jobs:
 
             ## Guidelines
             - Be specific about what documentation changes are required.
+            - Scope boundary — **documentation only.** Your remit is prose/doc files (README.md,
+              CLAUDE.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and the SKILL.md
+              skill) and the doc-side of the source↔doc contracts above. A SEPARATE post-merge
+              workflow (`.github/workflows/claude-style-check.yml`) owns source-code style/quality
+              (the CONTRIBUTING.md "Code Style" rules ruff can't catch). Do NOT file an issue about,
+              or ask the follow-up PR to change, the LOGIC or STYLE of `.py` source — only the
+              regeneration/reconciliation of documentation. If the merged PR needs no *documentation*
+              change, file nothing, even if its code could be improved. This keeps the two workflows
+              from filing duplicate or overlapping issues.
             - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->` marker — the deterministic guard relies on it to skip re-runs.
             - Your only responsibilities are to determine whether any documentation needs to be updated after the merged PR. Do not do anything that is not within this job scope.
 
