@@ -21,7 +21,7 @@ See [`README.md`](README.md#system-requirements) for the full system requirement
 
 Contributors should additionally have the following:
 
-- Git with GPG signing configured
+- Git with [GPG signing configured](#commit-signing-gpg)
 - [pre-commit](https://pre-commit.com/)
 - [tmux](https://github.com/tmux/tmux)
 
@@ -73,6 +73,89 @@ PYTHONPATH=src python utils/print_cli_help.py top
 ```
 
 See [`README.md`](README.md#installation) for the full walkthrough including `.env` configuration and how to launch the pipeline.
+
+---
+
+## Commit Signing (GPG)
+
+Every commit that lands in Aetherscan must carry a **verified GPG signature** — this is enforced by branch protection, so unsigned or unverifiable commits will block your PR. If you've never set this up, the one-time process below takes a few minutes.
+
+> [!NOTE]
+> GitHub shows a signature as **Verified** only when all three of these line up: (1) the commit is signed with a GPG key uploaded to your account, (2) the commit's author email matches a user ID (UID) on that key, and (3) that same email is a **verified** email on your GitHub account. Most "Unverified" badges come from one of these three drifting out of sync.
+
+### Already have a GPG key?
+
+List your secret keys and grab the fingerprint (the 40-character hex string on the line below `sec`):
+
+```bash
+gpg --list-secret-keys --keyid-format=long
+```
+
+If the key's UID email is the address you commit with (and it's verified on GitHub), skip ahead to [Point git at your key](#point-git-at-your-key). If the key lacks that email, either add it as a UID (`gpg --edit-key <FINGERPRINT>` → `adduid` → `save`) or generate a fresh key below.
+
+### Generate a new key
+
+```bash
+gpg --full-generate-key
+```
+
+Recommended answers at the prompts:
+
+| Prompt     | Choose                                                            |
+| ---------- | ---------------------------------------------------------------- |
+| Key type   | `(9) ECC (sign and encrypt)` → `(1) Curve 25519` (or RSA 4096)   |
+| Expiry     | Your call — `0` for no expiry, or e.g. `2y` and renew before it lapses |
+| Real name  | Your name                                                        |
+| Email      | An address that is **verified on your GitHub account**           |
+| Passphrase | A strong passphrase (cached by `gpg-agent` / your OS keychain)   |
+
+ed25519 (Curve 25519) keys are smaller and faster; RSA 4096 is the conservative choice if you need maximum tooling compatibility. GitHub accepts either.
+
+### Add the public key to GitHub
+
+Export the armored public key:
+
+```bash
+gpg --armor --export <FINGERPRINT> > my-gpg-key.asc
+```
+
+Then either paste the whole `-----BEGIN PGP PUBLIC KEY BLOCK-----` block into **GitHub → Settings → SSH and GPG keys → New GPG key**, or use the CLI:
+
+```bash
+gh auth refresh -s write:gpg_key    # one-time: grant gh permission to manage GPG keys
+gh gpg-key add my-gpg-key.asc
+```
+
+### Point git at your key
+
+This is the part that tailors signing to your commits. Set it globally, or drop `--global` to scope signing to this repo only:
+
+```bash
+git config --global user.signingkey <FINGERPRINT>    # which key to sign with
+git config --global commit.gpgsign true              # sign every commit
+git config --global tag.gpgsign true                 # sign every tag (optional)
+git config --global user.email "you@verified-email"  # must match a key UID + a verified GitHub email
+git config --global gpg.program "$(command -v gpg)"  # only needed if you have multiple gpg installs
+```
+
+### Verify
+
+```bash
+git commit --allow-empty -m "test: gpg signing"
+git log --show-signature -1     # expect "Good signature from ..."
+git reset --soft HEAD~1         # discard the throwaway commit
+```
+
+Once pushed, the commit should show a green **Verified** badge on GitHub.
+
+### Troubleshooting
+
+> [!TIP]
+>
+> - **`error: gpg failed to sign the data`** — the agent can't reach a prompt for your passphrase. Add `export GPG_TTY=$(tty)` to your shell rc (`~/.zshrc` / `~/.bashrc`) and re-source it.
+> - **macOS passphrase prompt never appears** — install a GUI pinentry: `brew install pinentry-mac`, add `pinentry-program $(brew --prefix)/bin/pinentry-mac` to `~/.gnupg/gpg-agent.conf`, then `gpgconf --kill gpg-agent`.
+> - **Commit shows "Unverified" on GitHub** — your commit email isn't a verified account email, or isn't a UID on the uploaded key. Reconcile the three: `git config user.email`, `gpg --list-secret-keys`, and GitHub → Settings → Emails.
+> - **`gpg` commands hang (newer GnuPG with the `use-keyboxd` backend)** — a wedged `keyboxd` / `gpg-agent` daemon. Run `gpgconf --kill all` and retry; if it persists, remove the stale `~/.gnupg/S.keyboxd` socket and try again.
 
 ---
 
@@ -210,7 +293,7 @@ git checkout -b feature/my_new_feature
 ### 5. Submit a Pull Request
 
 - Ensure your branch is up-to-date with `master` (use `git rebase`, not `git merge`)
-- All commits must have verified GPG signatures
+- All commits must have [verified GPG signatures](#commit-signing-gpg)
 - Fill out the appropriate PR template completely
 - Link your PR to the associated issue using GitHub's **"Development" sidebar** or by including `Closes #N` / `Fixes #N` in the PR body. This creates a formal link that enables automatic label syncing
 
