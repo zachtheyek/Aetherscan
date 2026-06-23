@@ -1,6 +1,4 @@
-# Note, this is the project's local gitignore. Find my global gitignore here:
-# https://github.com/zachtheyek/dotfiles/blob/master/git/.gitignore_global
-# Appended at the end of this file for completeness
+### Project-local gitignore
 
 # Forward-search paper
 2301.12670v1.pdf
@@ -11,13 +9,11 @@ rzad056.pdf
 # Outputs directory
 outputs/
 
-# Temporary docs
-docs/PRESENTATION_OUTLINE.md
-
 # Container artifacts
 *.sif
 
 
+### Global gitignore (https://github.com/zachtheyek/dotfiles/blob/master/git/.gitignore_global)
 
 # Mac system files
 .DS_Store
@@ -45,12 +41,9 @@ ENV/
 .nv/
 Session.vim
 
-# Claude configs (ignore local state, but track shared skills).
-# `!.claude/` re-includes the dir itself (overriding the global ~/.gitignore_global
-# `.claude/` rule) so git descends into it; `.claude/*` then re-ignores its contents
-# except the shared skills subtree.
-!.claude/
+# Claude configs (ignore local state, but track project-local instructions & shared skills)
 .claude/*
+!.claude/CLAUDE.md
 !.claude/skills/
 
 # Caches/backups
