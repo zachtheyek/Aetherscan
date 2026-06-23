@@ -782,6 +782,7 @@ pre-commit install
 ```
 
 - PRs: Must be linked to an existing issue and pass all hooks
+- Commits: Must carry a verified GPG signature — see [Commit Signing (GPG)](CONTRIBUTING.md#commit-signing-gpg)
 - Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
 - Code style: PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/) (see [pyproject.toml](pyproject.toml))
 
