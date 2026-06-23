@@ -3,6 +3,8 @@ Verify train/test data exist, can be accessed, and have sensible statistics
 Uses memory mapping to avoid loading entire files into RAM
 """
 
+from __future__ import annotations
+
 import gc
 import os
 from typing import Any

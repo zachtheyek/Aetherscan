@@ -74,16 +74,20 @@ exclude = [  # TODO: partially sync with .gitignore (local & global)
 [tool.ruff.lint]
 # Enable specific linting rules
 select = [
-    "E",    # Standard PEP 8 formatting errors (indentation, whitespace, etc.)
-    "W",    # Standard PEP 8 formatting warnings (indentation, whitespace, etc.)
-    "F",    # Detects unused imports, variables, etc.
-    "I",    # Checks import order consistency
-    "N",    # Enforces naming conventions (functions_names vs FunctionNames, etc.)
-    "UP",   # Suggests modern syntax upgrades (f-strings, type hints, etc.)
-    "B",    # Find common bugs and design patterns
-    "C4",   # Simplifies inefficient comprehensions (list, set, dict)
-    "SIM",  # Simplifies control flow (if/else, return, etc.)
-    "PL",   # Logical and stylistic checks
+    "E",     # Standard PEP 8 formatting errors (indentation, whitespace, etc.)
+    "W",     # Standard PEP 8 formatting warnings (indentation, whitespace, etc.)
+    "F",     # Detects unused imports, variables, etc.
+    "I",     # Checks import order consistency
+    "N",     # Enforces naming conventions (functions_names vs FunctionNames, etc.)
+    "UP",    # Suggests modern syntax upgrades (f-strings, type hints, etc.)
+    "B",     # Find common bugs and design patterns
+    "C4",    # Simplifies inefficient comprehensions (list, set, dict)
+    "SIM",   # Simplifies control flow (if/else, return, etc.)
+    "PL",    # Logical and stylistic checks
+    "G001",  # Logging cannot use str.format() (use f-strings instead)
+    "G002",  # Logging cannot use %-formatting (use f-strings instead)
+    "G003",  # Logging cannot use + concatenation (use f-strings instead)
+    "T20",   # No bare print()/pprint()
 ]
 
 # Ignore specific linting rules
@@ -106,10 +110,14 @@ unfixable = []
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+"utils/*" = ["T20"]  # Allow utility scripts to use print()
+"src/aetherscan/logger/slack_handler.py" = ["T201"]  # Allow logging handler to use print() (for stderr; handler can't log through itself without recursion)
 
 [tool.ruff.lint.isort]
 # Declare first-party imports (for sorting order)
 known-first-party = ["aetherscan"]
+# Require the modern-typing future import atop every module (I002, auto-fixed)
+required-imports = ["from __future__ import annotations"]
 
 [tool.ruff.format]
 # Configure formatter

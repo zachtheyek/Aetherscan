@@ -7,6 +7,8 @@ aetherscan.data_generation, aetherscan.preprocessing, etc.) — the top-level pa
 exposes only the version string.
 """
 
+from __future__ import annotations
+
 __version__ = "0.1.0"
 __author__ = "Zach Yek"
 

@@ -2,6 +2,8 @@
 Database package for Aetherscan pipeline
 """
 
+from __future__ import annotations
+
 from .db import (
     get_db,
     get_system_metadata,
