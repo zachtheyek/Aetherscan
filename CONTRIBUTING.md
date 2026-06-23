@@ -193,6 +193,7 @@ Aetherscan/
 ├── tests/                      # Test suite (placeholder; no tests yet)
 ├── utils/                      # Utility scripts
 │   ├── run_container.sh             # Apptainer/SingularityCE wrapper
+│   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
 │   ├── start_tmux_session.sh        # tmux session template helper
 │   ├── print_cli_help.py            # CLI reference regen helper
 │   ├── find_optimal_configs.py      # Per-host config helper
