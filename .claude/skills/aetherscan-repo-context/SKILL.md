@@ -29,6 +29,7 @@ CLI flags are identical between the two paths; only the launcher differs. `PYTHO
 - **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container.
 - **`utils/start_tmux_session.sh`** (optional) spins up a four-window monitoring tmux session (htop/CPU-MEM, `nvidia-smi`, `/dev/shm`, `tree` of models/outputs). Idempotent.
 - **`utils/kill_pipeline.sh`** stops a running pipeline (main process + all worker children) from a separate shell on the same machine — works for both run modes, finds the process tree itself, and tries a graceful SIGTERM (lets `ResourceManager` close pools/SHM) before escalating to SIGKILL. Assumes a single running instance. `--force` / `--dry-run` / `--timeout N`.
+- **`utils/fetch_run_outputs.sh`** rsyncs one run's outputs from remote cluster node(s) to the local `outputs/` tree, selecting files by the universal `*_<save_tag>.*` suffix and renaming each to `<machine>_<basename>` (collision-free across nodes). `<train|inference> <save_tag> <machine>...`; `--all` adds train checkpoints/archive, `--db` pulls the SQLite DB into `outputs/data/db/`, `--dry-run`. Assumes tagged log filenames; the inference branch is provisional pending the inference pipeline.
 
 **Common invocations:**
 
@@ -106,9 +107,10 @@ src/aetherscan/
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
-utils/                   # run_container.sh, kill_pipeline.sh, start_tmux_session.sh,
-                         # print_cli_help.py, find_optimal_configs.py,
-                         # verify_train_test_files.py, get_system_info.sh
+utils/                   # run_container.sh, kill_pipeline.sh, fetch_run_outputs.sh,
+                         # start_tmux_session.sh, print_cli_help.py,
+                         # find_optimal_configs.py, verify_train_test_files.py,
+                         # get_system_info.sh
 docs/                    # BLACKWELL_MIGRATION.md, CONFIG_AND_CLI.md, README.md, assets/
 tests/                   # Placeholder — no test suite yet
 ```

@@ -194,6 +194,7 @@ Aetherscan/
 ├── utils/                      # Utility scripts
 │   ├── run_container.sh             # Apptainer/SingularityCE wrapper
 │   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
+│   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
 │   ├── start_tmux_session.sh        # tmux session template helper
 │   ├── print_cli_help.py            # CLI reference regen helper
 │   ├── find_optimal_configs.py      # Per-host config helper
