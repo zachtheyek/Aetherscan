@@ -192,14 +192,14 @@ Aetherscan/
 ├── docs/                       # Documentation (placeholder; no docs yet)
 ├── tests/                      # Test suite (placeholder; no tests yet)
 ├── utils/                      # Utility scripts
-│   ├── run_container.sh             # Apptainer/SingularityCE wrapper
-│   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
-│   ├── start_tmux_session.sh        # tmux session template helper
-│   ├── print_cli_help.py            # CLI reference regen helper
 │   ├── find_optimal_configs.py      # Per-host config helper
-│   ├── verify_train_test_files.py   # Data sanity check helper
-│   └── get_system_info.sh           # System info helper
+│   ├── get_system_info.sh           # System info helper
+│   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
+│   ├── print_cli_help.py            # CLI reference regen helper
+│   ├── run_container.sh             # Apptainer/SingularityCE wrapper
+│   ├── start_tmux_session.sh        # tmux session template helper
+│   └── verify_train_test_files.py   # Data sanity check helper
 ├── .claude/                    # Claude Code config + on-demand skills (skills/aetherscan-repo-context/SKILL.md)
 ├── .github/                    # CI/CD workflows, issue templates, etc.
 ├── .gitignore                  # Local gitignore
