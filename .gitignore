@@ -42,9 +42,9 @@ ENV/
 Session.vim
 
 # Claude configs (ignore local state, but track project-local instructions & shared skills)
-.claude/*
-!.claude/CLAUDE.md
-!.claude/skills/
+**/.claude/*
+!**/.claude/CLAUDE.md
+!**/.claude/skills/
 
 # Caches/backups
 .cache/
