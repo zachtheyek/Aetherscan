@@ -462,3 +462,77 @@ No action required. The warning can be safely ignored.
 ### Related Code
 
 `src/aetherscan/train.py:1974-1976` (WARN comment)
+
+---
+
+## 14. XLA "Skipping the delay kernel" Warnings
+
+### Symptom
+
+During training and inference — on **both** the Ampere (conda) and Blackwell (NGC
+container) clusters — the console is flooded with:
+
+```
+...u_timer.cc:114] Skipping the delay kernel, measurement accuracy will be reduced
+```
+
+(observed ~1,400–1,600 times in a single short run).
+
+### Cause
+
+This comes from XLA's GPU timer (`gpu_timer.cc`). To time GPU ops precisely for
+autotuning, XLA normally launches a small "delay kernel"; when it opts to skip it, the
+internal timing measurements it feeds to its autotuning heuristics are slightly less
+precise. It is emitted per-measurement, hence the high count.
+
+### Impact
+
+**None on correctness.** Only the precision of XLA's internal *timing measurements* is
+reduced, which at worst could nudge autotuning toward a marginally suboptimal kernel
+variant — a negligible perf delta in practice. It is not specific to the Blackwell
+migration (it appears identically on the Ampere cluster), and runs complete normally.
+
+### Workaround
+
+No action required; safe to ignore. If the log volume is bothersome it is gated by
+`TF_CPP_MIN_LOG_LEVEL` along with TF's other INFO/WARNING output (raising it to `2`
+silences it but also hides other potentially useful warnings, so it's not recommended).
+
+### Status
+
+**Won't fix.** Benign upstream TensorFlow/XLA behavior.
+
+---
+
+## 15. LLVM "+ptxNN is not a recognized feature" Warnings (Blackwell only)
+
+### Symptom
+
+On the **Blackwell** cluster (NGC 25.02 container) only, stderr repeats:
+
+```
+'+ptx85' is not a recognized feature for this target (ignoring feature)
+```
+
+### Cause
+
+LLVM (via XLA's NVPTX backend) expresses CUDA capabilities as feature flags. The
+container's LLVM was built against CUDA 12.8 (PTX ISA ≤ 8.4); the newer host driver
+advertises PTX 8.5. When XLA asks LLVM to enable the newer PTX level, LLVM doesn't
+recognize the flag and falls back to a level it knows.
+
+### Impact
+
+**None.** Code still compiles and runs; only a handful of PTX 8.5-only instructions are
+unavailable. Negligible perf delta, zero correctness impact. Does not appear on the
+Ampere cluster.
+
+### Workaround
+
+No action required; safe to ignore. The line goes straight to stderr and is **not** gated
+by `TF_CPP_MIN_LOG_LEVEL`, so it can't be suppressed without redirecting stderr.
+
+### Status
+
+**Won't fix.** Expected LLVM/PTX version-skew behavior. See also
+[`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) ("warning noise" section).
