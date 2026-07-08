@@ -23,7 +23,7 @@ sys.argv
 parse_args()                   ── argparse picks one subparser; args.command set
    │
    ▼
-apply_saved_config_to_config   ── inference + --config-path only: layers the saved
+apply_saved_config             ── inference + --config-path only: layers the saved
    │                              JSON onto the singleton so it becomes the new
    │                              "defaults" validate_args sees via _resolve
    ▼
@@ -208,7 +208,7 @@ developer accidentally writing `config.inference.X` inside `train.py`).
 config defaults via the `_resolve(args, arg_name, default)` helper, so checks see the
 effective value the pipeline would use even when a flag is omitted.
 
-In inference mode, `apply_saved_config_to_config(args.config_path)` runs immediately
+In inference mode, `apply_saved_config(args.config_path)` runs immediately
 after `parse_args` and before `validate_args` — so by the time validation kicks in,
 the saved JSON's fields have already become the singleton's "defaults" and `_resolve`
 returns the merged saved+CLI view. This closes the loop on `--config-path`: prior to

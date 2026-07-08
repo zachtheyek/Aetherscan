@@ -721,7 +721,8 @@ def _add_inference_flags_to(parser):
     )
 
 
-def apply_saved_config_to_config(config_path: str) -> None:
+# NOTE: come back to this later
+def apply_saved_config(config_path: str) -> None:
     """Layer a saved JSON config (e.g. from a prior training run) onto the singleton.
 
     Used in inference mode to make `--config-path my_run.json` actually take effect:

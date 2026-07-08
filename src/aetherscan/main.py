@@ -19,7 +19,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from aetherscan.cli import (
     apply_args_to_config,
-    apply_saved_config_to_config,
+    apply_saved_config,
     setup_argument_parser,
     validate_args,
 )
@@ -515,7 +515,7 @@ def main():
     # is unaffected.
     if args.command == "inference" and getattr(args, "config_path", None) is not None:
         try:
-            apply_saved_config_to_config(args.config_path)
+            apply_saved_config(args.config_path)
             logger.info(f"Saved config loaded from {args.config_path}")
         except Exception as e:
             parser.print_help()
