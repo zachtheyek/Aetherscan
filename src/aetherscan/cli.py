@@ -1152,7 +1152,7 @@ def collect_validation_errors(
         data_path = _resolve(args, "data_path", config.data_path)
         train_files = _resolve(args, "train_files", config.data.train_files) or []
         for f in train_files:
-            full = os.path.join(data_path, f)
+            full = config.get_training_file_path(f, data_path)
             if not os.path.exists(full):
                 errors.append(
                     ValidationError(
@@ -1627,7 +1627,7 @@ def collect_validation_errors(
         data_path = _resolve(args, "data_path", config.data_path)
         test_files = _resolve(args, "test_files", config.data.test_files) or []
         for f in test_files:
-            full = os.path.join(data_path, f)
+            full = config.get_test_file_path(f, data_path)
             if not os.path.exists(full):
                 errors.append(
                     ValidationError(
@@ -1639,7 +1639,7 @@ def collect_validation_errors(
                 )
         inf_files = _resolve(args, "inference_files", config.data.inference_files)
         for f in inf_files or []:
-            full = os.path.join(data_path, f) if not os.path.isabs(f) else f
+            full = config.get_inference_file_path(f, data_path)
             if not os.path.exists(full):
                 errors.append(
                     ValidationError(

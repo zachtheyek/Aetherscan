@@ -409,17 +409,26 @@ class Config:
             # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
             cls._instance = None
 
-    def get_training_file_path(self, filename: str) -> str:
-        """Get full path for training data file"""
-        return os.path.join(self.data_path, "training", filename)
+    def get_training_file_path(self, filename: str, base_path: str | None = None) -> str:
+        """Get full path for training data file. base_path overrides self.data_path (used by
+        validate_args, which runs before a --data-path override is applied to the singleton)."""
+        return os.path.join(
+            base_path if base_path is not None else self.data_path, "training", filename
+        )
 
-    def get_test_file_path(self, filename: str) -> str:
-        """Get full path for test data file"""
-        return os.path.join(self.data_path, "testing", filename)
+    def get_test_file_path(self, filename: str, base_path: str | None = None) -> str:
+        """Get full path for test data file. base_path overrides self.data_path (see
+        get_training_file_path)."""
+        return os.path.join(
+            base_path if base_path is not None else self.data_path, "testing", filename
+        )
 
-    def get_inference_file_path(self, filename: str) -> str:
-        """Get full path for inference CSV file"""
-        return os.path.join(self.data_path, "inference", filename)
+    def get_inference_file_path(self, filename: str, base_path: str | None = None) -> str:
+        """Get full path for inference CSV file. base_path overrides self.data_path (see
+        get_training_file_path)."""
+        return os.path.join(
+            base_path if base_path is not None else self.data_path, "inference", filename
+        )
 
     def get_file_subset(self, filename: str) -> tuple[int | None, int | None]:
         """Get subset parameters for a file (start, end indices)"""
