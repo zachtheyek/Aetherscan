@@ -63,8 +63,8 @@ def setup_gpu_strategy():
     if config is None:
         raise ValueError("get_config() returned None")
 
-    # Both env vars are read lazily by TF when GPU memory is first allocated, so we set
-    # them before the first tf.config.* call below.
+    # Both env vars here are read lazily by TF when the GPU runtime first initializes (that is,
+    # on first GPU memory allocation), which happens below on set_memory_growth()
     if config.gpu.use_async_allocator:
         # Prevent memory fragmentation within each GPU.
         os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
@@ -106,7 +106,7 @@ def setup_gpu_strategy():
             # set_memory_growth stayed under tf.config.experimental in TF 2.17.
             tf.config.experimental.set_memory_growth(gpu, True)
             # When per_gpu_memory_limit_mb is None we skip this call entirely and
-            # rely on memory-growth only (recommended default on 96 GB Blackwell cards).
+            # rely on memory-growth only (recommended default on ~96 GB Blackwell cards).
             if config.gpu.per_gpu_memory_limit_mb is not None:
                 # set_logical_device_configuration is the stable replacement for the
                 # deprecated experimental.set_virtual_device_configuration.
@@ -159,6 +159,7 @@ def train_command():
     if config is None:
         raise ValueError("get_config() returned None")
 
+    # NOTE: come back to this later (print more descriptive info)
     logger.info("Configuration:")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
@@ -173,7 +174,7 @@ def train_command():
         logger.error(f"Failed to setup GPU strategy: {e}")
         sys.exit(1)
 
-    # NOTE: come back to this later (test whether pipeline runs on <4, <6 GPUs, on single GPU, and on CPU. if all is robust, remove no strategy error)
+    # NOTE: come back to this later (should we provide a CPU-only mode?)
     if strategy is None:
         logger.error("No GPU strategy available. Training requires GPU.")
         sys.exit(1)
@@ -305,6 +306,7 @@ def inference_command():
     # time inference_command() runs those preconditions are guaranteed to hold.
     # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
 
+    # NOTE: come back to this later (print more descriptive info)
     logger.info("Configuration:")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
@@ -325,7 +327,7 @@ def inference_command():
         logger.error(f"Failed to setup GPU strategy: {e}")
         sys.exit(1)
 
-    # NOTE: come back to this later (test whether pipeline runs on <4, <6 GPUs, on single GPU, and on CPU. if all is robust, remove no strategy error)
+    # NOTE: come back to this later (should we provide a CPU-only mode?)
     if strategy is None:
         logger.error("No GPU strategy available. Inference requires GPU.")
         sys.exit(1)
@@ -496,6 +498,7 @@ def main():
         # so cleanup handlers still run via atexit
         raise
 
+    # NOTE: come back to this later
     # Inference mode: if the user pointed --config-path at a saved JSON config,
     # layer its values onto the singleton *before* validate_args runs. That way
     # validate_args sees the merged (saved + CLI) view via _resolve, and any

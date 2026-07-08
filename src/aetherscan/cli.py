@@ -27,7 +27,7 @@ _TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
 # sklearn's RandomForestClassifier accepts these string values for max_features
 _RF_MAX_FEATURES_STR_VALUES = {"sqrt", "log2"}
 
-# Allowed curriculum schedules (--curriculum-schedule help mentions linear/exponential/step)
+# Allowed values for curriculum_schedule
 _CURRICULUM_SCHEDULES = {"linear", "exponential", "step"}
 
 
@@ -151,7 +151,7 @@ def _add_train_arguments(subparsers):
     _add_train_flags_to(train_parser)
 
 
-# TODO: update flag help descriptions
+# TODO: improve flag help descriptions
 def _add_train_flags_to(parser):
     """
     Add all training-mode CLI flags to `parser`. Defined separately from the subparser wrapper
@@ -566,7 +566,7 @@ def _add_inference_arguments(subparsers):
     _add_inference_flags_to(inf_parser)
 
 
-# TODO: update flag help descriptions
+# TODO: improve flag help descriptions
 def _add_inference_flags_to(parser):
     """
     Add all inference-mode CLI flags to `parser`. Defined separately from the subparser wrapper
