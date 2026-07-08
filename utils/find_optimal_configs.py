@@ -130,7 +130,7 @@ def main() -> int:
     num_replicas_list = _parse_num_gpus(args.num_gpus)
     # If user explicitly passed the subcommand --num-replicas, prefer it. Defensively
     # enforce >=1 here since validate_args() (which now owns that check, see
-    # validate_num_replicas_against_hardware) isn't on this code path.
+    # _resolve_num_replicas) isn't on this code path.
     nr_override = getattr(args, "num_replicas", None)
     if nr_override is not None:
         if nr_override < 1:

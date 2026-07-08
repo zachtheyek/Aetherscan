@@ -52,37 +52,80 @@ def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
     return val if val is not None else default
 
 
-def _detect_num_replicas(args: argparse.Namespace) -> int | None:
-    """Return the replica count to validate cross-replica constraints against.
+def _resolve_num_replicas(args: argparse.Namespace) -> int | None:
+    """Resolve the replica count to validate cross-replica constraints against, and
+    fail fast if an explicitly-requested count is unusable on this host.
 
-    Resolution order:
-    1. `args.num_replicas` if the user passed --num-replicas (returned as-is, even if
-       invalid; the >= 1 and <= num_gpus checks live in
-       :func:`validate_num_replicas_against_hardware`, which `validate_args` invokes
-       before `collect_validation_errors`).
-    2. `config.gpu.num_replicas` if set on the singleton — covers the case where it was
-       set programmatically (e.g. a test) or, in inference mode, loaded from the saved
-       JSON config before `validate_args` runs.
-    3. `len(tf.config.list_physical_devices('GPU'))` if TF is importable and reports at
-       least one GPU.
-    4. None — TF unavailable (e.g. utility scripts on a dev box) or TF reports zero
-       GPUs. Cross-replica checks are skipped in this case with a logged warning;
-       runtime will fail later in train_command or inference_command.
+    Returns the count `collect_validation_errors` should check batch/sample divisibility
+    against, or None to skip those checks.
+
+    Resolution:
+    - If the user passed --num-replicas, or `config.gpu.num_replicas` is set on the
+      singleton, e.g. loaded from a saved JSON config via `apply_saved_config` (flag has
+      priority), that value must be >= 1 and <= the number of GPUs TF reports; either
+      violation raises ValueError so a bad count hard-stops *before* the divisibility
+      checks consume it as a divisor. Otherwise it is returned, so those checks run
+      against the same count the strategy will actually use.
+    - With no explicit request, the returned count is the number of GPUs TF reports.
+    - If TF is unavailable (e.g. a dev box) or reports zero GPUs, None is returned
+      regardless of whether a count was requested: nothing can be confirmed against the
+      hardware, so the divisibility checks are skipped and handling is deferred to
+      `setup_gpu_strategy` (which determines whether to fail on GPU-required runs, or to
+      proceed with a CPU-only runtime). Note, the >= 1 check still runs first, so a
+      nonsensical explicit request is rejected even here.
+
+    TF is imported lazily so utility scripts (which call `collect_validation_errors`
+    directly and never reach this) don't pay the init cost.
     """
     config = get_config()
-    val = _resolve(args, "num_replicas", config.gpu.num_replicas if config else None)
-    if val is not None:
-        return int(val)
+    if config is None:
+        raise ValueError("get_config() returned None")
+
+    # Resolve the requested count and remember which source supplied it, so any failure
+    # below names the right one (the flag vs. the saved/programmatic config value).
+    if getattr(args, "num_replicas", None) is not None:
+        requested: int | None = int(args.num_replicas)
+        source = "--num-replicas"
+    elif config.gpu.num_replicas is not None:
+        requested = int(config.gpu.num_replicas)
+        source = "config.gpu.num_replicas"
+    else:
+        requested = None
+        source = None
+
+    # Positivity is checked first and without TF, so a nonsensical explicit request fails
+    # fast even on a no-GPU box.
+    if requested is not None and requested < 1:
+        raise ValueError(
+            f"{source} must be >= 1 (or unset to use all available GPUs), got {requested}"
+        )
+
+    # Everything below needs the host's GPU count. If TF is unavailable or reports zero
+    # GPUs we can neither detect nor verify a count, so skip the cross-replica checks and
+    # defer to setup_gpu_strategy rather than guessing.
     try:
-        # Lazy import: validate_args() is called early in main() and we don't want to force
-        # the full TF init for CLI parsing failures or for utility scripts that only need
-        # the validation surface.
         import tensorflow as tf  # noqa: PLC0415
 
         gpus = tf.config.list_physical_devices("GPU")
-        return len(gpus) if gpus else None
     except Exception:
         return None
+    if not gpus:
+        return None
+    total = len(gpus)
+
+    # No explicit request: use every GPU TF reports.
+    if requested is None:
+        return total
+
+    # Explicit request: never allow more replicas than the host has GPUs — propagating
+    # batch/sample sizes validated against the wrong replica count would silently corrupt
+    # the run.
+    if requested > total:
+        raise ValueError(
+            f"{source}={requested} exceeds the number of GPUs available on this node "
+            f"({total}). Set it to <= {total}, or unset it to use all available GPUs."
+        )
+    return requested
 
 
 def setup_argument_parser() -> argparse.ArgumentParser:
@@ -1035,7 +1078,7 @@ def collect_validation_errors(
     errors: list[ValidationError] = []
 
     # --num-replicas validation (>= 1 and <= available GPUs) is performed upstream
-    # by validate_num_replicas_against_hardware(), which validate_args() calls before
+    # by _resolve_num_replicas(), which validate_args() calls before
     # collect_validation_errors(). By the time we get here, num_replicas is known to
     # be a sane positive int (or None on a no-GPU dev box, in which case cross-
     # replica divisibility checks are skipped further down).
@@ -1397,10 +1440,10 @@ def collect_validation_errors(
                     "--num-replicas explicitly to run them."
                 )
             elif num_replicas < 1:
-                # validate_num_replicas_against_hardware would have raised before we
-                # got here for a real pipeline invocation. Reachable only via direct
-                # callers (e.g. utils/find_optimal_configs.py) that bypass validate_args;
-                # skip the cross-replica section to avoid div-by-zero.
+                # _resolve_num_replicas would have raised before we got here for a real
+                # pipeline invocation. Reachable only via direct callers (e.g.
+                # utils/find_optimal_configs.py) that bypass validate_args; skip the
+                # cross-replica section to avoid div-by-zero.
                 pass
             else:
                 train_samples = nsb * tvs
@@ -1775,56 +1818,7 @@ def collect_validation_errors(
     return errors
 
 
-def validate_num_replicas_against_hardware(
-    args: argparse.Namespace, num_replicas: int | None
-) -> None:
-    """Fail fast if --num-replicas is invalid against the host's GPU count.
-
-    Two checks live here rather than in `collect_validation_errors`:
-
-    1. `--num-replicas >= 1` — a 0/negative value would silently divide batch sizes
-       by 0 in the cross-replica checks downstream and is meaningless at strategy-
-       construction time.
-    2. `--num-replicas <= len(tf.config.list_physical_devices('GPU'))` — propagating
-       batch/sample sizes validated against the wrong replica count would silently
-       corrupt the run. Used to live in `main.py:setup_gpu_strategy`, but raising it
-       to validate_args time means cross-replica divisibility checks always run
-       against the same replica count the strategy will actually use, and
-       inference_command / train_command can assume their precondition holds.
-
-    Lazy-imports TF for the GPU count so dev boxes / utility scripts (which never
-    call this — they use `collect_validation_errors` directly) don't pay the TF
-    init cost. If TF is unavailable or reports zero GPUs, the GPU-count check is
-    skipped silently — the run will fail later in setup_gpu_strategy anyway.
-
-    Raises ValueError on either failure; caught by main.py's wrapper around
-    validate_args.
-    """
-    nr_arg = getattr(args, "num_replicas", None)
-    if nr_arg is not None and nr_arg <= 0:
-        raise ValueError(
-            f"--num-replicas must be >= 1 (or omitted to use all available GPUs), got {nr_arg}"
-        )
-
-    if num_replicas is None:
-        return
-    try:
-        import tensorflow as tf  # noqa: PLC0415
-
-        gpus = tf.config.list_physical_devices("GPU")
-    except Exception:
-        return
-    if not gpus:
-        return
-    total = len(gpus)
-    if num_replicas > total:
-        raise ValueError(
-            f"--num-replicas={num_replicas} exceeds the number of GPUs available on "
-            f"this node ({total}). Re-run with --num-replicas <= {total} (or omit the "
-            f"flag to use all available GPUs)."
-        )
-
-
+# NOTE: come back to this later (everything in this section)
 # ---------------------------------------------------------------------------
 # Fix proposal surface — used both by validate_args (to include suggestions in
 # the ValueError message on failure) and by utils/find_optimal_configs.py (to
@@ -2049,14 +2043,15 @@ def _build_suggestion_block(errors: list[ValidationError], num_replicas: int | N
 def validate_args(args: argparse.Namespace) -> None:
     """
     Pre-flight semantic and cross-parameter validation for the parsed CLI namespace, run before
-    apply_args_to_config(). Delegates to validate_num_replicas_against_hardware() and
-    collect_validation_errors() and raises ValueError if any failures came back. On failure
-    the ValueError message includes a list of suggested CLI flags from the same proposer
-    surface that powers utils/find_optimal_configs.py. Syntax and type checks are handled
-    earlier by argparse itself in ArgumentParser.parse_args (called from main.py:main).
+    apply_args_to_config(). Delegates to _resolve_num_replicas() (which also fails fast on a
+    replica count that's unusable on this host) and collect_validation_errors(), and raises
+    ValueError if any failures came back. On failure the ValueError message includes a list of
+    suggested CLI flags from the same proposer surface that powers utils/find_optimal_configs.py.
+    Syntax and type checks are handled earlier by argparse itself in ArgumentParser.parse_args
+    (called from main.py:main).
     """
-    num_replicas = _detect_num_replicas(args)
-    validate_num_replicas_against_hardware(args, num_replicas)
+    num_replicas = _resolve_num_replicas(args)
+    # NOTE: come back to this later
     errors = collect_validation_errors(args, num_replicas)
     if errors:
         violation_block = "\n".join(f"  - {e.message}" for e in errors)

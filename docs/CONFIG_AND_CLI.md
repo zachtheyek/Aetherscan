@@ -227,12 +227,20 @@ Three things to know:
    script exercises the same proposer for ad-hoc "what config would work on N GPUs?"
    queries.
 
-2. **`num_replicas` is determined ahead of time** by `_detect_num_replicas(args)`:
-   `args.num_replicas` if the user passed `--num-replicas`, else
-   `tf.config.list_physical_devices('GPU')` count if TF reports at least one GPU, else
-   `None`. When the value is `None`, `collect_validation_errors` logs a warning and
-   skips the cross-replica divisibility section — the runtime will fail later in
-   `setup_gpu_strategy` if it really needed GPUs. This lets utility scripts
+2. **`num_replicas` is resolved ahead of time** by `_resolve_num_replicas(args)`, in
+   priority order: `args.num_replicas` if the user passed `--num-replicas`, else
+   `config.gpu.num_replicas` if set on the singleton (e.g. a saved config loaded in
+   inference mode), else `tf.config.list_physical_devices('GPU')` count if TF reports at
+   least one GPU. When the count comes from an explicit request (the flag or config),
+   the function fails fast with a `ValueError` if it is `< 1` (checked first, without
+   importing TF) or — when TF can confirm the hardware — exceeds the host's GPU count,
+   naming whichever knob supplied the value, so a bad count hard-stops before the
+   cross-replica divisibility checks consume it as a divisor. If TF is unavailable or
+   reports zero GPUs, `_resolve_num_replicas` returns `None` regardless of whether a
+   count was requested — the upper bound can't be confirmed, so that check is deferred
+   to `setup_gpu_strategy`. When the value is `None`, `collect_validation_errors` logs a
+   warning and skips the cross-replica divisibility section — the runtime will fail
+   later in `setup_gpu_strategy` if it really needed GPUs. This lets utility scripts
    (e.g. `find_optimal_configs.py` on a dev box without TF) still produce the
    non-cross-replica part of the report.
 

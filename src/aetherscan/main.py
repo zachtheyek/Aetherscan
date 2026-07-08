@@ -77,34 +77,24 @@ def setup_gpu_strategy():
 
     gpus = tf.config.list_physical_devices("GPU")
     if not gpus:
-        logger.warning("No GPUs detected, running on CPU")
+        logger.warning("No GPUs detected")
         return None
 
     # Apply config.gpu.num_replicas. None means "use every visible GPU" (default);
-    # a positive int restricts TF to the first N GPUs and leaves the rest untouched
-    # for other workloads (the standard idiom for "use only K of the cluster's M
-    # GPUs" — set_visible_devices below is what wires it up).
+    # a positive int wired through set_visible_devices restricts TF to the first N
+    # GPUs and leaves the rest untouched for other workloads
     #
-    # `requested < total_gpus` is a supported configuration, not an error: the user
-    # is deliberately reserving the remaining cards (other workloads, debugging,
-    # single-GPU correctness validation on Blackwell — see docs/BLACKWELL_MIGRATION
-    # fallback option 4). We don't fail or warn — just restrict TF and log which
-    # devices were left out.
-    #
-    # The opposite case (`requested > total_gpus`) is fatal and is rejected upstream
-    # by cli.py:validate_num_replicas_against_hardware. Catching it at validate_args
-    # time (rather than here) means the cross-replica divisibility checks in
-    # collect_validation_errors always run against the same replica count the
-    # strategy will actually use — propagating batch/sample sizes that were
-    # validated against the wrong divisor would silently corrupt training. By the
-    # time we get here `requested` is guaranteed to be None or in [1, total_gpus].
+    # Note that config.gpu.num_replicas is guaranteed to be None or in [1, total_gpus].
+    # Any other values are caught at validate_args time before reaching this point. The
+    # remaining edge-case where 0-GPUs are reported by TF is handled by train_command()
+    # and inference_command() individually (here we simply return None)
     total_gpus = len(gpus)
     requested = config.gpu.num_replicas
     if requested is not None and requested < total_gpus:
+        gpus = gpus[:requested]
         # set_visible_devices must run before any GPU memory-growth or logical-device
         # call, since those initialize the GPU runtime and freeze the visible set.
-        tf.config.set_visible_devices(gpus[:requested], "GPU")
-        gpus = gpus[:requested]
+        tf.config.set_visible_devices(gpus, "GPU")
         logger.info(
             f"Restricting TF to {requested} of {total_gpus} GPUs "
             f"(per config.gpu.num_replicas={requested}); GPUs "
