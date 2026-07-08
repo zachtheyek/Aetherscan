@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # validate_args() and utility scripts (e.g. utils/find_optimal_configs.py)
 
 # Accepted formats for --load-tag and --save-tag (cli.py help strings document these)
+# NOTE: this whitelist is fairly restrictive — consider broadening it with more accepted
+# tag formats (e.g. free-form descriptive slugs like `smoke_blackwell` or `ampere_v1`) so
+# runs can be labelled meaningfully without being forced into the test_vX / final_vX shapes.
 _TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
 
 # sklearn's RandomForestClassifier accepts these string values for max_features

@@ -905,6 +905,12 @@ class TrainingPipeline:
         start_round = self.config.checkpoint.start_round
 
         if start_round > n_rounds:
+            # BUG: returning here skips the `self.start_time = time.time()` assignment below,
+            # so a resume/retry that finds the beta-VAE already trained (start_round > n_rounds)
+            # leaves self.start_time unset. Later plotting reads self.start_time and raises
+            # `'TrainingPipeline' object has no attribute 'start_time'`, which then masks the
+            # original error across retries. Fix by setting start_time in __init__ (or before
+            # this guard) so it always exists regardless of the resume point.
             return  # Return early if beta-VAE already trained (can occur from fault tolerance)
         elif start_round > 1:
             logger.info(f"Resuming training from round {start_round}/{n_rounds}")
