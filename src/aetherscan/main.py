@@ -277,8 +277,10 @@ def train_command():
                 logger.error(f"Final error: {e}")
                 sys.exit(1)
 
-    # Save training configuration
-    config_path = os.path.join(config.model_path, f"config_{config.checkpoint.save_tag}.json")
+    # Save training configuration. Configs live under output_path (not model_path) — same
+    # as the inference-side save below — so models/ holds only weights, outputs/ holds
+    # configs + plots + logs + db.
+    config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist
 
     with open(config_path, "w") as f:
