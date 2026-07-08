@@ -1302,7 +1302,8 @@ def collect_validation_errors(
             )
 
         edr = _resolve(args, "exponential_decay_rate", config.training.exponential_decay_rate)
-        if edr is not None and edr >= 0:
+        # exponential_decay_rate only governs the exponential schedule; skip it otherwise.
+        if cs == "exponential" and edr is not None and edr >= 0:
             errors.append(
                 ValidationError(
                     field="training.exponential_decay_rate",
@@ -1315,7 +1316,10 @@ def collect_validation_errors(
 
         ser = _resolve(args, "step_easy_rounds", config.training.step_easy_rounds)
         shr = _resolve(args, "step_hard_rounds", config.training.step_hard_rounds)
-        if ntr is not None and ser is not None and not (0 <= ser <= ntr):
+        # step_easy_rounds / step_hard_rounds only apply to the step schedule; skip their
+        # range checks otherwise (their defaults needn't fit num_training_rounds when the
+        # active schedule is linear or exponential).
+        if cs == "step" and ntr is not None and ser is not None and not (0 <= ser <= ntr):
             errors.append(
                 ValidationError(
                     field="training.step_easy_rounds",
@@ -1326,7 +1330,7 @@ def collect_validation_errors(
                     max_val=ntr,
                 )
             )
-        if ntr is not None and shr is not None and not (0 <= shr <= ntr):
+        if cs == "step" and ntr is not None and shr is not None and not (0 <= shr <= ntr):
             errors.append(
                 ValidationError(
                     field="training.step_hard_rounds",
@@ -1476,12 +1480,18 @@ def collect_validation_errors(
                             fix_kind="cross_param",
                         )
                     )
-                if global_val_batch > nsr:
+                # The RF splits num_samples_rf by train_val_split (like the beta-VAE), so the
+                # val set the runtime actually builds is nsr * (1 - train_val_split), then
+                # trims it to a multiple of the global val batch. Validate that val portion,
+                # not raw nsr — otherwise train_random_forest fails at runtime with
+                # "val_steps < 1: n_val_trimmed (0) ..." when the val split is too small.
+                rf_val_samples = round(nsr * (1 - tvs))
+                if global_val_batch > rf_val_samples:
                     errors.append(
                         ValidationError(
-                            field="training.per_replica_val_batch_size",
-                            current=prvb,
-                            message=f"--per-replica-val-batch-size * num_replicas ({prvb} * {num_replicas} = {global_val_batch}) must be <= num_samples_rf ({nsr})",
+                            field="training.num_samples_rf",
+                            current=nsr,
+                            message=f"num_samples_rf * (1 - train_val_split) ({nsr} * {1 - tvs:.4f} = {rf_val_samples}) must be >= per_replica_val_batch_size * num_replicas ({prvb} * {num_replicas} = {global_val_batch})",
                             fix_kind="cross_param",
                         )
                     )
