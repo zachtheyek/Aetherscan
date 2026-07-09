@@ -59,7 +59,7 @@ runtime defaults  <  loaded config  <  CLI args
 
 `Config` is a dataclass-of-dataclasses with double-checked-locking singleton semantics
 (see `Config.__new__`, `_lock`, `_initialized`). Every parameter the pipeline reads at
-runtime lives somewhere on this object, with a sensible default.
+runtime lives somewhere on this object, with a sensible default baked in.
 
 The sub-dataclasses are grouped by **what subsystem owns the parameter**, not by which
 subcommand uses it:
@@ -210,7 +210,7 @@ sub-dataclass (Pattern B) instead.
 
 Each layer addresses a different failure mode. Together they make cross-mode
 contamination essentially impossible without an explicit code mistake (e.g., a
-developer accidentally writing `config.inference.X` inside `train.py`).
+developer accidentally writing `config.inference.X` instead of `config.training.X`).
 
 ## The validation layer
 
@@ -218,33 +218,29 @@ developer accidentally writing `config.inference.X` inside `train.py`).
 config defaults via the `_resolve(args, arg_name, default)` helper, so checks see the
 effective value the pipeline would use even when a flag is omitted.
 
-In inference mode, `apply_saved_config(args.config_path)` runs immediately
+In `inference` mode, `apply_saved_config(args.config_path)` runs immediately
 after `parse_args` and before `validate_args` — so by the time validation kicks in,
-the saved JSON's fields have already become the singleton's "defaults" and `_resolve`
-returns the merged saved+CLI view. This closes the loop on `--config-path`: prior to
-this hook the flag was accepted, stored, and serialized at exit but never actually
-applied at runtime, which meant `validate_args` was checking dataclass defaults rather
-than the values inference would actually use.
+the singleton's defaults at runtime have already been overridden by the saved JSON's
+fields, allowing `_resolve` to return the correct value.
 
 Three things to know:
 
 1. **`collect_validation_errors(args, num_replicas)`** returns a list of structured
    `ValidationError` objects (with `field`, `current`, `message`, `fix_kind`, ...). The
-   `validate_args` wrapper turns the list into a `ValueError`, and uses the proposer
-   surface colocated in `cli.py` (`propose_simple_fix`, `_solve_cross_param_constraints`)
-   to append a `Suggested fixes:` block to the message. The standalone
-   [`utils/find_optimal_configs.py`](#diagnosing-config-issues-with-find_optimal_configspy)
-   script exercises the same proposer for ad-hoc "what config would work on N GPUs?"
-   queries.
+   `validate_args` wrapper turns the list into a single `ValueError`, and uses the
+   proposer surface colocated in `cli.py` (`propose_simple_fix`,
+   `_solve_cross_param_constraints`) to append a `Suggested fixes:` block to the
+   error message. The standalone [`utils/find_optimal_configs.py`](#diagnosing-config-issues-with-find_optimal_configspy) script exercises
+   the same proposer for ad-hoc "what config would work on N GPUs?" queries.
 
 2. **`num_replicas` is resolved ahead of time** by `_resolve_num_replicas(args)`, in
    priority order: `args.num_replicas` if the user passed `--num-replicas`, else
-   `config.gpu.num_replicas` if set on the singleton (e.g. a saved config loaded in
-   inference mode), else `tf.config.list_physical_devices('GPU')` count if TF reports at
-   least one GPU. When the count comes from an explicit request (the flag or config),
-   the function fails fast with a `ValueError` if it is `< 1` (checked first, without
-   importing TF) or — when TF can confirm the hardware — exceeds the host's GPU count,
-   naming whichever knob supplied the value, so a bad count hard-stops before the
+   `config.gpu.num_replicas` if set on the singleton, else
+   `tf.config.list_physical_devices('GPU')` count if TF reports at least one GPU.
+   When the count comes from an explicit request (the flag or config), the function
+   fails fast with a `ValueError` if it is `< 1` (checked first, without importing
+   TF) or — when TF can confirm the hardware — exceeds the host's GPU count, naming
+   whichever knob supplied the value, so a bad count hard-stops before the
    cross-replica divisibility checks consume it as a divisor. If TF is unavailable or
    reports zero GPUs, `_resolve_num_replicas` returns `None` regardless of whether a
    count was requested — the upper bound can't be confirmed, so that check is deferred
@@ -254,7 +250,7 @@ Three things to know:
    (e.g. `find_optimal_configs.py` on a dev box without TF) still produce the
    non-cross-replica part of the report.
 
-3. **The same mode-gating pattern applies inside validation**:
+3. **The same mode-gating pattern applies during validation**:
 
    ```python
    if cmd == "train":
