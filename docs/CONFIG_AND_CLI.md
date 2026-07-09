@@ -7,42 +7,52 @@ exist precisely so that one mode's parameters can't silently contaminate the oth
 
 ## TL;DR
 
-| Layer                                                                            | What it does                                                                                                                                                    | Source of truth                                                    |
-| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `src/aetherscan/config.py`                                                       | Defines the `Config` singleton and its sub-dataclasses (`TrainingConfig`, `InferenceConfig`, `GPUConfig`, ...). Holds **every** parameter with a default value. | `Config` instance returned by `get_config()`                       |
-| `_add_train_flags_to(parser)` / `_add_inference_flags_to(parser)` (cli.py)       | Register flags onto a given parser. Reused by the main pipeline and by `utils/find_optimal_configs.py`.                                                         | Single source for flag names, types, help text                     |
-| `setup_argument_parser()` (cli.py)                                               | Builds the top-level parser with `train` and `inference` subparsers and delegates flag registration to the helpers above.                                       | argparse `subparsers` object                                       |
-| `apply_args_to_config(args)` (cli.py)                                            | Mutates the singleton in place with any non-None overrides on `args`. Three patterns (A/B/C) below.                                                             | The singleton after this call                                      |
-| `collect_validation_errors(args, num_replicas)` / `validate_args(args)` (cli.py) | Cross-parameter and bounds validation. Returns structured `ValidationError`s; the wrapper raises `ValueError`.                                                  | The pre-apply args (validation runs before `apply_args_to_config`) |
-| `train_command()` / `inference_command()` (main.py)                              | Read their own slice of the singleton and run.                                                                                                                  | `config.training.*`, `config.inference.*`                          |
+| Layer                                                                                    | What it does                                                                                                                                                    |
+| ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/aetherscan/config.py`                                                               | Defines the `Config` singleton and its sub-dataclasses (`TrainingConfig`, `InferenceConfig`, `GPUConfig`, ...). Holds **every** parameter with a default value. |
+| `src/aetherscan/cli.py:setup_argument_parser()`                                          | Builds the top-level parser with `train` and `inference` subparsers. Delegates flag registration to the helpers below.                                          |
+| `src/aetherscan/cli.py:_add_train_flags_to(parser)` / `:_add_inference_flags_to(parser)` | Register flags onto a given parser. Reused by the main pipeline and by `utils/find_optimal_configs.py`.                                                         |
+| `src/aetherscan/cli.py:validate_args(args)`                                              | Cross-parameter and bounds validation. Returns structured `ValidationError`s; the wrapper raises `ValueError`.                                                  |
+| `src/aetherscan/cli.py:apply_args_to_config(args)`                                       | Mutates the singleton in place with any non-None overrides on `args`. Three patterns (A/B/C) below.                                                             |
+| `src/aetherscan/main.py:train_command()` / `:inference_command()`                        | Read their own slice of the singleton and run the main pipeline.                                                                                                |
+
+Startup flow:
 
 ```
+  ...
+   │
+   ▼
 sys.argv
    │
    ▼
-parse_args()                   ── argparse picks one subparser; args.command set
+setup_argument_parser()            ── calls helpers for subcommand flag registration
    │
    ▼
-apply_saved_config             ── inference + --config-path only: layers the saved
-   │                              JSON onto the singleton so it becomes the new
-   │                              "defaults" validate_args sees via _resolve
-   ▼
-validate_args(args)            ── raises ValueError on any failure (no mutation)
+parse_args()                       ── argparse picks the specified subparser; args.command set
    │
    ▼
-apply_args_to_config           ── writes non-None args onto the Config singleton
-   │                              (CLI overrides win over saved config)
-   ▼
-init_db / setup_gpu_strategy / ...
+apply_saved_config(config_path)    ── only runs on args.command == inference and args.config_path
+   │                                  is not None:
+   │                                  overrides the singleton defaults at runtime with a saved JSON
    │
    ▼
-train_command() | inference_command()
+validate_args(args)                ── raises ValueError on any failure (no mutation)
+   │
+   ▼
+apply_args_to_config(args)         ── writes non-None args onto the Config singleton
+   │                                  (CLI overrides saved config)
+   │
+   ▼
+  ...
+   │
+   ▼
+train_command() / inference_command()
 ```
 
-Priority order at the time `validate_args` runs:
+Priority order:
 
 ```
-defaults  <  saved config (inference + --config-path only)  <  CLI args
+runtime defaults  <  saved config (from )  <  CLI args
 ```
 
 ## The configuration singleton
