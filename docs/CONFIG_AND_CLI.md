@@ -229,9 +229,10 @@ Three things to know:
    `ValidationError` objects (with `field`, `current`, `message`, `fix_kind`, ...). The
    `validate_args` wrapper turns the list into a single `ValueError`, and uses the
    proposer surface colocated in `cli.py` (`propose_simple_fix`,
-   `_solve_cross_param_constraints`) to append a `Suggested fixes:` block to the
-   error message. The standalone [`utils/find_optimal_configs.py`](#diagnosing-config-issues-with-find_optimal_configspy) script exercises
-   the same proposer for ad-hoc "what config would work on N GPUs?" queries.
+   `_solve_cross_param_constraints`, `_check_cross_constraints`) to append a
+   `Suggested fixes:` block to the error message. The standalone
+   [`utils/find_optimal_configs.py`](#diagnosing-config-issues-with-find_optimal_configspy) script exercises the same proposer for ad-hoc
+   "what config would work on N GPUs?" queries.
 
 2. **`num_replicas` is resolved ahead of time** by `_resolve_num_replicas(args)`, in
    priority order: `args.num_replicas` if the user passed `--num-replicas`, else

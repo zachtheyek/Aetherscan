@@ -2064,7 +2064,7 @@ def validate_args(args: argparse.Namespace) -> None:
     (called from main.py:main).
     """
     num_replicas = _resolve_num_replicas(args)
-    # NOTE: come back to this later
+    # NOTE: come back to this later (should we log a help message to use utils/find_optimal_configs.py if the inline `Suggested fixes: ` block isn't enough? alternatively, why don't we make it such that validate_args and the utility script share the exact same proposer surface -- e.g. bounded grid search on both, not just utility script. then, the purpose of the utility script would simply be to test hypothetical configurations? update docs/CONFIG_AND_CLI.md if any changes.)
     errors = collect_validation_errors(args, num_replicas)
     if errors:
         violation_block = "\n".join(f"  - {e.message}" for e in errors)
