@@ -235,19 +235,20 @@ Three things to know:
 
 2. **`num_replicas` is resolved ahead of time** by `_resolve_num_replicas(args)`, in
    priority order: `args.num_replicas` if the user passed `--num-replicas`, else
-   `config.gpu.num_replicas` if set on the singleton, else
-   `tf.config.list_physical_devices('GPU')` count if TF reports at least one GPU.
-   When the count comes from an explicit request (the flag or config), the function
-   fails fast with a `ValueError` if it is `< 1` (checked first, without importing
-   TF) or — when TF can confirm the hardware — exceeds the host's GPU count, naming
-   whichever knob supplied the value, so a bad count hard-stops before the
-   cross-replica divisibility checks consume it as a divisor. If TF is unavailable or
-   reports zero GPUs, `_resolve_num_replicas` returns `None` regardless of whether a
-   count was requested — the upper bound can't be confirmed, so that check is deferred
-   to `setup_gpu_strategy`. When the value is `None`, `collect_validation_errors` logs a
-   warning and skips the cross-replica divisibility section — the runtime will fail
-   later in `setup_gpu_strategy` if it really needed GPUs. This lets utility scripts
-   (e.g. `find_optimal_configs.py` on a dev box without TF) still produce the
+   `config.gpu.num_replicas` if set on the singleton, else the count returned from
+   `tf.config.list_physical_devices('GPU')` if TF reports at least one GPU. When
+   the replica count comes from an explicit request (the flag or config), the
+   function fails fast with a `ValueError` if the count is `< 1` (checked first,
+   without importing TF) or — when TF can confirm the hardware — exceeds the
+   host's GPU count, naming whichever knob initially supplied the count, so a bad
+   value hard-stops before the cross-replica divisibility checks consume it as
+   a divisor. If TF is unavailable or reports zero GPUs, `_resolve_num_replicas`
+   returns `None` regardless of whether a replica count was requested — the upper
+   bound can't be confirmed, so that check is deferred to `setup_gpu_strategy`.
+   When the return value is `None`, `collect_validation_errors` logs a warning
+   and skips the cross-replica divisibility checks — the runtime will fail later
+   in `setup_gpu_strategy` if GPUs were required. This lets utility scripts (e.g.
+   `find_optimal_configs.py` on a dev box without TF) still produce the
    non-cross-replica part of the report.
 
 3. **The same mode-gating pattern applies during validation**:
