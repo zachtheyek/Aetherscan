@@ -52,7 +52,7 @@ train_command() / inference_command()
 Priority order:
 
 ```
-runtime defaults  <  saved config (from )  <  CLI args
+runtime defaults  <  loaded config  <  CLI args
 ```
 
 ## The configuration singleton
