@@ -269,6 +269,28 @@ def _threshold_hits_worker(args: tuple) -> list[tuple]:
     return hits
 
 
+def _extract_stamps_worker(args: tuple) -> None:
+    """Fill one (obs_file, stamp-range) slice of the memmap-backed cadence .npy.
+
+    Each worker opens its own hdf5 handle and its own r+ view of the shared .npy, then
+    copies a stamp_width-wide window (over the first `time_bins` rows, polarization 0) around
+    each hit. Tasks address disjoint output regions — distinct obs_idx and/or non-overlapping
+    stamp indices — so concurrent writes from the pool never collide. `stamp_starts` is the
+    contiguous, start-sorted slice for this task; `base_idx` is its offset into the full stamp
+    list so the worker writes to the correct absolute rows.
+    """
+    npy_path, obs_idx, obs_h5, stamp_starts, base_idx, time_bins, stamp_width = args
+    out = np.lib.format.open_memmap(npy_path, mode="r+")
+    try:
+        with h5py.File(obs_h5, "r") as hf:
+            dset = hf["data"]
+            for local_i, start in enumerate(stamp_starts):
+                out[base_idx + local_i, obs_idx] = dset[:time_bins, 0, start : start + stamp_width]
+        out.flush()
+    finally:
+        del out
+
+
 # NOTE: come back to this later
 # def _drop_side_channels(
 #     block_data: np.ndarray, side_channel_count: int, coarse_channel_width: int
@@ -1112,24 +1134,59 @@ class DataPreprocessor:
         # decompressed chunk across adjacent stamps instead of redecompressing it.
         stamp_centers.sort(key=lambda s: s[0])
 
-        # Extract stamps for all 6 observations (sequential per file, no pool)
-        cadence_stamps = np.zeros(
-            (len(stamp_centers), len(group.h5_paths), time_bins, stamp_width), dtype=np.float32
-        )
-
-        for obs_idx, obs_h5 in enumerate(group.h5_paths):
-            with h5py.File(obs_h5, "r") as hf:
-                for stamp_idx, (start, _, _) in enumerate(stamp_centers):
-                    end = start + stamp_width
-                    cadence_stamps[stamp_idx, obs_idx] = hf["data"][:time_bins, 0, start:end]
-
-        # Write the .npy and the sibling metadata atomically. A process kill
-        # mid-write must not leave a corrupt file at the canonical path —
-        # find_hits' resume path treats the existence of npy_path as proof of
-        # a complete write. We achieve that by writing to a .tmp sibling first
-        # then os.replace()-ing it onto the canonical name.
+        # Extract stamps into a memmap-backed .npy so worker processes can fill disjoint
+        # (obs_file, stamp-range) slices in parallel. The previous sequential per-file loop
+        # over all 6 observations (single-threaded reads + bitshuffle chunk decompression)
+        # was the dominant, GPU-idle cost of CSV inference.
+        #
+        # Atomicity is unchanged: the memmap is written to a .tmp sibling and we os.replace()
+        # it onto the canonical name only after every worker finishes, so find_hits' resume
+        # path (which treats npy_path's existence as proof of a complete write) still holds.
+        n_stamps = len(stamp_centers)
         tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
-        np.save(tmp_npy_path, cadence_stamps)
+        memmap = np.lib.format.open_memmap(
+            tmp_npy_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_stamps, len(group.h5_paths), time_bins, stamp_width),
+        )
+        memmap.flush()
+        del memmap  # header + full-size file are on disk; workers reopen it in r+ mode
+
+        stamp_starts = [start for start, _, _ in stamp_centers]
+        n_processes = self.config.manager.n_processes
+        # Split each obs file's (already start-sorted) stamps into contiguous chunks so more
+        # than len(h5_paths) workers can run, while keeping each worker's reads sequential to
+        # preserve the hdf5 chunk-cache reuse that the sort above buys us.
+        chunks_per_file = max(1, -(-n_processes // len(group.h5_paths)))  # ceil div
+        chunk_size = max(1, -(-n_stamps // chunks_per_file))  # ceil div
+        tasks = [
+            (
+                tmp_npy_path,
+                obs_idx,
+                obs_h5,
+                stamp_starts[base : base + chunk_size],
+                base,
+                time_bins,
+                stamp_width,
+            )
+            for obs_idx, obs_h5 in enumerate(group.h5_paths)
+            for base in range(0, n_stamps, chunk_size)
+        ]
+
+        if n_processes > 1 and len(tasks) > 1:
+            pool = self.manager.create_pool(
+                n_processes=min(len(tasks), n_processes),
+                name="DataPreproc_extract_stamps",
+            )
+            try:
+                pool.map(_extract_stamps_worker, tasks)
+            finally:
+                self.manager.close_pool(pool)
+        else:
+            for task in tasks:
+                _extract_stamps_worker(task)
+
         os.replace(tmp_npy_path, npy_path)
 
         metadata_path = self._cadence_metadata_path(npy_path)
@@ -1159,7 +1216,7 @@ class DataPreprocessor:
         gc.collect()
 
         logger.info(
-            f"Cadence {group.key}: wrote {cadence_stamps.shape[0]} stamps -> "
+            f"Cadence {group.key}: wrote {n_stamps} stamps -> "
             f"{npy_path} (metadata: {metadata_path})"
         )
 
@@ -1167,7 +1224,7 @@ class DataPreprocessor:
             npy_path=npy_path,
             h5_paths=group.h5_paths,
             key=group.key,
-            n_hits=cadence_stamps.shape[0],
+            n_hits=n_stamps,
             metadata_path=metadata_path,
         )
 
