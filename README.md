@@ -46,7 +46,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 - ≥12 GB combined VRAM (training) / ≥9 GB combined VRAM (inference)
 - ≥150 GB RAM (training) / ≥100 GB RAM (inference)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
-- See [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) for the full runbook
+- See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
 
 **Conda env (alternative, Ampere only)**
 
@@ -87,7 +87,7 @@ singularity build aetherscan-ngc25.02.sif aetherscan.def
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md).
+Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
 
 **3. Set up monitoring dashboards in tmux (optional)**
 

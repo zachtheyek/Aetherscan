@@ -1,6 +1,6 @@
-# Blackwell GPU Migration Runbook
+# GPU Runtime Guide
 
-This runbook covers running Aetherscan on the new Blackwell (RTX PRO 6000) workstation alongside the existing Ampere (A4000) cluster. The pipeline source tree is identical on both machines, and as of [`aetherscan.def`](../aetherscan.def) the NGC container is the canonical runtime on both clusters — one recipe builds and runs on each. The conda env from before the migration is kept as an alternative install path on Ampere.
+This runbook covers running Aetherscan across GPU architectures — the Blackwell (RTX PRO 6000) workstation and the Ampere (A4000) cluster. The pipeline source tree is identical on both machines, and as of [`aetherscan.def`](../aetherscan.def) the NGC container is the canonical runtime on both clusters — one recipe builds and runs on each. The pre-container conda env is kept as an alternative install path on Ampere.
 
 ## TL;DR
 

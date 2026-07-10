@@ -111,7 +111,7 @@ utils/                   # fetch_run_outputs.sh, find_optimal_configs.py,
                          # get_system_info.sh, kill_pipeline.sh, print_cli_help.py,
                          # run_container.sh, start_tmux_session.sh,
                          # verify_train_test_files.py
-docs/                    # BLACKWELL_MIGRATION.md, CONFIG_AND_CLI.md, README.md, assets/
+docs/                    # CONFIG_AND_CLI.md, GPU_RUNTIME_GUIDE.md, README.md, assets/
 tests/                   # Placeholder — no test suite yet
 ```
 
@@ -199,4 +199,4 @@ Paths relative to the repo root:
 - `KNOWN_ISSUES.md` — known bugs and workarounds
 - `AI_POLICY.md` — AI usage policy (read before AI-assisted contributions)
 - `docs/CONFIG_AND_CLI.md` — config system deep dive
-- `docs/BLACKWELL_MIGRATION.md` — container build/runtime runbook
+- `docs/GPU_RUNTIME_GUIDE.md` — container build/runtime runbook

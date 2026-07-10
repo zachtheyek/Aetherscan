@@ -535,4 +535,4 @@ by `TF_CPP_MIN_LOG_LEVEL`, so it can't be suppressed without redirecting stderr.
 ### Status
 
 **Won't fix.** Expected LLVM/PTX version-skew behavior. See also
-[`docs/BLACKWELL_MIGRATION.md`](docs/BLACKWELL_MIGRATION.md) ("warning noise" section).
+[`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) ("warning noise" section).
