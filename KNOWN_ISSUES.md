@@ -487,7 +487,7 @@ precise. It is emitted per-measurement, hence the high count.
 
 ### Impact
 
-**None on correctness.** Only the precision of XLA's internal *timing measurements* is
+**None on correctness.** Only the precision of XLA's internal _timing measurements_ is
 reduced, which at worst could nudge autotuning toward a marginally suboptimal kernel
 variant — a negligible perf delta in practice. It is not specific to the Blackwell
 migration (it appears identically on the Ampere cluster), and runs complete normally.
@@ -535,4 +535,4 @@ by `TF_CPP_MIN_LOG_LEVEL`, so it can't be suppressed without redirecting stderr.
 ### Status
 
 **Won't fix.** Expected LLVM/PTX version-skew behavior. See also
-[`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) ("warning noise" section).
+[`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) ("Benign noise to ignore" section).
