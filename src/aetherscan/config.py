@@ -91,6 +91,25 @@ class RandomForestConfig:
     seed: int = 11
 
 
+# NOTE: verify that our current GPU config gracefully handles cases where the node has a single GPU (vs multiple)
+# TODO: add a way to specify (either number or name) the specific GPUs on a system we wish to use (currently defaults to all available). extend to cli.py too
+# TODO: run performance benchmarks using different num_gpus on a single node (and in future, multi-node as well)
+@dataclass
+class GPUConfig:
+    """GPU runtime configuration"""
+
+    # If None, the strategy uses every GPU visible to TF. If set to a positive int N, the
+    # strategy is restricted to the first N physical GPUs (the rest are left untouched for
+    # other workloads on the node). Validated against batch/sample divisibility in cli.py
+    # before being applied; runtime mismatch (N > available GPUs) aborts in
+    # setup_gpu_strategy rather than silently downgrading, so we never propagate batch
+    # sizes that were validated against a different replica count.
+    num_replicas: int | None = None
+    per_gpu_memory_limit_mb: int | None = None
+    nccl_num_packs: int = 2
+    use_async_allocator: bool = True
+
+
 # TODO: make sure the entire pipeline respects DataConfig() values, instead of hard coding
 @dataclass
 class DataConfig:
@@ -356,6 +375,7 @@ class Config:
         self.logger = LoggerConfig()
         self.beta_vae = BetaVAEConfig()
         self.rf = RandomForestConfig()
+        self.gpu = GPUConfig()
         self.data = DataConfig()
         self.training = TrainingConfig()
         self.inference = InferenceConfig()
@@ -389,17 +409,26 @@ class Config:
             # Note, resources held by the old instance will remain alive unless explicitly closed beforehand
             cls._instance = None
 
-    def get_training_file_path(self, filename: str) -> str:
-        """Get full path for training data file"""
-        return os.path.join(self.data_path, "training", filename)
+    def get_training_file_path(self, filename: str, base_path: str | None = None) -> str:
+        """Get full path for training data files. base_path overrides self.data_path (used by
+        validate_args, which runs before a --data-path override is applied to the singleton)."""
+        return os.path.join(
+            base_path if base_path is not None else self.data_path, "training", filename
+        )
 
-    def get_test_file_path(self, filename: str) -> str:
-        """Get full path for test data file"""
-        return os.path.join(self.data_path, "testing", filename)
+    def get_test_file_path(self, filename: str, base_path: str | None = None) -> str:
+        """Get full path for testing data files. base_path overrides self.data_path (used by
+        validate_args, which runs before a --data-path override is applied to the singleton)."""
+        return os.path.join(
+            base_path if base_path is not None else self.data_path, "testing", filename
+        )
 
-    def get_inference_file_path(self, filename: str) -> str:
-        """Get full path for inference CSV file"""
-        return os.path.join(self.data_path, "inference", filename)
+    def get_inference_file_path(self, filename: str, base_path: str | None = None) -> str:
+        """Get full path for inference CSV files. base_path overrides self.data_path (used by
+        validate_args, which runs before a --data-path override is applied to the singleton)."""
+        return os.path.join(
+            base_path if base_path is not None else self.data_path, "inference", filename
+        )
 
     def get_file_subset(self, filename: str) -> tuple[int | None, int | None]:
         """Get subset parameters for a file (start, end indices)"""
@@ -465,6 +494,12 @@ class Config:
                 "max_features": self.rf.max_features,
                 "n_jobs": self.rf.n_jobs,
                 "seed": self.rf.seed,
+            },
+            "gpu": {
+                "num_replicas": self.gpu.num_replicas,
+                "per_gpu_memory_limit_mb": self.gpu.per_gpu_memory_limit_mb,
+                "nccl_num_packs": self.gpu.nccl_num_packs,
+                "use_async_allocator": self.gpu.use_async_allocator,
             },
             "data": {
                 "num_observations": self.data.num_observations,

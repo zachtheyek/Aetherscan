@@ -1,16 +1,13 @@
 """
-Aetherscan: Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale
+Aetherscan: Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale.
 
-This package provides tools for technosignature detection using signal processing and deep learning
-techniques applied to radio astronomy data.
-
-For most use cases, import specific modules as needed:
-    from aetherscan.config import Config
-    from aetherscan.models import RandomForestModel, create_beta_vae_model
-    from aetherscan.data_generation import DataGenerator
-    from aetherscan.preprocessing import DataPreprocessor
-    etc.
+Provides tools for technosignature detection using signal processing and deep learning techniques
+applied to radio astronomy data. Import submodules directly (aetherscan.config, aetherscan.models,
+aetherscan.data_generation, aetherscan.preprocessing, etc.) — the top-level package intentionally
+exposes only the version string.
 """
+
+from __future__ import annotations
 
 __version__ = "0.1.0"
 __author__ = "Zach Yek"

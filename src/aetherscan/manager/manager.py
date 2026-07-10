@@ -298,6 +298,9 @@ class ResourceManager:
         self._main_process_pid = os.getpid()
         self._cleanup_executed = False
         self._cleanup_lock = threading.Lock()
+        # Guards the signal handler against re-entrancy: a second Ctrl-C/SIGTERM while the
+        # first is still running cleanup_all() must not re-enter it (see _signal_handler).
+        self._shutdown_initiated = False
 
         # NOTE: should these be strong or weak references? import weakref ...
         # Track resources
@@ -352,13 +355,35 @@ class ResourceManager:
         logger.info("Cleanup handlers registered")
 
     def _signal_handler(self, signum, frame):
-        """Handle SIGINT and SIGTERM gracefully"""
+        """Handle SIGINT and SIGTERM.
+
+        Signals are delivered to the main thread and interrupt it wherever it is, so a
+        second signal arriving while the first is still inside cleanup_all() would re-enter
+        this handler on the same thread. cleanup_all() holds the non-reentrant
+        _cleanup_lock, so re-acquiring it from the same thread self-deadlocks — the process
+        then hangs until SIGKILL. To make repeated Ctrl-C behave predictably instead:
+
+        - First Ctrl-C / SIGTERM: run graceful cleanup once, then exit.
+        - Second: skip the (possibly still-running) cleanup and hard-exit immediately, and
+          reset both handlers to SIG_IGN so any further Ctrl-C is ignored rather than
+          re-triggering anything.
+        """
         # Ignore signals from worker processes entirely
         if os.getpid() != self._main_process_pid:
             return
 
+        if self._shutdown_initiated:
+            # Second signal while the first cleanup is in flight: ignore all further
+            # signals and force-quit now rather than re-entering cleanup_all() (deadlock).
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os._exit(130)  # 128 + SIGINT(2); skip remaining Python teardown
+        self._shutdown_initiated = True
+
         with contextlib.suppress(Exception):
-            logger.info(f"Received signal {signum}, initiating cleanup...")
+            logger.info(
+                f"Received signal {signum}, initiating cleanup (Ctrl-C again to force-quit)..."
+            )
 
         self.cleanup_all()
         # Properly terminate with sys.exit() after handling the signal inside main process
@@ -479,16 +504,10 @@ class ResourceManager:
         initargs: tuple = (),
     ) -> Pool:
         """
-        Create and register a managed pool
-
-        Args:
-            n_processes: Number of worker processes
-            name: Descriptive name for debugging
-            initializer: Worker initialization function
-            initargs: Arguments for initializer
-
-        Returns:
-            Multiprocessing Pool instance
+        Construct a multiprocessing.Pool with `n_processes` workers and register it for
+        lifecycle tracking; returns the raw Pool. `name` is a debugging label that surfaces in
+        manager logs and stats. `initializer` and `initargs` are forwarded to Pool() so each
+        worker runs that setup function at startup (commonly used to attach shared memory).
         """
         pool = Pool(processes=n_processes, initializer=initializer, initargs=initargs)
 
@@ -521,14 +540,10 @@ class ResourceManager:
 
     def create_shared_memory(self, size: int, name: str = "unnamed") -> SharedMemory:
         """
-        Create and register a managed shared memory
-
-        Args:
-            size: Size in bytes
-            name: Descriptive name for debugging
-
-        Returns:
-            SharedMemory instance
+        Allocate a POSIX shared-memory block of `size` bytes and register it for lifecycle
+        tracking; returns the raw SharedMemory. `name` is a debugging label that surfaces in
+        manager logs and stats (the OS-assigned shm name is separate and available via
+        shm.name).
         """
         shm = SharedMemory(create=True, size=size)
 

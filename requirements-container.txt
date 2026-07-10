@@ -1,0 +1,29 @@
+# Pip-only extras layered into the NGC TensorFlow 25.02 base image
+# (nvcr.io/nvidia/tensorflow:25.02-tf2-py3 already ships with numpy, scipy,
+# scikit-learn, matplotlib, pandas, h5py, psutil, pytest, and tensorflow 2.17).
+# Version ranges should be kept in lockstep with conda environment that targets the
+# Ampere cluster (see environment.yml)
+
+# Foundational deps -- already present in the NGC base; pinning here prevents
+# transitive bumps from upgrading them past TF 2.17's supported range.
+numpy>=1.26,<2.0
+scipy>=1.13,<1.14
+scikit-learn>=1.5,<1.6
+matplotlib>=3.9,<3.10
+
+# Aetherscan extras layered on top.
+astropy>=6.1,<7
+scikit-image>=0.24,<0.25
+joblib>=1.4,<2
+imageio>=2.34,<3
+umap-learn>=0.5.6,<0.6
+shap>=0.46.0,<0.47
+slack-sdk>=3.31.0,<4
+python-dotenv>=1.0,<2
+# setuptools provides pkg_resources, which blimpy (transitive via setigen)
+# imports at module load. Recent pip / Python releases dropped setuptools
+# from the bootstrap, so we install it explicitly. Upper-bound at <81 because
+# setuptools 81 removed pkg_resources as a vendored submodule -- revisit
+# once blimpy migrates off pkg_resources (upstream issue).
+setuptools>=70,<81
+setigen

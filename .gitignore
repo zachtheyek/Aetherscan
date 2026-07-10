@@ -1,5 +1,4 @@
-# Note, this is the project's local gitignore. Find my global gitignore here:
-# https://github.com/zachtheyek/dotfiles/blob/master/git/.gitignore_global
+### Project-local gitignore
 
 # Forward-search paper
 2301.12670v1.pdf
@@ -10,5 +9,53 @@ rzad056.pdf
 # Outputs directory
 outputs/
 
-# Temporary docs
-docs/PRESENTATION_OUTLINE.md
+# Container artifacts
+*.sif
+
+
+### Global gitignore (https://github.com/zachtheyek/dotfiles/blob/master/git/.gitignore_global)
+
+# Mac system files
+.DS_Store
+.localized
+
+# Python bytecode
+__pycache__/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Linters/formatters
+.ruff_cache
+
+# Vim/Neovim artifacts
+*.swp
+*.swo
+.session
+.nv/
+Session.vim
+
+# Claude configs (ignore local state, but track project-local instructions & shared skills)
+**/.claude/*
+!**/.claude/CLAUDE.md
+!**/.claude/skills/
+
+# Caches/backups
+.cache/
+*.tmp
+*.bak
+*.backup
+*.old
+
+# Logs/outputs
+*.log
+*.out
+
+# Environment variables
+.env

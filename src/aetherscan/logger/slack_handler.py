@@ -4,24 +4,17 @@
 # BUG: sometimes certain batched messages that are too long get cut off (even after clicking "show more"). they just end with "..."
 """
 Slack logging handler for Aetherscan Pipeline
-Provides custom logging handler that sends messages to Slack API with:
-- Batched message delivery (buffer size + time interval)
-- Thread-based logging (all logs as replies to a run summary message)
-- Color-coded messages by log level
-- Retry logic with exponential backoff
-- Image upload functionality
+Custom logging.Handler that batches log records, posts them as replies to a per-run summary
+thread, color-codes by level, retries with exponential backoff, and supports image uploads.
 
-Threading Model:
-- Main thread calls emit() to buffer log records
-- Background flush thread (_flush_loop) periodically sends buffered messages
-- _cooldown_lock protects cooldown state (_cooldown_until, _consecutive_failures)
-- _buffer_lock protects the message buffer
+Threading: emit() (main and worker threads) appends to a buffer guarded by _buffer_lock; a
+background _flush_loop thread drains the buffer at the configured interval and sends batches
+over the network. _cooldown_lock guards the failure-tracking state (_cooldown_until and
+_consecutive_failures) used by the throttling logic.
 
-Security Note (Log Injection):
-- Log messages are sent to Slack without sanitization of Slack markdown characters
-- This is acceptable because logs are internal pipeline output, not user-generated content
-- If logs could contain untrusted user input in the future, consider escaping <, >, &
-- Timestamps are wrapped in backticks which provides some protection
+Log messages are sent to Slack without escaping Slack markdown — fine because logs are
+internal pipeline output, not user input. If untrusted content ever flows in, escape <, >, and
+& at emit time (timestamps are already wrapped in backticks for partial protection).
 """
 
 from __future__ import annotations
@@ -102,16 +95,10 @@ class BufferedMessage(TypedDict):
 
 class SlackHandler(logging.Handler):
     """
-    Custom logging handler that sends messages to Slack.
-
-    Features:
-    - Batched message delivery to prevent rate limiting
-    - Thread-based logging (replies to initial run summary)
-    - Color-coded messages by log level
-    - Retry logic with exponential backoff
-    - Error throttling to prevent spam on consecutive failures
-    - Graceful degradation (never crashes the application)
-    - Image upload support via upload_file()
+    logging.Handler that sends records to Slack with batching, thread-based replies, level color
+    coding, exponential-backoff retries, consecutive-failure throttling (enters cooldown after
+    _max_failures_before_cooldown errors), graceful degradation on Slack/network failures, and
+    image uploads via upload_file().
     """
 
     def __init__(
@@ -126,17 +113,11 @@ class SlackHandler(logging.Handler):
         broadcast_level: int,
     ):
         """
-        Initialize SlackHandler.
-
-        Args:
-            token: Slack Bot User OAuth Token
-            channel: Default channel to post messages to (e.g., "#aetherscan-logs")
-            username: Bot username displayed in Slack
-            timeout: Request timeout in seconds
-            retry_attempts: Number of retry attempts on failure
-            buffer_size: Maximum messages to buffer before flushing
-            flush_interval: Seconds between automatic buffer flushes
-            broadcast_level: Log level at which messages are broadcast to main channel
+        Initialize the handler with a Slack Bot User OAuth token and the default channel
+        (e.g. "#aetherscan-logs"). buffer_size caps how many records accumulate before a flush
+        triggers; flush_interval is the background flush cadence. broadcast_level sets the
+        record level at or above which messages also get echoed to the main channel (not just
+        the run thread). The background flush thread is started here.
         """
         super().__init__()
 
@@ -217,16 +198,12 @@ class SlackHandler(logging.Handler):
 
     def _resolve_channel_id(self, channel: str) -> str | None:
         """
-        Resolve a channel name to its ID.
+        Convert a channel name (with or without #) to a channel ID (C/G/D/Z + 8 chars), paging
+        through conversations.list as needed. Returns the ID, or None if resolution failed.
 
-        The files_upload_v2 API requires a channel ID, not a name.
-        This method converts channel names (like #aetherscan-logs) to IDs (like C01234ABCD).
-
-        Args:
-            channel: Channel name (with or without #) or channel ID
-
-        Returns:
-            Channel ID, or None if resolution failed
+        Needed because files_upload_v2 requires an ID rather than a name. If the input already
+        looks like an ID it's returned unchanged; otherwise results are cached on
+        _channel_id_cache for the lifetime of the handler.
         """
         # If it already looks like a channel ID, return as-is
         # Slack channel IDs start with C (public), G (private), D (DM), or Z (app)
@@ -308,15 +285,11 @@ class SlackHandler(logging.Handler):
 
     def start_run(self, cli_args: list[str] | None = None) -> bool:
         """
-        Post the initial run summary message to Slack.
+        Post the initial per-run summary message to Slack and cache its thread timestamp so all
+        subsequent log records are posted as replies to it. Returns True on success.
 
-        All subsequent log messages will be posted as replies to this message.
-
-        Args:
-            cli_args: Command line arguments for this run
-
-        Returns:
-            True if the run summary was posted successfully
+        cli_args, when provided, is included in the summary. Idempotent: re-calling after a run
+        has already started is a no-op that returns True.
         """
         if self._run_started:
             return True
@@ -492,12 +465,9 @@ class SlackHandler(logging.Handler):
         return None
 
     def emit(self, record: logging.LogRecord) -> None:
-        """
-        Buffer log record for batched sending to Slack.
-
-        Args:
-            record: The log record to send
-        """
+        """Format the record, append it to the buffer, and trigger an immediate flush if the
+        buffer is at capacity. The network send happens outside _buffer_lock to avoid blocking
+        other emit() callers."""
         if self._is_in_cooldown():
             return
 
@@ -534,12 +504,8 @@ class SlackHandler(logging.Handler):
             self._record_failure()
 
     def _extract_buffer_locked(self) -> list[BufferedMessage] | None:
-        """
-        Extract messages from buffer. Must be called with _buffer_lock held.
-
-        Returns:
-            List of buffered messages, or None if buffer was empty.
-        """
+        """Drain the buffer and return its contents (or None if empty). Caller must hold
+        _buffer_lock; also resets _last_flush_time."""
         if not self._buffer:
             return None
 
@@ -623,12 +589,9 @@ class SlackHandler(logging.Handler):
             self._record_failure()
 
     def _send_with_retry(self, send_func):
-        """
-        Execute send function with exponential backoff retry.
-
-        Args:
-            send_func: Callable that performs the Slack API call
-        """
+        """Invoke send_func with up to retry_attempts retries using exponential backoff
+        (EXPONENTIAL_BACKOFF_BASE ** attempt seconds). Records success/failure on the cooldown
+        tracker; never returns a value."""
         last_exception = None
 
         for attempt in range(self.retry_attempts + 1):
@@ -650,15 +613,8 @@ class SlackHandler(logging.Handler):
             )
 
     def _send_with_retry_return(self, send_func):
-        """
-        Execute send function with retry and return the response.
-
-        Args:
-            send_func: Callable that performs the Slack API call
-
-        Returns:
-            The API response dict, or None on failure
-        """
+        """Like _send_with_retry, but also returns the API response dict (or None on failure)
+        so callers can inspect fields like ts/file ids."""
         last_exception = None
 
         for attempt in range(self.retry_attempts + 1):
@@ -689,21 +645,12 @@ class SlackHandler(logging.Handler):
         broadcast: bool = True,
     ) -> bool:
         """
-        Upload a file to Slack.
+        Upload a file to Slack and return True on success, False otherwise.
 
-        When uploading to a thread, the file is posted in the thread. If broadcast=True,
-        a message is also posted to the main channel with a link back to the thread
-        (similar to the "Also send to channel" checkbox in Slack).
-
-        Args:
-            file_path: Path to the file to upload
-            channels: Channel(s) to upload to (defaults to handler's channel)
-            title: Title for the file
-            initial_comment: Comment to add with the file
-            broadcast: If True and in a thread, also echo to main channel
-
-        Returns:
-            True if upload succeeded, False otherwise
+        Posts into the current run thread when one exists; with broadcast=True (default) also
+        echoes a link-back to the main channel — equivalent to ticking the "Also send to
+        channel" checkbox in Slack. `channels` overrides the handler's default channel (a list
+        falls back to the first element).
         """
         if not os.path.exists(file_path):
             print(f"File not found for Slack upload: {file_path}", file=sys.__stderr__)
@@ -766,13 +713,9 @@ class SlackHandler(logging.Handler):
         comment: str | None,
     ):
         """
-        Post a broadcast message to the main channel announcing a file upload in the thread.
-
-        Args:
-            client: Slack WebClient instance
-            channel: Channel to broadcast to
-            title: Title of the uploaded file
-            comment: Comment associated with the file
+        Post a short announcement of a thread file upload to the main channel (via thread_ts +
+        reply_broadcast=True). No-op if no run thread is active; broadcast failures are
+        swallowed so they don't fail the underlying upload.
         """
         if not self._thread_ts:
             return

@@ -48,21 +48,13 @@ _GLOBAL_DTYPE = None
 
 def _init_worker(shm_name, shape, dtype):
     """
-    Initialize worker process with shared memory reference and queue-based logging
-    This avoids serialization overhead between workers
+    Worker pool initializer: attach to the named shared-memory block and set up logging.
 
-    Args:
-        shm_name: Name of the shared memory block
-        shape: Shape of the background array
-        dtype: Data type of the background array
-
-    Note:
-        Worker cleanup uses a custom SIGTERM handler to properly close shared memory
-        file descriptors before termination. When pool.terminate() is called by the
-        main process, workers intercept SIGTERM, close their shared memory handles,
-        then re-raise the signal to complete termination.
-
-        The main process is responsible for unlinking shared memory (handled by ResourceManager).
+    Passing the shm_name/shape/dtype through the pool initializer (rather than per-task args)
+    avoids re-serializing the whole array on every map() call. The worker installs a SIGTERM
+    handler that closes its shared-memory file descriptor before letting the signal kill the
+    process; the main process is responsible for unlinking the shared memory afterwards (handled
+    by ResourceManager).
     """
     global _GLOBAL_SHM, _GLOBAL_CHUNK_DATA, _GLOBAL_SHAPE, _GLOBAL_DTYPE
 
@@ -80,10 +72,7 @@ def _init_worker(shm_name, shape, dtype):
     # This may interrupt the worker's cleanup process
     # Consider increasing pool_terminate_timeout if you're experiencing such issues
     def cleanup_on_sigterm(signum, frame):
-        """
-        Cleanup handler called when pool.terminate() sends SIGTERM
-        Closes shared memory file descriptor before process termination
-        """
+        """SIGTERM handler that closes the worker's shared-memory fd before re-raising the signal."""
         # Note, a race condition may occur if a worker receives more than 1 SIGTERM delivery
         # at a time, triggering re-entry of the same cleanup handler
         # It suffices to guard against this by simply suppressing exceptions, since subsequent
@@ -116,14 +105,12 @@ def _init_worker(shm_name, shape, dtype):
 # NOTE: come back to this later
 def _downsample_worker(args):
     """
-    Worker function to downsample a single cadence in parallel
-    Uses global chunk data to avoid serialization overhead
+    Downsample one cadence's 6 observations in parallel.
 
-    Args:
-        args: Tuple of (cadence_idx, downsample_factor, final_width)
-
-    Returns:
-        Downsampled cadence of shape (6, 16, final_width) or None if invalid
+    args is a (cadence_idx, downsample_factor, final_width) tuple — the cadence itself is
+    pulled from _GLOBAL_CHUNK_DATA to avoid pickling it across the pool boundary. Returns the
+    downsampled cadence of shape (6, 16, final_width), or None if the source cadence contained
+    NaN/Inf or had non-positive max (treated as invalid).
     """
     cadence_idx, downsample_factor, final_width = args
 
@@ -157,10 +144,9 @@ def _remove_dc_spike(
     """
     Interpolate over the 2-bin DC spike at the center of each coarse channel, in place.
 
-    Args:
-        block_data: shape (time_bins, n_coarse_channels * coarse_channel_width)
-        coarse_channel_width: fine channels per coarse channel
-        n_coarse_channels: number of coarse channels in block_data
+    block_data has shape (time_bins, n_coarse_channels * coarse_channel_width); the channel
+    layout is contiguous so the spike sits at i * coarse_channel_width + coarse_channel_width//2
+    for each i.
     """
     half_chan = coarse_channel_width // 2
     for i in range(n_coarse_channels):
@@ -180,15 +166,10 @@ def _fit_channel_bandpass(
     integrated_channel: np.ndarray, channel_width: int, spl_order: int
 ) -> np.ndarray:
     """
-    Fit a spline bandpass to a time-integrated coarse channel.
+    Fit a spline bandpass to a time-integrated coarse channel and evaluate it at every bin.
 
-    Args:
-        integrated_channel: 1-D array of shape (channel_width,), time-integrated
-        channel_width: fine channels per coarse channel
-        spl_order: spline order (higher = more knots = finer fit)
-
-    Returns:
-        1-D bandpass fit of shape (channel_width,)
+    integrated_channel is a 1-D array of shape (channel_width,). spl_order controls the number
+    of interior knots (higher = finer fit). Returns the per-bin bandpass fit of the same shape.
     """
     x = np.arange(channel_width)
     # Interior knots must lie strictly inside (x[0], x[-1]); knots[1:] drops the
@@ -205,15 +186,10 @@ def _fit_channel_bandpass(
 # NOTE: come back to this later
 def _read_coarse_channel_worker(args: tuple) -> np.ndarray:
     """
-    Worker: read one coarse channel from an .h5 file.
+    Worker: read one coarse channel from an .h5 file as an ndarray of shape
+    (time_bins, coarse_channel_width). args is (h5_path, channel_index, coarse_channel_width).
 
-    Workers open their own h5py.File (h5py file handles are fork-unsafe to share).
-
-    Args:
-        args: (h5_path, channel_index, coarse_channel_width)
-
-    Returns:
-        ndarray of shape (time_bins, coarse_channel_width)
+    Each worker opens its own h5py.File since h5py file handles are fork-unsafe to share.
     """
     h5_path, channel_index, coarse_channel_width = args
     start = channel_index * coarse_channel_width
@@ -225,16 +201,12 @@ def _read_coarse_channel_worker(args: tuple) -> np.ndarray:
 # NOTE: come back to this later
 def _remove_bandpass_worker(args: tuple) -> np.ndarray:
     """
-    Worker: subtract the per-coarse-channel spline bandpass from one coarse channel.
+    Worker: subtract the spline bandpass from one coarse channel and return the cleaned slice
+    of shape (time_bins, coarse_channel_width). args is (channel_index, coarse_channel_width,
+    spl_order).
 
-    Reads its slice from _GLOBAL_CHUNK_DATA (a (time_bins, n_coarse*width) view of
-    the current block's shared memory).
-
-    Args:
-        args: (channel_index, coarse_channel_width, spl_order)
-
-    Returns:
-        Bandpass-cleaned slice of shape (time_bins, coarse_channel_width)
+    Reads its slice from _GLOBAL_CHUNK_DATA — a (time_bins, n_coarse * coarse_channel_width)
+    view of the current block's shared memory, set up by _init_worker.
     """
     channel_index, coarse_channel_width, spl_order = args
 
@@ -253,19 +225,14 @@ def _remove_bandpass_worker(args: tuple) -> np.ndarray:
 # NOTE: come back to this later
 def _threshold_hits_worker(args: tuple) -> list[tuple]:
     """
-    Worker: slide a window across one coarse channel and emit hits above threshold.
+    Worker: slide a window across one coarse channel and emit hits whose D'Agostino-Pearson
+    normality statistic exceeds stat_threshold. Returns a list of (absolute_fine_channel_index,
+    statistic, pvalue) tuples.
 
-    The window is run through scipy.stats.normaltest (D'Agostino-Pearson).
-    Reads its slice from _GLOBAL_CHUNK_DATA (cleaned residuals for this block).
-
-    Args:
-        args: (channel_index, coarse_channel_width, window_size, step_size,
-               stat_threshold, block_offset)
-            block_offset is added to the returned absolute index so callers see
-            indices in the full spectrum rather than block-relative.
-
-    Returns:
-        List of (absolute_fine_channel_index, statistic, pvalue) tuples.
+    args is (channel_index, coarse_channel_width, window_size, step_size, stat_threshold,
+    block_offset). block_offset is added to each emitted index so callers see positions in the
+    full spectrum rather than block-relative ones. Reads its slice from _GLOBAL_CHUNK_DATA, which
+    holds the cleaned residuals for the current block.
     """
     (
         channel_index,
@@ -300,6 +267,28 @@ def _threshold_hits_worker(args: tuple) -> list[tuple]:
             hits.append((abs_idx, float(s), float(p)))
 
     return hits
+
+
+def _extract_stamps_worker(args: tuple) -> None:
+    """Fill one (obs_file, stamp-range) slice of the memmap-backed cadence .npy.
+
+    Each worker opens its own hdf5 handle and its own r+ view of the shared .npy, then
+    copies a stamp_width-wide window (over the first `time_bins` rows, polarization 0) around
+    each hit. Tasks address disjoint output regions — distinct obs_idx and/or non-overlapping
+    stamp indices — so concurrent writes from the pool never collide. `stamp_starts` is the
+    contiguous, start-sorted slice for this task; `base_idx` is its offset into the full stamp
+    list so the worker writes to the correct absolute rows.
+    """
+    npy_path, obs_idx, obs_h5, stamp_starts, base_idx, time_bins, stamp_width = args
+    out = np.lib.format.open_memmap(npy_path, mode="r+")
+    try:
+        with h5py.File(obs_h5, "r") as hf:
+            dset = hf["data"]
+            for local_i, start in enumerate(stamp_starts):
+                out[base_idx + local_i, obs_idx] = dset[:time_bins, 0, start : start + stamp_width]
+        out.flush()
+    finally:
+        del out
 
 
 # NOTE: come back to this later
@@ -353,25 +342,16 @@ def group_observations_from_csv(
     expected_obs: int = 6,
 ) -> tuple[list[CadenceGroup], list[CadenceGroup]]:
     """
-    Group rows of a CSV into cadences.
+    Group rows of a CSV into cadences and return (valid_groups, flagged_groups).
 
-    Rows are grouped by the joint value of `group_by_cols` (rows are assumed
-    already ordered correctly within each group in the source CSV). The function
-    is column-agnostic: it never assumes specific column names beyond what the
-    caller provides.
+    Rows are grouped by the joint value of group_by_cols and assumed to be already ordered
+    correctly within each group in the source CSV. expected_obs (typically 6) is the required
+    number of observations per cadence; groups with the wrong count are returned in
+    flagged_groups rather than valid_groups. The function is column-agnostic — it never assumes
+    specific column names beyond what the caller provides.
 
-    Args:
-        csv_path: path to CSV
-        group_by_cols: columns whose joint value defines cadence membership
-        h5_path_col: column containing the .h5 file path for that observation
-        expected_obs: required number of observations per cadence (typically 6)
-
-    Returns:
-        (valid_groups, flagged_groups) — flagged groups have wrong obs count.
-
-    Raises:
-        FileNotFoundError: if csv_path doesn't exist.
-        KeyError: if any column in group_by_cols + [h5_path_col] is missing.
+    Raises FileNotFoundError if csv_path doesn't exist, and KeyError if any column in
+    group_by_cols + [h5_path_col] is missing from the CSV header.
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -460,11 +440,11 @@ class DataPreprocessor:
     # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
     def load_train_data(self) -> np.ndarray:
         """
-        Load & preprocess data for training
-        Uses parallel processing to load and downsample the data (log-normalization is deferred to data_generation.py)
+        Load and preprocess training data into an array of shape (n, 6, 16, width_bin_downsampled).
 
-        Returns:
-            Array of preprocessed cadences with shape (n, 6, 16, width_bin_downsampled)
+        Uses a multiprocessing pool over shared memory to downsample cadences in parallel.
+        Log-normalization is deferred to data_generation.py (training-side log-norm runs
+        per-sample after injection), unlike load_inference_data which applies it here.
         """
         logger.info(f"Loading backgrounds from {self.config.data_path} for training")
 
@@ -647,17 +627,13 @@ class DataPreprocessor:
     # NOTE: calculate intensity statistics to overlay with training distributions (C' vs C)?
     def load_inference_data(self, override_filepaths: list[str] | None = None) -> np.ndarray:
         """
-        Load & preprocess data for inference
-        Uses parallel processing to load, downsample, and log-normalize the data
+        Load and preprocess inference data into an array of shape
+        (n, 6, 16, width_bin_downsampled). Uses a multiprocessing pool over shared memory to
+        downsample cadences in parallel, then applies per-cadence log-normalization in-process.
 
-        Args:
-            override_filepaths: If provided, iterate these absolute paths directly
-                instead of resolving config.data.test_files via get_test_file_path.
-                Used by find_hits() to chain per-cadence .npy outputs into inference
-                without monkey-patching paths.
-
-        Returns:
-            Array of preprocessed cadences with shape (n, 6, 16, width_bin_downsampled)
+        override_filepaths, when given, supplies absolute paths to iterate directly instead of
+        resolving config.data.test_files via get_test_file_path — used by find_hits() to chain
+        per-cadence .npy outputs into inference without monkey-patching paths.
         """
         logger.info(f"Loading backgrounds from {self.config.data_path} for inference")
 
@@ -869,21 +845,15 @@ class DataPreprocessor:
     # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
     def find_hits(self) -> list[CadenceResult]:
         """
-        Convert raw .h5 cadence observations into (n_hits, 6, 16, stamp_width) .npy snippets.
+        Convert raw .h5 cadence observations into (n_hits, 6, 16, stamp_width) .npy snippets,
+        returning one CadenceResult per successfully processed (or already cached) cadence.
 
-        Driven by CSVs in config.data.inference_files. Each CSV is grouped into
-        cadences via group_observations_from_csv() and processed sequentially.
-        Within each cadence, energy detection runs on ON-source files (positions
-        0, 2, 4 in ABACAD); stamps are extracted from all 6 observations at hit
-        frequencies.
-
-        Each cadence produces one .npy file on disk as soon as it's ready
-        (periodic checkpointing). On retry, cadences whose output already exists
+        Driven by CSVs in config.data.inference_files. Each CSV is grouped into cadences via
+        group_observations_from_csv() and processed sequentially. Within each cadence, energy
+        detection runs on ON-source files (positions 0, 2, 4 in ABACAD); stamps are then
+        extracted from all 6 observations at the hit frequencies. Each cadence is checkpointed
+        to disk as soon as its .npy is ready, and on retry, cadences whose output already exists
         are skipped.
-
-        Returns:
-            List of CadenceResult, one per successfully processed (or already
-            cached) cadence.
         """
         inference_files = self.config.data.inference_files
         if not inference_files:
@@ -1014,18 +984,13 @@ class DataPreprocessor:
     # NOTE: come back to this later (does a cadence snippet get created if only 1 of the ON observations crosses the threshold, or all 3? should probably be all 3 as of now since models are trained on signals that don't yet drift out of frame?)
     def _process_cadence(self, group: CadenceGroup, npy_path: str) -> CadenceResult | None:
         """
-        Run energy detection on one cadence and write its stamp .npy.
+        Run energy detection on one cadence and write its stamp .npy at the given absolute
+        npy_path. Returns a CadenceResult on success, or None if no hits survived.
 
-        Energy detection runs only on ON-source observations (positions 0, 2, 4
-        in ABACAD order). Hits define the frequency slices extracted from all 6
-        observations.
-
-        Args:
-            group: validated CadenceGroup (len(h5_paths) == expected_obs)
-            npy_path: target output path (already absolute)
-
-        Returns:
-            CadenceResult on success, or None if no hits survived.
+        Energy detection runs only on ON-source observations (positions 0, 2, 4 in ABACAD order);
+        the hits found there define the frequency slices that get extracted from all 6
+        observations. group is assumed to be a validated CadenceGroup with len(h5_paths) ==
+        expected_obs.
         """
         coarse_channel_width = self.config.inference.coarse_channel_width
         parallel_chans = self.config.inference.parallel_coarse_chans
@@ -1169,24 +1134,59 @@ class DataPreprocessor:
         # decompressed chunk across adjacent stamps instead of redecompressing it.
         stamp_centers.sort(key=lambda s: s[0])
 
-        # Extract stamps for all 6 observations (sequential per file, no pool)
-        cadence_stamps = np.zeros(
-            (len(stamp_centers), len(group.h5_paths), time_bins, stamp_width), dtype=np.float32
-        )
-
-        for obs_idx, obs_h5 in enumerate(group.h5_paths):
-            with h5py.File(obs_h5, "r") as hf:
-                for stamp_idx, (start, _, _) in enumerate(stamp_centers):
-                    end = start + stamp_width
-                    cadence_stamps[stamp_idx, obs_idx] = hf["data"][:time_bins, 0, start:end]
-
-        # Write the .npy and the sibling metadata atomically. A process kill
-        # mid-write must not leave a corrupt file at the canonical path —
-        # find_hits' resume path treats the existence of npy_path as proof of
-        # a complete write. We achieve that by writing to a .tmp sibling first
-        # then os.replace()-ing it onto the canonical name.
+        # Extract stamps into a memmap-backed .npy so worker processes can fill disjoint
+        # (obs_file, stamp-range) slices in parallel. The previous sequential per-file loop
+        # over all 6 observations (single-threaded reads + bitshuffle chunk decompression)
+        # was the dominant, GPU-idle cost of CSV inference.
+        #
+        # Atomicity is unchanged: the memmap is written to a .tmp sibling and we os.replace()
+        # it onto the canonical name only after every worker finishes, so find_hits' resume
+        # path (which treats npy_path's existence as proof of a complete write) still holds.
+        n_stamps = len(stamp_centers)
         tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
-        np.save(tmp_npy_path, cadence_stamps)
+        memmap = np.lib.format.open_memmap(
+            tmp_npy_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_stamps, len(group.h5_paths), time_bins, stamp_width),
+        )
+        memmap.flush()
+        del memmap  # header + full-size file are on disk; workers reopen it in r+ mode
+
+        stamp_starts = [start for start, _, _ in stamp_centers]
+        n_processes = self.config.manager.n_processes
+        # Split each obs file's (already start-sorted) stamps into contiguous chunks so more
+        # than len(h5_paths) workers can run, while keeping each worker's reads sequential to
+        # preserve the hdf5 chunk-cache reuse that the sort above buys us.
+        chunks_per_file = max(1, -(-n_processes // len(group.h5_paths)))  # ceil div
+        chunk_size = max(1, -(-n_stamps // chunks_per_file))  # ceil div
+        tasks = [
+            (
+                tmp_npy_path,
+                obs_idx,
+                obs_h5,
+                stamp_starts[base : base + chunk_size],
+                base,
+                time_bins,
+                stamp_width,
+            )
+            for obs_idx, obs_h5 in enumerate(group.h5_paths)
+            for base in range(0, n_stamps, chunk_size)
+        ]
+
+        if n_processes > 1 and len(tasks) > 1:
+            pool = self.manager.create_pool(
+                n_processes=min(len(tasks), n_processes),
+                name="DataPreproc_extract_stamps",
+            )
+            try:
+                pool.map(_extract_stamps_worker, tasks)
+            finally:
+                self.manager.close_pool(pool)
+        else:
+            for task in tasks:
+                _extract_stamps_worker(task)
+
         os.replace(tmp_npy_path, npy_path)
 
         metadata_path = self._cadence_metadata_path(npy_path)
@@ -1216,7 +1216,7 @@ class DataPreprocessor:
         gc.collect()
 
         logger.info(
-            f"Cadence {group.key}: wrote {cadence_stamps.shape[0]} stamps -> "
+            f"Cadence {group.key}: wrote {n_stamps} stamps -> "
             f"{npy_path} (metadata: {metadata_path})"
         )
 
@@ -1224,7 +1224,7 @@ class DataPreprocessor:
             npy_path=npy_path,
             h5_paths=group.h5_paths,
             key=group.key,
-            n_hits=cadence_stamps.shape[0],
+            n_hits=n_stamps,
             metadata_path=metadata_path,
         )
 

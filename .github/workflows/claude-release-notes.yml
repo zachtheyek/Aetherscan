@@ -1,0 +1,129 @@
+# Draft a user-facing release note when a PR is merged to master
+# Posts the draft as a comment on the PR for a human to curate into the changelog
+name: Claude Release Notes
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+
+jobs:
+  claude-release-notes:
+    # Only run when PR is actually merged, not just closed
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    # Drafting one release note from a single diff is quick; cap it so a stray rabbit
+    # hole can't run away (refine if data shows otherwise)
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      # Deterministic duplicate-comment guard: every comment this workflow posts carries
+      # the hidden marker `<!-- claude-release-notes -->`. If one already exists (e.g. the
+      # workflow was manually re-run), skip the Claude step entirely so we never double-post.
+      # Runs before checkout — resolves the repo via GH_REPO, no working tree needed.
+      - name: Check for existing release-note comment
+        id: dedup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' \
+              | grep -q '<!-- claude-release-notes -->'; then
+            echo "Existing release-note comment found — skipping Claude step."
+            echo "already_commented=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing release-note comment — proceeding."
+            echo "already_commented=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.dedup.outputs.already_commented != 'true'
+        uses: actions/checkout@v5
+        with:
+          # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
+          # in the allowlist, so a shallow checkout is sufficient.
+          fetch-depth: 1
+
+      - name: Run Claude Release Notes
+        if: steps.dedup.outputs.already_commented != 'true'
+        uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            ## Role
+            A pull request has just been merged to master. Your task is to draft a
+            release-notes entry written for end users and post it as a comment on the PR.
+
+            ## Context
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR TITLE: ${{ github.event.pull_request.title }}
+            PR BODY: ${{ github.event.pull_request.body }}
+            AUTHOR: ${{ github.event.pull_request.user.login }}
+            MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+
+            ## Task
+            1. Read the PR's title, description, and diff to identify the user-visible change:
+               `gh pr diff ${{ github.event.pull_request.number }}`
+               Use `gh pr view ${{ github.event.pull_request.number }}` for any additional
+               metadata (labels, files changed) that helps you judge user impact, and
+               `Read`/`Glob`/`Grep` to consult repo context (CLAUDE.md, README.md) when
+               deciding what counts as user-visible.
+
+            2. Decide whether the change is internal-only. Internal-only means it has no
+               observable effect for someone using the project — e.g. tests, CI/workflow
+               changes, pure refactors, lint/formatting, dependency bumps with no behaviour
+               change, or internal docs. If it is internal-only, post exactly this comment
+               and stop (the marker line is invisible when rendered):
+                   gh pr comment ${{ github.event.pull_request.number }} --body "$(cat <<'EOF'
+                   <!-- claude-release-notes -->
+                   Internal change — no release note.
+                   EOF
+                   )"
+
+            3. Otherwise, draft a 2–4 sentence release-notes entry written for end users
+               (plain language, focused on what changed for them and why it matters — not
+               on implementation detail). Classify it as exactly one of: **New**,
+               **Improved**, **Fixed**, or **Breaking**.
+
+            4. Post the draft as a comment on the PR. Keep the marker as the first line, and
+               format the rest as a clearly-labelled draft for a human to curate, e.g.:
+                   gh pr comment ${{ github.event.pull_request.number }} --body "$(cat <<'EOF'
+                   <!-- claude-release-notes -->
+                   **Release note draft — New**
+
+                   <2–4 sentence entry written for end users>
+
+                   _Draft for the changelog; edit or drop as needed._
+                   EOF
+                   )"
+
+            ## Available tools
+            PR inspection:
+            - `gh pr diff` to retrieve the merged PR's diff (the primary signal for the user-visible change in Step 1)
+            - `gh pr view` to look up additional PR metadata (labels, files) beyond the variables interpolated above
+
+            PR interaction:
+            - `gh pr comment` to post either the "Internal change — no release note." comment (Step 2) or the release-note draft (Step 4)
+
+            Code exploration:
+            - `Read`, `Glob`, `Grep` to consult CLAUDE.md, README.md, docs/*, or source files when judging whether a change is user-visible and how to describe it
+
+            ## Guidelines
+            - Post exactly one comment, and only on this PR (#${{ github.event.pull_request.number }}). Never modify code, labels, or the PR itself.
+            - Always include the `<!-- claude-release-notes -->` marker as the first line of any comment you post — the deterministic pre-step relies on it to skip already-processed PRs on re-runs.
+            - One classification only — pick the single best of New / Improved / Fixed / Breaking. Use **Breaking** whenever existing usage, configs, or outputs would change for current users.
+            - Write for end users, not maintainers: no file paths, function names, or internal jargon in the entry.
+            - When in doubt between internal-only and user-visible, prefer drafting a note — a human curates the changelog and can drop it.
+            - Reference CLAUDE.md for repository-specific context.
+            - Your only responsibility is to draft and post the release note for this merged PR. Do not do anything that is not within this job scope.
+
+          claude_args: |
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Glob,Grep"
+            --model opus

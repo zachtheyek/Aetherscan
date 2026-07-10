@@ -2,6 +2,8 @@
 Resource manager package for Aetherscan pipeline
 """
 
+from __future__ import annotations
+
 from .manager import (
     get_manager,
     init_manager,

@@ -8,10 +8,8 @@ on:
 jobs:
   claude-issue-triage:
     runs-on: ubuntu-latest
-    # Timeout implemented after run 21642589782 failed due to Claude going down a rabbit hole
     # Issue triage shouldn't take more than 5 mins (refine if data shows otherwise)
     # If Claude continues going down rabbit holes, consider refining the prompt to be more focused
-    # See: https://github.com/zachtheyek/Aetherscan/actions/runs/21642589782/job/62386093601
     timeout-minutes: 5
     permissions:
       contents: read
@@ -30,23 +28,43 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "claude[bot]"
           prompt: |
+            ## Role
+            You are an automated issue triager. Categorize, label, and check for duplicates of newly opened issues.
+
+            ## Context
             REPO: ${{ github.repository }}
             ISSUE NUMBER: ${{ github.event.issue.number }}
             TITLE: ${{ github.event.issue.title }}
             BODY: ${{ github.event.issue.body }}
             AUTHOR: ${{ github.event.issue.user.login }}
 
+            ## Task
             Analyze this new issue and:
             1. First, discover the available labels: `gh label list --json name,description`
-            2. Determine if it's a bug report, feature request, or question
+            2. Determine if it's a bug report, feature request, question, etc.
             3. Assess priority (critical, high, medium, low)
             4. Apply the appropriate labels from the available set using:
                `gh issue edit [number] --add-label "label1,label2"`
             5. Check if it duplicates existing issues using `gh search issues`
 
-            If it appears to be a duplicate, post a comment mentioning the original issue.
+            If it appears to be a duplicate, post a comment mentioning this with a link to the original issue.
 
-            ## Label restrictions
+            ## Available tools
+            Label discovery:
+            - `gh label list --json name,description` to discover the repo's available labels before deciding which to apply
+
+            Issue interaction:
+            - `gh issue edit --add-label` to apply categorization labels (bug / enhancement / question / priority level / etc.) — never the `claude` label, per the Label restrictions in Guidelines below
+            - `gh issue comment` to post a duplicate notice with a link to the original issue when applicable
+
+            Search:
+            - `gh search issues` to detect potential duplicates against existing issues
+
+            Code exploration:
+            - `Read`, `Glob`, `Grep` to consult repo context (e.g. CLAUDE.md) when categorizing
+
+            ## Guidelines
+            ### Label restrictions
             Do NOT apply the "claude" label during triage. That label is a control
             signal reserved for human users who want to manually summon @claude on
             an existing issue — adding it here re-triggers the `claude.yml`
@@ -54,8 +72,9 @@ jobs:
             the issue body, producing duplicate PRs. Stick to categorization labels
             (bug, enhancement, documentation, question, priority levels, etc.).
 
+            ### Scope
             Your only responsibilities are to triage the current issue. Do not do anything that is not within this job scope.
 
           claude_args: |
-            --allowedTools "Bash(gh issue:*),Bash(gh search:*),Bash(gh label:*),Read,Glob,Grep"
+            --allowedTools "Bash(gh label list:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh search:*),Read,Glob,Grep"
             --model opus

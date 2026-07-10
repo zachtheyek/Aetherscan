@@ -2,6 +2,8 @@
 Models package for Aetherscan pipeline
 """
 
+from __future__ import annotations
+
 from .random_forest import (
     RandomForestModel,
     prepare_latent_features,

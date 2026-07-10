@@ -1,0 +1,151 @@
+# Weekly routine check for flaky tests — tests that both passed and failed on the same commit
+# Opens a single GitHub issue: ranked table + per-test detail, with a fix for the worst offender
+# Runs Monday 09:00 MYT (GMT+8) == Monday 01:00 UTC
+name: Claude Flaky Test Tracker
+
+on:
+  schedule:
+    # cron is UTC; 01:00 UTC Mon == 09:00 MYT (GMT+8) Mon
+    - cron: "0 1 * * 1"
+  # Allow manual runs (scheduled workflows only fire from the default branch)
+  workflow_dispatch:
+
+jobs:
+  claude-flaky-test-tracker:
+    runs-on: ubuntu-latest
+    # Pulling a week of CI runs + reading code to diagnose the worse offender shouldn't take more
+    # than 20 mins (refine if data shows otherwise)
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+      id-token: write
+
+    steps:
+      # Deterministic week stamp + duplicate-issue guard. Every issue this workflow opens
+      # carries the hidden marker `<!-- aetherscan-flaky-test-tracker week=<WEEK> -->`. If one
+      # already exists for this ISO week (cron double-fire or a manual re-run), skip the
+      # Claude step so we never file twice. The WEEK/DATE outputs make the title deterministic.
+      - name: Compute window and check for existing issue
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          WEEK="$(date -u +'%G-W%V')"
+          DATE="$(date -u +'%Y-%m-%d')"
+          echo "week=$WEEK" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          MARKER="<!-- aetherscan-flaky-test-tracker week=$WEEK -->"
+          if gh issue list --state open --limit 200 --json body --jq '.[].body' \
+              | grep -qF "$MARKER"; then
+            echo "An open flaky-test issue for $WEEK already exists — skipping Claude step."
+            echo "already_filed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing flaky-test issue for $WEEK — proceeding."
+            echo "already_filed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: actions/checkout@v5
+        with:
+          # Used to read the current test + exercised code when diagnosing the top offender.
+          fetch-depth: 1
+
+      - name: Run Claude Flaky Test Tracker
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            ## Role
+            You are an automated CI reliability tracker. Once a week you scan the last 7 days of
+            CI runs on the default branch for flaky tests — tests that both passed and failed on
+            the same commit — then file a single routine issue ranking them, with a proposed fix
+            for the worst offender.
+
+            ## Context
+            REPO: ${{ github.repository }}
+            DEFAULT BRANCH: ${{ github.event.repository.default_branch }}
+            WEEK: ${{ steps.guard.outputs.week }}   (ISO week being analysed)
+            DATE: ${{ steps.guard.outputs.date }}
+            A deterministic pre-step already confirmed no open flaky-test issue exists for WEEK,
+            so you will not double-file.
+
+            ## Task
+            1. Pull CI workflow runs from the last 7 days on the default branch and focus on the
+               **test jobs** (`gh run list`, `gh api` for runs / jobs / check-runs). First identify
+               which workflows actually run tests.
+
+               If no test jobs or no test runs are found in the window, do NOT open an issue — that
+               would be weekly noise. Instead, state plainly in your final message that 0 test runs
+               were scanned (no test CI detected yet) and stop.
+
+            2. For each test failure, note the test name, file, and the commit (SHA) it ran against.
+               A test is **flaky** if it failed on a commit where the same test also passed — in an
+               in-run retry, a manual re-run, or a later run on the same SHA. Same SHA, both outcomes.
+
+            3. Rank flaky tests by flake rate (failures ÷ total runs) and by total time wasted on
+               retries.
+
+            4. For the top 5, include: test name and file path; flake rate; a link to one failing
+               and one passing run on the same commit; and the failure message pattern if it's
+               consistent.
+
+            5. Note which tests are **newly flaky this week** vs. ones that appeared in last week's
+               report — find the previous report (search prior issues for this workflow's marker or
+               its label/title) and diff against it.
+
+            6. For the #1 flakiest test, propose a fix: read the test and the code it exercises,
+               identify the likely cause (race condition, unawaited async, time/order dependence,
+               shared state, network reliance), and write a targeted fix presented as a diff/code
+               block in the issue, with a short root-cause analysis. Verify it passes locally across
+               several runs **only if feasible** — note that this runner has no GPU / TensorFlow /
+               test environment, so local verification usually will not be possible; if you cannot
+               verify, say so explicitly and present the fix as a proposed (unverified) change. If
+               you cannot determine a safe fix, instead recommend **quarantining** the test (skip it
+               with a comment linking to this report) as the interim mitigation.
+
+            7. Open exactly one issue:
+               - **Title** (templated — make clear it's a routine CI sanitisation check, include the
+                 week, and a one-line headline), e.g.:
+                 `[FLAKY TESTS]: Weekly CI check (${{ steps.guard.outputs.week }}) — 4 flaky, 1 flake rate >50%`
+               - **Body** — make the hidden marker the FIRST line so the guard can dedupe re-runs:
+                 `<!-- aetherscan-flaky-test-tracker week=${{ steps.guard.outputs.week }} -->`
+                 Then: a one-line note that this is a routine automated weekly CI check; a ranked
+                 table of the flaky tests; per-test detail (Task 4); the newly-flaky-vs-last-week
+                 delta (Task 5); and the proposed fix + root-cause for the #1 offender (Task 6).
+               - **If test runs were scanned but none were flaky**, still open the issue but keep it
+                 brief: confirm no flaky tests and state the total number of test runs scanned.
+               - Try your best to apply the appropriate labels; never apply the `claude` label
+                 (it re-triggers the assistant workflow).
+
+            ## Available tools
+            CI run inspection:
+            - `gh run list` to enumerate recent Actions runs on the default branch
+            - `gh run view` (including `--log`) to read a specific run's jobs and failure output
+            - `gh api` for workflow runs / jobs / check-runs keyed by commit SHA (the reliable way to pair pass+fail on one commit)
+
+            Code inspection (Task 6):
+            - `Read`, `Glob`, `Grep` to read the flaky test and the code it exercises when diagnosing the root cause
+
+            Issue interaction:
+            - `gh label list` to discover the repo's labels before choosing which to apply
+            - `gh issue list` to find last week's report (Task 5) and sanity-check for duplicates (the pre-step is the primary guard)
+            - `gh issue create` to file the single flaky-test report
+
+            ## Guidelines
+            - This is a routine, pre-sanctioned weekly CI check — the discussion-first rule for ad-hoc issues does not require a separate discussion thread; just say so in the body.
+            - Report only: present the suggested fix as a diff inside the issue. Never modify code, push a branch, or open a PR.
+            - Open at most one issue (none in the no-test-runs case above). Never modify other issues or their labels.
+            - Always include the `<!-- aetherscan-flaky-test-tracker week=${{ steps.guard.outputs.week }} -->` marker as the first body line — the deterministic guard relies on it.
+            - Be honest about verification: if you could not run the test locally, say so rather than claiming the fix is verified.
+            - Never apply the `claude` label. Prefer existing labels; don't invent new ones unless clearly warranted.
+            - Reference CLAUDE.md for repository conventions.
+            - Your only responsibility is this weekly flaky-test audit. Do not do anything outside that scope.
+
+          claude_args: |
+            --allowedTools "Bash(gh run list:*),Bash(gh run view:*),Bash(gh api:*),Bash(gh label list:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
+            --model opus

@@ -1,4 +1,3 @@
-# TODO: do a proper audit of ALL the docs in this repo -- their contents & purpose, and craft a comprehensive prompt for this workflow to make sure ALL docs are kept up-to-date on each merged PR
 # Analyze merged PRs and suggest documentation updates
 # Creates new issue & instructs Claude assistant to create PR
 name: Claude Update Docs
@@ -13,6 +12,9 @@ jobs:
     # Only run when PR is actually merged, not just closed
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    # Analysing one merged diff against the doc set + source↔doc contracts shouldn't take
+    # more than 15 mins (refine if data shows otherwise)
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: write
@@ -20,16 +22,46 @@ jobs:
       id-token: write
 
     steps:
+      # Deterministic duplicate-issue guard: when this workflow files a doc issue it carries
+      # the hidden marker `<!-- aetherscan-update-docs pr=<N> -->`. If one already exists for
+      # this PR (e.g. the merge event was manually re-run), skip the Claude step so we never
+      # file a second issue (and re-trigger a second @claude follow-up PR). Checks all states
+      # since the issue may have been closed once the docs landed.
+      - name: Check for existing documentation issue for this PR
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- aetherscan-update-docs pr=$PR_NUMBER -->"
+          if gh issue list --state all --limit 200 --json body --jq '.[].body' \
+              | grep -qF "$MARKER"; then
+            echo "A documentation issue for PR #$PR_NUMBER already exists — skipping Claude step."
+            echo "already_filed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No documentation issue for PR #$PR_NUMBER — proceeding."
+            echo "already_filed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.guard.outputs.already_filed != 'true'
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
+          # in the allowlist, so a shallow checkout is sufficient.
+          fetch-depth: 1
 
       - name: Run Claude Documentation Analysis
+        if: steps.guard.outputs.already_filed != 'true'
         uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
+            ## Role
+            A pull request has just been merged to master. Your task is to analyze the changes and determine if any documentation needs to be updated.
+
+            ## Context
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
             PR TITLE: ${{ github.event.pull_request.title }}
@@ -37,11 +69,7 @@ jobs:
             AUTHOR: ${{ github.event.pull_request.user.login }}
             MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
 
-            A pull request has just been merged to master. Your task is to analyze the changes
-            and determine if any documentation needs to be updated.
-
-            ## Steps:
-
+            ## Task
             1. First, get the diff of the merged PR:
                `gh pr diff ${{ github.event.pull_request.number }}`
 
@@ -53,32 +81,141 @@ jobs:
                - New dependencies
                - Changes to installation/setup process
                - Changes to usage patterns
+               - etc.
 
             3. Check the following documentation files for potential updates needed:
                - README.md (project overview, installation, usage)
-               - AGENTS.md (AI agent instructions and context)
+               - CLAUDE.md (lean, always-on AI agent operating rules — loaded in full into every Claude Code session; target < 200 lines)
                - CONTRIBUTING.md (contribution guidelines)
                - KNOWN_ISSUES.md (known issues, FAQ)
+               - SECURITY.md (security best practices)
                - docs/* (tutorials, guides, API docs)
+               - .claude/skills/aetherscan-repo-context/SKILL.md (on-demand agent deep-dive skill — loads only when relevant; home for multi-step procedures & part-specific detail)
+
+               Known tight source ↔ doc contracts (treat each as a single staleness signal):
+
+               (a) `src/aetherscan/cli.py` ↔ README.md's `## CLI Reference` section.
+                   The three code blocks under that section (### Top-Level Help,
+                   ### Train Command Help, ### Inference Command Help) are pasted
+                   verbatim argparse output. If `cli.py` changed in this PR — flags
+                   added/removed/renamed, help strings edited, subparsers added or
+                   dropped — those blocks have almost certainly drifted. The follow-up
+                   PR must regenerate them by running, from the repo root:
+
+                       PYTHONPATH=src python utils/print_cli_help.py all
+
+                   The script (utils/print_cli_help.py) does not require TensorFlow
+                   or the conda env — it imports only aetherscan.config and
+                   aetherscan.cli, both pure-stdlib modules. It pins COLUMNS=80 so
+                   line wrapping is deterministic. The output is three blocks
+                   separated by blank lines: top-level, then train, then inference.
+                   Each block goes verbatim into the matching `### ... Help` code
+                   block in README.md. Preserve each subsection's intro paragraph
+                   (which contains the "Regenerate this output with ..." hint).
+
+               (b) README.md + CONTRIBUTING.md + SECURITY.md + KNOWN_ISSUES.md + docs/* ↔ CLAUDE.md +
+                   .claude/skills/aetherscan-repo-context/SKILL.md.
+                   CLAUDE.md (lean, always-on operating rules) and the SKILL.md skill
+                   (on-demand deep-dive) are both DERIVED, hand-maintained summaries of
+                   the project's canonical docs — they restate the install paths, entry
+                   point / run commands, project structure, config & CLI system, code
+                   style and naming conventions, contribution workflow, security
+                   practices, and known limitations, plus pointers (file paths / section
+                   anchors) into all of those docs. The canonical docs always win;
+                   CLAUDE.md and the SKILL.md skill must follow them.
+
+                   Division of labor — keep this split sharp when reconciling: CLAUDE.md
+                   is loaded in full into EVERY Claude Code session, so it must stay
+                   lean — target < 200 lines, carrying only bare-essentials always-on
+                   rules (hard rules, core conventions, one-line run/lint commands, and
+                   pointers into the canonical docs). The SKILL.md skill loads ON DEMAND,
+                   so every multi-step procedure (full build/run recipes, token-rotation
+                   steps, regeneration commands, etc.) and any part-specific /
+                   subsystem-specific detail belongs there, NOT in CLAUDE.md. When a fact
+                   must be restated, prefer a terse pointer in CLAUDE.md plus the full
+                   detail in the skill over growing CLAUDE.md past its budget.
+
+                   If this PR changed README.md, CONTRIBUTING.md, SECURITY.md,
+                   KNOWN_ISSUES.md, or anything under docs/ in any way that alters facts
+                   those two files restate or point to — e.g. install/setup steps,
+                   supported GPUs or runtimes, how the pipeline is invoked (entry point,
+                   wrapper scripts, flags), project structure / module responsibilities,
+                   config or env-var resolution, ruff/style or naming rules, comment
+                   markers, branch-prefix or PR/GPG/pre-commit workflow, branch-protection
+                   rules, secrets-management / token-rotation / vulnerability-reporting
+                   guidance, known issues / limitations / workarounds, or the
+                   existence / location / section anchors of any doc they link to — then
+                   CLAUDE.md and the SKILL.md skill have very likely drifted. The
+                   follow-up PR must reconcile BOTH files against the updated canonical
+                   docs: update the affected lines (keeping CLAUDE.md lean — < 200 lines,
+                   essentials only — and putting any multi-step or part-specific detail in
+                   the on-demand SKILL.md skill), and do not introduce facts that contradict the
+                   canonical docs. A change confined entirely to source code (no edit to
+                   any canonical doc) does not trigger this contract on its own — but if
+                   it makes a statement in either file factually wrong, flag that too.
 
             4. If documentation updates are needed:
-               - First check for existing documentation issues to avoid duplicates:
-                 `gh issue list --label "documentation" --state open`
+               - A deterministic pre-step already confirmed no doc issue exists for THIS PR
+                 (the re-run guard). Separately, check for a semantically duplicate doc issue
+                 from another PR before filing: `gh issue list --label "documentation" --state open`
                - If no existing issue covers the same updates, create a new GitHub issue with the label "documentation"
                - Title: "[DOCUMENTATION]: <brief description>"
                - Body should include:
+                 - As the FIRST line, the hidden marker (invisible when rendered) so the
+                   deterministic guard can dedupe re-runs of this PR:
+                   `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->`
                  - Reference to the merged PR (#${{ github.event.pull_request.number }})
                  - Summary of changes that require documentation
                  - Specific files that need updates
                  - Suggested changes or additions
                  - Tag @claude with instructions to open a PR linking to this issue with the specified updates
+                 - If the changes touched `src/aetherscan/cli.py`, include the exact
+                   regen recipe in the issue body so the follow-up PR has a
+                   deterministic command to run:
+                       PYTHONPATH=src python utils/print_cli_help.py all
+                   …and explicitly instruct the follow-up to replace each of the
+                   three code blocks under README.md's `## CLI Reference` section
+                   verbatim with the matching output (top → ### Top-Level Help,
+                   train → ### Train Command Help, inference → ### Inference
+                   Command Help), keeping each subsection's intro paragraph intact.
+                 - If the changes touched any canonical doc in contract (b) above
+                   (README.md, CONTRIBUTING.md, SECURITY.md, KNOWN_ISSUES.md, or docs/*),
+                   explicitly instruct the follow-up PR to reconcile BOTH CLAUDE.md and
+                   .claude/skills/aetherscan-repo-context/SKILL.md against the updated canonical
+                   docs — listing the specific shared facts that changed — and to keep
+                   CLAUDE.md lean (< 200 lines, essentials only) while pushing any
+                   multi-step or part-specific detail into the on-demand SKILL.md skill,
+                   without contradicting the canonical docs.
 
             5. If no documentation updates are needed, do not create an issue.
                Only create an issue if there are meaningful documentation gaps.
 
-            Use `gh issue create` to create issues when needed.
-            Be specific about what documentation changes are required.
+            ## Available tools
+            PR inspection:
+            - `gh pr diff` to retrieve the merged PR's diff (the primary signal for what to analyze in Step 1)
+            - `gh pr view` to look up additional PR metadata (labels, comments, reviewers) if needed beyond the variables interpolated above
+
+            Issue interaction:
+            - `gh issue list --label "documentation" --state open` to check for an already-open documentation issue before filing a new one (Step 4 duplicate guard)
+            - `gh issue create` to file a new `[DOCUMENTATION]: <…>` issue tagging @claude when meaningful doc gaps are identified
+
+            Code exploration:
+            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and any source files referenced by the source ↔ doc contracts above
+
+            ## Guidelines
+            - Be specific about what documentation changes are required.
+            - Scope boundary — **documentation only.** Your remit is prose/doc files (README.md,
+              CLAUDE.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and the SKILL.md
+              skill) and the doc-side of the source↔doc contracts above. A SEPARATE post-merge
+              workflow (`.github/workflows/claude-style-check.yml`) owns source-code style/quality
+              (the CONTRIBUTING.md "Code Style" rules ruff can't catch). Do NOT file an issue about,
+              or ask the follow-up PR to change, the LOGIC or STYLE of `.py` source — only the
+              regeneration/reconciliation of documentation. If the merged PR needs no *documentation*
+              change, file nothing, even if its code could be improved. This keeps the two workflows
+              from filing duplicate or overlapping issues.
+            - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->` marker — the deterministic guard relies on it to skip re-runs.
+            - Your only responsibilities are to determine whether any documentation needs to be updated after the merged PR. Do not do anything that is not within this job scope.
 
           claude_args: |
-            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue create:*),Bash(gh issue list:*),Read,Glob,Grep"
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
             --model opus

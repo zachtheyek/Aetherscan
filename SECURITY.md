@@ -9,22 +9,23 @@ This document describes security practices and procedures for the Aetherscan pro
 | Version | Supported | Notes                       |
 | ------- | --------- | --------------------------- |
 | 1.x.x   | Yes       | Current development version |
-| 0.x.x   | No        | Pre-release, not supported  |
 
 ---
 
-## Reporting a Vulnerability
+## Responding to Security Issues
+
+### Reporting a Vulnerability
 
 If you discover a security vulnerability in Aetherscan:
 
-### For Non-Critical Issues
+#### For Non-Critical Issues
 
 1. Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label
 2. Provide a clear description of the vulnerability
 3. Include steps to reproduce if applicable
 4. Suggest a fix if you have one
 
-### For Critical Issues
+#### For Critical Issues
 
 For vulnerabilities that could expose sensitive data or allow unauthorized access:
 
@@ -37,6 +38,31 @@ For vulnerabilities that could expose sensitive data or allow unauthorized acces
    - Suggested remediation (if any)
 4. Allow up to 48-72 hours for initial response
 5. Work with maintainers on coordinated disclosure
+
+### Incident Response
+
+If a security incident occurs:
+
+1. **Contain**: Revoke compromised credentials immediately
+2. **Assess**: Determine what was accessed or modified
+3. **Notify**: Alert affected parties and maintainers
+4. **Remediate**: Fix the vulnerability and rotate all potentially affected secrets
+5. **Document**: Record the incident for future reference
+6. **Improve**: Update processes to prevent recurrence
+
+### Token Rotation
+
+If you suspect a token has been compromised, rotate immediately:
+
+#### Slack Bot Token
+
+1. Go to [Slack API](https://api.slack.com/apps)
+2. Select the Aetherscan app
+3. Navigate to "OAuth & Permissions"
+4. Click "Revoke Tokens"
+5. Reinstall the Aetherscan app and generate a new token with the following scopes: `channels:read`, `chat:write`, `files:write`, `groups:read`, `incoming-webhook`
+6. Update `SLACK_BOT_TOKEN` in all deployment environments
+7. Verify the new token works: `PYTHONPATH=src python utils/print_cli_help.py train` (should not show Slack errors)
 
 ---
 
@@ -70,27 +96,13 @@ Aetherscan uses the following secrets that must be protected:
 
 ---
 
-## Token Rotation
+## Security Scanning
 
-If you suspect a token has been compromised, rotate immediately:
-
-### Slack Bot Token
-
-1. Go to [Slack API](https://api.slack.com/apps)
-2. Select the Aetherscan app
-3. Navigate to "OAuth & Permissions"
-4. Click "Revoke Tokens"
-5. Reinstall the Aetherscan app and generate a new token with the following scopes: `channels:read`, `chat:write`, `files:write`, `groups:read`, `incoming-webhook`
-6. Update `SLACK_BOT_TOKEN` in all deployment environments
-7. Verify the new token works: `aetherscan train --help` (should not show Slack errors)
-
----
-
-## Pre-commit Security Scanning
+### Pre-commit Scanning (gitleaks)
 
 The project uses [gitleaks](https://github.com/gitleaks/gitleaks) as a pre-commit hook to prevent accidental secret commits.
 
-### What It Scans For
+#### What It Scans For
 
 - API keys and tokens
 - GCP/AWS credentials
@@ -98,7 +110,7 @@ The project uses [gitleaks](https://github.com/gitleaks/gitleaks) as a pre-commi
 - Generic secrets patterns
 - High-entropy strings
 
-### Running Manually
+#### Running Manually
 
 ```bash
 # Install gitleaks
@@ -113,7 +125,7 @@ gitleaks detect --source . --verbose
 gitleaks detect --source . --log-opts="HEAD~10..HEAD"
 ```
 
-### Handling False Positives
+#### Handling False Positives
 
 If gitleaks flags a non-secret (e.g., a test fixture):
 
@@ -129,15 +141,13 @@ If gitleaks flags a non-secret (e.g., a test fixture):
    fake_token = "test_token_abc123"  # gitleaks:allow
    ```
 
----
+### Dependency Scanning
 
-## Dependency Vulnerability Scanning
-
-### Automated Scanning
+#### Automated Scanning
 
 The repository uses GitHub's Dependabot for automated dependency vulnerability detection.
 
-### Manual Scanning
+#### Manual Scanning
 
 ```bash
 # Using pip-audit
@@ -149,7 +159,20 @@ pip install safety
 safety check
 ```
 
-### Responding to Vulnerabilities
+#### Version Selection Policy
+
+When pinning or bumping a dependency, prefer a proven release over the bleeding edge. Consider only final/stable releases — never pre-releases (alpha / beta / rc / dev) or nightly builds. The default target is the **higher (newer)** of:
+
+- **two minor releases below the latest stable release** (e.g. latest stable `1.8.x` → target the latest patch of `1.6.x`); or
+- **the latest stable release that is at least 6 months old**.
+
+This deliberately trails the newest release: brand-new versions are where regressions and freshly introduced (not-yet-disclosed) vulnerabilities surface, so letting a release "bake" for a couple of minors / six months trades a small amount of currency for stability and a wider window for advisories to come to light.
+
+**Exception — known advisories override the lag.** If the version selected by the rule above is itself affected by a known security advisory, instead pin the **minimum version that resolves the advisory**, even if it is newer than the default target (see _Responding to Vulnerabilities_ below).
+
+These targets are additionally bounded by the project's intentional version ceilings (e.g. `numpy<2.0`, `setuptools<81`) and the NGC TensorFlow 2.17 ABI — never select a version that crosses a documented upper bound. See the header comments in `environment.yml` and `requirements-container.txt` for the rationale behind each ceiling, and keep the coupled manifests (`environment.yml`, `requirements-container.txt`, `aetherscan.def`) in lockstep when bumping a shared dependency.
+
+#### Responding to Vulnerabilities
 
 1. **Critical/High severity**: Update immediately and release a patch
 2. **Medium severity**: Update in next minor release
@@ -159,44 +182,8 @@ safety check
 
 ## Data Security
 
-- All training & model data are publicly disclosed via relevant channels (e.g. [Ma et al. 2023](https://arxiv.org/abs/2301.12670)), and made available via the [Breakthrough Listen Open Data Archive](https://breakthroughinitiatives.org/opendatasearch)
-- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers not made available to the public. Contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack to discuss further
-
----
-
-## Secure Deployment
-
-### Recommendations
-
-1. **Run with least privilege**
-   - Don't run as root
-   - Use dedicated service accounts
-
-2. **Network isolation**
-   - Training nodes should have limited network access
-   - Only allow outbound connections to Slack API (if used)
-
-3. **Container security** (if using Docker)
-   - Use non-root user in container
-   - Scan images for vulnerabilities
-   - Don't mount sensitive host directories
-
-4. **Logging**
-   - Enable audit logging for production systems
-   - Monitor for unusual patterns (high error rates, unexpected access)
-
----
-
-## Incident Response
-
-If a security incident occurs:
-
-1. **Contain**: Revoke compromised credentials immediately
-2. **Assess**: Determine what was accessed or modified
-3. **Notify**: Alert affected parties and maintainers
-4. **Remediate**: Fix the vulnerability and rotate all potentially affected secrets
-5. **Document**: Record the incident for future reference
-6. **Improve**: Update processes to prevent recurrence
+- All major outputs (e.g. model weights, source code, search results, training/inference data, etc.) are publicly disclosed and made available via the appropriate channels (e.g. HuggingFace, GitHub, publications, [Breakthrough Listen's Open Data Archive](https://breakthroughinitiatives.org/opendatasearch), etc.)
+- Intermediate data products (e.g. db records or plots) are generally stored on secure, access-controlled HPC servers and not made available to the public. Contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack to discuss further
 
 ---
 

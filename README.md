@@ -7,9 +7,9 @@
     <br />
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License"></a>
-    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10-blue.svg" alt="Python"></a>
-    <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.16-orange.svg" alt="TensorFlow"></a>
-    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.2-green.svg" alt="CUDA"></a>
+    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%E2%80%933.12-blue.svg" alt="Python"></a>
+    <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.17-orange.svg" alt="TensorFlow"></a>
+    <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.4%E2%80%9312.8-green.svg" alt="CUDA"></a>
   </p>
 </p>
 
@@ -35,30 +35,121 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### System Requirements
 
-Aetherscan's _default_ configs have been tested on machines with the following _minimum_ specifications:
+Aetherscan supports two install paths off the same source tree. The NGC container is the canonical runtime on both clusters; the conda env is kept as an alternative for users who can't or don't want to use containers on Ampere.
 
-**Training**
-
-- Ubuntu 24.04
-- 1x NVIDIA GPU, 9GB VRAM, CUDA 12.2
-- 400 GB RAM
-
-**Inference**
+**NGC container (canonical, runs on both clusters)**
 
 - Ubuntu 24.04
-- 1x NVIDIA GPU, 12GB VRAM, CUDA 12.2
-- 150 GB RAM
+- ≥1x NVIDIA GPU:
+  - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
+  - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
+- ≥12 GB combined VRAM (training) / ≥9 GB combined VRAM (inference)
+- ≥150 GB RAM (training) / ≥100 GB RAM (inference)
+- Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
+- See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
 
-As the software matures, more detailed system requirements will be made available to the user.
+**Conda env (alternative, Ampere only)**
+
+- Ubuntu 24.04
+- ≥1x NVIDIA GPU:
+  - Ampere with CUDA 12.3+ driver
+- VRAM / RAM same as above
+- Python 3.10 / TF 2.17 (managed by conda)
+
+> [!NOTE]
+> There are no plans to support non-Nvidia GPUs
+
+> [!WARNING]
+>
+> # TODO: update system requirements after proper benchmarking (`docs/benchmarks.md`?)
+
+### Run From Container
+
+> [!NOTE]
+> This is the canonical install path, and the only option for Blackwell clusters
+
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+```
+
+**2. Build the `.sif` image**
+
+The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime — use whichever is installed on the host. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
+
+```bash
+# SingularityCE (e.g. Blackwell cluster running 4.1.1)
+singularity build aetherscan-ngc25.02.sif aetherscan.def
+
+# Apptainer (e.g. Ampere cluster running v1.4.5)
+apptainer build aetherscan-ngc25.02.sif aetherscan.def
+```
+
+Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
+
+**3. Set up monitoring dashboards in tmux (optional)**
 
 > [!Tip]
-> If you're running into resource bottlenecks, consider adjusting the appropriate config values (e.g. lower `--num-samples-beta-vae` or `--signal-injection-chunk-size` if RAM is the limiting factor).
+> Subsequent pipeline runs may proceed from the current step (3) onward
+
+The repo ships a convenience script that instantiates a four-window tmux session for monitoring system resources (`htop` + a CPU/MEM ticker), GPU state (`watch nvidia-smi`), shared memory buffers (`watch ls /dev/shm`), and models/outputs dirs (`watch tree`):
+
+```bash
+./utils/start_tmux_session.sh
+```
+
+Idempotent — re-running attaches to the existing session instead of recreating it.
+
+**4. Configure secrets and paths (optional)**
+
+Aetherscan reads secrets and path overrides from a `.env` file at the repo root. [`utils/run_container.sh`](utils/run_container.sh) auto-loads `<repo>/.env` into its own environment before launching the container and forwards the relevant keys via `--env`, so no `source .env` or inline prefix is needed.
+
+```ini
+# .env example
+
+# If none specified, Slack integration is automatically disabled
+SLACK_BOT_TOKEN=your-slack-bot-token
+SLACK_CHANNEL=your-slack-channel
+
+# If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
+# Note, CLI flags (--data-path, --model-path, --output-path) override these
+AETHERSCAN_DATA_PATH=/path/to/data
+AETHERSCAN_MODEL_PATH=/path/to/models
+AETHERSCAN_OUTPUT_PATH=/path/to/outputs
+```
+
+> [!TIP]
+> See [`SECURITY.md`](SECURITY.md) for best practices on managing `.env` files.
+
+If you'd rather set them directly in your shell (skipping `.env`), `export` works equivalently and takes precedence over `.env` for any keys it sets — useful for one-off overrides:
+
+```bash
+export SLACK_BOT_TOKEN="your-slack-bot-token"
+export SLACK_CHANNEL="your-slack-channel"
+...
+
+./utils/run_container.sh python -m aetherscan.main train ...
+```
+
+The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The `utils/run_container.sh` wrapper forwards `SLACK_*` and `AETHERSCAN_*` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
+
+**5. Run pipeline**
+
+```bash
+./utils/run_container.sh python -m aetherscan.main {train|inference} \
+  --save-tag final_v1
+```
+
+The `utils/run_container.sh` wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
+
+See the [Usage Examples](#usage-examples) section below for further ways to invoke the Aetherscan pipeline.
 
 ### Run From Source
 
 > [!NOTE]
-> Aetherscan currently only supports running from source.
-> Installation via pip and containerized distributions will be made available in a later release.
+> This is an alternative install path for Ampere clusters
 
 **1. Clone the repository**
 
@@ -74,36 +165,46 @@ conda env create -f environment.yml
 conda activate aetherscan
 ```
 
-**3. Set environment variables**
+**3. Set up monitoring dashboards in tmux (optional)**
+
+> [!Tip]
+> Subsequent pipeline runs may proceed from the current step (3) onward
+
+The repo ships a convenience script that instantiates a four-window tmux session for monitoring system resources (`htop` + a CPU/MEM ticker), GPU state (`watch nvidia-smi`), shared memory buffers (`watch ls /dev/shm`), and models/outputs dirs (`watch tree`):
 
 ```bash
-# (Recommended) from .env file — see SECURITY.md
-source .env
+./utils/start_tmux_session.sh
 ```
 
+Idempotent — re-running attaches to the existing session instead of recreating it.
+
+> [!Note]
+> If you skip the tmux helper, it's recommended to run these two exports manually before launching the pipeline — the script's pipeline pane sets them for you, and without them you may hit TF library-loading issues or noisy startup logs:
+
 ```bash
-# (Alternative) manual configuration
-
-# If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
-# Note, CLI flags (--data-path, --model-path, --output-path) overrides environment variables
-export AETHERSCAN_DATA_PATH="/path/to/data"
-export AETHERSCAN_MODEL_PATH="/path/to/models"
-export AETHERSCAN_OUTPUT_PATH="/path/to/outputs"
-
-# If none specified, Slack integration is automatically disabled
-export SLACK_BOT_TOKEN="your-slack-bot-token"
-export SLACK_CHANNEL="your-slack-channel"
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export TF_CPP_MIN_LOG_LEVEL=1
 ```
 
-**4. Run pipeline**
+**4. Configure secrets and paths (optional)**
+
+Same `.env` file format and precedence rules as [Run From Container](#run-from-container) step 4. Two differences on this path:
+
+- `<repo>/.env` is loaded directly into `os.environ` at the top of `main.py` via [python-dotenv](https://pypi.org/project/python-dotenv/) — no wrapper script in the loop — so **every** key in `.env` is visible to the pipeline, not just the subset the container wrapper forwards via `--env`.
+- No host→container bind mounts, so `AETHERSCAN_*` paths only need to exist when the pipeline actually accesses them, not at startup.
+
+Multiprocess worker pools inherit the values via `os.environ` as usual.
+
+**5. Run pipeline**
 
 ```bash
-# Use inline environment variables to create a temporary environment frame that applies to the current command and subsequent descendants
-# Necessary for proper parent→child environment inheritance in multiprocess worker pools
-SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
-  python -m aetherscan.main {train|inference} \
+PYTHONPATH=src python -m aetherscan.main {train|inference} \
   --save-tag final_v1
 ```
+
+`PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` step. No inline `KEY=VALUE` prefix is needed for Slack credentials — the `.env` auto-load runs before any worker process is spawned, so `os.environ` inheritance to multiprocess pools is automatic.
+
+See the [Usage Examples](#usage-examples) section below for further ways to invoke the Aetherscan pipeline.
 
 ---
 
@@ -114,52 +215,139 @@ SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_CHANNEL=$SLACK_CHANNEL PYTHONPATH=src \
 > Non-development workflows should avoid directly calling other scripts/modules.
 
 > [!NOTE]
-> The following section will omit writing the inline environment variables for brevity.
-> As well, `PYTHONPATH=src python -m aetherscan.main` will be shortened to simply `aetherscan`.
->
-> # TODO: update README once local builds with `pip install -e .` are working as expected.
+> Each scenario below is shown twice — first with the container wrapper (canonical), then with the conda-env source invocation (alternative). CLI flags are identical between the two; only the launcher differs.
 
 ### Training
 
-```bash
-# Default training run
-aetherscan train
+> [!TIP]
+> The examples below cover a small number of scenarios. For the full set of available flags, see [Train Command Help](#train-command-help).
 
-# Training with custom parameters
-aetherscan train \
+**Default training run**
+
+```bash
+# Container (canonical)
+./utils/run_container.sh python -m aetherscan.main train
+
+# Source (Ampere conda env)
+PYTHONPATH=src python -m aetherscan.main train
+```
+
+**Training with custom parameters**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main train \
     --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
     --num-training-rounds 20 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
     --save-tag test_v1
 
-# Resume from checkpoint
-aetherscan train \
+# Source
+PYTHONPATH=src python -m aetherscan.main train \
+    --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
+    --num-training-rounds 20 \
+    --epochs-per-round 100 \
+    --curriculum-schedule exponential \
+    --save-tag test_v1
+```
+
+**Resume from checkpoint**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main train \
+    --load-dir checkpoints \
+    --load-tag round_10 \
+    --save-tag test_v1
+
+# Source
+PYTHONPATH=src python -m aetherscan.main train \
     --load-dir checkpoints \
     --load-tag round_10 \
     --save-tag test_v1
 ```
 
-### Inference
+**Training with an explicit per-GPU memory cap (e.g. on an older Ampere GPU with lower VRAM)**
 
 ```bash
-# Default inference run
-aetherscan inference
+# Container
+./utils/run_container.sh python -m aetherscan.main train \
+    --gpu-memory-limit-mb 14000 \
+    --save-tag test_v1
 
-# Run inference with custom parameters
-aetherscan inference \
+# Source
+PYTHONPATH=src python -m aetherscan.main train \
+    --gpu-memory-limit-mb 14000 \
+    --save-tag test_v1
+```
+
+### Inference
+
+> [!TIP]
+> The examples below cover a small number of scenarios. For the full set of available flags, see [Inference Command Help](#inference-command-help).
+
+**Default inference run**
+
+```bash
+# Container (canonical)
+./utils/run_container.sh python -m aetherscan.main inference
+
+# Source (Ampere conda env)
+PYTHONPATH=src python -m aetherscan.main inference
+```
+
+**Inference on a pre-processed `.npy` file**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
     --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
     --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
     --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
     --classification-threshold 0.99
 
-# Run inference from raw .h5 files (energy detection preprocessing)
-aetherscan inference \
+# Source
+PYTHONPATH=src python -m aetherscan.main inference \
+    --test-files real_filtered_LARGE_test_HIP15638.npy \
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
+    --classification-threshold 0.99
+```
+
+**Inference from raw `.h5` files (invokes energy detection preprocessing)**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json \
+    --save-tag run_v1
+
+# Source
+PYTHONPATH=src python -m aetherscan.main inference \
+    --inference-files complete_cadences_catalog.csv \
+    --encoder-path /path/to/vae_encoder.keras \
+    --rf-path /path/to/random_forest.joblib \
+    --config-path /path/to/config.json \
+    --save-tag run_v1
+```
+
+**Inference with async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
+
+```bash
+# Container
+./utils/run_container.sh python -m aetherscan.main inference \
+    --no-async-allocator \
+    --save-tag run_v1
+
+# Source
+PYTHONPATH=src python -m aetherscan.main inference \
+    --no-async-allocator \
     --save-tag run_v1
 ```
 
@@ -171,81 +359,86 @@ Aetherscan uses a hierarchical configuration system with dataclass-based configs
 
 1. **Defaults** - Defined in `src/aetherscan/config.py`
 2. **Environment variables** - For paths and secrets
-3. **CLI arguments** - Override defaults on startup
+3. **CLI flags** - Override defaults & environment variables on startup
 
 At runtime, the singleton `Config` instance can be accessed via `get_config()` and modified programmatically.
 
+Read [docs/CONFIG_AND_CLI.md](/docs/CONFIG_AND_CLI.md) to learn more.
+
 ### Top-Level Help
 
-Aetherscan supports both training and inference, invoked using the first positional argument.
+Aetherscan dispatches to one of two subcommands via the first positional argument. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py top` (container) or `PYTHONPATH=src python utils/print_cli_help.py top` (source).
 
 ```
 usage: [-h] {train,inference} ...
 
-Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale
+Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade
+DL pipeline for SETI @ scale
 
 positional arguments:
-  {train,inference}
-                        Command to execute
-    train               Execute training pipeline
-    inference           Execute inference pipeline
+  {train,inference}  Command to execute
+    train            Execute training pipeline
+    inference        Execute inference pipeline
 
 options:
-  -h, --help            show this help message and exit
+  -h, --help         show this help message and exit
 ```
 
 ### Train Command Help
 
-The Aetherscan training pipeline exposes the following CLI flags to the user:
+The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py train` (container) or `PYTHONPATH=src python utils/print_cli_help.py train` (source).
 
 ```
-usage:  train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
-              [--output-path OUTPUT_PATH] [--vae-latent-dim VAE_LATENT_DIM]
-              [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
-              [--vae-kernel-size VAE_KERNEL_SIZE VAE_KERNEL_SIZE]
-              [--vae-beta VAE_BETA] [--vae-alpha VAE_ALPHA]
-              [--rf-n-estimators RF_N_ESTIMATORS]
-              [--rf-bootstrap RF_BOOTSTRAP]
-              [--rf-max-features RF_MAX_FEATURES] [--rf-n-jobs RF_N_JOBS]
-              [--rf-seed RF_SEED] [--num-observations NUM_OBSERVATIONS]
-              [--width-bin WIDTH_BIN] [--downsample-factor DOWNSAMPLE_FACTOR]
-              [--time-bins TIME_BINS] [--freq-resolution FREQ_RESOLUTION]
-              [--time-resolution TIME_RESOLUTION]
-              [--num-target-backgrounds NUM_TARGET_BACKGROUNDS]
-              [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
-              [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
-              [--train-files TRAIN_FILES [TRAIN_FILES ...]]
-              [--num-training-rounds NUM_TRAINING_ROUNDS]
-              [--epochs-per-round EPOCHS_PER_ROUND]
-              [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
-              [--num-samples-rf NUM_SAMPLES_RF]
-              [--train-val-split TRAIN_VAL_SPLIT]
-              [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
-              [--effective-batch-size EFFECTIVE_BATCH_SIZE]
-              [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
-              [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
-              [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
-              [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
-              [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
-              [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
-              [--latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]]
-              [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
-              [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
-              [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
-              [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
-              [--final-snr-range FINAL_SNR_RANGE]
-              [--curriculum-schedule CURRICULUM_SCHEDULE]
-              [--exponential-decay-rate EXPONENTIAL_DECAY_RATE]
-              [--step-easy-rounds STEP_EASY_ROUNDS]
-              [--step-hard-rounds STEP_HARD_ROUNDS]
-              [--base-learning-rate BASE_LEARNING_RATE]
-              [--min-learning-rate MIN_LEARNING_RATE]
-              [--min-pct-improvement MIN_PCT_IMPROVEMENT]
-              [--patience-threshold PATIENCE_THRESHOLD]
-              [--lr-reduction-factor LR_REDUCTION_FACTOR]
-              [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
-              [--load-dir LOAD_DIR] [--load-tag LOAD_TAG]
-              [--start-round START_ROUND] [--save-tag SAVE_TAG]
+usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+             [--output-path OUTPUT_PATH] [--vae-latent-dim VAE_LATENT_DIM]
+             [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
+             [--vae-kernel-size VAE_KERNEL_SIZE VAE_KERNEL_SIZE]
+             [--vae-beta VAE_BETA] [--vae-alpha VAE_ALPHA]
+             [--rf-n-estimators RF_N_ESTIMATORS] [--rf-bootstrap RF_BOOTSTRAP]
+             [--rf-max-features RF_MAX_FEATURES] [--rf-n-jobs RF_N_JOBS]
+             [--rf-seed RF_SEED] [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
+             [--nccl-num-packs NCCL_NUM_PACKS]
+             [--async-allocator | --no-async-allocator]
+             [--num-observations NUM_OBSERVATIONS] [--width-bin WIDTH_BIN]
+             [--downsample-factor DOWNSAMPLE_FACTOR] [--time-bins TIME_BINS]
+             [--freq-resolution FREQ_RESOLUTION]
+             [--time-resolution TIME_RESOLUTION]
+             [--num-target-backgrounds NUM_TARGET_BACKGROUNDS]
+             [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
+             [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
+             [--train-files TRAIN_FILES [TRAIN_FILES ...]]
+             [--num-training-rounds NUM_TRAINING_ROUNDS]
+             [--epochs-per-round EPOCHS_PER_ROUND]
+             [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
+             [--num-samples-rf NUM_SAMPLES_RF]
+             [--train-val-split TRAIN_VAL_SPLIT]
+             [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
+             [--effective-batch-size EFFECTIVE_BATCH_SIZE]
+             [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
+             [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
+             [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
+             [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
+             [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
+             [--latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL]
+             [--latent-viz-umap-fit-max-samples LATENT_VIZ_UMAP_FIT_MAX_SAMPLES]
+             [--latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]]
+             [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
+             [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
+             [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
+             [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
+             [--final-snr-range FINAL_SNR_RANGE]
+             [--curriculum-schedule CURRICULUM_SCHEDULE]
+             [--exponential-decay-rate EXPONENTIAL_DECAY_RATE]
+             [--step-easy-rounds STEP_EASY_ROUNDS]
+             [--step-hard-rounds STEP_HARD_ROUNDS]
+             [--base-learning-rate BASE_LEARNING_RATE]
+             [--min-learning-rate MIN_LEARNING_RATE]
+             [--min-pct-improvement MIN_PCT_IMPROVEMENT]
+             [--patience-threshold PATIENCE_THRESHOLD]
+             [--lr-reduction-factor LR_REDUCTION_FACTOR]
+             [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
+             [--load-dir LOAD_DIR] [--load-tag LOAD_TAG]
+             [--start-round START_ROUND] [--save-tag SAVE_TAG]
 
 options:
   -h, --help            show this help message and exit
@@ -284,6 +477,20 @@ options:
                         Number of parallel jobs for random forest training (-1
                         uses all CPU cores)
   --rf-seed RF_SEED     Random seed for random forest reproducibility
+  --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
+                        Per-GPU memory cap in MiB. Omit to use memory-growth-
+                        only (recommended on Blackwell). Set for TF to
+                        allocate a fixed logical device of a given size per
+                        physical GPU (e.g. 14000)
+  --nccl-num-packs NCCL_NUM_PACKS
+                        num_packs for NCCL/HierarchicalCopy all-reduce. Lower
+                        values (e.g. 1) reduces tiny-tensor latency; higher
+                        values (e.g. >=4) can help bandwidth on >4-GPU
+                        topologies.
+  --async-allocator, --no-async-allocator
+                        Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default:
+                        enabled). Pass --no-async-allocator as a workaround
+                        for NGC 25.02 multi-GPU OOM bugs.
   --num-observations NUM_OBSERVATIONS
                         Number of observations per cadence snippet (e.g., 6
                         for 3 ON + 3 OFF)
@@ -339,9 +546,9 @@ options:
                         signal injection (must be divisible by 4)
   --plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT
                         Max points per stat name, per signal type, for A→B
-                        intensity bias scatter plots. Outliers are prioritized,
-                        with the difference made up from randomly sampling
-                        without replacement the remaining points
+                        intensity bias scatter plots. Outliers are
+                        prioritized, with the difference made up from randomly
+                        sampling without replacement the remaining points
   --plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE
                         Threshold for points to always be included in A→B
                         intensity bias scatter plots
@@ -352,7 +559,7 @@ options:
   --latent-viz-step-interval LATENT_VIZ_STEP_INTERVAL
                         Capture a latent space snapshot every N training steps
                         (lower = more snapshots, more DB writes, and larger
-                        storage costs)",
+                        storage costs)
   --latent-viz-umap-fit-max-samples LATENT_VIZ_UMAP_FIT_MAX_SAMPLES
                         Maximum number of pooled latent vectors used to fit
                         the UMAP model (remaining vectors are projected via
@@ -360,12 +567,12 @@ options:
                         embedding)
   --latent-viz-umap-n-neighbors LATENT_VIZ_UMAP_N_NEIGHBORS [LATENT_VIZ_UMAP_N_NEIGHBORS ...]
                         UMAP n_neighbors values to sweep for latent space
-                        visualization (e.g., --latent-viz-umap-n-neighbors
-                        5 15 30 50)
+                        visualization (e.g., --latent-viz-umap-n-neighbors 5
+                        15 30 50)
   --latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]
                         UMAP min_dist values to sweep for latent space
-                        visualization (e.g., --latent-viz-umap-min-dist
-                        0.0 0.1 0.5)
+                        visualization (e.g., --latent-viz-umap-min-dist 0.0
+                        0.1 0.5)
   --latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES
                         Maximum number of frames in latent space GIF output
                         (snapshots beyond this limit are log-subsampled,
@@ -431,33 +638,33 @@ options:
 
 ### Inference Command Help
 
-The Aetherscan inference pipeline exposes the following CLI flags to the user:
+The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py inference` (container) or `PYTHONPATH=src python utils/print_cli_help.py inference` (source).
 
 ```
-usage:  inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
-                  [--output-path OUTPUT_PATH]
-                  [--test-files TEST_FILES [TEST_FILES ...]]
-                  [--inference-files INFERENCE_FILES [INFERENCE_FILES ...]]
-                  [--encoder-path ENCODER_PATH] [--rf-path RF_PATH]
-                  [--config-path CONFIG_PATH]
-                  [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
-                  [--classification-threshold CLASSIFICATION_THRESHOLD]
-                  [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
-                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
-                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
-                  [--coarse-channel-width COARSE_CHANNEL_WIDTH]
-                  [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
-                  [--spline-order SPLINE_ORDER]
-                  [--detection-window-size DETECTION_WINDOW_SIZE]
-                  [--detection-step-size DETECTION_STEP_SIZE]
-                  [--stat-threshold STAT_THRESHOLD]
-                  [--stamp-width STAMP_WIDTH]
-                  [--overlap-search | --no-overlap-search]
-                  [--overlap-fraction OVERLAP_FRACTION]
-                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
-                  [--max-retries MAX_RETRIES]
-                  [--retry-delay RETRY_DELAY]
-                  [--save-tag SAVE_TAG]
+usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+                 [--output-path OUTPUT_PATH]
+                 [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
+                 [--async-allocator | --no-async-allocator]
+                 [--test-files TEST_FILES [TEST_FILES ...]]
+                 [--inference-files INFERENCE_FILES [INFERENCE_FILES ...]]
+                 [--encoder-path ENCODER_PATH] [--rf-path RF_PATH]
+                 [--config-path CONFIG_PATH]
+                 [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
+                 [--classification-threshold CLASSIFICATION_THRESHOLD]
+                 [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
+                 [--cadence-h5-path-col CADENCE_H5_PATH_COL]
+                 [--cadence-expected-obs CADENCE_EXPECTED_OBS]
+                 [--coarse-channel-width COARSE_CHANNEL_WIDTH]
+                 [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
+                 [--spline-order SPLINE_ORDER]
+                 [--detection-window-size DETECTION_WINDOW_SIZE]
+                 [--detection-step-size DETECTION_STEP_SIZE]
+                 [--stat-threshold STAT_THRESHOLD] [--stamp-width STAMP_WIDTH]
+                 [--overlap-search | --no-overlap-search]
+                 [--overlap-fraction OVERLAP_FRACTION]
+                 [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
+                 [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
+                 [--save-tag SAVE_TAG]
 
 options:
   -h, --help            show this help message and exit
@@ -470,6 +677,15 @@ options:
   --output-path OUTPUT_PATH
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
+  --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
+                        Per-GPU memory cap in MiB. Omit to use memory-growth-
+                        only (recommended on Blackwell). Set for TF to
+                        allocate a fixed logical device of a given size per
+                        physical GPU (e.g. 14000)
+  --async-allocator, --no-async-allocator
+                        Toggle TF_GPU_ALLOCATOR=cuda_malloc_async (default:
+                        enabled). Pass --no-async-allocator as a workaround
+                        for NGC 25.02 multi-GPU OOM bugs.
   --test-files TEST_FILES [TEST_FILES ...]
                         Space-separated list of testing data file names (e.g.,
                         real_filtered_LARGE_test_HIP15638.npy)
@@ -544,7 +760,7 @@ options:
 
 ## Known Issues
 
-For a comprehensive list of known issues, limitations, and workarounds, see [`KNOWN_ISSUES.md`](/KNOWN_ISSUES.md).
+For a list of known issues, limitations, and workarounds, see [`KNOWN_ISSUES.md`](/KNOWN_ISSUES.md).
 
 ---
 
@@ -553,13 +769,22 @@ For a comprehensive list of known issues, limitations, and workarounds, see [`KN
 Contributions are welcome! Quick start:
 
 ```bash
-# Install pre-commit hooks
+git clone https://github.com/zachtheyek/Aetherscan.git
+cd Aetherscan
+
+singularity build aetherscan-ngc25.02.sif aetherscan.def
+# or:
+apptainer build aetherscan-ngc25.02.sif aetherscan.def
+
+./utils/start_tmux_session.sh
+
 pre-commit install
 ```
 
-- Code style: PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/) (see pyproject.toml)
-- Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
 - PRs: Must be linked to an existing issue and pass all hooks
+- Commits: Must carry a verified GPG signature — see [Commit Signing (GPG)](CONTRIBUTING.md#commit-signing-gpg)
+- Branches: Use `feature/`, `hotfix/`, or `misc/` prefixes
+- Code style: PEP-8 with minor relaxations, enforced via [ruff](https://docs.astral.sh/ruff/) (see [pyproject.toml](pyproject.toml))
 
 See [`CONTRIBUTING.md`](/CONTRIBUTING.md) for full guidelines on workflow, project structure, and testing.
 
@@ -579,14 +804,14 @@ See [`CITATION.cff`](CITATION.cff) for details
 
 ## Security
 
-For vulnerability reports, secrets management, and security best practices, see [`SECURITY.md`](SECURITY.md).
+Aetherscan is committed to responsible disclosure. Quick reference:
 
-**Quick reference:**
+- **Report vulnerabilities:** Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label (non-critical) or contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack (critical; expect a response within 48-72h)
+- **Incident response:** Contain compromised credentials immediately, then assess scope, notify affected parties, remediate, and document
+- **Secrets:** Never commit tokens; use `.env` files (gitignored). Rotate immediately if compromised
+- **Automated scanning:** [gitleaks](https://github.com/gitleaks/gitleaks) pre-commit hook blocks accidental secret commits; GitHub Dependabot monitors for vulnerable dependencies
 
-- **Report vulnerabilities:** Open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label (non-critical) or contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack (critical)
-- **Secrets:** Never commit tokens; use `.env` files instead
-- **Pre-commit hooks:** [gitleaks](https://github.com/gitleaks/gitleaks) scans for accidental secret commits
-- **Dependencies:** GitHub Dependabot monitors for vulnerable packages
+See [`SECURITY.md`](SECURITY.md) for more details.
 
 ---
 

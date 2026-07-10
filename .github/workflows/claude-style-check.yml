@@ -1,0 +1,217 @@
+# Scan each merged PR into master for code that breaks the style guides ruff can't catch
+# Opens a single GitHub issue tagging @claude to open a follow-up fix-up PR
+name: Claude Style Check
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+
+jobs:
+  claude-style-check:
+    # Only run when PR is actually merged, not just closed
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    # Scanning one merged diff's added lines against a fixed rule list shouldn't take more than
+    # 15 mins (refine if data shows otherwise)
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+      id-token: write
+
+    steps:
+      # Deterministic duplicate-issue guard: when this workflow files a style issue it carries
+      # the hidden marker `<!-- aetherscan-style-check pr=<N> -->`. If one already exists for
+      # this PR (e.g. the merge event was manually re-run), skip the Claude step so we never
+      # file a second issue (and re-trigger a second @claude follow-up PR). Checks all states
+      # since the issue may have been closed once the fixes landed.
+      - name: Check for existing style issue for this PR
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- aetherscan-style-check pr=$PR_NUMBER -->"
+          if gh issue list --state all --limit 200 --json body --jq '.[].body' \
+              | grep -qF "$MARKER"; then
+            echo "A style issue for PR #$PR_NUMBER already exists — skipping Claude step."
+            echo "already_filed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No style issue for PR #$PR_NUMBER — proceeding."
+            echo "already_filed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: actions/checkout@v5
+        with:
+          # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
+          # in the allowlist, so a shallow checkout is sufficient.
+          fetch-depth: 1
+
+      - name: Run Claude Style Check
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            ## Role
+            A pull request has just been merged to master. Your task is to scan its changes for
+            code that violates this project's documented code-style guidelines, and — only if you
+            find real violations — file a single issue tagging @claude to open a follow-up fix-up PR.
+
+            ## Context
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR TITLE: ${{ github.event.pull_request.title }}
+            PR BODY: ${{ github.event.pull_request.body }}
+            AUTHOR: ${{ github.event.pull_request.user.login }}
+            MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+
+            ## Scope — read this first, it defines what you must and must NOT flag
+            The canonical style guide is CONTRIBUTING.md's `## Code Style` section (mirrored in
+            CLAUDE.md and .claude/skills/aetherscan-repo-context/SKILL.md). MANY of those rules are
+            already enforced automatically by `ruff` (lint) and `ruff format`, which run as a
+            pre-commit hook AND as required CI on every PR (.github/workflows/pre-commit.yml). The
+            ruff lint set enabled in pyproject.toml is `E, W, F, I, N, UP, B, C4, SIM, PL`, plus the
+            targeted style codes `G001`/`G002`/`G003` and `T20`, plus the isort `required-imports`
+            setting. That means the following are ALREADY guaranteed by the time a PR merges — DO
+            NOT re-flag any of them:
+              - PEP 604 unions (`X | None`) / PEP 585 generics (`list[int]`) — ruff `UP`
+              - Naming *casing* (PascalCase / snake_case / UPPER_SNAKE / `_private`) — ruff `N`
+              - Dataclass mutable defaults using `field(default_factory=...)` — ruff `B`
+              - Import sorting / grouping — ruff `I`
+              - Line length (100), quote style (double), 4-space indent — ruff format
+              - Unused imports, comprehension and control-flow simplifications — ruff `F`/`C4`/`SIM`
+              - `from __future__ import annotations` present atop every module — ruff `I002`
+              - Bare `print()` in package code (allowed only under `utils/`) — ruff `T20`
+              - Logging that uses `%` / `str.format()` / `+` instead of an f-string — ruff `G001`/`G002`/`G003`
+
+            Your job is ONLY the style rules ruff's enabled set CANNOT catch — the ones with an
+            irreducibly subjective element. Flag a finding only when it is introduced by THIS PR —
+            i.e. it appears on an ADDED (`+`) line in the diff, in a Python file. Never flag
+            pre-existing code that the PR merely moved or left untouched, and never restate a
+            ruff-enforced rule from the list above.
+
+            ## Task
+            1. Get the diff of the merged PR:
+               `gh pr diff ${{ github.event.pull_request.number }}`
+               Restrict your attention to ADDED lines in Python files (`+` lines in `*.py` hunks).
+               Use `Read`/`Grep` to open the surrounding context of a changed file only when you
+               need it to judge a finding (e.g. to confirm a module already has a logger, or that a
+               docstring really is Sphinx-style). If the PR changed no Python files, there is
+               nothing to check — do not open an issue.
+
+            2. Check each added Python line against these NON-ruff style rules (CONTRIBUTING.md
+               `## Code Style` → `### Key Style Rules`):
+
+               (a) **Docstring style** — short, plain prose. NO Sphinx / Google / NumPy section
+                   markers. Flag added docstrings containing `Args:`, `Arguments:`, `Returns:`,
+                   `Raises:`, `Yields:`, `Parameters\n----------`, `:param`, `:return:`, `:rtype:`,
+                   `@param`, or similar structured-section syntax. One-line docstrings for
+                   self-evident helpers are fine; full prose is fine — only the structured-section
+                   *style* is the violation.
+
+               (b) **Inline comment markers** — only five canonical markers are allowed, each WITH
+                   the trailing colon: `# TODO:`, `# NOTE:`, `# FIX:`, `# BUG:`, `# TEST:`. Flag
+                   added comments using non-canonical markers (`# FIXME`, `# XXX`, `# HACK`, `# NB`,
+                   `# OPTIMIZE`, ...) or a canonical word without the colon (`# TODO foo`). Also
+                   nudge `# TODO:` → `# NOTE:` when the comment records a rationale/observation with
+                   no actionable follow-through (CONTRIBUTING: "Prefer `# NOTE:` over `# TODO:` when
+                   there's no obvious action").
+
+               (c) **Logging hygiene (the parts ruff can't see)** — modules log via a *module-level*
+                   logger obtained as `logger = logging.getLogger(__name__)`. ruff already forbids
+                   `print()` in package code (`T20`) and non-f-string log formatting
+                   (`G001`/`G002`/`G003`), so do NOT flag those. DO flag added: a logger created with
+                   a hard-coded name (`logging.getLogger("aetherscan.train")`) instead of `__name__`;
+                   a logger created inside a function instead of at module scope; and — most
+                   importantly — anything logged at INFO or above that could leak a
+                   secret/token/credential, since INFO+ records may be forwarded to Slack.
+
+               (d) **Singleton accessor + None-guard** — shared singletons are reached ONLY through
+                   `get_config()` / `get_db()` / `get_manager()`, never by constructing
+                   `Config(...)` / `Database(...)` / `ResourceManager(...)` directly outside their
+                   own module. After `config = get_config()`, the canonical idiom guards None:
+                   `if config is None: raise ValueError("get_config() returned None")`. Flag added
+                   direct instantiation of these singletons, and added `get_config()` call sites that
+                   dereference the result without the None-guard.
+
+               (e) **Retry / error-handling shape** — added retry loops should follow the project
+                   shape: catch `KeyboardInterrupt` separately and re-raise it (so the traceback
+                   propagates), log the failure with `logger.error(...)`, and `time.sleep(retry_delay)`
+                   before the next attempt. Flag a new retry loop that swallows `KeyboardInterrupt`
+                   in a broad `except Exception`, or that retries without logging the error.
+
+               (f) **Descriptive variable names** — prefer full-word names
+                   (`per_replica_batch_size`, not `bs`; `coarse_channel_width`, not `ccw`). Casing
+                   is ruff's job; semantic terseness is yours. Flag clearly cryptic NEW names
+                   outside the legitimate exceptions (tight-loop counters, math expressions, array
+                   indices). Apply this conservatively — only call out names a reviewer would
+                   genuinely ask to rename.
+
+            3. Decide whether to file. If you found NO violations on added lines, do NOT open an
+               issue — silence is the success signal; weekly/per-PR noise is worse than a missed
+               nit. Only file when there is at least one concrete, defensible violation.
+
+            4. If there are violations, open exactly ONE issue:
+               - First check for a semantically duplicate open style issue from another PR before
+                 filing: `gh issue list --state open` (the deterministic pre-step already ruled out
+                 a re-run of THIS PR).
+               - **Title**: `[STYLE]: <N> style-guide violation(s) in merged PR #${{ github.event.pull_request.number }}`
+               - **Body**:
+                 - As the FIRST line, the hidden marker (invisible when rendered) so the
+                   deterministic guard can dedupe re-runs of this PR:
+                   `<!-- aetherscan-style-check pr=${{ github.event.pull_request.number }} -->`
+                 - A one-line note that this is an automated post-merge style scan covering only the
+                   style rules ruff cannot enforce (ruff/pre-commit already gate the rest).
+                 - Reference to the merged PR (#${{ github.event.pull_request.number }}).
+                 - A findings table — one row per violation: `file:line`, which rule (a)–(f) it
+                   breaks, the offending snippet, and the concrete corrected form.
+                 - Tag @claude with instructions to open a follow-up PR (branch prefix `claude/`)
+                   that links this issue (`Closes #<this-issue>`) and applies ONLY these style
+                   fixes — no behavioural changes — and to run `ruff check src/ && ruff format src/`
+                   before pushing so the fix-up itself stays clean.
+                 - Try your best to apply an appropriate existing label (discover them with
+                   `gh label list`); never apply the `claude` label (it re-triggers the assistant
+                   workflow on the issue directly, which the @claude mention already handles).
+
+            ## Available tools
+            PR inspection:
+            - `gh pr diff` to retrieve the merged PR's diff (the primary signal — Step 1)
+            - `gh pr view` to look up additional PR metadata (labels, files) if needed
+
+            Issue interaction:
+            - `gh label list` to discover the repo's labels before choosing which to apply
+            - `gh issue list --state open` to check for an already-open style issue before filing
+            - `gh issue create` to file the single `[STYLE]: ...` issue tagging @claude
+
+            Code exploration:
+            - `Read`, `Glob`, `Grep` to open the context of a changed file when judging a finding,
+              and to consult CONTRIBUTING.md / pyproject.toml for the exact rule wording
+
+            ## Guidelines
+            - Be precise and conservative: every finding must sit on an added line and break one of
+              rules (a)–(f) above. When in doubt, leave it out — a wrong nit erodes trust in the check.
+            - Never re-flag a ruff-enforced rule (the Scope list) — pre-commit CI already gates those.
+            - Scope boundary — **source code only.** Every finding must be on an added line in a
+              `.py` file. A SEPARATE post-merge workflow (`.github/workflows/claude-update-docs.yml`)
+              owns documentation drift (README.md, CLAUDE.md, CONTRIBUTING.md, KNOWN_ISSUES.md,
+              SECURITY.md, docs/*, the SKILL.md skill). Do NOT file an issue about stale, missing, or
+              inconsistent documentation, or about prose/markdown — even if this PR touched docs. If
+              the only problems are in docs, file nothing. This keeps the two workflows from filing
+              duplicate or overlapping issues.
+            - Open at most one issue, and only when there are real violations. Never modify code,
+              push a branch, open a PR yourself, or touch other issues/labels.
+            - The issue body's FIRST line must be the `<!-- aetherscan-style-check pr=${{ github.event.pull_request.number }} -->`
+              marker — the deterministic guard relies on it to skip re-runs.
+            - Never apply the `claude` label. Prefer existing labels; don't invent new ones unless clearly warranted.
+            - Reference CLAUDE.md and CONTRIBUTING.md for repository conventions.
+            - Your only responsibility is this post-merge style scan. Do not do anything outside that scope.
+
+          claude_args: |
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh label list:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
+            --model opus

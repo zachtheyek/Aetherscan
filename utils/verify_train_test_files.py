@@ -3,6 +3,8 @@ Verify train/test data exist, can be accessed, and have sensible statistics
 Uses memory mapping to avoid loading entire files into RAM
 """
 
+from __future__ import annotations
+
 import gc
 import os
 from typing import Any
@@ -19,13 +21,10 @@ def get_memory_usage():
 
 def verify_data_file(filepath: str) -> dict[str, Any]:
     """
-    Verify a single data file using memory mapping
-
-    Args:
-        filepath: Path to the numpy file
-
-    Returns:
-        Dictionary with file information
+    Memory-map the .npy file at `filepath`, sample 50 evenly-spaced snippets to compute
+    descriptive stats, and return {filename, shape, dtype, file_size_gb, sample_min,
+    sample_max, sample_mean, expected_memory_gb}. mmap_mode='r' avoids paging the full file
+    into RAM during verification.
     """
     filename = os.path.basename(filepath)
     print(f"\nFile: {filename}")
@@ -91,12 +90,8 @@ def verify_data_file(filepath: str) -> dict[str, Any]:
 
 
 def verify_data_format(data_path: str):
-    """
-    Verify data format for all files in a directory
-
-    Args:
-        data_path: Directory containing .npy files
-    """
+    """Iterate every .npy file in `data_path`, run verify_data_file() on each, and print a
+    summary. Reports memory usage between files so OOM blowups are visible."""
     files = sorted([f for f in os.listdir(data_path) if f.endswith(".npy")])
 
     print(f"Found {len(files)} .npy files")

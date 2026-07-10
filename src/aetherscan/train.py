@@ -50,7 +50,6 @@ from aetherscan.db import get_db, get_system_metadata
 from aetherscan.logger import get_logger
 from aetherscan.models import (
     RandomForestModel,
-    Sampling,
     create_beta_vae_model,
     prepare_latent_features,
 )
@@ -64,13 +63,11 @@ logger = logging.getLogger(__name__)
 # None to use the function as "normal"
 def archive_directory(base_dir: str, target_dirs: list[str] | None = None, round_num: int = 1):
     """
-    Archive and clean up a directory
+    Move (round_num == 1) or copy (round_num > 1) the contents of base_dir into a timestamped
+    archive/ subdirectory; on resume, also delete entries whose round number is >= round_num.
 
-    Args:
-        base_dir: Base directory to archive/clean
-        target_dirs: List of subdirectory names to include in archiving (e.g., ['train', 'validation'])
-                     If None, only files are considered (directories are ignored)
-        round_num: Training round number (1 for fresh run, >1 for resume)
+    target_dirs lists subdirectory names to include in archiving (e.g. ['train', 'validation']);
+    when None, only loose files in base_dir are considered and any subdirectories are ignored.
     """
     # Create base directory if it doesn't exist
     os.makedirs(base_dir, exist_ok=True)
@@ -194,10 +191,12 @@ def archive_directory(base_dir: str, target_dirs: list[str] | None = None, round
 
 def get_latest_tag(checkpoints_dir: str) -> str:
     """
-    Find the latest checkpoint tag from the checkpoints directory
+    Find the latest checkpoint tag (e.g. "round_05") in checkpoints_dir, choosing the most recent
+    tag whose encoder/decoder pair both exist on disk.
 
-    Returns:
-        Latest checkpoint tag (e.g., "round_05")
+    Tag families are ranked by priority: final_vX > round_XX > YYYYMMDD_HHMMSS > test_vX. The
+    highest-priority family present wins, then ties within that family are broken by version /
+    round number / timestamp. Raises FileNotFoundError if no valid pair is found.
     """
     if not os.path.exists(checkpoints_dir):
         raise FileNotFoundError(f"Directory doesn't exist: {checkpoints_dir}")
@@ -300,8 +299,9 @@ def compute_expected_std(layer):
 
 def check_encoder_trained(encoder, threshold=0.2):
     """
-    Checks all Conv2D and Dense layers in encoder for deviation from initializer.
-    Returns True if at least one layer shows substantial deviation (i.e. the encoder was likely trained).
+    Heuristic: return True if at least one Conv2D/Dense layer's weight std deviates from its
+    initializer's expected std by more than `threshold` (default 20%) — taken as evidence that
+    the encoder has been trained rather than freshly initialized.
     """
     trained_layers = []
     for layer in encoder.layers:
@@ -396,25 +396,17 @@ def prepare_distributed_train_dataset(
     shuffle: bool = True,
 ) -> dict:
     """
-    Prepare distributed datasets for training & validation
-    Yields datasets with signature ((concat, true, false), concat)
+    Build distributed training and validation datasets from the in-memory `data` dict, returning
+    a dict with the two tf.data datasets, sample/step counts, the shared TrainDataHolder, and the
+    stratified train/val indices into the original arrays.
 
-    Args:
-        data: Dictionary with keys 'concatenated', 'true', 'false' (numpy arrays)
-        train_val_split: Split data into train/val sets
-        per_replica_batch_size: Batch size per replica for training
-        effective_batch_size: Effective batch size across all replicas for training
-        per_replica_val_batch_size: Batch size per replica for validation
-        num_replicas: Number of replicas in strategy
-        strategy: TensorFlow distribution strategy
-        shuffle: Whether to shuffle training data
-
-    Returns: {train_dataset, val_dataset, n_train_trimmed, n_val_trimmed, train_steps,
-              accumulation_steps, val_steps, _train_holder, train_indices, val_indices}
-             Train/val distributed datasets, number of samples in each, number of steps for each
-              (including accumulation sub-steps), shared TrainDataHolder reference (both generators
-              read from the original arrays via index subsets — no copies), and the stratified
-              train/validation indices into the original data arrays
+    `data` must contain 'concatenated', 'true', 'false', and 'labels' (numpy arrays). The split
+    is stratified across the 4 signal types (false_no_signal, false_with_rfi, true_only_eti,
+    true_eti_rfi) — generate_triplet_batch arranges labels sequentially within chunks, so a naive
+    positional split would over-represent later signal types in val. Each generated batch has the
+    signature ((concat, true, false), concat). Sample counts are trimmed to the global / effective
+    batch size to keep all replicas evenly fed; the holder is shared by both generators so neither
+    pays a memory cost beyond index subsets.
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -592,18 +584,14 @@ def prepare_distributed_viz_dataset(
     strategy: tf.distribute.Strategy,
 ) -> dict:
     """
-    Prepare distributed datasets for latent space visualization
-    Yields datasets with signature (concat)
+    Build a distributed dataset for latent-space visualization from `concat_data` (shape
+    (n_cadences, 6, 16, width_bin)), returning a dict with the dataset, padded/real sample counts,
+    step count, and the VizDataHolder.
 
-    Args:
-        concat_data: Concatenated cadences array, shape (n_cadences, 6, 16, width_bin)
-        per_replica_inf_batch_size: Batch size per replica for inference
-        num_replicas: Number of replicas in strategy
-        strategy: TensorFlow distribution strategy
-
-    Returns: {viz_dataset, n_padded, n_samples, viz_steps, _viz_holder}
-             Viz distributed dataset, number of padded samples, number of real/unpadded samples,
-              number of steps, and VizDataHolder reference
+    The dataset yields cadences in original order (no shuffle) — plot_latent_space_gif() depends
+    on this ordering. If n_samples isn't divisible by the global batch size, the input is padded
+    with random duplicates to keep all replicas evenly fed; downstream code can use n_samples vs.
+    n_padded to drop the padded tail when needed.
     """
     global_viz_batch_size = per_replica_inf_batch_size * num_replicas
     n_samples = concat_data.shape[0]
@@ -756,11 +744,8 @@ class TrainingPipeline:
 
     def __init__(self, background_data, strategy: tf.distribute.Strategy = None):
         """
-        Initialize training pipeline
-
-        Args:
-            background_data: Array of background observations
-            strategy: TensorFlow distribution strategy
+        Initialize the training pipeline with a background observation array and an optional
+        tf.distribute strategy (defaults to the current strategy, i.e. no-op for single-device).
         """
         self.config = get_config()
         if self.config is None:
@@ -920,6 +905,12 @@ class TrainingPipeline:
         start_round = self.config.checkpoint.start_round
 
         if start_round > n_rounds:
+            # BUG: returning here skips the `self.start_time = time.time()` assignment below,
+            # so a resume/retry that finds the beta-VAE already trained (start_round > n_rounds)
+            # leaves self.start_time unset. Later plotting reads self.start_time and raises
+            # `'TrainingPipeline' object has no attribute 'start_time'`, which then masks the
+            # original error across retries. Fix by setting start_time in __init__ (or before
+            # this guard) so it always exists regardless of the resume point.
             return  # Return early if beta-VAE already trained (can occur from fault tolerance)
         elif start_round > 1:
             logger.info(f"Resuming training from round {start_round}/{n_rounds}")
@@ -1597,14 +1588,13 @@ class TrainingPipeline:
 
     def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
         """
-        Calculate SNR parameters for curriculum learning
+        Compute the (snr_base, snr_range) for the round at 0-indexed `round_idx`, narrowing the
+        range from initial_snr_range to final_snr_range across config.training.num_training_rounds.
 
-        Args:
-            round_idx: Current training round (0-indexed)
-            total_rounds: Total number of training rounds
-
-        Returns:
-            (snr_base, snr_range) tuple
+        Three schedules are supported via config.training.curriculum_schedule: 'linear' (uniform
+        narrowing), 'exponential' (fast then slow, normalized so progress=0 and progress=1 hit the
+        exact endpoints), and 'step' (initial_snr_range for the first step_easy_rounds, then
+        final_snr_range for step_hard_rounds; the two must sum to num_training_rounds).
         """
         total_rounds = self.config.training.num_training_rounds
         snr_base = self.config.training.snr_base
@@ -1662,12 +1652,14 @@ class TrainingPipeline:
 
     def _update_learning_rate(self, val_losses):
         """
-        Robust adaptive learning rate with multiple safeguards
+        Adaptive LR: track validation loss; if it fails to improve by min_pct_improvement for
+        patience_threshold consecutive epochs, scale current LR by (1 - reduction_factor), floored
+        at min_learning_rate. Returns the (possibly unchanged) current LR.
 
-        Note the following heuristic:
-        min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
-          => LR can only reach min_learning_rate during round if above expression is > 0
-          => else LR will reset at start of new round before reaching min_learning_rate
+        Heuristic to keep in mind:
+            min_learning_rate - base_learning_rate * (1 - reduction_factor) ^ (epochs_per_round / patience_threshold)
+        LR can only reach min_learning_rate within a round if the expression above is > 0;
+        otherwise the LR resets at the start of the next round before bottoming out.
         """
 
         current_lr = self.vae.optimizer.learning_rate.numpy()
@@ -1707,21 +1699,13 @@ class TrainingPipeline:
         self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False
     ):
         """
-        Run distributed encoding over a dataset using a provided @tf.function.
+        Run a provided @tf.function (`encode_fn`) over `n_steps` of a distributed `dataset` and
+        return a list of (n_samples, latent_dim) ndarrays — one per tensor that encode_fn yields.
 
-        The number of output arrays is inferred from encode_fn's return type on the first step:
-        a single PerReplica tensor produces 1 output, a tuple of PerReplica tensors produces N.
-
-        Args:
-            dataset: Distributed dataset to iterate
-            n_steps: Number of steps to iterate
-            encode_fn: @tf.function that takes a batch and returns one or more per-replica tensors
-            n_samples: Total number of output rows per array
-            latent_dim: Latent dimension
-            logging: Whether to log progress (default: False)
-
-        Returns:
-            List of np.ndarray. Each shape (n_samples, latent_dim).
+        The number of output arrays is inferred from encode_fn's return on the first step: a bare
+        PerReplica tensor yields 1 output, a tuple of PerReplica tensors yields N. Per-replica
+        results are gathered via experimental_local_results + np.concatenate, which is faster than
+        a strategy-level gather over NCCL for the small latent payload.
         """
         # Process all batches
         iterator = iter(dataset)
@@ -2632,10 +2616,9 @@ class TrainingPipeline:
 
     def _get_snr_by_round(self, current_time: float) -> dict[int, dict[str, float]]:
         """
-        Query SNR range data from training_stats and return per-round SNR info.
-
-        Returns:
-            Dict mapping round_number to {"floor": x, "ceil": y}
+        Query snr_range_floor and snr_range_ceil from training_stats for the current run and
+        return a dict mapping round_number to {"floor": x, "ceil": y}. current_time bounds the
+        query's upper time range.
         """
         if self.db is None:
             return {}
@@ -2687,14 +2670,12 @@ class TrainingPipeline:
         show_text_annotations: bool = True,
     ) -> None:
         """
-        Add transparent background regions showing SNR range per round.
+        Overlay per-round SNR range shading on a matplotlib axis, with alternating light blue /
+        striped light orange backgrounds and optional "SNR: floor-ceil" text annotations.
 
-        Args:
-            ax: Matplotlib axis to add shading to
-            snr_by_round: Dict mapping round_number to {"floor": x, "ceil": y}
-            epochs_per_round: Number of epochs per training round (required if use_rounds=False)
-            use_rounds: If True, use round numbers for x-axis; if False, use epochs
-            show_text_annotations: If True, show SNR range text annotations in subplot
+        snr_by_round is the dict produced by _get_snr_by_round. When use_rounds is False the
+        x-axis is in epochs and epochs_per_round must be supplied so round boundaries can be
+        located; when True the round number itself is the x-axis coordinate.
         """
         if not snr_by_round:
             return
@@ -2757,18 +2738,12 @@ class TrainingPipeline:
     # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
-        Plot injection statistics for bias/leakage analysis.
+        Generate 8 figures for bias/leakage analysis of the injection pipeline: 1 injected signal
+        characteristics, 1 injection stability, 4 global intensity distributions (one per
+        signal_type), 1 A->B global intensity biases, and 1 final global intensity biases.
 
-        Generates 8 figures:
-        - 1 injected signal characteristics
-        - 1 injection stability
-        - 4 global intensity distributions (one per signal_type)
-        - 1 A->B global intensity biases
-        - 1 final global intensity biases
-
-        Args:
-            tag: Plot tag for filename (defaults to save_tag)
-            dir: Subdirectory (e.g., "checkpoints" for per-round)
+        tag defaults to config.checkpoint.save_tag and is used in filenames; dir is an optional
+        subdirectory under plots/ (e.g. "checkpoints" for per-round outputs).
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -3720,11 +3695,9 @@ class TrainingPipeline:
 
         Both UMAP models are persisted to disk (joblib) under `{model_path}/umap_{obs,
         cadence}_nn{nn}_md{md}_{tag}.joblib` so downstream visualizations can reuse them
-        (e.g. `plot_rf_latent_decision_boundary`).
-
-        Args:
-            tag: Plot tag for filename (defaults to save_tag)
-            dir: Subdirectory (e.g., "checkpoints" for per-round)
+        (e.g. `plot_rf_latent_decision_boundary`). tag defaults to config.checkpoint.save_tag
+        and is used in filenames; dir is an optional subdirectory under plots/ (e.g.
+        "checkpoints" for per-round outputs).
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -5464,20 +5437,15 @@ class TrainingPipeline:
 
     def _prepare_latent_viz_batch(self, concat_data, labels, candidate_indices=None):
         """
-        Subsample cadences from concat_data for latent space visualization
-        Will attempt to preserve an equal distribution of distinct values from labels if possible
+        Subsample cadences from concat_data for latent-space visualization, attempting an equal
+        distribution across the 4 signal_type values in `labels` (n_per_type per type).
 
         Called once on the first round's stratified validation partition and persisted across
-        subsequent rounds. Using held-out data ensures the latent space visualization captures
-        generalization, while persisting the same data across rounds eliminates the effects of
-        distribution shift (from the curriculum schedule)
-
-        Args:
-            concat_data: Full cadences array, shape (n_total, 6, 16, width_bin)
-            labels: Per-cadence signal type labels, shape (n_total,)
-            candidate_indices: Optional indices into concat_data/labels restricting which
-                samples are eligible (e.g. validation partition indices). If None, all
-                samples are eligible.
+        subsequent rounds — using held-out data ensures the visualization captures generalization,
+        and reusing the same data across rounds removes distribution-shift artifacts from the
+        curriculum schedule. concat_data is shape (n_total, 6, 16, width_bin); labels is shape
+        (n_total,); candidate_indices, when given, restricts eligible samples (e.g. to validation
+        partition indices) without copying the full partition.
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
@@ -5704,12 +5672,8 @@ class TrainingPipeline:
             logger.info(f"Loading models from {base_dir} with tag '{tag}'")
 
             # Load encoder & decoder
-            checkpoint_encoder = tf.keras.models.load_model(
-                encoder_path, custom_objects={"Sampling": Sampling}
-            )
-            checkpoint_decoder = tf.keras.models.load_model(
-                decoder_path, custom_objects={"Sampling": Sampling}
-            )
+            checkpoint_encoder = tf.keras.models.load_model(encoder_path)
+            checkpoint_decoder = tf.keras.models.load_model(decoder_path)
 
             # Transfer weights
             self.vae.encoder.set_weights(checkpoint_encoder.get_weights())
@@ -5741,11 +5705,9 @@ def run_training_pipeline(
     background_data: np.ndarray, strategy: tf.distribute.Strategy = None
 ) -> TrainingPipeline:
     """
-    Complete Aetherscan training pipeline run
-
-    Args:
-        background_data: Array of preprocessed backgrounds, shape (n, 6, 16, 512)
-        strategy: TensorFlow distribution strategy
+    End-to-end training entry point: construct a TrainingPipeline from preprocessed background
+    data (shape (n, 6, 16, 512)) and an optional tf.distribute strategy, then run all rounds
+    and final RF training.
     """
     try:
         # Create pipeline (no cleanup needed on failure)

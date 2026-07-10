@@ -21,6 +21,13 @@ from aetherscan.config import get_config
 logger = logging.getLogger(__name__)
 
 
+# Use keras.utils.* rather than keras.saving.* — the latter is the canonical
+# Keras 3 path, but `from tensorflow import keras` in TF 2.17 + NGC 25.02
+# resolves to the tf-keras compat shim (`keras._tf_keras.keras`), which
+# doesn't re-export the `saving` submodule. keras.utils.register_keras_serializable
+# is the back-compat alias that exists in both tf.keras lineages and standalone
+# Keras 3 — pick the path that works everywhere.
+@keras.utils.register_keras_serializable(package="aetherscan")
 class Sampling(layers.Layer):
     """
     Sampling layer for Beta-VAE using reparameterization trick
@@ -38,8 +45,10 @@ class Sampling(layers.Layer):
         batch = tf.shape(z_mean)[0]
         dim = tf.shape(z_mean)[1]
 
-        # Sample random noise from a standard normal N(0, 1) with same shape as z_mean
-        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        # Sample random noise from a standard normal N(0, 1) with same shape as z_mean.
+        # tf.random.normal is the stable canonical API; tf.keras.backend.random_normal was
+        # removed/deprecated in Keras 3 (shipped in TF 2.16+) and had inconsistent graph/seed semantics.
+        epsilon = tf.random.normal(shape=(batch, dim))
 
         # Compute latent vector using reparameterization
         # Equivalent to sampling from N(z_mean, exp(z_log_var))
@@ -50,7 +59,11 @@ class Sampling(layers.Layer):
 
 class BetaVAE(keras.Model):
     """
-    Beta-VAE model with custom loss functions for SETI
+    Beta-VAE for SETI cadence data with a composite loss that combines reconstruction, KL, and a
+    custom clustering term that pulls ON/ON & OFF/OFF latents together and pushes ON/OFF apart.
+
+    alpha weights the clustering term in the total loss; beta weights the KL term (standard
+    Beta-VAE knob trading reconstruction quality for latent disentanglement).
     """
 
     def __init__(self, encoder, decoder, alpha=10.0, beta=1.5, **kwargs):
@@ -64,7 +77,12 @@ class BetaVAE(keras.Model):
 
     def call(self, inputs, training=None):
         """
-        Forward pass through the Beta-VAE
+        Encode-decode a batch of cadences (shape (batch, 6, 16, 512)) and return
+        (reconstruction, z_mean, z_log_var, z).
+
+        The encoder operates on individual observations, so the call reshapes from cadence form
+        (batch, 6, 16, 512) to per-observation form (batch * 6, 16, 512, 1) before encoding, then
+        reshapes the reconstruction back to cadence form for loss computation.
         """
         batch_size = tf.shape(inputs)[0]
 
@@ -84,22 +102,24 @@ class BetaVAE(keras.Model):
 
     @tf.function
     def loss_same(self, a: tf.Tensor, b: tf.Tensor) -> tf.Tensor:
-        """
-        Distance between ON-ON or OFF-OFF (to be minimized)
-        """
+        """Mean squared L2 distance between two same-class latents — minimized to pull
+        ON/ON and OFF/OFF pairs together in latent space."""
         return tf.reduce_mean(tf.reduce_sum(tf.square(a - b), axis=1))
 
     @tf.function
     def loss_diff(self, a: tf.Tensor, b: tf.Tensor) -> tf.Tensor:
-        """
-        Distance between ON-OFF (to be maximized)
-        """
+        """Inverse squared L2 distance between ON and OFF latents (with 1e-8 epsilon for
+        stability when latents collide) — minimizing this term pushes ON/OFF pairs apart."""
         return tf.reduce_mean(1.0 / (tf.reduce_sum(tf.square(a - b), axis=1) + 1e-8))
 
     @tf.function
     def compute_clustering_loss_true(self, true_data: tf.Tensor) -> tf.Tensor:
         """
-        Clustering loss for true signals
+        Clustering loss for true-class (ETI-bearing) cadences: sum loss_same across all
+        within-class pairs (ON/ON: a1-a2, a1-a3, a2-a3 and OFF/OFF: b-c, b-d, c-d, each direction)
+        plus loss_diff across every ON/OFF cross-pair (a{1,2,3} × {b,c,d}). Minimizing this term
+        forces ON latents to cluster together, OFF latents to cluster together, and the two
+        clusters to separate.
         """
         batch_size = tf.shape(true_data)[0]
 
@@ -152,7 +172,10 @@ class BetaVAE(keras.Model):
     @tf.function
     def compute_clustering_loss_false(self, false_data: tf.Tensor) -> tf.Tensor:
         """
-        Clustering loss for false signals
+        Clustering loss for false-class (RFI / noise-only) cadences: sum loss_same across all 15
+        pairs of observations since every observation in a false cadence is treated as belonging
+        to the same class. Minimizing this term forces all 6 false-class latents to collapse to a
+        single cluster (no ON/OFF distinction).
         """
         batch_size = tf.shape(false_data)[0]
 
@@ -205,7 +228,13 @@ class BetaVAE(keras.Model):
     @tf.function
     def compute_total_loss(self, main_data, true_data, false_data, target_data, training=True):
         """
-        Perform forward pass and compute losses
+        Forward-pass main_data through the VAE and return a dict with reconstruction, KL, and
+        per-class clustering losses plus their weighted sum:
+            total = reconstruction + beta * kl + alpha * (true_loss + false_loss)
+
+        Reconstruction uses binary cross-entropy on the [0, 1]-bounded decoder output (sigmoid).
+        true_data and false_data are separate cadences fed through the clustering-loss heads —
+        they don't share gradients with reconstruction.
         """
         # Perform forward pass through Beta-VAE
         reconstruction, z_mean, z_log_var, z = self.call(main_data, training=training)
@@ -294,17 +323,9 @@ def build_encoder(
         - kernel_regularizer: L2(0.01) - prevents large weights
         - bias_regularizer: L2(0.01) - prevents large biases
 
-    Args:
-        latent_dim: Dimensionality of the latent space (default: 8)
-        dense_size: Size of the dense layer before latent projection (default: 512)
-        kernel_size: Convolutional kernel size (default: (3, 3))
-
-    Returns:
-        keras.Model: Encoder model with outputs [z_mean, z_log_var, z]
-
-    Note:
-        The decoder (build_decoder) must be an exact mirror of this architecture
-        for proper VAE symmetry. See build_decoder docstring for details.
+    The returned keras.Model outputs [z_mean, z_log_var, z]. The decoder (build_decoder) must
+    remain an exact mirror of this architecture for VAE symmetry — any layer-structure change
+    here must be reflected there.
     """
     # Input shape: (batch, 16, 512, 1) - "grayscale" spectrogram
     encoder_inputs = keras.Input(shape=(16, 512, 1), name="encoder_input")
@@ -543,17 +564,9 @@ def build_decoder(
         - Uses GlorotNormal initialization (matches encoder's latent layer style)
         - Includes full regularization for symmetry with encoder's first conv layer
 
-    Args:
-        latent_dim: Dimensionality of the latent space (default: 8)
-        dense_size: Size of the dense layer after latent input (default: 512)
-        kernel_size: Convolutional kernel size (default: (3, 3))
-
-    Returns:
-        keras.Model: Decoder model that outputs reconstructed spectrograms
-
-    Note:
-        This architecture is the exact mirror of build_encoder. Any changes to the
-        encoder's layer structure must be reflected here to maintain symmetry.
+    The returned keras.Model outputs reconstructed spectrograms of shape (16, 512, 1). This
+    architecture is the exact mirror of build_encoder — any layer-structure change there must
+    be reflected here to maintain symmetry.
     """
     # Input shape: (batch, latent_dim) - sampled latent vector z
     latent_inputs = keras.Input(shape=(latent_dim,), name="decoder_input")

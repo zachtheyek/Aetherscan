@@ -1,1 +1,2 @@
 # TODO:
+# Document (individually) db architecture, logger architecture, resource lifecycle manager, resource monitoring, training orchestration, inference orchestration, preprocessing (including energy detection and signal injection), model architecture design (beta-VAE, RF), github actions (especially the claude integrations)

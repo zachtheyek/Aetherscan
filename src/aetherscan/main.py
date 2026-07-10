@@ -15,8 +15,14 @@ import time
 
 import numpy as np
 import tensorflow as tf
+from dotenv import find_dotenv, load_dotenv
 
-from aetherscan.cli import apply_args_to_config, setup_argument_parser, validate_args
+from aetherscan.cli import (
+    apply_args_to_config,
+    apply_saved_config,
+    setup_argument_parser,
+    validate_args,
+)
 from aetherscan.config import get_config, init_config
 from aetherscan.db import init_db
 from aetherscan.inference import run_inference_pipeline
@@ -29,55 +35,122 @@ from aetherscan.train import get_latest_tag, run_training_pipeline
 logger = logging.getLogger(__name__)
 
 
-# NOTE: split this into strategy.py? have config option & cli flag to set single-GPU, multi-GPU, multi-node strategy. test thoroughly for each option
-# NOTE: how to only run on specific GPUs, rather than all GPUs?
+# NOTE: verify that our current GPU config gracefully handles cases where the node has a single GPU (vs multiple)
+# TODO: run performance benchmarks using different num_gpus on a single node (and in future, multi-node as well)
+# TODO: add a way to specify (either number or name) the specific GPUs on a system we wish to use (currently defaults to all available). extend to cli.py too
+# TEST: make sure this works, especially with _build_optimizer() in train.py (do they conflict? is one unnecessary vs the other?)
+def _warmup_collective(strategy):
+    """Trigger a tiny cross-device reduction to surface NCCL failures at setup time.
+
+    MirroredStrategy construction with NcclAllReduce never fails on its own — NCCL
+    errors only surface on the first actual collective. Doing a 1-element reduce
+    here lets us catch (and fall back from) NCCL failures before training starts,
+    rather than mid-epoch.
+    """
+
+    @tf.function
+    def _per_replica():
+        return tf.constant(1.0)
+
+    per_replica_value = strategy.run(_per_replica)
+    _ = strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_value, axis=None)
+
+
 def setup_gpu_strategy():
     """Configure GPU memory growth, memory limits, multi-GPU strategy with load balancing & async allocator"""
 
-    os.environ["TF_GPU_ALLOCATOR"] = (
-        "cuda_malloc_async"  # Prevent memory fragmentation within each GPU
-    )
-    os.environ["TF_ENABLE_GPU_GARBAGE_COLLECTION"] = (
-        "true"  # Aggressive cleanup of intermediate tensors
-    )
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+
+    # Both env vars here are read lazily by TF when the GPU runtime first initializes (that is,
+    # on first GPU memory allocation), which happens below on set_memory_growth()
+    if config.gpu.use_async_allocator:
+        # Prevent memory fragmentation within each GPU.
+        os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+    else:
+        # Explicitly clear so a previous run's env doesn't leak in.
+        os.environ.pop("TF_GPU_ALLOCATOR", None)
+
+    # Enable aggressive cleanup of intermediate tensors
+    os.environ["TF_ENABLE_GPU_GARBAGE_COLLECTION"] = "true"
 
     gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        try:
-            # Set equal memory limits for all GPUs
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-                tf.config.experimental.set_virtual_device_configuration(
+    if not gpus:
+        logger.warning("No GPUs detected")
+        return None
+
+    # Apply config.gpu.num_replicas. None means "use every visible GPU" (default);
+    # a positive int wired through set_visible_devices restricts TF to the first N
+    # GPUs and leaves the rest untouched for other workloads
+    #
+    # Note that config.gpu.num_replicas is guaranteed to be None or in [1, total_gpus].
+    # Any other values are caught at validate_args time before reaching this point. The
+    # remaining edge-case where 0-GPUs are reported by TF is handled by train_command()
+    # and inference_command() individually (here we simply return None)
+    total_gpus = len(gpus)
+    requested = config.gpu.num_replicas
+    if requested is not None and requested < total_gpus:
+        gpus = gpus[:requested]
+        # set_visible_devices must run before any GPU memory-growth or logical-device
+        # call, since those initialize the GPU runtime and freeze the visible set.
+        tf.config.set_visible_devices(gpus, "GPU")
+        logger.info(
+            f"Restricting TF to {requested} of {total_gpus} GPUs "
+            f"(per config.gpu.num_replicas={requested}); GPUs "
+            f"{list(range(requested, total_gpus))} are left untouched."
+        )
+
+    try:
+        for gpu in gpus:
+            # set_memory_growth stayed under tf.config.experimental in TF 2.17.
+            tf.config.experimental.set_memory_growth(gpu, True)
+            # When per_gpu_memory_limit_mb is None we skip this call entirely and
+            # rely on memory-growth only (recommended default on ~96 GB Blackwell cards).
+            if config.gpu.per_gpu_memory_limit_mb is not None:
+                # set_logical_device_configuration is the stable replacement for the
+                # deprecated experimental.set_virtual_device_configuration.
+                tf.config.set_logical_device_configuration(
                     gpu,
                     [
-                        tf.config.experimental.VirtualDeviceConfiguration(memory_limit=14000)
-                    ],  # 14GiB limit per GPU
+                        tf.config.LogicalDeviceConfiguration(
+                            memory_limit=config.gpu.per_gpu_memory_limit_mb
+                        )
+                    ],
                 )
 
-            # Set distributed strategy to prevent uneven GPU memory usage
-            try:
-                # Primary choice: NCCL for NVIDIA GPUs
-                strategy = tf.distribute.MirroredStrategy(
-                    cross_device_ops=tf.distribute.NcclAllReduce(num_packs=2)
-                )
-                logger.info("Using NcclAllReduce for optimal NVIDIA GPU performance")
+        num_packs = config.gpu.nccl_num_packs
 
-            except Exception as e:
-                # Fallback: HierarchicalCopyAllReduce
-                logger.warning(f"NCCL failed ({e}), using HierarchicalCopyAllReduce")
-                strategy = tf.distribute.MirroredStrategy(
-                    cross_device_ops=tf.distribute.HierarchicalCopyAllReduce(num_packs=2)
-                )
+        # Set distributed strategy to prevent uneven VRAM usage
+        # Try NCCL first; fall back to HierarchicalCopyAllReduce only if the
+        # warmup all-reduce actually fails. NCCL 2.25.1 is the first NCCL with
+        # official sm_120 (Blackwell) support, so this path is especially load-bearing
+        # on the Blackwell cluster.
+        try:
+            strategy = tf.distribute.MirroredStrategy(
+                cross_device_ops=tf.distribute.NcclAllReduce(num_packs=num_packs)
+            )
+            _warmup_collective(strategy)
+            logger.info("Using NcclAllReduce for optimal NVIDIA GPU performance")
+        except Exception as e:
+            logger.warning(
+                f"NCCL warmup all-reduce failed ({e}), falling back to HierarchicalCopyAllReduce"
+            )
+            strategy = tf.distribute.MirroredStrategy(
+                cross_device_ops=tf.distribute.HierarchicalCopyAllReduce(num_packs=num_packs)
+            )
+            _warmup_collective(strategy)
 
-            logger.info(f"Distributed strategy: {strategy.num_replicas_in_sync} GPUs")
-            return strategy
+        logger.info(f"Distributed strategy: {strategy.num_replicas_in_sync} GPUs")
+        return strategy
 
-        except RuntimeError as e:
-            logger.error(f"GPU configuration error: {e}")
-            return None
-
-    else:
-        logger.warning("No GPUs detected, running on CPU")
+    except Exception as e:
+        # This exception catch is broad on purpose:
+        # catches RuntimeError from device-config calls plus
+        # non-RuntimeError failures (ValueError, tf.errors.*) from the fallback
+        # warmup, so any GPU setup failure resolves to the graceful return-None
+        # path the callers expect rather than escaping this function.
+        logger.error(f"GPU configuration error: {e}")
         return None
 
 
@@ -91,6 +164,7 @@ def train_command():
     if config is None:
         raise ValueError("get_config() returned None")
 
+    # NOTE: come back to this later (print more descriptive info)
     logger.info("Configuration:")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
@@ -105,7 +179,7 @@ def train_command():
         logger.error(f"Failed to setup GPU strategy: {e}")
         sys.exit(1)
 
-    # NOTE: come back to this later (test whether pipeline runs on <4, <6 GPUs, on single GPU, and on CPU. if all is robust, remove no strategy error)
+    # NOTE: come back to this later (should we provide a CPU-only mode?)
     if strategy is None:
         logger.error("No GPU strategy available. Training requires GPU.")
         sys.exit(1)
@@ -208,8 +282,10 @@ def train_command():
                 logger.error(f"Final error: {e}")
                 sys.exit(1)
 
-    # Save training configuration
-    config_path = os.path.join(config.model_path, f"config_{config.checkpoint.save_tag}.json")
+    # Save training configuration. Configs live under output_path (not model_path) — same
+    # as the inference-side save below — so models/ holds only weights, outputs/ holds
+    # configs + plots + logs + db.
+    config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist
 
     with open(config_path, "w") as f:
@@ -232,33 +308,12 @@ def inference_command():
     if config is None:
         raise ValueError("get_config() returned None")
 
-    # Sanity check
-    if not all(
-        [
-            config.inference.encoder_path,
-            config.inference.rf_path,
-            config.inference.config_path,
-        ]
-    ):
-        logger.error("Encoder, RF, or config path not specified")
-        sys.exit(1)
-
+    # Required artifacts (encoder/rf/config paths) and stamp_width == width_bin
+    # are enforced upstream by collect_validation_errors() in cli.py, so by the
+    # time inference_command() runs those preconditions are guaranteed to hold.
     # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
 
-    # If inference_files is set, the energy detection preprocessing pipeline runs
-    # before inference; stamp_width must match the downstream width_bin so the
-    # extracted (n_hits, 6, 16, stamp_width) tensor is shaped correctly for the
-    # downsample + log-norm path.
-    if (
-        config.data.inference_files is not None
-        and config.inference.stamp_width != config.data.width_bin
-    ):
-        logger.error(
-            f"inference.stamp_width ({config.inference.stamp_width}) must equal "
-            f"data.width_bin ({config.data.width_bin}) when --inference-files is set"
-        )
-        sys.exit(1)
-
+    # NOTE: come back to this later (print more descriptive info)
     logger.info("Configuration:")
     logger.info(f"  Data path: {config.data_path}")
     logger.info(f"  Model path: {config.model_path}")
@@ -279,7 +334,7 @@ def inference_command():
         logger.error(f"Failed to setup GPU strategy: {e}")
         sys.exit(1)
 
-    # NOTE: come back to this later (test whether pipeline runs on <4, <6 GPUs, on single GPU, and on CPU. if all is robust, remove no strategy error)
+    # NOTE: come back to this later (should we provide a CPU-only mode?)
     if strategy is None:
         logger.error("No GPU strategy available. Inference requires GPU.")
         sys.exit(1)
@@ -380,69 +435,17 @@ def inference_command():
     logger.info("=" * 60)
 
 
-# NOTE: come back to this later
-# def evaluate_command(args):
-#     """Execute evaluation command"""
-#     logger.info("Starting model evaluation...")
-#
-#     # Setup GPU
-#     setup_gpu_config()
-#
-#     # Load configuration
-#     config = Config()
-#
-#     # Import necessary modules
-#     import tensorflow as tf
-#     from models.random_forest import RandomForestModel
-#
-#     # Load models
-#     logger.info(f"Loading VAE encoder from {args.vae_model}")
-#     vae_encoder = tf.keras.models.load_model(args.vae_model)
-#
-#     logger.info(f"Loading Random Forest from {args.rf_model}")
-#     rf_model = RandomForestModel(config)
-#     rf_model.load(args.rf_model)
-#
-#     # Load or generate test data
-#     if args.test_data:
-#         logger.info(f"Loading test data from {args.test_data}")
-#         test_data = np.load(args.test_data, allow_pickle=True).item()
-#     else:
-#         logger.info("Generating synthetic test data...")
-#         # Load some background for generation
-#         background_data = load_train_data(config)
-#         generator = DataGenerator(config, background_data[:100])  # Use subset
-#         test_data = generator.generate_test_set()
-#
-#     # Evaluate
-#     preprocessor = DataPreprocessor(config)
-#
-#     # Prepare test data
-#     test_true = preprocessor.prepare_batch(test_data['true'])
-#     test_false = preprocessor.prepare_batch(test_data['false'])
-#
-#     # Get predictions
-#     _, _, true_latents = vae_encoder.predict(test_true, batch_size=64)
-#     _, _, false_latents = vae_encoder.predict(test_false, batch_size=64)
-#
-#     true_preds = rf_model.predict(true_latents)
-#     false_preds = rf_model.predict(false_latents)
-#
-#     # Calculate metrics
-#     tpr = np.mean(true_preds == 1)
-#     fpr = np.mean(false_preds == 1)
-#     accuracy = np.mean(np.concatenate([true_preds == 1, false_preds == 0]))
-#
-#     logger.info("="*60)
-#     logger.info("Evaluation Results:")
-#     logger.info(f"  True Positive Rate: {tpr:.3f}")
-#     logger.info(f"  False Positive Rate: {fpr:.3f}")
-#     logger.info(f"  Overall Accuracy: {accuracy:.3f}")
-#     logger.info("="*60)
-
-
 def main():
     """Main entry point to Aetherscan pipeline"""
+    # Auto-load <repo>/.env (searched upward from CWD) into os.environ so
+    # environment variables land in the process env before any aetherscan
+    # module reads them — covers the Ampere conda workflow without needing
+    # "source .env" or an inline VAR=val prefix, and harmlessly redundant in
+    # the container workflow (utils/run_container.sh already passes --env for
+    # the same keys, and load_dotenv() by default won't override existing
+    # values). Multiprocess workers spawned later inherit os.environ from us.
+    load_dotenv(find_dotenv())
+
     # Initialize config
     try:
         init_config()
@@ -502,6 +505,24 @@ def main():
         # so cleanup handlers still run via atexit
         raise
 
+    # NOTE: come back to this later
+    # Inference mode: if the user pointed --config-path at a saved JSON config,
+    # layer its values onto the singleton *before* validate_args runs. That way
+    # validate_args sees the merged (saved + CLI) view via _resolve, and any
+    # invariants that involve fields stored in the saved config (e.g. width_bin /
+    # stamp_width / latent_dim / dense_layer_size) are checked against the actual
+    # values inference will use rather than the dataclass defaults. Train mode
+    # is unaffected.
+    if args.command == "inference" and getattr(args, "config_path", None) is not None:
+        try:
+            apply_saved_config(args.config_path)
+            logger.info(f"Saved config loaded from {args.config_path}")
+        except Exception as e:
+            parser.print_help()
+            logger.error(f"Failed to load saved config: {e}")
+            logger.error("See usage")
+            sys.exit(1)
+
     # Validate arguments (handles everything else parse_args() missed)
     try:
         validate_args(args)
@@ -543,9 +564,6 @@ def main():
             train_command()
         elif args.command == "inference":
             inference_command()
-        # NOTE: come back to this later
-        # elif args.command == 'evaluate':
-        #     evaluate_command(args)
         else:
             # Print help message & exit if no valid command provided
             parser.print_help()

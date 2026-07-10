@@ -25,15 +25,8 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_level(level_str: str) -> int:
-    """
-    Convert log level string to logging constant.
-
-    Args:
-        level_str: Log level name (e.g., "INFO", "WARNING", "DEBUG")
-
-    Returns:
-        Logging level constant (e.g., logging.INFO)
-    """
+    """Map a level name ('INFO', 'WARNING', 'DEBUG', etc.) to its logging constant; defaults to
+    logging.INFO for unknown values. Case-insensitive."""
     level_map = {
         "DEBUG": logging.DEBUG,
         "INFO": logging.INFO,
@@ -70,13 +63,12 @@ class StreamToLogger:
 
 class Logger:
     """
-    Thread-safe logging system with multiprocessing support
+    Thread- and process-safe logging singleton.
 
-    Architecture:
-    - Main process runs a QueueListener in a background thread
-    - Worker processes send log messages to a shared queue
-    - Listener consumes from queue and writes to file/console
-    - Eliminates concurrent write issues and corrupted outputs
+    The main process runs a QueueListener on a background thread; both the main process and any
+    multiprocessing workers push records onto the same shared queue, and the listener drains it
+    and writes to file/console/Slack. Funneling concurrent writes through one consumer eliminates
+    interleaved-output and lock-contention issues from naive multi-process logging.
     """
 
     _instance = None  # Stores singleton instance
@@ -228,12 +220,10 @@ class Logger:
     @classmethod
     def _reset(cls):
         """
-        Teardown hook for thread-safe singleton
-        Resets the logger instance to None
-
-        WARNING: Only use for testing or cleanup after shutdown.
-        Calling this while the logger is active will cause issues.
-        Should only be called after stop() has completed.
+        Teardown hook for the thread-safe singleton — discards the cached instance so the next
+        constructor call yields a fresh one. Only safe to call after stop() has completed;
+        calling it while the listener thread is still active leaves callers holding a stale
+        reference.
         """
         # Acquire lock to prevent race conditions
         with cls._lock:
@@ -271,21 +261,12 @@ class Logger:
         broadcast: bool = True,
     ) -> bool:
         """
-        Upload an image file to Slack.
+        Upload an image to Slack and return True on success, False otherwise.
 
-        The image is uploaded to the current run's thread. If broadcast=True (default),
-        a message is also posted to the main channel with a link back to the thread
-        (similar to the "Also send to channel" checkbox in Slack).
-
-        Args:
-            file_path: Path to the image file to upload
-            channels: Channel(s) to upload to (defaults to handler's configured channel)
-            title: Title for the image
-            message: Comment to add with the image
-            broadcast: If True, also echo to main channel with link to thread
-
-        Returns:
-            True if upload succeeded, False otherwise
+        The image goes into the current run's thread. With broadcast=True (default) a link-back
+        message is also posted to the main channel — equivalent to ticking the "Also send to
+        channel" checkbox in Slack. `channels` overrides the handler's configured channel; if
+        None, the configured one is used.
         """
         if self.slack_handler is None:
             logger.debug("Slack handler not initialized, skipping image upload")
@@ -314,13 +295,10 @@ def init_logger() -> Logger:
 
 def init_worker_logging():
     """
-    Initialize logging for multiprocessing workers.
-
-    Resets stdout/stderr to avoid inherited StreamToLogger from parent
-    and configures queue-based logging for process-safe logging.
-
-    Args:
-        log_queue: Queue for sending log messages to main process (optional)
+    Initialize logging in a multiprocessing worker: reset stdout/stderr to the original streams
+    (so the inherited StreamToLogger from the parent doesn't fire), then attach a QueueHandler
+    pointing at the main process's shared log queue. If no Logger singleton has been initialized
+    in the parent, falls back to a NullHandler to avoid noise.
     """
     logger_instance = Logger._instance
 

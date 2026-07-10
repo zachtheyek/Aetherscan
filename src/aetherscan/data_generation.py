@@ -46,21 +46,15 @@ _GLOBAL_DTYPE = None
 
 def _init_worker(shm_name, shape, dtype):
     """
-    Initialize worker process with shared memory reference and queue-based logging
-    This avoids serialization overhead between workers
+    Worker pool initializer: attach to the named shared-memory block holding the background
+    plates, seed numpy/random from the worker PID so each process gets a distinct RNG state, and
+    set up logging.
 
-    Args:
-        shm_name: Name of the shared memory block
-        shape: Shape of the background array
-        dtype: Data type of the background array
-
-    Note:
-        Worker cleanup uses a custom SIGTERM handler to properly close shared memory
-        file descriptors before termination. When pool.terminate() is called by the
-        main process, workers intercept SIGTERM, close their shared memory handles,
-        then re-raise the signal to complete termination.
-
-        The main process is responsible for unlinking shared memory (handled by ResourceManager).
+    Passing shm_name/shape/dtype through the pool initializer (rather than per-task args) avoids
+    re-serializing the array on every map() call. The worker installs a SIGTERM handler that
+    closes its shared-memory file descriptor before letting the signal kill the process; the
+    main process is responsible for unlinking shared memory afterwards (handled by
+    ResourceManager).
     """
     # NOTE: come back to this later
     # def _init_worker(shm_name, shape, dtype, output_shm_name=None, output_shape=None):
@@ -114,10 +108,7 @@ def _init_worker(shm_name, shape, dtype):
     # This may interrupt the worker's cleanup process
     # Consider increasing pool_terminate_timeout if you're experiencing such issues
     def cleanup_on_sigterm(signum, frame):
-        """
-        Cleanup handler called when pool.terminate() sends SIGTERM
-        Closes shared memory file descriptor before process termination
-        """
+        """SIGTERM handler that closes the worker's shared-memory fd before re-raising the signal."""
         # Note, a race condition may occur if a worker receives more than 1 SIGTERM delivery
         # at a time, triggering re-entry of the same cleanup handler
         # It suffices to guard against this by simply suppressing exceptions, since subsequent
@@ -143,9 +134,7 @@ def _init_worker(shm_name, shape, dtype):
 
 
 def log_norm(data: np.ndarray) -> np.ndarray:
-    """
-    Apply log normalization to data
-    """
+    """Log-transform `data` (with a 1e-10 epsilon), then shift and rescale into [0, 1]."""
     # Add small epsilon to avoid log(0)
     data = data + 1e-10
 
@@ -165,12 +154,12 @@ def new_cadence(
     data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
 ) -> tuple[np.ndarray, dict[str, float], bool]:
     """
-    Inject a single drifting narrowband signal into a stacked cadence array
+    Inject a single drifting narrowband signal into a stacked cadence array.
 
-    Returns:
-        modified_data: Array with injected signal
-        signal_info: Dict with keys: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept
-        slope_was_clamped: True if slope was clamped due to being near zero
+    Returns (modified_data, signal_info, slope_was_clamped). signal_info carries the realized
+    parameters {snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept};
+    slope_was_clamped is True if the drift slope was forced away from ~0 to avoid a degenerate
+    near-vertical injection (downstream queries can filter on this).
     """
     # NOTE: should noise = 3 parametrized?
     # Set noise parameter (for simulating randomness in drift rate calculation)
@@ -292,14 +281,12 @@ def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
 # TODO: add more sophisticated statistics for data leakage analysis
 def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
     """
-    Compute global intensity statistics on a spectrogram array.
+    Compute global intensity statistics on a spectrogram array, flattening to 1-D first and
+    promoting to float64 to avoid overflow in higher-order moments (especially pre-normalization).
 
-    Args:
-        data: Array of any shape (will be flattened for global stats)
-
-    Returns:
-        Dict with keys: global_mean, global_median, global_std,
-                        global_mad, global_skew, global_kurtosis
+    Returns {global_mean, global_median, global_std, global_mad, global_skew, global_kurtosis}.
+    Empty input returns NaN for every key — write_injection_stat() will record those with
+    is_finite=0 so they can be filtered out at query time.
     """
     # Return NaN for empty arrays
     # write_injection_stat() will set is_finite=0
@@ -344,12 +331,12 @@ def create_false(
     dynamic_range: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create false signal class
-    If specified, RFI is injected into all 6 observations. Otherwise, no RFI is injected.
+    Create a false-class cadence and return (final, sample_info). final has shape
+    (6, 16, width_bin); sample_info carries background_index, per-stage intensity_stats (A/B/C),
+    signal_info (rfi_* keys when inject=True, empty otherwise), and slope_was_clamped.
 
-    Returns:
-        final: Output array of shape (6, 16, width_bin)
-        sample_info: Dict with background_index, intensity_stats, signal_info
+    When inject=True, a drifting RFI signal is injected into all 6 observations; when False, the
+    background is log-normalized and returned as-is (Stage B = Stage A, signal_info empty).
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -425,12 +412,10 @@ def create_true_single(
     dynamic_range: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create true-single signal class
-    ETI signal is injected into the ON observations only.
-
-    Returns:
-        final: Output array of shape (6, 16, width_bin)
-        sample_info: Dict with background_index, intensity_stats, signal_info
+    Create a true-single-class cadence (ETI injected into ON observations only) and return
+    (final, sample_info). final has shape (6, 16, width_bin); sample_info carries
+    background_index, per-stage intensity_stats (A/B/C), eti_*-prefixed signal_info, and
+    slope_was_clamped.
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -496,12 +481,10 @@ def create_true_double(
     dynamic_range: float = 1,
 ) -> tuple[np.ndarray, dict]:
     """
-    Create true-double signal class
-    Non-intersecting ETI & RFI signals are injected into ON-only & ON-OFF, respectively.
-
-    Returns:
-        final: Output array of shape (6, 16, width_bin)
-        sample_info: Dict with background_index, intensity_stats, signal_info
+    Create a true-double-class cadence (non-intersecting ETI and RFI signals injected into
+    ON-only and ON-OFF respectively) and return (final, sample_info). final has shape
+    (6, 16, width_bin); sample_info carries background_index, per-stage intensity_stats (A/B/C),
+    signal_info with both eti_* and rfi_* keys, and slope_was_clamped.
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -584,14 +567,13 @@ def create_true_double(
 
 def _single_cadence_wrapper(args):
     """
-    Wrapper function for multiprocessing that unpacks arguments and generates a single cadence
-    Uses global background plates to avoid serialization overhead
+    Multiprocessing worker: unpack the per-task args tuple (function, snr_base, snr_range,
+    width_bin, freq_resolution, time_resolution, inject, dynamic_range) and call the chosen
+    create_* generator against _GLOBAL_BACKGROUNDS. Returns the (cadence, sample_info) pair from
+    the generator.
 
-    Args:
-        args: Tuple of (function, snr_base, snr_range, width_bin, freq_resolution, time_resolution, inject, dynamic_range)
-
-    Returns:
-        Single cadence array of shape (6, 16, width_bin)
+    Pulling backgrounds from the global rather than passing them per-task avoids pickling the
+    full plate on every dispatch.
     """
     (
         function,
@@ -691,26 +673,14 @@ def batch_create_cadence(
     chunks_per_worker: int | None = 4,
 ) -> tuple[np.ndarray, list[dict]]:
     """
-    Batch wrapper for creating multiple cadences using multiprocessing
+    Batch-generate `samples` cadences with the chosen `function` (create_false /
+    create_true_single / create_true_double), returning (cadence_array of shape
+    (samples, 6, 16, width_bin), all_sample_info: list of per-sample dicts).
 
-    Args:
-        function: Cadence generation function (create_false, create_true_single, create_true_double)
-        samples: Number of cadences to generate
-        plate: Background plate array (only used if pool is None)
-        snr_base: Base SNR value
-        snr_range: SNR range for randomization
-        width_bin: Number of frequency bins
-        freq_resolution: Frequency resolution in Hz
-        time_resolution: Time resolution in seconds
-        inject: Whether to inject signals (for create_false)
-        dynamic_range: Dynamic range for signal injection (for create_true_double)
-        pool: Pre-initialized multiprocessing Pool (if None, runs sequentially)
-        n_processes: Number of processes in multiprocessing Pool (1 if running sequentially)
-        chunks_per_worker: Used to calculate optimal chunksize for load balancing
-
-    Returns:
-        cadence: Array of shape (samples, 6, 16, width_bin) containing generated cadences
-        all_sample_info: List of sample_info dicts (one per sample)
+    When `pool` is provided, work is dispatched via _single_cadence_wrapper against the worker
+    pool's shared-memory background plate; otherwise the loop runs sequentially against `plate`
+    in-process. chunks_per_worker controls map() chunksize to balance scheduling overhead vs.
+    parallelism. dynamic_range only applies to create_true_double; inject only to create_false.
     """
     # Pre-allocate output array
     cadence = np.zeros((samples, 6, 16, width_bin))
@@ -928,11 +898,9 @@ class DataGenerator:
         background_plates: np.ndarray,
     ):
         """
-        Initialize generator
-
-        Args:
-            background_plates: Array of background observations
-                               Shape: (n_backgrounds, 6, 16, 512) after preprocessing
+        Initialize the generator. background_plates is an array of preprocessed background
+        observations with shape (n_backgrounds, 6, 16, 512). Plates are copied into shared memory
+        for worker access and a persistent multiprocessing pool is set up here.
         """
         self.config = get_config()
         if self.config is None:
@@ -1006,14 +974,13 @@ class DataGenerator:
 
     def _setup_managed_pool(self):
         """
-        Setup managed multiprocessing pool with shared memory
+        Stand up a persistent ResourceManager-owned multiprocessing pool whose workers attach to
+        the shared-memory background block at init time, so per-task dispatches don't have to
+        re-serialize the plates. Falls back to sequential mode (self.pool = None) when
+        n_processes == 1.
 
-        Creates a persistent worker pool that shares access to background data via
-        shared memory, avoiding costly data serialization for each worker process.
-
-        Note:
-            The pool is managed by the ResourceManager and should be closed via
-            _free_managed_pool() or close() to properly release resources.
+        The pool must be released via _free_managed_pool() or close() — the ResourceManager
+        won't reap it automatically.
         """
         # NOTE: should we explicitly guarantee only 1 shm & 1 pool can exist at a time?
         # If shared memory exists, then create pool using shared memory reference
