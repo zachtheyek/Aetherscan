@@ -68,8 +68,11 @@ and writing the first two 6-row groups to `inference/subset_test.csv`.
 
 ## 3. Current run state (as of this handoff)
 
-- **bla0**: full training `final_v1` **still running** in-container. Was ~round 1 / epoch 56
-  of 100. **~6.3 min/epoch → full 20×100 ≈ ~9 days.** GPU util **0–14%** (data-feed bound).
+- **bla0**: full training `final_v1` **OOM-KILLED** (`Killed`/SIGKILL, no traceback) after
+  ~29 h — completed **round 1** (saved `models/checkpoints/vae_{encoder,decoder}_round_01.keras`),
+  then died **~14 h into round 2's data generation** (chunk 10/10) at 2026-07-09 19:29. No
+  `final_v1` final artifacts. Root cause in §4. `~6.3 min/epoch` but data-gen dominates;
+  GPU util was **0–14%** during epochs (data-feed bound).
 - **blpc3**: subset CSV inference **completed successfully** end-to-end (tag was a datetime).
   Dummy `test_v17` model preserved in `models/`. `preprocessed/subset_test_*.npy` exist
   (114 GB + 34 GB). Pane idle.
@@ -93,10 +96,18 @@ Stage breakdown, GPUs idle ~98% of the run:
   positive predictions are written to `inference_results`, so 0 rows is correct.
 
 ### Training (bla0, 6× A4000, container)
-- GPU util **0–14%** → GPUs starved. Cause: `tf.data.Dataset.from_generator` yields **one
-  sample at a time** (GIL-bound, single-threaded), then `.batch(768)`; ~1 ms/sample of
-  Python/marshal overhead → 6 GPUs can't be fed. A comment at `train.py:351` notes the
-  generator's per-iteration **lock contends with the `.prefetch(AUTOTUNE)` threads**.
+- **OOM KILL is the headline problem.** Each round **generates the entire round dataset
+  (499,200 samples) and holds it in RAM** — measured at **~435 GB (86.5% of 503 GB) steady**,
+  with **system RAM peaking at 99.2%**. Round 2's data generation tipped it over the 503 GB
+  ceiling and the OS SIGKILLed the process. So full-scale training is infeasible on **memory**,
+  not just time — on any box with <~500 GB it OOMs immediately.
+- **Data generation is also extremely slow and un-parallelized-enough:** ~**1.5 h per 50k
+  chunk × 10 chunks = ~15 h of data-gen PER ROUND**, and it's regenerated every round (SNR
+  curriculum). Round 1 data-gen + 100 epochs took ~15 h; round 2 never finished data-gen.
+- **GPU starvation during epochs:** util **0–14%**. `tf.data.Dataset.from_generator` yields
+  **one sample at a time** (GIL-bound), then `.batch(768)`; ~1 ms/sample Python/marshal
+  overhead → 6 GPUs can't be fed. Comment at `train.py:351`: the generator's per-iteration
+  **lock contends with the `.prefetch(AUTOTUNE)` threads**. Data-gen in `data_generation.py`.
 
 ## 5. Optimization already implemented this session
 
@@ -126,14 +137,21 @@ Stage breakdown, GPUs idle ~98% of the run:
    inference of cadence N (matches the existing `# NOTE` at top of `main.py`).
 4. Minor: bump `parallel_coarse_chans` 28→32 to use all blpc3 cores in energy detection.
 
-### Training (bla0 GPU starvation)
-1. **Yield pre-batched slices from the generator** (numpy `arr[i:i+B]`) instead of per-sample
-   → ~768× fewer Python calls/marshals. Requires reshaping `output_signature` and dropping the
-   `.batch()`. Biggest win. (`train.py:526`.)
-2. `interleave` several generator shards with `num_parallel_calls` for parallel feeding.
-3. Shrink the generator's lock scope (lock-free reads from the shared-memory `TrainDataHolder`)
-   to unblock prefetch (`train.py:351`).
-4. `from_tensor_slices` for the smaller **val/viz** datasets (full train data ~300 GB won't fit).
+### Training — fix OOM first, then GPU starvation
+0. **RAM footprint / OOM (blocker).** Don't hold all 499,200 round samples in RAM (~435 GB).
+   Options: generate to an on-disk **memmap/`.npy`** and stream batches from it (also lets the
+   input pipeline mmap it — see #2); shrink/streamline the per-chunk intermediates so
+   "memory cleared" actually returns to a low baseline (verify no cross-chunk retention);
+   and/or expose a memory-aware `num_samples`/chunk cap. Immediate mitigation for a test run:
+   lower `--num-samples-beta-vae`/`--num-samples-rf` (keep divisibility) so the dataset fits.
+1. **Speed up + parallelize data generation** (~15 h/round). Profile `data_generation.py`; it
+   regenerates every round, so this dominates wall-clock alongside OOM.
+2. **Yield pre-batched slices from the generator** (numpy `arr[i:i+B]`) instead of per-sample
+   → ~768× fewer Python calls/marshals; or feed from the memmap in #0. Fixes GPU starvation.
+   (`train.py:526`; reshape `output_signature`, drop `.batch()`.)
+3. `interleave` generator shards with `num_parallel_calls`; shrink the generator's lock scope
+   (`train.py:351`) so it doesn't block prefetch; `from_tensor_slices` for the smaller val/viz
+   sets.
 
 ## 7. Config knobs relevant to perf (`src/aetherscan/config.py`)
 - Training: `num_training_rounds=20`, `epochs_per_round=100`, `num_samples_beta_vae=499200`,

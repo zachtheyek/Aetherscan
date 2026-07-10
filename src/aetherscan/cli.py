@@ -1320,8 +1320,7 @@ def collect_validation_errors(
         ser = _resolve(args, "step_easy_rounds", config.training.step_easy_rounds)
         shr = _resolve(args, "step_hard_rounds", config.training.step_hard_rounds)
         # step_easy_rounds / step_hard_rounds only apply to the step schedule; skip their
-        # range checks otherwise (their defaults needn't fit num_training_rounds when the
-        # active schedule is linear or exponential).
+        # range checks otherwise.
         if cs == "step" and ntr is not None and ser is not None and not (0 <= ser <= ntr):
             errors.append(
                 ValidationError(
