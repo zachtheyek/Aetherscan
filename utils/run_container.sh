@@ -34,6 +34,12 @@
 
 set -euo pipefail
 
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $0 <command> [args...]" >&2
+    echo "  e.g. $0 python -m aetherscan.main train --save-tag test_v1" >&2
+    exit 1
+fi
+
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Load <repo>/.env without clobbering anything already exported in our env.
