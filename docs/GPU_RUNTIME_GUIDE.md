@@ -44,6 +44,27 @@ Build takes ~9 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nv
 > [!NOTE]
 > A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch.
 
+#### Pinned base image (digest)
+
+The `From:` line in [`aetherscan.def`](../aetherscan.def) pins the NGC base by **digest**, not just by the `25.02-tf2-py3` tag:
+
+```
+From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3@sha256:c83b37d26f19ab00d8a13cf974edd079c3d099918ec3110c304a989d6e2f75d5
+```
+
+A tag is a mutable pointer: NVIDIA can re-push `25.02-tf2-py3` (e.g. a security rebuild) and every fresh build would silently pull different bytes. The digest is content-addressed, so it always resolves to the exact image this pipeline was validated against, and a build **fails loudly at the `From:` line** if that image is ever unreachable or altered rather than substituting something else. This matters mostly at rebuild time — an already-built `.sif` is itself immutable — but it keeps rebuilds on both clusters reproducible.
+
+The pinned value is the multi-arch **index** digest (a `manifest.list`), so the same line resolves the `linux/amd64` sub-manifest automatically on both x86_64 clusters — no per-arch digest needed.
+
+25.02 is [officially the final NGC TF release](#why-a-container-on-blackwell), so the tag is unlikely to move. But if NVIDIA ever ships a patched rebuild you want to adopt, updating is a deliberate one-line diff rather than a silent drift:
+
+```bash
+# Re-read the tag's current digest (needs `docker login nvcr.io` with an NGC API key).
+docker buildx imagetools inspect nvcr.io/nvidia/tensorflow:25.02-tf2-py3 --format '{{.Manifest.Digest}}'
+```
+
+Swap the new `sha256:…` into **both** the `From:` line and the `Base` label in [`aetherscan.def`](../aetherscan.def), commit, and rebuild.
+
 #### Build-time gotchas on hardened HPC nodes
 
 Locked-down clusters typically need three things adjusted before `singularity build` will succeed as an unprivileged user. Work through them in order:
@@ -204,7 +225,7 @@ If NGC 25.02 keeps misbehaving, escalate in this order:
 
 1. `--no-async-allocator` (cheapest, often sufficient).
 2. `--nccl-num-packs 1` or `4` (5-GPU NVLink topology is unusual).
-3. Rebuild against NGC 25.01 — same TF, one minor back; catches 25.02 regressions. Update the `From:` line in `aetherscan.def`.
+3. Rebuild against NGC 25.01 — same TF, one minor back; catches 25.02 regressions. Update the `From:` line in `aetherscan.def` (re-pin its digest too — see [Pinned base image](#pinned-base-image-digest)).
 4. `--num-replicas 1` for single-GPU fallback on Blackwell — one 96 GB card still beats 5x A4000 aggregate for correctness validation.
 5. Fall back to the Ampere conda env for any work that doesn't need Blackwell. With the container as the canonical runtime on both clusters, the conda env is now a fallback rather than a parallel workflow.
 6. Build TF 2.22 from source with sm_86 + sm_120 targets (1–2 days of build-system wrestling). Mostly obsolete now that one container runs on both clusters via forward compat; keep as a last resort if NGC 25.02 ever becomes unsupportable.

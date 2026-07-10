@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3@sha256:c83b37d26f19ab00d8a13cf974edd079c3d099918ec3110c304a989d6e2f75d5
 
 # Aetherscan container recipe.
 #
@@ -47,7 +47,7 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 %labels
     Maintainer Zach Yek <xiaoxiyek1.5@gmail.com>
     Project    Aetherscan
-    Base       nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+    Base       nvcr.io/nvidia/tensorflow:25.02-tf2-py3@sha256:c83b37d26f19ab00d8a13cf974edd079c3d099918ec3110c304a989d6e2f75d5
     Python     3.12
     TF         2.17
     CUDA       12.8
