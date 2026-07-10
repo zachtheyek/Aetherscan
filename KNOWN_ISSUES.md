@@ -500,7 +500,8 @@ silences it but also hides other potentially useful warnings, so it's not recomm
 
 ### Status
 
-**Won't fix.** Benign upstream TensorFlow/XLA behavior.
+**Won't fix.** Benign upstream TensorFlow/XLA behavior. See also
+[`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
 
 ---
 
@@ -535,4 +536,4 @@ by `TF_CPP_MIN_LOG_LEVEL`, so it can't be suppressed without redirecting stderr.
 ### Status
 
 **Won't fix.** Expected LLVM/PTX version-skew behavior. See also
-[`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) ("Benign noise to ignore" section).
+[`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
