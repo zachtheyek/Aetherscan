@@ -1765,7 +1765,10 @@ def collect_validation_errors(
                 ValidationError(
                     field="inference.detection_window_size",
                     current=detection_window_size,
-                    message=f"--detection-window-size ({detection_window_size}) must be <= --stamp-width ({stamp_width})",
+                    message=(
+                        f"--detection-window-size ({detection_window_size}) must be"
+                        f" <= --stamp-width ({stamp_width})"
+                    ),
                     fix_kind="clamp_high",
                     max_val=stamp_width,
                 )
@@ -1790,7 +1793,10 @@ def collect_validation_errors(
                 ValidationError(
                     field="inference.detection_step_size",
                     current=detection_step_size,
-                    message=f"--detection-step-size ({detection_step_size}) must be <= --detection-window-size ({detection_window_size})",
+                    message=(
+                        f"--detection-step-size ({detection_step_size}) must be"
+                        f" <= --detection-window-size ({detection_window_size})"
+                    ),
                     fix_kind="clamp_high",
                     max_val=detection_window_size,
                 )
