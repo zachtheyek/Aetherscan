@@ -144,7 +144,12 @@ def setup_gpu_strategy():
         logger.info(f"Distributed strategy: {strategy.num_replicas_in_sync} GPUs")
         return strategy
 
-    except RuntimeError as e:
+    except Exception as e:
+        # This exception catch is broad on purpose:
+        # catches RuntimeError from device-config calls plus
+        # non-RuntimeError failures (ValueError, tf.errors.*) from the fallback
+        # warmup, so any GPU setup failure resolves to the graceful return-None
+        # path the callers expect rather than escaping this function.
         logger.error(f"GPU configuration error: {e}")
         return None
 
