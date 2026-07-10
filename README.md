@@ -396,7 +396,8 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--vae-beta VAE_BETA] [--vae-alpha VAE_ALPHA]
              [--rf-n-estimators RF_N_ESTIMATORS] [--rf-bootstrap RF_BOOTSTRAP]
              [--rf-max-features RF_MAX_FEATURES] [--rf-n-jobs RF_N_JOBS]
-             [--rf-seed RF_SEED] [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
+             [--rf-seed RF_SEED] [--num-replicas NUM_REPLICAS]
+             [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
              [--nccl-num-packs NCCL_NUM_PACKS]
              [--async-allocator | --no-async-allocator]
              [--num-observations NUM_OBSERVATIONS] [--width-bin WIDTH_BIN]
@@ -477,6 +478,13 @@ options:
                         Number of parallel jobs for random forest training (-1
                         uses all CPU cores)
   --rf-seed RF_SEED     Random seed for random forest reproducibility
+  --num-replicas NUM_REPLICAS
+                        Number of GPUs to use for the distributed-inference
+                        strategy. If omitted, the strategy uses every GPU
+                        visible to TF; otherwise it is restricted to the
+                        first N physical GPUs and the rest are left
+                        untouched. Must be >= 1 and <= the number of
+                        physical GPUs on your machine.
   --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
                         Per-GPU memory cap in MiB. Omit to use memory-growth-
                         only (recommended on Blackwell). Set for TF to
@@ -643,6 +651,7 @@ The Aetherscan inference pipeline exposes the following CLI flags to the user. R
 ```
 usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--output-path OUTPUT_PATH]
+                 [--num-replicas NUM_REPLICAS]
                  [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
                  [--async-allocator | --no-async-allocator]
                  [--test-files TEST_FILES [TEST_FILES ...]]
@@ -677,6 +686,13 @@ options:
   --output-path OUTPUT_PATH
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
+  --num-replicas NUM_REPLICAS
+                        Number of GPUs to use for the distributed-inference
+                        strategy. If omitted, the strategy uses every GPU
+                        visible to TF; otherwise it is restricted to the
+                        first N physical GPUs and the rest are left
+                        untouched. Must be >= 1 and <= the number of
+                        physical GPUs on your machine.
   --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
                         Per-GPU memory cap in MiB. Omit to use memory-growth-
                         only (recommended on Blackwell). Set for TF to
