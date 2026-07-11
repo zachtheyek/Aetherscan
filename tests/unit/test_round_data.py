@@ -8,6 +8,7 @@ import queue
 import random
 import threading
 import time
+from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
 import pytest
@@ -559,3 +560,63 @@ class TestRoundDataProducerDrainer:
         producer._process.alive = False
         with pytest.raises(RuntimeError, match="exited before producing"):
             producer.await_round(5)
+
+
+@pytest.mark.slow
+class TestRoundDataProducerSpawnEndToEnd:
+    """Real spawn-started producer process + real (tiny) generation against real shared
+    memory — exercises the spawn pickling boundary, the child's import chain, its pool
+    creation, and the stats/done/shutdown protocol for real. Both cluster-smoke failures
+    this PR hit (a fork-inherited deadlocked lock; a fork-context SemLock crossing the
+    spawn boundary) were only reachable through a real child process."""
+
+    def test_spawned_producer_generates_round(self, tmp_path):
+        rng = np.random.default_rng(11)
+        plate = rng.chisquare(df=4, size=(4, 6, 16, _WIDTH_BIN)).astype(np.float32)
+
+        shm = SharedMemory(create=True, size=plate.nbytes)
+        producer = None
+        try:
+            shared = np.ndarray(plate.shape, dtype=plate.dtype, buffer=shm.buf)
+            shared[:] = plate
+
+            db = _FakeDB()
+            producer = RoundDataProducer(
+                base_dir=str(tmp_path),
+                n_samples=8,
+                shm_name=shm.name,
+                background_shape=plate.shape,
+                background_dtype=str(plate.dtype),
+                n_processes=2,
+                width_bin=_WIDTH_BIN,
+                num_observations=6,
+                time_bins=16,
+                chunk_size=4,
+                task_size=3,
+                freq_resolution=_FREQ_RES,
+                time_resolution=_TIME_RES,
+                db=db,
+                tag="test_v1",
+            )
+            producer.start()
+            producer.request_generation(1, 10, 5)
+            manifest = producer.await_round(1)
+            assert manifest["n_samples"] == 8
+
+            paths = RoundDataPaths.for_round(str(tmp_path), 1)
+            assert validate_done_manifest(paths, expected_n_samples=8) is not None
+
+            # Streamed stats land in the main-process drainer (DB writes stay in main)
+            deadline = time.time() + 30
+            while not db.writes and time.time() < deadline:
+                time.sleep(0.2)
+            assert db.writes
+
+            # A second request for the already-generated round short-circuits via the manifest
+            producer.request_generation(1, 10, 5)
+            assert producer.await_round(1)["n_samples"] == 8
+        finally:
+            if producer is not None:
+                producer.shutdown()
+            shm.close()
+            shm.unlink()

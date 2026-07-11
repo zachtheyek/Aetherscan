@@ -33,10 +33,11 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
+from logging.handlers import QueueListener
 
 import numpy as np
 
-from aetherscan.logger import get_logger, init_worker_logging
+from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 
 logger = logging.getLogger(__name__)
@@ -308,10 +309,11 @@ def _producer_main(
            ("error", round_idx, traceback_str)           on failure (producer keeps serving)
            ("shutdown_ack",)                             right before a graceful exit
 
-    `log_queue` is the main process's multiprocessing log queue — a spawned child has no
-    inherited Logger singleton, so it (and its pool workers) attach QueueHandlers to this queue
-    explicitly. `generate_fn` is a test seam: when provided, no worker pool is created and the
-    stub is called in place of the real memmap generation (see tests/unit/test_round_data.py).
+    `log_queue` is a spawn-context multiprocessing queue relayed into the main process's
+    logging pipeline by RoundDataProducer.start() — a spawned child has no inherited Logger
+    singleton, so it (and its pool workers) attach QueueHandlers to this queue explicitly.
+    `generate_fn` is a test seam: when provided, no worker pool is created and the stub is
+    called in place of the real memmap generation (see tests/unit/test_round_data.py).
     """
     global _PRODUCER_POOL
 
@@ -457,8 +459,13 @@ class RoundDataProducer:
         self._db = db
         self._tag = tag
         # Queues come from the spawn context so they can cross the spawn pickling boundary
+        # (mixing contexts raises "A SemLock created in a fork context is being shared with a
+        # process in a spawn context" — which also rules out handing the child the Logger
+        # singleton's fork-context queue directly; see the relay in start())
         self._request_queue: multiprocessing.Queue = _MP_CONTEXT.Queue()
         self._result_queue: multiprocessing.Queue = _MP_CONTEXT.Queue()
+        self._producer_log_queue: multiprocessing.Queue = _MP_CONTEXT.Queue()
+        self._log_relay: QueueListener | None = None
         self._process: multiprocessing.Process | None = None
         self._drainer: threading.Thread | None = None
         self._drainer_done = False
@@ -467,14 +474,26 @@ class RoundDataProducer:
 
     def start(self) -> None:
         """Spawn the producer process and the main-side result drainer thread."""
-        # Hand the producer the main process's log queue explicitly — a spawned child has no
-        # inherited Logger singleton (multiprocessing.Queue survives Process-args pickling).
-        logger_instance = get_logger()
-        log_queue = logger_instance.log_queue if logger_instance is not None else None
+        # A spawned child has no inherited Logger singleton, and the singleton's fork-context
+        # queue can't cross the spawn boundary — so the producer tree logs into its own
+        # spawn-context queue, and this main-side QueueListener relays each record into the
+        # main process's root handlers (i.e. into the normal file/console/Slack pipeline).
+        self._log_relay = QueueListener(
+            self._producer_log_queue,
+            *logging.getLogger().handlers,
+            respect_handler_level=False,
+        )
+        self._log_relay.start()
 
         self._process = _MP_CONTEXT.Process(
             target=_producer_main,
-            args=(self._request_queue, self._result_queue, self._params, None, log_queue),
+            args=(
+                self._request_queue,
+                self._result_queue,
+                self._params,
+                None,
+                self._producer_log_queue,
+            ),
             name="RoundDataProducer",
         )
 
@@ -548,6 +567,10 @@ class RoundDataProducer:
 
         if self._drainer is not None:
             self._drainer.join(timeout=timeout)
+        if self._log_relay is not None:
+            with contextlib.suppress(Exception):
+                self._log_relay.stop()
+            self._log_relay = None
         self._process = None
         logger.info("RoundDataProducer shut down")
 
