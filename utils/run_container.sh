@@ -24,8 +24,15 @@
 #                               (default: /datax/scratch/zachy/models/aetherscan)
 #     AETHERSCAN_OUTPUT_PATH    Host outputs dir, bound 1:1
 #                               (default: /datax/scratch/zachy/outputs/aetherscan)
+#     AETHERSCAN_EXTRA_BINDS    Comma-separated extra host paths, each bound 1:1
+#                               and appended to the standard bind list, e.g.
+#                               AETHERSCAN_EXTRA_BINDS=/datag for CSV inference
+#                               (default: none)
 #     SLACK_BOT_TOKEN           Slack bot token, forwarded into the container
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
+#
+# The runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
+# through untouched and are additive with the binds set up here.
 #
 # <repo>/.env is auto-loaded if present, so secrets set by "source .env" in the
 # user's shell survive the trip into this child process. Anything already in our
@@ -90,11 +97,25 @@ OUTPUT_PATH=${AETHERSCAN_OUTPUT_PATH:-/datax/scratch/zachy/outputs/aetherscan}
 # Each of the three data dirs gets a 1:1 bind (host path == container path) so
 # absolute paths persisted in the DB / config snapshots stay valid across both
 # host and container processes.
+BIND_ARGS=(
+    --bind "$REPO:/workspace/aetherscan"
+    --bind "$DATA_PATH:$DATA_PATH"
+    --bind "$MODEL_PATH:$MODEL_PATH"
+    --bind "$OUTPUT_PATH:$OUTPUT_PATH"
+)
+
+# Extra host paths (comma-separated), each bound 1:1, for data that lives
+# outside the standard dirs (e.g. raw .h5 files under /datag for CSV inference).
+if [[ -n ${AETHERSCAN_EXTRA_BINDS:-} ]]; then
+    IFS=',' read -ra EXTRA_BINDS <<<"$AETHERSCAN_EXTRA_BINDS"
+    for extra_path in "${EXTRA_BINDS[@]}"; do
+        [[ -z $extra_path ]] && continue
+        BIND_ARGS+=(--bind "$extra_path:$extra_path")
+    done
+fi
+
 exec "$RUNTIME" exec --nv \
-    --bind "$REPO:/workspace/aetherscan" \
-    --bind "$DATA_PATH:$DATA_PATH" \
-    --bind "$MODEL_PATH:$MODEL_PATH" \
-    --bind "$OUTPUT_PATH:$OUTPUT_PATH" \
+    "${BIND_ARGS[@]}" \
     --pwd /workspace/aetherscan \
     --env PYTHONPATH=/workspace/aetherscan/src \
     --env AETHERSCAN_DATA_PATH="$DATA_PATH" \

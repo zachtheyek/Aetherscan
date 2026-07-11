@@ -118,6 +118,10 @@ SLACK_CHANNEL=your-slack-channel
 AETHERSCAN_DATA_PATH=/path/to/data
 AETHERSCAN_MODEL_PATH=/path/to/models
 AETHERSCAN_OUTPUT_PATH=/path/to/outputs
+
+# Optional: comma-separated extra host paths for run_container.sh to bind 1:1,
+# for data outside the standard dirs (e.g. raw .h5 files for CSV inference)
+AETHERSCAN_EXTRA_BINDS=/datag
 ```
 
 > [!TIP]
@@ -320,8 +324,9 @@ PYTHONPATH=src python -m aetherscan.main inference \
 **Inference from raw `.h5` files (invokes energy detection preprocessing)**
 
 ```bash
-# Container
-./utils/run_container.sh python -m aetherscan.main inference \
+# Container — the raw .h5 paths in the CSV live outside the standard bind
+# mounts (e.g. under /datag), so bind them via AETHERSCAN_EXTRA_BINDS
+AETHERSCAN_EXTRA_BINDS=/datag ./utils/run_container.sh python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
