@@ -6,11 +6,22 @@ on:
   pull_request:
     types: [closed]
     branches: [master]
+  # Manual re-scan of an already-merged PR. A workflow_dispatch run uses the workflow file from
+  # the default branch, so this is the way to run the CURRENT logic against an old PR — a plain
+  # re-run of a past merge would replay that commit's older workflow file instead.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Number of a merged PR to (re)scan for documentation updates"
+        required: true
+        type: string
 
 jobs:
   claude-update-docs:
-    # Only run when PR is actually merged, not just closed
-    if: github.event.pull_request.merged == true
+    # Run on a real merge to master, or a manual workflow_dispatch re-scan of a merged PR.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     # Analysing one merged diff against the doc set + source↔doc contracts shouldn't take
     # more than 15 mins (refine if data shows otherwise)
@@ -20,6 +31,10 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
+    env:
+      # Target PR: the merged PR (pull_request event) or the pr_number input (manual re-scan).
+      # Everything below keys off this single value so both triggers share one code path.
+      PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
 
     steps:
       # Deterministic duplicate-issue guard: when this workflow files a doc issue it carries
@@ -32,7 +47,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           MARKER="<!-- aetherscan-update-docs pr=$PR_NUMBER -->"
           if gh issue list --state all --limit 200 --json body --jq '.[].body' \
@@ -79,7 +93,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           # Capture the file list first (don't pipe gh into `grep -q`: under the default
           # `bash -eo pipefail`, grep's early exit can SIGPIPE gh and mark the pipeline failed
@@ -102,15 +115,18 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             ## Role
-            A pull request has just been merged to master. Your task is to analyze the changes and determine if any documentation needs to be updated.
+            A pull request has been merged to master (or is being manually re-scanned). Your task is to analyze the changes and determine if any documentation needs to be updated.
 
             ## Context
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
             PR TITLE: ${{ github.event.pull_request.title }}
             PR BODY: ${{ github.event.pull_request.body }}
             AUTHOR: ${{ github.event.pull_request.user.login }}
             MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+            (On a manual workflow_dispatch re-scan the PR TITLE/BODY/AUTHOR/MERGE COMMIT fields
+            above are blank — fetch them yourself with
+            `gh pr view ${{ env.PR_NUMBER }} --json title,body,author,mergeCommit`.)
             CLI REFERENCE REGENERATED: ${{ steps.cli_help.outputs.cli_changed }}
             (When 'true', this PR touched cli.py and a prior CI step already regenerated the CLI
             Reference blocks into cli_help_regenerated.txt at the repo root — read that file and
@@ -119,7 +135,7 @@ jobs:
 
             ## Task
             1. First, get the diff of the merged PR:
-               `gh pr diff ${{ github.event.pull_request.number }}`
+               `gh pr diff ${{ env.PR_NUMBER }}`
 
             2. Review the changes and identify:
                - New features or functionality added
@@ -222,8 +238,8 @@ jobs:
                - Body should include:
                  - As the FIRST line, the hidden marker (invisible when rendered) so the
                    deterministic guard can dedupe re-runs of this PR:
-                   `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->`
-                 - Reference to the merged PR (#${{ github.event.pull_request.number }})
+                   `<!-- aetherscan-update-docs pr=${{ env.PR_NUMBER }} -->`
+                 - Reference to the merged PR (#${{ env.PR_NUMBER }})
                  - Summary of changes that require documentation
                  - Specific files that need updates
                  - Suggested changes or additions
@@ -296,7 +312,7 @@ jobs:
               regeneration/reconciliation of documentation. If the merged PR needs no *documentation*
               change, file nothing, even if its code could be improved. This keeps the two workflows
               from filing duplicate or overlapping issues.
-            - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs pr=${{ github.event.pull_request.number }} -->` marker — the deterministic guard relies on it to skip re-runs.
+            - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs pr=${{ env.PR_NUMBER }} -->` marker — the deterministic guard relies on it to skip re-runs.
             - Your only responsibilities are to determine whether any documentation needs to be updated after the merged PR. Do not do anything that is not within this job scope.
 
           claude_args: |
