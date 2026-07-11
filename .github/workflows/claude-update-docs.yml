@@ -339,7 +339,9 @@ jobs:
       # in seconds (well before the follow-up run spins up and reads the issue) and edits via
       # github.token, so it doesn't itself re-trigger any workflow.
       - name: Embed regenerated CLI Reference into the issue
-        if: steps.guard.outputs.already_filed != 'true' && steps.cli_help.outputs.cli_changed == 'true'
+        # !cancelled() (not the implicit success()) so the blocks are still embedded if the Claude
+        # step filed the issue but then errored; no-ops harmlessly when no issue was filed.
+        if: ${{ !cancelled() && steps.guard.outputs.already_filed != 'true' && steps.cli_help.outputs.cli_changed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -364,8 +366,8 @@ jobs:
               '`### Top-Level Help`, `### Train Command Help`, and `### Inference Command Help`' \
               'code blocks in README.md with the corresponding section, verbatim.' \
               '' \
-              '```'
+              '````'
             cat cli_help_regenerated.txt
-            printf '\n%s\n' '```'
+            printf '\n%s\n' '````'
           } > "$RUNNER_TEMP/issue_body.md"
           gh issue edit "$NUM" --body-file "$RUNNER_TEMP/issue_body.md"
