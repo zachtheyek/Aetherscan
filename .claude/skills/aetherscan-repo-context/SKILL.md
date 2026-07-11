@@ -165,6 +165,8 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 5. **PR** — rebase (not merge) onto `master`; **all commits need verified GPG signatures**; fill the PR template; link the issue via the Development sidebar or `Closes #N` / `Fixes #N` (enables label sync). PRs not tied to an issue may be closed.
 6. **Review** — needs passing checks, ≥1 maintainer approval, all conversations resolved, branch up to date. Approvals are voided when new commits are pushed. Claude provides an initial review automatically.
 
+**Invoking vs. mentioning the assistant.** The assistant workflow (`claude.yml`) triggers whenever the assistant handle — an `@` immediately followed by `claude` — appears in the title/body of a Discussion, issue, or PR (or a comment on one). Write it only when you actually want to summon the assistant (e.g. an auto-filed docs issue asking it to open a PR). To refer to the handle as plain text anywhere else — a PR description, issue body, commit message, review comment — write it as `"@ claude"` (a space after the `@`, double quotes on both sides) so the `contains(…, '@claude')` trigger can't match. Tagging it unintentionally spawns a spurious assistant run and follow-up PR (this is what happened around issue #83).
+
 **Pre-commit hooks** (`pre-commit install` to activate): `ruff` (lint, `--fix`), `ruff-format`, general `pre-commit-hooks` (large files >1 MB, case conflict, merge conflict, YAML/TOML syntax, EOF/trailing-whitespace, private-key detection, `no-commit-to-branch` on master), and `gitleaks` (secret detection). Ruff-format auto-reformats on commit — **re-run `git add` after** it modifies files, then commit again. Bypass only sparingly with `git commit --no-verify`.
 
 ```bash
