@@ -12,6 +12,7 @@ import contextlib
 import gc
 import json
 import logging
+import math
 import os
 import subprocess
 import threading
@@ -22,6 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import psutil
 import tensorflow as tf
+from matplotlib.lines import Line2D
 
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
@@ -582,13 +584,24 @@ class ResourceMonitor:
             ax_gpu.set_ylim(0, 100)
             ax_gpu_mem.set_ylim(0, 100)
 
-            # Combine legends
+            # Combine legends, grouped by metric. Matplotlib fills legends
+            # column-major, so pad each metric's entries with invisible
+            # handles up to a whole number of columns — usage entries then
+            # occupy their own column(s) and memory entries always start a
+            # fresh column (e.g. 5 GPUs -> columns of 3,2 | 3,2).
             lines1, labels1 = ax_gpu.get_legend_handles_labels()
             lines2, labels2 = ax_gpu_mem.get_legend_handles_labels()
+            cols_per_metric = math.ceil(len(gpu_data) / 3)  # cap the legend at 3 rows
+            nrows = math.ceil(len(gpu_data) / cols_per_metric)
+            slots = nrows * cols_per_metric
+            lines1 += [Line2D([], [], alpha=0)] * (slots - len(lines1))
+            labels1 += [""] * (slots - len(labels1))
+            lines2 += [Line2D([], [], alpha=0)] * (slots - len(lines2))
+            labels2 += [""] * (slots - len(labels2))
             ax_gpu.legend(
                 lines1 + lines2,
                 labels1 + labels2,
-                ncol=min(4, len(gpu_data) * 2),
+                ncol=2 * cols_per_metric,
                 fontsize=8,
                 loc="upper right",
             )
