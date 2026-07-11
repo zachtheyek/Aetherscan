@@ -46,9 +46,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          STATE=$(gh pr view "$PR_NUMBER" --json state,merged --jq '.state + ":" + (.merged|tostring)')
-          if [[ "$STATE" != "MERGED:true" ]]; then
-            echo "::error::pr_number=$PR_NUMBER is not a merged PR (state:merged = $STATE)"
+          STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+          if [[ "$STATE" != "MERGED" ]]; then
+            echo "::error::pr_number=$PR_NUMBER is not a merged PR (state = $STATE)"
             exit 1
           fi
           echo "PR #$PR_NUMBER is merged — proceeding."
