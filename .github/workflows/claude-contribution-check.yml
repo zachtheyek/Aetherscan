@@ -16,6 +16,16 @@ permissions:
 
 jobs:
   contribution-check:
+    # Never run on bot- or automation-authored issues/PRs. Our own workflows (e.g.
+    # claude-update-docs) file issues as the `claude` bot; without this guard the job would spin
+    # up a runner and claude-code-action would abort with a "non-human actor" error — a red
+    # failure on every bot issue. Skip the whole job instead. (allowed_bots is already unset, so
+    # no comment is ever posted; this additionally avoids the noisy failed run.) See issue #83.
+    if: >-
+      github.event.issue.user.type != 'Bot' &&
+      github.event.pull_request.user.type != 'Bot' &&
+      !endsWith(github.actor, '[bot]') &&
+      github.actor != 'claude'
     runs-on: ubuntu-latest
     # Contribution check shouldn't take more than 5 mins (refine if data shows otherwise)
     timeout-minutes: 5
