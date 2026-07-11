@@ -53,6 +53,13 @@ from aetherscan.models import (
     create_beta_vae_model,
     prepare_latent_features,
 )
+from aetherscan.round_data import (
+    RoundDataPaths,
+    RoundDataProducer,
+    load_round_arrays,
+    prepare_round_data_dir,
+    validate_done_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -335,24 +342,22 @@ def check_encoder_trained(encoder, threshold=0.2):
 
 
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
-# Allows for explicit dereferencing of large arrays using holder.clear(), which lets
+# Allows for explicit dereferencing of the backing arrays using holder.clear(), which lets
 # Python's garbage collector free up memory on-demand
-# Note, holder.clear() is only useful at the end of an epoch, once indices have been exhausted,
-# since the data generators' local caches maintain references to the data until then
-# This is not an issue in our current implementation, where we only clear & reset resources at the
-# end of a round. However, if you require early exit behavior, you may want to remove the _lock and
-# use explicit _cleared() checks instead, which negates the need for local caches (see commit hash
-# 2a404a4). The trade-off being that you're at risk of race conditions if multiple threads attempt
-# to access/clear the holder simultaneously. While this is not the case in our current
-# implementation, we opted for a more defensive approach rather than accomodating future design
-# patterns. As well, the data should not be modified once the holder has been initialized to
-# prevent corrupted state in the holder
-# Note, there's a potential deadlock issue with holder lock contention
-# Since the generators acquire locks at the start of every loop iteration, if TF's prefetch threads
-# (.prefetch(tf.data.AUTOTUNE)) are blocked waiting on this lock while the main thread is trying to
-# call holder.clear() (which also needs the lock), there could be contention.
-# This has not been an issue so far, but if you encounter this in the future, pls update this
-# comment with your findings
+# The holders now hold np.load(mmap_mode="r") memmap references rather than ~294 GB of in-RAM
+# arrays, so clear() drops file mappings (letting the round's directory be deleted and its page
+# cache reclaimed) rather than freeing huge heap allocations — but the semantics are unchanged:
+# clear() is only fully effective at the end of an epoch, once the generators' local caches have
+# been dropped, and the data must not be modified once the holder has been initialized
+# Note, if you require early exit behavior, you may want to remove the _lock and use explicit
+# _cleared() checks instead, which negates the need for local caches (see commit hash 2a404a4).
+# The trade-off being that you're at risk of race conditions if multiple threads attempt to
+# access/clear the holder simultaneously — we opted for the defensive approach
+# Lock contention with TF's prefetch threads is a non-issue in the batched design: each generator
+# acquires the lock exactly once per epoch pass (to snapshot the array references), then yields
+# whole global batches without touching the lock, so a clear() on the main thread can no longer
+# race hundreds of thousands of per-sample lock acquisitions (which the pre-memmap, per-sample
+# generators were at least theoretically exposed to)
 class TrainDataHolder:
     def __init__(self, concat, true, false):
         self._cleared = False
@@ -396,26 +401,42 @@ def prepare_distributed_train_dataset(
     shuffle: bool = True,
 ) -> dict:
     """
-    Build distributed training and validation datasets from the in-memory `data` dict, returning
-    a dict with the two tf.data datasets, sample/step counts, the shared TrainDataHolder, and the
+    Build distributed training and validation datasets from the `data` dict, returning a dict
+    with the two tf.data datasets, sample/step counts, the shared TrainDataHolder, and the
     stratified train/val indices into the original arrays.
 
-    `data` must contain 'concatenated', 'true', 'false', and 'labels' (numpy arrays). The split
-    is stratified across the 4 signal types (false_no_signal, false_with_rfi, true_only_eti,
-    true_eti_rfi) — generate_triplet_batch arranges labels sequentially within chunks, so a naive
-    positional split would over-represent later signal types in val. Each generated batch has the
-    signature ((concat, true, false), concat). Sample counts are trimmed to the global / effective
-    batch size to keep all replicas evenly fed; the holder is shared by both generators so neither
-    pays a memory cost beyond index subsets.
+    `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the read-only
+    memmaps returned by round_data.load_round_arrays(), though plain in-RAM ndarrays work too.
+    The split is stratified across the 4 signal types (false_no_signal, false_with_rfi,
+    true_only_eti, true_eti_rfi) — generation lays labels out sequentially within chunks, so a
+    naive positional split would over-represent later signal types in val.
+
+    The generators yield whole GLOBAL batches (leading batch dim in the output signature; no
+    .batch() call downstream): each batch gathers sorted fancy indices from the memmaps, cutting
+    the per-sample Python/tf.data boundary crossings by a factor of the global batch size — the
+    per-sample yields were the main source of the 0-14 % GPU utilization. Randomness lives at
+    the epoch level (train_indices are reshuffled each pass); sorting *within* a batch only
+    improves memmap read locality and the model is order-invariant within a batch.
+
+    Page-cache framing: gathering from the memmaps pulls pages through the OS page cache, so
+    after the first epoch a round's ~294 GB (at full-scale defaults) is served at RAM speed from
+    otherwise-free memory on the 503 GB training nodes — but under memory pressure the kernel
+    evicts pages instead of OOM-killing the process, which is exactly the failure mode the old
+    in-RAM arrays hit.
+
+    Each generated batch has the signature ((concat, true, false), concat). Sample counts are
+    trimmed to the global / effective batch size to keep all replicas evenly fed (so every epoch
+    pass yields whole batches exactly); the holder is shared by both generators so neither pays
+    a memory cost beyond index subsets.
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
 
     # Stratified train/val split to ensure both sets contain proportional representation
     # of all 4 signal types (false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi).
-    # This is necessary because generate_triplet_batch() arranges labels sequentially within
+    # This is necessary because generation arranges labels sequentially within
     # chunks, so a naive positional split would over-represent later signal types in val.
-    labels = data["labels"]
+    labels = np.asarray(data["labels"])
     unique_labels = np.unique(labels)
 
     train_indices = []
@@ -450,15 +471,25 @@ def prepare_distributed_train_dataset(
     if n_val_trimmed < n_val:
         val_indices = np.random.choice(val_indices, size=n_val_trimmed, replace=False)
 
+    # Sort both index sets ascending. For shuffle=False this pins the generators' yield order
+    # to the returned train_indices/val_indices arrays (the alignment contract
+    # train_random_forest depends on) while giving monotone memmap reads; for shuffle=True the
+    # epoch-level reshuffle below supplies the randomness anyway. Stratification is a property
+    # of index *membership*, not order, so sorting doesn't affect it.
+    train_indices = np.sort(train_indices)
+    val_indices = np.sort(val_indices)
+
     logger.info(f"Data alignment: Train {n_train}→{n_train_trimmed}, Val {n_val}→{n_val_trimmed}")
 
     # Share the original arrays between train and val generators via a single data holder.
     # The stratified split requires non-contiguous indices, which would force numpy to create
-    # full copies via fancy indexing (~2x peak memory). Instead, both generators read from the
-    # same original arrays using their respective index subsets — zero extra copies.
+    # full copies via fancy indexing (~2x peak memory). Instead, both generators gather
+    # per-batch slices from the same original arrays using their respective index subsets —
+    # only one global batch is materialized at a time.
     train_holder = TrainDataHolder(data["concatenated"], data["true"], data["false"])
 
-    # Create generator functions for memory-efficient data loading
+    # Create generator functions yielding whole global batches gathered from the (memmap)
+    # arrays — see the docstring for the batching/locality/page-cache rationale
     def train_generator():
         while True:  # Make generators infinite to reset state between epochs
             # Acquire lock to check cleared status and capture data references
@@ -471,14 +502,20 @@ def prepare_distributed_train_dataset(
                 true = train_holder.true
                 false = train_holder.false
 
-            # Work with local references (safe from clearing, no per-sample lock needed)
+            # Work with local references (safe from clearing, no per-batch lock needed)
             # Copy train_indices because np.random.shuffle mutates in-place
             indices = train_indices.copy()
             if shuffle:
                 # Perform global shuffle on each epoch so each pass through the data is unique
                 np.random.shuffle(indices)
-            for idx in indices:
-                yield (concat[idx], true[idx], false[idx]), concat[idx]
+            for start in range(0, len(indices), global_train_batch_size):
+                batch_indices = indices[start : start + global_train_batch_size]
+                if shuffle:
+                    # Within-batch sorted order improves memmap read locality; random batch
+                    # membership is already guaranteed by the epoch-level shuffle above
+                    batch_indices = np.sort(batch_indices)
+                concat_batch = concat[batch_indices]
+                yield (concat_batch, true[batch_indices], false[batch_indices]), concat_batch
 
             # Remove cache references to ensure garbage collection in future
             del concat, true, false
@@ -495,44 +532,40 @@ def prepare_distributed_train_dataset(
                 true = train_holder.true
                 false = train_holder.false
 
-            # Maintain order on each epoch since shuffling provides no benefits (no gradients
-            # are calculated during validation)
-            for idx in val_indices:
-                yield (concat[idx], true[idx], false[idx]), concat[idx]
+            # Maintain val_indices order on each epoch (already sorted above): no gradients are
+            # calculated during validation, and train_random_forest relies on the i-th encoded
+            # val cadence corresponding to val_indices[i]
+            for start in range(0, len(val_indices), global_val_batch_size):
+                batch_indices = val_indices[start : start + global_val_batch_size]
+                concat_batch = concat[batch_indices]
+                yield (concat_batch, true[batch_indices], false[batch_indices]), concat_batch
 
             # Remove cache references to ensure garbage collection in future
             del concat, true, false
 
-    # Determine dataset output signature
+    # Determine dataset output signature: the generators yield whole global batches, so the
+    # specs carry a leading (None) batch dimension and no .batch() call is applied downstream
     sample_shape = data["concatenated"].shape[1:]
-    output_signature = (
-        (
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-            tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-        ),
-        tf.TensorSpec(shape=sample_shape, dtype=tf.float32),
-    )
+    batch_spec = tf.TensorSpec(shape=(None, *sample_shape), dtype=tf.float32)
+    output_signature = ((batch_spec, batch_spec, batch_spec), batch_spec)
 
     # Create datasets using generators to reduce GPU memory pressure
     # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the datasets yield data in batches before being sharded (distributed) across replicas
-    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
+    # Note that the generators yield data in global batches before being sharded (distributed)
+    # across replicas, ensuring per replica batch sizes match expectations
     logger.info(
-        f"Creating infinite datasets from generators with global batch size - "
+        f"Creating infinite batched datasets from generators with global batch size - "
         f"Train: {global_train_batch_size}, Val: {global_val_batch_size}"
     )
 
     train_dataset = (
         tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
-        .batch(global_train_batch_size, drop_remainder=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
 
     val_dataset = (
         tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
-        .batch(global_val_batch_size, drop_remainder=True)
         # NOTE: do we need repeat for val dataset? run test without repeat & see if anything breaks?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
@@ -615,7 +648,9 @@ def prepare_distributed_viz_dataset(
 
     viz_holder = VizDataHolder(padded_data)
 
-    # Create generator function for memory-efficient data loading
+    # Create generator function yielding whole global batches — this feeds
+    # _capture_latent_snapshot every latent_viz_step_interval training steps, so per-sample
+    # yields here used to tax every capture during the epoch loop
     def viz_generator():
         while True:  # Make generator infinite to reset state between passes
             # Acquire lock to check cleared status and capture data references
@@ -627,29 +662,29 @@ def prepare_distributed_viz_dataset(
                 concat = viz_holder.concat
 
             # WARN: DO NOT SHUFFLE viz_generator(), OR ELSE YOU'LL BREAK plot_latent_space_gif()
-            # Maintain order on each epoch since shuffling provides no benefits (no gradients
-            # are calculated during inference)
-            for idx in range(len(concat)):
-                yield concat[idx]
+            # Contiguous in-order slices preserve the original cadence order on every pass
+            # (n_padded is an exact multiple of the global batch size, so slices are whole)
+            for start in range(0, len(concat), global_viz_batch_size):
+                yield concat[start : start + global_viz_batch_size]
 
             # Remove cache references for future garbage collection
             del concat
 
-    # Determine dataset output signature
+    # Determine dataset output signature: the generator yields whole global batches, so the
+    # spec carries a leading (None) batch dimension and no .batch() call is applied downstream
     sample_shape = padded_data.shape[1:]
-    output_signature = tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
+    output_signature = tf.TensorSpec(shape=(None, *sample_shape), dtype=tf.float32)
 
     # Create dataset using generator to reduce GPU memory pressure
     # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the dataset yields data in batches before being sharded (distributed) across replicas
-    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
+    # Note that the generator yields data in global batches before being sharded (distributed)
+    # across replicas, ensuring per replica batch sizes match expectations
     logger.info(
-        f"Creating infinite dataset from generator with global batch size: {global_viz_batch_size}"
+        f"Creating infinite batched dataset from generator with global batch size: {global_viz_batch_size}"
     )
 
     viz_dataset = (
         tf.data.Dataset.from_generator(viz_generator, output_signature=output_signature)
-        .batch(global_viz_batch_size, drop_remainder=True)
         # NOTE: do we need repeat for viz dataset? run test without repeat & see if anything breaks?
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
@@ -780,6 +815,10 @@ class TrainingPipeline:
         # Initialize RF model as None
         self.rf_model = None
 
+        # Background round-data producer (created in train_beta_vae when
+        # overlap_data_generation is enabled; None otherwise)
+        self._round_producer: RoundDataProducer | None = None
+
         # In-memory caches for RF eval artifacts and SHAP values, keyed by tag.
         # All ten RF plots consume the same eval-artifact joblib (and the five SHAP
         # plots additionally share a SHAP-values joblib); without these caches each
@@ -866,6 +905,15 @@ class TrainingPipeline:
         plot_checkpoints_dir = os.path.join(self.config.output_path, "plots", "checkpoints")
         archive_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
 
+        # Disk-backed round-data directory for this tag: delete round dirs >= start_round,
+        # keep earlier ones only if their .done manifest validates (round-data mirror of the
+        # checkpoint archiving above, minus the archiving — a round is ~295 GB)
+        round_data_root = self.config.training.round_data_dir or os.path.join(
+            self.config.output_path, "round_data"
+        )
+        self._round_data_base_dir = os.path.join(round_data_root, self.config.checkpoint.save_tag)
+        prepare_round_data_dir(self._round_data_base_dir, start_round)
+
         logger.info("Setup directories complete")
 
     # COMMENTED OUT: Removing TensorBoard support
@@ -920,6 +968,46 @@ class TrainingPipeline:
         # NOTE: this approach doesn't play well with fault tolerance. rethink later
         self.start_time = time.time()
 
+        # Stand up the background round-data producer (a dedicated process owning its own
+        # worker pool against the shared-memory background plates), so round k+1's data
+        # generates while round k trains AND generation escapes this process's GIL — TF's
+        # prefetch/callback threads made round 2+ generation far slower than round 1's.
+        # Falls back to sequential in-process generation when disabled
+        # (--no-overlap-data-generation) or when the DataGenerator has no shared memory for
+        # producer workers to attach to (n_processes == 1).
+        if self.config.training.overlap_data_generation:
+            if self.data_generator.shm is not None:
+                self._round_producer = RoundDataProducer(
+                    base_dir=self._round_data_base_dir,
+                    n_samples=self.config.training.num_samples_beta_vae,
+                    shm_name=self.data_generator.shm.name,
+                    background_shape=self.data_generator._background_shape,
+                    background_dtype=str(self.data_generator._background_dtype),
+                    n_processes=self.data_generator.n_processes,
+                    width_bin=self.data_generator.width_bin,
+                    num_observations=self.config.data.num_observations,
+                    time_bins=self.config.data.time_bins,
+                    chunk_size=self.config.training.signal_injection_chunk_size,
+                    task_size=self.config.training.data_gen_task_size,
+                    freq_resolution=self.data_generator.freq_resolution,
+                    time_resolution=self.data_generator.time_resolution,
+                    db=self.db,
+                    tag=self.config.checkpoint.save_tag,
+                )
+                self._round_producer.start()
+                # Kick off the first round's data right away (nothing to overlap with yet —
+                # the unavoidable serial start)
+                first_snr_base, first_snr_range = self._calculate_curriculum_snr(start_round - 1)
+                self._round_producer.request_generation(
+                    start_round, first_snr_base, first_snr_range
+                )
+            else:
+                logger.warning(
+                    "overlap_data_generation is enabled but DataGenerator is in sequential "
+                    "mode (n_processes=1, no shared memory) — falling back to in-process "
+                    "round data generation"
+                )
+
         try:
             for round_idx in range(start_round - 1, n_rounds):
                 snr_base, snr_range = self._calculate_curriculum_snr(round_idx)
@@ -945,6 +1033,12 @@ class TrainingPipeline:
                     round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
                 )
         finally:
+            # Wind down the producer (graceful shutdown message, escalating to
+            # terminate -> kill through the ResourceManager if it's mid-generation)
+            if self._round_producer is not None:
+                self._round_producer.shutdown()
+                self._round_producer = None
+
             # NOTE: this approach doesn't play well with fault tolerance. rethink later
             # Free the latent viz batch once all rounds are complete (or on failure)
             del self._latent_viz_batch, self._latent_viz_labels
@@ -960,10 +1054,37 @@ class TrainingPipeline:
             f"Training round {round_idx + 1} - Epochs: {epochs}, SNR: {snr_base}-{snr_base + snr_range}"
         )
 
-        # Generate training data
-        train_data = self.data_generator.generate_triplet_batch(
-            self.config.training.num_samples_beta_vae, snr_base, snr_range, round_idx + 1
-        )
+        round_number = round_idx + 1
+        n_samples = self.config.training.num_samples_beta_vae
+        paths = RoundDataPaths.for_round(self._round_data_base_dir, round_number)
+        round_trained = False  # Set True once the round fully completes (drives dir deletion)
+
+        # Obtain this round's disk-backed data: reuse a validated on-disk dataset if one
+        # exists, otherwise wait on the background producer (which was asked to generate it
+        # while the previous round trained) or generate in-process (overlap disabled)
+        if validate_done_manifest(paths, expected_n_samples=n_samples) is not None:
+            logger.info(f"Reusing validated round {round_number} data at {paths.round_dir}")
+        elif self._round_producer is not None:
+            logger.info(f"Waiting for round {round_number} data from the background producer")
+            wait_start = time.time()
+            self._round_producer.await_round(round_number)
+            logger.info(f"Round {round_number} data ready (waited {time.time() - wait_start:.1f}s)")
+        else:
+            self.data_generator.generate_round(paths, n_samples, snr_base, snr_range, round_number)
+
+        # Immediately queue generation of the next round's data so it runs in the producer
+        # process while this round's epochs train (curriculum SNR for round k+1 is
+        # deterministic, so it can be computed ahead of time)
+        if (
+            self._round_producer is not None
+            and round_number < self.config.training.num_training_rounds
+        ):
+            next_snr_base, next_snr_range = self._calculate_curriculum_snr(round_idx + 1)
+            self._round_producer.request_generation(round_number + 1, next_snr_base, next_snr_range)
+
+        # Open the round's arrays as read-only memmaps (nothing is loaded into RAM here; the
+        # batched generators gather from the OS page cache during training)
+        train_data = load_round_arrays(paths)
 
         # Extract labels before distributing (prepare_distributed_train_dataset keeps the
         # original arrays alive via a shared train_holder — no copies — so we can free the
@@ -1227,6 +1348,8 @@ class TrainingPipeline:
             # Save checkpoint
             self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
+            round_trained = True
+
         except Exception as e:
             logger.error(f"Error in train_round(): {e}")
             raise  # Re-raise to propagate error
@@ -1259,6 +1382,16 @@ class TrainingPipeline:
             logger.info("Reset managed pools")
 
             gc.collect()
+
+            # Delete the round's on-disk data as soon as its training completed (keeps the
+            # disk footprint at ~2 rounds max with overlap). A failed round leaves its data
+            # in place; the retry's _setup_directories() -> prepare_round_data_dir() decides
+            # what survives (dirs >= the resume round are regenerated). Deleting after the
+            # holder.clear()/clear_session() above is safe even if stray memmap handles
+            # linger — POSIX keeps the inodes alive until the mappings drop.
+            if round_trained and not self.config.training.keep_round_data:
+                shutil.rmtree(paths.round_dir, ignore_errors=True)
+                logger.info(f"Deleted round {round_number} data directory: {paths.round_dir}")
 
     def _train_epoch(
         self,
@@ -1827,9 +1960,20 @@ class TrainingPipeline:
         time_bins = self.config.data.time_bins
         width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
-        # Generate training data (concatenated is 4-way balanced; labels track per-sample subtype)
+        # Generate training data (concatenated is 4-way balanced; labels track per-sample
+        # subtype) into a disk-backed dataset alongside the per-round dirs. Generation is
+        # in-process (sequential with training) — there is nothing left to overlap with, the
+        # beta-VAE producer has already been shut down by train_beta_vae()
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
-        rf_data = self.data_generator.generate_triplet_batch(n_samples, snr_base, snr_range)
+        rf_paths = RoundDataPaths(
+            round_dir=os.path.join(self._round_data_base_dir, "rf"), round_idx=0
+        )
+        rf_trained = False  # Set True once RF training fully completes (drives dir deletion)
+        if validate_done_manifest(rf_paths, expected_n_samples=n_samples) is not None:
+            logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
+        else:
+            self.data_generator.generate_round(rf_paths, n_samples, snr_base, snr_range)
+        rf_data = load_round_arrays(rf_paths)
 
         # Prepare distributed train+val datasets (stratified split). shuffle=False so the
         # train generator yields in train_indices order, letting us align encoded features
@@ -1983,6 +2127,8 @@ class TrainingPipeline:
             joblib.dump(artifacts, artifact_path)
             logger.info(f"Saved RF eval artifacts to {artifact_path}")
 
+            rf_trained = True
+
             # NOTE: come back to this later (are we dereferencing the correct things? can we instead write things to db instead of storing in memory?)
             del (
                 artifacts,
@@ -2017,6 +2163,13 @@ class TrainingPipeline:
             # Reset multiprocessing pools in DataGenerator to further avoid memory accumulation
             self.data_generator.reset_managed_pool()
             logger.info("Reset managed pools")
+
+            # Delete the RF dataset once RF training fully completed. On failure it stays on
+            # disk for post-mortem; the next run's prepare_round_data_dir() treats it as
+            # stale and regenerates (matching the pre-memmap per-attempt regeneration)
+            if rf_trained and not self.config.training.keep_round_data:
+                shutil.rmtree(rf_paths.round_dir, ignore_errors=True)
+                logger.info(f"Deleted RF data directory: {rf_paths.round_dir}")
 
             # NOTE: is this the right way to check if arrays exist before dereferencing?
             if train_latents is not None:
@@ -2734,7 +2887,7 @@ class TrainingPipeline:
                 )
 
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
-    # TODO: move injection plots to data_generation.py & call at end of generate_triplet_batch() (instead of at the end of train_round() & run_training_pipeline())
+    # TODO: move injection plots to data_generation.py & call at end of generate_round_to_memmap() (instead of at the end of train_round() & run_training_pipeline())
     # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
     def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
         """
