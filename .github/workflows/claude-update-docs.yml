@@ -143,10 +143,10 @@ jobs:
             (Fields shown as "(unavailable …)" — e.g. on a manual re-scan — can be fetched with
             `gh pr view ${{ env.PR_NUMBER }} --json title,body,author,mergeCommit`.)
             CLI REFERENCE REGENERATED: ${{ steps.cli_help.outputs.cli_changed }}
-            (When 'true', this PR touched cli.py and a prior CI step already regenerated the CLI
-            Reference blocks into cli_help_regenerated.txt at the repo root — read that file and
-            carry the blocks into the issue per contract (a) and Task step 4. When 'false' or
-            empty, cli.py was untouched and no regenerated file exists.)
+            (When 'true', this PR touched cli.py and a prior CI step regenerated the CLI Reference
+            blocks. You do NOT paste them and must NOT reference the cli_help_regenerated.txt path
+            — a later CI step appends the blocks to the issue you file (contract (a) / Task step 4).
+            When 'false' or empty, cli.py was untouched.)
 
             ## Task
             1. First, get the diff of the merged PR:
@@ -181,17 +181,17 @@ jobs:
                    dropped — those blocks have almost certainly drifted. Because the
                    follow-up @claude PR can't run Python (it's not in that workflow's
                    tool allowlist), a prior CI step in THIS workflow has already
-                   regenerated the canonical help for you: when CLI REFERENCE
-                   REGENERATED is 'true', the output is in cli_help_regenerated.txt at
-                   the repo root — produced by `PYTHONPATH=src python
-                   utils/print_cli_help.py all` (stdlib-only; pins COLUMNS=80 so line
-                   wrapping is deterministic). It is three blocks separated by blank
-                   lines: top-level, then train, then inference. Read that file and
-                   paste each block VERBATIM into the issue (Task step 4) so the
-                   follow-up PR can drop them straight into the matching `### ... Help`
-                   code block in README.md — preserving each subsection's intro
-                   paragraph (the "Regenerate this output with ..." hint) — without
-                   running anything itself.
+                   regenerated the canonical help (via `PYTHONPATH=src python
+                   utils/print_cli_help.py all`, stdlib-only; pins COLUMNS=80 for
+                   deterministic wrapping). When CLI REFERENCE REGENERATED is 'true', a
+                   LATER CI step appends those blocks verbatim to whatever issue you file
+                   — you do NOT paste them, and you must NOT reference the
+                   cli_help_regenerated.txt path (that file is ephemeral to this run and
+                   won't exist for the follow-up). Your job for contract (a) is just to
+                   file the issue and instruct the follow-up PR to replace the matching
+                   `### ... Help` code blocks in README.md with the appended blocks,
+                   verbatim, preserving each subsection's intro paragraph, running
+                   nothing itself.
 
                (b) README.md + CONTRIBUTING.md + SECURITY.md + KNOWN_ISSUES.md + docs/* ↔ CLAUDE.md +
                    .claude/skills/aetherscan-repo-context/SKILL.md.
@@ -260,17 +260,15 @@ jobs:
                  - Suggested changes or additions
                  - Tag @claude with instructions to open a PR linking to this issue with the specified updates
                  - If CLI REFERENCE REGENERATED is 'true' (this PR touched
-                   `src/aetherscan/cli.py`), read the pre-generated
-                   cli_help_regenerated.txt at the repo root and paste its three blocks
-                   VERBATIM into the issue body under a clearly delimited
-                   `### Regenerated CLI Reference (paste verbatim into README.md)`
-                   section, each block in its own fenced code block. Explicitly instruct
-                   the follow-up PR to replace each of the three code blocks under
-                   README.md's `## CLI Reference` section verbatim with the matching
+                   `src/aetherscan/cli.py`), do NOT paste or reference
+                   cli_help_regenerated.txt — a later CI step automatically appends the
+                   regenerated blocks (under a `### Regenerated CLI Reference` heading) to
+                   the issue you file. Just state that README's `## CLI Reference` blocks
+                   drifted, and explicitly instruct the follow-up PR to replace each of the
+                   three code blocks under that section verbatim with the matching appended
                    block (top → ### Top-Level Help, train → ### Train Command Help,
-                   inference → ### Inference Command Help), keeping each subsection's
-                   intro paragraph intact. The follow-up runs no command — the blocks are
-                   already regenerated and carried in this issue.
+                   inference → ### Inference Command Help), keeping each subsection's intro
+                   paragraph intact and running no command.
                  - If the changes touched any canonical doc in contract (b) above
                    (README.md, CONTRIBUTING.md, SECURITY.md, KNOWN_ISSUES.md, or docs/*),
                    split the reconciliation by writability (see the write-access
@@ -295,8 +293,7 @@ jobs:
                           the listed edits to
                           .claude/skills/aetherscan-repo-context/SKILL.md, commit, and
                           push back to the branch for review & merge;
-                       3. tag the code owner of that path per CODEOWNERS (currently
-                          `@zachtheyek`) in the PR body to perform that local apply.
+                       3. tag the code owner of that path per CODEOWNERS in the PR body to perform that local apply.
                      If ONLY SKILL.md needs changing (CLAUDE.md is unaffected), the
                      follow-up still opens the PR solely to carry the verbatim SKILL.md
                      edits and the human-apply steps, tagging the code owner.
@@ -314,7 +311,7 @@ jobs:
             - `gh issue create` to file a new `[DOCUMENTATION]: <…>` issue tagging @claude when meaningful doc gaps are identified
 
             Code exploration:
-            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, CODEOWNERS (to identify the code owner to tag for SKILL.md edits), the pre-generated cli_help_regenerated.txt (present only when CLI REFERENCE REGENERATED is 'true'), and any source files referenced by the source ↔ doc contracts above
+            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, CODEOWNERS, and any source files referenced by the source ↔ doc contracts above
 
             ## Guidelines
             - Be specific about what documentation changes are required.
@@ -333,3 +330,44 @@ jobs:
           claude_args: |
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
             --model opus
+
+      # Contract (a) — deterministic embed. The Claude step above decides whether to file an issue
+      # but can't be relied on to paste ~400 lines of regenerated CLI help verbatim, and the
+      # follow-up @claude PR can't read cli_help_regenerated.txt (it's ephemeral to this runner).
+      # So if cli.py changed and an issue was just filed for this PR, append the regenerated blocks
+      # to that issue straight from the file — guaranteed verbatim, no reliance on the model. Runs
+      # in seconds (well before the follow-up run spins up and reads the issue) and edits via
+      # github.token, so it doesn't itself re-trigger any workflow.
+      - name: Embed regenerated CLI Reference into the issue
+        # !cancelled() (not the implicit success()) so the blocks are still embedded if the Claude
+        # step filed the issue but then errored; no-ops harmlessly when no issue was filed.
+        if: ${{ !cancelled() && steps.guard.outputs.already_filed != 'true' && steps.cli_help.outputs.cli_changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          MARKER="<!-- aetherscan-update-docs pr=$PR_NUMBER -->"
+          NUM=$(gh issue list --state open --limit 50 --json number,body \
+                  --jq "[.[] | select(.body | contains(\"$MARKER\"))][0].number // empty")
+          if [[ -z "$NUM" ]]; then
+            echo "No doc issue was filed for PR #$PR_NUMBER — nothing to embed."
+            exit 0
+          fi
+          echo "Appending regenerated CLI Reference blocks to issue #$NUM."
+          {
+            gh issue view "$NUM" --json body --jq '.body'
+            printf '%s\n' \
+              '' \
+              '### Regenerated CLI Reference (paste verbatim into README.md)' \
+              '' \
+              'Canonical `argparse` output for this PR, regenerated deterministically by CI.' \
+              'The fenced block below holds the three sections in order — split on each' \
+              '`usage:` line: top-level, then `train`, then `inference`. Replace the matching' \
+              '`### Top-Level Help`, `### Train Command Help`, and `### Inference Command Help`' \
+              'code blocks in README.md with the corresponding section, verbatim.' \
+              '' \
+              '````'
+            cat cli_help_regenerated.txt
+            printf '\n%s\n' '````'
+          } > "$RUNNER_TEMP/issue_body.md"
+          gh issue edit "$NUM" --body-file "$RUNNER_TEMP/issue_body.md"
