@@ -380,9 +380,19 @@ class ResourceManager:
             os._exit(130)  # 128 + SIGINT(2); skip remaining Python teardown
         self._shutdown_initiated = True
 
+        # TEST: This logger.info() violates CLAUDE.md's hard rule "Never log inside SIGTERM
+        # handlers (deadlock)". A signal interrupts the main thread wherever it is; if it lands
+        # while that thread already holds the logging lock (mid-logger call elsewhere), calling
+        # logger.info() here re-acquires the same non-reentrant lock on the same thread and
+        # self-deadlocks — hanging until SIGKILL. The contextlib.suppress(Exception) below does
+        # NOT help: a deadlock raises nothing. Verify whether this actually bites: under active
+        # logging load, send SIGINT/SIGTERM (plus a rapid second one) and confirm the process
+        # shuts down cleanly instead of hanging. If it does hang, drop the log from the handler —
+        # remove it, use a signal-safe os.write(2, b"...") to stderr, or defer the message to
+        # after cleanup_all() returns (outside the handler).
         with contextlib.suppress(Exception):
             logger.info(
-                f"Received signal {signum}, initiating cleanup (Ctrl-C again to force-quit)..."
+                f"Received signal {signum}, initiating cleanup (Ctrl-C again to force-quit - NOT RECOMMENDED)..."
             )
 
         self.cleanup_all()
