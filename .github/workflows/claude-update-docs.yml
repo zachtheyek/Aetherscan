@@ -293,8 +293,7 @@ jobs:
                           the listed edits to
                           .claude/skills/aetherscan-repo-context/SKILL.md, commit, and
                           push back to the branch for review & merge;
-                       3. tag the code owner of that path per CODEOWNERS (currently
-                          `@zachtheyek`) in the PR body to perform that local apply.
+                       3. tag the code owner of that path per CODEOWNERS in the PR body to perform that local apply.
                      If ONLY SKILL.md needs changing (CLAUDE.md is unaffected), the
                      follow-up still opens the PR solely to carry the verbatim SKILL.md
                      edits and the human-apply steps, tagging the code owner.
@@ -312,7 +311,7 @@ jobs:
             - `gh issue create` to file a new `[DOCUMENTATION]: <…>` issue tagging @claude when meaningful doc gaps are identified
 
             Code exploration:
-            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, CODEOWNERS (to identify the code owner to tag for SKILL.md edits), and any source files referenced by the source ↔ doc contracts above
+            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, CODEOWNERS, and any source files referenced by the source ↔ doc contracts above
 
             ## Guidelines
             - Be specific about what documentation changes are required.
