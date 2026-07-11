@@ -479,12 +479,11 @@ options:
                         uses all CPU cores)
   --rf-seed RF_SEED     Random seed for random forest reproducibility
   --num-replicas NUM_REPLICAS
-                        Number of GPUs to use for the distributed-inference
-                        strategy. If omitted, the strategy uses every GPU
-                        visible to TF; otherwise it is restricted to the first
-                        N physical GPUs and the rest are left untouched. Must
-                        be >= 1 and <= the number of physical GPUs on your
-                        machine.
+                        Number of GPUs to use for the distributed strategy. If
+                        omitted, the strategy uses every GPU visible to TF;
+                        otherwise it is restricted to the first N physical
+                        GPUs and the rest are left untouched. Must be >= 1 and
+                        <= the number of physical GPUs on your machine.
   --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
                         Per-GPU memory cap in MiB. Omit to use memory-growth-
                         only (recommended on Blackwell). Set for TF to
@@ -686,12 +685,11 @@ options:
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
   --num-replicas NUM_REPLICAS
-                        Number of GPUs to use for the distributed-inference
-                        strategy. If omitted, the strategy uses every GPU
-                        visible to TF; otherwise it is restricted to the first
-                        N physical GPUs and the rest are left untouched. Must
-                        be >= 1 and <= the number of physical GPUs on your
-                        machine.
+                        Number of GPUs to use for the distributed strategy. If
+                        omitted, the strategy uses every GPU visible to TF;
+                        otherwise it is restricted to the first N physical
+                        GPUs and the rest are left untouched. Must be >= 1 and
+                        <= the number of physical GPUs on your machine.
   --gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB
                         Per-GPU memory cap in MiB. Omit to use memory-growth-
                         only (recommended on Blackwell). Set for TF to
