@@ -382,7 +382,7 @@ class ResourceManager:
 
         with contextlib.suppress(Exception):
             logger.info(
-                f"Received signal {signum}, initiating cleanup (Ctrl-C again to force-quit)..."
+                f"Received signal {signum}, initiating cleanup (Ctrl-C again to force-quit - NOT RECOMMENDED)..."
             )
 
         self.cleanup_all()
