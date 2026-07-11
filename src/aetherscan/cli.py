@@ -1711,21 +1711,29 @@ def collect_validation_errors(
                     )
                 )
 
-        ccw = _resolve(args, "coarse_channel_width", config.inference.coarse_channel_width)
-        pcc = _resolve(args, "parallel_coarse_chans", config.inference.parallel_coarse_chans)
-        sp = _resolve(args, "spline_order", config.inference.spline_order)
-        dws = _resolve(args, "detection_window_size", config.inference.detection_window_size)
-        dss = _resolve(args, "detection_step_size", config.inference.detection_step_size)
-        st = _resolve(args, "stat_threshold", config.inference.stat_threshold)
-        sw = _resolve(args, "stamp_width", config.inference.stamp_width)
-        of = _resolve(args, "overlap_fraction", config.inference.overlap_fraction)
+        coarse_channel_width = _resolve(
+            args, "coarse_channel_width", config.inference.coarse_channel_width
+        )
+        parallel_coarse_chans = _resolve(
+            args, "parallel_coarse_chans", config.inference.parallel_coarse_chans
+        )
+        spline_order = _resolve(args, "spline_order", config.inference.spline_order)
+        detection_window_size = _resolve(
+            args, "detection_window_size", config.inference.detection_window_size
+        )
+        detection_step_size = _resolve(
+            args, "detection_step_size", config.inference.detection_step_size
+        )
+        stat_threshold = _resolve(args, "stat_threshold", config.inference.stat_threshold)
+        stamp_width = _resolve(args, "stamp_width", config.inference.stamp_width)
+        overlap_fraction = _resolve(args, "overlap_fraction", config.inference.overlap_fraction)
 
         # Positivity checks for the bare-int / bare-float fields, in parser order.
         for name, val in (
-            ("coarse_channel_width", ccw),
-            ("parallel_coarse_chans", pcc),
-            ("stat_threshold", st),
-            ("stamp_width", sw),
+            ("coarse_channel_width", coarse_channel_width),
+            ("parallel_coarse_chans", parallel_coarse_chans),
+            ("stat_threshold", stat_threshold),
+            ("stamp_width", stamp_width),
         ):
             if val is not None and val <= 0:
                 errors.append(
@@ -1737,54 +1745,68 @@ def collect_validation_errors(
                         min_val=1,
                     )
                 )
-        if sp is not None and sp < 1:
+        if spline_order is not None and spline_order < 1:
             errors.append(
                 ValidationError(
                     field="inference.spline_order",
-                    current=sp,
-                    message=f"--spline-order must be >= 1, got {sp}",
+                    current=spline_order,
+                    message=f"--spline-order must be >= 1, got {spline_order}",
                     fix_kind="clamp_low",
                     min_val=1,
                 )
             )
         # detection_window_size <= stamp_width
-        if dws is not None and sw is not None and dws > sw:
+        if (
+            detection_window_size is not None
+            and stamp_width is not None
+            and detection_window_size > stamp_width
+        ):
             errors.append(
                 ValidationError(
                     field="inference.detection_window_size",
-                    current=dws,
-                    message=f"--detection-window-size ({dws}) must be <= --stamp-width ({sw})",
+                    current=detection_window_size,
+                    message=(
+                        f"--detection-window-size ({detection_window_size}) must be"
+                        f" <= --stamp-width ({stamp_width})"
+                    ),
                     fix_kind="clamp_high",
-                    max_val=sw,
+                    max_val=stamp_width,
                 )
             )
         # detection_step_size > 0 and <= detection_window_size
-        if dss is not None and dss <= 0:
+        if detection_step_size is not None and detection_step_size <= 0:
             errors.append(
                 ValidationError(
                     field="inference.detection_step_size",
-                    current=dss,
-                    message=f"--detection-step-size must be > 0, got {dss}",
+                    current=detection_step_size,
+                    message=f"--detection-step-size must be > 0, got {detection_step_size}",
                     fix_kind="clamp_low",
                     min_val=1,
                 )
             )
-        if dss is not None and dws is not None and dss > dws:
+        if (
+            detection_step_size is not None
+            and detection_window_size is not None
+            and detection_step_size > detection_window_size
+        ):
             errors.append(
                 ValidationError(
                     field="inference.detection_step_size",
-                    current=dss,
-                    message=f"--detection-step-size ({dss}) must be <= --detection-window-size ({dws})",
+                    current=detection_step_size,
+                    message=(
+                        f"--detection-step-size ({detection_step_size}) must be"
+                        f" <= --detection-window-size ({detection_window_size})"
+                    ),
                     fix_kind="clamp_high",
-                    max_val=dws,
+                    max_val=detection_window_size,
                 )
             )
-        if of is not None and not (0 <= of <= 1):
+        if overlap_fraction is not None and not (0 <= overlap_fraction <= 1):
             errors.append(
                 ValidationError(
                     field="inference.overlap_fraction",
-                    current=of,
-                    message=f"--overlap-fraction must satisfy 0 <= fraction <= 1, got {of}",
+                    current=overlap_fraction,
+                    message=f"--overlap-fraction must satisfy 0 <= fraction <= 1, got {overlap_fraction}",
                     fix_kind="range",
                     min_val=0.0,
                     max_val=1.0,
@@ -1863,41 +1885,42 @@ _CROSS_PARAM_FIELDS = (
 
 
 def _check_cross_constraints(
-    nsb: int,
-    nsr: int,
-    tvs: float,
-    prb: int,
-    eb: int,
-    prvb: int,
+    num_samples_beta_vae: int,
+    num_samples_rf: int,
+    train_val_split: float,
+    per_replica_batch_size: int,
+    effective_batch_size: int,
+    per_replica_val_batch_size: int,
     num_replicas_list: list[int],
 ) -> bool:
     """Return True iff the six-tuple satisfies all cross-replica constraints for every
     num_replicas in the list. Mirrors the cross-replica checks in
     :func:`collect_validation_errors`."""
-    if not (0 <= tvs <= 1):
+    if not (0 <= train_val_split <= 1):
         return False
-    if nsr % 2 != 0:
+    if num_samples_rf % 2 != 0:
         return False
     for nr in num_replicas_list:
-        gtrain = prb * nr
-        gval = prvb * nr
-        # round() rather than int() — `nsb * (1 - tvs)` suffers IEEE-754 noise (e.g.
-        # 499200 * 0.2 = 99839.999...) and int() would truncate to 99839.
-        train_samples = round(nsb * tvs)
-        val_samples = round(nsb * (1 - tvs))
-        if not (gtrain <= eb <= nsb * tvs):
+        gtrain = per_replica_batch_size * nr
+        gval = per_replica_val_batch_size * nr
+        # round() rather than int() — `num_samples_beta_vae * (1 - train_val_split)`
+        # suffers IEEE-754 noise (e.g. 499200 * 0.2 = 99839.999...) and int() would
+        # truncate to 99839.
+        train_samples = round(num_samples_beta_vae * train_val_split)
+        val_samples = round(num_samples_beta_vae * (1 - train_val_split))
+        if not (gtrain <= effective_batch_size <= num_samples_beta_vae * train_val_split):
             return False
-        if gval > nsb * (1 - tvs):
+        if gval > num_samples_beta_vae * (1 - train_val_split):
             return False
-        if gval > nsr:
+        if gval > num_samples_rf:
             return False
-        if eb % gtrain != 0:
+        if effective_batch_size % gtrain != 0:
             return False
-        if train_samples % eb != 0:
+        if train_samples % effective_batch_size != 0:
             return False
         if val_samples % gval != 0:
             return False
-        if nsr % gval != 0:
+        if num_samples_rf % gval != 0:
             return False
     return True
 
@@ -1937,34 +1960,48 @@ def _solve_cross_param_constraints(
         )
         return None
 
-    tvs = base["train_val_split"]  # held fixed across the search
+    train_val_split = base["train_val_split"]  # held fixed across the search
     best: dict[str, int | float] | None = None
     best_dist = float("inf")
-    for nsb, nsr, prb, eb, prvb in product(
+    for (
+        num_samples_beta_vae,
+        num_samples_rf,
+        per_replica_batch_size,
+        effective_batch_size,
+        per_replica_val_batch_size,
+    ) in product(
         ranges["num_samples_beta_vae"],
         ranges["num_samples_rf"],
         ranges["per_replica_batch_size"],
         ranges["effective_batch_size"],
         ranges["per_replica_val_batch_size"],
     ):
-        if not _check_cross_constraints(nsb, nsr, tvs, prb, eb, prvb, num_replicas_list):
+        if not _check_cross_constraints(
+            num_samples_beta_vae,
+            num_samples_rf,
+            train_val_split,
+            per_replica_batch_size,
+            effective_batch_size,
+            per_replica_val_batch_size,
+            num_replicas_list,
+        ):
             continue
         dist = (
-            abs(nsb - base["num_samples_beta_vae"])
-            + abs(nsr - base["num_samples_rf"])
-            + abs(prb - base["per_replica_batch_size"])
-            + abs(eb - base["effective_batch_size"])
-            + abs(prvb - base["per_replica_val_batch_size"])
+            abs(num_samples_beta_vae - base["num_samples_beta_vae"])
+            + abs(num_samples_rf - base["num_samples_rf"])
+            + abs(per_replica_batch_size - base["per_replica_batch_size"])
+            + abs(effective_batch_size - base["effective_batch_size"])
+            + abs(per_replica_val_batch_size - base["per_replica_val_batch_size"])
         )
         if dist < best_dist:
             best_dist = dist
             best = {
-                "num_samples_beta_vae": nsb,
-                "num_samples_rf": nsr,
-                "train_val_split": tvs,
-                "per_replica_batch_size": prb,
-                "effective_batch_size": eb,
-                "per_replica_val_batch_size": prvb,
+                "num_samples_beta_vae": num_samples_beta_vae,
+                "num_samples_rf": num_samples_rf,
+                "train_val_split": train_val_split,
+                "per_replica_batch_size": per_replica_batch_size,
+                "effective_batch_size": effective_batch_size,
+                "per_replica_val_batch_size": per_replica_val_batch_size,
             }
     return best
 
