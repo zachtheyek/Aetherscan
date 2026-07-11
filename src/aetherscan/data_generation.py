@@ -45,22 +45,24 @@ _GLOBAL_SHAPE = None
 _GLOBAL_DTYPE = None
 
 
-def _init_worker(shm_name, shape, dtype):
+def _init_worker(shm_name, shape, dtype, log_queue=None):
     """
     Worker pool initializer: attach to the named shared-memory block holding the background
     plates, seed numpy/random from the worker PID so each process gets a distinct RNG state, and
     set up logging.
 
     Passing shm_name/shape/dtype through the pool initializer (rather than per-task args) avoids
-    re-serializing the array on every map() call. The worker installs a SIGTERM handler that
-    closes its shared-memory file descriptor before letting the signal kill the process; the
-    main process is responsible for unlinking shared memory afterwards (handled by
-    ResourceManager).
+    re-serializing the array on every map() call. `log_queue` must be passed explicitly for
+    pools whose parent process was spawn-started (the RoundDataProducer's — no inherited Logger
+    singleton there); fork-started pools omit it and inherit the singleton's queue. The worker
+    installs a SIGTERM handler that closes its shared-memory file descriptor before letting the
+    signal kill the process; the main process is responsible for unlinking shared memory
+    afterwards (handled by ResourceManager).
     """
     global _GLOBAL_SHM, _GLOBAL_BACKGROUNDS, _GLOBAL_SHAPE, _GLOBAL_DTYPE
 
     # Initialize worker logging
-    init_worker_logging()
+    init_worker_logging(log_queue)
 
     # Seed processes with process IDs so each worker gets a different random state
     random.seed(os.getpid())

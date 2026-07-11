@@ -36,10 +36,17 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from aetherscan.logger import init_worker_logging
+from aetherscan.logger import get_logger, init_worker_logging
 from aetherscan.manager import get_manager
 
 logger = logging.getLogger(__name__)
+
+# The producer process is started with the SPAWN method, not fork: the training parent holds
+# deep TF / NCCL / gRPC / CUDA thread state whose locks a forked child can inherit in a locked
+# state — an early producer prototype deadlocked on a futex before reaching its own code. A
+# spawned child runs a fresh interpreter with none of that baggage (its own pool workers are
+# then forked from the clean single-threaded producer, which is safe).
+_MP_CONTEXT = multiprocessing.get_context("spawn")
 
 # Directory-name pattern for one round's dataset (1-based, mirrors checkpoint round_XX tags)
 _ROUND_DIR_PATTERN = re.compile(r"^round_(\d+)$")
@@ -284,12 +291,14 @@ def _default_generate(paths, round_idx, snr_base, snr_range, pool, params, stats
     )
 
 
-def _producer_main(request_queue, result_queue, params: dict, generate_fn=None) -> None:
+def _producer_main(
+    request_queue, result_queue, params: dict, generate_fn=None, log_queue=None
+) -> None:
     """
-    Producer process entry point. Owns a private worker pool (workers attach to the
-    background-plate shared memory created by the main process) and generates rounds on
-    request, isolated from the main process's GIL (TF's prefetch threads no longer slow
-    generation down, and generation no longer steals cycles from training).
+    Producer process entry point (spawn-started — see _MP_CONTEXT). Owns a private worker pool
+    (workers attach to the background-plate shared memory created by the main process) and
+    generates rounds on request, isolated from the main process's GIL (TF's prefetch threads no
+    longer slow generation down, and generation no longer steals cycles from training).
 
     Protocol (multiprocessing.Queues):
     - in:  ("generate", round_idx, snr_base, snr_range) | ("shutdown",)
@@ -299,15 +308,17 @@ def _producer_main(request_queue, result_queue, params: dict, generate_fn=None) 
            ("error", round_idx, traceback_str)           on failure (producer keeps serving)
            ("shutdown_ack",)                             right before a graceful exit
 
-    `generate_fn` is a test seam: when provided, no worker pool is created and the stub is
-    called in place of the real memmap generation (see tests/unit/test_round_data.py).
+    `log_queue` is the main process's multiprocessing log queue — a spawned child has no
+    inherited Logger singleton, so it (and its pool workers) attach QueueHandlers to this queue
+    explicitly. `generate_fn` is a test seam: when provided, no worker pool is created and the
+    stub is called in place of the real memmap generation (see tests/unit/test_round_data.py).
     """
     global _PRODUCER_POOL
 
     is_main_thread = threading.current_thread() is threading.main_thread()
     if is_main_thread:
         # The log queue is a multiprocessing.Queue — safe to use from this process.
-        init_worker_logging()
+        init_worker_logging(log_queue)
 
         # Ignore SIGINT: the main process's ResourceManager coordinates Ctrl-C cleanup.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -333,6 +344,8 @@ def _producer_main(request_queue, result_queue, params: dict, generate_fn=None) 
         # Deferred import (setigen/scipy) — only the real producer needs it.
         from aetherscan.data_generation import _init_worker  # noqa: PLC0415
 
+        # Plain fork-context Pool: this spawned process is single-threaded, so forking its
+        # workers is safe — and they attach to the parent-created background SHM by name.
         pool = multiprocessing.Pool(
             processes=max(1, params["n_processes"]),
             initializer=_init_worker,
@@ -340,6 +353,7 @@ def _producer_main(request_queue, result_queue, params: dict, generate_fn=None) 
                 params["shm_name"],
                 tuple(params["background_shape"]),
                 np.dtype(params["background_dtype"]),
+                log_queue,
             ),
         )
         _PRODUCER_POOL = pool
@@ -442,8 +456,9 @@ class RoundDataProducer:
         }
         self._db = db
         self._tag = tag
-        self._request_queue: multiprocessing.Queue = multiprocessing.Queue()
-        self._result_queue: multiprocessing.Queue = multiprocessing.Queue()
+        # Queues come from the spawn context so they can cross the spawn pickling boundary
+        self._request_queue: multiprocessing.Queue = _MP_CONTEXT.Queue()
+        self._result_queue: multiprocessing.Queue = _MP_CONTEXT.Queue()
         self._process: multiprocessing.Process | None = None
         self._drainer: threading.Thread | None = None
         self._drainer_done = False
@@ -452,12 +467,30 @@ class RoundDataProducer:
 
     def start(self) -> None:
         """Spawn the producer process and the main-side result drainer thread."""
-        self._process = multiprocessing.Process(
+        # Hand the producer the main process's log queue explicitly — a spawned child has no
+        # inherited Logger singleton (multiprocessing.Queue survives Process-args pickling).
+        logger_instance = get_logger()
+        log_queue = logger_instance.log_queue if logger_instance is not None else None
+
+        self._process = _MP_CONTEXT.Process(
             target=_producer_main,
-            args=(self._request_queue, self._result_queue, self._params),
+            args=(self._request_queue, self._result_queue, self._params, None, log_queue),
             name="RoundDataProducer",
         )
-        self._process.start()
+
+        # The spawned child re-imports the aetherscan module chain, which includes TF; blank
+        # out GPU visibility for the child's entire process tree so nothing in the producer
+        # can ever initialize CUDA (generation is pure CPU). The parent's TF read this env at
+        # its own GPU init, so temporarily mutating it here is safe.
+        original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            self._process.start()
+        finally:
+            if original_cuda_visible is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
 
         manager = get_manager()
         if manager is not None:
