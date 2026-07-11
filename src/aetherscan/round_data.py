@@ -540,30 +540,36 @@ class RoundDataProducer:
 
     def _drain_results(self) -> None:
         """Drainer thread body: consume producer messages until shutdown-ack or producer death,
-        then sweep any messages still buffered in the queue."""
-        try:
-            while True:
-                try:
-                    message = self._result_queue.get(timeout=1.0)
-                except queue.Empty:
-                    if self._process is None or not self._process.is_alive():
-                        break
-                    continue
-                if message[0] == "shutdown_ack":
-                    break
-                self._handle_message(message)
+        then sweep any messages still buffered in the queue. A failure handling one message
+        (e.g. a DB hiccup on a stats write) must not kill the drainer — done/error messages
+        for in-flight rounds still need to unblock await_round()."""
 
-            # Final sweep: the producer may have exited with messages still in the pipe.
-            while True:
-                try:
-                    message = self._result_queue.get_nowait()
-                except queue.Empty:
+        def _handle_safely(message: tuple) -> None:
+            try:
+                self._handle_message(message)
+            except Exception as e:
+                logger.error(f"RoundDataDrainer failed to handle {message[0]!r} message: {e}")
+
+        while True:
+            try:
+                message = self._result_queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._process is None or not self._process.is_alive():
                     break
-                if message[0] != "shutdown_ack":
-                    self._handle_message(message)
-        except Exception as e:
-            logger.error(f"RoundDataDrainer failed: {e}")
-        finally:
-            with self._condition:
-                self._drainer_done = True
-                self._condition.notify_all()
+                continue
+            if message[0] == "shutdown_ack":
+                break
+            _handle_safely(message)
+
+        # Final sweep: the producer may have exited with messages still in the pipe.
+        while True:
+            try:
+                message = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if message[0] != "shutdown_ack":
+                _handle_safely(message)
+
+        with self._condition:
+            self._drainer_done = True
+            self._condition.notify_all()

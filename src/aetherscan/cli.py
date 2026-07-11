@@ -1279,7 +1279,7 @@ def collect_validation_errors(
                 ValidationError(
                     field="training.num_samples_rf",
                     current=nsr,
-                    message=f"--num-samples-rf must be divisible by 2 for generate_triplet_batch, got {nsr}",
+                    message=f"--num-samples-rf must be divisible by 2 for the balanced true/false halves in data generation, got {nsr}",
                     fix_kind="divisibility",
                     divisor=2,
                 )
