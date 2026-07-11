@@ -275,11 +275,12 @@ def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int)
     if n_windows <= 0:
         return np.empty(0, dtype=np.float64)
 
-    data = np.asarray(channel, dtype=np.float64)
+    # astype always copies, so the in-place shift below can't mutate the caller's array.
     # Shift-invariance guard: subtracting the channel mean leaves every central moment
     # mathematically unchanged while keeping the S2/n - mean**2 style differencing below
     # well conditioned even when the residuals carry a DC offset.
-    data = data - data.mean()
+    data = channel.astype(np.float64)
+    data -= data.mean()
 
     # Per-column power sums over the time axis, accumulated row by row so temporaries stay at
     # (width,) rather than (time_bins, width) x 3.

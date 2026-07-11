@@ -355,9 +355,10 @@ def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> di
                     metadata=metadata,
                 )
 
+                # copy=False: the loader already returns float32; don't duplicate GBs of stamps
                 cadence_data = preprocessor.load_inference_data(
                     override_filepaths=[cadence_result.npy_path]
-                ).astype(np.float32)
+                ).astype(np.float32, copy=False)
 
                 results = pipeline.run_inference(
                     data=cadence_data,
@@ -382,6 +383,12 @@ def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> di
         # Release TF dataset/iterator state once per run, after the loaded models are done
         tf.keras.backend.clear_session()
         logger.info("Cleared TensorFlow session state")
+
+    if totals["n_cadences"] == 0:
+        # Preserve the historical contract: preprocessing producing no stamp .npy at all is
+        # an error (bad paths/catalog), not a legitimate empty result
+        logger.error("No cadence results produced by preprocessing")
+        sys.exit(1)
 
     return totals
 
