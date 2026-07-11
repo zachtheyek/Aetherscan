@@ -48,9 +48,10 @@ jobs:
         if: steps.guard.outputs.already_filed != 'true'
         uses: actions/checkout@v5
         with:
-          # The diff comes from `gh pr diff` (GitHub API), but we also run
-          # utils/print_cli_help.py (contract (a) below) off the checked-out tree, so the
-          # working copy must be present. A shallow checkout is still sufficient.
+          # The diff comes from `gh pr diff` (GitHub API).
+          # We also run utils/print_cli_help.py (contract (a) below) off the checked-out tree,
+          # so the working copy must be present.
+          # A shallow checkout is sufficient.
           fetch-depth: 1
 
       # Contract (a): if this PR touched src/aetherscan/cli.py, the three verbatim argparse
