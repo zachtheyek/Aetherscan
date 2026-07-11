@@ -93,6 +93,8 @@ PYTHONPATH=src python utils/print_cli_help.py all
 
 ## Project Structure
 
+The tree below annotates the **source** layout. For the complete repository structure — root-level build/config files (`pyproject.toml`, `environment.yml`, `aetherscan.def`, `requirements-container.txt`, `.pre-commit-config.yaml`), governance docs (`CLAUDE.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, `AI_POLICY.md`), and the `.claude/` and `.github/` directories — see the Project Structure tree in `CONTRIBUTING.md` (the canonical source).
+
 ```
 src/aetherscan/
 ├── main.py              # Entry point, command dispatch, GPU strategy setup (NCCL + fallback)
