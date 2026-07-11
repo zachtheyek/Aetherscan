@@ -54,6 +54,18 @@ jobs:
           # A shallow checkout is sufficient.
           fetch-depth: 1
 
+      # Pin Python for the regen below: utils/print_cli_help.py emits argparse --help verbatim,
+      # and argparse's help formatting changed in 3.13 (it stopped repeating the metavar for
+      # options with both a short and long form). The project supports 3.10–3.12
+      # (requires-python ">=3.10,<3.13"; conda pins 3.10, the NGC container ships 3.12), across
+      # which the --help output is identical — so pinning keeps the regenerated blocks matching a
+      # local run regardless of whatever default python the runner image happens to ship.
+      - name: Set up Python
+        if: steps.guard.outputs.already_filed != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # Contract (a): if this PR touched src/aetherscan/cli.py, the three verbatim argparse
       # blocks under README.md's `## CLI Reference` have almost certainly drifted. The follow-up
       # @claude PR can't regenerate them itself — `python` is not in claude.yml's tool allowlist —
@@ -100,10 +112,10 @@ jobs:
             AUTHOR: ${{ github.event.pull_request.user.login }}
             MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
             CLI REFERENCE REGENERATED: ${{ steps.cli_help.outputs.cli_changed }}
-              (when 'true', this PR touched cli.py and a prior CI step already regenerated the
-              CLI Reference blocks into cli_help_regenerated.txt at the repo root — read that
-              file and carry the blocks into the issue per contract (a) and Task step 4. When
-              'false' or empty, cli.py was untouched and no regenerated file exists.)
+            (When 'true', this PR touched cli.py and a prior CI step already regenerated the CLI
+            Reference blocks into cli_help_regenerated.txt at the repo root — read that file and
+            carry the blocks into the issue per contract (a) and Task step 4. When 'false' or
+            empty, cli.py was untouched and no regenerated file exists.)
 
             ## Task
             1. First, get the diff of the merged PR:
