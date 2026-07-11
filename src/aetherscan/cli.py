@@ -764,7 +764,7 @@ def _add_inference_flags_to(parser):
         "--parallel-coarse-chans",
         type=int,
         default=None,
-        help="Number of coarse channels to process in parallel per block (default: 28)",
+        help="Progress-logging chunk size for energy detection, in coarse channels per log line (default: the number of worker processes). Parallelism itself comes from the persistent worker pool, not this knob.",
     )
     parser.add_argument(
         "--spline-order",
@@ -795,6 +795,12 @@ def _add_inference_flags_to(parser):
         type=int,
         default=None,
         help="Width in fine channels of the extracted stamp around each hit (default: 4096; must equal --width-bin)",
+    )
+    parser.add_argument(
+        "--store-downsampled-stamps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Downsample stamps along frequency (by --downsample-factor) at extraction time, storing stamp_width // downsample_factor bins per stamp (~8x smaller at defaults; default: enabled). Pass --no-store-downsampled-stamps to archive raw-resolution stamps; loading handles both layouts.",
     )
     parser.add_argument(
         "--overlap-search",
@@ -1130,6 +1136,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.stat_threshold = args.stat_threshold
     if hasattr(args, "stamp_width") and args.stamp_width is not None:
         config.inference.stamp_width = args.stamp_width
+    # store_downsampled_stamps uses argparse.BooleanOptionalAction with default=None so that
+    # the CLI can express "leave the config default" (omit), "force on"
+    # (--store-downsampled-stamps), and "force off" (--no-store-downsampled-stamps)
+    if hasattr(args, "store_downsampled_stamps") and args.store_downsampled_stamps is not None:
+        config.inference.store_downsampled_stamps = args.store_downsampled_stamps
     # overlap_search uses argparse.BooleanOptionalAction with default=None so that
     # the CLI can express "leave the config default" (omit), "force on"
     # (--overlap-search), and "force off" (--no-overlap-search). The `is not None`
@@ -1891,6 +1902,32 @@ def collect_validation_errors(
                         current=group_cols,
                         message="--cadence-group-by-cols must be non-empty when --inference-files is provided",
                         fix_kind="clamp_low",
+                    )
+                )
+            # Downsample-at-extraction stores stamp_width // downsample_factor bins per
+            # stamp, so the division must be exact for the stored width to be well-defined
+            store_ds = _resolve(
+                args, "store_downsampled_stamps", config.inference.store_downsampled_stamps
+            )
+            df_inf = _resolve(args, "downsample_factor", config.data.downsample_factor)
+            if (
+                store_ds
+                and sw_inf is not None
+                and df_inf is not None
+                and df_inf > 0
+                and sw_inf % df_inf != 0
+            ):
+                errors.append(
+                    ValidationError(
+                        field="inference.stamp_width",
+                        current=sw_inf,
+                        message=(
+                            f"--stamp-width ({sw_inf}) must be divisible by "
+                            f"--downsample-factor ({df_inf}) when stamps are downsampled at "
+                            "extraction (--store-downsampled-stamps)"
+                        ),
+                        fix_kind="divisibility",
+                        divisor=df_inf,
                     )
                 )
 

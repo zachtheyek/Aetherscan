@@ -314,12 +314,19 @@ class InferenceConfig:
 
     # NOTE: come back to this later (are these params correct?)
     coarse_channel_width: int = 1048576
-    parallel_coarse_chans: int = 28
+    # Progress-logging chunk size for energy detection (coarse channels per log line).
+    # None -> use manager.n_processes. Parallelism itself comes from the persistent worker
+    # pool (one fused task per coarse channel), not from this knob.
+    parallel_coarse_chans: int | None = None
     spline_order: int = 16
     detection_window_size: int = 256
     detection_step_size: int = 128
     stat_threshold: float = 2048.0
     stamp_width: int = 4096
+    # Downsample stamps along frequency at extraction time (by data.downsample_factor), so
+    # the per-cadence .npy stores stamp_width // downsample_factor bins (~8x smaller at
+    # defaults). Disable to archive raw-resolution stamps; loading handles both layouts.
+    store_downsampled_stamps: bool = True
 
     # NOTE: come back to this later (is overlap search implemented correctly? redo analysis from peter forwards search paper)
     overlap_search: bool = True
@@ -601,6 +608,7 @@ class Config:
                 "detection_step_size": self.inference.detection_step_size,
                 "stat_threshold": self.inference.stat_threshold,
                 "stamp_width": self.inference.stamp_width,
+                "store_downsampled_stamps": self.inference.store_downsampled_stamps,
                 "overlap_search": self.inference.overlap_search,
                 "overlap_fraction": self.inference.overlap_fraction,
                 "discard_side_channels": self.inference.discard_side_channels,
