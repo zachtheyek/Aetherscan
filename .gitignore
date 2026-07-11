@@ -6,6 +6,10 @@
 # Reverse-search paper
 rzad056.pdf
 
+# Local agent-session planning docs (working notes, never published)
+PIPELINE_OPTIMIZATION_HANDOFF.md
+PLAN.md
+
 # Outputs directory
 outputs/
 
