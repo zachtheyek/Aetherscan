@@ -252,7 +252,7 @@ def _add_train_flags_to(parser):
         "--num-replicas",
         type=int,
         default=None,
-        help="Number of GPUs to use for the distributed-inference strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1 and <= the number of physical GPUs on your machine.",
+        help="Number of GPUs to use for the distributed strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1 and <= the number of physical GPUs on your machine.",
     )
     parser.add_argument(
         "--gpu-memory-limit-mb",
@@ -602,7 +602,7 @@ def _add_inference_flags_to(parser):
         "--num-replicas",
         type=int,
         default=None,
-        help="Number of GPUs to use for the distributed-inference strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1 and <= the number of physical GPUs on your machine.",
+        help="Number of GPUs to use for the distributed strategy. If omitted, the strategy uses every GPU visible to TF; otherwise it is restricted to the first N physical GPUs and the rest are left untouched. Must be >= 1 and <= the number of physical GPUs on your machine.",
     )
     parser.add_argument(
         "--gpu-memory-limit-mb",
