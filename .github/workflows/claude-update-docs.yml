@@ -48,9 +48,39 @@ jobs:
         if: steps.guard.outputs.already_filed != 'true'
         uses: actions/checkout@v5
         with:
-          # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
-          # in the allowlist, so a shallow checkout is sufficient.
+          # The diff comes from `gh pr diff` (GitHub API), but we also run
+          # utils/print_cli_help.py (contract (a) below) off the checked-out tree, so the
+          # working copy must be present. A shallow checkout is still sufficient.
           fetch-depth: 1
+
+      # Contract (a): if this PR touched src/aetherscan/cli.py, the three verbatim argparse
+      # blocks under README.md's `## CLI Reference` have almost certainly drifted. The follow-up
+      # @claude PR can't regenerate them itself — `python` is not in claude.yml's tool allowlist —
+      # so do it HERE: this runner has Python and utils/print_cli_help.py is stdlib-only. The
+      # output is written to cli_help_regenerated.txt for the Claude step below to embed verbatim
+      # in the issue, so the follow-up only pastes, never runs anything. No-op if cli.py is
+      # untouched. This is a plain shell step, so it isn't bound by the Claude tool allowlist.
+      - name: Regenerate CLI Reference blocks if cli.py changed
+        id: cli_help
+        if: steps.guard.outputs.already_filed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Capture the file list first (don't pipe gh into `grep -q`: under the default
+          # `bash -eo pipefail`, grep's early exit can SIGPIPE gh and mark the pipeline failed
+          # even on a match). The here-string keeps grep out of a pipeline with gh.
+          CHANGED_FILES="$(gh pr diff "$PR_NUMBER" --name-only)"
+          if grep -qxF "src/aetherscan/cli.py" <<< "$CHANGED_FILES"; then
+            echo "cli.py changed — regenerating CLI Reference blocks."
+            PYTHONPATH=src python utils/print_cli_help.py all > cli_help_regenerated.txt
+            echo "cli_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Wrote $(wc -l < cli_help_regenerated.txt) lines to cli_help_regenerated.txt"
+          else
+            echo "cli.py not in this PR's diff — skipping CLI Reference regeneration."
+            echo "cli_changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run Claude Documentation Analysis
         if: steps.guard.outputs.already_filed != 'true'
@@ -68,6 +98,11 @@ jobs:
             PR BODY: ${{ github.event.pull_request.body }}
             AUTHOR: ${{ github.event.pull_request.user.login }}
             MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+            CLI REFERENCE REGENERATED: ${{ steps.cli_help.outputs.cli_changed }}
+              (when 'true', this PR touched cli.py and a prior CI step already regenerated the
+              CLI Reference blocks into cli_help_regenerated.txt at the repo root — read that
+              file and carry the blocks into the issue per contract (a) and Task step 4. When
+              'false' or empty, cli.py was untouched and no regenerated file exists.)
 
             ## Task
             1. First, get the diff of the merged PR:
@@ -99,19 +134,20 @@ jobs:
                    ### Train Command Help, ### Inference Command Help) are pasted
                    verbatim argparse output. If `cli.py` changed in this PR — flags
                    added/removed/renamed, help strings edited, subparsers added or
-                   dropped — those blocks have almost certainly drifted. The follow-up
-                   PR must regenerate them by running, from the repo root:
-
-                       PYTHONPATH=src python utils/print_cli_help.py all
-
-                   The script (utils/print_cli_help.py) does not require TensorFlow
-                   or the conda env — it imports only aetherscan.config and
-                   aetherscan.cli, both pure-stdlib modules. It pins COLUMNS=80 so
-                   line wrapping is deterministic. The output is three blocks
-                   separated by blank lines: top-level, then train, then inference.
-                   Each block goes verbatim into the matching `### ... Help` code
-                   block in README.md. Preserve each subsection's intro paragraph
-                   (which contains the "Regenerate this output with ..." hint).
+                   dropped — those blocks have almost certainly drifted. Because the
+                   follow-up @claude PR can't run Python (it's not in that workflow's
+                   tool allowlist), a prior CI step in THIS workflow has already
+                   regenerated the canonical help for you: when CLI REFERENCE
+                   REGENERATED is 'true', the output is in cli_help_regenerated.txt at
+                   the repo root — produced by `PYTHONPATH=src python
+                   utils/print_cli_help.py all` (stdlib-only; pins COLUMNS=80 so line
+                   wrapping is deterministic). It is three blocks separated by blank
+                   lines: top-level, then train, then inference. Read that file and
+                   paste each block VERBATIM into the issue (Task step 4) so the
+                   follow-up PR can drop them straight into the matching `### ... Help`
+                   code block in README.md — preserving each subsection's intro
+                   paragraph (the "Regenerate this output with ..." hint) — without
+                   running anything itself.
 
                (b) README.md + CONTRIBUTING.md + SECURITY.md + KNOWN_ISSUES.md + docs/* ↔ CLAUDE.md +
                    .claude/skills/aetherscan-repo-context/SKILL.md.
@@ -145,14 +181,24 @@ jobs:
                    rules, secrets-management / token-rotation / vulnerability-reporting
                    guidance, known issues / limitations / workarounds, or the
                    existence / location / section anchors of any doc they link to — then
-                   CLAUDE.md and the SKILL.md skill have very likely drifted. The
-                   follow-up PR must reconcile BOTH files against the updated canonical
-                   docs: update the affected lines (keeping CLAUDE.md lean — < 200 lines,
-                   essentials only — and putting any multi-step or part-specific detail in
-                   the on-demand SKILL.md skill), and do not introduce facts that contradict the
-                   canonical docs. A change confined entirely to source code (no edit to
-                   any canonical doc) does not trigger this contract on its own — but if
-                   it makes a statement in either file factually wrong, flag that too.
+                   CLAUDE.md and the SKILL.md skill have very likely drifted. BOTH files
+                   must then be reconciled against the updated canonical docs — updating
+                   the affected lines (keeping CLAUDE.md lean — < 200 lines, essentials
+                   only — and putting any multi-step or part-specific detail in the
+                   on-demand SKILL.md skill), without introducing facts that contradict
+                   the canonical docs. HOW each reconciliation is applied differs by
+                   writability — see the write-access constraint below. A change confined
+                   entirely to source code (no edit to any canonical doc) does not trigger
+                   this contract on its own — but if it makes a statement in either file
+                   factually wrong, flag that too.
+
+                   Write-access constraint (drives HOW Task step 4 routes the two files):
+                   CLAUDE.md sits at the repo root and is writable, but the SKILL.md skill
+                   lives under .claude/, which Claude Code's security model makes read-only
+                   in CI — so the follow-up @claude PR can reconcile CLAUDE.md directly but
+                   CANNOT write SKILL.md. Step 4 therefore routes SKILL.md changes to a
+                   human: the issue must spell out the exact SKILL.md edits, and the
+                   follow-up PR carries them verbatim for the code owner to apply locally.
 
             4. If documentation updates are needed:
                - A deterministic pre-step already confirmed no doc issue exists for THIS PR
@@ -169,23 +215,47 @@ jobs:
                  - Specific files that need updates
                  - Suggested changes or additions
                  - Tag @claude with instructions to open a PR linking to this issue with the specified updates
-                 - If the changes touched `src/aetherscan/cli.py`, include the exact
-                   regen recipe in the issue body so the follow-up PR has a
-                   deterministic command to run:
-                       PYTHONPATH=src python utils/print_cli_help.py all
-                   …and explicitly instruct the follow-up to replace each of the
-                   three code blocks under README.md's `## CLI Reference` section
-                   verbatim with the matching output (top → ### Top-Level Help,
-                   train → ### Train Command Help, inference → ### Inference
-                   Command Help), keeping each subsection's intro paragraph intact.
+                 - If CLI REFERENCE REGENERATED is 'true' (this PR touched
+                   `src/aetherscan/cli.py`), read the pre-generated
+                   cli_help_regenerated.txt at the repo root and paste its three blocks
+                   VERBATIM into the issue body under a clearly delimited
+                   `### Regenerated CLI Reference (paste verbatim into README.md)`
+                   section, each block in its own fenced code block. Explicitly instruct
+                   the follow-up PR to replace each of the three code blocks under
+                   README.md's `## CLI Reference` section verbatim with the matching
+                   block (top → ### Top-Level Help, train → ### Train Command Help,
+                   inference → ### Inference Command Help), keeping each subsection's
+                   intro paragraph intact. The follow-up runs no command — the blocks are
+                   already regenerated and carried in this issue.
                  - If the changes touched any canonical doc in contract (b) above
                    (README.md, CONTRIBUTING.md, SECURITY.md, KNOWN_ISSUES.md, or docs/*),
-                   explicitly instruct the follow-up PR to reconcile BOTH CLAUDE.md and
-                   .claude/skills/aetherscan-repo-context/SKILL.md against the updated canonical
-                   docs — listing the specific shared facts that changed — and to keep
-                   CLAUDE.md lean (< 200 lines, essentials only) while pushing any
-                   multi-step or part-specific detail into the on-demand SKILL.md skill,
-                   without contradicting the canonical docs.
+                   split the reconciliation by writability (see the write-access
+                   constraint under contract (b) above):
+                   - CLAUDE.md (repo root, writable): explicitly instruct the follow-up
+                     PR to reconcile it directly against the updated canonical docs —
+                     listing the specific shared facts that changed — keeping it lean
+                     (< 200 lines, essentials only) and pushing any multi-step or
+                     part-specific detail toward the SKILL.md skill, without
+                     contradicting the canonical docs.
+                   - .claude/skills/aetherscan-repo-context/SKILL.md (read-only in CI):
+                     the follow-up PR CANNOT edit it, so THIS issue must spell out the
+                     EXACT edits under a clearly delimited
+                     `### SKILL.md edits (apply manually — .claude/ is read-only in CI)`
+                     section — give each as old → new text (or a precise insert/delete
+                     with enough surrounding context to apply unambiguously). Then
+                     explicitly instruct the follow-up @claude PR to:
+                       1. NOT attempt to modify SKILL.md;
+                       2. copy those exact SKILL.md edits VERBATIM into its PR body,
+                          followed by step-by-step instructions for a human to apply them
+                          — check out the PR branch locally (`gh pr checkout <PR#>`), make
+                          the listed edits to
+                          .claude/skills/aetherscan-repo-context/SKILL.md, commit, and
+                          push back to the branch for review & merge;
+                       3. tag the code owner of that path per CODEOWNERS (currently
+                          `@zachtheyek`) in the PR body to perform that local apply.
+                     If ONLY SKILL.md needs changing (CLAUDE.md is unaffected), the
+                     follow-up still opens the PR solely to carry the verbatim SKILL.md
+                     edits and the human-apply steps, tagging the code owner.
 
             5. If no documentation updates are needed, do not create an issue.
                Only create an issue if there are meaningful documentation gaps.
@@ -200,7 +270,7 @@ jobs:
             - `gh issue create` to file a new `[DOCUMENTATION]: <…>` issue tagging @claude when meaningful doc gaps are identified
 
             Code exploration:
-            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, and any source files referenced by the source ↔ doc contracts above
+            - `Read`, `Glob`, `Grep` to inspect README.md, CLAUDE.md, .claude/skills/aetherscan-repo-context/SKILL.md, CONTRIBUTING.md, KNOWN_ISSUES.md, SECURITY.md, docs/*, CODEOWNERS (to identify the code owner to tag for SKILL.md edits), the pre-generated cli_help_regenerated.txt (present only when CLI REFERENCE REGENERATED is 'true'), and any source files referenced by the source ↔ doc contracts above
 
             ## Guidelines
             - Be specific about what documentation changes are required.
