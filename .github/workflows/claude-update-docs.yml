@@ -264,11 +264,15 @@ jobs:
                    cli_help_regenerated.txt — a later CI step automatically appends the
                    regenerated blocks (under a `### Regenerated CLI Reference` heading) to
                    the issue you file. Just state that README's `## CLI Reference` blocks
-                   drifted, and explicitly instruct the follow-up PR to replace each of the
-                   three code blocks under that section verbatim with the matching appended
-                   block (top → ### Top-Level Help, train → ### Train Command Help,
-                   inference → ### Inference Command Help), keeping each subsection's intro
-                   paragraph intact and running no command.
+                   drifted, and explicitly instruct the follow-up PR to do a STRICT,
+                   WHOLESALE replacement: delete the entire body of each of the three code
+                   blocks under that section and replace it with the matching appended block
+                   as-is (top → ### Top-Level Help, train → ### Train Command Help,
+                   inference → ### Inference Command Help). It must NOT hand-edit, cherry-pick
+                   individual flags/lines, or diff against the old block — the appended block
+                   is canonical and replaces the whole thing verbatim, so no drift (e.g. a
+                   second added flag) can be missed. Keep each subsection's intro paragraph
+                   intact and run no command.
                  - If the changes touched any canonical doc in contract (b) above
                    (README.md, CONTRIBUTING.md, SECURITY.md, KNOWN_ISSUES.md, or docs/*),
                    split the reconciliation by writability (see the write-access
@@ -362,9 +366,11 @@ jobs:
               '' \
               'Canonical `argparse` output for this PR, regenerated deterministically by CI.' \
               'The fenced block below holds the three sections in order — split on each' \
-              '`usage:` line: top-level, then `train`, then `inference`. Replace the matching' \
-              '`### Top-Level Help`, `### Train Command Help`, and `### Inference Command Help`' \
-              'code blocks in README.md with the corresponding section, verbatim.' \
+              '`usage:` line: top-level, then `train`, then `inference`. For each, do a' \
+              'strict WHOLESALE replacement: delete the ENTIRE body of the matching README' \
+              'block (`### Top-Level Help`, `### Train Command Help`, `### Inference Command' \
+              'Help`) and paste the corresponding section as-is — do NOT hand-edit or' \
+              'cherry-pick individual flags/lines; replace the whole block verbatim.' \
               '' \
               '````'
             cat cli_help_regenerated.txt
