@@ -10,7 +10,10 @@ so per-test instances don't accumulate process-global state.
 from __future__ import annotations
 
 import atexit
+import multiprocessing
+import signal
 import sys
+import time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
@@ -137,3 +140,62 @@ class TestCleanupAll:
         manager.create_shared_memory(size=512, name="shm")
         manager.cleanup_all()
         assert manager.stats.cleanup_time_seconds >= 0.0
+
+
+def _sleep_target(ready_event):
+    """Process target that just idles (module-level so spawn-based platforms can pickle it)."""
+    ready_event.set()
+    time.sleep(60)
+
+
+def _sigterm_ignoring_target(ready_event):
+    """Process target that ignores SIGTERM, forcing the kill escalation path."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready_event.set()
+    time.sleep(60)
+
+
+def _start_process(target):
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(target=target, args=(ready,))
+    process.start()
+    assert ready.wait(timeout=30)  # don't race the target's signal-handler setup
+    return process
+
+
+class TestProcessTracking:
+    def test_register_and_close_process(self, manager):
+        process = _start_process(_sleep_target)
+        manager.register_process(process, name="test-process")
+        assert manager.stats.processes_active == 1
+
+        manager.close_process(process)
+        assert not process.is_alive()
+        assert manager.stats.processes_active == 0
+        assert manager.stats.processes_closed == 1
+        assert manager._processes == []
+
+    def test_close_process_twice_is_safe(self, manager):
+        process = _start_process(_sleep_target)
+        manager.register_process(process, name="test-process")
+        manager.close_process(process)
+        manager.close_process(process)  # logs a warning; must not raise or double-count
+        assert manager.stats.processes_closed == 1
+
+    def test_close_escalates_to_kill_when_sigterm_ignored(self, manager):
+        process = _start_process(_sigterm_ignoring_target)
+        manager.register_process(process, name="stubborn-process")
+        managed = manager._processes[0]
+        managed.close(timeout=1.0)  # SIGTERM is ignored -> join times out -> SIGKILL
+        assert managed.closed is True
+        process.join(timeout=10)
+        assert not process.is_alive()
+
+    def test_managed_process_close_on_dead_process_is_clean(self, manager):
+        process = _start_process(_sleep_target)
+        manager.register_process(process, name="test-process")
+        process.terminate()
+        process.join(timeout=10)
+        # Closing an already-dead process must succeed without escalation
+        manager.close_process(process)
+        assert manager.stats.processes_closed == 1
