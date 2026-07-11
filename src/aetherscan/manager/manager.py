@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+import multiprocessing
 import os
 import signal
 import sys
@@ -35,10 +36,64 @@ class ResourceStats:
 
     pools_active: int = 0
     pools_closed: int = 0
+    processes_active: int = 0
+    processes_closed: int = 0
     shared_memories_active: int = 0
     shared_memories_cleaned: int = 0
     total_memory_freed_gb: float = 0.0
     cleanup_time_seconds: float = 0.0
+
+
+@dataclass
+class ManagedProcess:
+    """Wrapper for a tracked multiprocessing.Process (e.g. the RoundDataProducer)"""
+
+    process: multiprocessing.Process
+    name: str
+    created_at: float
+    closed: bool = False
+
+    def close(self, timeout):
+        """Close the process with terminate -> join -> kill escalation (mirrors ManagedPool.close)"""
+        if self.closed:
+            return
+
+        try:
+            if self.process.is_alive():
+                logger.info(f"Terminating process '{self.name}' (PID {self.process.pid})")
+
+                # SIGTERM first: the process's handler gets a chance to clean up (e.g. the
+                # producer terminates its own worker pool before dying)
+                self.process.terminate()
+                self.process.join(timeout)
+
+                if self.process.is_alive():
+                    logger.warning(f"Process '{self.name}' survived SIGTERM, escalating to SIGKILL")
+                    # SIGKILL gives the process no chance to reap its own children (e.g. the
+                    # producer's pool workers), so kill any survivors in its subtree first —
+                    # otherwise they'd be orphaned and keep running
+                    with contextlib.suppress(Exception):
+                        for child in psutil.Process(self.process.pid).children(recursive=True):
+                            with contextlib.suppress(psutil.NoSuchProcess):
+                                child.kill()
+                    self.process.kill()
+                    self.process.join(timeout)
+
+                    if self.process.is_alive():
+                        # Surviving SIGKILL is extremely rare (uninterruptible sleep state 'D').
+                        # Log and proceed — the OS will clean up on exit
+                        logger.error(
+                            f"Process '{self.name}' survived SIGKILL (uninterruptible state?)"
+                        )
+
+            self.closed = True
+            logger.info(f"Process '{self.name}' closed")
+
+        except Exception as e:
+            logger.warning(f"Error terminating process '{self.name}': {e}")
+            with contextlib.suppress(Exception):
+                self.process.kill()
+            self.closed = True
 
 
 @dataclass
@@ -305,6 +360,7 @@ class ResourceManager:
         # NOTE: should these be strong or weak references? import weakref ...
         # Track resources
         self._pools: list[ManagedPool] = []
+        self._processes: list[ManagedProcess] = []
         self._shared_memories: list[ManagedSharedMemory] = []
 
         # Track threads
@@ -409,11 +465,13 @@ class ResourceManager:
         """
         Unified cleanup of all resources.
         Strict order:
-            1. Pools
-            2. SharedMemory
-            3. Monitor
-            4. DB
-            5. Logger
+            1. Processes (before shared memory — e.g. the producer's workers attach to the
+               background-plate block)
+            2. Pools
+            3. SharedMemory
+            4. Monitor
+            5. DB
+            6. Logger
         """
         # Skip if not main process
         if os.getpid() != self._main_process_pid:
@@ -438,6 +496,12 @@ class ResourceManager:
         # Log initial stats
         start_time = time.time()
         initial_memory = self._get_memory_usage()
+
+        # Close managed processes
+        logger.info("Closing managed processes...")
+        for managed in list(self._processes):
+            if not managed.closed:
+                self._close_managed_process(managed)
 
         # Close managed pools
         logger.info("Closing multiprocessing pools...")
@@ -486,6 +550,7 @@ class ResourceManager:
         logger.info("=" * 60)
         logger.info("ResourceManager cleanup complete:")
         logger.info(f"  Pools closed: {self.stats.pools_closed}")
+        logger.info(f"  Processes closed: {self.stats.processes_closed}")
         logger.info(f"  Shared memories cleaned: {self.stats.shared_memories_cleaned}")
         logger.info(f"  Memory freed: {self.stats.total_memory_freed_gb:.2f} GB")
         logger.info(f"  Cleanup time: {self.stats.cleanup_time_seconds:.2f} seconds")
@@ -547,6 +612,35 @@ class ResourceManager:
         self._pools.remove(managed)
         self.stats.pools_active -= 1
         self.stats.pools_closed += 1
+
+    def register_process(self, process: multiprocessing.Process, name: str = "unnamed"):
+        """
+        Register an externally-created multiprocessing.Process (e.g. the RoundDataProducer)
+        for lifecycle tracking, so cleanup_all() can escalate terminate -> join -> kill on it.
+        """
+        managed = ManagedProcess(process=process, name=name, created_at=time.time())
+
+        self._processes.append(managed)
+        self.stats.processes_active += 1
+
+        logger.info(f"Registered process '{name}' (PID {process.pid})")
+        logger.info(f"  Current total active: {self.stats.processes_active}")
+
+    def close_process(self, process: multiprocessing.Process):
+        """Explicitly close a specific tracked process by reference"""
+        for managed in self._processes:
+            if managed.process is process and not managed.closed:
+                self._close_managed_process(managed)
+                return
+        logger.warning("ResourceManager.close_process(): Process not found in managed processes")
+
+    def _close_managed_process(self, managed: ManagedProcess):
+        """Internal method to close a ManagedProcess"""
+        managed.close(timeout=self.config.manager.pool_terminate_timeout)
+        # Remove from tracking list to allow garbage collection of the Process object
+        self._processes.remove(managed)
+        self.stats.processes_active -= 1
+        self.stats.processes_closed += 1
 
     def create_shared_memory(self, size: int, name: str = "unnamed") -> SharedMemory:
         """
