@@ -190,7 +190,10 @@ Aetherscan/
 │       ├── __init__.py         # Manager exports
 │       └── manager.py          # Resource lifecycle management
 ├── docs/                       # Documentation (placeholder; no docs yet)
-├── tests/                      # Test suite (placeholder; no tests yet)
+├── tests/                      # Pytest suite (see Testing section below)
+│   ├── conftest.py                  # Singleton-reset fixtures, tmp paths, synthetic data factories
+│   ├── unit/                        # Fast, hardware-independent unit tests (run in CI)
+│   └── integration/                 # gpu+cluster-marked end-to-end smoke tests
 ├── utils/                      # Utility scripts
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
 │   ├── find_optimal_configs.py      # Per-host config helper
@@ -510,9 +513,43 @@ Prefer descriptive, full-word names: `num_training_rounds`, `per_replica_batch_s
 
 ## Testing
 
-> [!WARNING]
->
-> # TODO: update this section once test suite is operational
+The test suite lives in `tests/` and runs on [pytest](https://docs.pytest.org/) (configured in `pyproject.toml` under `[tool.pytest.ini_options]` — `pythonpath = ["src"]` makes `import aetherscan` work without a `PYTHONPATH` prefix).
+
+### Running the suite
+
+```bash
+# Default selection — everything that doesn't need GPUs or cluster-resident data.
+# This is exactly what CI runs (.github/workflows/tests.yml).
+pytest -m "not gpu and not cluster" -q
+
+# Cluster integration smokes (end-to-end train + CSV inference), inside the NGC container:
+./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
+
+# A single file / test while iterating:
+pytest tests/unit/test_config.py -q
+pytest tests/unit/test_db.py::TestFlushSentinel -q
+```
+
+### Markers
+
+| Marker        | Meaning                                                                                     |
+| ------------- | ------------------------------------------------------------------------------------------- |
+| `slow`        | Slower tests (e.g. builds TF graphs on CPU); still included in the default CI selection      |
+| `gpu`         | Requires one or more physical GPUs; excluded from CI                                         |
+| `cluster`     | Requires cluster-resident data/models (blpc3/bla0); excluded from CI                         |
+| `integration` | End-to-end pipeline runs; skips the per-test singleton/env isolation fixture in `conftest.py` |
+
+### Test environment & fixtures
+
+- Every non-integration test runs isolated: `tests/conftest.py` points `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` at a pytest `tmp_path`, resets all singletons (`Config`, `ResourceManager`, `Database`, `Logger`, `ResourceMonitor`) via their `_reset()` hooks, and re-runs `init_config()` — so tests never touch real data or leak state into each other.
+- Synthetic data factories are provided as fixtures: `make_background_npy` (tiny background plates), `make_h5_observation` (tiny filterbank-style `.h5` files), and `make_inference_csv` (tiny cadence-grouping CSVs).
+- CI (`.github/workflows/tests.yml`) runs the default selection on Ubuntu with `tensorflow-cpu==2.17.*` + the pins from `requirements-container.txt`, on Python 3.10 and 3.12 (the conda and container runtimes respectively). A few tests assert Linux-only behavior (e.g. PSS-based memory accounting) and self-skip elsewhere.
+
+### Writing tests
+
+- Every PR that adds or changes logic should ship unit tests for it (`tests/unit/`), reusing the conftest fixtures rather than instantiating singletons directly.
+- Mark anything that needs hardware or cluster data with the appropriate marker so the default selection stays runnable on a laptop and in CI.
+- Test style follows the same ruff lint+format rules as `src/` (pre-commit runs on `tests/` too).
 
 ---
 

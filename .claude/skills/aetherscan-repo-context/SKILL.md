@@ -114,7 +114,10 @@ utils/                   # fetch_run_outputs.sh, find_optimal_configs.py,
                          # run_container.sh, start_tmux_session.sh,
                          # verify_train_test_files.py
 docs/                    # GPU_RUNTIME_GUIDE.md, CONFIG_AND_CLI.md, README.md, assets/
-tests/                   # Placeholder — no test suite yet
+tests/                   # Pytest suite: conftest.py (singleton-reset fixtures, synthetic
+                         # data factories), unit/, integration/ (gpu+cluster-marked smokes).
+                         # Default selection: pytest -m "not gpu and not cluster" -q
+                         # (runs in CI via .github/workflows/tests.yml); see CONTRIBUTING.md
 ```
 
 ---

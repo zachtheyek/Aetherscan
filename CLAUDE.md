@@ -4,7 +4,7 @@ Always-on, bare-essentials rules for any coding agent in this repo. The full dee
 
 ## Project
 
-Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Beta-VAE → Random Forest), single-node multi-GPU distributed train/inference. Sole entry point: `src/aetherscan/main.py`. `tests/` is a placeholder — **no test suite yet**, so don't claim `pytest` passes; verify changes another way and say how.
+Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Beta-VAE → Random Forest), single-node multi-GPU distributed train/inference. Sole entry point: `src/aetherscan/main.py`. Pytest suite lives in `tests/` (unit + cluster-marked integration; see [CONTRIBUTING.md](CONTRIBUTING.md#testing)) — run it before claiming a change works, and ship unit tests with new logic.
 
 ## Run / lint
 
@@ -15,6 +15,8 @@ Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Bet
 PYTHONPATH=src python -m aetherscan.main {train|inference} --save-tag final_v1
 # Lint + format (also enforced via pre-commit)
 ruff check src/ && ruff format src/
+# Tests (default selection = what CI runs; gpu/cluster-marked tests need a cluster)
+pytest -m "not gpu and not cluster" -q
 ```
 
 ## Hard rules (don't break these)
