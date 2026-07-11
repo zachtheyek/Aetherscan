@@ -13,18 +13,14 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import subprocess
-import sys
 
 import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.cluster]
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_TIMEOUT_SECONDS = 7200
-
-# The §known-good blpc3 smoke config: defaults are only divisible for 4 or 6 replicas, so the
-# batch/sample geometry is overridden to divide for 5.
+# The known-good blpc3 smoke config: repo defaults are only divisible for 4 or 6 replicas, so
+# the batch/sample geometry is overridden to divide for 5. Mirrored (as the subject under
+# test) by _SMOKE_FLAGS_5_REPLICAS in tests/unit/test_cli_validation.py — keep in sync.
 _SMOKE_FLAGS = [
     "--max-retries",
     "1",
@@ -47,10 +43,6 @@ _SMOKE_FLAGS = [
 ]
 
 
-def _env_path(var, default):
-    return os.environ.get(var, default)
-
-
 def _next_test_tag(model_path: str) -> str:
     """Scan existing artifacts for test_vNN tags and return the next unused one — reusing a
     tag causes stale-artifact confusion."""
@@ -65,32 +57,17 @@ def _next_test_tag(model_path: str) -> str:
     return f"test_v{max(versions) + 1}"
 
 
-def test_train_smoke():
+def test_train_smoke(cluster_paths, run_pipeline):
     if shutil.which("nvidia-smi") is None:
         pytest.skip("requires a GPU host (nvidia-smi not found)")
 
-    data_path = _env_path("AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan")
-    model_path = _env_path("AETHERSCAN_MODEL_PATH", "/datax/scratch/zachy/models/aetherscan")
-    output_path = _env_path("AETHERSCAN_OUTPUT_PATH", "/datax/scratch/zachy/outputs/aetherscan")
+    data_path, model_path, output_path = cluster_paths
     if not os.path.isdir(os.path.join(data_path, "training")):
         pytest.skip(f"training data not found under {data_path}")
 
     tag = _next_test_tag(model_path)
-    cmd = [sys.executable, "-m", "aetherscan.main", "train", "--save-tag", tag, *_SMOKE_FLAGS]
+    proc = run_pipeline(["train", "--save-tag", tag, *_SMOKE_FLAGS])
 
-    env = dict(os.environ)
-    src = os.path.join(_REPO_ROOT, "src")
-    env["PYTHONPATH"] = src + os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else src
-
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        cwd=_REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=_TIMEOUT_SECONDS,
-    )
     tail = "\n".join(proc.stdout.splitlines()[-40:])
     assert proc.returncode == 0, f"train smoke run failed (tag={tag}); last output:\n{tail}"
     assert "Training completed successfully!" in proc.stdout

@@ -20,6 +20,8 @@ from aetherscan.cli import (
 from aetherscan.config import get_config
 
 # The blpc3 smoke config from the repo's known-good runbook: divisible for exactly 5 replicas.
+# Mirrored by _SMOKE_FLAGS in tests/integration/test_train_smoke.py (which runs it for real on
+# the cluster) — keep the two in sync.
 _SMOKE_FLAGS_5_REPLICAS = [
     "--per-replica-batch-size",
     "4",

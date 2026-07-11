@@ -71,10 +71,23 @@ class TestFlushSentinel:
         database = Database()  # never started
         assert database.flush(timeout=1) is True
 
-    def test_flush_after_stop_event_set_returns_false(self, db):
-        db.stop_event.set()
-        assert db.flush(timeout=1) is False
-        db.stop_event.clear()  # let the fixture's stop() proceed normally
+    def test_flush_during_shutdown_returns_false(self, db):
+        # Deterministic shutdown-in-progress simulation: setting stop_event on the *live*
+        # writer races (the thread may exit before flush() checks it, flipping the result
+        # to True via the not-running branch). Stop the real writer first, then stand in an
+        # always-alive stub so flush() deterministically hits the stop_event check.
+        class _AliveStub:
+            @staticmethod
+            def is_alive():
+                return True
+
+        db.stop()
+        db.writer_thread = _AliveStub()
+        db.stop_event.set()  # stop() already set it; explicit for the reader
+        try:
+            assert db.flush(timeout=1) is False
+        finally:
+            db.writer_thread = None  # let the fixture's stop() no-op cleanly
 
 
 class TestExecutemanyBatching:
@@ -197,6 +210,11 @@ class TestQueryFiltersAndWhitelists:
             self.db.query_system_resource(columns=["round_number"])
 
     def test_empty_list_filter_matches_everything(self):
+        # NOTE: this documents CURRENT behavior, not desired behavior — an empty IN-list is
+        # treated as "no filter" (the `if tag:` gate in every query_* skips falsy values), so
+        # a caller passing a filtered-to-empty list gets the whole table instead of no rows.
+        # If query_* semantics are ever fixed to "empty list matches nothing", update this
+        # test deliberately rather than treating the failure as a regression.
         assert len(self.db.query_training_stat(tag=[])) == 6
 
     def test_confidence_bounds_on_inference_results(self):

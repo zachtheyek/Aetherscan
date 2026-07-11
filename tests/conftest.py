@@ -10,6 +10,11 @@ Provides three things:
 3. A headless matplotlib backend for CI (set before any aetherscan module imports pyplot).
 """
 
+# TODO: integration tests that verify clean shutdown under adverse conditions
+#       (SIGTERM/SIGINT mid-run, resource cleanup) — carried over from the old tests/placeholder
+# TODO: build tests that tagged releases deploy properly to various environments
+#       (PyPI, HuggingFace, etc.) once release engineering lands — carried over from placeholder
+
 from __future__ import annotations
 
 import contextlib
@@ -183,9 +188,11 @@ def make_inference_csv(tmp_path):
     """Factory for tiny inference CSVs in the cadence-grouping layout.
 
     Returns a callable(filename, groups) -> Path. `groups` is a list of (key_dict, h5_paths)
-    pairs; each h5 path becomes one row carrying the group's key columns. Column names default
-    to InferenceConfig.cadence_group_by_cols + cadence_h5_path_col.
+    pairs; each h5 path becomes one row carrying the group's key columns. The h5-path column
+    name is read from InferenceConfig.cadence_h5_path_col on the initialized singleton, and
+    the default group keys mirror InferenceConfig.cadence_group_by_cols.
     """
+    from aetherscan.config import get_config  # noqa: PLC0415
 
     def _make(filename="subset.csv", groups=None):
         if groups is None:
@@ -201,7 +208,8 @@ def make_inference_csv(tmp_path):
                     [f"/data/obs_{i}.h5" for i in range(6)],
                 )
             ]
-        fieldnames = list(groups[0][0].keys()) + [".h5 path"]
+        h5_col = get_config().inference.cadence_h5_path_col
+        fieldnames = list(groups[0][0].keys()) + [h5_col]
         path = tmp_path / "data" / "inference" / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="") as f:
@@ -209,7 +217,7 @@ def make_inference_csv(tmp_path):
             writer.writeheader()
             for key_dict, h5_paths in groups:
                 for h5 in h5_paths:
-                    writer.writerow({**key_dict, ".h5 path": h5})
+                    writer.writerow({**key_dict, h5_col: h5})
         return path
 
     return _make

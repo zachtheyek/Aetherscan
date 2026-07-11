@@ -147,7 +147,9 @@ class TestSamplingLayer:
 class TestEncoderDecoderSymmetry:
     """Builds the full Beta-VAE graph on CPU — slow but CI-safe."""
 
-    def test_encoder_decoder_shapes_mirror(self):
+    def test_symmetry_and_forward_pass(self):
+        import tensorflow as tf  # noqa: PLC0415
+
         from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
 
         vae = create_beta_vae_model()
@@ -164,16 +166,7 @@ class TestEncoderDecoderSymmetry:
         assert vae.decoder.input_shape == (None, latent_dim)
         assert vae.decoder.output_shape == vae.encoder.input_shape
 
-    def test_forward_pass_round_trips_cadence_shape(self):
-        import tensorflow as tf  # noqa: PLC0415
-
-        from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
-
-        vae = create_beta_vae_model()
-        config = get_config()
-        latent_dim = config.beta_vae.latent_dim
-        dense_size = config.beta_vae.dense_layer_size
-
+        # Forward pass round-trips the cadence shape (same graph — built once per test run).
         batch = tf.random.uniform((2, 6, 16, dense_size))
         reconstruction, z_mean, z_log_var, z = vae(batch, training=False)
         assert reconstruction.shape == (2, 6, 16, dense_size)

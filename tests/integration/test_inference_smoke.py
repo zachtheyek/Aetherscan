@@ -16,31 +16,21 @@ from __future__ import annotations
 import glob
 import os
 import shutil
-import subprocess
-import sys
 from datetime import datetime
 
 import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.cluster]
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_TIMEOUT_SECONDS = 7200
 _MODEL_TAG = "test_v17"  # persisted dummy model on blpc3
 _CSV_NAME = "subset_test.csv"  # 2 complete 6-observation cadences
 
 
-def _env_path(var, default):
-    return os.environ.get(var, default)
-
-
-def test_inference_smoke():
+def test_inference_smoke(cluster_paths, run_pipeline):
     if shutil.which("nvidia-smi") is None:
         pytest.skip("requires a GPU host (nvidia-smi not found)")
 
-    data_path = _env_path("AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan")
-    model_path = _env_path("AETHERSCAN_MODEL_PATH", "/datax/scratch/zachy/models/aetherscan")
-    output_path = _env_path("AETHERSCAN_OUTPUT_PATH", "/datax/scratch/zachy/outputs/aetherscan")
+    data_path, model_path, output_path = cluster_paths
 
     encoder = os.path.join(model_path, f"vae_encoder_{_MODEL_TAG}.keras")
     rf = os.path.join(model_path, f"random_forest_{_MODEL_TAG}.joblib")
@@ -56,38 +46,24 @@ def test_inference_smoke():
         pytest.skip("/datag not mounted and no preprocessed subset stamps to resume from")
 
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cmd = [
-        sys.executable,
-        "-m",
-        "aetherscan.main",
-        "inference",
-        "--encoder-path",
-        encoder,
-        "--rf-path",
-        rf,
-        "--config-path",
-        saved_config,
-        "--inference-files",
-        _CSV_NAME,
-        "--save-tag",
-        tag,
-        "--max-retries",
-        "1",
-    ]
-
-    env = dict(os.environ)
-    src = os.path.join(_REPO_ROOT, "src")
-    env["PYTHONPATH"] = src + os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else src
-
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        cwd=_REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=_TIMEOUT_SECONDS,
+    proc = run_pipeline(
+        [
+            "inference",
+            "--encoder-path",
+            encoder,
+            "--rf-path",
+            rf,
+            "--config-path",
+            saved_config,
+            "--inference-files",
+            _CSV_NAME,
+            "--save-tag",
+            tag,
+            "--max-retries",
+            "1",
+        ]
     )
+
     tail = "\n".join(proc.stdout.splitlines()[-40:])
     assert proc.returncode == 0, f"inference smoke run failed (tag={tag}); last output:\n{tail}"
     assert "Inference completed successfully!" in proc.stdout

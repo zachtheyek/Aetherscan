@@ -34,18 +34,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
-          cache-dependency-path: requirements-container.txt
+          # Include the workflow itself so the inline pins below also invalidate the cache
+          cache-dependency-path: |
+            requirements-container.txt
+            .github/workflows/tests.yml
 
       # Mirror the NGC container's dependency surface on a CPU-only runner:
       # tensorflow-cpu stands in for the container's GPU TF 2.17 build, the pinned
-      # extras come from requirements-container.txt, and h5py/pandas/psutil/pytest
-      # are installed explicitly because the NGC base image ships them (so the
-      # requirements file intentionally omits them)
+      # extras come from requirements-container.txt, and h5py/hdf5plugin/pandas/
+      # psutil/pytest are installed explicitly because the NGC base image ships
+      # them (so the requirements file intentionally omits them; hdf5plugin is
+      # pinned explicitly in environment.yml too — don't rely on setigen pulling
+      # it transitively)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt
-          pip install h5py pandas psutil pytest
+          pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
 
       # GPU- and cluster-marked tests need physical GPUs / cluster-resident data;
       # everything else (including slow CPU TF graph tests) runs here

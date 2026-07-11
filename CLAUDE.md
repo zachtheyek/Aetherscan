@@ -4,7 +4,7 @@ Always-on, bare-essentials rules for any coding agent in this repo. The full dee
 
 ## Project
 
-Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Beta-VAE → Random Forest), single-node multi-GPU distributed train/inference. Sole entry point: `src/aetherscan/main.py`. Pytest suite lives in `tests/` (unit + cluster-marked integration; see [CONTRIBUTING.md](CONTRIBUTING.md#testing)) — run it before claiming a change works, and ship unit tests with new logic.
+Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Beta-VAE → Random Forest), single-node multi-GPU distributed train/inference. Sole entry point: `src/aetherscan/main.py`. Pytest suite lives in `tests/` (unit + gpu/cluster-marked integration; see [CONTRIBUTING.md](CONTRIBUTING.md#testing)) — run it before claiming a change works, and ship unit tests with new logic. Most test modules import TensorFlow at collection; if the full dependency stack isn't available in your environment, run the subset you can and say exactly what you ran.
 
 ## Run / lint
 

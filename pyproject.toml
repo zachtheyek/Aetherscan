@@ -59,6 +59,8 @@ dev = ["ruff"]  # Python linter
 # Make `import aetherscan` work without a PYTHONPATH=src prefix
 pythonpath = ["src"]
 testpaths = ["tests"]
+# Reject undeclared markers so a typo'd @pytest.mark.gpu can't silently slip into CI
+addopts = "--strict-markers"
 markers = [
     "slow: slower tests (e.g. builds TF graphs on CPU); included in the default CI selection",
     "gpu: requires one or more physical GPUs; excluded from CI (-m 'not gpu and not cluster')",

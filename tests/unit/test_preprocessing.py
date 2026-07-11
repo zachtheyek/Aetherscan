@@ -6,6 +6,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from aetherscan.config import get_config
 from aetherscan.preprocessing import (
     DataPreprocessor,
     _fit_channel_bandpass,
@@ -14,8 +15,17 @@ from aetherscan.preprocessing import (
     group_observations_from_csv,
 )
 
-_GROUP_COLS = ["Target", "Session", "Band", "Cadence ID", "Frequency"]
-_H5_COL = ".h5 path"
+
+@pytest.fixture
+def group_cols():
+    """The real grouping columns from InferenceConfig — read from the config rather than
+    duplicated, so these tests track the defaults the pipeline actually uses."""
+    return list(get_config().inference.cadence_group_by_cols)
+
+
+@pytest.fixture
+def h5_col():
+    return get_config().inference.cadence_h5_path_col
 
 
 class TestDeduplicateHits:
@@ -47,7 +57,7 @@ class TestDeduplicateHits:
 
 
 class TestGroupObservationsFromCsv:
-    def test_valid_and_flagged_groups(self, make_inference_csv):
+    def test_valid_and_flagged_groups(self, make_inference_csv, group_cols, h5_col):
         key_a = {
             "Target": "HIP110750",
             "Session": "AGBT21B_999_31",
@@ -64,29 +74,29 @@ class TestGroupObservationsFromCsv:
             ],
         )
         valid, flagged = group_observations_from_csv(
-            str(csv_path), _GROUP_COLS, _H5_COL, expected_obs=6
+            str(csv_path), group_cols, h5_col, expected_obs=6
         )
         assert len(valid) == 1
         assert len(flagged) == 1
         assert valid[0].is_valid is True
-        assert valid[0].key == tuple(key_a[c] for c in _GROUP_COLS)
+        assert valid[0].key == tuple(key_a[c] for c in group_cols)
         # Row order within the group is preserved.
         assert valid[0].h5_paths == [f"/data/a_{i}.h5" for i in range(6)]
         assert flagged[0].is_valid is False
         assert len(flagged[0].h5_paths) == 3
 
-    def test_missing_column_raises_keyerror(self, make_inference_csv):
+    def test_missing_column_raises_keyerror(self, make_inference_csv, group_cols, h5_col):
         csv_path = make_inference_csv("ok.csv")
         with pytest.raises(KeyError, match="missing required column"):
             group_observations_from_csv(
-                str(csv_path), [*_GROUP_COLS, "Nonexistent"], _H5_COL, expected_obs=6
+                str(csv_path), [*group_cols, "Nonexistent"], h5_col, expected_obs=6
             )
 
-    def test_missing_file_raises(self):
+    def test_missing_file_raises(self, group_cols, h5_col):
         with pytest.raises(FileNotFoundError):
-            group_observations_from_csv("/nope.csv", _GROUP_COLS, _H5_COL)
+            group_observations_from_csv("/nope.csv", group_cols, h5_col)
 
-    def test_expected_obs_parameter(self, make_inference_csv):
+    def test_expected_obs_parameter(self, make_inference_csv, group_cols, h5_col):
         key = {
             "Target": "T",
             "Session": "S",
@@ -96,7 +106,7 @@ class TestGroupObservationsFromCsv:
         }
         csv_path = make_inference_csv("three.csv", groups=[(key, ["/a.h5", "/b.h5", "/c.h5"])])
         valid, flagged = group_observations_from_csv(
-            str(csv_path), _GROUP_COLS, _H5_COL, expected_obs=3
+            str(csv_path), group_cols, h5_col, expected_obs=3
         )
         assert len(valid) == 1
         assert flagged == []
