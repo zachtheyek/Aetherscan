@@ -537,3 +537,41 @@ by `TF_CPP_MIN_LOG_LEVEL`, so it can't be suppressed without redirecting stderr.
 
 **Won't fix.** Expected LLVM/PTX version-skew behavior. See also
 [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
+
+---
+
+## 16. Container-Build pip Resolver Warning (pydot/pyparsing)
+
+### Symptom
+
+During `singularity/apptainer build` of `aetherscan.def`, while `%post` runs
+`pip install -r requirements-container.txt`, the build log prints:
+
+```
+ERROR: pip's dependency resolver does not currently take into account all the packages
+that are installed. This behaviour is the source of the following dependency conflicts.
+pydot 3.0.4 requires pyparsing>=3.0.9, but you have pyparsing 2.4.7 which is incompatible.
+```
+
+### Cause
+
+The conflict is **pre-existing inside the NGC `tensorflow:25.02-tf2-py3` base image**,
+which ships `pydot 3.0.4` alongside `pyparsing 2.4.7`. Installing our extras makes pip's
+resolver re-inspect the environment and report the already-broken pair; nothing in
+`requirements-container.txt` installs or touches either package.
+
+### Impact
+
+**None.** Aetherscan never imports `pydot` (it is only used by
+`keras.utils.plot_model`-style graph plotting, which we don't call). The build completes
+and the image is fully functional.
+
+### Workaround
+
+None needed; safe to ignore. Do not "fix" by upgrading `pyparsing` in the base image —
+that risks disturbing NGC-pinned packages. NGC 25.02 is the final TF container release,
+so this won't change upstream.
+
+### Status
+
+**Won't fix.** Pre-existing conflict in the upstream NGC base image; documented here.
