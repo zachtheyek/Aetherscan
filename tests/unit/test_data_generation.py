@@ -45,6 +45,10 @@ _STAT_KEYS = {
 
 @pytest.fixture(autouse=True)
 def _seed_rngs():
+    # NOTE: np.random.seed() intentionally seeds the legacy global RandomState — the
+    # production code under test (new_cadence, create_*) draws from the legacy np.random.*
+    # API, so switching this to a Generator (np.random.default_rng) would NOT make those
+    # draws deterministic. Don't "modernize" this without migrating data_generation.py first.
     random.seed(11)
     np.random.seed(11)
 

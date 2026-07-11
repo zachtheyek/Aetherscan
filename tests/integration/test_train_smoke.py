@@ -45,7 +45,12 @@ _SMOKE_FLAGS = [
 
 def _next_test_tag(model_path: str) -> str:
     """Scan existing artifacts for test_vNN tags and return the next unused one — reusing a
-    tag causes stale-artifact confusion."""
+    tag causes stale-artifact confusion.
+
+    NOTE: the scan-then-pick is not atomic — two runs launched concurrently could both claim
+    the same tag. Fine for its intended use (manual, sequential smoke runs on a shared
+    cluster); revisit if these smokes are ever launched in parallel.
+    """
     versions = [0]
     for root in (model_path, os.path.join(model_path, "checkpoints")):
         if not os.path.isdir(root):
