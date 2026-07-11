@@ -30,12 +30,6 @@ jobs:
         uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # NOTE: intentionally no `allowed_bots` — claude-code-action blocks all bot / GitHub
-          # App actors by default (empty allowed_bots == "no bots"), which is exactly what we
-          # want here. Do NOT add claude[bot] (as claude.yml does): our own automation files
-          # issues/PRs as bots (e.g. the docs issue from claude-update-docs), and running the
-          # compliance check on those posts comments that can contain the literal "@claude",
-          # spuriously waking the assistant workflow (claude.yml) — see issue #83.
           prompt: |
             ## Role
             You are a contribution compliance checker. Your job is to verify that contributions follow the project's workflow rules.
