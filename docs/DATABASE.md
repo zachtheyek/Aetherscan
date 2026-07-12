@@ -86,9 +86,10 @@ failed attempt wrote.
 ## Schema
 
 Seven tables, created idempotently (`CREATE TABLE IF NOT EXISTS`) in `_init_database()`, each
-with a composite index matched to its dominant filter pattern. All rows carry `timestamp`
-(write time, `REAL` Unix seconds) and `tag` (the run's save tag — the primary provenance
-key).
+with a composite index matched to its dominant filter pattern. All rows carry `tag` (the run's
+save tag — the primary provenance key), and all but `pipeline_stages` carry `timestamp`
+(write time, `REAL` Unix seconds); `pipeline_stages` records explicit `start_time`/`end_time`
+span bounds instead.
 
 | Table | Rows | `superseded`? | Added in |
 | --- | --- | --- | --- |
