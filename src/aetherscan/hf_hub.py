@@ -71,6 +71,19 @@ def _hf_hub_download(**kwargs) -> str:
     return hf_hub_download(**kwargs)
 
 
+def _disable_hub_progress_bars() -> None:
+    """Disable huggingface_hub's tqdm progress bars for this process. The pipeline redirects
+    sys.stdout/sys.stderr to loggers (StreamToLogger), so interactive progress rendering is
+    line-spam at best — and tty/capability probing by the progress machinery must never be a
+    failure surface for uploads/downloads (hf_upload once died on a stdout isatty() probe).
+    Tolerant of a missing huggingface_hub: the subsequent Hub call raises its own error."""
+    try:
+        from huggingface_hub.utils import disable_progress_bars  # noqa: PLC0415
+    except Exception:
+        return
+    disable_progress_bars()
+
+
 def _is_tag_conflict(exc: Exception) -> bool:
     """True when `exc` is the Hub's tag-already-exists HTTP 409 conflict."""
     try:
@@ -152,6 +165,7 @@ def download_inference_artifacts(repo_id: str, revision: str) -> tuple[str, str,
     pinned revision. Returns the local cache paths (under HF_HOME / ~/.cache/huggingface;
     repeated runs hit the cache). Public repo — no token required.
     """
+    _disable_hub_progress_bars()
     try:
         paths = tuple(
             _hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
@@ -406,6 +420,7 @@ def upload_run_to_hf(
         versions=_collect_library_versions(),
     )
 
+    _disable_hub_progress_bars()
     api = _hf_api()
     with tempfile.TemporaryDirectory(prefix="aetherscan_hf_upload_") as staging:
         for stable_name, source in sources.items():

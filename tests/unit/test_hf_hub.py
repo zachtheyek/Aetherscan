@@ -267,6 +267,22 @@ class TestResolveInferenceArtifacts:
         with pytest.raises(RuntimeError, match="--hf-revision"):
             hf_hub.download_inference_artifacts("ns/repo", "v0.1.0")
 
+    def test_download_disables_hub_progress_bars(self, monkeypatch):
+        # The pipeline redirects stdout/stderr to StreamToLogger — progress bars must be
+        # off so the Hub client never depends on tty probing of the fake stream.
+        from huggingface_hub.utils import (  # noqa: PLC0415
+            are_progress_bars_disabled,
+            enable_progress_bars,
+        )
+
+        monkeypatch.setattr(hf_hub, "_hf_hub_download", lambda **kw: f"/cache/{kw['filename']}")
+        enable_progress_bars()
+        try:
+            hf_hub.download_inference_artifacts("ns/repo", "v0.1.0")
+            assert are_progress_bars_disabled()
+        finally:
+            enable_progress_bars()
+
     def test_repo_id_flag_overrides_config_default(self, monkeypatch):
         seen = []
         monkeypatch.setattr(
@@ -422,6 +438,29 @@ class TestUploadRunToHf:
                 model_path=config.model_path,
                 output_path=config.output_path,
             )
+
+    def test_upload_disables_hub_progress_bars(self, fake_api):
+        # Regression guard for the live-smoke failure: upload_folder's progress machinery
+        # probed the redirected stdout ("'StreamToLogger' object has no attribute
+        # 'isatty'"). Progress bars are force-disabled before any Hub call.
+        from huggingface_hub.utils import (  # noqa: PLC0415
+            are_progress_bars_disabled,
+            enable_progress_bars,
+        )
+
+        config = get_config()
+        _write_run_artifacts(config, "test_v1")
+        enable_progress_bars()
+        try:
+            upload_run_to_hf(
+                repo_id="ns/repo",
+                tag="test_v1",
+                model_path=config.model_path,
+                output_path=config.output_path,
+            )
+            assert are_progress_bars_disabled()
+        finally:
+            enable_progress_bars()
 
     def test_tag_conflict_after_upload_points_at_force_tag(self, monkeypatch):
         # TOCTOU: the tag appeared between the startup dedup check and the post-upload
