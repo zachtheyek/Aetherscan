@@ -249,7 +249,9 @@ def _spline_flatten_bandpass(channel: np.ndarray, spl_order: int) -> np.ndarray:
     return channel - fit
 
 
-@functools.cache
+# maxsize=4 bounds memory if a long-lived worker sees several response paths (unlikely in
+# production — one per run — but plausible across a long test session).
+@functools.lru_cache(maxsize=4)
 def _load_pfb_response(response_path: str) -> np.ndarray:
     """
     Load (and per-process cache) a PFB passband response written by

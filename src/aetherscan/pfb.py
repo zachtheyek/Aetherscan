@@ -47,7 +47,9 @@ def firdes(num_taps: int, fc: float) -> np.ndarray:
     return np.sinc(fc * (n - (num_taps - 1) / 2.0)) * np.hamming(num_taps)
 
 
-@functools.cache
+# maxsize=4 bounds memory if a long-lived process sees several parameter combinations
+# (e.g. a test session); a production run only ever uses one.
+@functools.lru_cache(maxsize=4)
 def gen_coarse_channel_response(
     fine_per_coarse: int, num_coarse_channels: int, taps_per_channel: int
 ) -> np.ndarray:
@@ -104,7 +106,11 @@ def equalize_passband(channel: np.ndarray, response: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"channel width {channel.shape[-1]} does not match response length {response.shape[0]}"
         )
-    return channel / response
+    # Defensive floor: the 12-tap GBT design bottoms out around 0.25-0.5 at channel edges,
+    # but a very high taps_per_channel (sharper rolloff) could push edge bins toward zero
+    # and turn the divide into inf. The floor sits far below any physical response value,
+    # so realistic responses pass through untouched.
+    return channel / np.maximum(response, 1e-10)
 
 
 def edge_mid_power_ratio(spectrum: np.ndarray) -> float:
