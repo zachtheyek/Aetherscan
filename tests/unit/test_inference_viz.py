@@ -334,6 +334,59 @@ class TestFigureSmoke:
         }
         _assert_figure(plot_inference_summary(collector.records, metadatas, totals))
 
+    def test_inference_summary_counts_superseded_preprocessing(
+        self, initialized_runtime, collector, metadatas, monkeypatch
+    ):
+        """Regression: _infer_cadence supersedes each cadence's 'preprocessed' row just before
+        writing its live 'inferred' row, so on a fully successful run every 'preprocessed' row
+        is superseded. The summary aggregation must include superseded rows (else preprocessing
+        time always reads 0.0 s) while summing per status so the preprocessed and inferred rows
+        of the same cadence aren't double-counted."""
+        db = initialized_runtime
+        npy_path = collector.records[0].npy_path
+        # Reproduce the post-success manifest state for one cadence: a 'preprocessed' row
+        # retired by mark_superseded, then the live 'inferred' row (the _infer_cadence order).
+        db.write_inference_cadence(
+            npy_path=npy_path, status="preprocessed", tag=TAG, n_stamps=N_STAMPS, duration_s=12.0
+        )
+        assert db.mark_superseded("inference_cadences", TAG, npy_path=npy_path) is True
+        db.write_inference_cadence(
+            npy_path=npy_path,
+            status="inferred",
+            tag=TAG,
+            n_stamps=N_STAMPS,
+            n_candidates=1,
+            duration_s=3.0,
+        )
+        assert db.flush(timeout=10) is True
+
+        # The 'preprocessed' row is invisible to the default query but must drive the summary.
+        assert db.query_inference_cadences(tag=TAG, status="preprocessed") == []
+
+        # Capture the rendered summary text (patch before _save_and_upload clears the figure).
+        captured: dict[str, str] = {}
+
+        def _capture(fig, filename, slack_title):
+            captured["text"] = "\n".join(t.get_text() for ax in fig.axes for t in ax.texts)
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+
+        totals = {
+            "n_cadence_snippets": 10,
+            "n_candidates": 1,
+            "n_cadences": 1,
+            "n_skipped": 0,
+        }
+        plot_inference_summary(collector.records, metadatas, totals)
+
+        lines = captured["text"].splitlines()
+        preproc_line = next(line for line in lines if line.startswith("preprocessing time"))
+        inference_line = next(line for line in lines if line.startswith("inference time"))
+        # Real non-zero value (bug read 0.0 s), summed exactly once (double count -> 24.0 s).
+        assert preproc_line.split()[-2:] == ["12.0", "s"]
+        assert inference_line.split()[-2:] == ["3.0", "s"]
+
 
 class TestSuiteEntryPoint:
     def test_render_all_never_raises(self, initialized_runtime, collector):

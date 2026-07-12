@@ -876,7 +876,13 @@ def plot_inference_summary(
     preproc_duration = inference_duration = 0.0
     if db is not None:
         db.flush()
-        for row in db.query_inference_cadences(tag=tag):
+        # NOTE: include_superseded=True is required here: _infer_cadence supersedes a
+        # cadence's 'preprocessed' row before writing its live 'inferred' row, so on a fully
+        # successful run every 'preprocessed' row is superseded and the default query would
+        # hide it (preprocessing time would always read 0.0 s). Summing per status keeps each
+        # metric on its own row — no double-counting between the 'preprocessed' and 'inferred'
+        # rows of the same cadence.
+        for row in db.query_inference_cadences(tag=tag, include_superseded=True):
             duration = row.get("duration_s") or 0.0
             if row.get("status") == "preprocessed":
                 preproc_duration += duration
