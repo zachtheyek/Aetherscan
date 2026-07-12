@@ -306,9 +306,16 @@ def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int)
     edges = np.arange(0, width, block)
     blocks_per_window = window_size // block
     blocks_per_step = step_size // block
+    # When block does not divide width (non-power-of-2 geometries), np.add.reduceat emits a
+    # short trailing block spanning the ragged tail [edges[-1], width). No in-range window ever
+    # reaches it — every window ends at a multiple of block that is < width, hence <= edges[-1]
+    # — but drop it explicitly so a partial sum can never leak into a window and silently
+    # corrupt k2. width // block == number of full blocks (== len(edges) when block divides
+    # width, so this is a no-op there); slicing to it keeps every window sum exact.
+    n_full_blocks = width // block
 
     def _window_sums(col_sums: np.ndarray) -> np.ndarray:
-        block_sums = np.add.reduceat(col_sums, edges)
+        block_sums = np.add.reduceat(col_sums, edges)[:n_full_blocks]
         # Moving sum of blocks_per_window adjacent blocks, sampled every blocks_per_step
         # blocks — one entry per window, no long cumulative accumulation (precision).
         view = np.lib.stride_tricks.sliding_window_view(block_sums, blocks_per_window)
@@ -661,6 +668,10 @@ class DataPreprocessor:
         # if hasattr(self, "shm") and self.shm is not None:
         #     self.manager.close_shared_memory(self.shm)
         #     self.shm = None
+
+        # Defense-in-depth: ensure the persistent energy-detection pool is torn down even if a
+        # caller forgot to call stop_energy_detection_pool(). No-op when no pool was started.
+        self.stop_energy_detection_pool()
 
         logger.info("DataPreprocessor closed")
 

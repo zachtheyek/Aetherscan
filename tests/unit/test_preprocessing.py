@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import os
 
 import numpy as np
@@ -582,6 +583,29 @@ class TestSlidingNormalityK2:
         assert len(k2) == len(indices)
         np.testing.assert_allclose(k2, expected, rtol=1e-9)
 
+    @pytest.mark.parametrize(
+        "width,window_size,step_size",
+        [
+            (1234, 100, 30),  # gcd 10; 1234 % 10 == 4 -> ragged short trailing block
+            (1000, 96, 36),  # gcd 12; 1000 % 12 == 4 -> ragged short trailing block
+        ],
+    )
+    def test_non_power_of_2_width_short_block_matches_scipy(self, width, window_size, step_size):
+        # Guards the reduceat trailing-block truncation: when block does not divide the coarse
+        # channel width, the final block spans a short ragged tail. No in-range window may
+        # consume it, so k2 must still match scipy exactly. Assert the geometry actually
+        # triggers the short block so a future refactor can't quietly make this test vacuous.
+        block = step_size if window_size % step_size == 0 else math.gcd(window_size, step_size)
+        assert width % block != 0  # this geometry must exercise the short-block path
+        rng = np.random.default_rng(17)
+        channel = rng.normal(0.0, 1.0, (16, width))
+
+        k2 = _sliding_normality_k2(channel, window_size, step_size)
+        indices, expected = _scipy_window_loop(channel, window_size, step_size)
+
+        assert len(k2) == len(indices)
+        np.testing.assert_allclose(k2, expected, rtol=1e-9)
+
     def test_float32_input_matches_scipy_on_float64_view(self):
         # The h5 data is float32, but the pipeline always tests the bandpass-subtracted
         # residuals, which are float64 (float32 channel - float64 spline fit). The oracle
@@ -711,6 +735,7 @@ class TestEnergyDetectChannelWorker:
                 (str(h5_path), channel_index, coarse_width, 16, bandpass_flatten, 64, 32, 0.0)
             )
             starts = [idx for idx, _, _ in hits]
+            assert len(starts) > 0  # threshold 0.0 must produce hits; else all(...) is vacuous
             assert all(
                 channel_index * coarse_width <= s < (channel_index + 1) * coarse_width
                 for s in starts
