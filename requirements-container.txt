@@ -30,7 +30,9 @@ huggingface_hub>=1.21,<1.22
 # setuptools 81 removed pkg_resources as a vendored submodule -- revisit
 # once blimpy migrates off pkg_resources (upstream issue).
 setuptools>=70,<81
-setigen
+# Range covers the proven 2.6/2.7 line (2.7.0 in current use) and blocks a future
+# major-version break; keep in lockstep with environment.yml and pyproject.toml.
+setigen>=2.6,<3
 # Live monitoring dashboard (utils/dashboard.py, auto-launched by main.py). streamlit 1.39
 # per SECURITY.md's version policy (proven, >=6-month-old); it accepts protobuf>=3.20,<6 and
 # numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin and the numpy<2 ceiling (pyarrow

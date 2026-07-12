@@ -62,6 +62,12 @@ def main() -> int:
     if not _RELEASE_TAG_PATTERN.match(args.release):
         print(f"ERROR: --release must look like vX.Y.Z (e.g. v1.0.0), got {args.release!r}")
         return 1
+    # Fail a mangled save-tag here with a clear message rather than as a Hub 404 later.
+    if not args.save_tag or any(c.isspace() for c in args.save_tag):
+        print(
+            f"ERROR: --save-tag must be a non-empty tag without whitespace, got {args.save_tag!r}"
+        )
+        return 1
 
     if load_dotenv is not None:
         load_dotenv()

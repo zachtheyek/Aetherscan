@@ -43,7 +43,7 @@ dependencies = [
     # setuptools provides pkg_resources, which blimpy (transitive via setigen) imports at
     # module load; <81 because setuptools 81 removed the vendored pkg_resources.
     "setuptools>=70,<81",
-    "setigen",
+    "setigen>=2.6,<3",
     # The NGC base image provides these implicitly (so requirements-container.txt omits
     # them); a pip install has no base image to lean on and must declare them. Ranges
     # mirror environment.yml's pins.
