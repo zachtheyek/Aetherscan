@@ -369,8 +369,12 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
     )
     fig.suptitle(f"Aetherscan Pipeline: Benchmark Report ({tag})", fontsize=16, fontweight="bold")
 
-    # --- Timeline: one lane per dot-depth, bars colored by top-level family ---
-    max_depth = max(len(str(row["stage"]).split(".")) for row in rows)
+    # --- Timeline: one lane per dot-depth actually present (grouping-only depths like a
+    # bare "train" never get spans of their own, so depth 1 is usually empty), bars
+    # colored by top-level family ---
+    depths_present = sorted({len(str(row["stage"]).split(".")) for row in rows})
+    lane_of = {depth: i for i, depth in enumerate(depths_present)}
+    n_lanes = len(depths_present)
     fallback_colors = plt.cm.tab10(np.linspace(0, 1, 10))
     families = sorted({str(row["stage"]).split(".")[0] for row in rows})
 
@@ -385,7 +389,7 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
         depth = len(str(row["stage"]).split("."))
         start_min = (row["start_time"] - run_start) / 60
         width_min = max(row["duration_s"] / 60, run_minutes * 0.001)  # keep slivers visible
-        y = max_depth - depth  # depth 1 on top
+        y = n_lanes - 1 - lane_of[depth]  # shallowest lane on top
         ax_tl.barh(
             y,
             width_min,
@@ -409,8 +413,8 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
                 clip_on=True,
             )
 
-    ax_tl.set_yticks(range(max_depth))
-    ax_tl.set_yticklabels([f"depth {max_depth - i}" for i in range(max_depth)], fontsize=9)
+    ax_tl.set_yticks(range(n_lanes))
+    ax_tl.set_yticklabels([f"depth {depth}" for depth in reversed(depths_present)], fontsize=9)
     ax_tl.set_xlabel("Time since first stage (minutes)", fontsize=11, fontweight="bold")
     ax_tl.set_title(
         "Stage timeline (bars nest top-down by dot-depth; overlaps = concurrent stages)",
@@ -437,12 +441,12 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
         colLabels=["stage", "n", "total", "self", "self % of wall"],
         colWidths=[0.52, 0.06, 0.14, 0.14, 0.14],
         cellLoc="left",
-        loc="upper center",
+        # Explicit bbox keeps the table below the axes title instead of overlapping it
+        bbox=(0.0, 0.0, 1.0, 0.86),
     )
     table.auto_set_font_size(False)
     table.set_fontsize(9)
-    table.scale(1.0, 1.4)
-    ax_tb.set_title("Top 10 slowest stages (by self time)", fontsize=11, y=0.95)
+    ax_tb.set_title("Top 10 slowest stages (by self time)", fontsize=11, y=0.9)
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

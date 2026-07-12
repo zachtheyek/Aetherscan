@@ -50,6 +50,18 @@ update this table in the same PR.
 | `bench_pfb_vs_spline` — pfb | 46.3 channels/s (plus a 7.7 s one-time response FFT) |
 | `bench_pfb_vs_spline` — spline | 6.0 channels/s → **7.7x speedup** |
 
+### blpc3 (EPYC 7313, 32 cores, NGC 25.02 container, July 2026)
+
+| Benchmark | Result |
+|---|---|
+| `bench_normality` — vectorized | 83,667 windows/s (0.10 s per 1M-bin channel) |
+| `bench_normality` — scipy loop | 679 windows/s (12.1 s per channel) → **123x speedup** |
+| `bench_injection` | 5.8 injections/s |
+| `bench_lognorm_downsample` — downsample | 798 cadences/s |
+| `bench_lognorm_downsample` — lognorm | 8,844 cadences/s |
+| `bench_pfb_vs_spline` — pfb | 59.6 channels/s (plus an 11.7 s one-time response FFT) |
+| `bench_pfb_vs_spline` — spline | 5.0 channels/s → **11.9x speedup** |
+
 Notes:
 
 - All numbers are single-process: the pipeline parallelizes these kernels across
