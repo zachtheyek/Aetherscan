@@ -882,6 +882,12 @@ def apply_saved_config(config_path: str) -> None:
     forward-compat with newer/older saved configs. Top-level scalar entries
     (`data_path`, `model_path`, `output_path`) are applied directly.
 
+    The `checkpoint` section is skipped entirely: a saved *training* config's
+    checkpoint fields (most damagingly `save_tag`) are never what an inference run
+    wants — layering them would make this run masquerade under the training run's
+    tag, corrupting DB provenance and output paths. The CLI `--save-tag` (or the
+    default import-time timestamp) stays authoritative.
+
     Raises `ValueError` if the file is missing or malformed — caught by main.py's
     wrapper alongside `validate_args` failures.
     """
@@ -898,6 +904,10 @@ def apply_saved_config(config_path: str) -> None:
         raise ValueError("get_config() returned None")
 
     for key, value in saved.items():
+        if key == "checkpoint":
+            # Never layer a saved training run's checkpoint section (save_tag/load_tag/
+            # load_dir/start_round) under CLI flags — see docstring.
+            continue
         target = getattr(config, key, None)
         if target is None:
             continue
