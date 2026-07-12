@@ -206,8 +206,8 @@ block, and a pool downsamples each cadence ×8 per observation (`_downsample_wor
 Cadences containing NaN/Inf or with non-positive max are dropped. **Log-normalization is
 deferred** — training-side log-norm happens per sample *after* signal injection (injection
 must operate on linear intensities). Loading stops at `num_target_backgrounds` (45 000)
-cadences ≈ 34 GB at model resolution, held in RAM for the whole run and shared with injection
-workers via shared memory.
+cadences — about 9 GB at model resolution (45 000 × 6 × 16 × 512 × 4 B) — held in RAM for
+the whole run and shared with injection workers via shared memory.
 
 **Inference snippets** (`load_inference_data`): same chunked SHM+pool pattern, branching on
 the stored width: files already at `width_bin // downsample_factor` (512 — written by

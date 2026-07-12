@@ -177,7 +177,7 @@ artifact filename and every DB row. Accepted formats
 | --- | --- | --- |
 | `YYYYMMDD_HHMMSS` | `20260712_143000` | Default (import-time timestamp) — every untagged run gets a unique one. |
 | `final_vX` | `final_v1` | Release-grade training runs. |
-| `round_XX` | `round_05` | Reserved for per-round checkpoints (written by the pipeline, not passed by users). |
+| `round_XX` | `round_05` | Per-round checkpoints (written by the pipeline; passed as `--load-tag` to resume from a specific round — `CheckpointConfig.infer_start_round()` derives the start round from it). |
 | `test_vX` | `test_v17` | Smoke/test runs. |
 
 `train.py:get_latest_tag()` ranks the families `final_vX > round_XX > timestamp > test_vX`
