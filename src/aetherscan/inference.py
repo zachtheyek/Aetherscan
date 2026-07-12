@@ -85,7 +85,10 @@ def prepare_distributed_inf_dataset(
         raise ValueError("Not enough samples (0) to run inference")
 
     # Pad with duplicate rows (cycled from the front, deterministic) to the next global-batch
-    # multiple; the encoded outputs for the padded rows are discarded by the caller
+    # multiple; the encoded outputs for the padded rows are discarded by the caller.
+    # NOTE: np.concatenate materializes a full copy of the cadence's stamps, briefly doubling
+    # that cadence's memory footprint. Acceptable at per-cadence scale (the padding itself is
+    # under one global batch); revisit if batches ever wrap multi-cadence arrays again.
     n_padded = int(np.ceil(n_samples / global_inf_batch_size)) * global_inf_batch_size
     if n_padded > n_samples:
         pad_count = n_padded - n_samples

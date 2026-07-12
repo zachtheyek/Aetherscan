@@ -284,6 +284,9 @@ def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int)
 
     # Per-column power sums over the time axis, accumulated row by row so temporaries stay at
     # (width,) rather than (time_bins, width) x 3.
+    # NOTE: the Python-level loop over time_bins rows is deliberate — it caps peak memory at a
+    # few (width,) float64 vectors per worker. With the default time_bins=16 the loop overhead
+    # is negligible; if time_bins ever grows large, vectorize via (channel**k).sum(axis=0).
     p1 = np.zeros(width, dtype=np.float64)
     p2 = np.zeros(width, dtype=np.float64)
     p3 = np.zeros(width, dtype=np.float64)
@@ -1450,6 +1453,17 @@ class DataPreprocessor:
         n_stamps = len(stamp_centers)
         stored_width = stamp_width // downsample_factor
         tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
+        # A leftover .tmp.npy means a previous attempt died (e.g. SIGKILL) between memmap
+        # creation and os.replace; it was never promoted to npy_path, so it's safe to drop
+        # (open_memmap would truncate it anyway — the warning is the point)
+        if os.path.exists(tmp_npy_path):
+            logger.warning(
+                f"Cadence {group.key}: removing stale partial output {tmp_npy_path} "
+                f"from an interrupted previous run"
+            )
+            os.remove(tmp_npy_path)
+        # NOTE: np.lib.format.open_memmap is a semi-public numpy API (stable across 1.x and
+        # documented via np.lib.format); revisit if a future numpy bump moves it
         memmap = np.lib.format.open_memmap(
             tmp_npy_path,
             mode="w+",

@@ -391,9 +391,16 @@ class TestProcessCadenceEndToEnd:
         npy_path = str(tmp_path / "out" / "cadence.npy")
         os.makedirs(os.path.dirname(npy_path), exist_ok=True)
 
+        # A stale partial output from an interrupted previous run must be detected,
+        # warned about, and removed before extraction proceeds
+        stale_tmp = os.path.splitext(npy_path)[0] + ".tmp.npy"
+        with open(stale_tmp, "wb") as f:
+            f.write(b"junk from a SIGKILLed run")
+
         preprocessor = DataPreprocessor()
         result = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
 
+        assert not os.path.exists(stale_tmp)
         assert result is not None
         assert result.npy_path == npy_path
         stamps = np.load(npy_path)

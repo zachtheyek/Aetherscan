@@ -286,6 +286,15 @@ def train_command():
     _report_final_training_status(pipeline)
 
 
+class NonRetryableInferenceError(RuntimeError):
+    """A permanent inference failure (bad catalog/config) that retrying cannot fix.
+
+    inference_command's retry loop re-raises this immediately instead of burning retry
+    attempts on it; transient failures (I/O hiccups, GPU errors) stay plain exceptions and
+    keep the existing retry semantics.
+    """
+
+
 def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> dict:
     """
     Per-cadence streaming inference over the configured CSV catalogs.
@@ -305,14 +314,17 @@ def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> di
     derived per cadence from its group key + metadata JSON via derive_cadence_provenance.
     Returns aggregate {n_cadence_snippets, n_processed, n_candidates, n_cadences}. Exceptions
     from the load/encode stages propagate to the retry loop in inference_command; per-cadence
-    preprocessing failures are logged and skipped inside process_pending_cadence.
+    preprocessing failures are logged and skipped inside process_pending_cadence. Raises
+    NonRetryableInferenceError when the catalog yields no work units or no cadence produces a
+    stamp .npy — permanent conditions the retry loop must not retry.
     """
     config = get_config()
 
     units = preprocessor.plan_cadences()
     if not units:
-        logger.error("No cadence work units produced from the configured inference CSVs")
-        sys.exit(1)
+        raise NonRetryableInferenceError(
+            "No cadence work units produced from the configured inference CSVs"
+        )
     logger.info(f"Streaming inference over {len(units)} cadence(s)")
 
     # Load models once; every cadence reuses this pipeline
@@ -328,6 +340,11 @@ def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> di
             future = prefetch.submit(preprocessor.process_pending_cadence, units[0])
 
             for i, unit in enumerate(units):
+                # NOTE: an exception inside a prefetched preprocessing task surfaces here,
+                # one iteration after it was submitted, when its future is resolved — and
+                # then propagates to inference_command's retry loop. In practice
+                # process_pending_cadence swallows per-cadence failures (returns None), so
+                # only infrastructure-level errors (e.g. a broken worker pool) raise.
                 cadence_result = future.result()
 
                 # Prefetch depth 1: kick off cadence i+1's CPU preprocessing while the main
@@ -387,8 +404,7 @@ def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> di
     if totals["n_cadences"] == 0:
         # Preserve the historical contract: preprocessing producing no stamp .npy at all is
         # an error (bad paths/catalog), not a legitimate empty result
-        logger.error("No cadence results produced by preprocessing")
-        sys.exit(1)
+        raise NonRetryableInferenceError("No cadence results produced by preprocessing")
 
     return totals
 
@@ -490,6 +506,12 @@ def inference_command():
             # Don't retry on user interruption; re-raise to propagate traceback
             logger.info("Inference interrupted by user")
             raise
+
+        except NonRetryableInferenceError as e:
+            # Permanent failure (empty/invalid catalog): retrying can't fix it, so fail
+            # fast instead of burning the remaining attempts
+            logger.error(f"Inference failed permanently: {e}")
+            sys.exit(1)
 
         except Exception as e:
             logger.error(f"Inference attempt {attempt + 1} failed with error: {e}")
