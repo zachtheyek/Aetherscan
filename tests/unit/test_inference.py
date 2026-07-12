@@ -1,6 +1,7 @@
 """Unit tests for aetherscan.inference: the tail-padding fix in
-prepare_distributed_inf_dataset (regression for the silent partial-batch drop) and the
-InfDataHolder clear semantics."""
+prepare_distributed_inf_dataset (regression for the silent partial-batch drop), the
+InfDataHolder clear semantics, and the confidence-summary math backing the
+inference_cadences manifest."""
 
 from __future__ import annotations
 
@@ -8,7 +9,11 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from aetherscan.inference import InfDataHolder, prepare_distributed_inf_dataset
+from aetherscan.inference import (
+    InfDataHolder,
+    prepare_distributed_inf_dataset,
+    summarize_confidences,
+)
 
 
 def _collect_batches(result: dict) -> np.ndarray:
@@ -113,3 +118,42 @@ class TestInfDataHolder:
         assert holder.data is None
         holder.clear()  # second clear is a no-op
         assert holder.data is None
+
+
+class TestSummarizeConfidences:
+    def test_summary_math(self):
+        proba = np.linspace(0.0, 1.0, 101)  # p50 = 0.5, p01 = 0.01, ... exactly
+        summary = summarize_confidences(proba, threshold=0.9)
+
+        assert summary["n"] == 101
+        assert summary["threshold"] == 0.9
+        assert summary["n_above_threshold"] == 10  # 0.91 .. 1.00 (strictly above)
+        assert summary["mean"] == pytest.approx(0.5)
+        assert summary["min"] == 0.0
+        assert summary["max"] == 1.0
+        assert summary["quantiles"]["p50"] == pytest.approx(0.5)
+        assert summary["quantiles"]["p01"] == pytest.approx(0.01)
+        assert summary["quantiles"]["p99"] == pytest.approx(0.99)
+        assert list(summary["quantiles"]) == ["p01", "p05", "p25", "p50", "p75", "p95", "p99"]
+
+    def test_single_value(self):
+        summary = summarize_confidences(np.array([0.42]), threshold=0.5)
+        assert summary["n"] == 1
+        assert summary["n_above_threshold"] == 0
+        assert all(v == pytest.approx(0.42) for v in summary["quantiles"].values())
+
+    def test_json_serializable(self):
+        import json  # noqa: PLC0415
+
+        summary = summarize_confidences(np.random.default_rng(1).random(50), threshold=0.99)
+        round_tripped = json.loads(json.dumps(summary))
+        assert round_tripped == summary  # plain floats/ints only, no numpy scalars
+
+    def test_threshold_boundary_is_strict(self):
+        # Matches the RF prediction rule: prediction = proba > threshold, not >=
+        summary = summarize_confidences(np.array([0.99, 0.991]), threshold=0.99)
+        assert summary["n_above_threshold"] == 1
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="at least one confidence"):
+            summarize_confidences(np.array([]), threshold=0.5)

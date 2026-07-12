@@ -22,6 +22,39 @@ from aetherscan.models import RandomForestModel
 
 logger = logging.getLogger(__name__)
 
+# Quantile levels stored in each cadence's confidence summary (inference_cadences manifest)
+_CONFIDENCE_QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+
+
+def summarize_confidences(proba_true: np.ndarray, threshold: float) -> dict:
+    """
+    Aggregate a cadence's P(true) vector into the JSON-serializable confidence summary
+    stored on its inference_cadences manifest row.
+
+    Returns {n, threshold, n_above_threshold, mean, min, max, quantiles} where quantiles maps
+    'p01'/'p05'/.../'p99' to the corresponding quantile of proba_true. Keeping the summary in
+    the manifest means run-level artifacts don't depend on the positives-only
+    inference_results table. Raises ValueError on an empty vector (a cadence with zero
+    snippets never reaches inference).
+    """
+    proba_true = np.asarray(proba_true, dtype=np.float64)
+    if proba_true.size == 0:
+        raise ValueError("summarize_confidences requires at least one confidence value")
+
+    quantiles = np.quantile(proba_true, _CONFIDENCE_QUANTILES)
+    return {
+        "n": int(proba_true.size),
+        "threshold": float(threshold),
+        "n_above_threshold": int((proba_true > threshold).sum()),
+        "mean": float(proba_true.mean()),
+        "min": float(proba_true.min()),
+        "max": float(proba_true.max()),
+        "quantiles": {
+            f"p{int(q * 100):02d}": float(v)
+            for q, v in zip(_CONFIDENCE_QUANTILES, quantiles, strict=True)
+        },
+    }
+
 
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
 # Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
@@ -237,7 +270,12 @@ class InferencePipeline:
     ) -> dict:
         """
         Run inference on preprocessed cadence snippets (shape (n, 6, 16, 512)) sourced from
-        npy_path, and return {n_cadence_snippets, n_processed, n_candidates}.
+        npy_path, and return {n_cadence_snippets, n_processed, n_candidates, proba_true,
+        predictions, latents}. proba_true is the per-snippet P(true) vector, predictions the
+        thresholded 0/1 array, and latents the truncated per-observation latent array of shape
+        (n * num_observations, latent_dim) — callers use them for the per-cadence manifest
+        summary and the visualization suite, then drop them (they are per-cadence transients,
+        never accumulated catalog-wide).
 
         Encodes each snippet through the VAE encoder under the distribution strategy, then runs
         the Random Forest classifier on the latents and writes positive predictions to the
@@ -301,9 +339,16 @@ class InferencePipeline:
             # rows correspond exactly to the real snippets (row order is snippet-major)
             latents = latents[: n_samples * self.num_observations]
 
-            # Run RF classification
+            # Run RF classification. One predict_proba pass (1000 trees per snippet) yields
+            # everything downstream: P(true) for the manifest confidence summary and the
+            # confidence-distribution figure, plus the same predictions / confidences
+            # predict_verbose would have derived from it (probability of the predicted
+            # class, so high for confident negatives too).
             logger.info("Running Random Forest classification")
-            predictions, confidence_scores = self.rf_model.predict_verbose(latents, self.threshold)
+            probas = self.rf_model.predict_proba(latents)
+            proba_true = probas[:, 1]
+            predictions = (proba_true > self.threshold).astype(int)
+            confidence_scores = np.where(predictions, proba_true, probas[:, 0])
 
             # Write results to database
             n_candidates = self._write_inference_results(
@@ -339,6 +384,9 @@ class InferencePipeline:
             "n_cadence_snippets": n_samples,
             "n_processed": n_samples,
             "n_candidates": n_candidates,
+            "proba_true": proba_true,
+            "predictions": predictions,
+            "latents": latents,
         }
 
     def _distributed_encode(
@@ -490,9 +538,9 @@ class InferencePipeline:
         logger.info(f"Wrote {n_candidates} candidates to database")
         return n_candidates
 
-    # TODO: add plotting functions (remember to call when candidate is found) (full workflow when candidate is found: db write, make plot, save plot, send to slack)
-    def plot_candidate(self):
-        pass
+    # NOTE: candidate plotting lives in aetherscan.inference_viz (plot_candidate /
+    # plot_candidate_gallery), rendered at end of run from the inference_results rows +
+    # stamp .npy files so it also covers cadences skipped by the stage-aware resume.
 
 
 # TODO: add try-except switch statements (see run_training_pipeline())
@@ -518,8 +566,8 @@ def run_inference_pipeline(
 
     The optional provenance arguments (target/session/cadence_id/band/frequency_mhz/
     stamp_frequencies_mhz/timestamp_observed/h5_path) are written to the inference_results
-    table for any positive candidates. Returns the {n_cadence_snippets, n_processed,
-    n_candidates} dict from run_inference.
+    table for any positive candidates. Returns run_inference's results dict
+    ({n_cadence_snippets, n_processed, n_candidates, proba_true, predictions, latents}).
     """
     # Create pipeline
     pipeline = InferencePipeline(strategy=strategy)
