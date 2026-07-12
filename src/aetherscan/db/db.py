@@ -644,9 +644,10 @@ class Database:
 
         # Final flush on shutdown
         if self.buffer:
+            flushed_count = len(self.buffer)
             self._flush_buffer()
             self.buffer.clear()
-            logger.info(f"Flushed {len(self.buffer)} remaining data on shutdown")
+            logger.info(f"Flushed {flushed_count} remaining data on shutdown")
 
     # In commit 08fc37d, we switched from using sequential execute() to executemany()
     # The sequential approaches parses SQL statements N times & performs N round trips to the db

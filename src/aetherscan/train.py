@@ -2325,7 +2325,8 @@ class TrainingPipeline:
         Attempt to restore the trained Random Forest persisted by a previous attempt of this
         run: both random_forest_{tag}.joblib and rf_eval_artifacts_{tag}.joblib must exist
         under model_path (the artifacts joblib is what every RF plot consumes, so resuming
-        into rf_plots without it would be pointless). Returns True when the model is loaded
+        into rf_plots without it would be pointless — but it is loaded lazily by
+        _load_rf_eval_artifacts(), not here). Returns True when the model is loaded
         and ready; False falls back to full RF training.
         """
         tag = self.config.checkpoint.save_tag
@@ -6159,7 +6160,9 @@ def _execute_training_stages(pipeline) -> None:
         finally:
             # RF plots are done (or abandoned) — drop the shared eval-artifact / SHAP
             # caches so the (large) features arrays they hold don't hang around through
-            # final_save and teardown
+            # final_save and teardown. Clearing only in this branch is deliberate: the
+            # caches are populated exclusively by the plot calls above, so the
+            # skip-if-done path never has anything to clear
             pipeline._clear_rf_caches()
 
     # Stage 5/5: final_save — final models + config JSON

@@ -69,8 +69,7 @@ class TrainingRunState:
             self.stages_failed.remove(stage)
 
     def record_stage_failure(self, stage: str) -> None:
-        """Record a non-critical stage failure (the stage stays out of stages_done, so the
-        next attempt/relaunch retries it)."""
+        """Record a non-critical stage failure; not in stages_done, so relaunches retry it."""
         if stage not in self.stages_failed:
             self.stages_failed.append(stage)
 
@@ -118,6 +117,11 @@ def load_run_state(path: str) -> TrainingRunState | None:
             stages_done=[str(s) for s in payload.get("stages_done", [])],
             stages_failed=[str(s) for s in payload.get("stages_failed", [])],
         )
+    except KeyError as e:
+        logger.warning(
+            f"Run state at {path} is missing required field {e} — treating as a fresh run"
+        )
+        return None
     except Exception as e:
         logger.warning(f"Failed to load run state from {path}: {e} — treating as a fresh run")
         return None
