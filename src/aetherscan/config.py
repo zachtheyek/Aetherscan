@@ -243,6 +243,18 @@ class TrainingConfig:
     latent_viz_gif_max_frames: int = 500  # Max frames in output GIF (log-spaced subsampling)
     latent_viz_gif_duration_ms: int = 100  # Milliseconds per frame in output GIF
 
+    # Latent traversal params (decoder-based interpretation of the latent dims; see
+    # TrainingPipeline.plot_latent_traversal)
+    latent_traversal_every_round: bool = (
+        False  # Also render traversal figures at the end of every training round
+    )
+    latent_traversal_num_steps: int = (
+        7  # Steps per latent dim (odd & >= 3 so the center column is the unperturbed decode)
+    )
+    latent_traversal_max_sigma: float = (
+        3.0  # Traversal range in per-dim standard deviations: steps span ±max_sigma (> 0)
+    )
+
     # RF visualization params
     shap_max_samples_summary: int = 5000  # Samples for SHAP summary/dependence computation
     shap_max_samples_interaction: int = (
@@ -550,6 +562,9 @@ class Config:
                 "latent_viz_umap_min_dist": self.training.latent_viz_umap_min_dist,
                 "latent_viz_gif_max_frames": self.training.latent_viz_gif_max_frames,
                 "latent_viz_gif_duration_ms": self.training.latent_viz_gif_duration_ms,
+                "latent_traversal_every_round": self.training.latent_traversal_every_round,
+                "latent_traversal_num_steps": self.training.latent_traversal_num_steps,
+                "latent_traversal_max_sigma": self.training.latent_traversal_max_sigma,
                 "shap_max_samples_summary": self.training.shap_max_samples_summary,
                 "shap_max_samples_interaction": self.training.shap_max_samples_interaction,
                 "shap_top_k_features_dependence": self.training.shap_top_k_features_dependence,
