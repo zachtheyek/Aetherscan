@@ -78,6 +78,9 @@ def record_stage(
 
         if tag is None:
             config = get_config()
+            # NOTE: tag stays None if a timer fires before checkpoint.save_tag is wired
+            # (early init, pre-CLI-parse). Such rows won't match a tag="..." query filter.
+            # In practice timers don't fire that early, so this is a documented edge, not a bug.
             tag = config.checkpoint.save_tag if config is not None else None
 
         db.write_pipeline_stage(
@@ -121,7 +124,7 @@ class _StageTimer(ContextDecorator):
         else:
             logger.warning(
                 f"stage_timer stack mismatch on exit of {self.full_name!r} "
-                f"(top: {stack[-1] if stack else None!r})"
+                f"(top: {(stack[-1] if stack else None)!r})"
             )
 
         metadata = self.metadata

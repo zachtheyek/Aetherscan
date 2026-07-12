@@ -302,16 +302,19 @@ def build_suggestions(root: StageNode, db_path: str, tag: str) -> list[str]:
             for node in inference.children.values()
             if node.name.startswith("preprocess_cadence_")
         )
+        # Guard against an inference subtree of pure grouping nodes with no measured spans
+        # (min/max over an empty sequence would raise); such a run has no wall to compare.
         spans = list(inference.iter_spans())
-        wall = max(s["end_time"] for s in spans) - min(s["start_time"] for s in spans)
-        if wall > 0 and preprocess_total / wall >= PREPROCESS_WALL_FRACTION:
-            suggestions.append(
-                f"inference: energy-detection preprocessing summed to "
-                f"{format_duration(preprocess_total)} = {preprocess_total / wall:.0%} of "
-                f"the run's wall-clock (>= {PREPROCESS_WALL_FRACTION:.0%}) — it is the "
-                f"bottleneck; raise ED worker count (manager.n_processes) before anything "
-                f"GPU-side."
-            )
+        if spans:
+            wall = max(s["end_time"] for s in spans) - min(s["start_time"] for s in spans)
+            if wall > 0 and preprocess_total / wall >= PREPROCESS_WALL_FRACTION:
+                suggestions.append(
+                    f"inference: energy-detection preprocessing summed to "
+                    f"{format_duration(preprocess_total)} = {preprocess_total / wall:.0%} of "
+                    f"the run's wall-clock (>= {PREPROCESS_WALL_FRACTION:.0%}) — it is the "
+                    f"bottleneck; raise ED worker count (manager.n_processes) before anything "
+                    f"GPU-side."
+                )
 
         # Rule 2b: GPU utilization during per-cadence encode spans (averaged over spans)
         encode_means = []
@@ -327,7 +330,7 @@ def build_suggestions(root: StageNode, db_path: str, tag: str) -> list[str]:
             suggestions.append(
                 f"inference: mean GPU utilization across encode spans is "
                 f"{np.mean(encode_means):.0f}% (< {GPU_UTIL_INPUT_BOUND:.0f}%) — encoding "
-                f"is input-bound; consider a larger --inf-batch-size."
+                f"is input-bound; consider a larger --per-replica-batch-size."
             )
 
     # Rule 4: RAM pressure anywhere in the run
@@ -449,7 +452,11 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
     ax_tb.set_title("Top 10 slowest stages (by self time)", fontsize=11, y=0.9)
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    # dirname is "" for a bare filename (cwd) — makedirs("") would raise, so only create
+    # a parent directory when output_path actually has one
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 

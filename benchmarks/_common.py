@@ -14,7 +14,10 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Make src/ importable when running directly: benchmarks/bench_*.py
+# Make src/ importable when running directly: benchmarks/bench_*.py. This import-time
+# sys.path injection is intentional for standalone script mode (the benchmarks are run as
+# `python benchmarks/bench_*.py`, never imported as a package), so mutating sys.path here
+# is safe and expected rather than a library side effect.
 _BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC_DIR = os.path.join(os.path.dirname(_BENCH_DIR), "src")
 if _SRC_DIR not in sys.path:

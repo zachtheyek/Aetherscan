@@ -44,7 +44,7 @@ from sklearn.metrics import (
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
-from aetherscan.benchmark import record_stage, stage_timer
+from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
@@ -1394,190 +1394,190 @@ class TrainingPipeline:
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
 
         try:
-            # Round-level epoch span (per-epoch durations already live in training_stats;
-            # record_stage instead of a `with` block spares the loop body a re-indent)
-            epochs_span_start = time.time()
-            for epoch in range(epochs):
-                # Training
-                epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
-                    round_idx,
-                    epoch,
-                    snr_base,
-                    snr_range,
-                    train_dataset,
-                    steps_per_epoch,
-                    accumulation_steps,
-                    time.time(),
-                )
-
-                # Validation
-                val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
-
-                # Queue db writes (non-blocking) & log results
-                current_time = time.time()
-
-                if self.db is None:
-                    raise RuntimeError(
-                        "No database instance detected - cannot generate loss curves plot"
+            # Round-level epoch span (per-epoch durations already live in training_stats).
+            # stage_timer records the span even on a mid-loop exception (status=failed).
+            with stage_timer("epochs"):
+                for epoch in range(epochs):
+                    # Training
+                    epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
+                        round_idx,
+                        epoch,
+                        snr_base,
+                        snr_range,
+                        train_dataset,
+                        steps_per_epoch,
+                        accumulation_steps,
+                        time.time(),
                     )
 
-                # Training losses
-                for stat_name, key in [
-                    ("total_loss", "total"),
-                    ("reconstruction_loss", "reconstruction"),
-                    ("kl_loss", "kl"),
-                    ("true_loss", "true"),
-                    ("false_loss", "false"),
-                ]:
+                    # Validation
+                    val_losses, val_duration = self._validate_epoch(
+                        val_dataset, val_steps, time.time()
+                    )
+
+                    # Queue db writes (non-blocking) & log results
+                    current_time = time.time()
+
+                    if self.db is None:
+                        raise RuntimeError(
+                            "No database instance detected - cannot generate loss curves plot"
+                        )
+
+                    # Training losses
+                    for stat_name, key in [
+                        ("total_loss", "total"),
+                        ("reconstruction_loss", "reconstruction"),
+                        ("kl_loss", "kl"),
+                        ("true_loss", "true"),
+                        ("false_loss", "false"),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=float(epoch_losses[key]),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # Validation losses
+                    for stat_name, key in [
+                        ("val_total_loss", "total"),
+                        ("val_reconstruction_loss", "reconstruction"),
+                        ("val_kl_loss", "kl"),
+                        ("val_true_loss", "true"),
+                        ("val_false_loss", "false"),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=float(val_losses[key]),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # Gradient norm/clipping statistics
+                    gradient_norm_mean = np.mean(epoch_gradient_norms)
+                    gradient_norm_max = np.max(epoch_gradient_norms)
+                    gradient_norm_std = np.std(epoch_gradient_norms)
+                    clipping_rate = np.sum(np.array(epoch_gradient_norms) > 1.0) / steps_per_epoch
+
+                    for stat_name, stat_value in [
+                        ("gradient_norm_mean", gradient_norm_mean),
+                        ("gradient_norm_max", gradient_norm_max),
+                        ("gradient_norm_std", gradient_norm_std),
+                        ("clipping_rate", clipping_rate),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=float(stat_value),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # Learning rate
+                    current_lr = float(self.vae.optimizer.learning_rate.numpy())
                     self.db.write_training_stat(
                         model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=float(epoch_losses[key]),
+                        stat_name="learning_rate",
+                        value=current_lr,
                         round_number=round_idx + 1,
                         epoch_number=epoch + 1,
                         tag=self.config.checkpoint.save_tag,
                         timestamp=current_time,
                     )
 
-                # Validation losses
-                for stat_name, key in [
-                    ("val_total_loss", "total"),
-                    ("val_reconstruction_loss", "reconstruction"),
-                    ("val_kl_loss", "kl"),
-                    ("val_true_loss", "true"),
-                    ("val_false_loss", "false"),
-                ]:
-                    self.db.write_training_stat(
-                        model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=float(val_losses[key]),
-                        round_number=round_idx + 1,
-                        epoch_number=epoch + 1,
-                        tag=self.config.checkpoint.save_tag,
-                        timestamp=current_time,
+                    # Misc stats
+                    for stat_name, stat_value in [
+                        ("train_duration", train_duration),
+                        ("val_duration", val_duration),
+                        ("snr_range_floor", snr_base),
+                        ("snr_range_ceil", snr_base + snr_range),
+                        ("num_steps", steps_per_epoch),
+                        ("num_sub_steps", accumulation_steps),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=stat_value,
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # COMMENTED OUT: Removing TensorBoard support
+                    # TensorBoard logging
+                    # with self.train_writer.as_default():
+                    #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
+                    #     tf.summary.scalar(
+                    #         "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
+                    #     )
+                    #     tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
+                    #     tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
+                    #     tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
+                    #     tf.summary.scalar(
+                    #         "learning_rate",
+                    #         self.vae.optimizer.learning_rate.numpy(),
+                    #         step=self.global_step,
+                    #     )
+                    #
+                    # with self.val_writer.as_default():
+                    #     tf.summary.scalar(
+                    #         "validation_total_loss", val_losses["total"], step=self.global_step
+                    #     )
+                    #     tf.summary.scalar(
+                    #         "validation_reconstruction_loss",
+                    #         val_losses["reconstruction"],
+                    #         step=self.global_step,
+                    #     )
+                    #     tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
+                    #     tf.summary.scalar(
+                    #         "validation_true_loss", val_losses["true"], step=self.global_step
+                    #     )
+                    #     tf.summary.scalar(
+                    #         "validation_false_loss", val_losses["false"], step=self.global_step
+                    #     )
+                    #
+                    # # Flush writers to ensure data is written
+                    # self.train_writer.flush()
+                    # self.val_writer.flush()
+                    #
+                    # # Increment global step
+                    # self.global_step += 1
+
+                    logger.info(f"Epoch {epoch + 1}")
+                    logger.info(
+                        f"Train -- Total: {epoch_losses['total']:.4f}, "
+                        f"Recon: {epoch_losses['reconstruction']:.4f}, "
+                        f"KL: {epoch_losses['kl']:.4f}, "
+                        f"True: {epoch_losses['true']:.4f}, "
+                        f"False: {epoch_losses['false']:.4f}, "
+                        f"Duration: {train_duration:.2f} "
+                    )
+                    logger.info(
+                        f"Gradient norm -- Mean: {gradient_norm_mean:.4f}, "
+                        f"Std: {gradient_norm_std:.4f}, "
+                        f"Max: {gradient_norm_max:.4f}, "
+                        f"Clipping rate: {clipping_rate:.4f} "
+                    )
+                    logger.info(
+                        f"Val -- Total: {val_losses['total']:.4f}, "
+                        f"Recon: {val_losses['reconstruction']:.4f}, "
+                        f"KL: {val_losses['kl']:.4f}, "
+                        f"True: {val_losses['true']:.4f}, "
+                        f"False: {val_losses['false']:.4f}, "
+                        f"Duration: {val_duration:.2f} "
                     )
 
-                # Gradient norm/clipping statistics
-                gradient_norm_mean = np.mean(epoch_gradient_norms)
-                gradient_norm_max = np.max(epoch_gradient_norms)
-                gradient_norm_std = np.std(epoch_gradient_norms)
-                clipping_rate = np.sum(np.array(epoch_gradient_norms) > 1.0) / steps_per_epoch
-
-                for stat_name, stat_value in [
-                    ("gradient_norm_mean", gradient_norm_mean),
-                    ("gradient_norm_max", gradient_norm_max),
-                    ("gradient_norm_std", gradient_norm_std),
-                    ("clipping_rate", clipping_rate),
-                ]:
-                    self.db.write_training_stat(
-                        model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=float(stat_value),
-                        round_number=round_idx + 1,
-                        epoch_number=epoch + 1,
-                        tag=self.config.checkpoint.save_tag,
-                        timestamp=current_time,
-                    )
-
-                # Learning rate
-                current_lr = float(self.vae.optimizer.learning_rate.numpy())
-                self.db.write_training_stat(
-                    model_name="beta_vae",
-                    stat_name="learning_rate",
-                    value=current_lr,
-                    round_number=round_idx + 1,
-                    epoch_number=epoch + 1,
-                    tag=self.config.checkpoint.save_tag,
-                    timestamp=current_time,
-                )
-
-                # Misc stats
-                for stat_name, stat_value in [
-                    ("train_duration", train_duration),
-                    ("val_duration", val_duration),
-                    ("snr_range_floor", snr_base),
-                    ("snr_range_ceil", snr_base + snr_range),
-                    ("num_steps", steps_per_epoch),
-                    ("num_sub_steps", accumulation_steps),
-                ]:
-                    self.db.write_training_stat(
-                        model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=stat_value,
-                        round_number=round_idx + 1,
-                        epoch_number=epoch + 1,
-                        tag=self.config.checkpoint.save_tag,
-                        timestamp=current_time,
-                    )
-
-                # COMMENTED OUT: Removing TensorBoard support
-                # TensorBoard logging
-                # with self.train_writer.as_default():
-                #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
-                #     tf.summary.scalar(
-                #         "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
-                #     )
-                #     tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
-                #     tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
-                #     tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
-                #     tf.summary.scalar(
-                #         "learning_rate",
-                #         self.vae.optimizer.learning_rate.numpy(),
-                #         step=self.global_step,
-                #     )
-                #
-                # with self.val_writer.as_default():
-                #     tf.summary.scalar(
-                #         "validation_total_loss", val_losses["total"], step=self.global_step
-                #     )
-                #     tf.summary.scalar(
-                #         "validation_reconstruction_loss",
-                #         val_losses["reconstruction"],
-                #         step=self.global_step,
-                #     )
-                #     tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
-                #     tf.summary.scalar(
-                #         "validation_true_loss", val_losses["true"], step=self.global_step
-                #     )
-                #     tf.summary.scalar(
-                #         "validation_false_loss", val_losses["false"], step=self.global_step
-                #     )
-                #
-                # # Flush writers to ensure data is written
-                # self.train_writer.flush()
-                # self.val_writer.flush()
-                #
-                # # Increment global step
-                # self.global_step += 1
-
-                logger.info(f"Epoch {epoch + 1}")
-                logger.info(
-                    f"Train -- Total: {epoch_losses['total']:.4f}, "
-                    f"Recon: {epoch_losses['reconstruction']:.4f}, "
-                    f"KL: {epoch_losses['kl']:.4f}, "
-                    f"True: {epoch_losses['true']:.4f}, "
-                    f"False: {epoch_losses['false']:.4f}, "
-                    f"Duration: {train_duration:.2f} "
-                )
-                logger.info(
-                    f"Gradient norm -- Mean: {gradient_norm_mean:.4f}, "
-                    f"Std: {gradient_norm_std:.4f}, "
-                    f"Max: {gradient_norm_max:.4f}, "
-                    f"Clipping rate: {clipping_rate:.4f} "
-                )
-                logger.info(
-                    f"Val -- Total: {val_losses['total']:.4f}, "
-                    f"Recon: {val_losses['reconstruction']:.4f}, "
-                    f"KL: {val_losses['kl']:.4f}, "
-                    f"True: {val_losses['true']:.4f}, "
-                    f"False: {val_losses['false']:.4f}, "
-                    f"Duration: {val_duration:.2f} "
-                )
-
-                # Adaptive learning rate
-                self._update_learning_rate(val_losses)
-
-            record_stage(f"train.round_{round_number:02d}.epochs", epochs_span_start, time.time())
+                    # Adaptive learning rate
+                    self._update_learning_rate(val_losses)
 
             # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
             with stage_timer("plots"):
