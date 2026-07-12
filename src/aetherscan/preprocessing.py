@@ -249,16 +249,31 @@ def _spline_flatten_bandpass(channel: np.ndarray, spl_order: int) -> np.ndarray:
     return channel - fit
 
 
-def _pfb_flatten_bandpass(
-    channel: np.ndarray, num_coarse_channels: int, taps_per_channel: int
-) -> np.ndarray:
+@functools.cache
+def _load_pfb_response(response_path: str) -> np.ndarray:
+    """
+    Load (and per-process cache) a PFB passband response written by
+    DataPreprocessor._ensure_pfb_response_file. The array is marked read-only because the
+    cache shares it across every call in the process.
+    """
+    response = np.load(response_path)
+    response.setflags(write=False)
+    return response
+
+
+def _pfb_flatten_bandpass(channel: np.ndarray, response_path: str) -> np.ndarray:
     """
     PFB static-equalization bandpass flattener (--bandpass-method pfb, the default): divide the
     channel by the instrument's precomputed polyphase-filterbank passband response instead of
     fitting a spline per channel per file. channel has shape (time_bins, coarse_channel_width);
-    returns the equalized float64 channel of the same shape. The response is lru_cached per
-    (width, num_coarse_channels, taps_per_channel), so each pool worker pays the one-time FFT
-    cost once and every subsequent channel is a single vectorized divide.
+    returns the equalized float64 channel of the same shape.
+
+    The response is computed ONCE, in the parent process, and shipped to pool workers as the
+    path of a small sidecar .npy (see _ensure_pfb_response_file) rather than as generation
+    parameters: at GBT scale, generating the response is an ~n_chans-point FFT with a
+    tens-of-GB transient, and every pool worker running that concurrently on its first task
+    would exhaust the node's memory. Workers just read the ~8 MB file, cached per process by
+    _load_pfb_response.
 
     # NOTE: the spline path *subtracts* its fit while this path *divides* by H, so equalized
     # channels keep their DC offset and a bin-dependent scale. That asymmetry is fine for
@@ -267,8 +282,7 @@ def _pfb_flatten_bandpass(
     # variance (scale cancels), so flattening the bandpass *shape* is all that matters.
     # The spline-vs-PFB detection comparison in the PR body is the empirical arbiter.
     """
-    response = gen_coarse_channel_response(channel.shape[1], num_coarse_channels, taps_per_channel)
-    return equalize_passband(channel, response)
+    return equalize_passband(channel, _load_pfb_response(response_path))
 
 
 def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int) -> np.ndarray:
@@ -1672,11 +1686,12 @@ class DataPreprocessor:
         method = self.config.inference.bandpass_method
         if method == "pfb":
             if num_coarse_channels >= 2:
-                return functools.partial(
-                    _pfb_flatten_bandpass,
-                    num_coarse_channels=num_coarse_channels,
-                    taps_per_channel=self.config.inference.pfb_taps_per_channel,
+                response_path = self._ensure_pfb_response_file(
+                    self.config.inference.coarse_channel_width,
+                    num_coarse_channels,
+                    self.config.inference.pfb_taps_per_channel,
                 )
+                return functools.partial(_pfb_flatten_bandpass, response_path=response_path)
             logger.warning(
                 "bandpass_method='pfb' requires >= 2 coarse channels to fold adjacent-channel "
                 f"leakage, but this file has {num_coarse_channels}; falling back to the "
@@ -1687,6 +1702,47 @@ class DataPreprocessor:
         return functools.partial(
             _spline_flatten_bandpass, spl_order=self.config.inference.spline_order
         )
+
+    def _ensure_pfb_response_file(
+        self, fine_per_coarse: int, num_coarse_channels: int, taps_per_channel: int
+    ) -> str:
+        """
+        Compute the PFB passband response in the parent process and persist it to a
+        deterministic sidecar .npy under {output_path}/pfb_cache/, returning its path.
+
+        The heavy work (an ~n_chans-point FFT) runs exactly once per parameter combination in
+        the parent — gen_coarse_channel_response is process-cached and the file is reused when
+        its content matches — while pool workers receive only the path and read the ~8 MB
+        array (see _pfb_flatten_bandpass). The file is content-addressed by its parameters, so
+        stale-run leftovers are impossible; a corrupt or mismatched file is rewritten. Writes
+        are atomic (tmp + os.replace), matching the stamp-extraction pattern.
+        """
+        response = gen_coarse_channel_response(
+            fine_per_coarse, num_coarse_channels, taps_per_channel
+        )
+
+        cache_dir = os.path.join(self.config.output_path, "pfb_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(
+            cache_dir,
+            f"pfb_response_w{fine_per_coarse}_c{num_coarse_channels}_t{taps_per_channel}.npy",
+        )
+
+        if os.path.exists(path):
+            try:
+                existing = np.load(path)
+                if np.array_equal(existing, response):
+                    return path
+                logger.warning(f"PFB response cache {path} does not match; rewriting")
+            except Exception as e:
+                logger.warning(f"PFB response cache {path} unreadable ({e}); rewriting")
+
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            np.save(f, response)
+        os.replace(tmp_path, path)
+        logger.info(f"Wrote PFB response cache: {path}")
+        return path
 
     @staticmethod
     def _sample_channel_indices(n_coarse_total: int) -> list[int]:

@@ -641,18 +641,49 @@ class TestProcessCadenceEndToEnd:
 
 class TestBandpassFlattenerSelection:
     """_get_bandpass_flattener must route on config.inference.bandpass_method (pfb default),
-    carry the file's coarse count into the PFB partial, fall back to spline when the fold is
+    materialize the parent-computed response as a sidecar .npy carried by path in the PFB
+    partial (workers must never generate the response themselves — at GBT scale that is an
+    ~n_chans-point FFT per worker, concurrently), fall back to spline when the fold is
     impossible, and reject unknown methods."""
 
     def test_default_is_pfb(self, initialized_runtime):
         config = get_config()
+        config.inference.coarse_channel_width = 512
         assert config.inference.bandpass_method == "pfb"
         flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
         assert flattener.func is _pfb_flatten_bandpass
-        assert flattener.keywords == {
-            "num_coarse_channels": 4,
-            "taps_per_channel": config.inference.pfb_taps_per_channel,
-        }
+        response_path = flattener.keywords["response_path"]
+        # The sidecar file lives under the run's output path and holds exactly the response
+        # the parent computed for (width, coarse count, taps)
+        assert response_path.startswith(os.path.join(config.output_path, "pfb_cache"))
+        expected = gen_coarse_channel_response(512, 4, config.inference.pfb_taps_per_channel)
+        np.testing.assert_array_equal(np.load(response_path), expected)
+
+    def test_response_file_reused_across_calls(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        preprocessor = DataPreprocessor()
+        first = preprocessor._get_bandpass_flattener(num_coarse_channels=4)
+        mtime = os.path.getmtime(first.keywords["response_path"])
+        second = preprocessor._get_bandpass_flattener(num_coarse_channels=4)
+        assert second.keywords["response_path"] == first.keywords["response_path"]
+        assert os.path.getmtime(second.keywords["response_path"]) == mtime  # not rewritten
+
+    def test_corrupt_response_file_is_rewritten(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        preprocessor = DataPreprocessor()
+        response_path = preprocessor._get_bandpass_flattener(num_coarse_channels=4).keywords[
+            "response_path"
+        ]
+        with open(response_path, "wb") as f:
+            f.write(b"garbage")
+        response_path_2 = preprocessor._get_bandpass_flattener(num_coarse_channels=4).keywords[
+            "response_path"
+        ]
+        assert response_path_2 == response_path
+        expected = gen_coarse_channel_response(512, 4, config.inference.pfb_taps_per_channel)
+        np.testing.assert_array_equal(np.load(response_path), expected)
 
     def test_spline_selected_via_config(self, initialized_runtime):
         config = get_config()
@@ -677,16 +708,21 @@ class TestBandpassFlattenerSelection:
         # The flattener ships to pool workers inside task tuples
         import pickle  # noqa: PLC0415
 
+        config = get_config()
+        config.inference.coarse_channel_width = 512
         flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
         restored = pickle.loads(pickle.dumps(flattener))
         channel = np.full((4, 512), 2.0)
         np.testing.assert_array_equal(restored(channel), flattener(channel))
 
     def test_pfb_flatten_divides_out_response(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        config.inference.pfb_taps_per_channel = 12
+        flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
         response = gen_coarse_channel_response(512, 4, 12)
         shaped = np.ones((16, 1)) * response
-        flattened = _pfb_flatten_bandpass(shaped, num_coarse_channels=4, taps_per_channel=12)
-        np.testing.assert_allclose(flattened, 1.0, rtol=1e-12)
+        np.testing.assert_allclose(flattener(shaped), 1.0, rtol=1e-12)
 
 
 class TestPfbResponseMismatchWarning:
