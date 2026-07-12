@@ -4705,10 +4705,21 @@ class TrainingPipeline:
         # Per-dim σ over the whole viz batch (all observations pooled) — sets each dim's
         # traversal scale in units the encoder actually uses
         sigmas = z_mean.reshape(-1, latent_dim).std(axis=0)
+        if np.all(sigmas == 0):
+            # Fully collapsed latents (e.g. a degenerate/untrained encoder): every traversal
+            # step would decode to the same image — skip rather than render 8 blank grids
+            logger.warning(
+                "plot_latent_traversal: all per-dim sigmas are zero (collapsed latents) — "
+                "skipping traversal figures"
+            )
+            return
 
         on_indices = np.arange(0, num_obs, 2)  # ON observations (ABACAD -> indices 0/2/4)
 
         def decode_fn(latents):
+            # Single-shot decode: the batch is bounded by latent_dim * num_steps rows (56 at
+            # defaults; even num_steps=99 is ~800 (16, 512, 1) reconstructions ≈ 26 MB) — no
+            # chunking needed, unlike the cadence-count-scaled encoding loop above
             return np.asarray(self.vae.decoder(tf.convert_to_tensor(latents), training=False))
 
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]

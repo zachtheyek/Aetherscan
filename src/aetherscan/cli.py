@@ -1353,7 +1353,9 @@ def collect_validation_errors(
             )
 
         # Latent traversal: odd step count >= 3 (so the center column is the unperturbed
-        # class-mean decode) and a strictly positive sigma range
+        # class-mean decode) and a strictly positive sigma range. No upper step bound:
+        # decode cost scales linearly and stays trivial at any plausible value (99 steps
+        # ~= 800 decoder calls), and an oversized figure is immediately self-evident
         lts = _resolve(
             args, "latent_traversal_num_steps", config.training.latent_traversal_num_steps
         )

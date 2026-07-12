@@ -1,14 +1,18 @@
 """Unit tests for the latent-traversal math in aetherscan.train: the latent grid builder,
-the stub-decodable panel computation, and the display un-preprocessing (log-norm inversion +
-frequency upsampling)."""
+the stub-decodable panel computation, the display un-preprocessing (log-norm inversion +
+frequency upsampling), and plot_latent_traversal's degenerate-input guards."""
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import pytest
 
+from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
 from aetherscan.train import (
+    TrainingPipeline,
     build_traversal_latents,
     compute_traversal_panels,
     unpreprocess_traversal_panels,
@@ -166,3 +170,61 @@ class TestUnpreprocessTraversalPanels:
         out, inverted = unpreprocess_traversal_panels(normalized[None, None], params, 1)
         assert inverted is True
         np.testing.assert_allclose(out[0, 0], data + 1e-10, rtol=1e-6)
+
+
+class TestPlotLatentTraversalGuards:
+    """plot_latent_traversal's degenerate-input guards, driven through a duck-typed pipeline
+    (object.__new__ skips the heavyweight __init__) with stub encoder/decoder."""
+
+    def _stub_pipeline(self, batch, labels):
+        config = get_config()
+        latent_dim = config.beta_vae.latent_dim
+
+        class _CollapsedEncoder:
+            def __call__(self, x, training=False):
+                z = np.zeros((np.asarray(x).shape[0], latent_dim), dtype=np.float32)
+                return z, z, z
+
+        class _ExplodingDecoder:
+            def __call__(self, z, training=False):
+                raise AssertionError("decoder must not be called for a degenerate traversal")
+
+        class _StubVAE:
+            encoder = _CollapsedEncoder()
+            decoder = _ExplodingDecoder()
+
+        pipeline = object.__new__(TrainingPipeline)
+        pipeline.config = config
+        pipeline.vae = _StubVAE()
+        pipeline._latent_viz_batch = batch
+        pipeline._latent_viz_labels = labels
+        pipeline._latent_viz_lognorm_params = None
+        return pipeline
+
+    def _no_traversal_figures(self, config):
+        plots_dir = os.path.join(config.output_path, "plots")
+        return not os.path.isdir(plots_dir) or not any(
+            "latent_traversal" in name for name in os.listdir(plots_dir)
+        )
+
+    def test_collapsed_latents_skip_rendering(self):
+        # An encoder whose latents all collapse to one point yields all-zero per-dim sigmas:
+        # the plot must skip (before touching the decoder) instead of rendering blank grids.
+        config = get_config()
+        time_bins = config.data.time_bins
+        width = config.data.width_bin // config.data.downsample_factor
+        batch = np.random.default_rng(0).random((2, 6, time_bins, width)).astype(np.float32)
+        labels = np.array(["true_only_eti", "false_no_signal"], dtype="U20")
+
+        pipeline = self._stub_pipeline(batch, labels)
+        pipeline.plot_latent_traversal()
+
+        assert self._no_traversal_figures(config)
+
+    def test_missing_viz_batch_skips_rendering(self):
+        # A resumed run whose beta-VAE rounds were already complete never builds the viz
+        # batch — the plot must warn and return, not raise.
+        pipeline = self._stub_pipeline(None, None)
+        pipeline.plot_latent_traversal()
+
+        assert self._no_traversal_figures(get_config())
