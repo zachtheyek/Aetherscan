@@ -62,12 +62,52 @@ cross-run caching).
 
 ## Model loading
 
-<!-- PHASE-B: HF model resolution — hf_hub.py resolution order (explicit paths → --hf-revision →
-latest v* semver tag → latest final_vX), download caching, and the relaxed local-path
-validation land with the HuggingFace integration. Update this section against the merged
-code. -->
+### Artifact resolution: local paths or the HuggingFace Hub
 
-`InferencePipeline.__init__` → `init_models()` loads the two models from explicit paths:
+Inference needs three artifacts — the encoder, the Random Forest, and the training run's
+`config.json`. They come from local disk **or** the HuggingFace Hub, resolved *before*
+validation by `hf_hub.resolve_inference_artifacts(args)` (called from `main()` immediately
+after argument parsing). The trio is **all-or-none**
+([`src/aetherscan/hf_hub.py`](../src/aetherscan/hf_hub.py)):
+
+- **All three local paths given** (`--encoder-path` / `--rf-path` / `--config-path`) → used
+  as-is; any `--hf-revision` is ignored (logged). The offline / cluster path.
+- **None given** → the artifacts are downloaded from the Hub and their cache paths are written
+  onto `args`, exactly as if passed on the CLI, so validation / `apply_saved_config` / model
+  load run unchanged. The resolved revision is also written to `config.hf.revision` for
+  provenance in the saved inference config.
+- **A partial set (one or two paths)** → left untouched; `collect_validation_errors` reports
+  the missing ones. Mixing local and Hub-sourced artifacts would silently pair mismatched
+  models, so it is rejected rather than half-resolved.
+
+When downloading, the **revision** is chosen by `resolve_hf_revision` in precedence order:
+
+1. **`--hf-revision <tag>`** — an explicit revision (a training tag `final_v1`, a release tag
+   `v1.0.0`, or a commit); returned as-is, existence checked by the download itself.
+2. **`v{__version__}`** — the version-coupled default. When the package is an **installed
+   release**, `version_default_revision()` returns `f"v{__version__}"`, so
+   `pip install aetherscan==1.0.0` + bare inference pulls exactly the `v1.0.0` weights. The
+   guard is strict — only a `vX.Y.Z` version matches (`_SEMVER_TAG_PATTERN`). Source-tree /
+   container runs (`PYTHONPATH=src`, the NGC image) have no installed distribution, so
+   `__version__` is the `"0.0.0.dev0"` fallback
+   ([`__init__.py`](../src/aetherscan/__init__.py)); `.dev` / `rc` / `post` pre-releases also
+   fail the match — all fall through to step 3. This is deliberately **not** existence-checked:
+   an installed release whose weights tag is missing must fail loudly (the release blessing
+   step was skipped), never silently pull some other version.
+3. **Latest `vX.Y.Z` release tag**, else **latest `final_vX` training tag** on the repo
+   (`select_default_revision`; numeric comparison, so `v1.10.0 > v1.9.9`; tags in neither
+   family — `test_vX`, timestamps — never win). Raises `RuntimeError` with guidance when
+   nothing resolves.
+
+Downloads go through `hf_hub_download` (revision-pinned, cached under `HF_HOME` /
+`~/.cache/huggingface`; repeated runs hit the cache); the public repo needs no token. The repo
+defaults to `config.hf.repo_id` (`zachtheyek/aetherscan`), overridable with `--hf-repo-id`.
+[`RELEASE.md`](RELEASE.md) covers how this revision couples releases to weights.
+
+### Loading the resolved artifacts
+
+`InferencePipeline.__init__` → `init_models()` loads the two models from the (now populated)
+paths:
 
 - `--encoder-path` → `tf.keras.models.load_model` **inside `strategy.scope()`** (the hard
   rule: all TF model creation/loading happens in scope so variables are mirrored across
@@ -81,9 +121,31 @@ code. -->
   tag, corrupting DB provenance and output paths. The CLI `--save-tag` (or the default
   timestamp) stays authoritative.
 
-All three paths are required by `collect_validation_errors` and must exist on disk. The three
-artifacts should carry the same training tag; nothing enforces it yet (`# TODO` in
-`inference_command`), so mismatched encoder/RF pairs are on the operator.
+`collect_validation_errors` enforces the trio all-or-none (a partial set is the error above);
+every path that *is* set must exist on disk. The three artifacts should carry the same training
+tag; nothing enforces it yet (`# TODO` in `inference_command`), so mismatched encoder/RF pairs
+are on the operator.
+
+### Tag-dedup guards
+
+Immediately before command dispatch (post-validation, post-DB-init, pre-any-work),
+`tag_guards.enforce_tag_guards(args)` hard-stops a run whose **explicitly-provided**
+`--save-tag` collides with a previous run's state
+([`src/aetherscan/tag_guards.py`](../src/aetherscan/tag_guards.py)) — the stale-artifact
+confusion that used to force manual `test_vNN` incrementing. For inference the collision
+markers (`find_inference_tag_collisions`) are:
+
+- the saved `config_{tag}.json` — written only at the very end of a successful pass, so it
+  marks a *completed* run and is always a collision; and
+- on the **legacy `--test-files` path only** (no `inference_cadences` manifest rows),
+  non-superseded `inference_results` rows for the tag.
+
+Manifest rows are deliberately **not** a collision: they mark an in-progress streaming run that
+the resume flow below consumes, so same-tag DB state there is expected. Default datetime tags
+are immune by construction (a fresh second-resolution timestamp can't collide), so the guard
+only fires for explicit tags; `--force-tag` consciously overrides it. (The same module also
+guards training tags and, under `--hf-upload`, checks the Hub for the tag at startup rather
+than after ~30 h of training.)
 
 ## The streaming loop
 

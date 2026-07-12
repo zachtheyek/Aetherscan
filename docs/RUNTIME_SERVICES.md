@@ -176,6 +176,25 @@ CPU/GPU activity. The figure is uploaded to the run's Slack thread like every ot
 Missing stretches in the panels are a known symptom
 ([`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) #10).
 
-<!-- PHASE-B: stage annotations — monitor.annotate_stages overlays pipeline_stages spans as
-labeled translucent bands on the CPU panel once the benchmarking suite lands. Document the
-config knob and the depth-<=2 rule here. -->
+### Stage annotations
+
+When `monitor.annotate_stages` is enabled (config default `True`), `_save_plot()` overlays the
+run's pipeline-stage spans as labeled translucent bands on the **CPU panel**
+(`_annotate_stage_spans`), turning the utilization curve into a self-explaining timeline: a CPU
+plateau reads as `round_03` (data generation), a GPU band as `epochs`, and so on. The spans
+come from the `pipeline_stages` table written by the always-on stage timers — see
+[`BENCHMARKING.md`](BENCHMARKING.md) for the timers and [`DATABASE.md`](DATABASE.md#pipeline_stages-stage-timers-schema-v3)
+for the table.
+
+Two details keep it readable and correct:
+
+- **Depth ≤ 2 only.** `select_annotation_spans` keeps spans whose dot-name has at most two
+  components (`train.round_03`, not `train.round_03.epochs`) — the deep per-ON-file and
+  encode/rf sub-stages stay report-tool-only so the panel doesn't drown in bands. Bands are
+  labeled with the leaf component (`round_03`) and cycle three face colors so adjacent stages
+  stay separable at low alpha.
+- **Flush first.** The method calls `db.flush()` before querying, so spans recorded moments
+  before shutdown (`final_save`, `inference.viz`) make it onto the plot. This is safe because
+  the writer thread outlives the monitor in the cleanup order (monitor stops before db); a
+  flush timeout just means the very newest spans are missing, never an error. Annotation
+  failures are caught and logged — a benchmarking overlay must never break the resource plot.

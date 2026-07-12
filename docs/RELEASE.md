@@ -100,11 +100,14 @@ impossible:
 3. **HF weights verification** — confirm the matching `v*` tag exists on
    `zachtheyek/aetherscan` (public repo, no token needed). **Verify, never create**: if this
    fails, you skipped the weight-blessing step; the error says so and how to fix it.
-4. **Build** — `python -m build` (sdist + wheel) from the tagged source.
+4. **Build** — `python -m build` (sdist + wheel) from the tagged source, then **smoke the
+   wheel**: install it `--no-deps` and assert `aetherscan.__version__` equals the guarded
+   version (catches a packaging/version-single-sourcing mismatch before anything publishes).
 5. **Publish to PyPI via trusted publishing** — `pypa/gh-action-pypi-publish` with
    `permissions: id-token: write` and the `pypi` environment. OIDC-based: **no long-lived
    PyPI API token is stored anywhere** in the repo or its secrets.
-6. **GitHub Release** — created from the tag with generated notes; curate the body from the
+6. **GitHub Release** — created from the tag (`gh release create --verify-tag
+   --generate-notes`) with the built sdist + wheel attached; curate the body from the
    per-PR `claude-release-notes` comments (see
    [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md)) — they are the raw material, written one
    merge at a time for exactly this purpose.

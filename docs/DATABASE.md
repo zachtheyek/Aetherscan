@@ -12,7 +12,7 @@ One SQLite file — `{output_path}/db/aetherscan.db`, WAL mode — behind a thre
 `queue.Queue` drained by **one background writer thread** that batches rows and commits with
 `executemany()`; reads open short-lived connections directly. Failed-attempt rows are never
 deleted — they're flagged `superseded = 1`, and every query filters them out by default.
-Schema evolution is a minimal `PRAGMA user_version` gate (currently version 2).
+Schema evolution is a minimal `PRAGMA user_version` gate (currently version 3).
 
 > [!IMPORTANT]
 > The write queue is a **thread** queue, not process-safe. Worker *processes* must never call
@@ -85,13 +85,23 @@ failed attempt wrote.
 
 ## Schema
 
-Six tables, created idempotently (`CREATE TABLE IF NOT EXISTS`) in `_init_database()`, each
+Seven tables, created idempotently (`CREATE TABLE IF NOT EXISTS`) in `_init_database()`, each
 with a composite index matched to its dominant filter pattern. All rows carry `timestamp`
 (write time, `REAL` Unix seconds) and `tag` (the run's save tag — the primary provenance
 key).
 
-<!-- PHASE-B: document the pipeline_stages table (stage timers) once the benchmarking suite
-lands: columns, hierarchical dot-names, writer-queue path, and the schema version bump. -->
+| Table | Rows | `superseded`? | Added in |
+| --- | --- | --- | --- |
+| `system_resources` | 1 Hz monitor samples | no (attempt-agnostic history) | v0 |
+| `injection_stats` | per generated cadence | yes | v0 (+ column v1) |
+| `training_stats` | per training epoch | yes | v0 (+ column v1) |
+| `latent_snapshots` | per viz cadence per capture | yes | v0 (+ column v1) |
+| `inference_results` | positives only | yes | v0 (+ column v1) |
+| `inference_cadences` | per-cadence run manifest | yes | v2 |
+| `pipeline_stages` | per timed stage span | no (attempt-agnostic history) | v3 |
+
+The `superseded` column and its default-filtering are what make same-tag retries safe; see
+[the migration section](#schema-migration) for how the `user_version` stamp maps to these.
 
 ### `system_resources`
 
@@ -193,19 +203,44 @@ resume ([`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)).
 
 Index: `(tag, npy_path, status)` — the resume lookup.
 
+### `pipeline_stages` (stage timers, schema v3)
+
+One row per timed pipeline-stage span, written by the always-on stage timers in
+[`aetherscan.benchmark`](../src/aetherscan/benchmark.py) (`stage_timer` / `record_stage`) via
+`db.write_pipeline_stage()`. Read back by [`utils/benchmark_report.py`](../utils/benchmark_report.py)
+and the monitor's stage-band overlay. Full context in [`BENCHMARKING.md`](BENCHMARKING.md).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `stage` | TEXT | Hierarchical dot-name (`train.round_02.data_generation`) |
+| `start_time`, `end_time` | REAL | Unix timestamps bounding the span |
+| `duration_s` | REAL | Derived (`end_time - start_time`) at write time so the table stays internally consistent |
+| `metadata` | TEXT | Optional pre-serialized JSON (e.g. `{"source": "producer"}`, or `{"status": "failed", ...}` on a span whose block raised) |
+
+Index: `(tag, start_time)`. **No `superseded` column** — timing spans are attempt-agnostic
+history like `system_resources`. Retried stages simply append new rows, so consumers see every
+attempt, each with its own span.
+
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 2`):
+(`_SCHEMA_VERSION = 3`). The stamp maps to schema features as:
 
-- **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on
-  `training_stats`, `injection_stats`, `latent_snapshots`, `inference_results` — the only
-  in-place change SQLite supports is additive `ADD COLUMN`, which is exactly what supersede
-  semantics needed. A per-table column-existence check (`PRAGMA table_info`) keeps each step
-  idempotent even if `user_version` was lost (a db file copied without its journal).
-- **v1 → v2**: the `inference_cadences` table — no migration step needed, because
-  `CREATE TABLE IF NOT EXISTS` in `_init_database()` creates it for old and new databases
-  alike before the migration runs; only the version stamp advances.
+| `user_version` | What it added | Migration work |
+| --- | --- | --- |
+| v0 | pre-versioning baseline (any db with no stamp) | — |
+| v1 | `superseded INTEGER DEFAULT 0` on `training_stats`, `injection_stats`, `latent_snapshots`, `inference_results` | additive `ALTER TABLE ... ADD COLUMN` |
+| v2 | the `inference_cadences` run-manifest table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
+| v3 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
+
+- **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
+  above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
+  what supersede semantics needed. A per-table column-existence check (`PRAGMA table_info`)
+  keeps the step idempotent even if `user_version` was lost (a db file copied without its
+  journal).
+- **v1 → v2** (`inference_cadences`) and **v2 → v3** (`pipeline_stages`): no migration step
+  needed — `CREATE TABLE IF NOT EXISTS` in `_init_database()` creates each new table for old
+  and new databases alike *before* `_migrate_schema()` runs; only the version stamp advances.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped.
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
@@ -217,7 +252,8 @@ The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
 Each table has a `query_*` method returning `list[dict]`
 (`query_system_resource`, `query_injection_stat`, `query_injection_stat_stability`,
 `query_training_stat`, `query_latent_snapshots`, `query_latent_snapshot_keys`,
-`query_inference_result`, `query_inference_cadences`). Shared conventions:
+`query_inference_result`, `query_inference_cadences`, `query_pipeline_stages`). Shared
+conventions:
 
 - **String filters** (`tag`, `stat_name`, `status`, ...) accept a single value (`=`) or a
   list (`IN`); **range filters** come as `start_*`/`end_*` pairs (inclusive);
@@ -256,6 +292,8 @@ Rules of thumb at full-scale defaults (dominant terms only):
 - **`system_resources`**: (4 + 2 × n_GPUs) rows/second — ~1.2 M rows/day on a 6-GPU node.
 - **`inference_results`**: positives only; at a 0.99 threshold this stays small by
   construction. `inference_cadences`: a handful of rows per cadence.
+- **`pipeline_stages`**: one row per timed stage span — tens per training run, a few per
+  inference cadence. Negligible.
 
 WAL mode keeps readers (plots, resume queries) unblocked during heavy write phases; the WAL
 file is checkpointed back into the main db periodically by SQLite itself.
