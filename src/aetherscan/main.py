@@ -30,7 +30,7 @@ from aetherscan.logger import init_logger
 from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
 from aetherscan.preprocessing import DataPreprocessor
-from aetherscan.train import get_latest_tag, run_training_pipeline
+from aetherscan.train import run_training_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -203,19 +203,16 @@ def train_command():
 
     max_retries = config.training.max_retries
     retry_delay = config.training.retry_delay
+    pipeline = None
 
     for attempt in range(max_retries):
-        pipeline = None
-
         try:
             logger.info(f"Training attempt: {attempt + 1}/{max_retries}")
 
-            if attempt > 0:
-                logger.info(f"Retrying training from round {config.checkpoint.start_round}")
-            else:
-                logger.info(f"Starting training from round {config.checkpoint.start_round}")
-
-            # Reinitialize training pipeline on each attempt so no corrupted state is persisted
+            # Reinitialize the training pipeline on each attempt so no corrupted state is
+            # persisted. The persisted run manifest (run_state_{save_tag}.json) tells the new
+            # pipeline which rounds/stages already completed, so the attempt resumes exactly
+            # where the previous one died (works identically for a full process relaunch)
             pipeline = run_training_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded
@@ -226,55 +223,18 @@ def train_command():
             logger.info("Training interrupted by user")
             raise
 
-        # NOTE: fault tolerance currently only accounts for beta-vae training failure. what about cases when train_random_forest fails and we wish to resume from there? should we add a check where if new round number is greater than specified rounds, skip directly to train RF? how would this look like? what about when save_models or plot_beta_vae_training_progress fails? should also add a db flag on training retry, such that we can easily filter out "corrupted" data when reading from db (e.g. for plotting). would need to return start_time so we can retain state on retries
         except Exception as e:
             logger.error(f"Training attempt {attempt + 1} failed with error: {e}")
 
             if attempt < max_retries - 1:
-                # Retry training
                 logger.info(
                     f"Attempting to recover from failure: attempt {attempt + 2}/{max_retries}"
                 )
+                logger.info(f"Waiting {retry_delay} seconds before retry...")
 
                 # Collect garbage
-                if pipeline:
-                    del pipeline
                 gc.collect()
-
-                # Save original checkpoint values in case of failure recovery
-                original_dir = config.checkpoint.load_dir
-                original_tag = config.checkpoint.load_tag
-                original_round = config.checkpoint.start_round
-
-                try:
-                    # Find the latest checkpoint & determine where to resume from
-                    config.checkpoint.load_dir = "checkpoints"
-                    config.checkpoint.load_tag = get_latest_tag(
-                        os.path.join(config.model_path, config.checkpoint.load_dir)
-                    )
-                    if config.checkpoint.load_tag.startswith("round_"):
-                        config.checkpoint.infer_start_round()
-                    else:
-                        raise ValueError("No valid checkpoints loaded")
-
-                    logger.info(
-                        f"Found latest checkpoint from round {config.checkpoint.start_round - 1}"
-                    )
-                    logger.info(f"Waiting {retry_delay} seconds before retry...")
-
-                except Exception as recovery_error:
-                    # If no checkpoints loaded, restart from last valid point
-                    config.checkpoint.load_dir = original_dir
-                    config.checkpoint.load_tag = original_tag
-                    config.checkpoint.start_round = original_round
-
-                    logger.error(f"Recovery failed: {recovery_error}")
-                    logger.info(
-                        f"Restarting training from round {config.checkpoint.start_round} in {retry_delay} seconds..."
-                    )
-
-                finally:
-                    time.sleep(retry_delay)
+                time.sleep(retry_delay)
 
             else:
                 # Max retries exceeded
@@ -282,13 +242,25 @@ def train_command():
                 logger.error(f"Final error: {e}")
                 sys.exit(1)
 
-    # Save training configuration
-    config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist
+    # Note, the training configuration JSON is saved by the pipeline's final_save stage
+    # (so it's covered by the retry machinery), not here
 
-    with open(config_path, "w") as f:
-        json.dump(config.to_dict(), f, indent=2)
-    logger.info(f"Training configuration saved to {config_path}")
+    # Plot stages are non-critical (a broken plot mustn't cost a retry cycle including data
+    # regeneration), but their failures are recorded in the run manifest — surface them
+    # loudly and exit nonzero so lost artifacts can't go unnoticed
+    failed_stages = pipeline.run_state.stages_failed if pipeline is not None else []
+    if failed_stages:
+        logger.error("=" * 60)
+        logger.error(
+            f"Training finished, but non-critical stage(s) permanently failed: "
+            f"{', '.join(failed_stages)}"
+        )
+        logger.error(
+            "Re-run the identical command to retry them — completed stages are skipped "
+            "via the run manifest"
+        )
+        logger.error("=" * 60)
+        sys.exit(1)
 
     logger.info("=" * 60)
     logger.info("Training completed successfully!")
