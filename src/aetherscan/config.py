@@ -45,6 +45,10 @@ class MonitorConfig:
     stop_monitor_timeout: float = 10.0  # seconds
     monitor_interval: float = 1.0  # seconds
     monitor_retry_delay: float = 1.0  # seconds
+    # Overlay top-level pipeline_stages spans (depth <= 2 dot-names, e.g. "train.round_03")
+    # as labeled translucent bands on the resource plot's CPU panel, so utilization
+    # plateaus are attributable to pipeline stages at a glance
+    annotate_stages: bool = True
 
 
 @dataclass
@@ -540,6 +544,7 @@ class Config:
                 "stop_monitor_timeout": self.monitor.stop_monitor_timeout,
                 "monitor_interval": self.monitor.monitor_interval,
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
+                "annotate_stages": self.monitor.annotate_stages,
             },
             "logger": {
                 "console_level": self.logger.console_level,
