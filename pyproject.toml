@@ -124,6 +124,7 @@ unfixable = []
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
 "utils/*" = ["T20"]  # Allow utility scripts to use print()
+"benchmarks/*" = ["T20"]  # Allow micro-benchmark scripts to use print()
 "src/aetherscan/logger/slack_handler.py" = ["T201"]  # Allow logging handler to use print() (for stderr; handler can't log through itself without recursion)
 
 [tool.ruff.lint.isort]
