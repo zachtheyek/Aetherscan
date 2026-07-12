@@ -23,8 +23,8 @@ Training data is synthetic (setigen signal injection over real observed backgrou
 real filterbank `.h5` observations reduced by an energy-detection preprocessing stage
 ([`src/aetherscan/preprocessing.py`](../src/aetherscan/preprocessing.py)). Both commands run
 single-node multi-GPU via `tf.distribute.MirroredStrategy` with NCCL all-reduce (falling back
-to `HierarchicalCopyAllReduce`), set up in
-[`src/aetherscan/main.py`](../src/aetherscan/main.py)`:setup_gpu_strategy()`.
+to `HierarchicalCopyAllReduce`), set up in `setup_gpu_strategy()`
+([`src/aetherscan/main.py`](../src/aetherscan/main.py)).
 
 `src/aetherscan/main.py` is the **sole entry point**: `python -m aetherscan.main
 {train|inference}`.

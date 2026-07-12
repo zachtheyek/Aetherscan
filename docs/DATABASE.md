@@ -277,10 +277,11 @@ size — logged at startup.
 Rules of thumb at full-scale defaults (dominant terms only):
 
 - **`injection_stats` is the giant.** Every generated cadence writes 18 intensity rows
-  (6 statistics × 3 stages) plus 0–12 signal-characteristic rows (0 / 6 / 6 / 12 by type —
-  average 6). A training round generates `3 × num_samples_beta_vae` cadences (main + true +
-  false), so at defaults: `3 × 499 200 × ~24 ≈ 36 M rows per round`, times 20 rounds plus the
-  RF dataset. This is why writes are batched, why the drainer runs off the training critical
+  (6 statistics × 3 stages A/B/C) plus 0–12 signal-characteristic rows depending on its type
+  (0 / 6 / 6 / 12 for the four equal-weighted `main`-class types — 0 for the no-signal type,
+  6 per injected signal, so their mean is 6). That is **~24 rows per cadence** (18 + 6). A
+  training round generates `3 × num_samples_beta_vae` cadences (main + true + false), so at
+  defaults: `3 × 499 200 × ~24 ≈ 36 M rows per round`, times 20 rounds plus the RF dataset. This is why writes are batched, why the drainer runs off the training critical
   path, and why the injection plots subsample (`plot_injection_subsampling_count`). If the
   database size becomes a problem, this table is where the budget goes — smoke-scale runs
   (`--num-samples-beta-vae 3072`) keep it trivial.

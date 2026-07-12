@@ -91,6 +91,15 @@ double-post.
 | [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
 | [`claude-flaky-test-tracker.yml`](../.github/workflows/claude-flaky-test-tracker.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Reads the week's `tests.yml` runs, identifies flaky/failing tests, diagnoses the worst offender, files a weekly report issue. | `<!-- aetherscan-flaky-test-tracker week=<WEEK> -->` |
 
+> [!NOTE]
+> **`claude-update-docs` is a two-step relay**, which is why its row is dense. Step 1 is a
+> deterministic shell step: when `cli.py` changed it regenerates the README CLI Reference with
+> `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13)
+> and files an issue embedding that output. Step 2 is the assistant: the filed issue carries an
+> intentional handle mention that triggers `claude.yml` to open the actual docs PR. The split
+> exists because the follow-up assistant run has no `python` in its tool allowlist, so it
+> cannot regenerate the CLI help itself — the shell step must do it first.
+
 The dedup-marker pattern is a convention to preserve in any new workflow that posts content:
 the guard step greps existing issues/comments for the marker (`gh ... --json body --jq` +
 `grep`), and the prompt instructs the assistant to put the marker as the **first line** of
