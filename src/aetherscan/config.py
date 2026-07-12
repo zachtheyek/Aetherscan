@@ -371,6 +371,20 @@ class InferenceConfig:
 
 
 @dataclass
+class HFConfig:
+    """HuggingFace Hub integration configuration"""
+
+    # Target model repo for weight upload (train) and download (inference).
+    repo_id: str = "zachtheyek/aetherscan"
+    # Opt-in: publish the final artifacts + a generated model card after training completes
+    # (requires HF_TOKEN in the environment; default off = local-only).
+    upload_after_training: bool = False
+    # Inference pin: HF revision (tag/branch/commit) to download artifacts from. None
+    # resolves to the latest release tag (highest semver vX.Y.Z, else highest final_vX).
+    revision: str | None = None
+
+
+@dataclass
 class CheckpointConfig:
     """Checkpoint configuration"""
 
@@ -378,6 +392,9 @@ class CheckpointConfig:
     load_tag: str | None = None
     start_round: int = 1
     save_tag: str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Override the fail-early save-tag dedup guards (local artifact/DB collisions and the
+    # HF-side tag check) for an explicitly-provided save_tag.
+    force_tag: bool = False
 
     def infer_start_round(self):
         """Infer start_round from load_tag"""
@@ -434,6 +451,7 @@ class Config:
         self.data = DataConfig()
         self.training = TrainingConfig()
         self.inference = InferenceConfig()
+        self.hf = HFConfig()
         self.checkpoint = CheckpointConfig()
 
         # Paths
@@ -648,11 +666,17 @@ class Config:
                 "max_retries": self.inference.max_retries,
                 "retry_delay": self.inference.retry_delay,
             },
+            "hf": {
+                "repo_id": self.hf.repo_id,
+                "upload_after_training": self.hf.upload_after_training,
+                "revision": self.hf.revision,
+            },
             "checkpoint": {
                 "load_dir": self.checkpoint.load_dir,
                 "load_tag": self.checkpoint.load_tag,
                 "start_round": self.checkpoint.start_round,
                 "save_tag": self.checkpoint.save_tag,
+                "force_tag": self.checkpoint.force_tag,
             },
         }
 

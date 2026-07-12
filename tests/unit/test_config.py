@@ -22,6 +22,7 @@ _CONFIG_SECTIONS = (
     "data",
     "training",
     "inference",
+    "hf",
     "checkpoint",
 )
 

@@ -214,14 +214,55 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(["train"]), None)
         assert [e for e in errors if e.fix_kind == "file_exists"] == []
 
-    def test_inference_requires_model_artifacts(self):
+    def test_inference_artifact_trio_omitted_is_valid(self):
+        # No local artifact paths -> resolution is handled upstream (HF download in main.py),
+        # so validation must not demand them.
         errors = collect_validation_errors(_parse(["inference"]), None)
+        artifact_fields = {"inference.encoder_path", "inference.rf_path", "inference.config_path"}
+        assert not artifact_fields & {e.field for e in errors}
+
+    def test_inference_artifact_partial_trio_rejected(self, tmp_path):
+        encoder = tmp_path / "vae_encoder_test_v1.keras"
+        encoder.touch()
+        errors = collect_validation_errors(
+            _parse(["inference", "--encoder-path", str(encoder)]), None
+        )
+        fields = {e.field for e in errors if e.fix_kind == "file_exists"}
+        # The two missing paths are reported; the provided one passes.
+        assert {"inference.rf_path", "inference.config_path"} <= fields
+        assert "inference.encoder_path" not in fields
+
+    def test_inference_artifact_full_trio_must_exist_on_disk(self):
+        errors = collect_validation_errors(
+            _parse(
+                [
+                    "inference",
+                    "--encoder-path",
+                    "/nonexistent/e.keras",
+                    "--rf-path",
+                    "/nonexistent/r.joblib",
+                    "--config-path",
+                    "/nonexistent/c.json",
+                ]
+            ),
+            None,
+        )
         fields = {e.field for e in errors if e.fix_kind == "file_exists"}
         assert {
             "inference.encoder_path",
             "inference.rf_path",
             "inference.config_path",
         } <= fields
+
+    @pytest.mark.parametrize("command", ["train", "inference"])
+    def test_hf_repo_id_format_rejected(self, command):
+        errors = collect_validation_errors(_parse([command, "--hf-repo-id", "not-a-repo-id"]), None)
+        assert any(e.field == "hf.repo_id" for e in errors)
+
+    @pytest.mark.parametrize("repo_id", ["zachtheyek/aetherscan", "org-name/repo.name-1"])
+    def test_hf_repo_id_valid_values_pass(self, repo_id):
+        errors = collect_validation_errors(_parse(["train", "--hf-repo-id", repo_id]), None)
+        assert [e for e in errors if e.field == "hf.repo_id"] == []
 
     def test_inference_stamp_width_must_match_width_bin(self, make_inference_csv):
         csv_path = make_inference_csv("subset.csv")
@@ -499,6 +540,28 @@ class TestApplyArgsToConfig:
         config.inference.bandpass_debug_plot = True
         apply_args_to_config(_parse(["inference"]))
         assert config.inference.bandpass_debug_plot is True
+
+    def test_hf_flags_route_to_hf_section(self):
+        config = get_config()
+        assert config.hf.upload_after_training is False  # default: local-only
+        apply_args_to_config(_parse(["train", "--hf-upload", "--hf-repo-id", "other/repo"]))
+        assert config.hf.upload_after_training is True
+        assert config.hf.repo_id == "other/repo"
+
+        apply_args_to_config(_parse(["train", "--no-hf-upload"]))
+        assert config.hf.upload_after_training is False
+
+        apply_args_to_config(_parse(["inference", "--hf-revision", "v0.1.0"]))
+        assert config.hf.revision == "v0.1.0"
+
+    def test_force_tag_routes_to_checkpoint_section(self):
+        config = get_config()
+        assert config.checkpoint.force_tag is False
+        apply_args_to_config(_parse(["train", "--force-tag"]))
+        assert config.checkpoint.force_tag is True
+        # Omitting the flag leaves the config value untouched (tri-state BooleanOptionalAction)
+        apply_args_to_config(_parse(["inference"]))
+        assert config.checkpoint.force_tag is True
 
 
 class TestLatentTraversalFlags:
