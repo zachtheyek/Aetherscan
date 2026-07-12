@@ -64,6 +64,14 @@ If you suspect a token has been compromised, rotate immediately:
 6. Update `SLACK_BOT_TOKEN` in all deployment environments
 7. Verify the new token works: `PYTHONPATH=src python utils/print_cli_help.py train` (should not show Slack errors)
 
+#### HuggingFace Hub Token
+
+1. Go to [HuggingFace access tokens](https://huggingface.co/settings/tokens)
+2. Locate the compromised token and invalidate (refresh) or delete it
+3. Create a replacement token — grant **write** access only if you upload artifacts (`train --hf-upload`); the default inference path downloads from a **public** repo and needs no token at all
+4. Update `HF_TOKEN` in all deployment environments (the gitignored `.env`, or exported in the shell)
+5. Verify the new token works by re-running an upload: `./utils/run_container.sh python -m aetherscan.main train --hf-upload ...` (the upload stage should authenticate without errors)
+
 ---
 
 ## Secrets Management
@@ -72,9 +80,12 @@ If you suspect a token has been compromised, rotate immediately:
 
 Aetherscan uses the following secrets that must be protected:
 
-| Secret          | Environment Variable | Purpose                        |
-| --------------- | -------------------- | ------------------------------ |
-| Slack Bot Token | `SLACK_BOT_TOKEN`    | Slack alerts and notifications |
+| Secret            | Environment Variable | Purpose                                       |
+| ----------------- | -------------------- | --------------------------------------------- |
+| Slack Bot Token   | `SLACK_BOT_TOKEN`    | Slack alerts and notifications                |
+| HuggingFace Token | `HF_TOKEN`           | Upload model artifacts to the HuggingFace Hub |
+
+`HF_TOKEN` is only needed to **upload** trained model artifacts to the HuggingFace Hub (opt-in via `train --hf-upload`); the default inference path downloads from a **public** repo and needs no token, so grant the token **write** scope only when uploading. Like `SLACK_BOT_TOKEN`, it is read from the gitignored `.env` (never committed) and forwarded into the NGC container through `utils/run_container.sh`'s explicit `--env` allowlist — never log it (INFO-level logs may reach Slack).
 
 ### Best Practices
 
