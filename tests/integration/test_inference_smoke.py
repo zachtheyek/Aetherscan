@@ -9,8 +9,11 @@ bind by default — either bind it explicitly:
 
     SINGULARITY_BIND=/datag ./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
 
-or rely on the resume path: preprocessing skips any cadence whose stamp .npy already exists
-under <output>/preprocessed, so a previously-preprocessed subset runs without /datag.
+or rely on the resume path: preprocessing skips any cadence whose stamp .npy already exists.
+The default stamp directory is tag-scoped ({data_path}/inference/preprocessed/
+<csv_stem>_<save_tag>/), so a fresh-tagged run never resumes on its own — when /datag is not
+mounted and legacy stamps exist under <output>/preprocessed, the test points
+--preprocess-output-dir at them explicitly (the documented reuse escape hatch).
 """
 
 from __future__ import annotations
@@ -46,10 +49,15 @@ def test_inference_smoke(cluster_paths, run_pipeline):
         if not os.path.exists(required):
             pytest.skip(f"required cluster artifact missing: {required}")
 
-    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional.
-    preprocessed = glob.glob(os.path.join(output_path, "preprocessed", "subset_test_*.npy"))
-    if not os.path.exists("/datag") and not preprocessed:
-        pytest.skip("/datag not mounted and no preprocessed subset stamps to resume from")
+    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional, but the
+    # tag-scoped default output dir means a fresh tag never sees them — reuse requires
+    # passing their directory explicitly.
+    extra_flags: list[str] = []
+    if not os.path.exists("/datag"):
+        legacy_dir = os.path.join(output_path, "preprocessed")
+        if not glob.glob(os.path.join(legacy_dir, "subset_test_*.npy")):
+            pytest.skip("/datag not mounted and no preprocessed subset stamps to resume from")
+        extra_flags = ["--preprocess-output-dir", legacy_dir]
 
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     proc = run_pipeline(
@@ -67,6 +75,7 @@ def test_inference_smoke(cluster_paths, run_pipeline):
             tag,
             "--max-retries",
             "1",
+            *extra_flags,
         ]
     )
 

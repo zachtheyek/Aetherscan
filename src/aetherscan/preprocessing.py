@@ -1752,14 +1752,19 @@ class DataPreprocessor:
         spectrum raw vs flattened, overlaying the model being removed (the scaled PFB response
         H, or the spline fit). Saved under {output_path}/plots/inference/. Deliberately
         minimal — PR-08's inference visualization suite formalizes this figure.
+
+        Uses matplotlib's object-oriented Figure API rather than pyplot: _process_cadence runs
+        on the streaming-inference prefetch thread, and pyplot's global figure registry is not
+        thread-safe.
         """
-        import matplotlib.pyplot as plt  # noqa: PLC0415
+        from matplotlib.figure import Figure  # noqa: PLC0415
 
         width = self.config.inference.coarse_channel_width
         pfb_active = bandpass_flatten.func is _pfb_flatten_bandpass
         sampled = self._sample_channel_indices(n_coarse_total)
 
-        fig, axes = plt.subplots(len(sampled), 2, figsize=(14, 3.2 * len(sampled)), squeeze=False)
+        fig = Figure(figsize=(14, 3.2 * len(sampled)))
+        axes = fig.subplots(len(sampled), 2, squeeze=False)
         for row, ch in enumerate(sampled):
             channel = self._read_despiked_channel(h5_path, ch)
             raw = channel.mean(axis=0)
@@ -1796,8 +1801,8 @@ class DataPreprocessor:
         stem = os.path.splitext(os.path.basename(npy_path))[0]
         tag = self.config.checkpoint.save_tag
         out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{tag}.png")
+        # No close/registry bookkeeping needed: an OO-API Figure is garbage-collected
         fig.savefig(out_path, dpi=120)
-        plt.close(fig)
         logger.info(f"Saved bandpass overlay debug plot: {out_path}")
 
     # NOTE: come back to this later (what's the trade-off for doing dedup vs not? e.g. lower storage & compute, but higher FNR or lower DR sensitivity?)
