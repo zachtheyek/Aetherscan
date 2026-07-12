@@ -174,6 +174,33 @@ class TestCollector:
         assert record.confidence_hist is None
 
 
+class TestSelectTopStamps:
+    def test_overlap_offset_duplicates_are_skipped(self, tmp_path):
+        """With overlap_search the same hit yields stamps at ±overlap_fraction*stamp_width
+        (exactly stamp_width // 2 at defaults) sharing one statistic — the gallery selection
+        must keep only one of each triplet (regression: a strict < comparison let all
+        three through)."""
+        from aetherscan.inference_viz import _select_top_stamps  # noqa: PLC0415
+
+        npy_path, metadata_path, metadata = _write_cadence_artifacts(tmp_path, "cad_ov", ("O",))
+        # One hit at start 1000 with its two overlap offsets (stamp_width=256 -> offset 128),
+        # plus one genuinely distinct weaker hit far away
+        metadata["stamp_starts"] = [872, 1000, 1128, 5000]
+        metadata["stamp_statistics"] = [9000.0, 9000.0, 9000.0, 3000.0]
+        metadata["stamp_frequencies_mhz"] = [1400.1, 1400.1, 1400.1, 1405.0]
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+
+        coll = InferenceVizCollector()
+        coll.record_processed(("O",), npy_path, metadata_path, {}, _fake_results(n=4), 1.0)
+        metadatas = {npy_path: metadata}
+
+        selected = _select_top_stamps(coll.records, metadatas, top_k=4)
+        starts = [metadata["stamp_starts"][idx] for _, idx, _, _ in selected]
+        assert len([s for s in starts if s in (872, 1000, 1128)]) == 1
+        assert 5000 in starts
+
+
 class TestFigureSmoke:
     def test_ed_stat_distributions(self, collector, metadatas):
         _assert_figure(plot_ed_stat_distributions(collector.records, metadatas))
@@ -281,7 +308,7 @@ class TestFigureSmoke:
         config.inference.config_path = str(config_json)
         assert plot_inference_latent_projection(collector) is None
 
-    def test_inference_summary(self, initialized_runtime, collector):
+    def test_inference_summary(self, initialized_runtime, collector, metadatas):
         db = initialized_runtime
         db.write_inference_cadence(
             npy_path=collector.records[0].npy_path,
@@ -305,7 +332,7 @@ class TestFigureSmoke:
             "n_cadences": 2,
             "n_skipped": 0,
         }
-        _assert_figure(plot_inference_summary(collector.records, totals))
+        _assert_figure(plot_inference_summary(collector.records, metadatas, totals))
 
 
 class TestSuiteEntryPoint:

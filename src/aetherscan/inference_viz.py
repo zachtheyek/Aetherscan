@@ -312,7 +312,9 @@ def plot_ed_stat_distributions(
     ax.axvline(
         stat_threshold, color="red", ls="--", lw=1.2, label=f"threshold ({stat_threshold:g})"
     )
-    above = int(per_on_totals.sum(axis=0)[edges[:-1] >= stat_threshold].sum())
+    # Exact above-threshold count from the workers' hit lists (the histogram bins are fixed,
+    # so the threshold generally falls inside a bin — summing bins would be approximate)
+    above = sum(int((metadatas.get(r.npy_path) or {}).get("n_raw_hits") or 0) for r in records)
     total = int(per_on_totals.sum())
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -446,37 +448,36 @@ def plot_bandpass_flattening(
 def _select_top_stamps(
     records: list[CadenceVizRecord], metadatas: dict[str, dict], top_k: int
 ) -> list[tuple[CadenceVizRecord, int, float, float]]:
-    """Pick the top_k stamps by detection statistic across all cadences, greedily skipping
-    near-duplicates (overlap-search offsets of an already-selected stamp share its statistic
-    and nearly its start, so a plain top-K would show the same hit up to three times).
-    Returns (record, snippet_index, statistic, frequency_mhz) tuples, strongest first."""
-    candidates: list[tuple[float, CadenceVizRecord, int, float, int]] = []
+    """Pick the top_k stamps by detection statistic across all cadences, collapsing
+    overlap-search offset copies first: with overlap_search each hit yields up to three
+    stamps (at -offset/0/+offset) that all carry the hit's statistic, so a plain top-K
+    would show the same hit up to three times. Copies are grouped by their (exact) shared
+    statistic per cadence and represented by the median-start stamp — the offset-0 center
+    for a full triplet. Returns (record, snippet_index, statistic, frequency_mhz) tuples,
+    strongest first."""
+    representatives: list[tuple[float, CadenceVizRecord, int, float]] = []
     for record in records:
         metadata = metadatas.get(record.npy_path) or {}
         stats_list = metadata.get("stamp_statistics") or []
         freqs = metadata.get("stamp_frequencies_mhz") or []
         starts = metadata.get("stamp_starts") or []
+
+        # Group this cadence's stamps by exact statistic value (offset copies of one hit
+        # share the same float64 statistic; distinct hits colliding on the exact value is
+        # vanishingly unlikely, and for a gallery a collision merely hides a duplicate look)
+        by_stat: dict[float, list[tuple[int, int]]] = {}
         for idx, stat in enumerate(stats_list):
-            freq = float(freqs[idx]) if idx < len(freqs) else float("nan")
             start = int(starts[idx]) if idx < len(starts) else 0
-            candidates.append((float(stat), record, idx, freq, start))
+            by_stat.setdefault(float(stat), []).append((start, idx))
 
-    candidates.sort(key=lambda c: c[0], reverse=True)
+        for stat, members in by_stat.items():
+            members.sort()  # by start; median = offset-0 center for a full triplet
+            _, idx = members[len(members) // 2]
+            freq = float(freqs[idx]) if idx < len(freqs) else float("nan")
+            representatives.append((stat, record, idx, freq))
 
-    selected: list[tuple[CadenceVizRecord, int, float, float]] = []
-    taken_starts: dict[str, list[int]] = {}
-    for stat, record, idx, freq, start in candidates:
-        if len(selected) >= top_k:
-            break
-        metadata = metadatas.get(record.npy_path) or {}
-        stamp_width = int(metadata.get("stamp_width") or 0)
-        min_gap = max(1, stamp_width // 2)
-        near = [s for s in taken_starts.get(record.npy_path, []) if abs(s - start) < min_gap]
-        if near:
-            continue
-        taken_starts.setdefault(record.npy_path, []).append(start)
-        selected.append((record, idx, stat, freq))
-    return selected
+    representatives.sort(key=lambda c: c[0], reverse=True)
+    return [(record, idx, stat, freq) for stat, record, idx, freq in representatives[:top_k]]
 
 
 def plot_stamp_gallery(records: list[CadenceVizRecord], metadatas: dict[str, dict]) -> str | None:
@@ -848,7 +849,9 @@ def plot_inference_latent_projection(collector: InferenceVizCollector) -> str | 
     )
 
 
-def plot_inference_summary(records: list[CadenceVizRecord], totals: dict) -> str | None:
+def plot_inference_summary(
+    records: list[CadenceVizRecord], metadatas: dict[str, dict], totals: dict
+) -> str | None:
     """Table-style run summary card: cadence/snippet/candidate counts, per-stage durations
     and throughput from the inference_cadences manifest, and per-target/band candidate
     counts from inference_results."""
@@ -867,7 +870,6 @@ def plot_inference_summary(records: list[CadenceVizRecord], totals: dict) -> str
                 inference_duration += duration
 
     n_snippets = int(totals.get("n_cadence_snippets", 0))
-    metadatas = {r.npy_path: _load_metadata(r) or {} for r in records}
     n_raw_hits = sum(int((m or {}).get("n_raw_hits") or 0) for m in metadatas.values())
     n_merged_hits = sum(int((m or {}).get("n_merged_hits") or 0) for m in metadatas.values())
     storage_gb = 0.0
@@ -957,6 +959,6 @@ def render_inference_visualizations(
     _viz_safe("confidence_distribution", plot_confidence_distribution, records)
     _viz_safe("candidate_gallery", plot_candidate_gallery)
     _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
-    _viz_safe("inference_summary", plot_inference_summary, records, totals)
+    _viz_safe("inference_summary", plot_inference_summary, records, metadatas, totals)
 
     logger.info("Inference visualization suite complete")

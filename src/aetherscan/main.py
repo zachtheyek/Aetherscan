@@ -536,12 +536,13 @@ def _run_streaming_csv_inference(
                             results,
                             results["duration_s"],
                         )
-                    del results
 
                     logger.info(
                         f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "
-                        f"{len(pending) - i - 1} to go)"
+                        f"{len(pending) - i - 1} to go): {results['n_processed']} snippets, "
+                        f"{results['n_candidates']} candidate(s)"
                     )
+                    del results
         finally:
             preprocessor.stop_energy_detection_pool()
             # Release TF dataset/iterator state once per run, after the loaded models are done
