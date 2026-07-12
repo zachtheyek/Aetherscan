@@ -15,6 +15,10 @@ benchmarks/results/
 # Container artifacts
 *.sif
 
+# Python packaging artifacts (python -m build)
+dist/
+*.egg-info/
+
 
 ### Global gitignore (https://github.com/zachtheyek/dotfiles/blob/master/git/.gitignore_global)
 
