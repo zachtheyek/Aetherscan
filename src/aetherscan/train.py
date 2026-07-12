@@ -374,6 +374,10 @@ def build_traversal_latents(
 
     latent_dim = z_base.shape[0]
     steps = np.linspace(-max_sigma, max_sigma, num_steps).astype(np.float32)
+    if num_steps % 2 == 1:
+        # Snap the center step to exactly 0 — linspace can leave ~1e-16 residue for
+        # non-integral max_sigma, and the center column must be the exact base decode
+        steps[num_steps // 2] = 0.0
     latents = np.tile(z_base, (latent_dim * num_steps, 1))
     for d in range(latent_dim):
         latents[d * num_steps : (d + 1) * num_steps, d] += steps * sigmas[d]
@@ -4748,9 +4752,9 @@ class TrainingPipeline:
                 )
             else:
                 caption = (
-                    "Intensity in normalized log space (log-norm params unavailable); "
-                    f"frequency ×{downsample_factor} nearest-neighbor upsampled. Exact "
-                    "un-preprocessing impossible (lossy downsample)."
+                    "Intensity in normalized log space (log-norm params unavailable or "
+                    f"degenerate); frequency ×{downsample_factor} nearest-neighbor upsampled. "
+                    "Exact un-preprocessing impossible (lossy downsample)."
                 )
 
             self._render_traversal_waterfalls(
@@ -4831,7 +4835,9 @@ class TrainingPipeline:
                 ax.set_xticks([])
                 ax.set_yticks([])
                 if d == 0:
-                    ax.set_title("0σ (base)" if steps[s] == 0 else f"{steps[s]:+.3g}σ", fontsize=10)
+                    # The center column (odd, validated step count) is the unperturbed decode
+                    is_center = num_steps % 2 == 1 and s == num_steps // 2
+                    ax.set_title("0σ (base)" if is_center else f"{steps[s]:+.3g}σ", fontsize=10)
                 if s == 0:
                     ax.set_ylabel(f"dim {d}\n(σ={sigmas[d]:.3f})", fontsize=9)
         axes[-1][num_steps // 2].set_xlabel(

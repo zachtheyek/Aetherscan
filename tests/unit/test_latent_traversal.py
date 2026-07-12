@@ -57,6 +57,13 @@ class TestBuildTraversalLatents:
                 expected[d] = steps[s] * sigmas[d]
                 np.testing.assert_allclose(delta, expected, atol=1e-6)
 
+    @pytest.mark.parametrize("max_sigma", [2.5, 3.0, 0.7])
+    def test_center_step_is_exactly_zero_for_any_max_sigma(self, z_base, sigmas, max_sigma):
+        # linspace can leave ~1e-16 residue at the center for non-integral ranges; the
+        # builder must snap it so the center column is the exact base decode.
+        _, steps = build_traversal_latents(z_base, sigmas, _NUM_STEPS, max_sigma)
+        assert steps[_NUM_STEPS // 2] == 0.0
+
     def test_mismatched_shapes_raise(self, z_base):
         with pytest.raises(ValueError, match="matching 1-D"):
             build_traversal_latents(z_base, np.ones(_LATENT_DIM + 1), _NUM_STEPS, _MAX_SIGMA)
