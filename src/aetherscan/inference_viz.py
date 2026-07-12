@@ -665,8 +665,12 @@ def plot_candidate(row: dict, index: int) -> str | None:
     _draw_cadence_strip(waterfall_axes, snippet, label_rows=True)
     waterfall_axes[-1].set_xlabel("frequency bin")
 
-    # Right column: latent bar chart on top, provenance text below
-    latent_ax = fig.add_subplot(grid[: n_obs // 2, 1])
+    # Right column: latent bar chart on top, provenance text below. A nested gridspec gives
+    # the two panels a dedicated vertical gap so the bar chart's x-axis label can never
+    # collide with the first metadata line; the text panel takes the taller share so all of
+    # the provenance lines stay clear of the axis label regardless of how many there are.
+    right_grid = grid[:, 1].subgridspec(2, 1, height_ratios=(1.0, 1.3), hspace=0.55)
+    latent_ax = fig.add_subplot(right_grid[0])
     latent_json = row.get("latent_vector")
     if latent_json:
         latent = np.asarray(json.loads(latent_json), dtype=np.float64).ravel()
@@ -681,10 +685,10 @@ def plot_candidate(row: dict, index: int) -> str | None:
         latent_ax.set_axis_off()
         latent_ax.text(0.5, 0.5, "no latent vector stored", ha="center", va="center")
 
-    text_ax = fig.add_subplot(grid[n_obs // 2 :, 1])
+    text_ax = fig.add_subplot(right_grid[1])
     text_ax.set_axis_off()
     text_ax.text(
-        0.0, 0.95, _candidate_annotation(row), va="top", ha="left", fontsize=9, family="monospace"
+        0.0, 1.0, _candidate_annotation(row), va="top", ha="left", fontsize=9, family="monospace"
     )
 
     fig.suptitle(f"Candidate {index} ({tag}) — P(true) = {row.get('confidence', 0):.4f}")
