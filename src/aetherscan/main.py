@@ -454,7 +454,7 @@ def _run_streaming_csv_inference(
             collector.record_skipped(
                 unit.group.key,
                 unit.npy_path,
-                DataPreprocessor._cadence_metadata_path(unit.npy_path),
+                DataPreprocessor.cadence_metadata_path(unit.npy_path),
                 manifest_row,
             )
         logger.info(
@@ -518,6 +518,10 @@ def _run_streaming_csv_inference(
                             tag=tag,
                             csv_path=unit.group.csv_path,
                             cadence_key=cadence_result.key,
+                            # Despite the historical field name, CadenceResult.n_hits is
+                            # the .npy's stamp-row count — the same quantity as the
+                            # 'preprocessed'/'inferred' rows' n_stamps, so the manifest
+                            # stays consistent across all three statuses.
                             n_stamps=cadence_result.n_hits,
                         )
                         continue

@@ -107,7 +107,7 @@ class _StubPreprocessor:
         rng = np.random.default_rng(3)
         stamps = rng.random((self.n_stamps, 6, 16, self.width)).astype(np.float32)
         np.save(unit.npy_path, stamps)
-        metadata_path = DataPreprocessor._cadence_metadata_path(unit.npy_path)
+        metadata_path = DataPreprocessor.cadence_metadata_path(unit.npy_path)
         with open(metadata_path, "w") as f:
             json.dump({"h5_paths": unit.group.h5_paths, "key": list(unit.group.key)}, f)
         return CadenceResult(

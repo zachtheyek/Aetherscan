@@ -203,6 +203,11 @@ def _save_and_upload(fig: Figure, filename: str, slack_title: str) -> str:
     tag = get_config().checkpoint.save_tag
     save_path = os.path.join(_plots_dir(tag), filename)
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    # Eagerly release the figure's artists/render buffers. OO-API Figures aren't tracked by
+    # a global registry, so this isn't a leak fix — it just frees the backing memory now
+    # instead of at garbage collection (relevant for dense stamp/candidate galleries). The
+    # Slack upload below reads the saved PNG, not the figure.
+    fig.clear()
     logger.info(f"Inference viz saved: {save_path}")
 
     logger_instance = get_logger()
@@ -336,6 +341,11 @@ def plot_ed_hit_spectrum(records: list[CadenceVizRecord], metadatas: dict[str, d
     structure shows up immediately as spikes/picket-fences."""
     tag = get_config().checkpoint.save_tag
 
+    # NOTE: unlike the pre-binned ED stat histograms, hit frequencies are accumulated raw
+    # across every cadence before the histogram call — an asymmetry that is bounded at
+    # current catalog scale (~1e5-1e6 floats) but would warrant pre-binning in the
+    # metadata (fixed frequency grid, like ed_stat_hist) if catalogs grow to hundreds of
+    # RFI-dense cadences.
     raw_freqs: list[float] = []
     merged_freqs: list[float] = []
     for record in records:

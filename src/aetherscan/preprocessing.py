@@ -565,6 +565,9 @@ class CadenceResult:
     npy_path: str
     h5_paths: list[str]  # Same as in CadenceGroup
     key: tuple  # Same as in CadenceGroup
+    # Number of stamp rows in the .npy (post-dedup, incl. overlap offsets) — the same
+    # quantity the inference_cadences manifest stores as n_stamps. Historical name: this
+    # is NOT the raw energy-detection hit count (metadata's n_raw_hits carries that).
     n_hits: int
     metadata_path: str  # Sibling .json with hit details
 
@@ -1298,7 +1301,7 @@ class DataPreprocessor:
 
         if os.path.exists(npy_path):
             # Resume path: rebuild a minimal CadenceResult from the existing file
-            metadata_path = self._cadence_metadata_path(npy_path)
+            metadata_path = self.cadence_metadata_path(npy_path)
             try:
                 existing = np.load(npy_path, mmap_mode="r")
                 n_hits = existing.shape[0]
@@ -1376,8 +1379,10 @@ class DataPreprocessor:
         return f"{csv_stem}_{'_'.join(safe_parts)}.npy"
 
     @staticmethod
-    def _cadence_metadata_path(npy_path: str) -> str:
-        """Return the sibling .json path for a cadence's metadata."""
+    def cadence_metadata_path(npy_path: str) -> str:
+        """Return the sibling .json path for a cadence's metadata. Public: the streaming
+        loop (main.py) and the viz suite derive metadata paths for resume-skipped cadences
+        whose CadenceResult was never rebuilt."""
         return os.path.splitext(npy_path)[0] + ".json"
 
     @staticmethod
@@ -1656,7 +1661,7 @@ class DataPreprocessor:
 
         os.replace(tmp_npy_path, npy_path)
 
-        metadata_path = self._cadence_metadata_path(npy_path)
+        metadata_path = self.cadence_metadata_path(npy_path)
         # Per-stamp frequency = center bin's frequency, computed from header's fch1/foff
         stamp_freqs_mhz = [float(fch1 + foff * (start + half)) for start, _, _ in stamp_centers]
         stamp_stats = [float(s) for _, s, _ in stamp_centers]
@@ -1678,7 +1683,11 @@ class DataPreprocessor:
             "overlap_fraction": overlap_fraction if overlap_search else None,
             # Energy-detection provenance for the visualization suite: the all-window
             # statistic histograms (per ON file, fixed log-spaced bins) and the hit
-            # frequencies before/after deduplication (hit spectrum + funnel figures)
+            # frequencies before/after deduplication (hit spectrum + funnel figures).
+            # NOTE: the frequency lists are stored raw (unlike the pre-binned stat
+            # histograms — an asymmetry): tens of thousands of floats per RFI-dense
+            # cadence, bounded at current catalog scale. If metadata JSONs grow unwieldy,
+            # pre-bin these onto a fixed frequency grid the way ed_stat_hist does.
             "ed_stat_hist": {
                 "bin_edges": [float(e) for e in ED_STAT_HIST_EDGES],
                 "counts_per_on_file": stat_hists.tolist(),

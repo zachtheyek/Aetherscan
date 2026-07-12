@@ -90,7 +90,7 @@ def _write_cadence_artifacts(tmp_path, name, key, n_stamps=N_STAMPS, h5_paths=No
         "raw_hit_frequencies_mhz": list(np.repeat(freqs, 3)),
         "merged_hit_frequencies_mhz": freqs,
     }
-    metadata_path = DataPreprocessor._cadence_metadata_path(npy_path)
+    metadata_path = DataPreprocessor.cadence_metadata_path(npy_path)
     with open(metadata_path, "w") as f:
         json.dump(metadata, f)
     return npy_path, metadata_path, metadata
