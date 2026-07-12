@@ -226,7 +226,10 @@ class InferencePipeline:
         # instead of accumulating a new concrete function per cadence
         self._encode_step = None
 
-    # TODO: implement model loading from HuggingFace (parametrize args to InferenceConfig)
+    # NOTE: HuggingFace Hub model loading is handled upstream: when no local artifact paths
+    # are given, hf_hub.resolve_inference_artifacts() (called from main()) downloads the
+    # revision-pinned artifacts and routes their cache paths into config.inference, so the
+    # paths received here are always local files
     def init_models(self, encoder_path: str, rf_path: str):
         """Load the VAE encoder (inside strategy.scope) and the Random Forest classifier from disk."""
         if not os.path.exists(encoder_path):
