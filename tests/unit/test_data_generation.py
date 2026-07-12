@@ -93,6 +93,28 @@ class TestLogNorm:
         assert twice.max() == pytest.approx(1.0)
         assert np.array_equal(np.argsort(once, axis=None), np.argsort(twice, axis=None))
 
+    def test_return_params_matches_default_output(self):
+        rng = np.random.default_rng(2)
+        data = rng.chisquare(df=4, size=(16, 64))
+        with_params, params = log_norm(data, return_params=True)
+        np.testing.assert_array_equal(with_params, log_norm(data))
+        assert len(params) == 2
+
+    def test_return_params_inverts_transform(self):
+        # exp(normalized * range_log + min_log) must recover the epsilon-shifted input.
+        rng = np.random.default_rng(3)
+        data = rng.chisquare(df=4, size=(16, 64))
+        normalized, (min_log, range_log) = log_norm(data, return_params=True)
+        recovered = np.exp(normalized * range_log + min_log)
+        np.testing.assert_allclose(recovered, data + 1e-10, rtol=1e-6)
+
+    def test_return_params_constant_input_degenerate_range(self):
+        # Constant input has zero dynamic range: range_log == 0 flags "no inversion possible".
+        normalized, (min_log, range_log) = log_norm(np.full((4, 4), 3.0), return_params=True)
+        assert np.all(normalized == 0.0)
+        assert range_log == 0.0
+        assert min_log == pytest.approx(np.log(3.0), abs=1e-9)
+
 
 class TestCheckValidIntersection:
     def test_parallel_lines_are_valid(self):
@@ -199,6 +221,10 @@ class TestCreateCadences:
         # Output is log-normalized per observation.
         assert final.min() >= 0.0
         assert final.max() <= 1.0
+        # Per-observation log-norm params are threaded through for display inversion,
+        # with a positive dynamic range for noisy inputs.
+        assert sample_info["lognorm_params"].shape == (6, 2)
+        assert np.all(sample_info["lognorm_params"][:, 1] > 0)
 
     def test_create_false_injected(self, plate):
         final, sample_info = create_false(plate, inject=True, **self._kwargs())
@@ -217,6 +243,12 @@ class TestCreateCadences:
         base = plate[sample_info["background_index"]]
         for obs in range(6):
             np.testing.assert_allclose(final[obs], log_norm(base[obs]))
+        # The recorded per-observation params invert the normalization back to the raw
+        # (epsilon-shifted) background.
+        for obs in range(6):
+            min_log, range_log = sample_info["lognorm_params"][obs]
+            recovered = np.exp(final[obs] * range_log + min_log)
+            np.testing.assert_allclose(recovered, base[obs] + 1e-10, rtol=1e-5)
 
     def test_create_true_single_injects_on_only(self, plate):
         final, sample_info = create_true_single(plate, **self._kwargs())

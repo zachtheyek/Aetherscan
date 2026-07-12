@@ -109,19 +109,32 @@ def _init_worker(shm_name, shape, dtype, log_queue=None):
     signal.signal(signal.SIGTERM, cleanup_on_sigterm)
 
 
-def log_norm(data: np.ndarray) -> np.ndarray:
-    """Log-transform `data` (with a 1e-10 epsilon), then shift and rescale into [0, 1]."""
+def log_norm(
+    data: np.ndarray, return_params: bool = False
+) -> np.ndarray | tuple[np.ndarray, tuple[float, float]]:
+    """Log-transform `data` (with a 1e-10 epsilon), then shift and rescale into [0, 1].
+
+    With return_params=True, also returns the (min_log, range_log) normalization parameters,
+    which allow an approximate inversion back to linear intensity:
+    linear ≈ exp(normalized * range_log + min_log). Used by the latent-traversal plot to
+    display decoded reconstructions on a near-physical scale (approximate because the
+    upstream downsampling is lossy).
+    """
     # Add small epsilon to avoid log(0)
     data = data + 1e-10
 
     # Transform data into log-space
     data = np.log(data)
     # Shift data to be >= 0
-    data = data - data.min()
+    min_log = float(data.min())
+    data = data - min_log
     # Normalize data to [0, 1]
-    if data.max() > 0:
-        data = data / data.max()
+    range_log = float(data.max())
+    if range_log > 0:
+        data = data / range_log
 
+    if return_params:
+        return data, (min_log, range_log)
     return data
 
 
@@ -309,7 +322,8 @@ def create_false(
     """
     Create a false-class cadence and return (final, sample_info). final has shape
     (6, 16, width_bin); sample_info carries background_index, per-stage intensity_stats (A/B/C),
-    signal_info (rfi_* keys when inject=True, empty otherwise), and slope_was_clamped.
+    signal_info (rfi_* keys when inject=True, empty otherwise), slope_was_clamped, and the
+    per-observation lognorm_params (shape (6, 2): (min_log, range_log) per observation).
 
     When inject=True, a drifting RFI signal is injected into all 6 observations; when False, the
     background is log-normalized and returned as-is (Stage B = Stage A, signal_info empty).
@@ -328,6 +342,10 @@ def create_false(
 
     # Initialize signal info (will be populated if inject=True)
     signal_info = {}
+
+    # Per-observation log-norm parameters, recorded so the latent-traversal plot can
+    # approximately invert the normalization for display (see log_norm)
+    lognorm_params = np.zeros((n_obs, 2), dtype=np.float32)
 
     # Inject RFI into all 6 observations
     slope_was_clamped = False
@@ -353,7 +371,9 @@ def create_false(
 
         # Reshape stacked data back into original shape & log-normalize after signal injection
         for i in range(n_obs):
-            final[i, :, :] = log_norm(cadence[i * n_time : (i + 1) * n_time, :])
+            final[i, :, :], lognorm_params[i] = log_norm(
+                cadence[i * n_time : (i + 1) * n_time, :], return_params=True
+            )
 
     # Just return background. No signal injection
     else:
@@ -361,7 +381,7 @@ def create_false(
         stats_b = stats_a.copy()
         # Log-normalize base background
         for i in range(n_obs):
-            final[i, :, :] = log_norm(base[i, :, :])
+            final[i, :, :], lognorm_params[i] = log_norm(base[i, :, :], return_params=True)
 
     # STAGE C: Post-injection, post-normalization
     stats_c = _compute_intensity_stats(final)
@@ -372,6 +392,7 @@ def create_false(
         # NOTE: how do we handle db writes & plotting when signal_info is empty?
         "signal_info": signal_info,  # Empty if no injection, rfi_* if injected
         "slope_was_clamped": slope_was_clamped,
+        "lognorm_params": lognorm_params,
     }
 
     return final, sample_info
@@ -390,8 +411,8 @@ def create_true_single(
     """
     Create a true-single-class cadence (ETI injected into ON observations only) and return
     (final, sample_info). final has shape (6, 16, width_bin); sample_info carries
-    background_index, per-stage intensity_stats (A/B/C), eti_*-prefixed signal_info, and
-    slope_was_clamped.
+    background_index, per-stage intensity_stats (A/B/C), eti_*-prefixed signal_info,
+    slope_was_clamped, and per-observation lognorm_params (shape (6, 2)).
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -425,13 +446,18 @@ def create_true_single(
     stats_b = _compute_intensity_stats(cadence)
 
     # Reshape stacked data back into original shape & log-normalize after signal injection
+    lognorm_params = np.zeros((n_obs, 2), dtype=np.float32)
     for i in range(n_obs):
         if i % 2 == 0:
             # ONs: injected signal
-            final[i, :, :] = log_norm(cadence[i * n_time : (i + 1) * n_time, :])
+            final[i, :, :], lognorm_params[i] = log_norm(
+                cadence[i * n_time : (i + 1) * n_time, :], return_params=True
+            )
         else:
             # OFFs: original background
-            final[i, :, :] = log_norm(data[i * n_time : (i + 1) * n_time, :])
+            final[i, :, :], lognorm_params[i] = log_norm(
+                data[i * n_time : (i + 1) * n_time, :], return_params=True
+            )
 
     # STAGE C: Post-injection, post-normalization
     stats_c = _compute_intensity_stats(final)
@@ -441,6 +467,7 @@ def create_true_single(
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # eti_* signal characteristics
         "slope_was_clamped": slope_was_clamped,
+        "lognorm_params": lognorm_params,
     }
 
     return final, sample_info
@@ -460,7 +487,8 @@ def create_true_double(
     Create a true-double-class cadence (non-intersecting ETI and RFI signals injected into
     ON-only and ON-OFF respectively) and return (final, sample_info). final has shape
     (6, 16, width_bin); sample_info carries background_index, per-stage intensity_stats (A/B/C),
-    signal_info with both eti_* and rfi_* keys, and slope_was_clamped.
+    signal_info with both eti_* and rfi_* keys, slope_was_clamped, and per-observation
+    lognorm_params (shape (6, 2)).
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -524,13 +552,18 @@ def create_true_double(
     stats_b = _compute_intensity_stats(cadence_2)
 
     # Reshape stacked data back into original shape & log-normalize after signal injection
+    lognorm_params = np.zeros((n_obs, 2), dtype=np.float32)
     for i in range(n_obs):
         if i % 2 == 0:
             # ONs: 2 injected signals (ETI + RFI)
-            final[i, :, :] = log_norm(cadence_2[i * n_time : (i + 1) * n_time, :])
+            final[i, :, :], lognorm_params[i] = log_norm(
+                cadence_2[i * n_time : (i + 1) * n_time, :], return_params=True
+            )
         else:
             # OFFs: 1 injected signal (RFI only)
-            final[i, :, :] = log_norm(cadence_1[i * n_time : (i + 1) * n_time, :])
+            final[i, :, :], lognorm_params[i] = log_norm(
+                cadence_1[i * n_time : (i + 1) * n_time, :], return_params=True
+            )
 
     # STAGE C: Post-injection, post-normalization
     stats_c = _compute_intensity_stats(final)
@@ -540,6 +573,7 @@ def create_true_double(
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # Both eti_* and rfi_* signal characteristics
         "slope_was_clamped": slope_was_clamped,
+        "lognorm_params": lognorm_params,
     }
 
     return final, sample_info
@@ -631,12 +665,14 @@ def build_segment_tasks(
     freq_resolution: float,
     time_resolution: float,
     seed_rng: np.random.Generator,
+    lognorm_path: str | None = None,
 ) -> list[tuple]:
     """
     Partition one segment into batched worker tasks of at most `task_size` cadences each.
     Together the tasks cover rows [segment.start_idx, segment.start_idx + segment.count)
     exactly once. Each task carries a fresh RNG seed drawn from `seed_rng` so results don't
-    depend on which persistent worker picks the task up.
+    depend on which persistent worker picks the task up. `lognorm_path`, when given, is the
+    sibling memmap the task writes each cadence's per-observation log-norm parameters into.
     """
     if task_size < 1:
         raise ValueError(f"task_size must be >= 1, got {task_size}")
@@ -659,6 +695,7 @@ def build_segment_tasks(
                 segment.inject,
                 segment.dynamic_range,
                 seed,
+                lognorm_path,
             )
         )
     return tasks
@@ -668,9 +705,10 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     """
     Execute one batched generation task against `backgrounds`: open the target .npy r+ (like
     preprocessing._extract_stamps_worker), generate `count` cadences with the chosen create_*
-    function, and write each result row straight into the memmap. Tasks address disjoint row
-    ranges, so concurrent pool writes never collide. Returns (elapsed_seconds,
-    [sample_info, ...]) — the only data that crosses the IPC boundary.
+    function, and write each result row straight into the memmap (plus its per-observation
+    log-norm parameters into the sibling lognorm memmap). Tasks address disjoint row ranges,
+    so concurrent pool writes never collide. Returns (elapsed_seconds, [sample_info, ...]) —
+    the only data that crosses the IPC boundary.
     """
     (
         array_path,
@@ -685,6 +723,7 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
         inject,
         dynamic_range,
         seed,
+        lognorm_path,
     ) = args
 
     task_start = time.time()
@@ -710,6 +749,9 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     all_sample_info = []
 
     out = np.lib.format.open_memmap(array_path, mode="r+")
+    lognorm_out = (
+        np.lib.format.open_memmap(lognorm_path, mode="r+") if lognorm_path is not None else None
+    )
     try:
         for i in range(count):
             cadence, sample_info = create_fn(
@@ -723,6 +765,11 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
                 dynamic_range=dynamic_range,
             )
             out[start_idx + i] = cadence
+            # Log-norm params land in the sibling memmap, not the IPC stats payload (they're
+            # per-observation display metadata, not DB-bound injection stats)
+            lognorm_params = sample_info.pop("lognorm_params")
+            if lognorm_out is not None:
+                lognorm_out[start_idx + i] = lognorm_params
             all_sample_info.append(sample_info)
     finally:
         # Flush in the finally so rows written before a mid-task exception still reach disk
@@ -730,6 +777,9 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
         # way, but not all filesystems are guaranteed to write back dirty pages on munmap)
         out.flush()
         del out
+        if lognorm_out is not None:
+            lognorm_out.flush()
+            del lognorm_out
 
     return time.time() - task_start, all_sample_info
 
@@ -858,7 +908,9 @@ def generate_round_to_memmap(
     main: collapsed cadences, 1/4 balanced across the 4 signal types (labels array tracks the
     per-row type); false: 1/2 false_no_signal + 1/2 false_with_rfi; true: 1/2 true_only_eti +
     1/2 true_eti_rfi — each of shape (n_samples, num_observations, time_bins, width_bin)
-    float32, laid out contiguously per chunk (see build_chunk_segments).
+    float32, laid out contiguously per chunk (see build_chunk_segments). Each array gets a
+    sibling {name}_lognorm.npy of shape (n_samples, num_observations, 2) carrying the
+    per-observation (min_log, range_log) normalization parameters.
 
     Work is dispatched as one unified batched task list per chunk through a single pool.map
     barrier (instead of the old 8 sequential per-class barriers); workers write rows in-place
@@ -889,6 +941,14 @@ def generate_round_to_memmap(
     for path in array_paths.values():
         mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
         del mm  # Close immediately: creation only reserves the file; workers do the writing
+
+    # Sibling per-observation log-norm parameter arrays ((min_log, range_log) per obs — tiny),
+    # recorded so the latent-traversal plot can approximately invert the normalization
+    lognorm_paths = paths.lognorm_paths
+    lognorm_shape = (n_samples, num_observations, 2)
+    for path in lognorm_paths.values():
+        mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=lognorm_shape)
+        del mm
 
     labels = np.empty(n_samples, dtype="U20")
 
@@ -925,6 +985,7 @@ def generate_round_to_memmap(
                 freq_resolution,
                 time_resolution,
                 seed_rng,
+                lognorm_path=lognorm_paths[segment.array_name],
             )
             tasks.extend(segment_tasks)
             task_owners.extend([segment_idx] * len(segment_tasks))
