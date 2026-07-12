@@ -101,8 +101,12 @@ src/aetherscan/
 ├── cli.py               # Argument parsing, validation, config override
 ├── config.py            # Configuration dataclasses & defaults (singleton)
 ├── train.py             # Training orchestration, curriculum learning, checkpointing
+├── round_data.py        # Disk-backed (memmap) round datasets + background producer process
+├── run_state.py         # Persisted training-run manifest (stage-aware resume)
 ├── inference.py         # Inference orchestration, candidate detection
+├── inference_viz.py     # End-of-run inference visualization suite
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
+├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection (setigen)
 ├── models/{vae,random_forest}.py
 ├── db/db.py             # Thread-safe SQLite, async queue-based writes
@@ -113,7 +117,8 @@ utils/                   # fetch_run_outputs.sh, find_optimal_configs.py,
                          # get_system_info.sh, kill_pipeline.sh, print_cli_help.py,
                          # run_container.sh, start_tmux_session.sh,
                          # verify_train_test_files.py
-docs/                    # GPU_RUNTIME_GUIDE.md, CONFIG_AND_CLI.md, README.md, assets/
+docs/                    # Full technical doc suite, one doc per pipeline surface —
+                         # indexed in docs/README.md; start at docs/ARCHITECTURE.md
 tests/                   # Pytest suite: conftest.py (singleton-reset fixtures, synthetic
                          # data factories), unit/, integration/ (gpu+cluster-marked smokes).
                          # Default selection: pytest -m "not gpu and not cluster" -q
@@ -205,5 +210,16 @@ Paths relative to the repo root:
 - `SECURITY.md` — security policy, secrets management, token rotation
 - `KNOWN_ISSUES.md` — known bugs and workarounds
 - `AI_POLICY.md` — AI usage policy (read before AI-assisted contributions)
+- `docs/README.md` — index of the technical documentation suite (one doc per surface)
+- `docs/ARCHITECTURE.md` — system map: data model, module map, init order, artifact layout
+- `docs/TRAINING_PIPELINE.md` — rounds, round data + producer, retries, every training plot
+- `docs/INFERENCE_PIPELINE.md` — catalogs, streaming flow, manifest retries, inference figures
+- `docs/PREPROCESSING.md` — energy detection math (PFB/spline, k² derivation), signal injection
+- `docs/MODELS.md` — Beta-VAE architecture/loss math, RF features + threshold semantics
+- `docs/DATABASE.md` — schema, writer thread, flush/supersede protocols, migrations
+- `docs/RUNTIME_SERVICES.md` — logger/Slack, ResourceManager lifecycle, resource monitor
+- `docs/TESTING.md` — suite layout, markers, isolation fixtures, CI, cluster smokes
+- `docs/GITHUB_AUTOMATION.md` — every workflow, dedup guards, assistant-handle rules
+- `docs/RELEASE.md` — version-coupling contract, CD gates, release runbook
 - `docs/GPU_RUNTIME_GUIDE.md` — container build/runtime runbook
 - `docs/CONFIG_AND_CLI.md` — config system deep dive

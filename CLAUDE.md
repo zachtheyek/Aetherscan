@@ -54,4 +54,4 @@ ruff lint+format, 100-char lines, Python 3.10 target ([`pyproject.toml`](pyproje
 
 ## More detail
 
-On-demand deep-dive skill: [`.claude/skills/aetherscan-repo-context/SKILL.md`](.claude/skills/aetherscan-repo-context/SKILL.md) — install paths, config/CLI system, architecture patterns, full workflow & security.
+On-demand deep-dive skill: [`.claude/skills/aetherscan-repo-context/SKILL.md`](.claude/skills/aetherscan-repo-context/SKILL.md) — install paths, config/CLI system, architecture patterns, full workflow & security. Per-surface technical docs (architecture, training, inference, preprocessing, models, database, runtime services, testing, automation, releases) are indexed in [docs/README.md](docs/README.md) — start at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

@@ -169,8 +169,12 @@ Aetherscan/
 │   ├── cli.py                  # Argument parsing, validation, config override
 │   ├── config.py               # Configuration defaults
 │   ├── train.py                # Training orchestration
+│   ├── round_data.py           # Disk-backed (memmap) round datasets + producer process
+│   ├── run_state.py            # Persisted training-run manifest (stage-aware resume)
 │   ├── inference.py            # Inference orchestration
-│   ├── preprocessing.py        # Data preprocessing
+│   ├── inference_viz.py        # Inference visualization suite
+│   ├── preprocessing.py        # Data preprocessing + energy detection
+│   ├── pfb.py                  # PFB static passband equalization
 │   ├── data_generation.py      # Synthetic signal injection
 │   ├── models/
 │   │   ├── __init__.py         # Model exports
@@ -189,9 +193,11 @@ Aetherscan/
 │   └── manager/
 │       ├── __init__.py         # Manager exports
 │       └── manager.py          # Resource lifecycle management
-├── docs/                       # Documentation (placeholder; no docs yet)
+├── docs/                       # Technical documentation suite, one doc per pipeline surface
+│                               #   (indexed in docs/README.md; start at docs/ARCHITECTURE.md)
 ├── tests/                      # Pytest suite (see Testing section below)
 │   ├── conftest.py                  # Singleton-reset fixtures, tmp paths, synthetic data factories
+│   ├── fixtures/                    # Small recorded data fixtures (e.g. real ED channel slice)
 │   ├── unit/                        # Fast, hardware-independent unit tests (run in CI)
 │   └── integration/                 # gpu+cluster-marked end-to-end smoke tests
 ├── utils/                      # Utility scripts
@@ -231,8 +237,12 @@ Aetherscan/
 | `cli.py`                  | Argument parsing, validation, config override                          |
 | `config.py`               | All configuration dataclasses and defaults                             |
 | `train.py`                | Training orchestration, curriculum learning, checkpointing             |
+| `round_data.py`           | Disk-backed round datasets, `.done` manifests, background producer     |
+| `run_state.py`            | Persisted training-run manifest driving stage-aware resume             |
 | `inference.py`            | Model inference, candidate detection                                   |
+| `inference_viz.py`        | End-of-run inference visualization suite                               |
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
+| `pfb.py`                  | Polyphase-filterbank static passband response (bandpass flattening)    |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
 | `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
 | `models/random_forest.py` | Scikit-learn RF wrapper                                                |
@@ -241,9 +251,9 @@ Aetherscan/
 | `manager/manager.py`      | Resource lifecycle management (pools, shared memory)                   |
 | `logger/`                 | Multi-handler logging with Slack integration                           |
 
-> [!WARNING]
->
-> # TODO: add an architecture section? (`docs/architecture.md`?)
+For how these modules fit together — data flow, process/thread topology, initialization
+order, and where every artifact lands — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
+the full per-surface documentation suite is indexed in [`docs/README.md`](docs/README.md).
 
 ---
 
