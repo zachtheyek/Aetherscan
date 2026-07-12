@@ -135,6 +135,14 @@ class TestResolveHfRevision:
         with pytest.raises(RuntimeError, match="--hf-revision"):
             resolve_hf_revision("ns/repo", None)
 
+    def test_listing_failure_wrapped_with_guidance(self, monkeypatch):
+        def boom(repo_id):
+            raise ConnectionError("no route to host")
+
+        monkeypatch.setattr(hf_hub, "list_hf_tags", boom)
+        with pytest.raises(RuntimeError, match="--hf-revision"):
+            resolve_hf_revision("ns/repo", None)
+
 
 class TestListHfTags:
     def test_names_extracted_from_refs(self, monkeypatch, fake_api):
@@ -250,6 +258,14 @@ class TestResolveInferenceArtifacts:
         # The resolved revision is written back to args so it lands in config.hf.revision
         # (and the saved inference config) via apply_args_to_config.
         assert args.hf_revision == "v0.1.0"
+
+    def test_download_failure_wrapped_with_guidance(self, monkeypatch):
+        def boom(**kwargs):
+            raise ConnectionError("connection reset")
+
+        monkeypatch.setattr(hf_hub, "_hf_hub_download", boom)
+        with pytest.raises(RuntimeError, match="--hf-revision"):
+            hf_hub.download_inference_artifacts("ns/repo", "v0.1.0")
 
     def test_repo_id_flag_overrides_config_default(self, monkeypatch):
         seen = []
@@ -406,3 +422,34 @@ class TestUploadRunToHf:
                 model_path=config.model_path,
                 output_path=config.output_path,
             )
+
+    def test_tag_conflict_after_upload_points_at_force_tag(self, monkeypatch):
+        # TOCTOU: the tag appeared between the startup dedup check and the post-upload
+        # create_tag (e.g. a concurrent run). The wrapped error must point at --force-tag.
+        import httpx  # noqa: PLC0415
+        from huggingface_hub.errors import HfHubHTTPError  # noqa: PLC0415
+
+        config = get_config()
+        _write_run_artifacts(config, "test_v1")
+        api = _FakeHfApi()
+
+        def conflict(repo_id, *, tag):
+            api._record("create_tag", repo_id=repo_id, tag=tag)
+            raise HfHubHTTPError(
+                "conflict",
+                response=httpx.Response(
+                    409, request=httpx.Request("POST", "https://huggingface.co/api")
+                ),
+            )
+
+        api.create_tag = conflict
+        monkeypatch.setattr(hf_hub, "_hf_api", lambda: api)
+        with pytest.raises(RuntimeError, match="--force-tag"):
+            upload_run_to_hf(
+                repo_id="ns/repo",
+                tag="test_v1",
+                model_path=config.model_path,
+                output_path=config.output_path,
+            )
+        # The artifacts were still uploaded before the tag conflict surfaced.
+        assert [name for name, _ in api.calls[:2]] == ["create_repo", "upload_folder"]

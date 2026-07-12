@@ -71,6 +71,17 @@ def _hf_hub_download(**kwargs) -> str:
     return hf_hub_download(**kwargs)
 
 
+def _is_tag_conflict(exc: Exception) -> bool:
+    """True when `exc` is the Hub's tag-already-exists HTTP 409 conflict."""
+    try:
+        from huggingface_hub.errors import HfHubHTTPError  # noqa: PLC0415
+    except Exception:
+        return False
+    if not isinstance(exc, HfHubHTTPError):
+        return False
+    return getattr(getattr(exc, "response", None), "status_code", None) == 409
+
+
 def list_hf_tags(repo_id: str) -> list[str]:
     """Return the names of every git tag on the HF model repo; [] when the repo doesn't exist
     yet (first upload creates it). Network/auth errors propagate to the caller."""
@@ -114,7 +125,15 @@ def resolve_hf_revision(repo_id: str, revision: str | None) -> str:
     """
     if revision is not None:
         return revision
-    tags = list_hf_tags(repo_id)
+    try:
+        tags = list_hf_tags(repo_id)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not list tags on HF repo '{repo_id}' to resolve the latest release: {e}. "
+            f"Check that --hf-repo-id is correct, the repo is public (or HF_TOKEN grants "
+            f"access), and this host can reach huggingface.co — or pin a revision with "
+            f"--hf-revision / pass all three local artifact paths."
+        ) from e
     selected = select_default_revision(tags)
     if selected is None:
         raise RuntimeError(
@@ -133,10 +152,20 @@ def download_inference_artifacts(repo_id: str, revision: str) -> tuple[str, str,
     pinned revision. Returns the local cache paths (under HF_HOME / ~/.cache/huggingface;
     repeated runs hit the cache). Public repo — no token required.
     """
-    paths = tuple(
-        _hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
-        for filename in (HF_ENCODER_FILENAME, HF_RF_FILENAME, HF_CONFIG_FILENAME)
-    )
+    try:
+        paths = tuple(
+            _hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
+            for filename in (HF_ENCODER_FILENAME, HF_RF_FILENAME, HF_CONFIG_FILENAME)
+        )
+    except Exception as e:
+        # Wrap raw huggingface_hub errors (404s, network failures, auth) with operator
+        # guidance — this surfaces via main.py's resolution path at startup.
+        raise RuntimeError(
+            f"Failed to download model artifacts from {repo_id}@{revision}: {e}. Check "
+            f"that the revision exists (--hf-revision), the repo id is correct "
+            f"(--hf-repo-id), the repo is public (or HF_TOKEN grants access), and this "
+            f"host can reach huggingface.co."
+        ) from e
     logger.info(f"Downloaded model artifacts from {repo_id}@{revision}")
     return paths
 
@@ -390,7 +419,24 @@ def upload_run_to_hf(
     if force:
         # --force-tag semantics: repoint the existing tag at the fresh commit rather than
         # failing (delete errors are ignored — the tag may simply not exist yet).
+        # NOTE: delete_tag -> create_tag is not atomic (the Hub has no tag-move primitive):
+        # a crash between the two calls leaves the tag missing until the stage is retried —
+        # hf_upload stays un-done in the run manifest, so re-running the identical command
+        # recreates it. Acceptable for a consciously-forced override.
         with contextlib.suppress(Exception):
             api.delete_tag(repo_id, tag=tag)
-    api.create_tag(repo_id, tag=tag)
+    try:
+        api.create_tag(repo_id, tag=tag)
+    except Exception as e:
+        if _is_tag_conflict(e):
+            # TOCTOU: the startup dedup guard checked this tag hours ago (a full-scale run
+            # trains for ~30 h) — a concurrent run may have created it since. The artifacts
+            # are safely uploaded on the main branch; only the tag is missing.
+            raise RuntimeError(
+                f"Tag '{tag}' already exists on {repo_id} (created after this run's "
+                f"startup check, e.g. by a concurrent run). The artifacts were uploaded "
+                f"but left untagged — re-run the identical command with --force-tag to "
+                f"move the tag to this run's upload."
+            ) from e
+        raise
     logger.info(f"Uploaded run '{tag}' to https://huggingface.co/{repo_id} and tagged the commit")
