@@ -341,6 +341,101 @@ class TestMarkSuperseded:
             db.mark_superseded("training_stats", "")
 
 
+class TestInferenceCadences:
+    """The per-cadence inference run manifest (schema v2): write/query round-trip, JSON
+    field serialization, status filtering, and the supersede-on-retry flow the stage-aware
+    resume relies on."""
+
+    def test_write_query_round_trip(self, db):
+        tag = "test_v1"
+        summary = {"n": 4, "mean": 0.5, "quantiles": {"p50": 0.5}}
+        db.write_inference_cadence(
+            npy_path="/pre/cad_a.npy",
+            status="inferred",
+            tag=tag,
+            csv_path="/catalog.csv",
+            cadence_key=("HIP110750", "AGBT21B_999_31", "L", "0", "1400"),
+            n_stamps=4,
+            n_candidates=1,
+            confidence_summary=summary,
+            duration_s=12.5,
+        )
+        assert db.flush(timeout=10) is True
+
+        rows = db.query_inference_cadences(tag=tag)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["npy_path"] == "/pre/cad_a.npy"
+        assert row["status"] == "inferred"
+        assert row["csv_path"] == "/catalog.csv"
+        assert json.loads(row["cadence_key"]) == ["HIP110750", "AGBT21B_999_31", "L", "0", "1400"]
+        assert row["n_stamps"] == 4
+        assert row["n_candidates"] == 1
+        assert json.loads(row["confidence_summary"]) == summary
+        assert row["duration_s"] == 12.5
+        assert row["superseded"] == 0
+
+    def test_optional_fields_default_to_none(self, db):
+        db.write_inference_cadence(npy_path="/pre/cad_b.npy", status="preprocessed", tag="test_v1")
+        assert db.flush(timeout=10) is True
+        row = db.query_inference_cadences(tag="test_v1")[0]
+        assert row["cadence_key"] is None
+        assert row["confidence_summary"] is None
+        assert row["n_candidates"] is None
+
+    def test_status_and_npy_path_filters(self, db):
+        tag = "test_v2"
+        db.write_inference_cadence(npy_path="/a.npy", status="preprocessed", tag=tag, n_stamps=3)
+        db.write_inference_cadence(npy_path="/a.npy", status="inferred", tag=tag, n_stamps=3)
+        db.write_inference_cadence(npy_path="/b.npy", status="failed", tag=tag)
+        assert db.flush(timeout=10) is True
+
+        inferred = db.query_inference_cadences(tag=tag, status="inferred")
+        assert [r["npy_path"] for r in inferred] == ["/a.npy"]
+        a_rows = db.query_inference_cadences(tag=tag, npy_path="/a.npy")
+        assert sorted(r["status"] for r in a_rows) == ["inferred", "preprocessed"]
+        multi = db.query_inference_cadences(tag=tag, status=["inferred", "failed"])
+        assert sorted(r["status"] for r in multi) == ["failed", "inferred"]
+
+    def test_supersede_on_retry_flow(self, db):
+        """The manifest state machine on a retried cadence: 'preprocessed' + 'failed' rows
+        from the dead attempt are superseded before the fresh 'inferred' row is written, so
+        the resume query (status='inferred', default superseded filter) flips from empty to
+        exactly one row."""
+        tag = "test_v3"
+        npy = "/pre/cad_c.npy"
+        db.write_inference_cadence(npy_path=npy, status="preprocessed", tag=tag, n_stamps=7)
+        db.write_inference_cadence(npy_path=npy, status="failed", tag=tag)
+
+        # Before the retry completes: no live 'inferred' row -> the cadence is re-attempted
+        assert db.flush(timeout=10) is True
+        assert db.query_inference_cadences(tag=tag, npy_path=npy, status="inferred") == []
+
+        # Retry succeeds: supersede old rows, then write the fresh 'inferred' row
+        assert db.mark_superseded("inference_cadences", tag, npy_path=npy) is True
+        db.write_inference_cadence(
+            npy_path=npy, status="inferred", tag=tag, n_stamps=7, n_candidates=0
+        )
+        assert db.flush(timeout=10) is True
+
+        live = db.query_inference_cadences(tag=tag, npy_path=npy)
+        assert [r["status"] for r in live] == ["inferred"]
+        all_rows = db.query_inference_cadences(tag=tag, npy_path=npy, include_superseded=True)
+        assert len(all_rows) == 3
+
+    def test_supersede_scoped_to_npy_path(self, db):
+        tag = "test_v4"
+        db.write_inference_cadence(npy_path="/a.npy", status="inferred", tag=tag)
+        db.write_inference_cadence(npy_path="/b.npy", status="inferred", tag=tag)
+        assert db.mark_superseded("inference_cadences", tag, npy_path="/a.npy") is True
+        live = db.query_inference_cadences(tag=tag, status="inferred")
+        assert [r["npy_path"] for r in live] == ["/b.npy"]
+
+    def test_invalid_column_rejected(self, db):
+        with pytest.raises(ValueError, match="Invalid column"):
+            db.query_inference_cadences(columns=["npy_path; DROP TABLE inference_cadences"])
+
+
 class TestSchemaMigration:
     # The v0 schema (pre-superseded) for the four tables the migration touches, trimmed to
     # the columns the assertions need plus everything NOT NULL.
@@ -445,6 +540,16 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
+    def _table_names(self, db_path):
+        conn = sqlite3.connect(db_path)
+        try:
+            return {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        finally:
+            conn.close()
+
     def test_old_schema_gains_superseded_column(self):
         db_path = self._create_v0_db(get_config())
         assert self._user_version(db_path) == 0
@@ -459,6 +564,23 @@ class TestSchemaMigration:
             rows = database.query_training_stat(tag="test_v1")
             assert len(rows) == 1
             assert rows[0]["superseded"] == 0
+        finally:
+            database.stop()
+
+    def test_old_schema_gains_inference_cadences_table(self):
+        """A pre-versioning database (v0: no inference_cadences table) must come out of
+        _init_database() with the v2 manifest table present and usable."""
+        db_path = self._create_v0_db(get_config())
+        assert "inference_cadences" not in self._table_names(db_path)
+
+        database = Database()
+        database.start()
+        try:
+            assert "inference_cadences" in self._table_names(db_path)
+            assert self._user_version(db_path) == _SCHEMA_VERSION
+            database.write_inference_cadence(npy_path="/a.npy", status="inferred", tag="test_v1")
+            assert database.flush(timeout=10) is True
+            assert len(database.query_inference_cadences(tag="test_v1")) == 1
         finally:
             database.stop()
 

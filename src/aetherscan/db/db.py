@@ -41,7 +41,12 @@ _MARK_SUPERSEDED_SENTINEL = object()
 # Bump this and extend _migrate_schema() with an `if version < N:` block for future changes.
 # v1: added `superseded INTEGER DEFAULT 0` to training_stats, injection_stats,
 #     latent_snapshots, and inference_results (stale-data supersede semantics on retry)
-_SCHEMA_VERSION = 1
+# v2: added the `inference_cadences` table (per-cadence inference run manifest driving
+#     stage-aware retries). New tables need no ALTER step — the CREATE TABLE IF NOT EXISTS
+#     statements in _init_database() run before migration for old and new databases alike —
+#     so the version bump exists to record the change and keep future `if version < N:`
+#     blocks ordered.
+_SCHEMA_VERSION = 2
 
 
 def get_system_metadata() -> str:
@@ -325,6 +330,35 @@ class Database:
                 ON inference_results(tag, timestamp, confidence, prediction)
             """)
 
+            # Inference cadence manifest table (schema v2): one row per (cadence, stage
+            # transition) — status 'preprocessed' when the stamp .npy lands, a superseding
+            # 'inferred' row (with aggregate stats) when inference completes, and 'failed'
+            # when the inference stage of a cadence dies. Drives stage-aware retry resume:
+            # a live 'inferred' row means the cadence is skipped entirely on retry.
+            # cadence_key and confidence_summary are JSON TEXT.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS inference_cadences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    tag TEXT,
+                    csv_path TEXT,
+                    cadence_key TEXT,
+                    npy_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    n_stamps INTEGER,
+                    n_candidates INTEGER,
+                    confidence_summary TEXT,
+                    duration_s REAL,
+                    superseded INTEGER DEFAULT 0
+                )
+            """)
+
+            # Composite index for the resume lookup pattern (tag + npy_path + status)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inference_cadences_filter
+                ON inference_cadences(tag, npy_path, status)
+            """)
+
             conn.commit()
 
             # Bring pre-existing databases (older schema) up to the current version
@@ -366,6 +400,11 @@ class Database:
                 if "superseded" not in columns:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN superseded INTEGER DEFAULT 0")
                     logger.info(f"Schema migration: added {table}.superseded")
+
+        # v2 (inference_cadences table) needs no migration step here: the table is created
+        # for old and new databases alike by the CREATE TABLE IF NOT EXISTS statement in
+        # _init_database(), which always runs before this method. Only the version stamp
+        # below advances.
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -455,12 +494,14 @@ class Database:
         return False
 
     # Tables that support supersede marking, mapped to the optional filters each accepts
-    # (round_ge needs a round_number column; npy_path only exists on inference_results)
+    # (round_ge needs a round_number column; npy_path exists on inference_results and
+    # inference_cadences)
     _SUPERSEDE_TABLES = {
         "training_stats": frozenset({"round_ge"}),
         "injection_stats": frozenset({"round_ge"}),
         "latent_snapshots": frozenset({"round_ge"}),
         "inference_results": frozenset({"npy_path"}),
+        "inference_cadences": frozenset({"npy_path"}),
     }
 
     def mark_superseded(
@@ -479,7 +520,7 @@ class Database:
 
         round_ge narrows the mark to round_number >= round_ge (training_stats /
         injection_stats / latent_snapshots only); npy_path narrows to one cadence file
-        (inference_results only).
+        (inference_results / inference_cadences only).
 
         The command executes on the background writer thread (a command tuple through the
         write queue, like the flush sentinel) so single-writer semantics are preserved:
@@ -498,7 +539,9 @@ class Database:
         if round_ge is not None and "round_ge" not in allowed_filters:
             raise ValueError(f"round_ge is not supported for table {table!r}")
         if npy_path is not None and "npy_path" not in allowed_filters:
-            raise ValueError("npy_path is only supported for table 'inference_results'")
+            raise ValueError(
+                "npy_path is only supported for tables 'inference_results' and 'inference_cadences'"
+            )
         if not tag:
             raise ValueError("mark_superseded requires a non-empty tag")
 
@@ -683,6 +726,7 @@ class Database:
                 training_stats_records: list[tuple] = []
                 latent_snapshots_records: list[tuple] = []
                 inference_results_records: list[tuple] = []
+                inference_cadences_records: list[tuple] = []
 
                 for table, values in self.buffer:
                     if table == "system_resources":
@@ -695,6 +739,8 @@ class Database:
                         latent_snapshots_records.append(values)
                     elif table == "inference_results":
                         inference_results_records.append(values)
+                    elif table == "inference_cadences":
+                        inference_cadences_records.append(values)
 
                 # Bulk insert each table type
                 if system_resources_records:
@@ -752,6 +798,17 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_results_records,
+                    )
+
+                if inference_cadences_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO inference_cadences
+                        (timestamp, tag, csv_path, cadence_key, npy_path, status, n_stamps,
+                         n_candidates, confidence_summary, duration_s)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        inference_cadences_records,
                     )
 
                 conn.commit()
@@ -999,6 +1056,57 @@ class Database:
             )
         )
 
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
+    def write_inference_cadence(
+        self,
+        npy_path: str,
+        status: str,
+        tag: str | None = None,
+        csv_path: str | None = None,
+        cadence_key: tuple | list | None = None,
+        n_stamps: int | None = None,
+        n_candidates: int | None = None,
+        confidence_summary: dict | None = None,
+        duration_s: float | None = None,
+        timestamp: float | None = None,
+    ):
+        """
+        Queue a non-blocking write to the inference_cadences run manifest.
+
+        One row per (cadence, stage transition): status='preprocessed' when the cadence's
+        stamp .npy lands (n_stamps set, aggregates None), status='inferred' when inference
+        completes (aggregates set; the caller supersedes older rows for the same
+        (tag, npy_path) first), status='failed' when the cadence's inference stage died
+        (so the failure is inspectable and the retry pass re-attempts it). cadence_key
+        (the CSV group-by key) and confidence_summary (quantile stats from
+        inference.summarize_confidences) are JSON-serialized for storage. duration_s is
+        the stage's wall-clock duration. Timestamp defaults to current wall time.
+        """
+        cadence_key_json = None
+        if cadence_key is not None:
+            cadence_key_json = json.dumps([str(part) for part in cadence_key])
+        confidence_summary_json = None
+        if confidence_summary is not None:
+            confidence_summary_json = json.dumps(confidence_summary)
+
+        self.write_queue.put(
+            (
+                "inference_cadences",
+                (
+                    timestamp or time.time(),
+                    tag,
+                    csv_path,
+                    cadence_key_json,
+                    npy_path,
+                    status,
+                    n_stamps,
+                    n_candidates,
+                    confidence_summary_json,
+                    duration_s,
+                ),
+            )
+        )
+
     # Column whitelists per table (for SQL injection prevention when using column projection)
     _SYSTEM_RESOURCES_COLUMNS = {
         "id",
@@ -1073,6 +1181,20 @@ class Database:
         "h5_path",
         "tag",
         "metadata",
+        "superseded",
+    }
+    _INFERENCE_CADENCES_COLUMNS = {
+        "id",
+        "timestamp",
+        "tag",
+        "csv_path",
+        "cadence_key",
+        "npy_path",
+        "status",
+        "n_stamps",
+        "n_candidates",
+        "confidence_summary",
+        "duration_s",
         "superseded",
     }
 
@@ -1709,6 +1831,72 @@ class Database:
             # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
+    def query_inference_cadences(
+        self,
+        npy_path: str | list[str] | None = None,
+        status: str | list[str] | None = None,
+        csv_path: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        columns: list[str] | None = None,
+        include_superseded: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        Query rows from the inference_cadences run manifest as a list of dicts.
+
+        String filters (npy_path, status, csv_path, tag) accept either a single value
+        (= filter) or a list (IN filter); status is one of {'preprocessed', 'inferred',
+        'failed'}. The returned cadence_key and confidence_summary fields are JSON strings —
+        callers parse them with json.loads. include_superseded (default False) controls
+        whether rows flagged stale by mark_superseded() are returned — the resume flow relies
+        on the default so a cadence whose 'inferred' row was superseded is re-attempted.
+        columns is validated against _INFERENCE_CADENCES_COLUMNS.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            select = self._build_select(
+                "inference_cadences", columns, self._INFERENCE_CADENCES_COLUMNS
+            )
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
+            query = f"{select} WHERE 1=1"
+            params: list = []
+
+            # Build the query dynamically based on user-specified conditions
+            if npy_path:
+                query = self._add_str_filter(query, params, "npy_path", npy_path)
+
+            if status:
+                query = self._add_str_filter(query, params, "status", status)
+
+            if csv_path:
+                query = self._add_str_filter(query, params, "csv_path", csv_path)
+
+            if tag:
+                query = self._add_str_filter(query, params, "tag", tag)
+
+            if start_time is not None:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+
+            if end_time is not None:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+
+            if not include_superseded:
+                query += " AND superseded = 0"
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+
     # NOTE: this call gets expensive as db grows. create a separate schema to track num_rows_added per pipeline run. then count & update as part of db cleanup routine? or use SQLite's dbstat virtual table or periodic ANALYZE?
     def get_db_stats(self) -> dict[str, Any]:
         """Get summary statistics for the database"""
@@ -1732,6 +1920,9 @@ class Database:
 
             cursor.execute("SELECT COUNT(*) FROM inference_results")
             stats["inference_results_row_count"] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM inference_cadences")
+            stats["inference_cadences_row_count"] = cursor.fetchone()[0]
 
             # Time range
             # Use system_resources as proxy
