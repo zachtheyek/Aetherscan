@@ -18,6 +18,7 @@ import math
 import os
 import re
 import signal
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
@@ -54,6 +55,12 @@ _GLOBAL_DTYPE = None
 # PFB static-response sanity check: warn when a file's measured edge/mid power ratio
 # disagrees with the theoretical response's by more than this relative tolerance.
 _PFB_RATIO_MISMATCH_TOL = 0.05
+# Fixed log-spaced bin edges for the energy-detection statistic summary histograms
+# accumulated by _energy_detect_channel_worker. The edges are identical for every channel /
+# file / cadence, so per-channel counts combine by plain addition; the range spans sub-noise
+# k2 values (~1e-3) through extreme RFI statistics (~1e9) at 10 bins per decade. Consumed by
+# inference_viz.plot_ed_stat_distributions via each cadence's metadata JSON.
+ED_STAT_HIST_EDGES = np.logspace(-3.0, 9.0, 121)
 # Coarse channels sampled (evenly across the band) by the opt-in bandpass overlay debug plot.
 _BANDPASS_SAMPLE_CHANNELS = 3
 # The PFB static-response sanity check samples more channels and takes a median (not a mean),
@@ -429,12 +436,15 @@ def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int)
     return k2
 
 
-def _energy_detect_channel_worker(args: tuple) -> list[tuple]:
+def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]:
     """
     Fused worker: run the complete energy-detection chain for one coarse channel — read the
     channel's h5 slice, remove the DC spike, flatten the bandpass, and threshold the vectorized
-    normality statistic. Returns a small list of (absolute_fine_channel_index, statistic,
-    pvalue) hit tuples; the bulky (time_bins, coarse_channel_width) intermediates never leave
+    normality statistic. Returns (hits, stat_hist): hits is a small list of
+    (absolute_fine_channel_index, statistic, pvalue) tuples; stat_hist is the histogram of
+    *all* finite window statistics (not just hits) over the fixed ED_STAT_HIST_EDGES bins, so
+    the parent can cheaply accumulate the full per-file statistic distribution for the
+    visualization suite. The bulky (time_bins, coarse_channel_width) intermediates never leave
     the worker, so no shared memory or per-block parent arrays are needed.
 
     args is (h5_path, channel_index, coarse_channel_width, time_bins, bandpass_flatten,
@@ -467,16 +477,26 @@ def _energy_detect_channel_worker(args: tuple) -> list[tuple]:
     residuals = bandpass_flatten(channel)
 
     k2 = _sliding_normality_k2(residuals, window_size, step_size)
+
+    # Summary histogram over all finite window statistics — a handful of numpy ops on ~1e4
+    # values, negligible next to the k2 computation itself. Out-of-range values are clipped
+    # onto the fixed edges so counts are never silently dropped.
+    finite = k2[np.isfinite(k2)]
+    stat_hist, _ = np.histogram(
+        np.clip(finite, ED_STAT_HIST_EDGES[0], ED_STAT_HIST_EDGES[-1]), bins=ED_STAT_HIST_EDGES
+    )
+
     hit_windows = np.nonzero(k2 > stat_threshold)[0]
     if hit_windows.size == 0:
-        return []
+        return [], stat_hist
 
     # p-values are only stored in metadata, so chi2.sf runs on the (small) hit subset only
     pvalues = stats.chi2.sf(k2[hit_windows], 2)
-    return [
+    hits = [
         (start + int(j) * step_size, float(k2[j]), float(p))
         for j, p in zip(hit_windows, pvalues, strict=True)
     ]
+    return hits, stat_hist
 
 
 def _extract_stamps_worker(args: tuple) -> None:
@@ -1473,8 +1493,12 @@ class DataPreprocessor:
             except Exception as e:
                 logger.error(f"Cadence {group.key}: bandpass overlay plot failed: {e}")
 
-        # Aggregate hits across all ON-source files
+        cadence_start_time = time.time()
+
+        # Aggregate hits across all ON-source files, plus the per-ON-file summary histogram
+        # of every window statistic (for the ed_stat_distributions figure)
         all_hits: list[tuple] = []  # (abs_idx, stat, p)
+        stat_hists = np.zeros((len(on_source_paths), len(ED_STAT_HIST_EDGES) - 1), dtype=np.int64)
 
         for on_source_idx, on_h5 in enumerate(on_source_paths):
             logger.info(
@@ -1512,8 +1536,9 @@ class DataPreprocessor:
                     )
                 channel_hits_iter = map(_energy_detect_channel_worker, tasks)
 
-            for done, channel_hits in enumerate(channel_hits_iter, start=1):
+            for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter, start=1):
                 all_hits.extend(channel_hits)
+                stat_hists[on_source_idx] += channel_hist
                 if done % progress_chunk == 0 or done == n_coarse_total:
                     logger.info(
                         f"  Coarse channel {done}/{n_coarse_total} of ON-source "
@@ -1651,6 +1676,17 @@ class DataPreprocessor:
             "stamp_pvalues": stamp_pvals,
             "overlap_search": overlap_search,
             "overlap_fraction": overlap_fraction if overlap_search else None,
+            # Energy-detection provenance for the visualization suite: the all-window
+            # statistic histograms (per ON file, fixed log-spaced bins) and the hit
+            # frequencies before/after deduplication (hit spectrum + funnel figures)
+            "ed_stat_hist": {
+                "bin_edges": [float(e) for e in ED_STAT_HIST_EDGES],
+                "counts_per_on_file": stat_hists.tolist(),
+            },
+            "n_raw_hits": len(all_hits),
+            "n_merged_hits": len(merged_hits),
+            "raw_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in all_hits],
+            "merged_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in merged_hits],
         }
         tmp_metadata_path = metadata_path + ".tmp"
         with open(tmp_metadata_path, "w") as f:
@@ -1658,6 +1694,20 @@ class DataPreprocessor:
         os.replace(tmp_metadata_path, metadata_path)
 
         gc.collect()
+
+        # Record the stage transition in the inference_cadences run manifest. Written only
+        # when preprocessing actually ran (the resume path never re-writes it); a crash
+        # between the os.replace above and this write just loses an informational row —
+        # resume keys off the .npy's existence, and the 'inferred' row keys off inference.
+        self.db.write_inference_cadence(
+            npy_path=npy_path,
+            status="preprocessed",
+            tag=self.config.checkpoint.save_tag,
+            csv_path=group.csv_path,
+            cadence_key=group.key,
+            n_stamps=n_stamps,
+            duration_s=time.time() - cadence_start_time,
+        )
 
         logger.info(
             f"Cadence {group.key}: wrote {n_stamps} stamps -> "
