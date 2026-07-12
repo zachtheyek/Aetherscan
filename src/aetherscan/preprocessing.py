@@ -37,6 +37,7 @@ from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
+from aetherscan.pfb import edge_mid_power_ratio, equalize_passband, gen_coarse_channel_response
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,13 @@ _GLOBAL_SHM = None
 _GLOBAL_CHUNK_DATA = None
 _GLOBAL_SHAPE = None
 _GLOBAL_DTYPE = None
+
+# PFB static-response sanity check: warn when a file's measured edge/mid power ratio
+# disagrees with the theoretical response's by more than this relative tolerance.
+_PFB_RATIO_MISMATCH_TOL = 0.05
+# Coarse channels sampled (evenly across the band) by the PFB sanity check and the opt-in
+# bandpass overlay debug plot.
+_BANDPASS_SAMPLE_CHANNELS = 3
 
 
 def _init_worker(shm_name, shape, dtype):
@@ -227,18 +235,40 @@ def _fit_channel_bandpass(
 
 def _spline_flatten_bandpass(channel: np.ndarray, spl_order: int) -> np.ndarray:
     """
-    Default bandpass flattener: fit a spline to the time-integrated coarse channel and subtract
-    it from every time row. channel has shape (time_bins, coarse_channel_width); returns the
-    float64 residuals of the same shape.
+    Spline bandpass flattener (--bandpass-method spline): fit a spline to the time-integrated
+    coarse channel and subtract it from every time row. channel has shape
+    (time_bins, coarse_channel_width); returns the float64 residuals of the same shape.
 
     Bandpass flattening is a pluggable stage: _process_cadence obtains a picklable callable via
-    DataPreprocessor._get_bandpass_flattener() and ships it to the pool workers, so alternative
-    flatteners (e.g. the PFB static equalization planned for a later PR) only need a
-    module-level function with the same (channel) -> residuals contract.
+    DataPreprocessor._get_bandpass_flattener() and ships it to the pool workers, so a flattener
+    only needs to be a module-level function with the same (channel) -> flattened contract
+    (see _pfb_flatten_bandpass for the other implementation).
     """
     integrated_channel = np.mean(channel, axis=0)
     fit = _fit_channel_bandpass(integrated_channel, channel.shape[1], spl_order)
     return channel - fit
+
+
+def _pfb_flatten_bandpass(
+    channel: np.ndarray, num_coarse_channels: int, taps_per_channel: int
+) -> np.ndarray:
+    """
+    PFB static-equalization bandpass flattener (--bandpass-method pfb, the default): divide the
+    channel by the instrument's precomputed polyphase-filterbank passband response instead of
+    fitting a spline per channel per file. channel has shape (time_bins, coarse_channel_width);
+    returns the equalized float64 channel of the same shape. The response is lru_cached per
+    (width, num_coarse_channels, taps_per_channel), so each pool worker pays the one-time FFT
+    cost once and every subsequent channel is a single vectorized divide.
+
+    # NOTE: the spline path *subtracts* its fit while this path *divides* by H, so equalized
+    # channels keep their DC offset and a bin-dependent scale. That asymmetry is fine for
+    # detection: the D'Agostino-Pearson normality statistic is built from skewness and
+    # kurtosis, which are central moments (location cancels) normalized by powers of the
+    # variance (scale cancels), so flattening the bandpass *shape* is all that matters.
+    # The spline-vs-PFB detection comparison in the PR body is the empirical arbiter.
+    """
+    response = gen_coarse_channel_response(channel.shape[1], num_coarse_channels, taps_per_channel)
+    return equalize_passband(channel, response)
 
 
 def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int) -> np.ndarray:
@@ -1163,12 +1193,15 @@ class DataPreprocessor:
             logger.warning("plan_cadences() called with no inference_files configured")
             return []
 
-        # Resolve output directory
-        output_dir = self.config.inference.preprocess_output_dir or os.path.join(
-            self.config.output_path, "preprocessed"
-        )
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Preprocessing output directory: {output_dir}")
+        # Output directory resolution: an explicit --preprocess-output-dir is used as-is
+        # (shared across CSVs); otherwise each CSV gets its own tag-scoped default,
+        # {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/. Tag scoping trades
+        # cross-run caching for isolation: a retry under the same tag still resumes via the
+        # existing-.npy skip, while a fresh run (new datetime tag) starts from a clean
+        # directory that stale stamps from an older failed attempt can't leak into. To reuse
+        # an old run's preprocessing, pass its directory explicitly.
+        explicit_output_dir = self.config.inference.preprocess_output_dir
+        save_tag = self.config.checkpoint.save_tag
 
         group_by_cols = self.config.inference.cadence_group_by_cols
         h5_path_col = self.config.inference.cadence_h5_path_col
@@ -1196,6 +1229,12 @@ class DataPreprocessor:
             )
 
             csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
+
+            output_dir = explicit_output_dir or self.config.get_inference_file_path(
+                os.path.join("preprocessed", f"{csv_stem}_{save_tag}")
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            logger.info(f"Preprocessing output directory for {csv_filename}: {output_dir}")
 
             for group in valid_groups:
                 npy_filename = self._cadence_npy_filename(csv_stem, group.key)
@@ -1353,8 +1392,6 @@ class DataPreprocessor:
         n_processes = self.config.manager.n_processes
         progress_chunk = max(1, parallel_chans if parallel_chans is not None else n_processes)
 
-        bandpass_flatten = self._get_bandpass_flattener()
-
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
         primary_h5 = on_source_paths[0]
@@ -1406,6 +1443,17 @@ class DataPreprocessor:
             f"ON-source files={len(on_source_paths)}"
         )
 
+        # The flattener depends on the file's actual coarse count (PFB folds
+        # adjacent-channel leakage), so it can only be built once n_coarse_total is known.
+        bandpass_flatten = self._get_bandpass_flattener(n_coarse_total)
+        pfb_active = bandpass_flatten.func is _pfb_flatten_bandpass
+
+        if self.config.inference.bandpass_debug_plot:
+            try:
+                self._plot_bandpass_overlay(primary_h5, n_coarse_total, bandpass_flatten, npy_path)
+            except Exception as e:
+                logger.error(f"Cadence {group.key}: bandpass overlay plot failed: {e}")
+
         # Aggregate hits across all ON-source files
         all_hits: list[tuple] = []  # (abs_idx, stat, p)
 
@@ -1414,6 +1462,10 @@ class DataPreprocessor:
                 f"Cadence {group.key}: running energy detection on ON-source "
                 f"{on_source_idx + 1}/{len(on_source_paths)}: {on_h5}"
             )
+
+            if pfb_active:
+                # Cheap static-response sanity check (once per file, not per channel)
+                self._warn_on_pfb_response_mismatch(on_h5, n_coarse_total)
 
             tasks = [
                 (
@@ -1601,20 +1653,152 @@ class DataPreprocessor:
             metadata_path=metadata_path,
         )
 
-    def _get_bandpass_flattener(self) -> Callable[[np.ndarray], np.ndarray]:
+    def _get_bandpass_flattener(
+        self, num_coarse_channels: int
+    ) -> Callable[[np.ndarray], np.ndarray]:
         """
         Return the configured bandpass-flattening callable for energy detection.
 
         The callable takes one coarse channel of shape (time_bins, coarse_channel_width) and
-        returns the flattened residuals; it must be picklable (a functools.partial over a
-        module-level function) so pool workers can receive it in their task args. Currently
-        only the spline flattener exists.
+        returns the flattened channel; it must be picklable (a functools.partial over a
+        module-level function) so pool workers can receive it in their task args.
 
-        # NOTE: PR-07 adds a PFB static-equalization flattener here (selected via config)
+        num_coarse_channels is the *file's* actual coarse-channel count
+        (n_chans // coarse_channel_width) — the PFB response folds adjacent-channel leakage,
+        so it depends on how many coarse channels the recording actually has. Files with a
+        single coarse channel can't support the fold and fall back to the spline flattener
+        with a warning.
         """
+        method = self.config.inference.bandpass_method
+        if method == "pfb":
+            if num_coarse_channels >= 2:
+                return functools.partial(
+                    _pfb_flatten_bandpass,
+                    num_coarse_channels=num_coarse_channels,
+                    taps_per_channel=self.config.inference.pfb_taps_per_channel,
+                )
+            logger.warning(
+                "bandpass_method='pfb' requires >= 2 coarse channels to fold adjacent-channel "
+                f"leakage, but this file has {num_coarse_channels}; falling back to the "
+                "spline flattener for this cadence"
+            )
+        elif method != "spline":
+            raise ValueError(f"Unknown bandpass_method {method!r}; expected 'pfb' or 'spline'")
         return functools.partial(
             _spline_flatten_bandpass, spl_order=self.config.inference.spline_order
         )
+
+    @staticmethod
+    def _sample_channel_indices(n_coarse_total: int) -> list[int]:
+        """Pick up to _BANDPASS_SAMPLE_CHANNELS coarse-channel indices evenly across the band."""
+        num = min(_BANDPASS_SAMPLE_CHANNELS, n_coarse_total)
+        return sorted({int(i) for i in np.linspace(0, n_coarse_total - 1, num=num)})
+
+    def _read_despiked_channel(self, h5_path: str, channel_index: int) -> np.ndarray:
+        """Read one coarse channel as float64 with the DC spike interpolated away — the same
+        preparation the energy-detection workers apply before bandpass flattening."""
+        width = self.config.inference.coarse_channel_width
+        time_bins = self.config.data.time_bins
+        start = channel_index * width
+        with h5py.File(h5_path, "r") as hf:
+            channel = hf["data"][:time_bins, 0, start : start + width].astype(np.float64)
+        _remove_dc_spike(channel, width, 1)
+        return channel
+
+    def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
+        """
+        Cheap validation of the static PFB response against the recording (after the bliss
+        `validate` flag): compare the file's mean edge/mid power ratio — measured on a few
+        coarse channels sampled evenly across the band — with the theoretical response's, and
+        warn once per file (never per channel) when they disagree by more than
+        _PFB_RATIO_MISMATCH_TOL. A mismatch means the static response doesn't describe this
+        recording (wrong --pfb-taps-per-channel for the instrument that produced the .h5),
+        in which case the data-driven spline method may be preferable.
+        """
+        width = self.config.inference.coarse_channel_width
+        taps = self.config.inference.pfb_taps_per_channel
+        try:
+            response = gen_coarse_channel_response(width, n_coarse_total, taps)
+            expected = edge_mid_power_ratio(response)
+            ratios = [
+                edge_mid_power_ratio(self._read_despiked_channel(h5_path, ch).mean(axis=0))
+                for ch in self._sample_channel_indices(n_coarse_total)
+            ]
+            measured = float(np.mean(ratios))
+        except Exception as e:
+            logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
+            return
+
+        rel_diff = abs(measured - expected) / expected
+        if rel_diff > _PFB_RATIO_MISMATCH_TOL:
+            logger.warning(
+                f"{h5_path}: measured edge/mid power ratio {measured:.3f} differs from the "
+                f"static PFB response's {expected:.3f} by {rel_diff:.1%} "
+                f"(> {_PFB_RATIO_MISMATCH_TOL:.0%}). The configured response may not match "
+                f"the backend that produced this file — check --pfb-taps-per-channel "
+                f"(currently {taps}), or consider --bandpass-method spline"
+            )
+
+    def _plot_bandpass_overlay(
+        self,
+        h5_path: str,
+        n_coarse_total: int,
+        bandpass_flatten: Callable[[np.ndarray], np.ndarray],
+        npy_path: str,
+    ) -> None:
+        """
+        Opt-in debug artifact (--bandpass-debug-plot): for a few coarse channels sampled evenly
+        across the band of the cadence's primary ON-source file, plot the time-integrated
+        spectrum raw vs flattened, overlaying the model being removed (the scaled PFB response
+        H, or the spline fit). Saved under {output_path}/plots/inference/. Deliberately
+        minimal — PR-08's inference visualization suite formalizes this figure.
+        """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
+        width = self.config.inference.coarse_channel_width
+        pfb_active = bandpass_flatten.func is _pfb_flatten_bandpass
+        sampled = self._sample_channel_indices(n_coarse_total)
+
+        fig, axes = plt.subplots(len(sampled), 2, figsize=(14, 3.2 * len(sampled)), squeeze=False)
+        for row, ch in enumerate(sampled):
+            channel = self._read_despiked_channel(h5_path, ch)
+            raw = channel.mean(axis=0)
+            flat = np.asarray(bandpass_flatten(channel)).mean(axis=0)
+            if pfb_active:
+                response = gen_coarse_channel_response(
+                    width, n_coarse_total, self.config.inference.pfb_taps_per_channel
+                )
+                # Least-squares scale so the unit-peak response overlays the raw spectrum
+                overlay = response * (float(raw @ response) / float(response @ response))
+                overlay_label = "scaled PFB response H"
+            else:
+                overlay = _fit_channel_bandpass(raw, width, self.config.inference.spline_order)
+                overlay_label = "spline fit"
+
+            ax_raw, ax_flat = axes[row]
+            ax_raw.plot(raw, lw=0.6, color="tab:blue", label="raw integrated spectrum")
+            ax_raw.plot(overlay, lw=1.2, ls="--", color="tab:orange", label=overlay_label)
+            ax_raw.set_ylabel(f"coarse channel {ch}\nintegrated power")
+            ax_flat.plot(flat, lw=0.6, color="tab:green", label="flattened integrated spectrum")
+            if row == 0:
+                ax_raw.legend(loc="upper right", fontsize=8)
+                ax_flat.legend(loc="upper right", fontsize=8)
+            if row == len(sampled) - 1:
+                ax_raw.set_xlabel("fine channel (within coarse channel)")
+                ax_flat.set_xlabel("fine channel (within coarse channel)")
+
+        method = "pfb" if pfb_active else "spline"
+        fig.suptitle(f"Bandpass flattening overlay ({method}): {os.path.basename(h5_path)}")
+        fig.tight_layout()
+
+        save_dir = os.path.join(self.config.output_path, "plots", "inference")
+        os.makedirs(save_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(npy_path))[0]
+        tag = self.config.checkpoint.save_tag
+        out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{tag}.png")
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+        logger.info(f"Saved bandpass overlay debug plot: {out_path}")
 
     # NOTE: come back to this later (what's the trade-off for doing dedup vs not? e.g. lower storage & compute, but higher FNR or lower DR sensitivity?)
     @staticmethod
