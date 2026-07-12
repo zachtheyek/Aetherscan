@@ -932,7 +932,7 @@ def _add_inference_flags_to(parser):
         "--hf-revision",
         type=str,
         default=None,
-        help="HuggingFace revision (tag, branch, or commit hash) to pin the model download to when no local artifact paths are given (default: the repo's latest release tag — highest semver vX.Y.Z tag, falling back to the highest final_vX training tag)",
+        help="HuggingFace revision (tag, branch, or commit hash) to pin the model download to when no local artifact paths are given (default: v{package version} when running as an installed release, else the repo's latest release tag — highest semver vX.Y.Z tag, falling back to the highest final_vX training tag)",
     )
 
     # Checkpoint configuration
