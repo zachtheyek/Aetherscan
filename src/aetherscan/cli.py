@@ -841,6 +841,26 @@ def _add_inference_flags_to(parser):
         default=None,
         help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV, tag-scoped directory {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/ — retrying with the same tag resumes from existing .npy files, while a new tag starts clean. Pass an old run's directory explicitly to reuse its preprocessing (shared across CSVs)",
     )
+
+    # Visualization suite
+    parser.add_argument(
+        "--inference-viz",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Render the inference visualization suite (energy detection distributions, hit spectrum, bandpass overlay, stamp/candidate galleries, confidence distribution, latent projection, summary card) at the end of a CSV inference run, saved under plots/inference/{save_tag}/ and uploaded to Slack (default: enabled). Pass --no-inference-viz to disable.",
+    )
+    parser.add_argument(
+        "--stamp-gallery-top-k",
+        type=int,
+        default=None,
+        help="Number of top-statistic stamps shown in the stamp gallery figure, each as a 6-observation waterfall grid (default: 12)",
+    )
+    parser.add_argument(
+        "--max-candidate-plots",
+        type=int,
+        default=None,
+        help="Maximum number of per-candidate figures rendered per run, highest confidence first (default: 50; the candidate gallery is unaffected)",
+    )
     parser.add_argument(
         "--max-retries",
         type=int,
@@ -1191,6 +1211,17 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.overlap_fraction = args.overlap_fraction
     if hasattr(args, "preprocess_output_dir") and args.preprocess_output_dir is not None:
         config.inference.preprocess_output_dir = args.preprocess_output_dir
+
+    # Visualization suite
+    # inference_viz uses argparse.BooleanOptionalAction with default=None so that the CLI
+    # can express "leave the config default" (omit), "force on" (--inference-viz), and
+    # "force off" (--no-inference-viz)
+    if hasattr(args, "inference_viz") and args.inference_viz is not None:
+        config.inference.inference_viz_enabled = args.inference_viz
+    if hasattr(args, "stamp_gallery_top_k") and args.stamp_gallery_top_k is not None:
+        config.inference.stamp_gallery_top_k = args.stamp_gallery_top_k
+    if hasattr(args, "max_candidate_plots") and args.max_candidate_plots is not None:
+        config.inference.max_candidate_plots = args.max_candidate_plots
     if (
         hasattr(args, "max_retries")
         and args.max_retries is not None
@@ -2092,6 +2123,34 @@ def collect_validation_errors(
                     fix_kind="range",
                     min_val=0.0,
                     max_val=1.0,
+                )
+            )
+
+        # Visualization suite
+        stamp_gallery_top_k = _resolve(
+            args, "stamp_gallery_top_k", config.inference.stamp_gallery_top_k
+        )
+        if stamp_gallery_top_k is not None and stamp_gallery_top_k < 1:
+            errors.append(
+                ValidationError(
+                    field="inference.stamp_gallery_top_k",
+                    current=stamp_gallery_top_k,
+                    message=f"--stamp-gallery-top-k must be >= 1, got {stamp_gallery_top_k}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        max_candidate_plots = _resolve(
+            args, "max_candidate_plots", config.inference.max_candidate_plots
+        )
+        if max_candidate_plots is not None and max_candidate_plots < 0:
+            errors.append(
+                ValidationError(
+                    field="inference.max_candidate_plots",
+                    current=max_candidate_plots,
+                    message=f"--max-candidate-plots must be >= 0, got {max_candidate_plots}",
+                    fix_kind="clamp_low",
+                    min_val=0,
                 )
             )
 

@@ -163,6 +163,43 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(argv), None)
         assert any(e.field == "training.initial_snr_range" for e in errors)
 
+    def test_stamp_gallery_top_k_bounds(self):
+        errors = collect_validation_errors(
+            _parse(["inference", "--stamp-gallery-top-k", "0"]), None
+        )
+        assert any(e.field == "inference.stamp_gallery_top_k" for e in errors)
+
+    def test_max_candidate_plots_bounds(self):
+        errors = collect_validation_errors(
+            _parse(["inference", "--max-candidate-plots", "-1"]), None
+        )
+        assert any(e.field == "inference.max_candidate_plots" for e in errors)
+
+    def test_viz_flags_route_to_inference_config(self):
+        config = get_config()
+        apply_args_to_config(
+            _parse(
+                [
+                    "inference",
+                    "--no-inference-viz",
+                    "--stamp-gallery-top-k",
+                    "6",
+                    "--max-candidate-plots",
+                    "10",
+                ]
+            )
+        )
+        assert config.inference.inference_viz_enabled is False
+        assert config.inference.stamp_gallery_top_k == 6
+        assert config.inference.max_candidate_plots == 10
+
+    def test_viz_flags_omitted_keep_defaults(self):
+        config = get_config()
+        apply_args_to_config(_parse(["inference"]))
+        assert config.inference.inference_viz_enabled is True
+        assert config.inference.stamp_gallery_top_k == 12
+        assert config.inference.max_candidate_plots == 50
+
     def test_missing_train_files_reported(self):
         errors = collect_validation_errors(_parse(["train"]), None)
         # Default train_files don't exist under the tmp data path.

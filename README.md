@@ -722,6 +722,9 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--overlap-search | --no-overlap-search]
                  [--overlap-fraction OVERLAP_FRACTION]
                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
+                 [--inference-viz | --no-inference-viz]
+                 [--stamp-gallery-top-k STAMP_GALLERY_TOP_K]
+                 [--max-candidate-plots MAX_CANDIDATE_PLOTS]
                  [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
                  [--save-tag SAVE_TAG]
 
@@ -843,6 +846,23 @@ options:
                         from existing .npy files, while a new tag starts
                         clean. Pass an old run's directory explicitly to reuse
                         its preprocessing (shared across CSVs)
+  --inference-viz, --no-inference-viz
+                        Render the inference visualization suite (energy
+                        detection distributions, hit spectrum, bandpass
+                        overlay, stamp/candidate galleries, confidence
+                        distribution, latent projection, summary card) at the
+                        end of a CSV inference run, saved under
+                        plots/inference/{save_tag}/ and uploaded to Slack
+                        (default: enabled). Pass --no-inference-viz to
+                        disable.
+  --stamp-gallery-top-k STAMP_GALLERY_TOP_K
+                        Number of top-statistic stamps shown in the stamp
+                        gallery figure, each as a 6-observation waterfall grid
+                        (default: 12)
+  --max-candidate-plots MAX_CANDIDATE_PLOTS
+                        Maximum number of per-candidate figures rendered per
+                        run, highest confidence first (default: 50; the
+                        candidate gallery is unaffected)
   --max-retries MAX_RETRIES
                         Maximum number of retry attempts for inference
                         (including preprocessing) on failure
