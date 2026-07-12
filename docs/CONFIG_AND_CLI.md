@@ -4,6 +4,10 @@ This document explains how Aetherscan's runtime configuration is structured, how
 flags map onto it, and how the `train` and `inference` subcommands stay isolated from
 each other. Read this before adding a new flag or config field — the patterns below
 exist precisely so that one mode's parameters can't silently contaminate the other.
+For where config initialization sits in the overall startup sequence (and the singleton
+pattern's rules), see [`ARCHITECTURE.md`](ARCHITECTURE.md); for what the individual
+training/inference fields *do*, see [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md) and
+[`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).
 
 ## TL;DR
 
