@@ -688,6 +688,11 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     # Per-task seeding keeps results independent of worker scheduling (workers are
     # persistent, so PID-only seeding from _init_worker would tie the stream to which
     # worker happens to pick the task up).
+    # NOTE: this seeds the LEGACY global RNGs because new_cadence/create_* draw from
+    # random.random() and the np.random.* module API. The determinism therefore holds only
+    # as long as nothing else mutates the global RNG state between cadences within a task;
+    # threading an explicit np.random.Generator through the create_* functions would remove
+    # that coupling if it ever matters.
     random.seed(seed)
     np.random.seed(seed % (2**32))
 
@@ -709,8 +714,11 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
             )
             out[start_idx + i] = cadence
             all_sample_info.append(sample_info)
-        out.flush()
     finally:
+        # Flush in the finally so rows written before a mid-task exception still reach disk
+        # deterministically (a failed round has no .done manifest and reads as garbage either
+        # way, but not all filesystems are guaranteed to write back dirty pages on munmap)
+        out.flush()
         del out
 
     return time.time() - task_start, all_sample_info

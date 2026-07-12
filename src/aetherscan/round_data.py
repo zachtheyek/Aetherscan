@@ -100,6 +100,9 @@ def _array_checksum(arr: np.ndarray) -> dict:
     deterministically-sampled flat-index values. Positions are derived from the element count,
     so validation re-samples the same spots without storing an RNG state.
     """
+    # NOTE: reshape(-1) is a zero-copy view here (and in validate_done_manifest) because
+    # open_memmap/np.save arrays are always C-contiguous; on a non-contiguous array it would
+    # silently materialize a full in-RAM copy — switch to .ravel()/.flat if the layout ever changes
     flat = arr.reshape(-1)
     n = int(flat.size)
     rng = np.random.default_rng(n)
@@ -499,8 +502,11 @@ class RoundDataProducer:
 
         # The spawned child re-imports the aetherscan module chain, which includes TF; blank
         # out GPU visibility for the child's entire process tree so nothing in the producer
-        # can ever initialize CUDA (generation is pure CPU). The parent's TF read this env at
-        # its own GPU init, so temporarily mutating it here is safe.
+        # can ever initialize CUDA (generation is pure CPU).
+        # NOTE: another thread reading os.environ during this brief window would see the
+        # blanked value — intentionally acceptable ONLY because the parent's TF read the var
+        # once at its own GPU init (long before this point) and nothing else in the pipeline
+        # spawns GPU-visible subprocesses concurrently with training startup.
         original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         try:
@@ -541,6 +547,9 @@ class RoundDataProducer:
                     raise RuntimeError(
                         f"RoundDataProducer exited before producing round {round_idx} data"
                     )
+                # NOTE: the drainer's notify_all() wakes this immediately on done/error; the
+                # 1 s timeout is not a polling latency, just a liveness re-check so a drainer
+                # that died without notifying can't strand this wait forever
                 self._condition.wait(timeout=1.0)
 
         if kind == "error":
