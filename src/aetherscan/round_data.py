@@ -37,6 +37,7 @@ from logging.handlers import QueueListener
 
 import numpy as np
 
+from aetherscan.benchmark import record_stage
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 
@@ -347,6 +348,13 @@ def _producer_main(
     - in:  ("generate", round_idx, snr_base, snr_range) | ("shutdown",)
     - out: ("stats", round_idx, segment_dict)            per class-segment per chunk
            ("progress", round_idx, chunk, n_chunks)      per chunk
+           ("timing", round_idx, start_ts, end_ts)       generation wall-clock span, sent
+                                                         before "done" (skipped on reuse —
+                                                         no generation happened); the
+                                                         main-process drainer records it as
+                                                         a pipeline_stages row (this
+                                                         process can't reach the DB writer
+                                                         queue, a thread queue.Queue)
            ("done", round_idx, manifest)                 on success (or valid reuse)
            ("error", round_idx, traceback_str)           on failure (producer keeps serving)
            ("shutdown_ack",)                             right before a graceful exit
@@ -429,6 +437,7 @@ def _producer_main(
                     f"RoundDataProducer: generating round {round_idx} data "
                     f"(SNR {snr_base}-{snr_base + snr_range})"
                 )
+                generation_start = time.time()
                 manifest = generate_fn(
                     paths,
                     round_idx,
@@ -442,6 +451,9 @@ def _producer_main(
                     ),
                 )
                 logger.info(f"RoundDataProducer: round {round_idx} data complete")
+                # Timing before done: queue FIFO means the drainer records the stage span
+                # before await_round() unblocks on the done message
+                result_queue.put(("timing", round_idx, generation_start, time.time()))
                 result_queue.put(("done", round_idx, manifest))
             except Exception:
                 result_queue.put(("error", round_idx, traceback.format_exc()))
@@ -634,6 +646,17 @@ class RoundDataProducer:
         elif kind == "progress":
             _, round_idx, chunk, n_chunks = message
             logger.info(f"Round {round_idx} data generation: chunk {chunk}/{n_chunks} complete")
+        elif kind == "timing":
+            # The producer's generation wall-clock span, recorded from this (main) process
+            # because the DB writer queue is thread-only
+            _, round_idx, start_ts, end_ts = message
+            record_stage(
+                f"train.round_{round_idx:02d}.data_generation",
+                start_ts,
+                end_ts,
+                tag=self._tag,
+                metadata={"source": "producer"},
+            )
         elif kind in ("done", "error"):
             _, round_idx, payload = message
             with self._condition:

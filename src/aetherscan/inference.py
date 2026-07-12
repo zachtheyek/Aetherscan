@@ -16,6 +16,7 @@ import time
 import numpy as np
 import tensorflow as tf
 
+from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.db import get_db
 from aetherscan.models import RandomForestModel
@@ -336,7 +337,8 @@ class InferencePipeline:
                 f"({n_padded} padded) using distributed inference"
             )
 
-            latents = self._distributed_encode(inf_dataset, n_padded, inf_steps)
+            with stage_timer("encode"):
+                latents = self._distributed_encode(inf_dataset, n_padded, inf_steps)
 
             # Drop the encoded padding rows: the first n_samples * num_observations latent
             # rows correspond exactly to the real snippets (row order is snippet-major)
@@ -348,26 +350,28 @@ class InferencePipeline:
             # predict_verbose would have derived from it (probability of the predicted
             # class, so high for confident negatives too).
             logger.info("Running Random Forest classification")
-            probas = self.rf_model.predict_proba(latents)
-            proba_true = probas[:, 1]
-            predictions = (proba_true > self.threshold).astype(int)
-            confidence_scores = np.where(predictions, proba_true, probas[:, 0])
+            with stage_timer("rf"):
+                probas = self.rf_model.predict_proba(latents)
+                proba_true = probas[:, 1]
+                predictions = (proba_true > self.threshold).astype(int)
+                confidence_scores = np.where(predictions, proba_true, probas[:, 0])
 
             # Write results to database
-            n_candidates = self._write_inference_results(
-                npy_path=npy_path,
-                predictions=predictions,
-                confidence_scores=confidence_scores,
-                latents=latents,
-                target=target,
-                session=session,
-                cadence_id=cadence_id,
-                band=band,
-                frequency_mhz=frequency_mhz,
-                stamp_frequencies_mhz=stamp_frequencies_mhz,
-                timestamp_observed=timestamp_observed,
-                h5_path=h5_path,
-            )
+            with stage_timer("db_write"):
+                n_candidates = self._write_inference_results(
+                    npy_path=npy_path,
+                    predictions=predictions,
+                    confidence_scores=confidence_scores,
+                    latents=latents,
+                    target=target,
+                    session=session,
+                    cadence_id=cadence_id,
+                    band=band,
+                    frequency_mhz=frequency_mhz,
+                    stamp_frequencies_mhz=stamp_frequencies_mhz,
+                    timestamp_observed=timestamp_observed,
+                    h5_path=h5_path,
+                )
 
         except Exception as e:
             logger.error(f"Error in run_inference(): {e}")
@@ -576,19 +580,22 @@ def run_inference_pipeline(
     pipeline = InferencePipeline(strategy=strategy)
 
     try:
-        # Run inference
-        results = pipeline.run_inference(
-            data=cadence_data,
-            npy_path=npy_path,
-            target=target,
-            session=session,
-            cadence_id=cadence_id,
-            band=band,
-            frequency_mhz=frequency_mhz,
-            stamp_frequencies_mhz=stamp_frequencies_mhz,
-            timestamp_observed=timestamp_observed,
-            h5_path=h5_path,
-        )
+        # Run inference. The umbrella span makes run_inference's encode/rf/db_write
+        # sub-stages record as "inference.infer.*" on this legacy path (the streaming
+        # path opens a per-cadence "inference.infer_cadence_NNN" umbrella instead)
+        with stage_timer("inference.infer"):
+            results = pipeline.run_inference(
+                data=cadence_data,
+                npy_path=npy_path,
+                target=target,
+                session=session,
+                cadence_id=cadence_id,
+                band=band,
+                frequency_mhz=frequency_mhz,
+                stamp_frequencies_mhz=stamp_frequencies_mhz,
+                timestamp_observed=timestamp_observed,
+                h5_path=h5_path,
+            )
     finally:
         # Force TensorFlow to release internal references to datasets/iterators. Runs once
         # per pipeline lifetime (after the loaded models are no longer needed) rather than

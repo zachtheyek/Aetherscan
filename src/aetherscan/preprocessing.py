@@ -34,6 +34,7 @@ import numpy as np
 from scipy import interpolate, stats
 from skimage.transform import downscale_local_mean
 
+from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
@@ -589,6 +590,9 @@ class PendingCadence:
 
     group: CadenceGroup
     npy_path: str
+    # 1-based position in plan_cadences() output (CSV order, so stable across resumed
+    # attempts) — the short label used in this cadence's pipeline_stages span names
+    index: int = 0
 
 
 def derive_cadence_provenance(key: tuple, group_by_cols: list[str], metadata: dict) -> dict:
@@ -1281,7 +1285,11 @@ class DataPreprocessor:
             for group in valid_groups:
                 npy_filename = self._cadence_npy_filename(csv_stem, group.key)
                 units.append(
-                    PendingCadence(group=group, npy_path=os.path.join(output_dir, npy_filename))
+                    PendingCadence(
+                        group=group,
+                        npy_path=os.path.join(output_dir, npy_filename),
+                        index=len(units) + 1,
+                    )
                 )
 
         logger.info(
@@ -1326,7 +1334,11 @@ class DataPreprocessor:
                 )
 
         try:
-            return self._process_cadence(group, npy_path)
+            # Umbrella stage span for this cadence's preprocessing phase — the per-ON-file
+            # read_ed / dedup / extract sub-stages inside _process_cadence nest under it
+            # via thread-local naming. The resume path above records nothing (no work done)
+            with stage_timer(f"inference.preprocess_cadence_{unit.index:03d}"):
+                return self._process_cadence(group, npy_path)
         except Exception as e:
             logger.error(f"Failed to process cadence {group.key}: {e}")
             return None
@@ -1511,50 +1523,53 @@ class DataPreprocessor:
                 f"{on_source_idx + 1}/{len(on_source_paths)}: {on_h5}"
             )
 
-            if pfb_active:
-                # Cheap static-response sanity check (once per file, not per channel)
-                self._warn_on_pfb_response_mismatch(on_h5, n_coarse_total)
+            # One stage span per ON file (read + DC spike + bandpass flatten + threshold)
+            with stage_timer(f"read_ed_on{on_source_idx + 1}"):
+                if pfb_active:
+                    # Cheap static-response sanity check (once per file, not per channel)
+                    self._warn_on_pfb_response_mismatch(on_h5, n_coarse_total)
 
-            tasks = [
-                (
-                    on_h5,
-                    ch,
-                    coarse_channel_width,
-                    time_bins,
-                    bandpass_flatten,
-                    window_size,
-                    step_size,
-                    stat_threshold,
-                )
-                for ch in range(n_coarse_total)
-            ]
-
-            if self._ed_pool is not None:
-                # imap (ordered, chunksize 1) keeps every worker busy across the whole file
-                # while results stream back for progress logging
-                channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
-            else:
-                if n_processes > 1:
-                    logger.info(
-                        "Energy detection running sequentially: no persistent pool started "
-                        "(call start_energy_detection_pool() to parallelize)"
+                tasks = [
+                    (
+                        on_h5,
+                        ch,
+                        coarse_channel_width,
+                        time_bins,
+                        bandpass_flatten,
+                        window_size,
+                        step_size,
+                        stat_threshold,
                     )
-                channel_hits_iter = map(_energy_detect_channel_worker, tasks)
+                    for ch in range(n_coarse_total)
+                ]
 
-            for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter, start=1):
-                all_hits.extend(channel_hits)
-                stat_hists[on_source_idx] += channel_hist
-                if done % progress_chunk == 0 or done == n_coarse_total:
-                    logger.info(
-                        f"  Coarse channel {done}/{n_coarse_total} of ON-source "
-                        f"{on_source_idx + 1}/{len(on_source_paths)}"
-                    )
+                if self._ed_pool is not None:
+                    # imap (ordered, chunksize 1) keeps every worker busy across the whole
+                    # file while results stream back for progress logging
+                    channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
+                else:
+                    if n_processes > 1:
+                        logger.info(
+                            "Energy detection running sequentially: no persistent pool "
+                            "started (call start_energy_detection_pool() to parallelize)"
+                        )
+                    channel_hits_iter = map(_energy_detect_channel_worker, tasks)
+
+                for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter, start=1):
+                    all_hits.extend(channel_hits)
+                    stat_hists[on_source_idx] += channel_hist
+                    if done % progress_chunk == 0 or done == n_coarse_total:
+                        logger.info(
+                            f"  Coarse channel {done}/{n_coarse_total} of ON-source "
+                            f"{on_source_idx + 1}/{len(on_source_paths)}"
+                        )
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
         # NOTE: come back to this later (what's the trade-off for doing dedup vs not? e.g. lower storage & compute, but higher FNR or lower DR sensitivity?)
         # Deduplicate: greedy merge of any pair within stamp_width // 2
-        merged_hits = self._deduplicate_hits(all_hits, stamp_width)
+        with stage_timer("dedup"):
+            merged_hits = self._deduplicate_hits(all_hits, stamp_width)
         logger.info(
             f"Cadence {group.key}: {len(merged_hits)} hits after deduplication "
             f"(stamp_width={stamp_width})"
@@ -1651,15 +1666,16 @@ class DataPreprocessor:
             for base in range(0, n_stamps, chunk_size)
         ]
 
-        if self._ed_pool is not None and len(tasks) > 1:
-            # Reuse the persistent energy-detection pool — extraction workers are plain
-            # (no shared memory), so the same pool serves both stages without churn
-            self._ed_pool.map(_extract_stamps_worker, tasks)
-        else:
-            for task in tasks:
-                _extract_stamps_worker(task)
+        with stage_timer("extract"):
+            if self._ed_pool is not None and len(tasks) > 1:
+                # Reuse the persistent energy-detection pool — extraction workers are plain
+                # (no shared memory), so the same pool serves both stages without churn
+                self._ed_pool.map(_extract_stamps_worker, tasks)
+            else:
+                for task in tasks:
+                    _extract_stamps_worker(task)
 
-        os.replace(tmp_npy_path, npy_path)
+            os.replace(tmp_npy_path, npy_path)
 
         metadata_path = self.cadence_metadata_path(npy_path)
         # Per-stamp frequency = center bin's frequency, computed from header's fch1/foff
