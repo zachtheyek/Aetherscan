@@ -34,12 +34,14 @@ STAGE_VAE_PLOTS = "vae_plots"
 STAGE_RF_TRAIN = "rf_train"
 STAGE_RF_PLOTS = "rf_plots"
 STAGE_FINAL_SAVE = "final_save"
+STAGE_HF_UPLOAD = "hf_upload"  # Opt-in (config.hf.upload_after_training); non-critical
 TRAINING_STAGES = (
     STAGE_VAE_ROUNDS,
     STAGE_VAE_PLOTS,
     STAGE_RF_TRAIN,
     STAGE_RF_PLOTS,
     STAGE_FINAL_SAVE,
+    STAGE_HF_UPLOAD,
 )
 
 
@@ -162,6 +164,13 @@ class TrainingRunState:
         """Record a non-critical stage failure; not in stages_done, so relaunches retry it."""
         if stage not in self.stages_failed:
             self.stages_failed.append(stage)
+
+    def clear_stage_failure(self, stage: str) -> None:
+        """Drop a recorded failure without marking the stage done — used when the user opts
+        out of an optional stage (e.g. re-running without --hf-upload) so a stale failure
+        can't force a nonzero exit forever."""
+        if stage in self.stages_failed:
+            self.stages_failed.remove(stage)
 
     def mark_round_completed(self, round_number: int) -> None:
         if round_number not in self.completed_rounds:
