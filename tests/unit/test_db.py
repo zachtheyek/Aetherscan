@@ -436,6 +436,49 @@ class TestInferenceCadences:
             db.query_inference_cadences(columns=["npy_path; DROP TABLE inference_cadences"])
 
 
+class TestPipelineStages:
+    def test_write_and_query_round_trip(self, db):
+        tag = "test_v1"
+        db.write_pipeline_stage("train.round_01", 100.0, 160.0, tag=tag, metadata='{"a": 1}')
+        assert db.flush(timeout=10) is True
+
+        rows = db.query_pipeline_stages(tag=tag)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["stage"] == "train.round_01"
+        assert row["start_time"] == 100.0
+        assert row["end_time"] == 160.0
+        assert row["duration_s"] == 60.0  # derived at write time
+        assert json.loads(row["metadata"]) == {"a": 1}
+
+    def test_query_filters_and_ordering(self, db):
+        tag = "test_v1"
+        # Inserted out of chronological order on purpose
+        db.write_pipeline_stage("train.round_02", 200.0, 260.0, tag=tag)
+        db.write_pipeline_stage("train.round_01", 100.0, 160.0, tag=tag)
+        db.write_pipeline_stage("inference.viz", 300.0, 310.0, tag=tag)
+        db.write_pipeline_stage("train.round_01", 100.0, 150.0, tag="test_v2")
+        assert db.flush(timeout=10) is True
+
+        rows = db.query_pipeline_stages(tag=tag)
+        assert [r["stage"] for r in rows] == ["train.round_01", "train.round_02", "inference.viz"]
+
+        # stage accepts str or list; start/end bound the row's start_time
+        assert len(db.query_pipeline_stages(stage="inference.viz", tag=tag)) == 1
+        assert len(db.query_pipeline_stages(stage=["train.round_01", "train.round_02"])) == 3
+        assert [
+            r["stage"] for r in db.query_pipeline_stages(tag=tag, start_time=150.0, end_time=250.0)
+        ] == ["train.round_02"]
+
+    def test_column_projection_and_whitelist(self, db):
+        db.write_pipeline_stage("train.rf", 1.0, 2.0, tag="test_v1")
+        assert db.flush(timeout=10) is True
+        rows = db.query_pipeline_stages(tag="test_v1", columns=["stage", "duration_s"])
+        assert rows == [{"stage": "train.rf", "duration_s": 1.0}]
+        with pytest.raises(ValueError, match="Invalid column"):
+            db.query_pipeline_stages(columns=["stage; DROP TABLE pipeline_stages"])
+
+
 class TestSchemaMigration:
     # The v0 schema (pre-superseded) for the four tables the migration touches, trimmed to
     # the columns the assertions need plus everything NOT NULL.
@@ -581,6 +624,57 @@ class TestSchemaMigration:
             database.write_inference_cadence(npy_path="/a.npy", status="inferred", tag="test_v1")
             assert database.flush(timeout=10) is True
             assert len(database.query_inference_cadences(tag="test_v1")) == 1
+        finally:
+            database.stop()
+
+    def test_old_schema_gains_pipeline_stages_table(self):
+        """A pre-versioning database (v0: no pipeline_stages table) must come out of
+        _init_database() with the v4 stage-timing table present and usable."""
+        db_path = self._create_v0_db(get_config())
+        assert "pipeline_stages" not in self._table_names(db_path)
+
+        database = Database()
+        database.start()
+        try:
+            assert "pipeline_stages" in self._table_names(db_path)
+            assert self._user_version(db_path) == _SCHEMA_VERSION
+            database.write_pipeline_stage("train.round_01", 1.0, 2.5, tag="test_v1")
+            assert database.flush(timeout=10) is True
+            rows = database.query_pipeline_stages(tag="test_v1")
+            assert len(rows) == 1
+            assert rows[0]["duration_s"] == 1.5
+        finally:
+            database.stop()
+
+    def test_v2_schema_migrates_to_v4(self):
+        """A database stamped at v2 (superseded columns + inference_cadences already
+        present, no config_fingerprint, no pipeline_stages) must gain the v3
+        config_fingerprint column, the v4 pipeline_stages table, and the v4 stamp."""
+        config = get_config()
+        db_path = os.path.join(config.output_path, "db", "aetherscan.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.executescript(self._V0_SCHEMA)
+        for table in self._MIGRATED_TABLES:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN superseded INTEGER DEFAULT 0")
+        conn.execute(
+            "CREATE TABLE inference_cadences (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " timestamp REAL NOT NULL, tag TEXT, csv_path TEXT, cadence_key TEXT,"
+            " npy_path TEXT NOT NULL, status TEXT NOT NULL, n_stamps INTEGER,"
+            " n_candidates INTEGER, confidence_summary TEXT, duration_s REAL,"
+            " superseded INTEGER DEFAULT 0)"
+        )
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+
+        database = Database()
+        try:
+            # v3 ALTER: the pre-existing inference_cadences table gains config_fingerprint
+            assert "config_fingerprint" in self._column_names(db_path, "inference_cadences")
+            # v4: the new stage-timing table is created
+            assert "pipeline_stages" in self._table_names(db_path)
+            assert self._user_version(db_path) == _SCHEMA_VERSION
         finally:
             database.stop()
 
