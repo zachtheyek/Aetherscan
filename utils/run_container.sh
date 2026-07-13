@@ -26,13 +26,13 @@
 #                               (default: /datax/scratch/zachy/outputs/aetherscan)
 #     AETHERSCAN_EXTRA_BINDS    Comma-separated extra host paths, each bound 1:1
 #                               and appended to the standard bind list, e.g.
-#                               AETHERSCAN_EXTRA_BINDS=/datag for CSV inference
+#                               AETHERSCAN_EXTRA_BINDS=/datag for inference
 #                               (default: none)
 #     SLACK_BOT_TOKEN           Slack bot token, forwarded into the container
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
 #
-# The runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
-# through untouched and are additive with the binds set up here.
+# Note, the runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
+# through untouched and are additive with the binds set up from AETHERSCAN_EXTRA_BINDS.
 #
 # <repo>/.env is auto-loaded if present, so secrets set by "source .env" in the
 # user's shell survive the trip into this child process. Anything already in our
@@ -105,7 +105,7 @@ BIND_ARGS=(
 )
 
 # Extra host paths (comma-separated), each bound 1:1, for data that lives
-# outside the standard dirs (e.g. raw .h5 files under /datag for CSV inference).
+# outside the standard dirs (e.g. raw .h5 files in /datag during inference).
 if [[ -n ${AETHERSCAN_EXTRA_BINDS:-} ]]; then
     IFS=',' read -ra EXTRA_BINDS <<<"$AETHERSCAN_EXTRA_BINDS"
     for extra_path in "${EXTRA_BINDS[@]}"; do
