@@ -109,15 +109,19 @@ Aetherscan reads secrets and path overrides from a `.env` file at the repo root.
 ```ini
 # .env example
 
-# If none specified, Slack integration is automatically disabled
-SLACK_BOT_TOKEN=your-slack-bot-token
-SLACK_CHANNEL=your-slack-channel
-
 # If none specified, defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan
 # Note, CLI flags (--data-path, --model-path, --output-path) override these
 AETHERSCAN_DATA_PATH=/path/to/data
 AETHERSCAN_MODEL_PATH=/path/to/models
 AETHERSCAN_OUTPUT_PATH=/path/to/outputs
+
+# Optional: comma-separated extra host paths for run_container.sh to bind 1:1, for
+# data outside the standard dirs (e.g. parent dir with raw .h5 files for inference)
+AETHERSCAN_EXTRA_BINDS=/extra/host/paths
+
+# If none specified, Slack integration is automatically disabled
+SLACK_BOT_TOKEN=your-slack-bot-token
+SLACK_CHANNEL=your-slack-channel
 ```
 
 > [!TIP]
@@ -320,8 +324,9 @@ PYTHONPATH=src python -m aetherscan.main inference \
 **Inference from raw `.h5` files (invokes energy detection preprocessing)**
 
 ```bash
-# Container
-./utils/run_container.sh python -m aetherscan.main inference \
+# Container — if the raw .h5 paths in the CSV live outside the standard bind
+# mounts (e.g. under /datag), then we bind them via AETHERSCAN_EXTRA_BINDS
+AETHERSCAN_EXTRA_BINDS=/datag ./utils/run_container.sh python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
