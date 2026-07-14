@@ -45,7 +45,7 @@ def _reset_all_singletons():
     from aetherscan.manager.manager import ResourceManager  # noqa: PLC0415
     from aetherscan.monitor.monitor import ResourceMonitor  # noqa: PLC0415
 
-    for cls in (ResourceMonitor, Database, Logger, ResourceManager, Config):
+    for cls in (Config, Database, Logger, ResourceManager, ResourceMonitor):
         cls._reset()
 
 
