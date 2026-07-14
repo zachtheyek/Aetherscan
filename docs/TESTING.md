@@ -36,6 +36,7 @@ tests/
 ├── unit/                        # fast, hardware-independent; the CI surface
 │   ├── test_config.py               # singleton semantics, to_dict round-trip
 │   ├── test_cli_validation.py       # tag pattern, divisibility matrix, saved-config precedence
+│   ├── test_tag_guards.py           # save-tag dedup matrix: local/HF collisions, --force-tag
 │   ├── test_data_generation.py      # log_norm, create_* shapes/labels, intersection checks,
 │   │                                #   chunk segments / batched task partitioning
 │   ├── test_round_data.py           # paths/manifest protocol, reuse/delete semantics, producer
@@ -49,13 +50,35 @@ tests/
 │   ├── test_inference.py            # padding fix, provenance mapping, confidence summaries
 │   ├── test_inference_viz.py        # every figure smoke-tested against tiny synthetic inputs
 │   ├── test_main.py                 # streaming-loop resume/containment with stubbed stages
+│   ├── test_hf_hub.py               # revision resolution, artifact download, upload staging, card
 │   ├── test_db.py                   # writer thread, flush/supersede sentinels, migrations, queries
-│   └── test_manager.py              # pool/SHM tracking and cleanup idempotence
+│   ├── test_manager.py              # pool/SHM tracking and cleanup idempotence
+│   ├── test_benchmark.py            # stage_timer nesting/failures, report tree math + suggestions
+│   └── test_logger.py               # StreamToLogger redirect probes: isatty/writable/readable/fileno
 └── integration/                 # marked integration+gpu+cluster: real subprocess runs
     ├── conftest.py                  # repo-root launcher + cluster path resolution
     ├── test_train_smoke.py          # known-good training smoke config, end to end
     └── test_inference_smoke.py     # subset CSV inference against cluster-resident .h5 data
 ```
+
+## Coverage and deliberate gaps
+
+A couple of modules are unit-tested lightly or not at all, by design rather than oversight:
+
+- **`monitor`** has no dedicated unit-test module. It's dominated by the 1 Hz background
+  sampling thread (PSS process-tree stats) and the matplotlib rendering of the resource plot,
+  both low-value to unit-test; its behavior is exercised by the integration smokes (real runs)
+  and verified by manual inspection of the resource-utilization plot uploaded to Slack. (Its
+  one pure helper, `select_annotation_spans`, *is* covered — in `test_benchmark.py`.)
+- **`logger`** is unit-tested only for the `StreamToLogger` stdout/stderr-redirect probes
+  (`isatty`/`writable`/`readable`/`fileno`) in `test_logger.py`; the QueueListener,
+  SlackHandler, and stderr-to-logger redirect are exercised by the integration smokes rather
+  than unit tests.
+
+The inference pipeline follows the suite's usual shape: its logic is unit-tested at the
+function level (`test_inference.py`, `test_main.py`, `test_inference_viz.py`), with full
+end-to-end behavior covered by `test_inference_smoke.py` — there is no unit-level end-to-end
+inference test by nature.
 
 ## Markers
 
