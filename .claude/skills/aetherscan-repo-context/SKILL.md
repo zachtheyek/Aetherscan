@@ -160,7 +160,7 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 | Private       | \_prefix    | `_init_worker`           |
 | Config fields | snake_case  | `per_replica_batch_size` |
 
-**Grep-friendly inline comment markers** (used consistently): `# TODO:` (actionable work), `# NOTE:` (rationale/question), `# FIX:` (known issue, no time now), `# BUG:` (known bug, often with workaround), `# TEST:` (behavior to verify, no suite yet). Prefer `# NOTE:` over `# TODO:` when there's no obvious action.
+**Grep-friendly inline comment markers** (used consistently): `# TODO:` (actionable work), `# NOTE:` (rationale/question), `# FIX:` (known issue, no time now), `# BUG:` (known bug, often with workaround), `# TEST:` (behavior to verify — now backed by the `tests/` suite). Prefer `# NOTE:` over `# TODO:` when there's no obvious action.
 
 ---
 

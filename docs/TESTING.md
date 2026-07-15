@@ -73,7 +73,14 @@ A couple of modules are unit-tested lightly or not at all, by design rather than
 - **`logger`** is unit-tested only for the `StreamToLogger` stdout/stderr-redirect probes
   (`isatty`/`writable`/`readable`/`fileno`) in `test_logger.py`; the QueueListener,
   SlackHandler, and stderr-to-logger redirect are exercised by the integration smokes rather
-  than unit tests.
+  than unit tests. In particular `src/aetherscan/logger/slack_handler.py` — a `logging.Handler`
+  that batches records, posts them as threaded replies to a per-run summary message, color-codes
+  by level, retries with exponential backoff, throttles via a consecutive-failure cooldown, and
+  uploads images — has no unit tests at all; its batching / level-to-color coding / backoff /
+  throttling are only ever driven by real runs. It also carries two known `# BUG:` markers at the
+  top of the module (batch messages colored by the wrong priority level, and over-long batched
+  messages truncated to a trailing `...`), both observability-only cosmetics that do not affect
+  pipeline results.
 
 The inference pipeline follows the suite's usual shape: its logic is unit-tested at the
 function level (`test_inference.py`, `test_main.py`, `test_inference_viz.py`), with full
