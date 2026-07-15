@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.models: latent feature layout, RandomForestModel behavior, the
 Sampling layer, and encoder/decoder symmetry."""
 

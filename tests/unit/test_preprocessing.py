@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.preprocessing: hit deduplication, CSV cadence grouping, filename
 sanitization, JSON coercion, DC-spike removal, and spline bandpass fitting."""
 

@@ -18,6 +18,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 _SUBPROCESS_TIMEOUT_SECONDS = 7200
 
 
+# NOTE: come back to this later
 @pytest.fixture
 def cluster_paths():
     """(data_path, model_path, output_path) from AETHERSCAN_* env, falling back to the same
@@ -29,6 +30,7 @@ def cluster_paths():
     )
 
 
+# NOTE: come back to this later
 @pytest.fixture
 def run_pipeline():
     """Launcher for `python -m aetherscan.main <args...>` from the repo root, with <repo>/src

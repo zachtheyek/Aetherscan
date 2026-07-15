@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.config: singleton semantics and to_dict() field coverage."""
 
 from __future__ import annotations

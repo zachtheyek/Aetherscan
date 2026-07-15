@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.cli: tag pattern, validation matrix, cross-param solver, and
 apply_saved_config precedence (defaults < saved config < CLI args)."""
 

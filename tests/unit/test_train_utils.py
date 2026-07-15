@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
 schedules, directory archiving, encoder-trained heuristics, and SHAP output normalization."""
 

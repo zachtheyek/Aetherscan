@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.db: writer thread lifecycle, flush sentinel protocol, executemany
 batching across tables, is_finite sanitization, and query filters / column whitelists — all
 against a tmp-path SQLite file."""

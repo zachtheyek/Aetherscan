@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.data_generation: log-norm, intersection checks, signal injection,
 create_* cadence generators, and intensity statistics."""
 

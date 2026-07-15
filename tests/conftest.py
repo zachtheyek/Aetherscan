@@ -139,6 +139,7 @@ def aetherscan_isolated_env(request, tmp_path, monkeypatch):
     sys.stdout, sys.stderr = original_stdout, original_stderr
 
 
+# NOTE: come back to this later
 @pytest.fixture
 def make_background_npy(tmp_path):
     """Factory for tiny .npy background plates shaped like real training backgrounds.
@@ -159,6 +160,7 @@ def make_background_npy(tmp_path):
     return _make
 
 
+# NOTE: come back to this later
 @pytest.fixture
 def make_h5_observation(tmp_path):
     """Factory for tiny .h5 observation files matching the filterbank-style layout.
@@ -183,6 +185,7 @@ def make_h5_observation(tmp_path):
     return _make
 
 
+# NOTE: come back to this later
 @pytest.fixture
 def make_inference_csv(tmp_path):
     """Factory for tiny inference CSVs in the cadence-grouping layout.

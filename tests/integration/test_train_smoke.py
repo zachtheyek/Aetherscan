@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """End-to-end training smoke test (cluster-only).
 
 Runs the known-good blpc3 5-GPU smoke config from the repo runbook as a subprocess of

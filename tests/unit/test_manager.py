@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """Unit tests for aetherscan.manager: pool / shared-memory tracking and cleanup idempotence.
 
 ResourceManager registers atexit + signal handlers on construction; the conftest autouse

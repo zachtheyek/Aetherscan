@@ -1,3 +1,5 @@
+# NOTE: come back to this later
+
 """End-to-end CSV-inference smoke test (cluster-only, blpc3).
 
 Runs subset CSV inference against the persisted dummy model (test_v17) as a subprocess of
