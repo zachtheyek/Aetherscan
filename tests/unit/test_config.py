@@ -10,21 +10,16 @@ import os
 
 from aetherscan.config import Config, get_config, init_config
 
-# Sub-dataclass sections serialized by Config.to_dict(), keyed by attribute name.
-_CONFIG_SECTIONS = (
-    "db",
-    "manager",
-    "monitor",
-    "logger",
-    "beta_vae",
-    "rf",
-    "gpu",
-    "data",
-    "training",
-    "inference",
-    "hf",
-    "checkpoint",
-)
+# Keys to_dict() emits that are not sub-dataclass sections (derived/grouped scalars).
+_NON_SECTION_KEYS = frozenset({"paths"})
+
+
+def _config_sections(config: Config) -> set[str]:
+    """Attribute names on a Config whose values are dataclass instances (its serialized sections).
+
+    Derived at runtime so a newly added section is auto-covered by the coverage test below.
+    """
+    return {name for name, value in vars(config).items() if dataclasses.is_dataclass(value)}
 
 
 class TestSingletonSemantics:
@@ -76,10 +71,21 @@ class TestSingletonSemantics:
 
 class TestToDict:
     def test_sections_cover_every_dataclass_field(self):
-        """to_dict() must be updated by hand for every new config field — catch drift."""
+        """to_dict() must be updated by hand for every new config section/field — catch drift."""
         config = get_config()
         serialized = config.to_dict()
-        for section in _CONFIG_SECTIONS:
+        sections = _config_sections(config)
+
+        # A forgotten (or spurious extra) whole section: the section keys to_dict() emits, minus
+        # the known non-section keys, must equal the dynamically-derived set of Config sections.
+        serialized_sections = set(serialized) - _NON_SECTION_KEYS
+        assert serialized_sections == sections, (
+            "Config.to_dict() sections are out of sync with Config: "
+            f"missing={sections - serialized_sections}, extra={serialized_sections - sections}"
+        )
+
+        # A forgotten field within a section: each section's keys must equal its dataclass fields.
+        for section in sections:
             expected = {f.name for f in dataclasses.fields(type(getattr(config, section)))}
             actual = set(serialized[section].keys())
             assert actual == expected, (
@@ -96,7 +102,7 @@ class TestToDict:
         assert serialized["training"]["num_training_rounds"] == 5
         assert serialized["gpu"]["num_replicas"] == 4
         assert serialized["paths"]["data_path"] == config.data_path
-        for section in _CONFIG_SECTIONS:
+        for section in _config_sections(config):
             for field_name, value in serialized[section].items():
                 stored = getattr(getattr(config, section), field_name)
                 if isinstance(stored, tuple):
