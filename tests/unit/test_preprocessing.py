@@ -144,6 +144,31 @@ class TestGroupObservationsFromCsv:
         assert len(valid) == 1
         assert flagged == []
 
+    def test_empty_catalog_returns_no_groups(self, make_inference_csv, group_cols, h5_col):
+        # A header-only catalog is not a hard error at this layer: grouping degrades to two
+        # empty lists (the loud "no work" failure is raised later, in the inference command).
+        key = {
+            "Target": "T",
+            "Session": "S",
+            "Band": "L",
+            "Cadence ID": "0",
+            "Frequency": "1",
+        }
+        csv_path = make_inference_csv("header_only.csv", groups=[(key, [])])
+        valid, flagged = group_observations_from_csv(
+            str(csv_path), group_cols, h5_col, expected_obs=6
+        )
+        assert valid == []
+        assert flagged == []
+
+    def test_headerless_catalog_raises_keyerror(self, tmp_path, group_cols, h5_col):
+        # A catalog with no parseable header (e.g. an empty/truncated file) has none of the
+        # required columns, so grouping fails loudly rather than silently yielding nothing.
+        empty = tmp_path / "headerless.csv"
+        empty.write_text("")
+        with pytest.raises(KeyError, match="missing required column"):
+            group_observations_from_csv(str(empty), group_cols, h5_col)
+
 
 class TestCadenceNpyFilename:
     def test_clean_key_passes_through(self):
@@ -453,6 +478,32 @@ class TestProcessCadenceEndToEnd:
         assert metadata["stored_width"] == config.inference.stamp_width
         assert metadata["downsample_factor_applied"] == 1
 
+    @pytest.mark.parametrize("missing_attr", ["foff", "fch1"])
+    def test_missing_header_attr_raises_keyerror(self, tmp_path, initialized_runtime, missing_attr):
+        """A cadence whose primary ON-source .h5 lacks a required header attr (fch1/foff)
+        fails loudly: _process_cadence reads them unguarded to derive stamp frequencies."""
+        import h5py  # noqa: PLC0415
+
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        # Tamper the primary ON-source file (position 0 in ABACAD), whose header is read.
+        with h5py.File(h5_paths[0], "r+") as hf:
+            del hf["data"].attrs[missing_attr]
+        group = CadenceGroup(
+            key=("T3", "S1", "L", "9", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / f"cad_no_{missing_attr}.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        with pytest.raises(KeyError, match=missing_attr):
+            DataPreprocessor()._process_cadence(group, npy_path)
+
 
 class TestLoadInferenceDataPaths:
     """load_inference_data must branch on the stored width: already-downsampled cadence .npy
@@ -510,6 +561,28 @@ class TestLoadInferenceDataPaths:
 
         with pytest.raises(ValueError, match="No data loaded successfully"):
             DataPreprocessor().load_inference_data(override_filepaths=[str(path)])
+
+    def test_unrecognized_width_skipped_but_valid_file_still_loads(
+        self, tmp_path, initialized_runtime
+    ):
+        # A single .npy at an unsupported stored width is logged and skipped; a valid file in
+        # the same batch must still load, so one malformed file can't sink the whole run.
+        config = self._configure()
+        final_width = config.data.width_bin // config.data.downsample_factor
+        rng = np.random.default_rng(53)
+        bad = rng.chisquare(df=4, size=(2, 6, 16, final_width + 3)).astype(np.float32)
+        good = rng.chisquare(df=4, size=(2, 6, 16, final_width)).astype(np.float32)
+        bad_path = tmp_path / "bad_width.npy"
+        good_path = tmp_path / "good.npy"
+        np.save(bad_path, bad)
+        np.save(good_path, good)
+
+        loaded = DataPreprocessor().load_inference_data(
+            override_filepaths=[str(bad_path), str(good_path)]
+        )
+        assert loaded.shape == (2, 6, 16, final_width)
+        for i in range(2):
+            np.testing.assert_allclose(loaded[i], log_norm(good[i]), rtol=1e-6)
 
     def test_mixed_legacy_and_downsampled_files(self, tmp_path, initialized_runtime):
         config = self._configure()
@@ -638,6 +711,72 @@ class TestSlidingNormalityK2:
 
     def test_empty_when_window_exceeds_width(self):
         assert _sliding_normality_k2(np.zeros((16, 128)), 256, 128).size == 0
+
+
+class TestSlidingNormalityK2AffineInvariance:
+    """k2 is a function of the standardized 3rd/4th moments, so it is invariant under any affine
+    remap x -> a*x + b (a != 0): the skew Z enters squared (sign-flip safe) and the kurtosis Z
+    is even. This location/scale invariance is what PR-07's spline-vs-PFB detection-equivalence
+    argument relies on, so pin it to the same rtol=1e-9 as the scipy-equivalence gates above."""
+
+    WINDOW, STEP = 256, 128
+
+    def _channel(self, seed=101):
+        # Skewed and heavy-tailed enough that k2 is large and finite in every window.
+        return np.random.default_rng(seed).chisquare(4, (16, 4096))
+
+    @pytest.mark.parametrize("shift", [2.5, -100.0, 1e4])
+    def test_additive_shift_leaves_k2_unchanged(self, shift):
+        channel = self._channel()
+        base = _sliding_normality_k2(channel, self.WINDOW, self.STEP)
+        shifted = _sliding_normality_k2(channel + shift, self.WINDOW, self.STEP)
+        np.testing.assert_allclose(shifted, base, rtol=1e-9)
+
+    @pytest.mark.parametrize("scale", [2.0, 0.5, 1e3])
+    def test_positive_scale_leaves_k2_unchanged(self, scale):
+        channel = self._channel()
+        base = _sliding_normality_k2(channel, self.WINDOW, self.STEP)
+        scaled = _sliding_normality_k2(scale * channel, self.WINDOW, self.STEP)
+        np.testing.assert_allclose(scaled, base, rtol=1e-9)
+
+    @pytest.mark.parametrize("scale", [-1.0, -4.0])
+    def test_negative_scale_leaves_k2_unchanged(self, scale):
+        # A sign flip negates the skew statistic Z1, but k2 = Z1**2 + Z2**2 squares it and the
+        # kurtosis Z2 is untouched, so k2 is invariant for a < 0 as well as a > 0.
+        channel = self._channel()
+        base = _sliding_normality_k2(channel, self.WINDOW, self.STEP)
+        flipped = _sliding_normality_k2(scale * channel, self.WINDOW, self.STEP)
+        np.testing.assert_allclose(flipped, base, rtol=1e-9)
+
+    def test_full_affine_matches_scipy_on_transformed_data(self):
+        # Cross-check against scipy on the *transformed* samples, so the invariance is a real
+        # property of the statistic and not a tautology of reusing the same input array.
+        channel = self._channel()
+        a, b = 2.5, -7.0
+        transformed = a * channel + b
+        k2 = _sliding_normality_k2(transformed, self.WINDOW, self.STEP)
+        _, expected = _scipy_window_loop(transformed, self.WINDOW, self.STEP)
+        np.testing.assert_allclose(k2, expected, rtol=1e-9)
+        base = _sliding_normality_k2(channel, self.WINDOW, self.STEP)
+        np.testing.assert_allclose(k2, base, rtol=1e-9)
+
+    def test_hit_set_identical_under_affine(self):
+        # Half-Gaussian (low k2) + half strongly-skewed (high k2) so a mid threshold yields a
+        # proper, non-trivial hit set; the surviving windows must be identical after an affine
+        # remap with either sign of scale.
+        rng = np.random.default_rng(7)
+        gaussian = rng.normal(0.0, 1.0, (16, 2048))
+        skewed = rng.chisquare(2, (16, 2048))
+        channel = np.hstack([gaussian, skewed])
+        threshold = 50.0
+
+        base = _sliding_normality_k2(channel, self.WINDOW, self.STEP)
+        base_hits = set(np.nonzero(base > threshold)[0].tolist())
+        assert 0 < len(base_hits) < int(np.sum(np.isfinite(base)))
+
+        for a, b in ((3.0, 10.0), (-2.0, -5.0)):
+            k2 = _sliding_normality_k2(a * channel + b, self.WINDOW, self.STEP)
+            assert set(np.nonzero(k2 > threshold)[0].tolist()) == base_hits
 
 
 @pytest.mark.slow
