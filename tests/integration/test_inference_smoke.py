@@ -24,6 +24,10 @@ import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.cluster]
 
+# NOTE: this smoke is coupled to a specific dummy model that must exist on the cluster; the
+# skip guard below handles its absence gracefully. Future improvement for a contributor who
+# wants to decouple it: make the tag configurable via an env var (e.g.
+# AETHERSCAN_SMOKE_MODEL_TAG) or a pytest option/marker so the smoke isn't wired to one artifact.
 _MODEL_TAG = "test_v17"  # persisted dummy model on blpc3
 _CSV_NAME = "subset_test.csv"  # 2 complete 6-observation cadences
 

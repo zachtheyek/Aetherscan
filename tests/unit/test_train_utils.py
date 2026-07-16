@@ -91,6 +91,11 @@ class TestGetLatestTag:
 class _PipelineStub:
     """Just enough of TrainingPipeline to drive _calculate_curriculum_snr."""
 
+    # NOTE: this stub intentionally carries only `.config` because _calculate_curriculum_snr
+    # reads nothing else today. If that method ever touches another attribute (e.g.
+    # self.logger), the stub fails with a bare AttributeError rather than a clear message —
+    # extend it (or build a real instance via TrainingPipeline.__new__) at that point.
+
     def __init__(self, config):
         self.config = config
 
