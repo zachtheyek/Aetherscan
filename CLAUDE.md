@@ -52,6 +52,14 @@ ruff lint+format, 100-char lines, Python 3.10 target ([`pyproject.toml`](pyproje
 - Bumping a dependency? Don't jump to the latest — target a proven version per [SECURITY.md](SECURITY.md) (the newer of ~2 minors back / latest stable ≥6 months old; a known advisory on that target overrides the lag). Never cross a documented ceiling (`numpy<2.0`, …) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` in sync.
 - Security: non-critical → GitHub Discussion w/ "security" label; critical → [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack, no public issue. Rotate any leaked token immediately.
 
+## Code review
+
+Every PR gets an automated `claude-code-review` first pass. **Wait for it to land**, then work each note individually — weigh it against your own read of the code, don't take it on faith.
+
+- Genuine gaps → fix in focused, self-contained commits on the **same** PR. Notes you think are wrong → leave the code, argue concretely why.
+- Post **one** reply covering both (what you changed and why, then where you think the review erred and why), and end it by deliberately tagging the assistant handle to trigger a second pass — the sanctioned intentional case of the handle rule above, not a contradiction of it.
+- Loop (wait → validate → address/rebut → comment → re-tag) until the review is clean/LGTM, or it drifts off the PR's theme or turns nonsensical — then post why you're stopping and **don't** tag again.
+
 ## More detail
 
 On-demand deep-dive skill: [`.claude/skills/aetherscan-repo-context/SKILL.md`](.claude/skills/aetherscan-repo-context/SKILL.md) — install paths, config/CLI system, architecture patterns, full workflow & security. Per-surface technical docs (architecture, training, inference, preprocessing, models, database, runtime services, testing, automation, releases) are indexed in [docs/README.md](docs/README.md) — start at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
