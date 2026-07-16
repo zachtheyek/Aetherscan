@@ -1,3 +1,4 @@
+# NOTE: come back to this later (is there a way to run github actions CI on blpc3/bla0? would give access to GPUs instead of CPU-only testing)
 # Unit test suite (pytest)
 name: Tests
 
