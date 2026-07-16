@@ -602,9 +602,20 @@ def group_observations_from_csv(
                 f"Available columns: {available}"
             )
 
-        for row in reader:
+        for row_idx, row in enumerate(reader, start=1):
             key = tuple(row[c] for c in group_by_cols)
-            groups.setdefault(key, []).append(row[h5_path_col])
+            h5_path = row[h5_path_col]
+            # A ragged row (fewer fields than the header) makes csv.DictReader fill the path
+            # with None; an empty/whitespace-only cell is just as unusable. Skip such rows
+            # loudly instead of grouping them under a None/empty path, which would otherwise
+            # only surface much later as a cryptic failure when the .h5 is opened.
+            if h5_path is None or not str(h5_path).strip():
+                logger.warning(
+                    f"CSV {csv_path}: data row {row_idx} (key={key}) has a missing/empty "
+                    f"'{h5_path_col}' value ({h5_path!r}); skipping row"
+                )
+                continue
+            groups.setdefault(key, []).append(h5_path)
 
     valid: list[CadenceGroup] = []
     flagged: list[CadenceGroup] = []
@@ -936,6 +947,27 @@ class DataPreprocessor:
                 raw_data = raw_data[start:end]
 
             logger.info(f"  Raw data shape: {raw_data.shape}")
+
+            # A cadence plate must be 4-D (n, 6, time_bins, width); only the trailing width was
+            # validated historically, so a wrong-rank array would flow into the pool workers and
+            # either fail cryptically or silently mis-index the 6 observations. Skip-and-warn,
+            # matching the unsupported-width skip below, so one malformed file can't sink the run.
+            if raw_data.ndim != 4:
+                logger.error(
+                    f"  {filename} has ndim {raw_data.ndim} (shape {raw_data.shape}), "
+                    f"expected 4 (n, 6, time_bins, width); skipping file"
+                )
+                del raw_data
+                continue
+
+            # Everything downstream casts to float32; a non-float input (e.g. integer power
+            # counts) was previously coerced silently. Surface the coercion loudly — the values
+            # are unchanged, but the dtype change is worth naming so a mis-typed catalog is
+            # visible rather than hidden.
+            if not np.issubdtype(raw_data.dtype, np.floating):
+                logger.warning(
+                    f"  {filename} has non-float dtype {raw_data.dtype}; coercing to float32"
+                )
 
             # Branch on the stored width: already-downsampled stamps (written by
             # _extract_stamps_worker) only need log-norm; legacy full-width files keep the
@@ -1330,6 +1362,19 @@ class DataPreprocessor:
         with h5py.File(primary_h5, "r") as hf:
             header = {k: hf["data"].attrs[k] for k in hf["data"].attrs}
             data_shape = hf["data"].shape
+
+        # Energy detection and stamp extraction index the dataset as [time, polarization,
+        # frequency] (see _energy_detect_channel_worker / _extract_stamps_worker), so a 'data'
+        # dataset that isn't rank-3 would otherwise blow up deep inside a worker with a cryptic
+        # IndexError. Reject it up front with the file path and expected-vs-actual rank; the
+        # caller (process_pending_cadence) turns this ValueError into a logged skip, so the
+        # skip-and-continue policy across a large catalog is preserved.
+        if len(data_shape) != 3:
+            raise ValueError(
+                f"Cadence {group.key}: primary ON-source file {primary_h5} has 'data' of rank "
+                f"{len(data_shape)} (shape {data_shape}), expected rank 3 "
+                f"(time, polarization, frequency)"
+            )
 
         n_chans = int(header.get("nchans", data_shape[-1]))
         foff = float(header["foff"])

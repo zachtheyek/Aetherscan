@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import math
 import os
 
@@ -168,6 +169,43 @@ class TestGroupObservationsFromCsv:
         empty.write_text("")
         with pytest.raises(KeyError, match="missing required column"):
             group_observations_from_csv(str(empty), group_cols, h5_col)
+
+    def test_missing_path_row_skipped_with_warning(self, tmp_path, group_cols, h5_col, caplog):
+        """A row whose h5-path cell is missing (ragged row -> csv.DictReader None) or blank is
+        skipped with a warning and never grouped under a None/empty path, while the rest of the
+        catalog is grouped normally (skip-and-continue)."""
+        import csv as _csv  # noqa: PLC0415
+
+        header = [*group_cols, h5_col]
+        good_vals = [f"good_{i}" for i in range(len(group_cols))]
+        bad_vals = [f"bad_{i}" for i in range(len(group_cols))]
+
+        csv_path = tmp_path / "with_missing_path.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = _csv.writer(f)
+            writer.writerow(header)
+            for i in range(6):  # a complete, valid cadence
+                writer.writerow([*good_vals, f"/data/good_{i}.h5"])
+            writer.writerow([*bad_vals, ""])  # blank h5-path cell
+            writer.writerow(bad_vals)  # ragged row: no h5-path field -> DictReader None
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
+            valid, flagged = group_observations_from_csv(
+                str(csv_path), group_cols, h5_col, expected_obs=6
+            )
+
+        # The valid cadence survives intact; the bad key never entered the grouping at all.
+        assert len(valid) == 1
+        assert valid[0].key == tuple(good_vals)
+        assert valid[0].h5_paths == [f"/data/good_{i}.h5" for i in range(6)]
+        assert tuple(bad_vals) not in {g.key for g in (*valid, *flagged)}
+        # Both malformed rows were warned about.
+        missing_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "missing/empty" in r.getMessage()
+        ]
+        assert len(missing_warnings) == 2
 
 
 class TestCadenceNpyFilename:
@@ -504,6 +542,64 @@ class TestProcessCadenceEndToEnd:
         with pytest.raises(KeyError, match=missing_attr):
             DataPreprocessor()._process_cadence(group, npy_path)
 
+    @staticmethod
+    def _rewrite_primary_rank(h5_path, shape):
+        """Replace the primary file's 'data' with an array of the given (wrong) shape, keeping
+        the original header attrs so only the rank is invalid."""
+        import h5py  # noqa: PLC0415
+
+        with h5py.File(h5_path, "r+") as hf:
+            attrs = dict(hf["data"].attrs)
+            del hf["data"]
+            dset = hf.create_dataset("data", data=np.ones(shape, dtype=np.float32))
+            for k, v in attrs.items():
+                dset.attrs[k] = v
+
+    @pytest.mark.parametrize("bad_shape", [(16, 2048), (16, 1, 2048, 1)])
+    def test_wrong_rank_data_raises_valueerror(self, tmp_path, initialized_runtime, bad_shape):
+        """A primary ON-source .h5 whose 'data' dataset is not rank-3 is rejected up front with a
+        clear ValueError (file path + expected-vs-actual rank), instead of a cryptic IndexError
+        deep inside an energy-detection worker."""
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        self._rewrite_primary_rank(h5_paths[0], bad_shape)
+        group = CadenceGroup(
+            key=("T4", "S1", "L", "10", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cad_bad_rank.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        with pytest.raises(ValueError, match=r"expected rank 3"):
+            DataPreprocessor()._process_cadence(group, npy_path)
+
+    def test_wrong_rank_data_is_skipped_not_fatal(self, tmp_path, initialized_runtime):
+        """process_pending_cadence swallows the rank ValueError into a logged skip (returns
+        None, no .npy written), so one malformed cadence can't abort a large-catalog run."""
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        self._rewrite_primary_rank(h5_paths[0], (16, 2048))
+        group = CadenceGroup(
+            key=("T5", "S1", "L", "11", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cad_bad_rank_skip.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        result = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert result is None
+        assert not os.path.exists(npy_path)
+
 
 class TestLoadInferenceDataPaths:
     """load_inference_data must branch on the stored width: already-downsampled cadence .npy
@@ -573,6 +669,50 @@ class TestLoadInferenceDataPaths:
         bad = rng.chisquare(df=4, size=(2, 6, 16, final_width + 3)).astype(np.float32)
         good = rng.chisquare(df=4, size=(2, 6, 16, final_width)).astype(np.float32)
         bad_path = tmp_path / "bad_width.npy"
+        good_path = tmp_path / "good.npy"
+        np.save(bad_path, bad)
+        np.save(good_path, good)
+
+        loaded = DataPreprocessor().load_inference_data(
+            override_filepaths=[str(bad_path), str(good_path)]
+        )
+        assert loaded.shape == (2, 6, 16, final_width)
+        for i in range(2):
+            np.testing.assert_allclose(loaded[i], log_norm(good[i]), rtol=1e-6)
+
+    def test_non_float_dtype_coerced_with_warning(self, tmp_path, initialized_runtime, caplog):
+        """A non-float cadence plate still loads (values preserved through log-norm) but the
+        previously-silent float32 coercion is surfaced as a warning naming the file and dtype."""
+        config = self._configure()
+        final_width = config.data.width_bin // config.data.downsample_factor
+        rng = np.random.default_rng(61)
+        arr = rng.integers(1, 500, size=(2, 6, 16, final_width)).astype(np.int32)
+        path = tmp_path / "int_counts.npy"
+        np.save(path, arr)
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
+            loaded = DataPreprocessor().load_inference_data(override_filepaths=[str(path)])
+
+        assert loaded.shape == (2, 6, 16, final_width)
+        for i in range(2):
+            np.testing.assert_allclose(loaded[i], log_norm(arr[i].astype(np.float32)), rtol=1e-6)
+        coercion_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "non-float dtype" in r.getMessage()
+        ]
+        assert len(coercion_warnings) == 1
+        assert "int32" in coercion_warnings[0].getMessage()
+
+    def test_wrong_ndim_is_skipped_but_valid_file_still_loads(self, tmp_path, initialized_runtime):
+        """A cadence plate with the wrong rank is logged and skipped (only the trailing width was
+        validated before); a valid file in the same batch still loads (skip-and-continue)."""
+        config = self._configure()
+        final_width = config.data.width_bin // config.data.downsample_factor
+        rng = np.random.default_rng(67)
+        bad = rng.chisquare(df=4, size=(6, 16, final_width)).astype(np.float32)  # 3-D, wrong rank
+        good = rng.chisquare(df=4, size=(2, 6, 16, final_width)).astype(np.float32)
+        bad_path = tmp_path / "wrong_ndim.npy"
         good_path = tmp_path / "good.npy"
         np.save(bad_path, bad)
         np.save(good_path, good)
