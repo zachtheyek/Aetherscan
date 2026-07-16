@@ -119,10 +119,8 @@ utils/                   # fetch_run_outputs.sh, find_optimal_configs.py,
                          # verify_train_test_files.py
 docs/                    # Full technical doc suite, one doc per pipeline surface —
                          # indexed in docs/README.md; start at docs/ARCHITECTURE.md
-tests/                   # Pytest suite: conftest.py (singleton-reset fixtures, synthetic
-                         # data factories), unit/, integration/ (gpu+cluster-marked smokes).
-                         # Default selection: pytest -m "not gpu and not cluster" -q
-                         # (runs in CI via .github/workflows/tests.yml); see CONTRIBUTING.md
+tests/                   # Pytest suite: unit/ (CI surface) + gpu/cluster-marked
+                         # integration/ smokes — see the "Testing" section below
 ```
 
 ---
@@ -161,6 +159,40 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 | Config fields | snake_case  | `per_replica_batch_size` |
 
 **Grep-friendly inline comment markers** (used consistently): `# TODO:` (actionable work), `# NOTE:` (rationale/question), `# FIX:` (known issue, no time now), `# BUG:` (known bug, often with workaround), `# TEST:` (behavior to verify — now backed by the `tests/` suite). Prefer `# NOTE:` over `# TODO:` when there's no obvious action.
+
+---
+
+## Testing
+
+The `tests/` suite splits along a hardware axis:
+
+- **`tests/unit/`** — fast, hardware-independent, one `test_<module>.py` per source module. This is the CI surface; everything here must pass on a CPU-only runner.
+- **`tests/integration/`** — `gpu`/`cluster`-marked end-to-end smokes (`test_train_smoke.py`, `test_inference_smoke.py`) that launch `python -m aetherscan.main ...` as a real subprocess on a cluster, against cluster-resident data/models. Not run in CI.
+
+**Default selection — exactly what CI runs** (`.github/workflows/tests.yml`, on Python 3.10 and 3.12), no GPUs or cluster data needed:
+
+```bash
+pytest -m "not gpu and not cluster" -q
+```
+
+`pyproject.toml`'s `[tool.pytest.ini_options]` sets `pythonpath = ["src"]`, so **pytest needs no `PYTHONPATH=src` prefix** (unlike running `main.py` from source); it also sets `testpaths = ["tests"]` and `--strict-markers` (a typo'd marker is a collection error, not a silently-ignored one).
+
+**Markers** (declared in `pyproject.toml`; `--strict-markers` rejects undeclared ones):
+
+| Marker        | Meaning                                          | In default selection?   |
+| ------------- | ------------------------------------------------ | ----------------------- |
+| `slow`        | Slower CPU tests (e.g. builds real TF graphs)    | **Yes** — CI runs them  |
+| `gpu`         | Needs one or more physical GPUs                  | No                      |
+| `cluster`     | Needs cluster-resident data/models (blpc3/bla0)  | No                      |
+| `integration` | End-to-end subprocess runs; **skips isolation**  | No (also `gpu`+`cluster`) |
+
+**Isolation.** The autouse `aetherscan_isolated_env` fixture in `tests/conftest.py` wraps every non-integration test: it points `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` at a fresh `tmp_path` tree, deletes `SLACK_BOT_TOKEN`/`SLACK_CHANNEL` (tests must never talk to Slack), resets all five singletons (`Config`, `Database`, `Logger`, `ResourceManager`, `ResourceMonitor`) via their `_reset()` hooks, then on teardown stops any leaked background threads/pools and restores the snapshotted SIGINT/SIGTERM handlers and stdout/stderr. Net effect: tests never touch real data and can't leak state into one another. Integration tests are exempt — they inherit the real environment and run the pipeline as a subprocess.
+
+**Discipline.** Run the suite (or the subset you can) before claiming a change works, and **ship unit tests with new logic** — every behavior change should land tests under `tests/unit/` in the matching `test_<module>.py` (create it if the module is new).
+
+**Gotcha.** Most unit modules import TensorFlow at collection time, so a bare `pytest` needs the full dependency stack (CI installs `tensorflow-cpu==2.17.*` plus the container requirements). If that stack isn't available locally, run the TF-free subset you can — e.g. `pytest tests/unit/test_config.py -q` — and **say exactly what you ran** rather than claiming the whole suite passed.
+
+Deep dive: `docs/TESTING.md` covers the full layout, the synthetic data factories, the coverage-and-deliberate-gaps notes (`monitor` / `logger` / `slack_handler`), CI specifics, how to run the cluster smokes, and the adding-tests checklist.
 
 ---
 
