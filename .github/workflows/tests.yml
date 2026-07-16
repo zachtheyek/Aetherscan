@@ -1,0 +1,58 @@
+# NOTE: come back to this later (is there a way to run github actions CI on blpc3/bla0? would give access to GPUs instead of CPU-only testing)
+# Unit test suite (pytest)
+name: Tests
+
+# Run on every PR and on pushes to master
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      # Let both Python versions report rather than cancelling the sibling on first failure
+      fail-fast: false
+      matrix:
+        # The two supported runtimes: conda env (3.10) and NGC container (3.12)
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      # Pull repo contents into GitHub Actions runner
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # Install the matrix Python version, with built-in pip caching keyed on the
+      # dependency pins (invalidates when requirements-container.txt changes)
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          # Include the workflow itself so the inline pins below also invalidate the cache
+          cache-dependency-path: |
+            requirements-container.txt
+            .github/workflows/tests.yml
+
+      # Mirror the NGC container's dependency surface on a CPU-only runner:
+      # tensorflow-cpu stands in for the container's GPU TF 2.17 build, the pinned
+      # extras come from requirements-container.txt, and h5py/hdf5plugin/pandas/
+      # psutil/pytest are installed explicitly because the NGC base image ships
+      # them (so the requirements file intentionally omits them; hdf5plugin is
+      # pinned explicitly in environment.yml too — don't rely on setigen pulling
+      # it transitively)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
+
+      # GPU- and cluster-marked tests need physical GPUs / cluster-resident data;
+      # everything else (including slow CPU TF graph tests) runs here
+      - name: Run test suite
+        run: pytest -m "not gpu and not cluster" -q

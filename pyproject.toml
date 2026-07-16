@@ -55,6 +55,19 @@ Issues = "https://github.com/zachtheyek/Aetherscan/issues"
 [project.optional-dependencies]
 dev = ["ruff"]  # Python linter
 
+[tool.pytest.ini_options]
+# Make `import aetherscan` work without a PYTHONPATH=src prefix
+pythonpath = ["src"]
+testpaths = ["tests"]
+# Reject undeclared markers so a typo'd @pytest.mark.gpu can't silently slip into CI
+addopts = "--strict-markers"
+markers = [
+    "slow: slower tests (e.g. builds TF graphs on CPU); included in the default CI selection",
+    "gpu: requires one or more physical GPUs; excluded from CI",
+    "cluster: requires cluster-resident data/models (blpc3/bla0); excluded from CI",
+    "integration: end-to-end pipeline runs; skips the per-test singleton/env isolation fixture in `conftest.py`",
+]
+
 [tool.ruff]
 # Configure linter
 target-version = "py310"   # Target Python version

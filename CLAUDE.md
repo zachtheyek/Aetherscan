@@ -4,7 +4,7 @@ Always-on, bare-essentials rules for any coding agent in this repo. The full dee
 
 ## Project
 
-Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Beta-VAE → Random Forest), single-node multi-GPU distributed train/inference. Sole entry point: `src/aetherscan/main.py`. `tests/` is a placeholder — **no test suite yet**, so don't claim `pytest` passes; verify changes another way and say how.
+Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Beta-VAE → Random Forest), single-node multi-GPU distributed train/inference. Sole entry point: `src/aetherscan/main.py`.
 
 ## Run / lint
 
@@ -16,6 +16,20 @@ PYTHONPATH=src python -m aetherscan.main {train|inference} --save-tag final_v1
 # Lint + format (also enforced via pre-commit)
 ruff check src/ && ruff format src/
 ```
+
+## Testing
+
+Pytest suite in `tests/`: unit (the CI surface) + `gpu`/`cluster`-marked integration smokes. Layout, fixtures, and markers are in [CONTRIBUTING.md](CONTRIBUTING.md#testing).
+
+```bash
+# Default selection = what CI runs (no GPUs / cluster data needed):
+pytest -m "not gpu and not cluster" -q
+# gpu/cluster integration smokes — need a cluster (data + a persisted model under /datax) and the NGC container:
+./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
+```
+
+- **Run the suite before claiming a change works**, and **ship unit tests with new logic**.
+- Most test modules import TensorFlow at collection — if the full dependency stack isn't available locally, run the subset you can and say exactly what you ran.
 
 ## Hard rules (don't break these)
 

@@ -1,0 +1,327 @@
+# NOTE: come back to this later
+
+"""Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
+schedules, directory archiving, encoder-trained heuristics, and SHAP output normalization."""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pytest
+
+from aetherscan.config import get_config
+from aetherscan.train import (
+    TrainingPipeline,
+    _select_positive_class_shap,
+    archive_directory,
+    check_encoder_trained,
+    compute_expected_std,
+    get_latest_tag,
+)
+
+
+def _touch_pair(checkpoints_dir, tag):
+    """Create a matching encoder/decoder checkpoint pair for `tag`."""
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    for prefix in ("vae_encoder", "vae_decoder"):
+        with open(os.path.join(checkpoints_dir, f"{prefix}_{tag}.keras"), "w") as f:
+            f.write("stub")
+
+
+class TestGetLatestTag:
+    def test_priority_ladder(self, tmp_path):
+        d = str(tmp_path / "ckpt")
+        for tag in ("test_v3", "20240101_000000", "round_02", "final_v1"):
+            _touch_pair(d, tag)
+        assert get_latest_tag(d) == "final_v1"
+
+    def test_round_beats_timestamp_and_test(self, tmp_path):
+        d = str(tmp_path / "ckpt")
+        for tag in ("test_v9", "20991231_235959", "round_02", "round_10"):
+            _touch_pair(d, tag)
+        # Numeric compare, not lexicographic: round_10 > round_02.
+        assert get_latest_tag(d) == "round_10"
+
+    def test_timestamp_beats_test(self, tmp_path):
+        d = str(tmp_path / "ckpt")
+        for tag in ("test_v9", "20240101_000000", "20250101_000000"):
+            _touch_pair(d, tag)
+        assert get_latest_tag(d) == "20250101_000000"
+
+    def test_test_tags_ranked_by_version(self, tmp_path):
+        d = str(tmp_path / "ckpt")
+        for tag in ("test_v2", "test_v17", "test_v9"):
+            _touch_pair(d, tag)
+        assert get_latest_tag(d) == "test_v17"
+
+    def test_final_ranked_by_version(self, tmp_path):
+        d = str(tmp_path / "ckpt")
+        for tag in ("final_v1", "final_v12", "final_v3"):
+            _touch_pair(d, tag)
+        assert get_latest_tag(d) == "final_v12"
+
+    def test_encoder_without_decoder_ignored(self, tmp_path):
+        d = str(tmp_path / "ckpt")
+        _touch_pair(d, "round_01")
+        # Higher-priority final_v2 lacks its decoder — must not win.
+        with open(os.path.join(d, "vae_encoder_final_v2.keras"), "w") as f:
+            f.write("stub")
+        assert get_latest_tag(d) == "round_01"
+
+    def test_missing_directory_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="doesn't exist"):
+            get_latest_tag(str(tmp_path / "nope"))
+
+    def test_empty_directory_raises(self, tmp_path):
+        d = tmp_path / "empty"
+        d.mkdir()
+        with pytest.raises(FileNotFoundError, match="No encoder files"):
+            get_latest_tag(str(d))
+
+    def test_no_complete_pair_raises(self, tmp_path):
+        d = tmp_path / "orphans"
+        d.mkdir()
+        with open(d / "vae_encoder_round_01.keras", "w") as f:
+            f.write("stub")
+        with pytest.raises(FileNotFoundError, match="No valid model pairs"):
+            get_latest_tag(str(d))
+
+
+class _PipelineStub:
+    """Just enough of TrainingPipeline to drive _calculate_curriculum_snr."""
+
+    # NOTE: this stub intentionally carries only `.config` because _calculate_curriculum_snr
+    # reads nothing else today. If that method ever touches another attribute (e.g.
+    # self.logger), the stub fails with a bare AttributeError rather than a clear message —
+    # extend it (or build a real instance via TrainingPipeline.__new__) at that point.
+
+    def __init__(self, config):
+        self.config = config
+
+
+def _curriculum(round_idx):
+    return TrainingPipeline._calculate_curriculum_snr(_PipelineStub(get_config()), round_idx)
+
+
+class TestCalculateCurriculumSnr:
+    @pytest.fixture(autouse=True)
+    def _setup_config(self):
+        config = get_config()
+        config.training.num_training_rounds = 5
+        config.training.snr_base = 10
+        config.training.initial_snr_range = 40
+        config.training.final_snr_range = 10
+
+    def test_linear_endpoints_and_monotonicity(self):
+        get_config().training.curriculum_schedule = "linear"
+        ranges = [_curriculum(i)[1] for i in range(5)]
+        assert ranges[0] == 40
+        assert ranges[-1] == 10
+        assert all(a >= b for a, b in zip(ranges, ranges[1:], strict=False))
+        assert all(base == 10 for base, _ in (_curriculum(i) for i in range(5)))
+
+    def test_linear_midpoint(self):
+        get_config().training.curriculum_schedule = "linear"
+        # progress = 2/4 = 0.5 -> 40 - 0.5 * 30 = 25
+        assert _curriculum(2)[1] == 25
+
+    def test_exponential_endpoints_exact(self):
+        config = get_config()
+        config.training.curriculum_schedule = "exponential"
+        config.training.exponential_decay_rate = -3.0
+        assert _curriculum(0)[1] == 40
+        assert _curriculum(4)[1] == 10
+
+    def test_exponential_decays_faster_than_linear(self):
+        config = get_config()
+        config.training.curriculum_schedule = "exponential"
+        config.training.exponential_decay_rate = -3.0
+        ranges = [_curriculum(i)[1] for i in range(5)]
+        assert all(a >= b for a, b in zip(ranges, ranges[1:], strict=False))
+        # Exponential front-loads the difficulty ramp: below linear at the midpoint.
+        assert ranges[2] < 25
+
+    def test_exponential_rejects_nonnegative_decay_rate(self):
+        config = get_config()
+        config.training.curriculum_schedule = "exponential"
+        config.training.exponential_decay_rate = 0.5
+        with pytest.raises(ValueError, match="must be < 0"):
+            _curriculum(1)
+
+    def test_step_schedule(self):
+        config = get_config()
+        config.training.curriculum_schedule = "step"
+        config.training.step_easy_rounds = 2
+        config.training.step_hard_rounds = 3
+        assert [_curriculum(i)[1] for i in range(5)] == [40, 40, 10, 10, 10]
+
+    def test_step_schedule_rejects_bad_sum(self):
+        config = get_config()
+        config.training.curriculum_schedule = "step"
+        config.training.step_easy_rounds = 2
+        config.training.step_hard_rounds = 2  # 2 + 2 != 5
+        with pytest.raises(ValueError, match="must equal total_rounds"):
+            _curriculum(0)
+
+    def test_single_round_returns_initial_range(self):
+        config = get_config()
+        config.training.num_training_rounds = 1
+        config.training.curriculum_schedule = "linear"
+        assert _curriculum(0) == (10, 40)
+
+    def test_unknown_schedule_raises(self):
+        get_config().training.curriculum_schedule = "sigmoid"
+        with pytest.raises(ValueError, match="invalid"):
+            _curriculum(0)
+
+
+class TestArchiveDirectory:
+    def test_empty_directory_is_noop(self, tmp_path):
+        base = tmp_path / "plots"
+        archive_directory(str(base))
+        assert base.exists()
+        assert list(base.iterdir()) == []
+
+    def test_fresh_run_moves_files_to_archive(self, tmp_path):
+        base = tmp_path / "plots"
+        base.mkdir()
+        (base / "a.png").write_text("a")
+        (base / "b.png").write_text("b")
+        (base / "subdir").mkdir()  # not in target_dirs -> untouched
+
+        archive_directory(str(base), round_num=1)
+
+        remaining = {p.name for p in base.iterdir()}
+        assert remaining == {"archive", "subdir"}
+        archived = list((base / "archive").iterdir())
+        assert len(archived) == 1  # one timestamped snapshot
+        assert {p.name for p in archived[0].iterdir()} == {"a.png", "b.png"}
+
+    def test_resume_copies_then_deletes_rounds_geq(self, tmp_path):
+        base = tmp_path / "checkpoints"
+        base.mkdir()
+        for tag in ("round_01", "round_02", "round_03"):
+            (base / f"vae_encoder_{tag}.keras").write_text("stub")
+        (base / "notes.txt").write_text("keep me")
+
+        archive_directory(str(base), round_num=2)
+
+        remaining = {p.name for p in base.iterdir()}
+        # Rounds >= 2 deleted; round_01 and non-round files kept.
+        assert remaining == {"archive", "vae_encoder_round_01.keras", "notes.txt"}
+        # Everything (including the later-deleted files) was backed up first.
+        snapshot = next((base / "archive").iterdir())
+        assert {p.name for p in snapshot.iterdir()} == {
+            "vae_encoder_round_01.keras",
+            "vae_encoder_round_02.keras",
+            "vae_encoder_round_03.keras",
+            "notes.txt",
+        }
+
+    def test_target_dirs_moved_and_recreated_empty(self, tmp_path):
+        base = tmp_path / "tb"
+        (base / "train").mkdir(parents=True)
+        (base / "train" / "events.1").write_text("x")
+        (base / "validation").mkdir()
+
+        archive_directory(str(base), target_dirs=["train"], round_num=1)
+
+        assert (base / "train").exists()
+        assert list((base / "train").iterdir()) == []  # replaced with an empty dir
+        assert (base / "validation").exists()  # not a target -> untouched
+        snapshot = next((base / "archive").iterdir())
+        assert (snapshot / "train" / "events.1").exists()
+
+
+class TestEncoderTrainedHeuristics:
+    @staticmethod
+    def _dense_model(initializer, units=256, input_dim=256):
+        import tensorflow as tf  # noqa: PLC0415
+
+        model = tf.keras.Sequential(
+            [
+                tf.keras.layers.Input(shape=(input_dim,)),
+                tf.keras.layers.Dense(units, kernel_initializer=initializer),
+            ]
+        )
+        return model
+
+    def test_expected_std_he_normal(self):
+        from tensorflow.keras.initializers import HeNormal  # noqa: PLC0415
+
+        model = self._dense_model(HeNormal(seed=0), units=4, input_dim=8)
+        expected = compute_expected_std(model.layers[-1])
+        assert expected == pytest.approx(np.sqrt(2.0 / 8))
+
+    def test_expected_std_glorot_normal(self):
+        from tensorflow.keras.initializers import GlorotNormal  # noqa: PLC0415
+
+        model = self._dense_model(GlorotNormal(seed=0), units=4, input_dim=8)
+        expected = compute_expected_std(model.layers[-1])
+        assert expected == pytest.approx(np.sqrt(2.0 / (8 + 4)))
+
+    def test_expected_std_unknown_initializer_returns_none(self):
+        model = self._dense_model("glorot_uniform", units=4, input_dim=8)
+        assert compute_expected_std(model.layers[-1]) is None
+
+    def test_fresh_encoder_reports_untrained(self):
+        from tensorflow.keras.initializers import HeNormal  # noqa: PLC0415
+
+        # 256x256 kernel: sampling noise on the std is ~0.3%, far under the 20% threshold.
+        model = self._dense_model(HeNormal(seed=0))
+        assert check_encoder_trained(model) is False
+
+    def test_scaled_weights_report_trained(self):
+        from tensorflow.keras.initializers import HeNormal  # noqa: PLC0415
+
+        model = self._dense_model(HeNormal(seed=0))
+        layer = model.layers[-1]
+        kernel, bias = layer.get_weights()
+        layer.set_weights([kernel * 3.0, bias])  # 200% deviation from expected std
+        assert check_encoder_trained(model) is True
+
+
+class TestSelectPositiveClassShap:
+    N, F = 5, 8
+
+    def test_list_of_class_arrays_selects_positive(self):
+        neg = np.zeros((self.N, self.F))
+        pos = np.ones((self.N, self.F))
+        result = _select_positive_class_shap([neg, pos])
+        np.testing.assert_array_equal(result, pos)
+
+    def test_trailing_class_axis_values(self):
+        values = np.stack(
+            [np.zeros((self.N, self.F)), np.ones((self.N, self.F))], axis=-1
+        )  # (N, F, 2)
+        result = _select_positive_class_shap(values)
+        assert result.shape == (self.N, self.F)
+        assert np.all(result == 1.0)
+
+    def test_trailing_class_axis_interactions(self):
+        values = np.stack(
+            [np.zeros((self.N, self.F, self.F)), np.ones((self.N, self.F, self.F))], axis=-1
+        )  # (N, F, F, 2)
+        result = _select_positive_class_shap(values)
+        assert result.shape == (self.N, self.F, self.F)
+        assert np.all(result == 1.0)
+
+    def test_single_output_passthrough(self):
+        values = np.arange(self.N * self.F, dtype=float).reshape(self.N, self.F)
+        np.testing.assert_array_equal(_select_positive_class_shap(values), values)
+
+    def test_log_loss_list_selects_first(self):
+        first = np.ones((self.N, self.F))
+        result = _select_positive_class_shap([first, np.zeros((self.N, self.F))], log_loss=True)
+        np.testing.assert_array_equal(result, first)
+
+    def test_log_loss_trailing_class_axis(self):
+        values = np.stack([np.zeros((self.N, self.F)), np.ones((self.N, self.F))], axis=-1)
+        result = _select_positive_class_shap(values, log_loss=True)
+        assert result.shape == (self.N, self.F)
+        assert np.all(result == 1.0)
+
+    def test_log_loss_passthrough(self):
+        values = np.arange(self.N * self.F, dtype=float).reshape(self.N, self.F)
+        np.testing.assert_array_equal(_select_positive_class_shap(values, log_loss=True), values)
