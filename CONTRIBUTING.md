@@ -101,13 +101,13 @@ gpg --full-generate-key
 
 Recommended answers at the prompts:
 
-| Prompt     | Choose                                                            |
-| ---------- | ---------------------------------------------------------------- |
-| Key type   | `(9) ECC (sign and encrypt)` → `(1) Curve 25519` (or RSA 4096)   |
+| Prompt     | Choose                                                                 |
+| ---------- | ---------------------------------------------------------------------- |
+| Key type   | `(9) ECC (sign and encrypt)` → `(1) Curve 25519` (or RSA 4096)         |
 | Expiry     | Your call — `0` for no expiry, or e.g. `2y` and renew before it lapses |
-| Real name  | Your name                                                        |
-| Email      | An address that is **verified on your GitHub account**           |
-| Passphrase | A strong passphrase (cached by `gpg-agent` / your OS keychain)   |
+| Real name  | Your name                                                              |
+| Email      | An address that is **verified on your GitHub account**                 |
+| Passphrase | A strong passphrase (cached by `gpg-agent` / your OS keychain)         |
 
 ed25519 (Curve 25519) keys are smaller and faster; RSA 4096 is the conservative choice if you need maximum tooling compatibility. GitHub accepts either.
 
@@ -532,11 +532,11 @@ pytest tests/unit/test_db.py::TestFlushSentinel -q
 
 ### Markers
 
-| Marker        | Meaning                                                                                     |
-| ------------- | ------------------------------------------------------------------------------------------- |
-| `slow`        | Slower tests (e.g. builds TF graphs on CPU); still included in the default CI selection      |
-| `gpu`         | Requires one or more physical GPUs; excluded from CI                                         |
-| `cluster`     | Requires cluster-resident data/models (blpc3/bla0); excluded from CI                         |
+| Marker        | Meaning                                                                                       |
+| ------------- | --------------------------------------------------------------------------------------------- |
+| `slow`        | Slower tests (e.g. builds TF graphs on CPU); included in the default CI selection             |
+| `gpu`         | Requires one or more physical GPUs; excluded from CI                                          |
+| `cluster`     | Requires cluster-resident data/models (blpc3/bla0); excluded from CI                          |
 | `integration` | End-to-end pipeline runs; skips the per-test singleton/env isolation fixture in `conftest.py` |
 
 ### Test environment & fixtures

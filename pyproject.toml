@@ -63,9 +63,9 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
     "slow: slower tests (e.g. builds TF graphs on CPU); included in the default CI selection",
-    "gpu: requires one or more physical GPUs; excluded from CI (-m 'not gpu and not cluster')",
+    "gpu: requires one or more physical GPUs; excluded from CI",
     "cluster: requires cluster-resident data/models (blpc3/bla0); excluded from CI",
-    "integration: end-to-end pipeline runs (skips the per-test singleton/env isolation fixture)",
+    "integration: end-to-end pipeline runs; skips the per-test singleton/env isolation fixture in `conftest.py`",
 ]
 
 [tool.ruff]
