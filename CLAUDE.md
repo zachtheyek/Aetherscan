@@ -24,6 +24,8 @@ Pytest suite in `tests/`: unit (the CI surface) + `gpu`/`cluster`-marked integra
 ```bash
 # Default selection = what CI runs (no GPUs / cluster data needed):
 pytest -m "not gpu and not cluster" -q
+# gpu/cluster integration smokes — need a cluster (data + a persisted model under /datax) and the NGC container:
+./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
 ```
 
 - **Run the suite before claiming a change works**, and **ship unit tests with new logic**.
