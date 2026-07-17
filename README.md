@@ -566,9 +566,9 @@ options:
                         disk memmap; must be >= 1)
   --round-data-dir ROUND_DATA_DIR
                         Directory for disk-backed per-round training datasets
-                        (defaults to <output-path>/round_data; needs ~2.2x one
-                        round's size free when data-generation overlap is
-                        enabled, ~1.1x otherwise)
+                        (defaults to <data-path>/training/round_data; needs
+                        ~2.2x one round's size free when data-generation
+                        overlap is enabled, ~1.1x otherwise)
   --overlap-data-generation, --no-overlap-data-generation
                         Generate round k+1's training data in a background
                         producer process while round k trains (default:

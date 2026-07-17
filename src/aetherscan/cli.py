@@ -431,7 +431,7 @@ def _add_train_flags_to(parser):
         "--round-data-dir",
         type=str,
         default=None,
-        help="Directory for disk-backed per-round training datasets (defaults to <output-path>/round_data; needs ~2.2x one round's size free when data-generation overlap is enabled, ~1.1x otherwise)",
+        help="Directory for disk-backed per-round training datasets (defaults to <data-path>/training/round_data; needs ~2.2x one round's size free when data-generation overlap is enabled, ~1.1x otherwise)",
     )
     parser.add_argument(
         "--overlap-data-generation",
@@ -1331,10 +1331,11 @@ def collect_validation_errors(
         nob = _resolve(args, "num_observations", config.data.num_observations)
         tb = _resolve(args, "time_bins", config.data.time_bins)
         overlap = _resolve(args, "overlap_data_generation", config.training.overlap_data_generation)
-        output_path = _resolve(args, "output_path", config.output_path)
         round_data_dir = _resolve(args, "round_data_dir", config.training.round_data_dir)
         if round_data_dir is None:
-            round_data_dir = os.path.join(output_path, "round_data")
+            # data_path was resolved in the Data block above; round data are generated
+            # training data, so they live under the training-data root
+            round_data_dir = config.get_training_file_path("round_data", data_path)
         if all(v is not None for v in (nsb, nob, tb, wb)) and df:
             round_nbytes = _estimate_round_data_nbytes(nsb, nob, tb, wb // df)
             required_factor = 2.2 if overlap else 1.1

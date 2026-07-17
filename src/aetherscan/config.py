@@ -186,7 +186,7 @@ class TrainingConfig:
     data_gen_task_size: int = 256  # Cadences per batched worker task (workers write results straight into the round memmap)
 
     # Round data pipeline params (disk-backed per-round datasets, see round_data.py)
-    round_data_dir: str | None = None  # Defaults to <output_path>/round_data at runtime
+    round_data_dir: str | None = None  # Defaults to get_training_file_path("round_data") at runtime
     overlap_data_generation: bool = (
         True  # Generate round k+1's data in a background process while round k trains
     )

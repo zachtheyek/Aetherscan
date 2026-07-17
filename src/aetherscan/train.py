@@ -908,8 +908,8 @@ class TrainingPipeline:
         # Disk-backed round-data directory for this tag: delete round dirs >= start_round,
         # keep earlier ones only if their .done manifest validates (round-data mirror of the
         # checkpoint archiving above, minus the archiving — a round is ~295 GB)
-        round_data_root = self.config.training.round_data_dir or os.path.join(
-            self.config.output_path, "round_data"
+        round_data_root = self.config.training.round_data_dir or self.config.get_training_file_path(
+            "round_data"
         )
         self._round_data_base_dir = os.path.join(round_data_root, self.config.checkpoint.save_tag)
         prepare_round_data_dir(self._round_data_base_dir, start_round)
