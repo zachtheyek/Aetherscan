@@ -87,6 +87,25 @@ function level (`test_inference.py`, `test_main.py`, `test_inference_viz.py`), w
 end-to-end behavior covered by `test_inference_smoke.py` — there is no unit-level end-to-end
 inference test by nature.
 
+A few narrower gaps in the training-data pipeline were identified during that PR's
+verification pass and left as low-risk follow-ups (each is safe by construction or covered
+indirectly today; a direct test would only harden against future refactors):
+
+- **`_distributed_encode`'s step-count drift guard** (`train.py`) has no direct unit test. It
+  fires loudly (`RuntimeError`) when the caller's `train_steps × accumulation_steps` disagrees
+  with what `prepare_distributed_train_dataset` will yield; the alignment it protects *is*
+  pinned by `test_train_datasets.py`, but the guard itself is only reached via the full encode
+  path. A CPU-strategy test that drives a deliberately mismatched geometry would pin it.
+- **Per-task RNG determinism** in `data_generation._run_memmap_task` — that the same
+  `(task, seed)` produces byte-identical output regardless of worker scheduling or prior global
+  RNG state — is relied on but not asserted anywhere. A small same-seed-twice equality test
+  would catch a future refactor that drops the per-task reseed or adds in-process threads.
+- **Round-data manifest corruption cases**: `test_round_data.py` covers missing/mismatched
+  manifests, shape mismatch, and whole-array value corruption, but truncation and array-swap
+  are only caught *implicitly* (via the broad `except` and the sampled checksum). The checksum
+  is a probabilistic smoke test by design (see `round_data._array_checksum`), so these aren't
+  integrity guarantees; a truncation test would at least pin the current behavior.
+
 ## Markers
 
 | Marker | Meaning | In default selection? |
