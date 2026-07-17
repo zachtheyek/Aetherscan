@@ -1433,9 +1433,9 @@ class DataPreprocessor:
         boundary, so no blocks, block-sized shared memory, or per-stage pools exist anymore.
         """
         coarse_channel_width = self.config.inference.coarse_channel_width
-        # parallel_coarse_chans is a progress-logging chunk size only (None -> n_processes);
+        # coarse_channel_log_interval is a progress-logging chunk size only (None -> n_processes);
         # actual parallelism is the persistent pool's worker count.
-        parallel_chans = self.config.inference.parallel_coarse_chans
+        log_interval = self.config.inference.coarse_channel_log_interval
         window_size = self.config.inference.detection_window_size
         step_size = self.config.inference.detection_step_size
         stat_threshold = self.config.inference.stat_threshold
@@ -1446,7 +1446,7 @@ class DataPreprocessor:
         downsample_factor = self.config.data.downsample_factor if store_downsampled else 1
         time_bins = self.config.data.time_bins
         n_processes = self.config.manager.n_processes
-        progress_chunk = max(1, parallel_chans if parallel_chans is not None else n_processes)
+        progress_chunk = max(1, log_interval if log_interval is not None else n_processes)
 
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
@@ -1483,9 +1483,9 @@ class DataPreprocessor:
             return None
 
         # NOTE: every complete coarse channel is processed. The historical block-based path
-        # floored to a multiple of parallel_coarse_chans, silently dropping up to
-        # parallel_coarse_chans - 1 trailing coarse channels when n_chans wasn't an exact
-        # multiple of a block.
+        # floored to a multiple of the old parallel_coarse_chans knob, silently dropping up to
+        # that many - 1 trailing coarse channels when n_chans wasn't an exact multiple of a
+        # block. (That knob is now coarse_channel_log_interval and only affects log cadence.)
         n_coarse_total = n_chans // coarse_channel_width
         if n_coarse_total == 0:
             logger.warning(

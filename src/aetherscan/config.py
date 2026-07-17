@@ -321,7 +321,7 @@ class InferenceConfig:
     # Progress-logging chunk size for energy detection (coarse channels per log line).
     # None -> use manager.n_processes. Parallelism itself comes from the persistent worker
     # pool (one fused task per coarse channel), not from this knob.
-    parallel_coarse_chans: int | None = None
+    coarse_channel_log_interval: int | None = None
     # Bandpass flattening method for energy detection: "pfb" divides each coarse channel by
     # the instrument's static polyphase-filterbank response (computed once per run); "spline"
     # fits and subtracts a spline per coarse channel per file (the historical, data-driven
@@ -650,7 +650,7 @@ class Config:
                 "cadence_h5_path_col": self.inference.cadence_h5_path_col,
                 "cadence_expected_obs": self.inference.cadence_expected_obs,
                 "coarse_channel_width": self.inference.coarse_channel_width,
-                "parallel_coarse_chans": self.inference.parallel_coarse_chans,
+                "coarse_channel_log_interval": self.inference.coarse_channel_log_interval,
                 "bandpass_method": self.inference.bandpass_method,
                 "pfb_taps_per_channel": self.inference.pfb_taps_per_channel,
                 "bandpass_debug_plot": self.inference.bandpass_debug_plot,
