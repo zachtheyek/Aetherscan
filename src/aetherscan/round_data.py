@@ -99,6 +99,15 @@ def _array_checksum(arr: np.ndarray) -> dict:
     Cheap, sha-less checksum for a (possibly huge) memmap: total element count plus a few
     deterministically-sampled flat-index values. Positions are derived from the element count,
     so validation re-samples the same spots without storing an RNG state.
+
+    NOTE: this is a smoke test, not integrity protection. It reliably catches truncation and
+    gross corruption (wrong element count, shape, swapped arrays), but sub-threshold damage
+    slips through: a randomly corrupted fraction f of one array is only detected with
+    probability 1-(1-f)^_MANIFEST_SAMPLE_COUNT (e.g. a single lost page in a ~90 GB array is
+    ~never sampled). That is acceptable because a crash leaves NO manifest at all (the dir is
+    then treated as garbage and regenerated), so the checksum only guards against same-run
+    disk/NFS corruption between writing .done and reading it back — not power-loss/torn-page
+    scenarios. If stronger guarantees are ever needed, upgrade to a full content hash.
     """
     # NOTE: reshape(-1) is a zero-copy view here (and in validate_done_manifest) because
     # open_memmap/np.save arrays are always C-contiguous; on a non-contiguous array it would
@@ -168,6 +177,15 @@ def validate_done_manifest(
     Validate a round dir's .done manifest against the arrays on disk. Returns the manifest
     dict when everything checks out (round index, optional expected sample count, per-array
     existence, shape, element count, and the sampled checksum values), else None.
+
+    NOTE: validation does NOT compare the manifest's snr_base/snr_range against what the caller
+    wants — it only proves the arrays match the manifest that was written with them. Reusing a
+    validated round dir is safe TODAY only because _setup_directories deletes every round dir
+    >= start_round before generation begins, so a reused dir is always one written earlier in
+    THIS run's curriculum. If cross-run round reuse is ever added (the obvious ~295 GB-saving
+    optimization), a dir generated under a different SNR curriculum would validate and be
+    silently trained on — add an expected_snr guard here (and at the _producer_main reuse
+    short-circuit) before relaxing the delete-on-startup policy.
     """
     try:
         if not os.path.isfile(paths.done_path):

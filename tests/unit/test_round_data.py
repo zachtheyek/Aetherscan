@@ -568,7 +568,14 @@ class TestRoundDataProducerSpawnEndToEnd:
     memory — exercises the spawn pickling boundary, the child's import chain, its pool
     creation, and the stats/done/shutdown protocol for real. Both cluster-smoke failures
     this PR hit (a fork-inherited deadlocked lock; a fork-context SemLock crossing the
-    spawn boundary) were only reachable through a real child process."""
+    spawn boundary) were only reachable through a real child process.
+
+    COVERAGE LIMIT: this validates that spawn WORKS, not the rationale for choosing it. The
+    original fork deadlock needs a thread-laden TF/NCCL parent, which pytest does not have —
+    so a revert to a fork start method would still PASS here (verified: the e2e body passes
+    with _MP_CONTEXT patched to fork in an idle parent). The only guard against re-introducing
+    the fork deadlock is a cluster smoke; gate any change to _MP_CONTEXT / the start method on
+    one. The SemLock/log-relay regression, by contrast, IS caught here (it raises at start)."""
 
     def test_spawned_producer_generates_round(self, tmp_path):
         rng = np.random.default_rng(11)

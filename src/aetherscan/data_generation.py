@@ -485,6 +485,10 @@ def create_true_double(
     snr = random.random() * snr_range + snr_base
 
     # Note, small but nonzero probability for "infinite" (long-running) loops
+    # NOTE: quantified in #118 — acceptance is i.i.d. geometric with p~=0.42, so the worst
+    # sample over a full 499200-round is ~25 retries (~3s); a >100-retry sample is effectively
+    # impossible (P~1e-24). This loop is therefore NOT the ~10-min single-worker stall seen in
+    # the #117 smoke (that is gc/IO/scheduling, see #118). #118 tracks a defensive retry cap.
     # Retry signal injection until we get valid non-intersecting signals
     while True:
         # Inject RFI
@@ -692,7 +696,13 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     # random.random() and the np.random.* module API. The determinism therefore holds only
     # as long as nothing else mutates the global RNG state between cadences within a task;
     # threading an explicit np.random.Generator through the create_* functions would remove
-    # that coupling if it ever matters.
+    # that coupling if it ever matters. In practice the coupling is not exposed: pool workers
+    # are single-threaded processes, and the only in-process (pool=None) generation is the RF
+    # dataset, which runs after the training datasets/iterators are torn down (train_round's
+    # finally: holder.clear() -> del datasets -> clear_session -> gc), so no tf.data generator
+    # thread is alive mutating global RNG state during it. Note per-task seeds come from OS
+    # entropy (round_data seed_rng) and are not persisted, so runs are not reproducible anyway;
+    # what this guarantees is independence of results from worker scheduling within a run.
     random.seed(seed)
     np.random.seed(seed % (2**32))
 
