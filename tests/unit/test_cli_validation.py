@@ -214,6 +214,23 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(argv), None)
         assert any("divisible by" in e.message and "downsample-factor" in e.message for e in errors)
 
+    def test_bandpass_method_enum(self):
+        errors = collect_validation_errors(
+            _parse(["inference", "--bandpass-method", "median"]), None
+        )
+        assert any(e.field == "inference.bandpass_method" for e in errors)
+
+    @pytest.mark.parametrize("method", ["pfb", "spline"])
+    def test_bandpass_method_valid_values_pass(self, method):
+        errors = collect_validation_errors(_parse(["inference", "--bandpass-method", method]), None)
+        assert [e for e in errors if e.field == "inference.bandpass_method"] == []
+
+    def test_pfb_taps_per_channel_must_be_positive(self):
+        errors = collect_validation_errors(
+            _parse(["inference", "--pfb-taps-per-channel", "0"]), None
+        )
+        assert any(e.field == "inference.pfb_taps_per_channel" for e in errors)
+
 
 class TestCrossParamSolver:
     _VALID_BASE = {
@@ -390,6 +407,34 @@ class TestApplyArgsToConfig:
         config = get_config()
         apply_args_to_config(_parse(["train", "--load-tag", "round_03"]))
         assert config.checkpoint.start_round == 4
+
+    def test_bandpass_flags_apply_to_inference_config(self):
+        config = get_config()
+        # Preset True so --no-bandpass-debug-plot has something to force off.
+        config.inference.bandpass_debug_plot = True
+        apply_args_to_config(
+            _parse(
+                [
+                    "inference",
+                    "--bandpass-method",
+                    "spline",
+                    "--pfb-taps-per-channel",
+                    "8",
+                    "--no-bandpass-debug-plot",
+                ]
+            )
+        )
+        assert config.inference.bandpass_method == "spline"
+        assert config.inference.pfb_taps_per_channel == 8
+        assert config.inference.bandpass_debug_plot is False
+
+    def test_bandpass_debug_plot_omitted_preserves_default(self):
+        # BooleanOptionalAction default=None: omitting the flag must not clobber the config
+        # value (the "is not None" apply guard is what preserves it).
+        config = get_config()
+        config.inference.bandpass_debug_plot = True
+        apply_args_to_config(_parse(["inference"]))
+        assert config.inference.bandpass_debug_plot is True
 
 
 class TestLatentTraversalFlags:

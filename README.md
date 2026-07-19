@@ -342,6 +342,11 @@ PYTHONPATH=src python -m aetherscan.main inference \
     --save-tag run_v1
 ```
 
+> [!NOTE]
+> Energy detection flattens each coarse channel's bandpass before thresholding. The default method (`--bandpass-method pfb`) divides by the instrument's static polyphase-filterbank response — computed once per run — instead of fitting a spline per channel per file (`--bandpass-method spline`). The PFB response is instrument-dependent: `--pfb-taps-per-channel` defaults to 12 (the GBT/Breakthrough Listen backend) and must match the backend that produced the `.h5` files; a warning is logged when the recording's measured bandpass shape disagrees with the static response.
+>
+> Preprocessed per-cadence `.npy` stamps land in a per-CSV, tag-scoped directory by default (`{data_path}/inference/preprocessed/<csv_stem>_<save_tag>/`): retrying with the same `--save-tag` resumes from the existing `.npy` files, while a new tag starts from a clean directory that stale stamps from an older failed attempt can't leak into. To reuse an earlier run's preprocessing instead, pass its directory explicitly via `--preprocess-output-dir`.
+
 **Inference with async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
 
 ```bash
@@ -706,6 +711,9 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
                  [--coarse-channel-width COARSE_CHANNEL_WIDTH]
                  [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
+                 [--bandpass-method BANDPASS_METHOD]
+                 [--pfb-taps-per-channel PFB_TAPS_PER_CHANNEL]
+                 [--bandpass-debug-plot | --no-bandpass-debug-plot]
                  [--spline-order SPLINE_ORDER]
                  [--detection-window-size DETECTION_WINDOW_SIZE]
                  [--detection-step-size DETECTION_STEP_SIZE]
@@ -781,8 +789,25 @@ options:
                         coarse channels per log line (default: the number of
                         worker processes). Parallelism itself comes from the
                         persistent worker pool, not this knob.
+  --bandpass-method BANDPASS_METHOD
+                        Bandpass flattening method for energy detection: 'pfb'
+                        (default) divides each coarse channel by the
+                        instrument's static polyphase-filterbank response;
+                        'spline' fits and subtracts a per-channel spline
+  --pfb-taps-per-channel PFB_TAPS_PER_CHANNEL
+                        PFB prototype-filter taps per coarse channel for
+                        --bandpass-method pfb (default: 12, the
+                        GBT/Breakthrough Listen backend value). INSTRUMENT-
+                        DEPENDENT: must match the backend that produced the
+                        .h5 files
+  --bandpass-debug-plot, --no-bandpass-debug-plot
+                        Save a per-cadence bandpass-flattening overlay debug
+                        plot (raw vs flattened integrated spectrum for a few
+                        sampled coarse channels) under plots/inference/
+                        (default: off)
   --spline-order SPLINE_ORDER
-                        Spline order for bandpass fitting (default: 16)
+                        Spline order for bandpass fitting with --bandpass-
+                        method spline (default: 16)
   --detection-window-size DETECTION_WINDOW_SIZE
                         Sliding window size in fine channels for normality
                         test (default: 256)
@@ -812,7 +837,12 @@ options:
                         overlap-search stamps (default: 0.5)
   --preprocess-output-dir PREPROCESS_OUTPUT_DIR
                         Directory for per-cadence .npy outputs from
-                        preprocessing
+                        preprocessing. Default: a per-CSV, tag-scoped
+                        directory {data_path}/inference/preprocessed/<csv_stem
+                        >_<save_tag>/ — retrying with the same tag resumes
+                        from existing .npy files, while a new tag starts
+                        clean. Pass an old run's directory explicitly to reuse
+                        its preprocessing (shared across CSVs)
   --max-retries MAX_RETRIES
                         Maximum number of retry attempts for inference
                         (including preprocessing) on failure

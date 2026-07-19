@@ -34,6 +34,9 @@ _RF_MAX_FEATURES_STR_VALUES = {"sqrt", "log2"}
 # Allowed values for curriculum_schedule
 _CURRICULUM_SCHEDULES = {"linear", "exponential", "step"}
 
+# Allowed values for bandpass_method (energy-detection bandpass flattening)
+_BANDPASS_METHODS = {"pfb", "spline"}
+
 
 @dataclass
 class ValidationError:
@@ -767,10 +770,28 @@ def _add_inference_flags_to(parser):
         help="Progress-logging chunk size for energy detection, in coarse channels per log line (default: the number of worker processes). Parallelism itself comes from the persistent worker pool, not this knob.",
     )
     parser.add_argument(
+        "--bandpass-method",
+        type=str,
+        default=None,
+        help="Bandpass flattening method for energy detection: 'pfb' (default) divides each coarse channel by the instrument's static polyphase-filterbank response; 'spline' fits and subtracts a per-channel spline",
+    )
+    parser.add_argument(
+        "--pfb-taps-per-channel",
+        type=int,
+        default=None,
+        help="PFB prototype-filter taps per coarse channel for --bandpass-method pfb (default: 12, the GBT/Breakthrough Listen backend value). INSTRUMENT-DEPENDENT: must match the backend that produced the .h5 files",
+    )
+    parser.add_argument(
+        "--bandpass-debug-plot",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save a per-cadence bandpass-flattening overlay debug plot (raw vs flattened integrated spectrum for a few sampled coarse channels) under plots/inference/ (default: off)",
+    )
+    parser.add_argument(
         "--spline-order",
         type=int,
         default=None,
-        help="Spline order for bandpass fitting (default: 16)",
+        help="Spline order for bandpass fitting with --bandpass-method spline (default: 16)",
     )
     parser.add_argument(
         "--detection-window-size",
@@ -818,7 +839,7 @@ def _add_inference_flags_to(parser):
         "--preprocess-output-dir",
         type=str,
         default=None,
-        help="Directory for per-cadence .npy outputs from preprocessing",
+        help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV, tag-scoped directory {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/ — retrying with the same tag resumes from existing .npy files, while a new tag starts clean. Pass an old run's directory explicitly to reuse its preprocessing (shared across CSVs)",
     )
     parser.add_argument(
         "--max-retries",
@@ -1126,6 +1147,15 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.coarse_channel_width = args.coarse_channel_width
     if hasattr(args, "parallel_coarse_chans") and args.parallel_coarse_chans is not None:
         config.inference.parallel_coarse_chans = args.parallel_coarse_chans
+    if hasattr(args, "bandpass_method") and args.bandpass_method is not None:
+        config.inference.bandpass_method = args.bandpass_method
+    if hasattr(args, "pfb_taps_per_channel") and args.pfb_taps_per_channel is not None:
+        config.inference.pfb_taps_per_channel = args.pfb_taps_per_channel
+    # bandpass_debug_plot uses argparse.BooleanOptionalAction with default=None so the CLI
+    # can express "leave the config default" (omit), "force on" (--bandpass-debug-plot),
+    # and "force off" (--no-bandpass-debug-plot).
+    if hasattr(args, "bandpass_debug_plot") and args.bandpass_debug_plot is not None:
+        config.inference.bandpass_debug_plot = args.bandpass_debug_plot
     if hasattr(args, "spline_order") and args.spline_order is not None:
         config.inference.spline_order = args.spline_order
     if hasattr(args, "detection_window_size") and args.detection_window_size is not None:
@@ -1971,6 +2001,28 @@ def collect_validation_errors(
                     field="inference.spline_order",
                     current=spline_order,
                     message=f"--spline-order must be >= 1, got {spline_order}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+        bandpass_method = _resolve(args, "bandpass_method", config.inference.bandpass_method)
+        if bandpass_method is not None and bandpass_method not in _BANDPASS_METHODS:
+            errors.append(
+                ValidationError(
+                    field="inference.bandpass_method",
+                    current=bandpass_method,
+                    message=f"--bandpass-method must be one of {sorted(_BANDPASS_METHODS)}, got {bandpass_method!r}",
+                    fix_kind="enum",
+                    allowed=sorted(_BANDPASS_METHODS),
+                )
+            )
+        pfb_taps = _resolve(args, "pfb_taps_per_channel", config.inference.pfb_taps_per_channel)
+        if pfb_taps is not None and pfb_taps < 1:
+            errors.append(
+                ValidationError(
+                    field="inference.pfb_taps_per_channel",
+                    current=pfb_taps,
+                    message=f"--pfb-taps-per-channel must be >= 1, got {pfb_taps}",
                     fix_kind="clamp_low",
                     min_val=1,
                 )

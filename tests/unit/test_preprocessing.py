@@ -21,12 +21,14 @@ from skimage.transform import downscale_local_mean
 
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
+from aetherscan.pfb import edge_mid_power_ratio, gen_coarse_channel_response
 from aetherscan.preprocessing import (
     DataPreprocessor,
     PendingCadence,
     _energy_detect_channel_worker,
     _extract_stamps_worker,
     _fit_channel_bandpass,
+    _pfb_flatten_bandpass,
     _remove_dc_spike,
     _sliding_normality_k2,
     _spline_flatten_bandpass,
@@ -400,10 +402,11 @@ def initialized_runtime():
 
 class TestProcessCadenceEndToEnd:
     """Sequential (no pool) end-to-end run of _process_cadence on synthetic .h5 observations
-    with an injected non-Gaussian feature: exercises fused detection, dedup, overlap stamps,
-    downsample-at-extraction, metadata, and the resume path."""
+    with an injected non-Gaussian feature: exercises fused detection, both bandpass
+    flatteners (spline on flat data, PFB on PFB-shaped data), dedup, overlap stamps,
+    downsample-at-extraction, metadata, the debug overlay plot, and the resume path."""
 
-    def _make_cadence(self, tmp_path, n_chans=2048, inject_at=768):
+    def _make_cadence(self, tmp_path, n_chans=2048, inject_at=768, pfb_shaped=False):
         import h5py  # noqa: PLC0415
 
         rng = np.random.default_rng(23)
@@ -414,6 +417,11 @@ class TestProcessCadenceEndToEnd:
             data = rng.normal(1000.0, 10.0, size=(16, 1, n_chans)).astype(np.float32)
             if obs in (0, 2, 4):
                 data[:, 0, inject_at : inject_at + 4] *= 50.0
+            if pfb_shaped:
+                # Imprint the instrument passband the PFB flattener expects to divide out
+                # (a flat recording would look like a static-response mismatch instead)
+                response = gen_coarse_channel_response(512, n_chans // 512, 12)
+                data *= np.tile(response, n_chans // 512).astype(np.float32)
             path = tmp_path / f"cad_obs_{obs}.h5"
             with h5py.File(path, "w") as hf:
                 dset = hf.create_dataset("data", data=data)
@@ -424,13 +432,14 @@ class TestProcessCadenceEndToEnd:
             h5_paths.append(str(path))
         return h5_paths
 
-    def _configure(self):
+    def _configure(self, bandpass_method="spline"):
         config = get_config()
         config.manager.n_processes = 1  # sequential: no pools/shm in unit tests
         config.data.time_bins = 16
         config.data.width_bin = 256
         config.data.downsample_factor = 8
         config.inference.coarse_channel_width = 512
+        config.inference.bandpass_method = bandpass_method
         config.inference.spline_order = 4
         config.inference.detection_window_size = 64
         config.inference.detection_step_size = 32
@@ -440,11 +449,12 @@ class TestProcessCadenceEndToEnd:
         config.inference.overlap_fraction = 0.5
         return config
 
-    def test_process_and_resume(self, tmp_path, initialized_runtime):
+    @pytest.mark.parametrize(("bandpass_method", "pfb_shaped"), [("spline", False), ("pfb", True)])
+    def test_process_and_resume(self, tmp_path, initialized_runtime, bandpass_method, pfb_shaped):
         from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
 
-        config = self._configure()
-        h5_paths = self._make_cadence(tmp_path)
+        config = self._configure(bandpass_method)
+        h5_paths = self._make_cadence(tmp_path, pfb_shaped=pfb_shaped)
         group = CadenceGroup(
             key=("T1", "S1", "L", "7", "2251"),
             h5_paths=h5_paths,
@@ -599,6 +609,212 @@ class TestProcessCadenceEndToEnd:
         result = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
         assert result is None
         assert not os.path.exists(npy_path)
+
+    def test_bandpass_debug_plot_saved(self, tmp_path, initialized_runtime):
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        config = self._configure("pfb")
+        config.inference.bandpass_debug_plot = True
+        h5_paths = self._make_cadence(tmp_path, pfb_shaped=True)
+        group = CadenceGroup(
+            key=("T3", "S1", "L", "9", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cadence_dbg.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        result = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+
+        assert result is not None
+        plot_path = os.path.join(
+            config.output_path,
+            "plots",
+            "inference",
+            f"bandpass_overlay_cadence_dbg_{config.checkpoint.save_tag}.png",
+        )
+        assert os.path.exists(plot_path)
+        assert os.path.getsize(plot_path) > 0
+
+
+class TestBandpassFlattenerSelection:
+    """_get_bandpass_flattener must route on config.inference.bandpass_method (pfb default),
+    materialize the parent-computed response as a sidecar .npy carried by path in the PFB
+    partial (workers must never generate the response themselves — at GBT scale that is an
+    ~n_chans-point FFT per worker, concurrently), fall back to spline when the fold is
+    impossible, and reject unknown methods."""
+
+    def test_default_is_pfb(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        assert config.inference.bandpass_method == "pfb"
+        flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
+        assert flattener.func is _pfb_flatten_bandpass
+        response_path = flattener.keywords["response_path"]
+        # The sidecar file lives under the run's output path and holds exactly the response
+        # the parent computed for (width, coarse count, taps)
+        assert response_path.startswith(os.path.join(config.output_path, "pfb_cache"))
+        expected = gen_coarse_channel_response(512, 4, config.inference.pfb_taps_per_channel)
+        np.testing.assert_array_equal(np.load(response_path), expected)
+
+    def test_response_file_reused_across_calls(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        preprocessor = DataPreprocessor()
+        first = preprocessor._get_bandpass_flattener(num_coarse_channels=4)
+        mtime = os.path.getmtime(first.keywords["response_path"])
+        second = preprocessor._get_bandpass_flattener(num_coarse_channels=4)
+        assert second.keywords["response_path"] == first.keywords["response_path"]
+        assert os.path.getmtime(second.keywords["response_path"]) == mtime  # not rewritten
+
+    def test_corrupt_response_file_is_rewritten(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        preprocessor = DataPreprocessor()
+        response_path = preprocessor._get_bandpass_flattener(num_coarse_channels=4).keywords[
+            "response_path"
+        ]
+        with open(response_path, "wb") as f:
+            f.write(b"garbage")
+        response_path_2 = preprocessor._get_bandpass_flattener(num_coarse_channels=4).keywords[
+            "response_path"
+        ]
+        assert response_path_2 == response_path
+        expected = gen_coarse_channel_response(512, 4, config.inference.pfb_taps_per_channel)
+        np.testing.assert_array_equal(np.load(response_path), expected)
+
+    def test_spline_selected_via_config(self, initialized_runtime):
+        config = get_config()
+        config.inference.bandpass_method = "spline"
+        flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
+        assert flattener.func is _spline_flatten_bandpass
+        assert flattener.keywords == {"spl_order": config.inference.spline_order}
+
+    def test_pfb_single_coarse_channel_falls_back_to_spline(self, initialized_runtime):
+        config = get_config()
+        config.inference.bandpass_method = "pfb"
+        flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=1)
+        assert flattener.func is _spline_flatten_bandpass
+
+    def test_unknown_method_raises(self, initialized_runtime):
+        config = get_config()
+        config.inference.bandpass_method = "median"
+        with pytest.raises(ValueError, match="bandpass_method"):
+            DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
+
+    def test_pfb_flattener_is_picklable(self, initialized_runtime):
+        # The flattener ships to pool workers inside task tuples
+        import pickle  # noqa: PLC0415
+
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
+        restored = pickle.loads(pickle.dumps(flattener))
+        channel = np.full((4, 512), 2.0)
+        np.testing.assert_array_equal(restored(channel), flattener(channel))
+
+    def test_pfb_flatten_divides_out_response(self, initialized_runtime):
+        config = get_config()
+        config.inference.coarse_channel_width = 512
+        config.inference.pfb_taps_per_channel = 12
+        flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
+        response = gen_coarse_channel_response(512, 4, 12)
+        shaped = np.ones((16, 1)) * response
+        np.testing.assert_allclose(flattener(shaped), 1.0, rtol=1e-12)
+
+
+class TestPfbResponseMismatchWarning:
+    """_warn_on_pfb_response_mismatch compares the file's measured edge/mid power ratio with
+    the static response's, warning once per file when they disagree by more than 5%."""
+
+    def _make_obs(self, tmp_path, shaped: bool, n_chans=1024, width=512):
+        import h5py  # noqa: PLC0415
+
+        rng = np.random.default_rng(51)
+        data = rng.normal(1000.0, 5.0, size=(16, 1, n_chans)).astype(np.float32)
+        if shaped:
+            response = gen_coarse_channel_response(width, n_chans // width, 12)
+            data *= np.tile(response, n_chans // width).astype(np.float32)
+        path = tmp_path / ("shaped.h5" if shaped else "flat.h5")
+        with h5py.File(path, "w") as hf:
+            hf.create_dataset("data", data=data)
+        return str(path)
+
+    def _configure(self):
+        config = get_config()
+        config.data.time_bins = 16
+        config.inference.coarse_channel_width = 512
+        config.inference.pfb_taps_per_channel = 12
+        return config
+
+    def test_flat_recording_warns(self, tmp_path, initialized_runtime, caplog):
+        self._configure()
+        h5_path = self._make_obs(tmp_path, shaped=False)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            DataPreprocessor()._warn_on_pfb_response_mismatch(h5_path, n_coarse_total=2)
+        mismatch_warnings = [r for r in caplog.records if "edge/mid power ratio" in r.message]
+        assert len(mismatch_warnings) == 1  # once per file, not per channel
+
+    def test_pfb_shaped_recording_does_not_warn(self, tmp_path, initialized_runtime, caplog):
+        self._configure()
+        h5_path = self._make_obs(tmp_path, shaped=True)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            DataPreprocessor()._warn_on_pfb_response_mismatch(h5_path, n_coarse_total=2)
+        assert [r for r in caplog.records if "edge/mid power ratio" in r.message] == []
+
+    def test_ratio_statistic_separates_the_two(self):
+        # The underlying statistic the check relies on (sanity of the 5% tolerance)
+        response = gen_coarse_channel_response(512, 2, 12)
+        expected = edge_mid_power_ratio(response)
+        assert abs(edge_mid_power_ratio(np.ones(512)) - expected) / expected > 0.05
+
+
+class TestPlanCadencesOutputDir:
+    """plan_cadences resolves the .npy output dir per CSV: tag-scoped default under
+    {data_path}/inference/preprocessed/, with an explicit --preprocess-output-dir shared
+    across CSVs."""
+
+    def test_default_is_per_csv_tag_scoped(self, initialized_runtime, make_inference_csv):
+        config = get_config()
+        make_inference_csv("subset.csv")
+        config.data.inference_files = ["subset.csv"]
+        config.checkpoint.save_tag = "test_v1"
+
+        units = DataPreprocessor().plan_cadences()
+
+        assert len(units) == 1
+        expected_dir = os.path.join(config.data_path, "inference", "preprocessed", "subset_test_v1")
+        assert os.path.dirname(units[0].npy_path) == expected_dir
+        assert os.path.isdir(expected_dir)
+
+    def test_new_tag_gets_clean_directory(self, initialized_runtime, make_inference_csv):
+        config = get_config()
+        make_inference_csv("subset.csv")
+        config.data.inference_files = ["subset.csv"]
+
+        config.checkpoint.save_tag = "test_v1"
+        first = DataPreprocessor().plan_cadences()
+        config.checkpoint.save_tag = "test_v2"
+        second = DataPreprocessor().plan_cadences()
+
+        assert os.path.dirname(first[0].npy_path) != os.path.dirname(second[0].npy_path)
+
+    def test_explicit_override_shared_across_csvs(
+        self, initialized_runtime, make_inference_csv, tmp_path
+    ):
+        config = get_config()
+        make_inference_csv("a.csv")
+        make_inference_csv("b.csv")
+        config.data.inference_files = ["a.csv", "b.csv"]
+        override = str(tmp_path / "shared_preproc")
+        config.inference.preprocess_output_dir = override
+
+        units = DataPreprocessor().plan_cadences()
+
+        assert len(units) == 2
+        assert {os.path.dirname(u.npy_path) for u in units} == {override}
 
 
 class TestLoadInferenceDataPaths:

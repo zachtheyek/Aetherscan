@@ -318,6 +318,18 @@ class InferenceConfig:
     # None -> use manager.n_processes. Parallelism itself comes from the persistent worker
     # pool (one fused task per coarse channel), not from this knob.
     parallel_coarse_chans: int | None = None
+    # Bandpass flattening method for energy detection: "pfb" divides each coarse channel by
+    # the instrument's static polyphase-filterbank response (computed once per run); "spline"
+    # fits and subtracts a spline per coarse channel per file (the historical, data-driven
+    # method).
+    bandpass_method: str = "pfb"
+    # PFB prototype-filter taps per coarse channel. Instrument-dependent: 12 is the GBT /
+    # Breakthrough Listen backend default, and it must match the backend that produced the
+    # .h5 files being processed.
+    pfb_taps_per_channel: int = 12
+    # Opt-in debug artifact: save a raw-vs-flattened overlay plot (a few sampled coarse
+    # channels per cadence) under {output_path}/plots/inference/.
+    bandpass_debug_plot: bool = False
     spline_order: int = 16
     detection_window_size: int = 256
     detection_step_size: int = 128
@@ -336,8 +348,11 @@ class InferenceConfig:
     discard_side_channels: bool = False
     side_channel_count: int = 0
 
-    # NOTE: come back to this later (is this consumed properly downstream? how does archiving functionality work with this? is there caching, e.g. if a h5 grouping already preprocessed & written to output dir, just read from it directly instead of wasting compute)
-    preprocess_output_dir: str | None = None  # Defaults to <output_path>/preprocessed at runtime
+    # Per-cadence .npy output directory for energy-detection preprocessing. None (default)
+    # resolves per CSV to {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/ — tag
+    # scoping keeps runs isolated (same-tag retries resume; a new tag starts clean). Set
+    # explicitly to share/reuse one directory across runs and CSVs.
+    preprocess_output_dir: str | None = None
 
     # NOTE: come back to this later (is this implemented correctly?)
     # Fault tolerance
@@ -603,6 +618,9 @@ class Config:
                 "cadence_expected_obs": self.inference.cadence_expected_obs,
                 "coarse_channel_width": self.inference.coarse_channel_width,
                 "parallel_coarse_chans": self.inference.parallel_coarse_chans,
+                "bandpass_method": self.inference.bandpass_method,
+                "pfb_taps_per_channel": self.inference.pfb_taps_per_channel,
+                "bandpass_debug_plot": self.inference.bandpass_debug_plot,
                 "spline_order": self.inference.spline_order,
                 "detection_window_size": self.inference.detection_window_size,
                 "detection_step_size": self.inference.detection_step_size,
