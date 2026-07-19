@@ -326,7 +326,11 @@ def _infer_cadence(
        artifacts don't depend on the positives-only inference_results table.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     db = get_db()
+    if db is None:
+        raise ValueError("get_db() returned None")
     tag = config.checkpoint.save_tag
 
     # Per-cadence provenance from the group key + metadata JSON
@@ -424,6 +428,8 @@ def _run_streaming_csv_inference(
     n_skipped}, where skipped (resumed) cadences contribute their manifest aggregates.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     db = get_db()
     if db is None:
         raise ValueError("get_db() returned None")
