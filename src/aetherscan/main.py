@@ -321,6 +321,8 @@ def _run_streaming_csv_inference(
     stamp .npy — permanent conditions the retry loop must not retry.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
 
     units = preprocessor.plan_cadences()
     if not units:
