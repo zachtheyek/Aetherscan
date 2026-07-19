@@ -295,7 +295,9 @@ class NonRetryableInferenceError(RuntimeError):
     """
 
 
-def _run_streaming_csv_inference(preprocessor: DataPreprocessor, strategy) -> dict:
+def _run_streaming_csv_inference(
+    preprocessor: DataPreprocessor, strategy: tf.distribute.Strategy
+) -> dict:
     """
     Per-cadence streaming inference over the configured CSV catalogs.
 

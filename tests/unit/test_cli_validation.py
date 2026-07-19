@@ -198,6 +198,22 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(argv), None)
         assert any(e.field == "inference.stamp_width" for e in errors)
 
+    def test_inference_stamp_width_must_be_divisible_by_downsample_factor(self, make_inference_csv):
+        # store_downsampled_stamps defaults on, so the stored width (stamp_width //
+        # downsample_factor) must be exact; a stamp_width indivisible by the default
+        # downsample_factor (8) is rejected. Distinct from the equality check above, which the
+        # 2048 case only exercised because 2048 happens to divide 8.
+        csv_path = make_inference_csv("subset.csv")
+        argv = [
+            "inference",
+            "--inference-files",
+            csv_path.name,
+            "--stamp-width",
+            "4095",  # not a multiple of the default downsample_factor (8)
+        ]
+        errors = collect_validation_errors(_parse(argv), None)
+        assert any("divisible by" in e.message and "downsample-factor" in e.message for e in errors)
+
 
 class TestCrossParamSolver:
     _VALID_BASE = {
