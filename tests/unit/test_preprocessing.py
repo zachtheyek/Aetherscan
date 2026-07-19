@@ -23,6 +23,7 @@ from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
 from aetherscan.pfb import edge_mid_power_ratio, gen_coarse_channel_response
 from aetherscan.preprocessing import (
+    ED_STAT_HIST_EDGES,
     DataPreprocessor,
     PendingCadence,
     _energy_detect_channel_worker,
@@ -392,12 +393,13 @@ class TestExtractStampsWorkerDownsample:
 
 @pytest.fixture
 def initialized_runtime():
-    """DataPreprocessor needs live db + manager singletons; conftest tears them down."""
+    """DataPreprocessor needs live db + manager singletons; conftest tears them down.
+    Returns the Database so tests can flush/query the run manifest."""
     from aetherscan.db import init_db  # noqa: PLC0415
     from aetherscan.manager import init_manager  # noqa: PLC0415
 
     init_manager()
-    init_db()
+    return init_db()
 
 
 class TestProcessCadenceEndToEnd:
@@ -494,11 +496,35 @@ class TestProcessCadenceEndToEnd:
         assert len(metadata["stamp_frequencies_mhz"]) == result.n_hits
         assert len(metadata["stamp_starts"]) == result.n_hits
 
-        # Resume path: a second call must skip reprocessing and report the same hit count
+        # Viz-suite provenance: per-ON-file all-window statistic histograms on the shared
+        # bins, plus pre-/post-dedup hit frequency lists
+        ed_hist = metadata["ed_stat_hist"]
+        assert ed_hist["bin_edges"] == pytest.approx(list(ED_STAT_HIST_EDGES))
+        assert len(ed_hist["counts_per_on_file"]) == 3  # one histogram per ON file
+        assert all(sum(counts) > 0 for counts in ed_hist["counts_per_on_file"])
+        assert metadata["n_raw_hits"] >= metadata["n_merged_hits"] > 0
+        assert len(metadata["raw_hit_frequencies_mhz"]) == metadata["n_raw_hits"]
+        assert len(metadata["merged_hit_frequencies_mhz"]) == metadata["n_merged_hits"]
+
+        # Preprocessing completion is recorded in the inference_cadences run manifest
+        db = initialized_runtime
+        assert db.flush(timeout=10) is True
+        manifest = db.query_inference_cadences(tag=config.checkpoint.save_tag, npy_path=npy_path)
+        assert [r["status"] for r in manifest] == ["preprocessed"]
+        assert manifest[0]["n_stamps"] == result.n_hits
+        assert manifest[0]["csv_path"] == "unused.csv"
+        assert json.loads(manifest[0]["cadence_key"]) == ["T1", "S1", "L", "7", "2251"]
+        assert manifest[0]["duration_s"] > 0
+
+        # Resume path: a second call must skip reprocessing and report the same hit count,
+        # without duplicating the manifest row
         resumed = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
         assert resumed is not None
         assert resumed.n_hits == result.n_hits
         assert resumed.npy_path == npy_path
+        assert db.flush(timeout=10) is True
+        manifest = db.query_inference_cadences(tag=config.checkpoint.save_tag, npy_path=npy_path)
+        assert len(manifest) == 1
 
     def test_full_width_stamps_when_disabled(self, tmp_path, initialized_runtime):
         from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
@@ -1188,7 +1214,7 @@ class TestEnergyDetectChannelWorker:
         h5_path = make_h5_observation("obs.h5", n_chans=n_chans)
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=spl_order)
 
-        hits = _energy_detect_channel_worker(
+        hits, stat_hist = _energy_detect_channel_worker(
             (
                 str(h5_path),
                 channel_index,
@@ -1221,12 +1247,20 @@ class TestEnergyDetectChannelWorker:
             np.testing.assert_allclose(stat_val, expected[idx], rtol=1e-9)
             np.testing.assert_allclose(pval, stats.chi2.sf(stat_val, 2), rtol=1e-9)
 
+        # The summary histogram covers every finite window statistic, not just hits, on the
+        # fixed shared bins — one count per window
+        assert stat_hist.shape == (len(ED_STAT_HIST_EDGES) - 1,)
+        assert stat_hist.sum() == len(statistics)
+        # Hits land in the bins above the threshold
+        hit_bin_counts = stat_hist[np.searchsorted(ED_STAT_HIST_EDGES, stat_threshold) - 1 :]
+        assert hit_bin_counts.sum() >= len(hits)
+
     def test_absolute_indices_offset_by_channel_start(self, make_h5_observation):
         h5_path = make_h5_observation("obs.h5", n_chans=2048)
         coarse_width = 512
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=4)
         for channel_index in (0, 3):
-            hits = _energy_detect_channel_worker(
+            hits, _ = _energy_detect_channel_worker(
                 (str(h5_path), channel_index, coarse_width, 16, bandpass_flatten, 64, 32, 0.0)
             )
             starts = [idx for idx, _, _ in hits]
@@ -1235,3 +1269,14 @@ class TestEnergyDetectChannelWorker:
                 channel_index * coarse_width <= s < (channel_index + 1) * coarse_width
                 for s in starts
             )
+
+    def test_no_hits_still_returns_histogram(self, make_h5_observation):
+        """An impossibly high threshold yields no hits but the all-window statistic
+        histogram must still be populated (it feeds the viz suite regardless of hits)."""
+        h5_path = make_h5_observation("obs.h5", n_chans=2048)
+        bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=4)
+        hits, stat_hist = _energy_detect_channel_worker(
+            (str(h5_path), 0, 512, 16, bandpass_flatten, 64, 32, 1e12)
+        )
+        assert hits == []
+        assert stat_hist.sum() > 0

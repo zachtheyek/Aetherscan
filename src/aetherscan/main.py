@@ -25,12 +25,14 @@ from aetherscan.cli import (
     validate_args,
 )
 from aetherscan.config import get_config, init_config
-from aetherscan.db import init_db
-from aetherscan.inference import InferencePipeline, run_inference_pipeline
+from aetherscan.db import get_db, init_db
+from aetherscan.inference import InferencePipeline, run_inference_pipeline, summarize_confidences
+from aetherscan.inference_viz import InferenceVizCollector, render_inference_visualizations
 from aetherscan.logger import init_logger
 from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
 from aetherscan.preprocessing import DataPreprocessor, derive_cadence_provenance
+from aetherscan.run_state import inference_config_fingerprint
 from aetherscan.train import run_training_pipeline
 
 logger = logging.getLogger(__name__)
@@ -295,118 +297,304 @@ class NonRetryableInferenceError(RuntimeError):
     """
 
 
+def _infer_cadence(
+    pipeline: InferencePipeline,
+    preprocessor: DataPreprocessor,
+    unit,
+    cadence_result,
+    config_fingerprint: str,
+) -> dict:
+    """
+    Run the inference stage for one preprocessed cadence: derive provenance, load its stamps
+    (memmap -> log-norm), encode on the GPUs, classify with the RF, and record the result in
+    both DB tables. Returns run_inference's results dict augmented with the provenance dict
+    and the stage's duration_s. Exceptions propagate to the caller's per-cadence containment.
+
+    Supersede-on-retry ordering (single-writer FIFO makes each step atomic w.r.t. the next):
+    1. mark_superseded(inference_results, tag, npy_path) — partial positives written by a
+       dead attempt can't mix with this attempt's rows;
+    2. run_inference writes the fresh positives;
+    3. mark_superseded(inference_cadences, tag, npy_path) — retires the 'preprocessed' row
+       and any 'failed'/stale 'inferred' rows;
+    4. write_inference_cadence(status='inferred') — the row the stage-aware resume keys on,
+       carrying the aggregate stats (n_stamps/n_candidates/confidence summary) so run-level
+       artifacts don't depend on the positives-only inference_results table.
+    """
+    config = get_config()
+    db = get_db()
+    tag = config.checkpoint.save_tag
+
+    # Per-cadence provenance from the group key + metadata JSON
+    try:
+        with open(cadence_result.metadata_path) as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            f"Cadence {cadence_result.key}: could not read metadata at "
+            f"{cadence_result.metadata_path} ({e}); provenance will be sparse"
+        )
+        metadata = {"h5_paths": cadence_result.h5_paths}
+    provenance = derive_cadence_provenance(
+        key=cadence_result.key,
+        group_by_cols=config.inference.cadence_group_by_cols,
+        metadata=metadata,
+    )
+
+    stage_start = time.time()
+
+    # copy=False: the loader already returns float32; don't duplicate GBs of stamps
+    cadence_data = preprocessor.load_inference_data(
+        override_filepaths=[cadence_result.npy_path]
+    ).astype(np.float32, copy=False)
+
+    # Step 1: retire any partial rows from a dead attempt before fresh ones land
+    db.mark_superseded("inference_results", tag, npy_path=cadence_result.npy_path)
+
+    results = pipeline.run_inference(
+        data=cadence_data,
+        npy_path=cadence_result.npy_path,
+        **provenance,
+    )
+    del cadence_data
+    gc.collect()
+
+    duration_s = time.time() - stage_start
+
+    # Steps 3 + 4: new-row-plus-supersede on the run manifest
+    confidence_summary = summarize_confidences(
+        results["proba_true"], config.inference.classification_threshold
+    )
+    db.mark_superseded("inference_cadences", tag, npy_path=cadence_result.npy_path)
+    db.write_inference_cadence(
+        npy_path=cadence_result.npy_path,
+        status="inferred",
+        tag=tag,
+        csv_path=unit.group.csv_path,
+        cadence_key=cadence_result.key,
+        n_stamps=results["n_cadence_snippets"],
+        n_candidates=results["n_candidates"],
+        confidence_summary=confidence_summary,
+        duration_s=duration_s,
+        config_fingerprint=config_fingerprint,
+    )
+
+    results["provenance"] = provenance
+    results["duration_s"] = duration_s
+    return results
+
+
 def _run_streaming_csv_inference(
     preprocessor: DataPreprocessor, strategy: tf.distribute.Strategy
 ) -> dict:
     """
-    Per-cadence streaming inference over the configured CSV catalogs.
+    Per-cadence streaming inference over the configured CSV catalogs, with stage-aware
+    resume off the inference_cadences run manifest.
 
     Flow (peak memory = one cadence's stamps + the next cadence's in-flight preprocessing,
     independent of catalog size):
 
-        units = plan_cadences()                      # cadence groups + .npy paths, no work yet
-        pipeline = InferencePipeline(strategy)       # models loaded once for the whole run
-        for each cadence (prefetch depth 1):
-            [background thread] preprocess cadence i+1 (energy detection; the persistent pool's
-                                child processes do the real work — the thread mostly waits)
-            [main thread]       load cadence i's stamps (memmap -> log-norm) -> encode on GPUs
-                                -> RF -> write per-cadence results with per-cadence provenance
+        units = plan_cadences()                # cadence groups + .npy paths, no work yet
+        skip units with a live 'inferred' manifest row for this tag (fold their stored
+            aggregates into the totals); for the rest:
+        pipeline = InferencePipeline(strategy) # models loaded once for the whole run
+        for each pending cadence (prefetch depth 1):
+            [background thread] preprocess cadence i+1 (energy detection; skipped when its
+                                stamp .npy already exists — preprocessing-artifact resume)
+            [main thread]       load cadence i's stamps -> encode on GPUs -> RF -> write
+                                per-cadence results + manifest row (_infer_cadence)
 
-    Provenance (target/session/band/cadence_id/per-stamp frequency/timestamp/h5_path) is
-    derived per cadence from its group key + metadata JSON via derive_cadence_provenance.
-    Returns aggregate {n_cadence_snippets, n_processed, n_candidates, n_cadences}. Exceptions
-    from the load/encode stages propagate to the retry loop in inference_command; per-cadence
-    preprocessing failures are logged and skipped inside process_pending_cadence. Raises
-    NonRetryableInferenceError when the catalog yields no work units or no cadence produces a
-    stamp .npy — permanent conditions the retry loop must not retry.
+    Failure containment mirrors preprocessing's: a cadence whose inference stage fails is
+    logged, recorded as status='failed' in the manifest, and the loop continues; the pass
+    raises at the end so inference_command's retry loop re-attempts — and the manifest skip
+    means only the failed cadences re-run. Raises NonRetryableInferenceError when the
+    catalog yields no work units or no cadence produces a stamp .npy — permanent conditions
+    the retry loop must not retry. On a fully successful pass the visualization suite is
+    rendered (config.inference.inference_viz_enabled; every figure is exception-guarded).
+
+    Returns aggregate {n_cadence_snippets, n_processed, n_candidates, n_cadences,
+    n_skipped}, where skipped (resumed) cadences contribute their manifest aggregates.
     """
     config = get_config()
+    db = get_db()
+    if db is None:
+        raise ValueError("get_db() returned None")
+    tag = config.checkpoint.save_tag
 
     units = preprocessor.plan_cadences()
     if not units:
         raise NonRetryableInferenceError(
             "No cadence work units produced from the configured inference CSVs"
         )
-    logger.info(f"Streaming inference over {len(units)} cadence(s)")
 
-    # Load models once; every cadence reuses this pipeline
-    pipeline = InferencePipeline(strategy=strategy)
+    totals = {
+        "n_cadence_snippets": 0,
+        "n_processed": 0,
+        "n_candidates": 0,
+        "n_cadences": 0,
+        "n_skipped": 0,
+    }
+    collector = InferenceVizCollector() if config.inference.inference_viz_enabled else None
 
-    totals = {"n_cadence_snippets": 0, "n_processed": 0, "n_candidates": 0, "n_cadences": 0}
+    # Stage-aware resume: a live 'inferred' manifest row for (tag, npy_path) means the cadence
+    # completed on an earlier attempt — skip it and reuse its aggregates, but ONLY when it was
+    # written under the same inference config. The fingerprint guard stops a reused --save-tag
+    # with a changed threshold/model/geometry from silently serving stale results (the inference
+    # counterpart of the training-side config_fingerprint guard).
+    # Flush first so rows queued by this process (an in-process retry) are visible.
+    current_fingerprint = inference_config_fingerprint(config.to_dict())
+    db.flush()
+    inferred_rows = {
+        row["npy_path"]: row for row in db.query_inference_cadences(tag=tag, status="inferred")
+    }
 
-    # Start the persistent energy-detection pool from the main thread (forking after
-    # background threads exist risks inheriting mid-operation locks in the children)
-    preprocessor.start_energy_detection_pool()
-    try:
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="preproc_prefetch") as prefetch:
-            future = prefetch.submit(preprocessor.process_pending_cadence, units[0])
+    pending = []
+    stale_config = 0
+    for unit in units:
+        manifest_row = inferred_rows.get(unit.npy_path)
+        if manifest_row is None:
+            pending.append(unit)
+            continue
+        if manifest_row.get("config_fingerprint") != current_fingerprint:
+            # Live 'inferred' row, but written under a different inference config -> don't reuse.
+            # Re-infer; _infer_cadence's supersede step retires the stale row.
+            stale_config += 1
+            pending.append(unit)
+            continue
+        n_snippets = int(manifest_row.get("n_stamps") or 0)
+        n_candidates = int(manifest_row.get("n_candidates") or 0)
+        totals["n_cadence_snippets"] += n_snippets
+        totals["n_processed"] += n_snippets
+        totals["n_candidates"] += n_candidates
+        totals["n_cadences"] += 1
+        totals["n_skipped"] += 1
+        if collector is not None:
+            collector.record_skipped(
+                unit.group.key,
+                unit.npy_path,
+                DataPreprocessor.cadence_metadata_path(unit.npy_path),
+                manifest_row,
+            )
+        logger.info(
+            f"Cadence {unit.group.key}: already inferred under tag {tag} "
+            f"({n_snippets} snippets, {n_candidates} candidate(s)); skipping"
+        )
 
-            for i, unit in enumerate(units):
-                # NOTE: an exception inside a prefetched preprocessing task surfaces here,
-                # one iteration after it was submitted, when its future is resolved — and
-                # then propagates to inference_command's retry loop. In practice
-                # process_pending_cadence swallows per-cadence failures (returns None), so
-                # only infrastructure-level errors (e.g. a broken worker pool) raise.
-                cadence_result = future.result()
+    if stale_config:
+        logger.warning(
+            f"{stale_config} cadence(s) under tag {tag} have an 'inferred' manifest row written "
+            f"with a DIFFERENT inference config; re-inferring rather than reusing stale results "
+            f"(a reused --save-tag with a changed threshold/model/geometry is not resumed). Use a "
+            f"fresh --save-tag to keep separate configs' results separate."
+        )
 
-                # Prefetch depth 1: kick off cadence i+1's CPU preprocessing while the main
-                # thread loads + encodes cadence i on the GPUs
-                if i + 1 < len(units):
-                    future = prefetch.submit(preprocessor.process_pending_cadence, units[i + 1])
+    logger.info(
+        f"Streaming inference over {len(pending)} cadence(s) "
+        f"({totals['n_skipped']} already inferred, resumed from manifest)"
+    )
 
-                if cadence_result is None:
-                    logger.info(f"Cadence {unit.group.key}: no stamps produced; skipping")
-                    continue
+    failed_keys: list[tuple] = []
+    if pending:
+        # Load models once; every cadence reuses this pipeline
+        pipeline = InferencePipeline(strategy=strategy)
 
-                # Per-cadence provenance from the group key + metadata JSON
-                try:
-                    with open(cadence_result.metadata_path) as f:
-                        metadata = json.load(f)
-                except (OSError, json.JSONDecodeError) as e:
-                    logger.warning(
-                        f"Cadence {cadence_result.key}: could not read metadata at "
-                        f"{cadence_result.metadata_path} ({e}); provenance will be sparse"
+        # Start the persistent energy-detection pool from the main thread (forking after
+        # background threads exist risks inheriting mid-operation locks in the children)
+        preprocessor.start_energy_detection_pool()
+        try:
+            with ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="preproc_prefetch"
+            ) as prefetch:
+                future = prefetch.submit(preprocessor.process_pending_cadence, pending[0])
+
+                for i, unit in enumerate(pending):
+                    # NOTE: an exception inside a prefetched preprocessing task surfaces
+                    # here, one iteration after it was submitted, when its future is
+                    # resolved — and then propagates to inference_command's retry loop. In
+                    # practice process_pending_cadence swallows per-cadence failures
+                    # (returns None), so only infrastructure-level errors (e.g. a broken
+                    # worker pool) raise.
+                    cadence_result = future.result()
+
+                    # Prefetch depth 1: kick off cadence i+1's CPU preprocessing while the
+                    # main thread loads + encodes cadence i on the GPUs
+                    if i + 1 < len(pending):
+                        future = prefetch.submit(
+                            preprocessor.process_pending_cadence, pending[i + 1]
+                        )
+
+                    if cadence_result is None:
+                        logger.info(f"Cadence {unit.group.key}: no stamps produced; skipping")
+                        continue
+
+                    # Inference-stage failure containment: log, record in the manifest,
+                    # move on — one bad cadence must not abort the catalog. The pass
+                    # raises after the loop so the retry loop re-attempts failed cadences.
+                    try:
+                        results = _infer_cadence(
+                            pipeline, preprocessor, unit, cadence_result, current_fingerprint
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Cadence {cadence_result.key}: inference stage failed ({e}); "
+                            f"continuing with remaining cadences"
+                        )
+                        failed_keys.append(cadence_result.key)
+                        db.write_inference_cadence(
+                            npy_path=cadence_result.npy_path,
+                            status="failed",
+                            tag=tag,
+                            csv_path=unit.group.csv_path,
+                            cadence_key=cadence_result.key,
+                            # Despite the historical field name, CadenceResult.n_hits is
+                            # the .npy's stamp-row count — the same quantity as the
+                            # 'preprocessed'/'inferred' rows' n_stamps, so the manifest
+                            # stays consistent across all three statuses.
+                            n_stamps=cadence_result.n_hits,
+                        )
+                        continue
+
+                    totals["n_cadence_snippets"] += results["n_cadence_snippets"]
+                    totals["n_processed"] += results["n_processed"]
+                    totals["n_candidates"] += results["n_candidates"]
+                    totals["n_cadences"] += 1
+
+                    if collector is not None:
+                        collector.record_processed(
+                            cadence_result.key,
+                            cadence_result.npy_path,
+                            cadence_result.metadata_path,
+                            results["provenance"],
+                            results,
+                            results["duration_s"],
+                        )
+
+                    logger.info(
+                        f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "
+                        f"{len(pending) - i - 1} to go): {results['n_processed']} snippets, "
+                        f"{results['n_candidates']} candidate(s)"
                     )
-                    metadata = {"h5_paths": cadence_result.h5_paths}
-                provenance = derive_cadence_provenance(
-                    key=cadence_result.key,
-                    group_by_cols=config.inference.cadence_group_by_cols,
-                    metadata=metadata,
-                )
+                    del results
+        finally:
+            preprocessor.stop_energy_detection_pool()
+            # Release TF dataset/iterator state once per run, after the loaded models are done
+            tf.keras.backend.clear_session()
+            logger.info("Cleared TensorFlow session state")
 
-                # copy=False: the loader already returns float32; don't duplicate GBs of stamps
-                cadence_data = preprocessor.load_inference_data(
-                    override_filepaths=[cadence_result.npy_path]
-                ).astype(np.float32, copy=False)
-
-                results = pipeline.run_inference(
-                    data=cadence_data,
-                    npy_path=cadence_result.npy_path,
-                    **provenance,
-                )
-                del cadence_data
-                gc.collect()
-
-                totals["n_cadence_snippets"] += results["n_cadence_snippets"]
-                totals["n_processed"] += results["n_processed"]
-                totals["n_candidates"] += results["n_candidates"]
-                totals["n_cadences"] += 1
-
-                logger.info(
-                    f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "
-                    f"{len(units) - i - 1} to go): {results['n_processed']} snippets, "
-                    f"{results['n_candidates']} candidate(s)"
-                )
-    finally:
-        preprocessor.stop_energy_detection_pool()
-        # Release TF dataset/iterator state once per run, after the loaded models are done
-        tf.keras.backend.clear_session()
-        logger.info("Cleared TensorFlow session state")
+        if failed_keys:
+            # Whole-pass retry over the remaining failed set: cadences that completed are
+            # skipped via their 'inferred' manifest rows on the next attempt
+            raise RuntimeError(
+                f"Inference stage failed for {len(failed_keys)} cadence(s): {failed_keys}"
+            )
 
     if totals["n_cadences"] == 0:
         # Preserve the historical contract: preprocessing producing no stamp .npy at all is
         # an error (bad paths/catalog), not a legitimate empty result
         raise NonRetryableInferenceError("No cadence results produced by preprocessing")
+
+    if collector is not None:
+        # Every figure is individually exception-guarded — a plot bug can't fail the pass
+        render_inference_visualizations(collector, preprocessor, totals)
 
     return totals
 
@@ -453,23 +641,16 @@ def inference_command():
         logger.error("No GPU strategy available. Inference requires GPU.")
         sys.exit(1)
 
-    # NOTE: come back to this later (does fault tolerance work properly with inference?)
     # Run preprocessing + inference with fault tolerance.
-    # Recovery is state-based, not checkpoint-based: preprocessing writes per-cadence
-    # .npy files as it goes and skips any whose .npy already exists, so simply
-    # retrying resumes from where the last attempt died. No checkpoint metadata
-    # is needed for the preprocessing stage.
+    # Recovery is state-based, not checkpoint-based: preprocessing resumes off each
+    # cadence's on-disk stamp .npy, and the inference stage resumes off the
+    # inference_cadences run manifest in the DB (a live status='inferred' row means the
+    # cadence is skipped entirely) — so a retry, in-process or a full relaunch of the
+    # identical command, re-runs only what the previous attempt didn't finish.
     preprocessor = DataPreprocessor()
     max_retries = config.inference.max_retries
     retry_delay = config.inference.retry_delay
     results = None
-    # Legacy --test-files path only: cache cadence_data across retry attempts so an
-    # inference-only failure doesn't trigger a re-load / re-downsample / re-log-norm
-    # pass. Mirrors how train_command loads background_data once outside its retry
-    # loop. The streaming CSV path holds no catalog-sized state to cache — its
-    # per-cadence .npy files are the resume mechanism.
-    cadence_data: np.ndarray | None = None
-    npy_path_for_logging: str | None = None
 
     for attempt in range(max_retries):
         try:
@@ -487,21 +668,17 @@ def inference_command():
                         "nothing to load for inference"
                     )
                     sys.exit(1)
-                # Load stage. Skipped on retry if a previous attempt already produced
-                # cadence_data (i.e. only the inference stage failed).
-                if cadence_data is None:
-                    cadence_data = preprocessor.load_inference_data().astype(np.float32)
-                    npy_path_for_logging = config.data.test_files[0]
-                else:
-                    logger.info("Reusing cadence_data from previous attempt (skipping load)")
-
-                # NOTE: come back to this later (inference-stage resume should skip cadences already in the DB. not yet implemented)
-                # Inference stage
+                # Legacy --test-files path: load + infer in one shot. The load repeats on
+                # retry (the old cross-attempt cadence_data cache is gone — the manifest
+                # made it obsolete on the streaming path, and holding a catalog-sized
+                # array across attempts was its only remaining use).
+                cadence_data = preprocessor.load_inference_data().astype(np.float32)
                 results = run_inference_pipeline(
                     cadence_data=cadence_data,
-                    npy_path=npy_path_for_logging,  # TODO: handle multiple test_files properly
+                    npy_path=config.data.test_files[0],  # TODO: handle multiple test_files properly
                     strategy=strategy,
                 )
+                del cadence_data
             break  # success
 
         except KeyboardInterrupt:
@@ -539,6 +716,8 @@ def inference_command():
     logger.info("Summary:")
     if "n_cadences" in results:
         logger.info(f"  Total cadences: {results['n_cadences']}")
+    if results.get("n_skipped"):
+        logger.info(f"    Resumed from a previous attempt (skipped): {results['n_skipped']}")
     logger.info(f"  Total cadence snippets: {results['n_cadence_snippets']}")
     logger.info(f"    Processed: {results['n_processed']}")
     logger.info(f"    Candidates found: {results['n_candidates']}")

@@ -354,6 +354,16 @@ class InferenceConfig:
     # explicitly to share/reuse one directory across runs and CSVs.
     preprocess_output_dir: str | None = None
 
+    # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming
+    # CSV inference run, saved under {output_path}/plots/inference/{save_tag}/ and uploaded
+    # to Slack. Every figure is individually exception-guarded — a plot bug can never kill
+    # a science run.
+    inference_viz_enabled: bool = True
+    # Number of top-statistic stamps shown in the stamp gallery (6-obs waterfall grids).
+    stamp_gallery_top_k: int = 12
+    # Cap on per-candidate figures (candidate_{i}_{tag}.png), highest confidence first.
+    max_candidate_plots: int = 50
+
     # NOTE: come back to this later (is this implemented correctly?)
     # Fault tolerance
     max_retries: int = 3
@@ -632,6 +642,9 @@ class Config:
                 "discard_side_channels": self.inference.discard_side_channels,
                 "side_channel_count": self.inference.side_channel_count,
                 "preprocess_output_dir": self.inference.preprocess_output_dir,
+                "inference_viz_enabled": self.inference.inference_viz_enabled,
+                "stamp_gallery_top_k": self.inference.stamp_gallery_top_k,
+                "max_candidate_plots": self.inference.max_candidate_plots,
                 "max_retries": self.inference.max_retries,
                 "retry_delay": self.inference.retry_delay,
             },

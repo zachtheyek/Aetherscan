@@ -163,6 +163,43 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(argv), None)
         assert any(e.field == "training.initial_snr_range" for e in errors)
 
+    def test_stamp_gallery_top_k_bounds(self):
+        errors = collect_validation_errors(
+            _parse(["inference", "--stamp-gallery-top-k", "0"]), None
+        )
+        assert any(e.field == "inference.stamp_gallery_top_k" for e in errors)
+
+    def test_max_candidate_plots_bounds(self):
+        errors = collect_validation_errors(
+            _parse(["inference", "--max-candidate-plots", "-1"]), None
+        )
+        assert any(e.field == "inference.max_candidate_plots" for e in errors)
+
+    def test_viz_flags_route_to_inference_config(self):
+        config = get_config()
+        apply_args_to_config(
+            _parse(
+                [
+                    "inference",
+                    "--no-inference-viz",
+                    "--stamp-gallery-top-k",
+                    "6",
+                    "--max-candidate-plots",
+                    "10",
+                ]
+            )
+        )
+        assert config.inference.inference_viz_enabled is False
+        assert config.inference.stamp_gallery_top_k == 6
+        assert config.inference.max_candidate_plots == 10
+
+    def test_viz_flags_omitted_keep_defaults(self):
+        config = get_config()
+        apply_args_to_config(_parse(["inference"]))
+        assert config.inference.inference_viz_enabled is True
+        assert config.inference.stamp_gallery_top_k == 12
+        assert config.inference.max_candidate_plots == 50
+
     def test_missing_train_files_reported(self):
         errors = collect_validation_errors(_parse(["train"]), None)
         # Default train_files don't exist under the tmp data path.
@@ -333,7 +370,6 @@ class TestApplySavedConfigPrecedence:
     def test_saved_config_overrides_defaults(self, tmp_path):
         saved = {
             "training": {"num_training_rounds": 7, "snr_base": 33},
-            "checkpoint": {"save_tag": "final_v9"},
             "data_path": "/saved/data/path",
         }
         path = tmp_path / "saved_config.json"
@@ -343,9 +379,37 @@ class TestApplySavedConfigPrecedence:
         config = get_config()
         assert config.training.num_training_rounds == 7
         assert config.training.snr_base == 33
-        # Documented sharp edge: the saved file clobbers checkpoint.save_tag too.
-        assert config.checkpoint.save_tag == "final_v9"
         assert config.data_path == "/saved/data/path"
+
+    def test_checkpoint_section_is_never_applied(self, tmp_path):
+        """Regression: a saved *training* config's checkpoint section (most damagingly
+        save_tag) must never leak onto the singleton — an inference run layering the
+        training config would otherwise masquerade under the training run's tag."""
+        config = get_config()
+        config.checkpoint.save_tag = "20260712_010203"  # this run's own tag
+        original_load_dir = config.checkpoint.load_dir
+        original_load_tag = config.checkpoint.load_tag
+        original_start_round = config.checkpoint.start_round
+
+        saved = {
+            "checkpoint": {
+                "save_tag": "final_v9",
+                "load_dir": "/somewhere/else",
+                "load_tag": "round_05",
+                "start_round": 6,
+            },
+            "beta_vae": {"latent_dim": 16},
+        }
+        path = tmp_path / "saved_config.json"
+        path.write_text(json.dumps(saved))
+        apply_saved_config(str(path))
+
+        assert config.checkpoint.save_tag == "20260712_010203"
+        assert config.checkpoint.load_dir == original_load_dir
+        assert config.checkpoint.load_tag == original_load_tag
+        assert config.checkpoint.start_round == original_start_round
+        # Non-checkpoint sections still layer normally.
+        assert config.beta_vae.latent_dim == 16
 
     def test_cli_args_override_saved_config(self, tmp_path):
         saved = {"training": {"snr_base": 33, "num_training_rounds": 7}}
