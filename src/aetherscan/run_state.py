@@ -103,7 +103,7 @@ _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS = frozenset(
     {
         "config_path",  # source-config file path, not a result input
         "per_replica_batch_size",  # batching only; #120's pad+truncate makes results batch-invariant
-        "parallel_coarse_chans",  # progress-logging chunk size only (inert)
+        "coarse_channel_log_interval",  # progress-logging chunk size only (inert)
         "bandpass_debug_plot",  # opt-in debug artifact
         "preprocess_output_dir",  # where stamps are written (folded into npy_path, not values)
         "inference_viz_enabled",  # viz toggle

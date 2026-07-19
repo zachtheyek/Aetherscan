@@ -367,7 +367,7 @@ class Database:
                 ON inference_cadences(tag, npy_path, status)
             """)
 
-            # Pipeline stage timing table (schema v3): one row per timed pipeline stage
+            # Pipeline stage timing table (schema v4): one row per timed pipeline stage
             # span, written by aetherscan.benchmark (stage_timer / record_stage). stage is
             # a hierarchical dot-name ("train.round_02.data_generation"); metadata is an
             # optional JSON TEXT blob (e.g. {"status": "failed", ...} for spans that ended

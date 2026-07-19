@@ -2258,7 +2258,9 @@ class TrainingPipeline:
         if validate_done_manifest(rf_paths, expected_n_samples=n_samples) is not None:
             logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
         else:
-            with stage_timer("data_generation"):
+            # RF data is always generated in-process (no background producer for the RF phase);
+            # tag source to match the per-round data_generation spans (producer / in-process)
+            with stage_timer("data_generation", metadata={"source": "in-process"}):
                 self.data_generator.generate_round(rf_paths, n_samples, snr_base, snr_range)
         rf_data = load_round_arrays(rf_paths)
 

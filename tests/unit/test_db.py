@@ -669,12 +669,19 @@ class TestSchemaMigration:
         conn.close()
 
         database = Database()
+        database.start()
         try:
             # v3 ALTER: the pre-existing inference_cadences table gains config_fingerprint
             assert "config_fingerprint" in self._column_names(db_path, "inference_cadences")
             # v4: the new stage-timing table is created
             assert "pipeline_stages" in self._table_names(db_path)
             assert self._user_version(db_path) == _SCHEMA_VERSION
+            # ...and the table created during a v2->v4 migration is actually usable
+            database.write_pipeline_stage("train.round_01", 10.0, 12.5, tag="test_v2")
+            assert database.flush(timeout=10) is True
+            rows = database.query_pipeline_stages(tag="test_v2")
+            assert len(rows) == 1
+            assert rows[0]["duration_s"] == 2.5
         finally:
             database.stop()
 
