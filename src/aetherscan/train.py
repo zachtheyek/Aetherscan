@@ -44,6 +44,7 @@ from sklearn.metrics import (
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
+from aetherscan.benchmark import round_stage_name, stage_timer
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
@@ -1266,9 +1267,12 @@ class TrainingPipeline:
 
                 logger.info(f"Curriculum LR reset: {current_lr:.2e} → {original_lr:.2e}")
 
-                self.train_round(
-                    round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
-                )
+                # Umbrella stage span for the whole round (data wait + epochs + plots +
+                # checkpoint save) — the sub-stages inside train_round nest under it
+                with stage_timer(round_stage_name(round_idx + 1)):
+                    self.train_round(
+                        round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
+                    )
         finally:
             # Wind down the producer (graceful shutdown message, escalating to
             # terminate -> kill through the ResourceManager if it's mid-generation)
@@ -1305,7 +1309,13 @@ class TrainingPipeline:
             self._round_producer.await_round(round_number)
             logger.info(f"Round {round_number} data ready (waited {time.time() - wait_start:.1f}s)")
         else:
-            self.data_generator.generate_round(paths, n_samples, snr_base, snr_range, round_number)
+            # In-process generation (overlap disabled). The producer path records the same
+            # stage from its own timing message (see round_data._producer_main / the
+            # drainer's "timing" handler) — the two paths never both run for one round
+            with stage_timer("data_generation", metadata={"source": "in-process"}):
+                self.data_generator.generate_round(
+                    paths, n_samples, snr_base, snr_range, round_number
+                )
 
         # Immediately queue generation of the next round's data so it runs in the producer
         # process while this round's epochs train (curriculum SNR for round k+1 is
@@ -1384,219 +1394,228 @@ class TrainingPipeline:
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
 
         try:
-            for epoch in range(epochs):
-                # Training
-                epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
-                    round_idx,
-                    epoch,
-                    snr_base,
-                    snr_range,
-                    train_dataset,
-                    steps_per_epoch,
-                    accumulation_steps,
-                    time.time(),
-                )
-
-                # Validation
-                val_losses, val_duration = self._validate_epoch(val_dataset, val_steps, time.time())
-
-                # Queue db writes (non-blocking) & log results
-                current_time = time.time()
-
-                if self.db is None:
-                    raise RuntimeError(
-                        "No database instance detected - cannot generate loss curves plot"
+            # Round-level epoch span (per-epoch durations already live in training_stats).
+            # stage_timer records the span even on a mid-loop exception (status=failed).
+            with stage_timer("epochs"):
+                for epoch in range(epochs):
+                    # Training
+                    epoch_losses, epoch_gradient_norms, train_duration = self._train_epoch(
+                        round_idx,
+                        epoch,
+                        snr_base,
+                        snr_range,
+                        train_dataset,
+                        steps_per_epoch,
+                        accumulation_steps,
+                        time.time(),
                     )
 
-                # Training losses
-                for stat_name, key in [
-                    ("total_loss", "total"),
-                    ("reconstruction_loss", "reconstruction"),
-                    ("kl_loss", "kl"),
-                    ("true_loss", "true"),
-                    ("false_loss", "false"),
-                ]:
+                    # Validation
+                    val_losses, val_duration = self._validate_epoch(
+                        val_dataset, val_steps, time.time()
+                    )
+
+                    # Queue db writes (non-blocking) & log results
+                    current_time = time.time()
+
+                    if self.db is None:
+                        raise RuntimeError(
+                            "No database instance detected - cannot generate loss curves plot"
+                        )
+
+                    # Training losses
+                    for stat_name, key in [
+                        ("total_loss", "total"),
+                        ("reconstruction_loss", "reconstruction"),
+                        ("kl_loss", "kl"),
+                        ("true_loss", "true"),
+                        ("false_loss", "false"),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=float(epoch_losses[key]),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # Validation losses
+                    for stat_name, key in [
+                        ("val_total_loss", "total"),
+                        ("val_reconstruction_loss", "reconstruction"),
+                        ("val_kl_loss", "kl"),
+                        ("val_true_loss", "true"),
+                        ("val_false_loss", "false"),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=float(val_losses[key]),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # Gradient norm/clipping statistics
+                    gradient_norm_mean = np.mean(epoch_gradient_norms)
+                    gradient_norm_max = np.max(epoch_gradient_norms)
+                    gradient_norm_std = np.std(epoch_gradient_norms)
+                    clipping_rate = np.sum(np.array(epoch_gradient_norms) > 1.0) / steps_per_epoch
+
+                    for stat_name, stat_value in [
+                        ("gradient_norm_mean", gradient_norm_mean),
+                        ("gradient_norm_max", gradient_norm_max),
+                        ("gradient_norm_std", gradient_norm_std),
+                        ("clipping_rate", clipping_rate),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=float(stat_value),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # Learning rate
+                    current_lr = float(self.vae.optimizer.learning_rate.numpy())
                     self.db.write_training_stat(
                         model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=float(epoch_losses[key]),
+                        stat_name="learning_rate",
+                        value=current_lr,
                         round_number=round_idx + 1,
                         epoch_number=epoch + 1,
                         tag=self.config.checkpoint.save_tag,
                         timestamp=current_time,
                     )
 
-                # Validation losses
-                for stat_name, key in [
-                    ("val_total_loss", "total"),
-                    ("val_reconstruction_loss", "reconstruction"),
-                    ("val_kl_loss", "kl"),
-                    ("val_true_loss", "true"),
-                    ("val_false_loss", "false"),
-                ]:
-                    self.db.write_training_stat(
-                        model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=float(val_losses[key]),
-                        round_number=round_idx + 1,
-                        epoch_number=epoch + 1,
-                        tag=self.config.checkpoint.save_tag,
-                        timestamp=current_time,
+                    # Misc stats
+                    for stat_name, stat_value in [
+                        ("train_duration", train_duration),
+                        ("val_duration", val_duration),
+                        ("snr_range_floor", snr_base),
+                        ("snr_range_ceil", snr_base + snr_range),
+                        ("num_steps", steps_per_epoch),
+                        ("num_sub_steps", accumulation_steps),
+                    ]:
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=stat_name,
+                            value=stat_value,
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+
+                    # COMMENTED OUT: Removing TensorBoard support
+                    # TensorBoard logging
+                    # with self.train_writer.as_default():
+                    #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
+                    #     tf.summary.scalar(
+                    #         "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
+                    #     )
+                    #     tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
+                    #     tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
+                    #     tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
+                    #     tf.summary.scalar(
+                    #         "learning_rate",
+                    #         self.vae.optimizer.learning_rate.numpy(),
+                    #         step=self.global_step,
+                    #     )
+                    #
+                    # with self.val_writer.as_default():
+                    #     tf.summary.scalar(
+                    #         "validation_total_loss", val_losses["total"], step=self.global_step
+                    #     )
+                    #     tf.summary.scalar(
+                    #         "validation_reconstruction_loss",
+                    #         val_losses["reconstruction"],
+                    #         step=self.global_step,
+                    #     )
+                    #     tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
+                    #     tf.summary.scalar(
+                    #         "validation_true_loss", val_losses["true"], step=self.global_step
+                    #     )
+                    #     tf.summary.scalar(
+                    #         "validation_false_loss", val_losses["false"], step=self.global_step
+                    #     )
+                    #
+                    # # Flush writers to ensure data is written
+                    # self.train_writer.flush()
+                    # self.val_writer.flush()
+                    #
+                    # # Increment global step
+                    # self.global_step += 1
+
+                    logger.info(f"Epoch {epoch + 1}")
+                    logger.info(
+                        f"Train -- Total: {epoch_losses['total']:.4f}, "
+                        f"Recon: {epoch_losses['reconstruction']:.4f}, "
+                        f"KL: {epoch_losses['kl']:.4f}, "
+                        f"True: {epoch_losses['true']:.4f}, "
+                        f"False: {epoch_losses['false']:.4f}, "
+                        f"Duration: {train_duration:.2f} "
+                    )
+                    logger.info(
+                        f"Gradient norm -- Mean: {gradient_norm_mean:.4f}, "
+                        f"Std: {gradient_norm_std:.4f}, "
+                        f"Max: {gradient_norm_max:.4f}, "
+                        f"Clipping rate: {clipping_rate:.4f} "
+                    )
+                    logger.info(
+                        f"Val -- Total: {val_losses['total']:.4f}, "
+                        f"Recon: {val_losses['reconstruction']:.4f}, "
+                        f"KL: {val_losses['kl']:.4f}, "
+                        f"True: {val_losses['true']:.4f}, "
+                        f"False: {val_losses['false']:.4f}, "
+                        f"Duration: {val_duration:.2f} "
                     )
 
-                # Gradient norm/clipping statistics
-                gradient_norm_mean = np.mean(epoch_gradient_norms)
-                gradient_norm_max = np.max(epoch_gradient_norms)
-                gradient_norm_std = np.std(epoch_gradient_norms)
-                clipping_rate = np.sum(np.array(epoch_gradient_norms) > 1.0) / steps_per_epoch
-
-                for stat_name, stat_value in [
-                    ("gradient_norm_mean", gradient_norm_mean),
-                    ("gradient_norm_max", gradient_norm_max),
-                    ("gradient_norm_std", gradient_norm_std),
-                    ("clipping_rate", clipping_rate),
-                ]:
-                    self.db.write_training_stat(
-                        model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=float(stat_value),
-                        round_number=round_idx + 1,
-                        epoch_number=epoch + 1,
-                        tag=self.config.checkpoint.save_tag,
-                        timestamp=current_time,
-                    )
-
-                # Learning rate
-                current_lr = float(self.vae.optimizer.learning_rate.numpy())
-                self.db.write_training_stat(
-                    model_name="beta_vae",
-                    stat_name="learning_rate",
-                    value=current_lr,
-                    round_number=round_idx + 1,
-                    epoch_number=epoch + 1,
-                    tag=self.config.checkpoint.save_tag,
-                    timestamp=current_time,
-                )
-
-                # Misc stats
-                for stat_name, stat_value in [
-                    ("train_duration", train_duration),
-                    ("val_duration", val_duration),
-                    ("snr_range_floor", snr_base),
-                    ("snr_range_ceil", snr_base + snr_range),
-                    ("num_steps", steps_per_epoch),
-                    ("num_sub_steps", accumulation_steps),
-                ]:
-                    self.db.write_training_stat(
-                        model_name="beta_vae",
-                        stat_name=stat_name,
-                        value=stat_value,
-                        round_number=round_idx + 1,
-                        epoch_number=epoch + 1,
-                        tag=self.config.checkpoint.save_tag,
-                        timestamp=current_time,
-                    )
-
-                # COMMENTED OUT: Removing TensorBoard support
-                # TensorBoard logging
-                # with self.train_writer.as_default():
-                #     tf.summary.scalar("total_loss", epoch_losses["total"], step=self.global_step)
-                #     tf.summary.scalar(
-                #         "reconstruction_loss", epoch_losses["reconstruction"], step=self.global_step
-                #     )
-                #     tf.summary.scalar("kl_loss", epoch_losses["kl"], step=self.global_step)
-                #     tf.summary.scalar("true_loss", epoch_losses["true"], step=self.global_step)
-                #     tf.summary.scalar("false_loss", epoch_losses["false"], step=self.global_step)
-                #     tf.summary.scalar(
-                #         "learning_rate",
-                #         self.vae.optimizer.learning_rate.numpy(),
-                #         step=self.global_step,
-                #     )
-                #
-                # with self.val_writer.as_default():
-                #     tf.summary.scalar(
-                #         "validation_total_loss", val_losses["total"], step=self.global_step
-                #     )
-                #     tf.summary.scalar(
-                #         "validation_reconstruction_loss",
-                #         val_losses["reconstruction"],
-                #         step=self.global_step,
-                #     )
-                #     tf.summary.scalar("validation_kl_loss", val_losses["kl"], step=self.global_step)
-                #     tf.summary.scalar(
-                #         "validation_true_loss", val_losses["true"], step=self.global_step
-                #     )
-                #     tf.summary.scalar(
-                #         "validation_false_loss", val_losses["false"], step=self.global_step
-                #     )
-                #
-                # # Flush writers to ensure data is written
-                # self.train_writer.flush()
-                # self.val_writer.flush()
-                #
-                # # Increment global step
-                # self.global_step += 1
-
-                logger.info(f"Epoch {epoch + 1}")
-                logger.info(
-                    f"Train -- Total: {epoch_losses['total']:.4f}, "
-                    f"Recon: {epoch_losses['reconstruction']:.4f}, "
-                    f"KL: {epoch_losses['kl']:.4f}, "
-                    f"True: {epoch_losses['true']:.4f}, "
-                    f"False: {epoch_losses['false']:.4f}, "
-                    f"Duration: {train_duration:.2f} "
-                )
-                logger.info(
-                    f"Gradient norm -- Mean: {gradient_norm_mean:.4f}, "
-                    f"Std: {gradient_norm_std:.4f}, "
-                    f"Max: {gradient_norm_max:.4f}, "
-                    f"Clipping rate: {clipping_rate:.4f} "
-                )
-                logger.info(
-                    f"Val -- Total: {val_losses['total']:.4f}, "
-                    f"Recon: {val_losses['reconstruction']:.4f}, "
-                    f"KL: {val_losses['kl']:.4f}, "
-                    f"True: {val_losses['true']:.4f}, "
-                    f"False: {val_losses['false']:.4f}, "
-                    f"Duration: {val_duration:.2f} "
-                )
-
-                # Adaptive learning rate
-                self._update_learning_rate(val_losses)
+                    # Adaptive learning rate
+                    self._update_learning_rate(val_losses)
 
             # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
-            # Plot loss curves
-            self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+            with stage_timer("plots"):
+                # Plot loss curves
+                self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
-            # Plot clipping rate
-            self.plot_beta_vae_training_stability(
-                tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
-            )
+                # Plot clipping rate
+                self.plot_beta_vae_training_stability(
+                    tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+                )
 
-            # Plot injection stats
-            self.plot_injection_stats(
-                tag=f"round_{round_idx + 1:02d}",
-                dir="checkpoints",
-            )
+                # Plot injection stats
+                self.plot_injection_stats(
+                    tag=f"round_{round_idx + 1:02d}",
+                    dir="checkpoints",
+                )
 
-            # Optional per-round latent traversal (config-gated; the canonical set renders
-            # once at end of training in the vae_plots stage). Failures are logged and
-            # swallowed — an optional plot mustn't fail the round and cost a retry cycle
-            # including data regeneration
-            if self.config.training.latent_traversal_every_round:
-                try:
-                    self.plot_latent_traversal(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to execute plot_latent_traversal for round {round_idx + 1}: {e}"
-                    )
+                # Optional per-round latent traversal (config-gated; the canonical set
+                # renders once at end of training in the vae_plots stage). Failures are
+                # logged and swallowed — an optional plot mustn't fail the round and cost
+                # a retry cycle including data regeneration
+                if self.config.training.latent_traversal_every_round:
+                    try:
+                        self.plot_latent_traversal(
+                            tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to execute plot_latent_traversal for round {round_idx + 1}: {e}"
+                        )
 
-            # NOTE: commented out to save compute. a final latent space gif at the end of training should suffice
-            # Generate latent space GIF
-            # self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+                # NOTE: commented out to save compute. a final latent space gif at the end of training should suffice
+                # Generate latent space GIF
+                # self.plot_latent_space_gif(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
             # Save checkpoint
-            self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+            with stage_timer("checkpoint_save"):
+                self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
 
             # Checkpoint is on disk — record the round in the run manifest so a retry (or a
             # relaunch of the identical command) resumes at the next round
@@ -2239,7 +2258,10 @@ class TrainingPipeline:
         if validate_done_manifest(rf_paths, expected_n_samples=n_samples) is not None:
             logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
         else:
-            self.data_generator.generate_round(rf_paths, n_samples, snr_base, snr_range)
+            # RF data is always generated in-process (no background producer for the RF phase);
+            # tag source to match the per-round data_generation spans (producer / in-process)
+            with stage_timer("data_generation", metadata={"source": "in-process"}):
+                self.data_generator.generate_round(rf_paths, n_samples, snr_base, snr_range)
         rf_data = load_round_arrays(rf_paths)
 
         # Prepare distributed train+val datasets (stratified split). shuffle=False so the
@@ -2325,23 +2347,24 @@ class TrainingPipeline:
             # each generator only yields rows from its own index subset.
             train_encode_steps = train_steps * accumulation_steps
 
-            [train_latents] = self._distributed_encode(
-                dataset=train_dataset,
-                n_steps=train_encode_steps,
-                encode_fn=rf_encode_fn,
-                n_samples=n_train_trimmed * num_observations,
-                latent_dim=latent_dim,
-                logging=True,
-            )
+            with stage_timer("encode"):
+                [train_latents] = self._distributed_encode(
+                    dataset=train_dataset,
+                    n_steps=train_encode_steps,
+                    encode_fn=rf_encode_fn,
+                    n_samples=n_train_trimmed * num_observations,
+                    latent_dim=latent_dim,
+                    logging=True,
+                )
 
-            [val_latents] = self._distributed_encode(
-                dataset=val_dataset,
-                n_steps=val_steps,
-                encode_fn=rf_encode_fn,
-                n_samples=n_val_trimmed * num_observations,
-                latent_dim=latent_dim,
-                logging=True,
-            )
+                [val_latents] = self._distributed_encode(
+                    dataset=val_dataset,
+                    n_steps=val_steps,
+                    encode_fn=rf_encode_fn,
+                    n_samples=n_val_trimmed * num_observations,
+                    latent_dim=latent_dim,
+                    logging=True,
+                )
 
             # Derive aligned binary & sub-type labels for train/val splits. With shuffle=False,
             # the i-th cadence in the encoded train/val array corresponds to train_indices[i] /
@@ -2356,7 +2379,8 @@ class TrainingPipeline:
             )
 
             # Train Random Forest classifier (passes latent_vectors; model flattens internally)
-            self.rf_model.train(train_latents, train_binary_labels)
+            with stage_timer("fit"):
+                self.rf_model.train(train_latents, train_binary_labels)
             logger.info("Random Forest training complete")
 
             # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for? why are we calling model.predict_proba directly? is it better to have a wrapper here? could we modify the return signature of predict_proba to return both features & probabilities?)
@@ -6594,7 +6618,8 @@ def _execute_training_stages(pipeline) -> None:
         logger.info(f"Stage '{STAGE_VAE_PLOTS}' already complete — skipping")
     else:
         try:
-            pipeline.plot_vae_diagnostics()
+            with stage_timer("train.vae_plots"):
+                pipeline.plot_vae_diagnostics()
             pipeline._mark_stage_done(STAGE_VAE_PLOTS)
         except Exception as e:
             logger.error(f"Stage '{STAGE_VAE_PLOTS}' failed: {e}")
@@ -6611,7 +6636,10 @@ def _execute_training_stages(pipeline) -> None:
         logger.info(f"Stage '{STAGE_RF_TRAIN}' already complete — loaded persisted RF model")
     else:
         try:
-            pipeline.train_random_forest()
+            # Umbrella span for the RF stage — the data_generation / encode / fit
+            # sub-stages inside train_random_forest nest under it
+            with stage_timer("train.rf"):
+                pipeline.train_random_forest()
         except Exception as e:
             logger.error(f"Error in train_random_forest(): {e}")
             # Attempt to save models on RF training failure
@@ -6625,7 +6653,8 @@ def _execute_training_stages(pipeline) -> None:
         logger.info(f"Stage '{STAGE_RF_PLOTS}' already complete — skipping")
     else:
         try:
-            pipeline.plot_rf_diagnostics()
+            with stage_timer("train.rf_plots"):
+                pipeline.plot_rf_diagnostics()
             pipeline._mark_stage_done(STAGE_RF_PLOTS)
         except Exception as e:
             logger.error(f"Stage '{STAGE_RF_PLOTS}' failed: {e}")
@@ -6642,7 +6671,8 @@ def _execute_training_stages(pipeline) -> None:
     if state.is_stage_done(STAGE_FINAL_SAVE):
         logger.info(f"Stage '{STAGE_FINAL_SAVE}' already complete — skipping")
     else:
-        pipeline.final_save()
+        with stage_timer("train.final_save"):
+            pipeline.final_save()
         pipeline._mark_stage_done(STAGE_FINAL_SAVE)
 
     # Stage 6: hf_upload (opt-in via config.hf.upload_after_training; non-critical) —

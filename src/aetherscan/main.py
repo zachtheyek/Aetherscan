@@ -18,6 +18,7 @@ import numpy as np
 import tensorflow as tf
 from dotenv import find_dotenv, load_dotenv
 
+from aetherscan.benchmark import stage_timer
 from aetherscan.cli import (
     apply_args_to_config,
     apply_saved_config,
@@ -235,7 +236,8 @@ def train_command():
     # then we should consider moving this into TrainingPipeline proper
     try:
         preprocessor = DataPreprocessor()
-        background_data = preprocessor.load_train_data().astype(np.float32)
+        with stage_timer("train.load_backgrounds"):
+            background_data = preprocessor.load_train_data().astype(np.float32)
         # NOTE: do we need to close preprocessing pools and/or shared memory?
     except Exception as e:
         logger.error(f"Failed to load train backgrounds: {e}")
@@ -344,41 +346,45 @@ def _infer_cadence(
 
     stage_start = time.time()
 
-    # copy=False: the loader already returns float32; don't duplicate GBs of stamps
-    cadence_data = preprocessor.load_inference_data(
-        override_filepaths=[cadence_result.npy_path]
-    ).astype(np.float32, copy=False)
+    # Umbrella stage span for this cadence's inference phase — the load_lognorm /
+    # encode / rf / db_write sub-stages inside nest under it via thread-local naming
+    with stage_timer(f"inference.infer_cadence_{unit.index:03d}"):
+        # copy=False: the loader already returns float32; don't duplicate GBs of stamps
+        with stage_timer("load_lognorm"):
+            cadence_data = preprocessor.load_inference_data(
+                override_filepaths=[cadence_result.npy_path]
+            ).astype(np.float32, copy=False)
 
-    # Step 1: retire any partial rows from a dead attempt before fresh ones land
-    db.mark_superseded("inference_results", tag, npy_path=cadence_result.npy_path)
+        # Step 1: retire any partial rows from a dead attempt before fresh ones land
+        db.mark_superseded("inference_results", tag, npy_path=cadence_result.npy_path)
 
-    results = pipeline.run_inference(
-        data=cadence_data,
-        npy_path=cadence_result.npy_path,
-        **provenance,
-    )
-    del cadence_data
-    gc.collect()
+        results = pipeline.run_inference(
+            data=cadence_data,
+            npy_path=cadence_result.npy_path,
+            **provenance,
+        )
+        del cadence_data
+        gc.collect()
 
-    duration_s = time.time() - stage_start
+        duration_s = time.time() - stage_start
 
-    # Steps 3 + 4: new-row-plus-supersede on the run manifest
-    confidence_summary = summarize_confidences(
-        results["proba_true"], config.inference.classification_threshold
-    )
-    db.mark_superseded("inference_cadences", tag, npy_path=cadence_result.npy_path)
-    db.write_inference_cadence(
-        npy_path=cadence_result.npy_path,
-        status="inferred",
-        tag=tag,
-        csv_path=unit.group.csv_path,
-        cadence_key=cadence_result.key,
-        n_stamps=results["n_cadence_snippets"],
-        n_candidates=results["n_candidates"],
-        confidence_summary=confidence_summary,
-        duration_s=duration_s,
-        config_fingerprint=config_fingerprint,
-    )
+        # Steps 3 + 4: new-row-plus-supersede on the run manifest
+        confidence_summary = summarize_confidences(
+            results["proba_true"], config.inference.classification_threshold
+        )
+        db.mark_superseded("inference_cadences", tag, npy_path=cadence_result.npy_path)
+        db.write_inference_cadence(
+            npy_path=cadence_result.npy_path,
+            status="inferred",
+            tag=tag,
+            csv_path=unit.group.csv_path,
+            cadence_key=cadence_result.key,
+            n_stamps=results["n_cadence_snippets"],
+            n_candidates=results["n_candidates"],
+            confidence_summary=confidence_summary,
+            duration_s=duration_s,
+            config_fingerprint=config_fingerprint,
+        )
 
     results["provenance"] = provenance
     results["duration_s"] = duration_s
@@ -596,7 +602,8 @@ def _run_streaming_csv_inference(
 
     if collector is not None:
         # Every figure is individually exception-guarded — a plot bug can't fail the pass
-        render_inference_visualizations(collector, preprocessor, totals)
+        with stage_timer("inference.viz"):
+            render_inference_visualizations(collector, preprocessor, totals)
 
     return totals
 
@@ -676,7 +683,8 @@ def inference_command():
                 # retry (the old cross-attempt cadence_data cache is gone — the manifest
                 # made it obsolete on the streaming path, and holding a catalog-sized
                 # array across attempts was its only remaining use).
-                cadence_data = preprocessor.load_inference_data().astype(np.float32)
+                with stage_timer("inference.load_lognorm"):
+                    cadence_data = preprocessor.load_inference_data().astype(np.float32)
                 results = run_inference_pipeline(
                     cadence_data=cadence_data,
                     npy_path=config.data.test_files[0],  # TODO: handle multiple test_files properly

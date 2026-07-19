@@ -451,11 +451,16 @@ class TestProducerProtocol:
                 break
         return messages
 
-    def test_generate_emits_stats_progress_done(self, tmp_path):
+    def test_generate_emits_stats_progress_timing_done(self, tmp_path):
         messages = self._run(tmp_path, _stub_generate_ok, [("generate", 1, 10, 40)])
         kinds = [m[0] for m in messages]
-        assert kinds == ["stats", "progress", "done", "shutdown_ack"]
-        done = messages[2]
+        # Timing precedes done (queue FIFO: the drainer records the stage span before
+        # await_round unblocks)
+        assert kinds == ["stats", "progress", "timing", "done", "shutdown_ack"]
+        timing = messages[2]
+        assert timing[1] == 1
+        assert timing[2] <= timing[3]  # start_ts <= end_ts
+        done = messages[3]
         assert done[1] == 1
         assert done[2]["stub"] is True
 
@@ -594,6 +599,22 @@ class TestRoundDataProducerDrainer:
             "inject_duration",
         }
         assert all(w["tag"] == "test_v1" for w in producer._db.writes)
+
+    def test_timing_message_records_stage_span(self, producer, monkeypatch):
+        recorded = []
+        monkeypatch.setattr(
+            "aetherscan.round_data.record_stage",
+            lambda *args, **kwargs: recorded.append((args, kwargs)),
+        )
+        producer._result_queue.put(("timing", 3, 100.0, 160.0))
+        producer._result_queue.put(("done", 3, {"n_samples": 8}))
+        producer.await_round(3)  # FIFO: the timing message was handled before done
+        assert recorded == [
+            (
+                ("train.round_03.data_generation", 100.0, 160.0),
+                {"tag": "test_v1", "metadata": {"source": "producer"}},
+            )
+        ]
 
     def test_producer_death_unblocks_await_round(self, producer):
         producer._process.alive = False

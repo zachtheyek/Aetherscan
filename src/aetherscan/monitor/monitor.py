@@ -32,6 +32,27 @@ from aetherscan.logger import get_logger
 
 logger = logging.getLogger(__name__)
 
+# Only pipeline_stages spans this shallow (dot-separated components) are overlaid on the
+# resource plot — deep spans (per-ON-file energy detection, encode/rf sub-stages, ...) stay
+# report-tool-only so the CPU panel doesn't drown in bands
+_ANNOTATION_MAX_DEPTH = 2
+
+# Alternating band face colors (matplotlib named colors), cycled across adjacent spans so
+# consecutive stages stay visually separable at low alpha
+_ANNOTATION_COLORS = ("tab:purple", "tab:olive", "tab:cyan")
+
+
+def select_annotation_spans(rows: list[dict], max_depth: int = _ANNOTATION_MAX_DEPTH) -> list[dict]:
+    """
+    Filter pipeline_stages rows down to the ones the resource plot overlays: spans whose
+    dot-name has at most max_depth components (e.g. "train.round_03" but not
+    "train.round_03.epochs"), sorted by start_time. Pure helper, unit-testable without a
+    monitor instance.
+    """
+    spans = [row for row in rows if len(str(row["stage"]).split(".")) <= max_depth]
+    spans.sort(key=lambda row: row["start_time"])
+    return spans
+
 
 # BUG:
 # system total CPU usage appears "unnormalized" compared to aetherscan CPU usage (aetherscan CPU & RAM sometimes exceeds system total)
@@ -382,6 +403,50 @@ class ResourceMonitor:
         # Save plot on shutdown
         self._save_plot()
 
+    def _annotate_stage_spans(self, ax, current_time: float) -> None:
+        """
+        Overlay this run's top-level pipeline_stages spans (depth <= 2 dot-names) as
+        labeled translucent vertical bands on `ax` (the CPU panel). X units match the
+        panel: minutes since monitor start. Flushes the DB first so spans recorded moments
+        before shutdown (final_save, viz) make it onto the plot.
+        """
+        # The writer thread outlives the monitor (manager cleanup order: monitor before
+        # db), so a flush here is safe; a timeout just means the newest spans are missing
+        self.db.flush()
+
+        rows = self.db.query_pipeline_stages(
+            tag=self.tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+        spans = select_annotation_spans(rows)
+        if not spans:
+            logger.info("No top-level pipeline stage spans to annotate")
+            return
+
+        for idx, span in enumerate(spans):
+            start_min = (span["start_time"] - self.start_time) / 60
+            end_min = (min(span["end_time"], current_time) - self.start_time) / 60
+            color = _ANNOTATION_COLORS[idx % len(_ANNOTATION_COLORS)]
+            ax.axvspan(start_min, end_min, alpha=0.12, color=color, zorder=0)
+            # Label with the leaf name component ("round_03", not "train.round_03"),
+            # anchored near the top of the band, clipped to the axes
+            label = str(span["stage"]).split(".")[-1]
+            ax.text(
+                (start_min + end_min) / 2,
+                97,
+                label,
+                rotation=90,
+                ha="center",
+                va="top",
+                fontsize=7,
+                color="dimgray",
+                clip_on=True,
+                zorder=1,
+            )
+
+        logger.info(f"Annotated {len(spans)} pipeline stage span(s) on the CPU panel")
+
     def _save_plot(self):
         """Generate and save resource utilization plot from database"""
         current_time = time.time()
@@ -496,6 +561,15 @@ class ResourceMonitor:
         # TODO: place legend outside of plot (see plot_beta_vae_training_progress()) (only for gpu plot?)
         ax_cpu.legend(loc="upper right", fontsize=10)
         ax_cpu.set_title(f"CPU Pressure (n={psutil.cpu_count()} cores)", fontsize=12)
+
+        # Overlay top-level pipeline stage spans as labeled translucent bands so CPU
+        # plateaus are attributable at a glance ("this plateau = round 3 data gen").
+        # Fully exception-guarded: a broken overlay must never cost the resource plot
+        if self.config.monitor.annotate_stages:
+            try:
+                self._annotate_stage_spans(ax_cpu, current_time)
+            except Exception as e:
+                logger.error(f"Failed to annotate pipeline stages on resource plot: {e}")
 
         # RAM plot
         ax_ram = axes[1]

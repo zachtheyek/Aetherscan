@@ -45,6 +45,10 @@ class MonitorConfig:
     stop_monitor_timeout: float = 10.0  # seconds
     monitor_interval: float = 1.0  # seconds
     monitor_retry_delay: float = 1.0  # seconds
+    # Overlay top-level pipeline_stages spans (depth <= 2 dot-names, e.g. "train.round_03")
+    # as labeled translucent bands on the resource plot's CPU panel, so utilization
+    # plateaus are attributable to pipeline stages at a glance
+    annotate_stages: bool = True
 
 
 @dataclass
@@ -183,8 +187,11 @@ class TrainingConfig:
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
     )
-    # NOTE: is this the optimal size?
-    data_gen_task_size: int = 256  # Cadences per batched worker task (workers write results straight into the round memmap)
+    # Tuned to 64 via smoke-scale (n=8192) task-size sweeps on bla0 (96c) + blpc3 (32c):
+    # finer tasks load-balance the create_true_double straggler with negligible per-task
+    # overhead; 64 was near-optimal on both (256 ran ~2x slower on bla0).
+    # TODO: re-confirm at production sample sizes (~500k) before treating as final.
+    data_gen_task_size: int = 64  # Cadences per batched worker task (workers write results straight into the round memmap)
 
     # Round data pipeline params (disk-backed per-round datasets, see round_data.py)
     round_data_dir: str | None = None  # Defaults to get_training_file_path("round_data") at runtime
@@ -317,7 +324,7 @@ class InferenceConfig:
     # Progress-logging chunk size for energy detection (coarse channels per log line).
     # None -> use manager.n_processes. Parallelism itself comes from the persistent worker
     # pool (one fused task per coarse channel), not from this knob.
-    parallel_coarse_chans: int | None = None
+    coarse_channel_log_interval: int | None = None
     # Bandpass flattening method for energy detection: "pfb" divides each coarse channel by
     # the instrument's static polyphase-filterbank response (computed once per run); "spline"
     # fits and subtracts a spline per coarse channel per file (the historical, data-driven
@@ -540,6 +547,7 @@ class Config:
                 "stop_monitor_timeout": self.monitor.stop_monitor_timeout,
                 "monitor_interval": self.monitor.monitor_interval,
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
+                "annotate_stages": self.monitor.annotate_stages,
             },
             "logger": {
                 "console_level": self.logger.console_level,
@@ -645,7 +653,7 @@ class Config:
                 "cadence_h5_path_col": self.inference.cadence_h5_path_col,
                 "cadence_expected_obs": self.inference.cadence_expected_obs,
                 "coarse_channel_width": self.inference.coarse_channel_width,
-                "parallel_coarse_chans": self.inference.parallel_coarse_chans,
+                "coarse_channel_log_interval": self.inference.coarse_channel_log_interval,
                 "bandpass_method": self.inference.bandpass_method,
                 "pfb_taps_per_channel": self.inference.pfb_taps_per_channel,
                 "bandpass_debug_plot": self.inference.bandpass_debug_plot,

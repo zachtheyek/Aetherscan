@@ -21,6 +21,7 @@ from aetherscan.run_state import (
     TrainingRunState,
     config_changed,
     config_fingerprint,
+    inference_config_fingerprint,
     load_run_state,
     run_state_path,
     save_run_state,
@@ -164,7 +165,7 @@ class TestConfigFingerprint:
         "data": {"num_target_backgrounds": 45000},
         "training": {"num_samples_beta_vae": 499200, "max_retries": 3, "retry_delay": 60},
         "gpu": {"num_replicas": None},
-        "inference": {"max_retries": 3, "parallel_coarse_chans": None},
+        "inference": {"max_retries": 3, "coarse_channel_log_interval": None},
         "hf": {
             "upload_after_training": False,
             "repo_id": "zachtheyek/aetherscan",
@@ -242,3 +243,70 @@ class TestConfigFingerprint:
         state = TrainingRunState(tag="final_v1", run_start_time=1.0, config_fingerprint="deadbeef")
         save_run_state(state, path)
         assert load_run_state(path).config_fingerprint == "deadbeef"
+
+
+class TestInferenceConfigFingerprint:
+    """inference_config_fingerprint(): the inference-side config-drift guard. The denylist must
+    keep inert knobs (I/O, batching, retry, viz, and the coarse_channel_log_interval progress-log
+    cadence) out of the hash, while result-affecting inference params and data-geometry changes
+    flip it."""
+
+    BASE = {
+        "inference": {
+            "classification_threshold": 0.99,
+            "stat_threshold": 2048.0,
+            "coarse_channel_log_interval": None,
+            "max_retries": 3,
+            "inference_viz_enabled": True,
+        },
+        "data": {
+            "downsample_factor": 8,
+            "width_bin": 4096,
+            "num_observations": 6,
+            "time_bins": 16,
+        },
+    }
+
+    def _mutate(self, section, key, value):
+        d = copy.deepcopy(self.BASE)
+        d[section][key] = value
+        return d
+
+    def test_stable_for_identical_config(self):
+        assert inference_config_fingerprint(self.BASE) == inference_config_fingerprint(
+            copy.deepcopy(self.BASE)
+        )
+
+    @pytest.mark.parametrize(
+        "section,key,value",
+        [
+            ("inference", "classification_threshold", 0.5),
+            ("inference", "stat_threshold", 1024.0),
+            ("data", "downsample_factor", 4),
+            ("data", "width_bin", 2048),
+            ("data", "num_observations", 4),
+            ("data", "time_bins", 32),
+        ],
+    )
+    def test_result_affecting_change_flips_fingerprint(self, section, key, value):
+        assert inference_config_fingerprint(self._mutate(section, key, value)) != (
+            inference_config_fingerprint(self.BASE)
+        )
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            # coarse_channel_log_interval is inert (progress-log cadence only); changing it must
+            # NOT invalidate stage-aware resume. Regression guard for the
+            # parallel_coarse_chans -> coarse_channel_log_interval rename: the denylist in
+            # run_state.py must track the new field name, else this knob leaks into the hash and
+            # a reused --save-tag needlessly re-infers every cadence.
+            ("coarse_channel_log_interval", 8),
+            ("max_retries", 9),
+            ("inference_viz_enabled", False),
+        ],
+    )
+    def test_inert_inference_change_keeps_fingerprint(self, key, value):
+        d = copy.deepcopy(self.BASE)
+        d["inference"][key] = value
+        assert inference_config_fingerprint(d) == inference_config_fingerprint(self.BASE)

@@ -50,7 +50,10 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     cadence whose stored 'inferred' row was written under the same inference config — guards
 #     the reused-tag-with-changed-config stale-reuse footgun (the inference counterpart of the
 #     training-side config_fingerprint guard).
-_SCHEMA_VERSION = 3
+# v4: added the `pipeline_stages` table (always-on stage timing spans from
+#     aetherscan.benchmark, consumed by utils/benchmark_report.py and the monitor's
+#     stage-band overlay). New table -> no ALTER step, same as v2.
+_SCHEMA_VERSION = 4
 
 
 def get_system_metadata() -> str:
@@ -364,6 +367,30 @@ class Database:
                 ON inference_cadences(tag, npy_path, status)
             """)
 
+            # Pipeline stage timing table (schema v4): one row per timed pipeline stage
+            # span, written by aetherscan.benchmark (stage_timer / record_stage). stage is
+            # a hierarchical dot-name ("train.round_02.data_generation"); metadata is an
+            # optional JSON TEXT blob (e.g. {"status": "failed", ...} for spans that ended
+            # in an exception). Retried stages simply append new rows — consumers see every
+            # attempt, each with its own span.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pipeline_stages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stage TEXT NOT NULL,
+                    start_time REAL NOT NULL,
+                    end_time REAL NOT NULL,
+                    duration_s REAL NOT NULL,
+                    tag TEXT,
+                    metadata TEXT
+                )
+            """)
+
+            # Composite index for the common filter pattern (tag + start_time)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pipeline_stages_filter
+                ON pipeline_stages(tag, start_time)
+            """)
+
             conn.commit()
 
             # Bring pre-existing databases (older schema) up to the current version
@@ -406,10 +433,9 @@ class Database:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN superseded INTEGER DEFAULT 0")
                     logger.info(f"Schema migration: added {table}.superseded")
 
-        # v2 (inference_cadences table) needs no migration step here: the table is created
-        # for old and new databases alike by the CREATE TABLE IF NOT EXISTS statement in
-        # _init_database(), which always runs before this method. Only the version stamp
-        # below advances.
+        # v2 (inference_cadences table) needs no migration step here: the table is created for
+        # old and new databases alike by the CREATE TABLE IF NOT EXISTS statements in
+        # _init_database(), which always runs before this method.
 
         if version < 3:
             # v3: config_fingerprint on inference_cadences. A fresh db already has the column
@@ -419,6 +445,10 @@ class Database:
             if "config_fingerprint" not in columns:
                 cursor.execute("ALTER TABLE inference_cadences ADD COLUMN config_fingerprint TEXT")
                 logger.info("Schema migration: added inference_cadences.config_fingerprint")
+
+        # v4 (pipeline_stages table) needs no migration step here either: like v2, the table is
+        # created for old and new databases alike by the CREATE TABLE IF NOT EXISTS statement in
+        # _init_database(). Only the version stamp below advances.
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -741,6 +771,7 @@ class Database:
                 latent_snapshots_records: list[tuple] = []
                 inference_results_records: list[tuple] = []
                 inference_cadences_records: list[tuple] = []
+                pipeline_stages_records: list[tuple] = []
 
                 for table, values in self.buffer:
                     if table == "system_resources":
@@ -755,6 +786,8 @@ class Database:
                         inference_results_records.append(values)
                     elif table == "inference_cadences":
                         inference_cadences_records.append(values)
+                    elif table == "pipeline_stages":
+                        pipeline_stages_records.append(values)
 
                 # Bulk insert each table type
                 if system_resources_records:
@@ -823,6 +856,16 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_cadences_records,
+                    )
+
+                if pipeline_stages_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO pipeline_stages
+                        (stage, start_time, end_time, duration_s, tag, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        pipeline_stages_records,
                     )
 
                 conn.commit()
@@ -1123,6 +1166,38 @@ class Database:
             )
         )
 
+    # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
+    def write_pipeline_stage(
+        self,
+        stage: str,
+        start_time: float,
+        end_time: float,
+        tag: str | None = None,
+        metadata: str | None = None,
+    ):
+        """
+        Queue a non-blocking write to pipeline_stages.
+
+        stage is a hierarchical dot-name ("train.round_02.data_generation"); start_time /
+        end_time are unix timestamps bounding the span (duration_s is derived here so the
+        table stays internally consistent). metadata, when given, is an already-serialized
+        JSON string (aetherscan.benchmark owns the serialization). Prefer the stage_timer /
+        record_stage helpers in aetherscan.benchmark over calling this directly.
+        """
+        self.write_queue.put(
+            (
+                "pipeline_stages",
+                (
+                    stage,
+                    start_time,
+                    end_time,
+                    end_time - start_time,
+                    tag,
+                    metadata,
+                ),
+            )
+        )
+
     # Column whitelists per table (for SQL injection prevention when using column projection)
     _SYSTEM_RESOURCES_COLUMNS = {
         "id",
@@ -1213,6 +1288,15 @@ class Database:
         "duration_s",
         "config_fingerprint",
         "superseded",
+    }
+    _PIPELINE_STAGES_COLUMNS = {
+        "id",
+        "stage",
+        "start_time",
+        "end_time",
+        "duration_s",
+        "tag",
+        "metadata",
     }
 
     @staticmethod
@@ -1914,6 +1998,61 @@ class Database:
             # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
+    def query_pipeline_stages(
+        self,
+        stage: str | list[str] | None = None,
+        tag: str | list[str] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        columns: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query rows from pipeline_stages as a list of dicts, ordered by start_time.
+
+        stage and tag accept either a single value (= filter) or a list (IN filter).
+        start_time/end_time bound the row's start_time column (unix time, inclusive on both
+        ends) — a span that started inside the window but ended after end_time is still
+        returned. The returned metadata field is a JSON string or None — callers parse it
+        with json.loads. columns is validated against _PIPELINE_STAGES_COLUMNS.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            select = self._build_select("pipeline_stages", columns, self._PIPELINE_STAGES_COLUMNS)
+            # WHERE 1=1 is a way of building parametrized queries
+            # Since 1=1 is always true, it does nothing functionally
+            # But it allows us to safely add more conditions by appending AND clauses
+            # While not breaking the query if none are added
+            query = f"{select} WHERE 1=1"
+            params: list = []
+
+            # Build the query dynamically based on user-specified conditions
+            if stage:
+                query = self._add_str_filter(query, params, "stage", stage)
+
+            if tag:
+                query = self._add_str_filter(query, params, "tag", tag)
+
+            if start_time is not None:
+                query += " AND start_time >= ?"
+                params.append(start_time)
+
+            if end_time is not None:
+                query += " AND start_time <= ?"
+                params.append(end_time)
+
+            # Chronological order is what every consumer (report tree, timeline plot,
+            # monitor overlay) wants; the table stays small (one row per stage span), so
+            # the filesort on top of idx_pipeline_stages_filter is cheap
+            query += " ORDER BY start_time"
+
+            cursor.execute(query, params)
+
+            # Create a list of column names using query result's metadata
+            result_columns = [desc[0] for desc in cursor.description]
+            # Pair column names with values and return to user as a dict
+            return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+
     # NOTE: this call gets expensive as db grows. create a separate schema to track num_rows_added per pipeline run. then count & update as part of db cleanup routine? or use SQLite's dbstat virtual table or periodic ANALYZE?
     def get_db_stats(self) -> dict[str, Any]:
         """Get summary statistics for the database"""
@@ -1940,6 +2079,9 @@ class Database:
 
             cursor.execute("SELECT COUNT(*) FROM inference_cadences")
             stats["inference_cadences_row_count"] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM pipeline_stages")
+            stats["pipeline_stages_row_count"] = cursor.fetchone()[0]
 
             # Time range
             # Use system_resources as proxy

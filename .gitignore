@@ -9,6 +9,9 @@ rzad056.pdf
 # Outputs directory
 outputs/
 
+# Micro-benchmark result JSONs (per-machine; baselines are documented in benchmarks/README.md)
+benchmarks/results/
+
 # Container artifacts
 *.sif
 

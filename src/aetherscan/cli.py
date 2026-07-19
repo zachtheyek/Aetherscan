@@ -787,7 +787,7 @@ def _add_inference_flags_to(parser):
         help="Number of fine channels per coarse channel (default: 1048576)",
     )
     parser.add_argument(
-        "--parallel-coarse-chans",
+        "--coarse-channel-log-interval",
         type=int,
         default=None,
         help="Progress-logging chunk size for energy detection, in coarse channels per log line (default: the number of worker processes). Parallelism itself comes from the persistent worker pool, not this knob.",
@@ -1234,8 +1234,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.cadence_expected_obs = args.cadence_expected_obs
     if hasattr(args, "coarse_channel_width") and args.coarse_channel_width is not None:
         config.inference.coarse_channel_width = args.coarse_channel_width
-    if hasattr(args, "parallel_coarse_chans") and args.parallel_coarse_chans is not None:
-        config.inference.parallel_coarse_chans = args.parallel_coarse_chans
+    if (
+        hasattr(args, "coarse_channel_log_interval")
+        and args.coarse_channel_log_interval is not None
+    ):
+        config.inference.coarse_channel_log_interval = args.coarse_channel_log_interval
     if hasattr(args, "bandpass_method") and args.bandpass_method is not None:
         config.inference.bandpass_method = args.bandpass_method
     if hasattr(args, "pfb_taps_per_channel") and args.pfb_taps_per_channel is not None:
@@ -2087,8 +2090,8 @@ def collect_validation_errors(
         coarse_channel_width = _resolve(
             args, "coarse_channel_width", config.inference.coarse_channel_width
         )
-        parallel_coarse_chans = _resolve(
-            args, "parallel_coarse_chans", config.inference.parallel_coarse_chans
+        coarse_channel_log_interval = _resolve(
+            args, "coarse_channel_log_interval", config.inference.coarse_channel_log_interval
         )
         spline_order = _resolve(args, "spline_order", config.inference.spline_order)
         detection_window_size = _resolve(
@@ -2104,7 +2107,7 @@ def collect_validation_errors(
         # Positivity checks for the bare-int / bare-float fields, in parser order.
         for name, val in (
             ("coarse_channel_width", coarse_channel_width),
-            ("parallel_coarse_chans", parallel_coarse_chans),
+            ("coarse_channel_log_interval", coarse_channel_log_interval),
             ("stat_threshold", stat_threshold),
             ("stamp_width", stamp_width),
         ):

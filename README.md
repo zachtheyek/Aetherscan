@@ -731,7 +731,7 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
                  [--coarse-channel-width COARSE_CHANNEL_WIDTH]
-                 [--parallel-coarse-chans PARALLEL_COARSE_CHANS]
+                 [--coarse-channel-log-interval COARSE_CHANNEL_LOG_INTERVAL]
                  [--bandpass-method BANDPASS_METHOD]
                  [--pfb-taps-per-channel PFB_TAPS_PER_CHANNEL]
                  [--bandpass-debug-plot | --no-bandpass-debug-plot]
@@ -817,7 +817,7 @@ options:
   --coarse-channel-width COARSE_CHANNEL_WIDTH
                         Number of fine channels per coarse channel (default:
                         1048576)
-  --parallel-coarse-chans PARALLEL_COARSE_CHANS
+  --coarse-channel-log-interval COARSE_CHANNEL_LOG_INTERVAL
                         Progress-logging chunk size for energy detection, in
                         coarse channels per log line (default: the number of
                         worker processes). Parallelism itself comes from the

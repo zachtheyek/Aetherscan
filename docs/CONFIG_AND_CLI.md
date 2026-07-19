@@ -68,7 +68,7 @@ subcommand uses it:
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `DBConfig`           | SQLite writer timeouts, buffer sizes                                                                                               |
 | `ManagerConfig`      | Multiprocessing pool sizing                                                                                                        |
-| `MonitorConfig`      | Resource-monitor cadence and timeouts                                                                                              |
+| `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle                                                           |
 | `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
 | `BetaVAEConfig`      | Beta-VAE model hyperparameters                                                                                                     |
 | `RandomForestConfig` | RF classifier hyperparameters                                                                                                      |
