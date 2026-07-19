@@ -425,6 +425,14 @@ class TestUploadRunToHf:
         )
         assert "test_v1" in fake_api.uploaded_files[HF_CARD_FILENAME]
 
+        # HFSEC-1: the config.json actually pushed to the public repo is redacted of host paths
+        # and real dataset filenames, but keeps hyperparameters.
+        uploaded_config = json.loads(fake_api.uploaded_files[HF_CONFIG_FILENAME])
+        assert "paths" not in uploaded_config
+        assert "train_files" not in uploaded_config["data"]
+        assert "encoder_path" not in uploaded_config["inference"]
+        assert uploaded_config["beta_vae"]["latent_dim"] == get_config().beta_vae.latent_dim
+
         names = [name for name, _ in fake_api.calls]
         assert names == ["create_repo", "upload_folder", "create_tag"]
         create_repo = dict(fake_api.calls[0][1])
