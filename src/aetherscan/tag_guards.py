@@ -31,7 +31,7 @@ import sys
 
 from aetherscan.config import get_config
 from aetherscan.db import get_db
-from aetherscan.run_state import run_state_path
+from aetherscan.run_state import STAGE_FINAL_SAVE, load_run_state, run_state_path
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +151,19 @@ def enforce_tag_guards(args: argparse.Namespace) -> None:
     if command == "train":
         if explicit:
             manifest_path = run_state_path(config.output_path, tag)
-            if os.path.isfile(manifest_path):
+            # Only an UNFINISHED run's manifest exempts the collision guard. The manifest
+            # persists on success, so a completed run's manifest must NOT keep disabling dedup
+            # for that tag — otherwise a reused --save-tag would silently overwrite a finished
+            # model with no warning (TG-1). "Unfinished" = final_save not yet done, or a
+            # recorded non-critical stage failure still pending retry.
+            state = load_run_state(manifest_path)
+            resumable = state is not None and (
+                not state.is_stage_done(STAGE_FINAL_SAVE) or bool(state.stages_failed)
+            )
+            if resumable:
                 logger.info(
-                    f"Run-state manifest found at {manifest_path} — tag '{tag}' marks a "
-                    f"resumable run, skipping the collision guard"
+                    f"Run-state manifest at {manifest_path} marks an unfinished run — tag "
+                    f"'{tag}' is resumable, skipping the collision guard"
                 )
             else:
                 collisions = find_train_tag_collisions(tag)

@@ -11,7 +11,7 @@ import pytest
 
 from aetherscan import hf_hub, tag_guards
 from aetherscan.config import get_config
-from aetherscan.run_state import run_state_path
+from aetherscan.run_state import STAGE_FINAL_SAVE, STAGE_VAE_PLOTS, run_state_path
 from aetherscan.tag_guards import (
     enforce_tag_guards,
     find_inference_tag_collisions,
@@ -137,6 +137,35 @@ class TestEnforceTagGuardsTrain:
         _touch(os.path.join(config.model_path, f"vae_encoder_{TAG}.keras"))
         with open(run_state_path(config.output_path, TAG), "w") as f:
             json.dump({"tag": TAG, "run_start_time": 1.0}, f)
+        enforce_tag_guards(_args("train"))  # must not exit
+
+    def test_completed_manifest_does_not_exempt_collision(self, fake_db):
+        # A COMPLETED run's manifest (final_save done, no pending failures) persists on success,
+        # but must NOT keep disabling the collision guard — otherwise a reused --save-tag would
+        # silently overwrite a finished model with no warning (TG-1).
+        config = _set_tag()
+        _touch(os.path.join(config.model_path, f"vae_encoder_{TAG}.keras"))
+        with open(run_state_path(config.output_path, TAG), "w") as f:
+            json.dump({"tag": TAG, "run_start_time": 1.0, "stages_done": [STAGE_FINAL_SAVE]}, f)
+        with pytest.raises(SystemExit) as excinfo:
+            enforce_tag_guards(_args("train"))
+        assert excinfo.value.code == 1
+
+    def test_manifest_with_pending_failure_stays_resumable(self, fake_db):
+        # final_save done but a non-critical stage still failed -> resumable (the relaunch
+        # retries the failed stage), so the collision guard stays exempt.
+        config = _set_tag()
+        _touch(os.path.join(config.model_path, f"vae_encoder_{TAG}.keras"))
+        with open(run_state_path(config.output_path, TAG), "w") as f:
+            json.dump(
+                {
+                    "tag": TAG,
+                    "run_start_time": 1.0,
+                    "stages_done": [STAGE_FINAL_SAVE],
+                    "stages_failed": [STAGE_VAE_PLOTS],
+                },
+                f,
+            )
         enforce_tag_guards(_args("train"))  # must not exit
 
     def test_force_tag_overrides_collision(self, fake_db):

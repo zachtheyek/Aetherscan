@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -385,6 +386,33 @@ If you use Aetherscan in your research, please cite it via the repository's `CIT
 """
 
 
+# Environment-specific config fields stripped before config.json is published to the PUBLIC Hub
+# repo (HFSEC-1): whole sections that are pure host layout, and per-field absolute paths / real
+# observation filenames. None are reproducible off-host, and they would otherwise disclose the
+# operator's username, directory layout, and dataset file names on huggingface.co.
+_UPLOAD_REDACT_SECTIONS = ("paths",)
+_UPLOAD_REDACT_FIELDS = {
+    "data": ("train_files", "test_files", "inference_files"),
+    "inference": ("encoder_path", "rf_path", "config_path", "preprocess_output_dir"),
+    "checkpoint": ("load_dir",),
+}
+
+
+def _sanitize_config_for_upload(config_dict: dict) -> dict:
+    """Return a copy of the run config with host-specific fields (absolute paths, real dataset
+    filenames) stripped, so the config.json published to the public Hub repo carries only
+    reproducibility-relevant hyperparameters. See HFSEC-1."""
+    sanitized = copy.deepcopy(config_dict)
+    for section in _UPLOAD_REDACT_SECTIONS:
+        sanitized.pop(section, None)
+    for section, fields in _UPLOAD_REDACT_FIELDS.items():
+        block = sanitized.get(section)
+        if isinstance(block, dict):
+            for field in fields:
+                block.pop(field, None)
+    return sanitized
+
+
 def upload_run_to_hf(
     *, repo_id: str, tag: str, model_path: str, output_path: str, force: bool = False
 ) -> None:
@@ -412,10 +440,15 @@ def upload_run_to_hf(
 
     with open(sources[HF_CONFIG_FILENAME]) as f:
         config_dict = json.load(f)
+    # The repo is PUBLIC, so strip environment-specific fields before publishing config.json:
+    # absolute host paths (username + internal layout) and real observation filenames, none of
+    # which are reproducible off-host (HFSEC-1). The model card renders only hyperparameters, so
+    # it is safe to build from the sanitized config too.
+    public_config = _sanitize_config_for_upload(config_dict)
     card = generate_model_card(
         tag=tag,
         repo_id=repo_id,
-        config_dict=config_dict,
+        config_dict=public_config,
         metrics=compute_rf_metrics(model_path, tag),
         versions=_collect_library_versions(),
     )
@@ -424,7 +457,11 @@ def upload_run_to_hf(
     api = _hf_api()
     with tempfile.TemporaryDirectory(prefix="aetherscan_hf_upload_") as staging:
         for stable_name, source in sources.items():
-            shutil.copy2(source, os.path.join(staging, stable_name))
+            if stable_name == HF_CONFIG_FILENAME:
+                with open(os.path.join(staging, stable_name), "w") as f:
+                    json.dump(public_config, f, indent=2)
+            else:
+                shutil.copy2(source, os.path.join(staging, stable_name))
         with open(os.path.join(staging, HF_CARD_FILENAME), "w") as f:
             f.write(card)
 

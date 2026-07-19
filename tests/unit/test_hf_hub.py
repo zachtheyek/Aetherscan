@@ -20,6 +20,7 @@ from aetherscan.hf_hub import (
     HF_DECODER_FILENAME,
     HF_ENCODER_FILENAME,
     HF_RF_FILENAME,
+    _sanitize_config_for_upload,
     compute_rf_metrics,
     generate_model_card,
     resolve_hf_revision,
@@ -95,6 +96,44 @@ def _write_run_artifacts(config, tag, with_eval_artifacts=True):
             },
             os.path.join(config.model_path, f"rf_eval_artifacts_{tag}.joblib"),
         )
+
+
+class TestSanitizeConfigForUpload:
+    """The config.json published to the PUBLIC Hub repo must not carry host paths or real
+    dataset filenames, only reproducibility-relevant hyperparameters (HFSEC-1)."""
+
+    _CONFIG = {
+        "paths": {"data_path": "/datax/scratch/zachy/data", "output_path": "/datax/out"},
+        "data": {
+            "train_files": ["real_HIP123.npy"],
+            "test_files": ["x.npy"],
+            "num_backgrounds": 45000,
+        },
+        "inference": {
+            "encoder_path": "/datax/enc",
+            "rf_path": "/datax/rf",
+            "classification_threshold": 0.99,
+        },
+        "checkpoint": {"load_dir": "/datax/ckpt", "save_tag": "final_v1"},
+        "beta_vae": {"beta": 1.5, "latent_dim": 8},
+    }
+
+    def test_strips_host_paths_and_filenames_keeps_hyperparameters(self):
+        s = _sanitize_config_for_upload(self._CONFIG)
+        # Whole host-layout section gone; per-field paths/filenames gone.
+        assert "paths" not in s
+        assert "train_files" not in s["data"] and "test_files" not in s["data"]
+        assert "encoder_path" not in s["inference"] and "rf_path" not in s["inference"]
+        assert "load_dir" not in s["checkpoint"]
+        # Reproducibility-relevant fields survive.
+        assert s["data"]["num_backgrounds"] == 45000
+        assert s["inference"]["classification_threshold"] == 0.99
+        assert s["checkpoint"]["save_tag"] == "final_v1"
+        assert s["beta_vae"] == {"beta": 1.5, "latent_dim": 8}
+
+    def test_does_not_mutate_the_input(self):
+        _sanitize_config_for_upload(self._CONFIG)
+        assert "paths" in self._CONFIG and "train_files" in self._CONFIG["data"]
 
 
 class TestSelectDefaultRevision:
