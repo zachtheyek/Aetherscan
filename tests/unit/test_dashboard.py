@@ -218,6 +218,22 @@ def test_parse_latent_matrix_drops_malformed(conn):
     assert "bad" not in labels
 
 
+def test_parse_latent_matrix_drops_nonfinite(conn):
+    # json.loads accepts NaN/Infinity; such rows must be dropped so the downstream SVD (pca_2d)
+    # can't blow up ("SVD did not converge") on a live run with unstable latents.
+    df = dashboard.load_latent_snapshots_latest(conn, "t1").copy()
+    df.loc[len(df)] = {
+        "signal_type": "naninf",
+        "latent_vector": json.dumps([float("nan"), 1.0, 2.0]),
+    }
+    mat, labels = dashboard.parse_latent_matrix(df)
+    assert mat.shape[0] == 2  # only the 2 finite rows survive
+    assert "naninf" not in labels
+    assert np.isfinite(mat).all()
+    # and the projection is computable (no LinAlgError)
+    assert dashboard.pca_2d(mat).shape == (2, 2)
+
+
 def test_pca_2d_empty_and_1d():
     assert dashboard.pca_2d(np.empty((0, 0))).shape == (0, 2)
     proj = dashboard.pca_2d(np.array([[1.0], [2.0], [3.0]]))  # d==1 -> zero-filled 2nd col

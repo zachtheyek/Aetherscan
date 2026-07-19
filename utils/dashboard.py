@@ -93,7 +93,7 @@ def load_resources(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
 
 def load_training_stats(conn: sqlite3.Connection, tag: str, stats: list[str]) -> pd.DataFrame:
     """Non-superseded beta_vae training_stats for `tag` limited to `stats` (and their val_
-    counterparts), ordered so curves plot in run order. Adds a monotonic `step` column."""
+    counterparts), ordered so curves plot in run order (round, epoch, timestamp)."""
     wanted = list(stats) + [f"val_{s}" for s in stats]
     placeholders = ",".join("?" * len(wanted))
     df = pd.read_sql_query(
@@ -184,7 +184,8 @@ def load_stages(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
 
 def parse_latent_matrix(snapshots: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
     """Parse a latent_snapshots frame's JSON latent_vector column into an (n, d) float array +
-    the matching signal_type labels. Rows whose vector is malformed or ragged are dropped."""
+    the matching signal_type labels. Rows whose vector is malformed, ragged, or non-finite
+    (NaN/inf — json.loads accepts these and they blow up the downstream SVD) are dropped."""
     vecs, labels = [], []
     for _, row in snapshots.iterrows():
         try:
@@ -199,7 +200,12 @@ def parse_latent_matrix(snapshots: pd.DataFrame) -> tuple[np.ndarray, list[str]]
     width = len(vecs[0])
     keep = [(v, s) for v, s in zip(vecs, labels, strict=False) if len(v) == width]
     mat = np.array([v for v, _ in keep], dtype=float)
-    return mat, [s for _, s in keep]
+    labels_keep = [s for _, s in keep]
+    if mat.size:
+        finite = np.isfinite(mat).all(axis=1)
+        mat = mat[finite]
+        labels_keep = [s for s, f in zip(labels_keep, finite, strict=False) if f]
+    return mat, labels_keep
 
 
 def pca_2d(matrix: np.ndarray) -> np.ndarray:
