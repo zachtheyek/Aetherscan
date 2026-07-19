@@ -250,6 +250,8 @@ def resolve_inference_artifacts(args: argparse.Namespace) -> None:
         return
 
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     repo_id = getattr(args, "hf_repo_id", None) or config.hf.repo_id
     revision = resolve_hf_revision(repo_id, getattr(args, "hf_revision", None))
     logger.info(

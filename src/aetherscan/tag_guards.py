@@ -43,6 +43,8 @@ def find_train_tag_collisions(tag: str) -> list[str]:
     and non-superseded training_stats DB rows. Empty list = no collisions.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     db = get_db()
     collisions: list[str] = []
 
@@ -73,6 +75,8 @@ def find_inference_tag_collisions(tag: str) -> list[str]:
     exactly what the streaming path's resume flow consumes, so it must not be flagged.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     db = get_db()
     collisions: list[str] = []
 
@@ -112,6 +116,8 @@ def _guard_hf_tag(tag: str, force: bool) -> None:
     the upload stage itself is non-critical, so its guard must not block training either.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     repo_id = config.hf.repo_id
     from aetherscan.hf_hub import hf_tag_exists  # noqa: PLC0415
 
@@ -143,6 +149,8 @@ def enforce_tag_guards(args: argparse.Namespace) -> None:
     construction, so the local guards are skipped for them).
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     tag = config.checkpoint.save_tag
     force = bool(config.checkpoint.force_tag)
     explicit = getattr(args, "save_tag", None) is not None
