@@ -511,7 +511,7 @@ class DataPreprocessor:
                 # Load chunk into memory
                 chunk_data = np.array(raw_data[chunk_start:chunk_end])
 
-                # NOTE: is this access pattern the most efficient (least pickling)? see comments in _single_cadence_wrapper() from data_generation.py for more details
+                # NOTE: is this access pattern the most efficient (least pickling)? see _downsample_worker()'s docstring on pulling the cadence from the shared-memory global to avoid per-cadence pickling
                 # NOTE: currently, loading the backgrounds takes WAY more time than processing the backgrounds
                 # Prepare arguments for downsampling (just indices, not data - data is in global state)
                 n_cadences = min(chunk_data.shape[0], num_target_backgrounds - len(all_backgrounds))
@@ -704,7 +704,7 @@ class DataPreprocessor:
                 # Load chunk into memory
                 chunk_data = np.array(raw_data[chunk_start:chunk_end])
 
-                # NOTE: is this access pattern the most efficient (least pickling)? see comments in _single_cadence_wrapper() from data_generation.py for more details
+                # NOTE: is this access pattern the most efficient (least pickling)? see _downsample_worker()'s docstring on pulling the cadence from the shared-memory global to avoid per-cadence pickling
                 # NOTE: currently, loading the backgrounds takes WAY more time than processing the backgrounds
                 # Prepare arguments for downsampling (just indices, not data - data is in global state)
                 n_cadences = chunk_data.shape[0]

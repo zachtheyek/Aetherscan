@@ -63,6 +63,9 @@ def _teardown_singletons():
 
     manager = ResourceManager._instance
     if manager is not None:
+        for managed_process in list(manager._processes):
+            with contextlib.suppress(Exception):
+                managed_process.close(timeout=5.0)
         for managed_pool in list(manager._pools):
             with contextlib.suppress(Exception):
                 managed_pool.close(timeout=5.0)

@@ -293,24 +293,30 @@ def init_logger() -> Logger:
     return logger_instance
 
 
-def init_worker_logging():
+def init_worker_logging(log_queue=None):
     """
     Initialize logging in a multiprocessing worker: reset stdout/stderr to the original streams
     (so the inherited StreamToLogger from the parent doesn't fire), then attach a QueueHandler
-    pointing at the main process's shared log queue. If no Logger singleton has been initialized
-    in the parent, falls back to a NullHandler to avoid noise.
+    pointing at the main process's shared log queue.
+
+    `log_queue` defaults to the Logger singleton's queue, which fork-started workers inherit.
+    Spawn-started processes (e.g. the RoundDataProducer and its pool workers) run a fresh
+    interpreter where the singleton doesn't exist — they must pass the queue explicitly
+    (a multiprocessing.Queue survives the spawn pickling boundary). Without either, falls back
+    to a NullHandler to avoid noise.
     """
-    logger_instance = Logger._instance
+    if log_queue is None:
+        logger_instance = Logger._instance
 
-    if logger_instance is None:
-        logger.warning(
-            "No logger instance initialized - disabling worker logging to avoid conflicts"
-        )
-        logging.getLogger().handlers.clear()
-        logging.getLogger().addHandler(logging.NullHandler())
-        return
+        if logger_instance is None:
+            logger.warning(
+                "No logger instance initialized - disabling worker logging to avoid conflicts"
+            )
+            logging.getLogger().handlers.clear()
+            logging.getLogger().addHandler(logging.NullHandler())
+            return
 
-    log_queue = logger_instance.log_queue
+        log_queue = logger_instance.log_queue
 
     # Reset stdout/stderr to avoid inherited StreamToLogger from parent
     sys.stdout = sys.__stdout__

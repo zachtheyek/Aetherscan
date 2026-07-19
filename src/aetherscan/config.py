@@ -183,6 +183,17 @@ class TrainingConfig:
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
     )
+    # NOTE: is this the optimal size?
+    data_gen_task_size: int = 256  # Cadences per batched worker task (workers write results straight into the round memmap)
+
+    # Round data pipeline params (disk-backed per-round datasets, see round_data.py)
+    round_data_dir: str | None = None  # Defaults to get_training_file_path("round_data") at runtime
+    overlap_data_generation: bool = (
+        True  # Generate round k+1's data in a background process while round k trains
+    )
+    keep_round_data: bool = (
+        False  # Retain each round's on-disk data after its training completes (debugging)
+    )
     # TODO: tune to include sufficient info without bottlenecking training
     plot_injection_subsampling_count: int = (
         100000  # Max points per series in injection_stats scatter plots
@@ -526,6 +537,10 @@ class Config:
                 "effective_batch_size": self.training.effective_batch_size,
                 "per_replica_val_batch_size": self.training.per_replica_val_batch_size,
                 "signal_injection_chunk_size": self.training.signal_injection_chunk_size,
+                "data_gen_task_size": self.training.data_gen_task_size,
+                "round_data_dir": self.training.round_data_dir,
+                "overlap_data_generation": self.training.overlap_data_generation,
+                "keep_round_data": self.training.keep_round_data,
                 "plot_injection_subsampling_count": self.training.plot_injection_subsampling_count,
                 "plot_injection_outlier_percentile": self.training.plot_injection_outlier_percentile,
                 "latent_viz_num_cadences_per_type": self.training.latent_viz_num_cadences_per_type,

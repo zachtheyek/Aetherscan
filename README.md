@@ -422,6 +422,10 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--effective-batch-size EFFECTIVE_BATCH_SIZE]
              [--per-replica-val-batch-size PER_REPLICA_VAL_BATCH_SIZE]
              [--signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE]
+             [--data-gen-task-size DATA_GEN_TASK_SIZE]
+             [--round-data-dir ROUND_DATA_DIR]
+             [--overlap-data-generation | --no-overlap-data-generation]
+             [--keep-round-data | --no-keep-round-data]
              [--plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT]
              [--plot-injection-outlier-percentile PLOT_INJECTION_OUTLIER_PERCENTILE]
              [--latent-viz-num-cadences-per-type LATENT_VIZ_NUM_CADENCES_PER_TYPE]
@@ -556,6 +560,25 @@ options:
   --signal-injection-chunk-size SIGNAL_INJECTION_CHUNK_SIZE
                         Maximum cadences to process at once during synthetic
                         signal injection (must be divisible by 4)
+  --data-gen-task-size DATA_GEN_TASK_SIZE
+                        Cadences per batched signal-injection worker task
+                        (workers write results straight into the round's on-
+                        disk memmap; must be >= 1)
+  --round-data-dir ROUND_DATA_DIR
+                        Directory for disk-backed per-round training datasets
+                        (defaults to <data-path>/training/round_data; needs
+                        ~2.2x one round's size free when data-generation
+                        overlap is enabled, ~1.1x otherwise)
+  --overlap-data-generation, --no-overlap-data-generation
+                        Generate round k+1's training data in a background
+                        producer process while round k trains (default:
+                        enabled). Pass --no-overlap-data-generation to fall
+                        back to sequential in-process generation for debugging
+  --keep-round-data, --no-keep-round-data
+                        Retain each round's on-disk training data after that
+                        round finishes (default: disabled — round k's data
+                        directory is deleted as soon as round k's training
+                        completes). Enable for debugging
   --plot-injection-subsampling-count PLOT_INJECTION_SUBSAMPLING_COUNT
                         Max points per stat name, per signal type, for A→B
                         intensity bias scatter plots. Outliers are

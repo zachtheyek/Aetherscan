@@ -5,6 +5,7 @@ apply_saved_config precedence (defaults < saved config < CLI args)."""
 
 from __future__ import annotations
 
+import collections
 import json
 
 import pytest
@@ -47,6 +48,16 @@ def _parse(argv):
 def _cross_param_errors(args, num_replicas):
     errors = collect_validation_errors(args, num_replicas)
     return [e for e in errors if e.fix_kind == "cross_param"]
+
+
+@pytest.fixture(autouse=True)
+def _ample_disk_space(monkeypatch):
+    """The round-data disk-budget check reads the real filesystem via shutil.disk_usage (the
+    full-scale default config needs ~650 GB free — more than CI runners or dev boxes have).
+    Pin it to a huge value so validation tests are machine-independent; tests that exercise
+    the check itself (TestRoundDataFlags) patch their own values on top."""
+    usage = collections.namedtuple("usage", ["total", "used", "free"])
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda path: usage(2**60, 0, 2**60))
 
 
 class TestTagPattern:
@@ -363,3 +374,90 @@ class TestApplyArgsToConfig:
         config = get_config()
         apply_args_to_config(_parse(["train", "--load-tag", "round_03"]))
         assert config.checkpoint.start_round == 4
+
+
+class TestRoundDataFlags:
+    """Flags and validation for the disk-backed round-data pipeline (round_data.py)."""
+
+    def test_flags_apply_to_config(self):
+        apply_args_to_config(
+            _parse(
+                [
+                    "train",
+                    "--round-data-dir",
+                    "/scratch/rounds",
+                    "--no-overlap-data-generation",
+                    "--keep-round-data",
+                    "--data-gen-task-size",
+                    "128",
+                ]
+            )
+        )
+        config = get_config()
+        assert config.training.round_data_dir == "/scratch/rounds"
+        assert config.training.overlap_data_generation is False
+        assert config.training.keep_round_data is True
+        assert config.training.data_gen_task_size == 128
+
+    def test_defaults_preserved_when_omitted(self):
+        apply_args_to_config(_parse(["train"]))
+        config = get_config()
+        assert config.training.round_data_dir is None
+        assert config.training.overlap_data_generation is True
+        assert config.training.keep_round_data is False
+        assert config.training.data_gen_task_size == 256
+
+    def test_data_gen_task_size_below_one_rejected(self):
+        errors = collect_validation_errors(_parse(["train", "--data-gen-task-size", "0"]), None)
+        assert any(
+            e.field == "training.data_gen_task_size" and e.fix_kind == "clamp_low" for e in errors
+        )
+
+    def _patch_free_bytes(self, monkeypatch, free_bytes):
+        usage = collections.namedtuple("usage", ["total", "used", "free"])
+        monkeypatch.setattr(
+            cli.shutil, "disk_usage", lambda path: usage(free_bytes * 2, free_bytes, free_bytes)
+        )
+
+    def test_disk_budget_error_when_insufficient(self, monkeypatch):
+        config = get_config()
+        round_nbytes = cli._estimate_round_data_nbytes(
+            config.training.num_samples_beta_vae,
+            config.data.num_observations,
+            config.data.time_bins,
+            config.data.width_bin // config.data.downsample_factor,
+        )
+        # Between 1.1x and 2.2x one round: fails with overlap (default), passes without
+        self._patch_free_bytes(monkeypatch, int(1.5 * round_nbytes))
+
+        errors = collect_validation_errors(_parse(["train"]), None)
+        disk_errors = [e for e in errors if e.field == "training.round_data_dir"]
+        assert len(disk_errors) == 1
+        assert "GB free" in disk_errors[0].message
+
+        errors = collect_validation_errors(_parse(["train", "--no-overlap-data-generation"]), None)
+        assert not any(e.field == "training.round_data_dir" for e in errors)
+
+    def test_disk_budget_ok_when_sufficient(self, monkeypatch):
+        config = get_config()
+        round_nbytes = cli._estimate_round_data_nbytes(
+            config.training.num_samples_beta_vae,
+            config.data.num_observations,
+            config.data.time_bins,
+            config.data.width_bin // config.data.downsample_factor,
+        )
+        self._patch_free_bytes(monkeypatch, int(10 * round_nbytes))
+        errors = collect_validation_errors(_parse(["train"]), None)
+        assert not any(e.field == "training.round_data_dir" for e in errors)
+
+    def test_estimate_scales_with_sample_count(self):
+        one = cli._estimate_round_data_nbytes(4, 6, 16, 512)
+        two = cli._estimate_round_data_nbytes(8, 6, 16, 512)
+        assert two == 2 * one
+        # 3 arrays x n x 6 x 16 x 512 float32 + n x U20 labels
+        assert one == 3 * 4 * 6 * 16 * 512 * 4 + 4 * 80
+
+    def test_nearest_existing_ancestor(self, tmp_path):
+        missing = tmp_path / "a" / "b" / "c"
+        assert cli._nearest_existing_ancestor(str(missing)) == str(tmp_path)
+        assert cli._nearest_existing_ancestor(str(tmp_path)) == str(tmp_path)

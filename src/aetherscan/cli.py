@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, field, is_dataclass
 from itertools import product
 from typing import Any
@@ -53,6 +54,32 @@ def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
     """Return `args.<arg_name>` if present and not None, otherwise `default` (typically the config value at startup time)."""
     val = getattr(args, arg_name, None)
     return val if val is not None else default
+
+
+def _estimate_round_data_nbytes(
+    n_samples: int, num_observations: int, time_bins: int, width_bin_downsampled: int
+) -> int:
+    """
+    Estimate the on-disk size of one round's disk-backed dataset (see round_data.py): three
+    float32 arrays of shape (n_samples, num_observations, time_bins, width_bin_downsampled)
+    plus a tiny U20 labels array. Kept stdlib-only (no numpy) so utils/print_cli_help.py can
+    keep importing cli.py without the scientific stack.
+    """
+    per_sample_bytes = num_observations * time_bins * width_bin_downsampled * 4  # float32
+    labels_bytes = n_samples * 20 * 4  # numpy "U20" = 20 UCS-4 code points per label
+    return 3 * n_samples * per_sample_bytes + labels_bytes
+
+
+def _nearest_existing_ancestor(path: str) -> str:
+    """Walk up from `path` to the closest directory that exists (for shutil.disk_usage on a
+    round-data dir that hasn't been created yet)."""
+    probe = os.path.abspath(path)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return probe
 
 
 def _resolve_num_replicas(args: argparse.Namespace) -> int | None:
@@ -393,6 +420,30 @@ def _add_train_flags_to(parser):
         default=None,
         # NOTE: divisible by 4 or num_replicas?
         help="Maximum cadences to process at once during synthetic signal injection (must be divisible by 4)",
+    )
+    parser.add_argument(
+        "--data-gen-task-size",
+        type=int,
+        default=None,
+        help="Cadences per batched signal-injection worker task (workers write results straight into the round's on-disk memmap; must be >= 1)",
+    )
+    parser.add_argument(
+        "--round-data-dir",
+        type=str,
+        default=None,
+        help="Directory for disk-backed per-round training datasets (defaults to <data-path>/training/round_data; needs ~2.2x one round's size free when data-generation overlap is enabled, ~1.1x otherwise)",
+    )
+    parser.add_argument(
+        "--overlap-data-generation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Generate round k+1's training data in a background producer process while round k trains (default: enabled). Pass --no-overlap-data-generation to fall back to sequential in-process generation for debugging",
+    )
+    parser.add_argument(
+        "--keep-round-data",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Retain each round's on-disk training data after that round finishes (default: disabled — round k's data directory is deleted as soon as round k's training completes). Enable for debugging",
     )
     parser.add_argument(
         "--plot-injection-subsampling-count",
@@ -920,6 +971,18 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         and args.signal_injection_chunk_size is not None
     ):
         config.training.signal_injection_chunk_size = args.signal_injection_chunk_size
+    if hasattr(args, "data_gen_task_size") and args.data_gen_task_size is not None:
+        config.training.data_gen_task_size = args.data_gen_task_size
+    if hasattr(args, "round_data_dir") and args.round_data_dir is not None:
+        config.training.round_data_dir = args.round_data_dir
+    # overlap_data_generation / keep_round_data use argparse.BooleanOptionalAction with
+    # default=None so that the CLI can express "leave the config default" (omit), "force on"
+    # (--overlap-data-generation), and "force off" (--no-overlap-data-generation). The
+    # `is not None` guard preserves the config default when the user passes neither
+    if hasattr(args, "overlap_data_generation") and args.overlap_data_generation is not None:
+        config.training.overlap_data_generation = args.overlap_data_generation
+    if hasattr(args, "keep_round_data") and args.keep_round_data is not None:
+        config.training.keep_round_data = args.keep_round_data
     if (
         hasattr(args, "plot_injection_subsampling_count")
         and args.plot_injection_subsampling_count is not None
@@ -1216,7 +1279,7 @@ def collect_validation_errors(
                 ValidationError(
                     field="training.num_samples_rf",
                     current=nsr,
-                    message=f"--num-samples-rf must be divisible by 2 for generate_triplet_batch, got {nsr}",
+                    message=f"--num-samples-rf must be divisible by 2 for the balanced true/false halves in data generation, got {nsr}",
                     fix_kind="divisibility",
                     divisor=2,
                 )
@@ -1246,6 +1309,63 @@ def collect_validation_errors(
                     divisor=4,
                 )
             )
+
+        # data_gen_task_size >= 1 (batched memmap worker tasks)
+        dgts = _resolve(args, "data_gen_task_size", config.training.data_gen_task_size)
+        if dgts is not None and dgts < 1:
+            errors.append(
+                ValidationError(
+                    field="training.data_gen_task_size",
+                    current=dgts,
+                    message=f"--data-gen-task-size must be >= 1, got {dgts}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+
+        # Disk budget for the disk-backed round datasets (round_data.py): with overlap enabled
+        # two rounds coexist on disk (round k trains while round k+1 generates), so require
+        # 2.2x one round's estimated size free; 1.1x when overlap is disabled. Estimated from
+        # sample counts only — actual usage tracks the estimate closely since the arrays are
+        # fixed-shape float32.
+        nob = _resolve(args, "num_observations", config.data.num_observations)
+        tb = _resolve(args, "time_bins", config.data.time_bins)
+        overlap = _resolve(args, "overlap_data_generation", config.training.overlap_data_generation)
+        round_data_dir = _resolve(args, "round_data_dir", config.training.round_data_dir)
+        if round_data_dir is None:
+            # data_path was resolved in the Data block above; round data are generated
+            # training data, so they live under the training-data root
+            round_data_dir = config.get_training_file_path("round_data", data_path)
+        if all(v is not None for v in (nsb, nob, tb, wb)) and df:
+            round_nbytes = _estimate_round_data_nbytes(nsb, nob, tb, wb // df)
+            required_factor = 2.2 if overlap else 1.1
+            required_bytes = required_factor * round_nbytes
+            try:
+                free_bytes = shutil.disk_usage(_nearest_existing_ancestor(round_data_dir)).free
+            except OSError as e:
+                logger.warning(
+                    f"Could not check free disk space for --round-data-dir "
+                    f"({round_data_dir}): {e} — skipping the disk-budget check"
+                )
+            else:
+                if free_bytes < required_bytes:
+                    errors.append(
+                        ValidationError(
+                            field="training.round_data_dir",
+                            current=round_data_dir,
+                            message=(
+                                f"--round-data-dir ({round_data_dir}) needs >= "
+                                f"{required_bytes / 1e9:.1f} GB free ({required_factor}x one "
+                                f"round's ~{round_nbytes / 1e9:.1f} GB"
+                                f"{' with data-generation overlap enabled' if overlap else ''}), "
+                                f"but only {free_bytes / 1e9:.1f} GB is available. Free up disk "
+                                f"space, point --round-data-dir at a larger volume, reduce "
+                                f"--num-samples-beta-vae, or pass --no-overlap-data-generation "
+                                f"to halve the requirement"
+                            ),
+                            fix_kind="file_exists",
+                        )
+                    )
 
         # SNR sanity (positivity + curriculum ordering)
         snr_base = _resolve(args, "snr_base", config.training.snr_base)
