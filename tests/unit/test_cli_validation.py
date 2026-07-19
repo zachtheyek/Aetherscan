@@ -461,3 +461,22 @@ class TestRoundDataFlags:
         missing = tmp_path / "a" / "b" / "c"
         assert cli._nearest_existing_ancestor(str(missing)) == str(tmp_path)
         assert cli._nearest_existing_ancestor(str(tmp_path)) == str(tmp_path)
+
+
+class TestMaxRetriesValidation:
+    """--max-retries must be >= 1: 0 would run zero attempts and exit 0 having trained nothing."""
+
+    def test_zero_rejected(self):
+        errors = collect_validation_errors(_parse(["train", "--max-retries", "0"]), None)
+        assert any(
+            e.field == "training.max_retries" and e.fix_kind == "clamp_low" and e.min_val == 1
+            for e in errors
+        )
+
+    def test_negative_rejected(self):
+        errors = collect_validation_errors(_parse(["train", "--max-retries", "-2"]), None)
+        assert any(e.field == "training.max_retries" for e in errors)
+
+    def test_one_accepted(self):
+        errors = collect_validation_errors(_parse(["train", "--max-retries", "1"]), None)
+        assert not any(e.field == "training.max_retries" for e in errors)

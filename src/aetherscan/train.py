@@ -60,6 +60,19 @@ from aetherscan.round_data import (
     prepare_round_data_dir,
     validate_done_manifest,
 )
+from aetherscan.run_state import (
+    STAGE_FINAL_SAVE,
+    STAGE_RF_PLOTS,
+    STAGE_RF_TRAIN,
+    STAGE_VAE_PLOTS,
+    STAGE_VAE_ROUNDS,
+    TrainingRunState,
+    config_changed,
+    config_fingerprint,
+    load_run_state,
+    run_state_path,
+    save_run_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -790,6 +803,12 @@ class TrainingPipeline:
         if self.db is None:
             raise ValueError("get_db() returned None")
 
+        # Load (or create) the persisted run manifest for this tag. This resolves
+        # self.start_time (wall clock of attempt 1 — used by every DB query/plot, so retries
+        # see the whole run), self._start_round (where the beta-VAE loop resumes), and marks
+        # stale DB rows from a previously failed attempt as superseded.
+        self._init_run_state()
+
         # Initialize data generator
         self.data_generator = DataGenerator(background_data)
 
@@ -801,8 +820,10 @@ class TrainingPipeline:
             self.vae = create_beta_vae_model()
             self._build_optimizer()
 
-        # NOTE: this approach doesn't play well with fault tolerance. rethink later
-        # Latent viz data (prepared once on first round, persisted across rounds)
+        # Latent viz data (prepared once on first round, persisted across rounds within an
+        # attempt; a resumed attempt rebuilds it from the resumed round's val split — the data
+        # distribution matches by construction, and latent-GIF frames captured before the
+        # failure stay valid in the DB)
         self._latent_viz_batch = None
         self._latent_viz_labels = None
         self._latent_viz_dataset = None
@@ -828,12 +849,17 @@ class TrainingPipeline:
         self._rf_shap_cache: dict[str, dict] = {}
 
         try:
-            # Load models from checkpoints if provided
+            # Load models from checkpoints: explicit user flags win; otherwise a
+            # manifest-driven resume reloads the last completed round's checkpoint
             if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
                 logger.info("Resuming from checkpoint")
                 self.load_models(
                     tag=self.config.checkpoint.load_tag, dir=self.config.checkpoint.load_dir
                 )
+            elif self._start_round > 1:
+                resume_tag = f"round_{self._start_round - 1:02d}"
+                logger.info(f"Resuming from checkpoint {resume_tag} (per run manifest)")
+                self.load_models(tag=resume_tag, dir="checkpoints")
 
         except Exception as e:
             logger.error(f"Error loading models from checkpoint: {e}")
@@ -843,7 +869,6 @@ class TrainingPipeline:
             self.config.checkpoint.start_round = 1
             raise  # Re-raise to propagate error
 
-        # NOTE: similar to _setup_directories() & archive_directory(), perhaps we need a flag that gets toggled when fault tolerance is triggered, s.t. future reads from the db know to ignore the flagged rows as "archived" from a previous failed training run?
         finally:
             # Regardless whether checkpoints were loaded or not, we finish the directory setup
             # since fault tolerance expects a clean directory structure
@@ -860,6 +885,127 @@ class TrainingPipeline:
     #         self.train_writer.close()
     #     if hasattr(self, "val_writer"):
     #         self.val_writer.close()
+
+    def _init_run_state(self):
+        """
+        Load or create the persisted run manifest (run_state_{save_tag}.json) and derive all
+        resume state from it:
+
+        - self.start_time: the manifest's run_start_time (wall clock of attempt 1). Setting it
+          here — unconditionally, before any training/plotting can run — fixes the old bug
+          where train_beta_vae()'s already-trained early return skipped the assignment and
+          every subsequent plot raised AttributeError, masking the real failure.
+        - self._start_round: 1-based round the beta-VAE loop starts from. Explicit user
+          checkpoint flags (--load-tag/--load-dir [+ --start-round]) win as an escape hatch;
+          otherwise the manifest's completed_rounds drive resume; a fresh run falls back to
+          config.checkpoint.start_round (default 1).
+        - Supersede marking: on resume of round k, rows for (tag, round >= k) in
+          training_stats / injection_stats / latent_snapshots are stale output of the failed
+          attempt and get flagged before the rerun re-writes them — otherwise duplicated
+          epochs corrupt the loss-curve plots (which sort by (round, epoch)).
+        """
+        tag = self.config.checkpoint.save_tag
+        self._run_state_path = run_state_path(self.config.output_path, tag)
+
+        state = load_run_state(self._run_state_path)
+
+        # Config-drift guard: if the manifest was written under a different result-affecting
+        # config (reused --save-tag with changed hyperparameters, or a manifest that predates
+        # fingerprinting), do NOT silently resume/skip and ship the stale model — warn loudly
+        # and downgrade to a fresh run (the previous attempt's outputs get overwritten).
+        current_fingerprint = config_fingerprint(self.config.to_dict())
+        if config_changed(state, current_fingerprint):
+            logger.warning("=" * 60)
+            logger.warning(
+                f"Run manifest at {self._run_state_path} was written under a DIFFERENT "
+                f"training config (fingerprint mismatch) — starting a FRESH run and "
+                f"overwriting the previous attempt's outputs for tag '{tag}'. Use a new "
+                f"--save-tag to keep both, or restore the original config to resume."
+            )
+            logger.warning("=" * 60)
+            state = None
+
+        self._resumed = state is not None
+
+        if state is None:
+            state = TrainingRunState(
+                tag=tag, run_start_time=time.time(), config_fingerprint=current_fingerprint
+            )
+            logger.info(f"Starting a fresh training run manifest at {self._run_state_path}")
+        else:
+            state.attempt += 1
+            logger.info(
+                f"Resuming training run from manifest {self._run_state_path} "
+                f"(attempt {state.attempt}, completed rounds: {state.completed_rounds}, "
+                f"stages done: {state.stages_done}, stages failed: {state.stages_failed})"
+            )
+
+        explicit_checkpoint = (
+            self.config.checkpoint.load_tag is not None
+            or self.config.checkpoint.load_dir is not None
+        )
+        if explicit_checkpoint:
+            self._start_round = self.config.checkpoint.start_round
+            if self._resumed:
+                # User override re-runs rounds >= start_round: drop manifest records the
+                # override invalidates (stages_done is cleared wholesale — downstream stages
+                # depend on the re-run rounds and will simply re-execute)
+                logger.info(
+                    f"Explicit checkpoint flags override the manifest: restarting from round "
+                    f"{self._start_round} and re-running all pipeline stages"
+                )
+                state.completed_rounds = [
+                    r for r in state.completed_rounds if r < self._start_round
+                ]
+                state.stages_done = []
+        elif state.completed_rounds:
+            self._start_round = state.resume_round
+        else:
+            self._start_round = self.config.checkpoint.start_round
+
+        self.start_time = state.run_start_time
+        self.run_state = state
+
+        # Flag the failed attempt's partial rows before this attempt re-writes them.
+        # Rows from completed rounds (< _start_round) stay live — they're valid history
+        # (including latent-GIF snapshot frames). No-op on a fresh run (nothing to mark)
+        # and when resuming into post-VAE stages (_start_round > num_training_rounds)
+        if self._resumed:
+            for table in ("training_stats", "injection_stats", "latent_snapshots"):
+                if not self.db.mark_superseded(table, tag, round_ge=self._start_round):
+                    # Non-fatal (matches flush() semantics), but must be loud: unmarked
+                    # stale rows would re-corrupt the loss-curve plots on this attempt
+                    logger.warning(
+                        f"Could not mark stale {table} rows superseded "
+                        f"(tag={tag}, round_ge={self._start_round}); "
+                        f"plots may include rows from the failed attempt"
+                    )
+
+        self._persist_run_state()
+
+    def _persist_run_state(self):
+        """Persist the run manifest (atomic tmp -> replace)."""
+        save_run_state(self.run_state, self._run_state_path)
+
+    def _mark_stage_done(self, stage: str):
+        """Record a pipeline stage success in the manifest and persist it."""
+        self.run_state.mark_stage_done(stage)
+        self._persist_run_state()
+        logger.info(f"Stage '{stage}' complete (recorded in run manifest)")
+
+    def _record_stage_failure(self, stage: str):
+        """Record a non-critical stage failure in the manifest and persist it. The stage
+        stays out of stages_done, so a relaunch retries it; main.py exits nonzero at the very
+        end if any recorded failure never recovers."""
+        self.run_state.record_stage_failure(stage)
+        self._persist_run_state()
+        logger.error(f"Stage '{stage}' failed (recorded in run manifest)")
+
+    def _mark_round_completed(self, round_number: int):
+        """Record a fully-trained round (checkpoint saved) in the manifest and persist it."""
+        self.run_state.mark_round_completed(round_number)
+        self._persist_run_state()
+        logger.info(f"Round {round_number} recorded as completed in run manifest")
 
     def _build_optimizer(self):
         """
@@ -897,7 +1043,7 @@ class TrainingPipeline:
         """Create necessary directories"""
         logger.info("Setting up directories")
 
-        start_round = self.config.checkpoint.start_round
+        start_round = self._start_round
 
         model_checkpoints_dir = os.path.join(self.config.model_path, "checkpoints")
         archive_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
@@ -950,23 +1096,18 @@ class TrainingPipeline:
         """
         n_rounds = self.config.training.num_training_rounds
         epochs = self.config.training.epochs_per_round
-        start_round = self.config.checkpoint.start_round
+        start_round = self._start_round
 
         if start_round > n_rounds:
-            # BUG: returning here skips the `self.start_time = time.time()` assignment below,
-            # so a resume/retry that finds the beta-VAE already trained (start_round > n_rounds)
-            # leaves self.start_time unset. Later plotting reads self.start_time and raises
-            # `'TrainingPipeline' object has no attribute 'start_time'`, which then masks the
-            # original error across retries. Fix by setting start_time in __init__ (or before
-            # this guard) so it always exists regardless of the resume point.
-            return  # Return early if beta-VAE already trained (can occur from fault tolerance)
+            # Every round already has a saved checkpoint (per the run manifest) — nothing to
+            # train. Safe to return early: self.start_time is set in __init__ from the
+            # manifest's run_start_time, so downstream plots still span the whole run.
+            logger.info(f"All {n_rounds} rounds already trained — skipping beta-VAE training")
+            return
         elif start_round > 1:
             logger.info(f"Resuming training from round {start_round}/{n_rounds}")
         else:
             logger.info(f"Starting training for {n_rounds} rounds")
-
-        # NOTE: this approach doesn't play well with fault tolerance. rethink later
-        self.start_time = time.time()
 
         # Stand up the background round-data producer (a dedicated process owning its own
         # worker pool against the shared-memory background plates), so round k+1's data
@@ -1039,8 +1180,8 @@ class TrainingPipeline:
                 self._round_producer.shutdown()
                 self._round_producer = None
 
-            # NOTE: this approach doesn't play well with fault tolerance. rethink later
-            # Free the latent viz batch once all rounds are complete (or on failure)
+            # Free the latent viz batch once all rounds are complete (or on failure); a
+            # resumed attempt rebuilds it from the resumed round's val split
             del self._latent_viz_batch, self._latent_viz_labels
             self._latent_viz_batch = None
             self._latent_viz_labels = None
@@ -1347,6 +1488,10 @@ class TrainingPipeline:
 
             # Save checkpoint
             self.save_models(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+
+            # Checkpoint is on disk — record the round in the run manifest so a retry (or a
+            # relaunch of the identical command) resumes at the next round
+            self._mark_round_completed(round_number)
 
             round_trained = True
 
@@ -1909,6 +2054,19 @@ class TrainingPipeline:
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
 
+        # Resume path: a previous attempt of THIS run (same tag AND matching config
+        # fingerprint) already trained and persisted the RF — load it back instead of
+        # regenerating ~num_samples_rf cadences and retraining. self._resumed is False for a
+        # fresh run, and for a reused tag whose config changed (the fingerprint guard in
+        # _init_run_state downgraded it to a fresh run), so stale artifacts are never
+        # silently reused.
+        if self._resumed and self.try_load_rf_for_resume():
+            logger.info(
+                "Loaded existing Random Forest model + eval artifacts for this tag — "
+                "skipping RF data generation and retraining"
+            )
+            return
+
         # Initialize RF model
         if self.rf_model is None:
             self.rf_model = RandomForestModel()
@@ -2127,6 +2285,13 @@ class TrainingPipeline:
             joblib.dump(artifacts, artifact_path)
             logger.info(f"Saved RF eval artifacts to {artifact_path}")
 
+            # Persist the trained RF immediately (final_save re-saves it later): a retry that
+            # resumes into rf_plots/final_save can then reload the model without regenerating
+            # data — see try_load_rf_for_resume()
+            rf_model_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+            self.rf_model.save(rf_model_path)
+            logger.info(f"Saved Random Forest to {rf_model_path}")
+
             rf_trained = True
 
             # NOTE: come back to this later (are we dereferencing the correct things? can we instead write things to db instead of storing in memory?)
@@ -2177,6 +2342,31 @@ class TrainingPipeline:
             if val_latents is not None:
                 del val_latents
             gc.collect()
+
+    def try_load_rf_for_resume(self) -> bool:
+        """
+        Attempt to restore the trained Random Forest persisted by a previous attempt of this
+        run: both random_forest_{tag}.joblib and rf_eval_artifacts_{tag}.joblib must exist
+        under model_path (the artifacts joblib is what every RF plot consumes, so resuming
+        into rf_plots without it would be pointless — but it is loaded lazily by
+        _load_rf_eval_artifacts(), not here). Returns True when the model is loaded
+        and ready; False falls back to full RF training.
+        """
+        tag = self.config.checkpoint.save_tag
+        rf_model_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+        artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
+
+        if not (os.path.exists(rf_model_path) and os.path.exists(artifact_path)):
+            return False
+
+        try:
+            if self.rf_model is None:
+                self.rf_model = RandomForestModel()
+            self.rf_model.load(rf_model_path)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load persisted Random Forest from {rf_model_path}: {e}")
+            return False
 
     def _load_rf_eval_artifacts(self, tag: str | None = None) -> dict:
         """
@@ -5853,14 +6043,167 @@ class TrainingPipeline:
             logger.error(f"Failed to load models: {e}")
             raise  # Re-raise to propagate error
 
+    def _run_plot_group(self, plot_calls: list[tuple[Callable, str]]) -> None:
+        """
+        Run a group of plot methods, attempting every one even when some fail (a single
+        broken plot mustn't block the others), then raise a summary error listing the
+        failures so the stage machine can record the group as failed.
+        """
+        failures = []
+        for func, name in plot_calls:
+            try:
+                func()
+            except Exception as e:
+                logger.error(f"Failed to execute {name}: {e}")
+                failures.append(name)
+        if failures:
+            raise RuntimeError(f"{len(failures)} plot(s) failed: {', '.join(failures)}")
+
+    # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
+    def plot_vae_diagnostics(self) -> None:
+        """The vae_plots stage: final loss curves, training stability, injection stats, and
+        the latent-space GIF. Attempts every plot even if one fails, then raises listing the
+        failures — the stage machine records them without costing a data regeneration."""
+        self._run_plot_group(
+            [
+                (self.plot_beta_vae_loss_curves, "plot_beta_vae_loss_curves"),
+                (self.plot_beta_vae_training_stability, "plot_beta_vae_training_stability"),
+                (self.plot_injection_stats, "plot_injection_stats"),
+                (self.plot_latent_space_gif, "plot_latent_space_gif"),
+            ]
+        )
+
+    def plot_rf_diagnostics(self) -> None:
+        """
+        The rf_plots stage: the ten Random Forest visualizations. All plots consume the
+        eval-artifact joblib persisted by train_random_forest() (the five SHAP plots
+        additionally share a SHAP-values joblib); every plot is attempted even when one
+        fails (e.g. an optional dep like SHAP missing), then a summary error is raised for
+        the stage machine to record. plot_rf_latent_decision_boundary relies on the
+        cadence-level UMAP joblibs written by plot_latent_space_gif (vae_plots stage), so
+        stage ordering matters.
+        """
+        self._run_plot_group(
+            [
+                (self.plot_rf_confusion_matrices, "plot_rf_confusion_matrices"),
+                (self.plot_rf_classification_curves, "plot_rf_classification_curves"),
+                (self.plot_rf_shap_summary, "plot_rf_shap_summary"),
+                (self.plot_rf_shap_dependence, "plot_rf_shap_dependence"),
+                (self.plot_rf_shap_interactions, "plot_rf_shap_interactions"),
+                (self.plot_rf_shap_loss_monitoring, "plot_rf_shap_loss_monitoring"),
+                (
+                    self.plot_rf_shap_explanation_clustering,
+                    "plot_rf_shap_explanation_clustering",
+                ),
+                (self.plot_rf_calibration_curve, "plot_rf_calibration_curve"),
+                (self.plot_rf_ensemble_accuracy_curve, "plot_rf_ensemble_accuracy_curve"),
+                (
+                    self.plot_rf_latent_decision_boundary,
+                    "plot_rf_latent_decision_boundary",
+                ),
+            ]
+        )
+
+    def final_save(self) -> None:
+        """The final_save stage: persist the final models plus the resolved config JSON.
+        The config dump used to live in main.py's train_command after the retry loop; doing
+        it here puts it under the stage machine's retry coverage."""
+        self.save_models()
+
+        config_path = os.path.join(
+            self.config.output_path, f"config_{self.config.checkpoint.save_tag}.json"
+        )
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(self.config.to_dict(), f, indent=2)
+        logger.info(f"Training configuration saved to {config_path}")
+
+
+def _execute_training_stages(pipeline) -> None:
+    """
+    The training stage machine: an explicit ordered stage list with skip-if-done and
+    persist-on-success semantics driven by the pipeline's run manifest.
+
+    Critical stages (vae_rounds, rf_train, final_save) raise on failure — the retry loop in
+    main.py rebuilds the pipeline and the manifest resumes it here. Non-critical stages
+    (vae_plots, rf_plots) are recorded in stages_failed and execution continues: a broken
+    plot mustn't cost a retry cycle including data regeneration, but main.py exits nonzero
+    at the very end if any recorded failure never recovers, so lost artifacts stay loud.
+
+    `pipeline` is duck-typed (a TrainingPipeline in production) so unit tests can drive the
+    stage logic with a lightweight stub.
+    """
+    state = pipeline.run_state
+
+    # Stage 1/5: vae_rounds — the beta-VAE round loop (per-round sub-resume happens inside
+    # train_beta_vae via the manifest's completed_rounds)
+    if state.is_stage_done(STAGE_VAE_ROUNDS):
+        logger.info(f"Stage '{STAGE_VAE_ROUNDS}' already complete — skipping")
+    else:
+        pipeline.train_beta_vae()
+        pipeline._mark_stage_done(STAGE_VAE_ROUNDS)
+
+    # Stage 2/5: vae_plots (non-critical)
+    if state.is_stage_done(STAGE_VAE_PLOTS):
+        logger.info(f"Stage '{STAGE_VAE_PLOTS}' already complete — skipping")
+    else:
+        try:
+            pipeline.plot_vae_diagnostics()
+            pipeline._mark_stage_done(STAGE_VAE_PLOTS)
+        except Exception as e:
+            logger.error(f"Stage '{STAGE_VAE_PLOTS}' failed: {e}")
+            pipeline._record_stage_failure(STAGE_VAE_PLOTS)
+
+    # Stage 3/5: rf_train. On skip, the persisted RF from the attempt that completed the
+    # stage is loaded back (rf_plots and final_save need a live model); if that reload
+    # fails (e.g. the joblib was deleted), fall through to a full retrain
+    if state.is_stage_done(STAGE_RF_TRAIN) and pipeline.try_load_rf_for_resume():
+        logger.info(f"Stage '{STAGE_RF_TRAIN}' already complete — loaded persisted RF model")
+    else:
+        try:
+            pipeline.train_random_forest()
+        except Exception as e:
+            logger.error(f"Error in train_random_forest(): {e}")
+            # Attempt to save models on RF training failure
+            pipeline.rf_model = None  # Avoid saving incomplete RF model state
+            _safe_call(pipeline.save_models, "save_models")
+            raise  # Re-raise to propagate error
+        pipeline._mark_stage_done(STAGE_RF_TRAIN)
+
+    # Stage 4/5: rf_plots (non-critical)
+    if state.is_stage_done(STAGE_RF_PLOTS):
+        logger.info(f"Stage '{STAGE_RF_PLOTS}' already complete — skipping")
+    else:
+        try:
+            pipeline.plot_rf_diagnostics()
+            pipeline._mark_stage_done(STAGE_RF_PLOTS)
+        except Exception as e:
+            logger.error(f"Stage '{STAGE_RF_PLOTS}' failed: {e}")
+            pipeline._record_stage_failure(STAGE_RF_PLOTS)
+        finally:
+            # RF plots are done (or abandoned) — drop the shared eval-artifact / SHAP
+            # caches so the (large) features arrays they hold don't hang around through
+            # final_save and teardown. Clearing only in this branch is deliberate: the
+            # caches are populated exclusively by the plot calls above, so the
+            # skip-if-done path never has anything to clear
+            pipeline._clear_rf_caches()
+
+    # Stage 5/5: final_save — final models + config JSON
+    if state.is_stage_done(STAGE_FINAL_SAVE):
+        logger.info(f"Stage '{STAGE_FINAL_SAVE}' already complete — skipping")
+    else:
+        pipeline.final_save()
+        pipeline._mark_stage_done(STAGE_FINAL_SAVE)
+
 
 def run_training_pipeline(
     background_data: np.ndarray, strategy: tf.distribute.Strategy = None
 ) -> TrainingPipeline:
     """
     End-to-end training entry point: construct a TrainingPipeline from preprocessed background
-    data (shape (n, 6, 16, 512)) and an optional tf.distribute strategy, then run all rounds
-    and final RF training.
+    data (shape (n, 6, 16, 512)) and an optional tf.distribute strategy, then run the ordered
+    training stages (vae_rounds -> vae_plots -> rf_train -> rf_plots -> final_save), skipping
+    any the persisted run manifest already records as done.
     """
     try:
         # Create pipeline (no cleanup needed on failure)
@@ -5870,75 +6213,13 @@ def run_training_pipeline(
         raise  # Re-raise to propagate error
 
     try:
-        try:
-            # Train beta-VAE
-            pipeline.train_beta_vae()
-        except Exception as e:
-            logger.error(f"Error in train_beta_vae(): {e}")
-            raise  # Re-raise to propagate error
+        _execute_training_stages(pipeline)
 
-        try:
-            # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
-            # Plot loss curves
-            pipeline.plot_beta_vae_loss_curves()
-
-            # Plot clipping rate
-            pipeline.plot_beta_vae_training_stability()
-
-            # Plot injection stats
-            pipeline.plot_injection_stats()
-
-            # Plot latent space GIF
-            pipeline.plot_latent_space_gif()
-        except Exception as e:
-            logger.error(f"Error in plotting: {e}")
-            raise  # Re-raise to propagate error
-
-        try:
-            # Train Random Forest
-            pipeline.train_random_forest()
-        except Exception as e:
-            logger.error(f"Error in train_random_forest(): {e}")
-            # Attempt to save models on RF training failure
-            pipeline.rf_model = None  # Avoid saving incomplete RF model state
-            _safe_call(pipeline.save_models, "save_models")
-            raise  # Re-raise to propagate error
-
-        # NOTE: come back to this later
-        # Random Forest visualizations. All plots consume the eval-artifact joblib
-        # persisted by train_random_forest(); each is wrapped in _safe_call so one
-        # failure (e.g. an optional dep like SHAP missing) doesn't kill the others.
-        # plot_rf_latent_decision_boundary relies on the cadence-level UMAP joblibs
-        # written by plot_latent_space_gif above, so ordering matters.
-        _safe_call(pipeline.plot_rf_confusion_matrices, "plot_rf_confusion_matrices")
-        _safe_call(pipeline.plot_rf_classification_curves, "plot_rf_classification_curves")
-        _safe_call(pipeline.plot_rf_shap_summary, "plot_rf_shap_summary")
-        _safe_call(pipeline.plot_rf_shap_dependence, "plot_rf_shap_dependence")
-        _safe_call(pipeline.plot_rf_shap_interactions, "plot_rf_shap_interactions")
-        _safe_call(pipeline.plot_rf_shap_loss_monitoring, "plot_rf_shap_loss_monitoring")
-        _safe_call(
-            pipeline.plot_rf_shap_explanation_clustering,
-            "plot_rf_shap_explanation_clustering",
-        )
-        _safe_call(pipeline.plot_rf_calibration_curve, "plot_rf_calibration_curve")
-        _safe_call(pipeline.plot_rf_ensemble_accuracy_curve, "plot_rf_ensemble_accuracy_curve")
-        _safe_call(
-            pipeline.plot_rf_latent_decision_boundary,
-            "plot_rf_latent_decision_boundary",
-        )
-
-        # All RF plots are done — drop the shared eval-artifact / SHAP caches
-        # so the (large) features arrays they hold don't hang around through
-        # save_models() and final teardown.
-        pipeline._clear_rf_caches()
-
-        try:
-            # Save final models
-            pipeline.save_models()
-        except Exception as e:
-            logger.error(f"Error in save_models(): {e}")
-            raise  # Re-raise to propagate error
-
+        if pipeline.run_state.stages_failed:
+            logger.warning(
+                f"Training pipeline finished, but non-critical stage(s) failed: "
+                f"{', '.join(pipeline.run_state.stages_failed)}"
+            )
         logger.info("Training complete!")
 
         return pipeline
@@ -5952,10 +6233,10 @@ def _safe_call(func: Callable, name: str, args: tuple | None = None) -> None:
     """
     Invoke a callable, log-and-swallow any exception.
 
-    Used as the primary dispatch for the RF diagnostic plot methods so a single
-    failure (e.g. an optional dependency like SHAP missing, an interaction-value
-    fallback) cannot take down the rest of the pipeline. Also used opportunistically
-    during error cleanup where a best-effort call is still worth attempting.
+    Used during error cleanup where a best-effort call is still worth attempting (e.g.
+    saving the VAE weights after an RF-training failure). Plot dispatch uses
+    TrainingPipeline._run_plot_group instead, which also attempts every call but reports
+    the failures so the stage machine can record them.
     """
     try:
         func(*args) if args else func()

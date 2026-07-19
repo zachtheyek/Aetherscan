@@ -1,7 +1,8 @@
 # NOTE: come back to this later
 
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
-schedules, directory archiving, encoder-trained heuristics, and SHAP output normalization."""
+schedules, directory archiving, encoder-trained heuristics, SHAP output normalization, and the
+training stage machine (skip-if-done / record-failure semantics against a stub pipeline)."""
 
 from __future__ import annotations
 
@@ -11,8 +12,18 @@ import numpy as np
 import pytest
 
 from aetherscan.config import get_config
+from aetherscan.run_state import (
+    STAGE_FINAL_SAVE,
+    STAGE_RF_PLOTS,
+    STAGE_RF_TRAIN,
+    STAGE_VAE_PLOTS,
+    STAGE_VAE_ROUNDS,
+    TRAINING_STAGES,
+    TrainingRunState,
+)
 from aetherscan.train import (
     TrainingPipeline,
+    _execute_training_stages,
     _select_positive_class_shap,
     archive_directory,
     check_encoder_trained,
@@ -325,3 +336,135 @@ class TestSelectPositiveClassShap:
     def test_log_loss_passthrough(self):
         values = np.arange(self.N * self.F, dtype=float).reshape(self.N, self.F)
         np.testing.assert_array_equal(_select_positive_class_shap(values, log_loss=True), values)
+
+
+class _StageMachineStub:
+    """Duck-typed TrainingPipeline for _execute_training_stages: records the call order,
+    raises inside any method named in `fail`, and reports rf-load success per `rf_load_ok`."""
+
+    def __init__(self, state, fail=(), rf_load_ok=True):
+        self.run_state = state
+        self.calls = []
+        self.rf_model = "trained-rf"
+        self._fail = set(fail)
+        self._rf_load_ok = rf_load_ok
+
+    def _invoke(self, name):
+        self.calls.append(name)
+        if name in self._fail:
+            raise RuntimeError(f"{name} failed")
+
+    def train_beta_vae(self):
+        self._invoke("train_beta_vae")
+
+    def plot_vae_diagnostics(self):
+        self._invoke("plot_vae_diagnostics")
+
+    def train_random_forest(self):
+        self._invoke("train_random_forest")
+
+    def plot_rf_diagnostics(self):
+        self._invoke("plot_rf_diagnostics")
+
+    def final_save(self):
+        self._invoke("final_save")
+
+    def save_models(self):
+        self._invoke("save_models")
+
+    def try_load_rf_for_resume(self):
+        self.calls.append("try_load_rf_for_resume")
+        return self._rf_load_ok
+
+    def _clear_rf_caches(self):
+        self.calls.append("_clear_rf_caches")
+
+    # The real methods also persist the manifest; persistence is covered in test_run_state.
+    def _mark_stage_done(self, stage):
+        self.run_state.mark_stage_done(stage)
+
+    def _record_stage_failure(self, stage):
+        self.run_state.record_stage_failure(stage)
+
+
+class TestExecuteTrainingStages:
+    def _state(self, **kwargs):
+        return TrainingRunState(tag="test_v1", run_start_time=1.0, **kwargs)
+
+    def test_fresh_run_executes_all_stages_in_order(self):
+        stub = _StageMachineStub(self._state())
+        _execute_training_stages(stub)
+        assert stub.calls == [
+            "train_beta_vae",
+            "plot_vae_diagnostics",
+            "train_random_forest",
+            "plot_rf_diagnostics",
+            "_clear_rf_caches",
+            "final_save",
+        ]
+        assert stub.run_state.stages_done == list(TRAINING_STAGES)
+        assert stub.run_state.stages_failed == []
+
+    def test_done_stages_are_skipped(self):
+        state = self._state(
+            completed_rounds=[1, 2],
+            stages_done=[STAGE_VAE_ROUNDS, STAGE_VAE_PLOTS, STAGE_RF_TRAIN],
+        )
+        stub = _StageMachineStub(state)
+        _execute_training_stages(stub)
+        # rf_train skip must reload the persisted RF (rf_plots/final_save need a live model)
+        assert stub.calls == [
+            "try_load_rf_for_resume",
+            "plot_rf_diagnostics",
+            "_clear_rf_caches",
+            "final_save",
+        ]
+        assert state.stages_done == list(TRAINING_STAGES)
+
+    def test_vae_plot_failure_is_recorded_but_does_not_abort(self):
+        stub = _StageMachineStub(self._state(), fail={"plot_vae_diagnostics"})
+        _execute_training_stages(stub)
+        assert "final_save" in stub.calls
+        assert stub.run_state.stages_failed == [STAGE_VAE_PLOTS]
+        assert not stub.run_state.is_stage_done(STAGE_VAE_PLOTS)
+        assert stub.run_state.is_stage_done(STAGE_FINAL_SAVE)
+
+    def test_rf_plot_failure_is_recorded_and_caches_cleared(self):
+        stub = _StageMachineStub(self._state(), fail={"plot_rf_diagnostics"})
+        _execute_training_stages(stub)
+        assert "_clear_rf_caches" in stub.calls
+        assert "final_save" in stub.calls
+        assert stub.run_state.stages_failed == [STAGE_RF_PLOTS]
+
+    def test_rf_train_failure_saves_vae_and_propagates(self):
+        stub = _StageMachineStub(self._state(), fail={"train_random_forest"})
+        with pytest.raises(RuntimeError, match="train_random_forest failed"):
+            _execute_training_stages(stub)
+        assert stub.rf_model is None  # partial RF state dropped before the best-effort save
+        assert stub.calls[-1] == "save_models"
+        assert not stub.run_state.is_stage_done(STAGE_RF_TRAIN)
+        assert "final_save" not in stub.calls
+
+    def test_rf_train_skip_falls_back_to_retrain_when_reload_fails(self):
+        state = self._state(
+            stages_done=[STAGE_VAE_ROUNDS, STAGE_VAE_PLOTS, STAGE_RF_TRAIN],
+        )
+        stub = _StageMachineStub(state, rf_load_ok=False)
+        _execute_training_stages(stub)
+        assert "train_random_forest" in stub.calls
+        assert state.is_stage_done(STAGE_RF_TRAIN)
+
+    def test_relaunch_after_plot_failure_retries_only_failed_stage(self):
+        # First run: vae_plots fails, everything else succeeds
+        state = self._state()
+        first = _StageMachineStub(state, fail={"plot_vae_diagnostics"})
+        _execute_training_stages(first)
+        assert state.stages_failed == [STAGE_VAE_PLOTS]
+
+        # Relaunch with the persisted state: only vae_plots re-runs (the rf_train skip still
+        # reloads the persisted RF — cheap, and by design), and success clears the failure
+        second = _StageMachineStub(state)
+        _execute_training_stages(second)
+        assert second.calls == ["plot_vae_diagnostics", "try_load_rf_for_resume"]
+        assert state.stages_failed == []
+        assert state.stages_done[-1] == STAGE_VAE_PLOTS  # re-marked after the retry

@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 # written
 _FLUSH_SENTINEL = object()
 
+# Command sentinel for mark_superseded() requests routed through the writer thread (same
+# identity-based recognition as _FLUSH_SENTINEL, so single-writer semantics are preserved)
+_MARK_SUPERSEDED_SENTINEL = object()
+
+# Current schema version, stored in SQLite's PRAGMA user_version (0 on any pre-versioning db).
+# Bump this and extend _migrate_schema() with an `if version < N:` block for future changes.
+# v1: added `superseded INTEGER DEFAULT 0` to training_stats, injection_stats,
+#     latent_snapshots, and inference_results (stale-data supersede semantics on retry)
+_SCHEMA_VERSION = 1
+
 
 def get_system_metadata() -> str:
     """
@@ -159,18 +169,9 @@ class Database:
             cls._instance = None
             logger.info("Database singleton instance reset")
 
-    # TODO:
-    # We currently don't support schema versioning or migration scripting for schema changes
-    # This means that while new tables can be easily added using CREATE TABLE IF NOT EXISTS
-    # statements, existing tables cannot be easily modified (i.e. no ALTER TABLE support for adding
-    # new columns to tables, modifying column constraints, renaming columns, or dropping obsolete
-    # columns), and no rollback mechanisms exist
-    # This makes it impossible to evolve existing schema without manual database updates. As well as
-    # having no audit trail of schema changes, or no rollback capability for failed upgrades. It's
-    # also difficult to coordinate deployments across multiple db instances
     # NOTE: should we consider migrating to PostgreSQL? or should we go all in on SQLite?
     def _init_database(self):
-        """Create database tables if they don't exist"""
+        """Create database tables if they don't exist, then run schema migrations"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
@@ -222,7 +223,8 @@ class Database:
                     is_finite INTEGER DEFAULT 1,
                     slope_clamped INTEGER DEFAULT 0,
                     tag TEXT,
-                    metadata TEXT
+                    metadata TEXT,
+                    superseded INTEGER DEFAULT 0
                 )
             """)
 
@@ -250,7 +252,8 @@ class Database:
                     round_number INTEGER,
                     epoch_number INTEGER,
                     tag TEXT,
-                    metadata TEXT
+                    metadata TEXT,
+                    superseded INTEGER DEFAULT 0
                 )
             """)
 
@@ -282,7 +285,8 @@ class Database:
                     snr_base INTEGER,
                     snr_range INTEGER,
                     tag TEXT,
-                    metadata TEXT
+                    metadata TEXT,
+                    superseded INTEGER DEFAULT 0
                 )
             """)
 
@@ -310,7 +314,8 @@ class Database:
                     timestamp_observed REAL,
                     h5_path TEXT,
                     tag TEXT,
-                    metadata TEXT
+                    metadata TEXT,
+                    superseded INTEGER DEFAULT 0
                 )
             """)
 
@@ -322,12 +327,50 @@ class Database:
 
             conn.commit()
 
+            # Bring pre-existing databases (older schema) up to the current version
+            self._migrate_schema(conn)
+
             # Enable Write-Ahead Logging (WAL) mode for better concurrent read performance
             # WAL places writes in a separate log file so reads can still go through while writes happen
             # The WAL log is periodically merged back into the main db (i.e. checkpointing)
             cursor.execute("PRAGMA journal_mode=WAL")
 
             logger.info("Database schema initialized with WAL mode")
+
+    def _migrate_schema(self, conn):
+        """
+        Minimal schema migration gated on SQLite's PRAGMA user_version.
+
+        Each block below upgrades one version step via additive ALTER TABLE ... ADD COLUMN
+        statements (the only in-place table change SQLite supports); a per-table column-existence
+        check keeps every step idempotent even if user_version was lost (e.g. a db file copied
+        without its journal). Fresh databases already get the full schema from the CREATE TABLE
+        statements in _init_database(), so migration only stamps their version.
+        """
+        cursor = conn.cursor()
+        version = cursor.execute("PRAGMA user_version").fetchone()[0]
+
+        if version >= _SCHEMA_VERSION:
+            return
+
+        if version < 1:
+            # v1: stale-data supersede semantics — rows from failed/superseded attempts are
+            # flagged (never deleted) so default queries can filter them out
+            for table in (
+                "training_stats",
+                "injection_stats",
+                "latent_snapshots",
+                "inference_results",
+            ):
+                columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+                if "superseded" not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN superseded INTEGER DEFAULT 0")
+                    logger.info(f"Schema migration: added {table}.superseded")
+
+        # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
+        cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
+        conn.commit()
+        logger.info(f"Database schema migrated from version {version} to {_SCHEMA_VERSION}")
 
     @contextmanager
     def _get_connection(self):
@@ -411,6 +454,116 @@ class Database:
         logger.warning(f"Database flush timed out after {timeout} seconds")
         return False
 
+    # Tables that support supersede marking, mapped to the optional filters each accepts
+    # (round_ge needs a round_number column; npy_path only exists on inference_results)
+    _SUPERSEDE_TABLES = {
+        "training_stats": frozenset({"round_ge"}),
+        "injection_stats": frozenset({"round_ge"}),
+        "latent_snapshots": frozenset({"round_ge"}),
+        "inference_results": frozenset({"npy_path"}),
+    }
+
+    def mark_superseded(
+        self,
+        table: str,
+        tag: str,
+        *,
+        round_ge: int | None = None,
+        npy_path: str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        """
+        Flag existing rows for `tag` as superseded (stale data from a failed attempt) so the
+        default query_* filters ignore them. Rows are never deleted — pass
+        include_superseded=True to a query method to inspect them.
+
+        round_ge narrows the mark to round_number >= round_ge (training_stats /
+        injection_stats / latent_snapshots only); npy_path narrows to one cadence file
+        (inference_results only).
+
+        The command executes on the background writer thread (a command tuple through the
+        write queue, like the flush sentinel) so single-writer semantics are preserved:
+        buffered rows are flushed first, then the UPDATE runs — queue FIFO ordering
+        guarantees every row queued before this call gets marked while later writes keep
+        superseded = 0. Blocks until the mark lands; returns False on timeout or shutdown.
+        When the writer thread isn't running there are no queued rows to order against, so
+        the UPDATE executes synchronously in the caller thread.
+        """
+        if table not in self._SUPERSEDE_TABLES:
+            raise ValueError(
+                f"mark_superseded does not support table {table!r}; "
+                f"expected one of {sorted(self._SUPERSEDE_TABLES)}"
+            )
+        allowed_filters = self._SUPERSEDE_TABLES[table]
+        if round_ge is not None and "round_ge" not in allowed_filters:
+            raise ValueError(f"round_ge is not supported for table {table!r}")
+        if npy_path is not None and "npy_path" not in allowed_filters:
+            raise ValueError("npy_path is only supported for table 'inference_results'")
+        if not tag:
+            raise ValueError("mark_superseded requires a non-empty tag")
+
+        if timeout is None:
+            timeout = self.flush_timeout
+
+        # No writer thread -> nothing queued to order against; run inline
+        if self.writer_thread is None or not self.writer_thread.is_alive():
+            self._execute_mark_superseded(table, tag, round_ge, npy_path)
+            return True
+
+        if self.stop_event.is_set():
+            logger.warning("mark_superseded called during shutdown, skipping")
+            return False
+
+        mark_complete = threading.Event()
+        self.write_queue.put(
+            (_MARK_SUPERSEDED_SENTINEL, (table, tag, round_ge, npy_path), mark_complete)
+        )
+
+        # Block until the writer signals completion, timeout, or shutdown (same loop as flush)
+        wait_interval = 0.1
+        elapsed = 0.0
+        while elapsed < timeout:
+            if mark_complete.wait(timeout=wait_interval):
+                return True
+            if self.stop_event.is_set():
+                logger.warning("Shutdown initiated during mark_superseded, aborting wait")
+                return False
+            elapsed += wait_interval
+
+        logger.warning(f"mark_superseded timed out after {timeout} seconds")
+        return False
+
+    def _execute_mark_superseded(
+        self, table: str, tag: str, round_ge: int | None, npy_path: str | None
+    ) -> None:
+        """Apply the supersede UPDATE (runs on the writer thread, or inline via
+        mark_superseded when no writer thread is running). `table` was already validated
+        against _SUPERSEDE_TABLES, so the f-string interpolation below is safe."""
+        query = f"UPDATE {table} SET superseded = 1 WHERE superseded = 0 AND tag = ?"
+        params: list = [tag]
+
+        if round_ge is not None:
+            query += " AND round_number >= ?"
+            params.append(round_ge)
+
+        if npy_path is not None:
+            query += " AND npy_path = ?"
+            params.append(npy_path)
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params)
+                conn.commit()
+                logger.info(
+                    f"Marked {cursor.rowcount} row(s) superseded in {table} "
+                    f"(tag={tag}, round_ge={round_ge}, npy_path={npy_path})"
+                )
+        except Exception as e:
+            # Mirror _flush_buffer's log-and-continue semantics: a failed mark must not
+            # kill the writer thread (stale rows would then merely reappear in plots)
+            logger.error(f"Error marking rows superseded in {table}: {e}")
+
     def _writer_loop(self):
         """Background loop that consumes data from queue and writes to database"""
         self.buffer = []
@@ -439,6 +592,22 @@ class Database:
                         last_write_time = time.time()
                     # Signal that flush is complete
                     flush_complete_event.set()
+                    continue
+
+                # Check for mark-superseded command. Flush buffered rows first: queue FIFO
+                # guarantees every row enqueued before the command is already in the buffer,
+                # so the UPDATE covers them, while rows enqueued after keep superseded = 0
+                if metric[0] is _MARK_SUPERSEDED_SENTINEL:
+                    _, payload, mark_complete_event = metric
+                    try:
+                        if self.buffer:
+                            self._flush_buffer()
+                            self.buffer.clear()
+                            last_write_time = time.time()
+                        self._execute_mark_superseded(*payload)
+                    finally:
+                        # Always unblock the caller, even if the flush/UPDATE errored
+                        mark_complete_event.set()
                     continue
 
                 self.buffer.append(metric)
@@ -475,9 +644,10 @@ class Database:
 
         # Final flush on shutdown
         if self.buffer:
+            flushed_count = len(self.buffer)
             self._flush_buffer()
             self.buffer.clear()
-            logger.info(f"Flushed {len(self.buffer)} remaining data on shutdown")
+            logger.info(f"Flushed {flushed_count} remaining data on shutdown")
 
     # In commit 08fc37d, we switched from using sequential execute() to executemany()
     # The sequential approaches parses SQL statements N times & performs N round trips to the db
@@ -856,6 +1026,7 @@ class Database:
         "slope_clamped",
         "tag",
         "metadata",
+        "superseded",
     }
     _TRAINING_STATS_COLUMNS = {
         "id",
@@ -867,6 +1038,7 @@ class Database:
         "epoch_number",
         "tag",
         "metadata",
+        "superseded",
     }
     _LATENT_SNAPSHOTS_COLUMNS = {
         "id",
@@ -882,6 +1054,7 @@ class Database:
         "snr_range",
         "tag",
         "metadata",
+        "superseded",
     }
     _INFERENCE_RESULTS_COLUMNS = {
         "id",
@@ -900,6 +1073,7 @@ class Database:
         "h5_path",
         "tag",
         "metadata",
+        "superseded",
     }
 
     @staticmethod
@@ -1031,6 +1205,7 @@ class Database:
         start_time: float | None = None,
         end_time: float | None = None,
         columns: list[str] | None = None,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Query rows from injection_stats as a list of dicts.
@@ -1041,8 +1216,9 @@ class Database:
         injection_stage is one of {A=pre-inj pre-norm, B=post-inj pre-norm, C=post-inj post-norm}.
         start_*/end_* pairs bound the corresponding integer column. only_finite (default True)
         drops rows where the stored value was non-finite at write time; only_slope_clamped, when
-        not None, filters by the slope_clamped flag. columns is validated against
-        _INJECTION_STATS_COLUMNS.
+        not None, filters by the slope_clamped flag. include_superseded (default False) controls
+        whether rows flagged stale by mark_superseded() are returned. columns is validated
+        against _INJECTION_STATS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1107,6 +1283,9 @@ class Database:
                 query += " AND slope_clamped = ?"
                 params.append(1 if only_slope_clamped else 0)
 
+            if not include_superseded:
+                query += " AND superseded = 0"
+
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
@@ -1136,6 +1315,7 @@ class Database:
         tag: str | list[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Per-round aggregation of injection_stats for sanitization and clamping rates.
@@ -1177,6 +1357,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            if not include_superseded:
+                query += " AND superseded = 0"
+
             query += " GROUP BY round_number ORDER BY round_number"
 
             cursor.execute(query, params)
@@ -1200,13 +1383,15 @@ class Database:
         start_time: float | None = None,
         end_time: float | None = None,
         columns: list[str] | None = None,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Query rows from training_stats as a list of dicts.
 
         model_name, stat_name, and tag accept either a single value (= filter) or a list
         (IN filter). start_*/end_* pairs bound the corresponding integer column (inclusive).
-        columns is validated against _TRAINING_STATS_COLUMNS.
+        include_superseded (default False) controls whether rows flagged stale by
+        mark_superseded() are returned. columns is validated against _TRAINING_STATS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1242,6 +1427,9 @@ class Database:
                 query += " AND epoch_number <= ?"
                 params.append(end_epoch_number)
 
+            if not include_superseded:
+                query += " AND superseded = 0"
+
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
 
@@ -1276,6 +1464,7 @@ class Database:
         start_time: float | None = None,
         end_time: float | None = None,
         columns: list[str] | None = None,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Query rows from latent_snapshots as a list of dicts.
@@ -1283,7 +1472,8 @@ class Database:
         model_name, signal_type, and tag accept either a single value (= filter) or a list
         (IN filter). round_number/epoch_number/step_number are exact-match filters (no range
         variant). The returned latent_vector field is a JSON string — callers parse it with
-        json.loads. columns is validated against _LATENT_SNAPSHOTS_COLUMNS.
+        json.loads. include_superseded (default False) controls whether rows flagged stale by
+        mark_superseded() are returned. columns is validated against _LATENT_SNAPSHOTS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1326,6 +1516,9 @@ class Database:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
 
+            if not include_superseded:
+                query += " AND superseded = 0"
+
             # NOTE: hard-coded ORDER BY? add template index to init_db
 
             cursor.execute(query, params)
@@ -1340,6 +1533,7 @@ class Database:
         tag: str | list[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Distinct snapshot keys (model_name, round_number, epoch_number, step_number, snr_base,
@@ -1367,6 +1561,9 @@ class Database:
             if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
+
+            if not include_superseded:
+                query += " AND superseded = 0"
 
             # This ORDER BY doesn't make full use of idx_latent_snapshots_filter, since the ORDER BY
             # columns don't follow contiguously in the index
@@ -1408,6 +1605,7 @@ class Database:
         start_time: float | None = None,
         end_time: float | None = None,
         columns: list[str] | None = None,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Query rows from inference_results as a list of dicts.
@@ -1416,7 +1614,8 @@ class Database:
         value (= filter) or a list (IN filter). prediction is exact-match (0=RFI, 1=candidate).
         start_*/end_*/min_*/max_* pairs bound the corresponding numeric column (inclusive).
         timestamp_observed is the original observation time (distinct from the write-time
-        timestamp). columns is validated against _INFERENCE_RESULTS_COLUMNS.
+        timestamp). include_superseded (default False) controls whether rows flagged stale by
+        mark_superseded() are returned. columns is validated against _INFERENCE_RESULTS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1497,6 +1696,9 @@ class Database:
             if end_time is not None:
                 query += " AND timestamp <= ?"
                 params.append(end_time)
+
+            if not include_superseded:
+                query += " AND superseded = 0"
 
             # NOTE: hard-coded ORDER BY? add template index to init_db
 

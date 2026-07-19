@@ -1533,14 +1533,14 @@ def collect_validation_errors(
         # Retries (training-scoped — args.max_retries / args.retry_delay also exist
         # in the inference subparser, so the Pattern C gate on cmd kept this clean).
         mr = _resolve(args, "max_retries", config.training.max_retries)
-        if mr is not None and mr < 0:
+        if mr is not None and mr < 1:
             errors.append(
                 ValidationError(
                     field="training.max_retries",
                     current=mr,
-                    message=f"--max-retries must be >= 0, got {mr}",
+                    message=f"--max-retries must be >= 1 (the run needs at least one attempt), got {mr}",
                     fix_kind="clamp_low",
-                    min_val=0,
+                    min_val=1,
                 )
             )
         rd = _resolve(args, "retry_delay", config.training.retry_delay)

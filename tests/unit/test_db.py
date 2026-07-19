@@ -7,13 +7,15 @@ against a tmp-path SQLite file."""
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import time
 
 import numpy as np
 import pytest
 
 from aetherscan.config import get_config
-from aetherscan.db.db import Database
+from aetherscan.db.db import _SCHEMA_VERSION, Database
 
 
 @pytest.fixture
@@ -227,3 +229,256 @@ class TestQueryFiltersAndWhitelists:
         assert [r["confidence"] for r in rows] == [0.99]
         rows = self.db.query_inference_result(tag="test_v9", prediction=0)
         assert [r["confidence"] for r in rows] == [0.42]
+
+
+class TestMarkSuperseded:
+    def _write_rounds(self, db, tag, rounds=(1, 2, 3)):
+        for round_number in rounds:
+            db.write_training_stat("beta_vae", "total_loss", 1.0, round_number, 1, tag=tag)
+            db.write_injection_stat("eti_snr", 12.5, round_number=round_number, tag=tag)
+            db.write_latent_snapshot(
+                "beta_vae", round_number, 1, 10, 0, "true_only_eti", [[0.1] * 4] * 6, tag=tag
+            )
+
+    def test_round_ge_marking_and_default_filtering(self, db):
+        """Marking (tag, round >= k) must hide those rows from every default query while
+        include_superseded=True still returns them — the resume-of-round-k scenario."""
+        tag = "test_v1"
+        self._write_rounds(db, tag)
+
+        for table in ("training_stats", "injection_stats", "latent_snapshots"):
+            assert db.mark_superseded(table, tag, round_ge=2) is True
+
+        assert sorted(r["round_number"] for r in db.query_training_stat(tag=tag)) == [1]
+        assert sorted(r["round_number"] for r in db.query_injection_stat(tag=tag)) == [1]
+        assert sorted(r["round_number"] for r in db.query_latent_snapshots(tag=tag)) == [1]
+
+        everything = db.query_training_stat(tag=tag, include_superseded=True)
+        assert sorted(r["round_number"] for r in everything) == [1, 2, 3]
+        assert {r["round_number"]: r["superseded"] for r in everything} == {1: 0, 2: 1, 3: 1}
+
+    def test_mark_flushes_queued_writes_first(self, db):
+        """Rows still sitting in the write queue when mark_superseded() is called were
+        written before it, so FIFO ordering must land them in the table AND mark them."""
+        tag = "test_v2"
+        db.write_training_stat("beta_vae", "total_loss", 1.0, 2, 1, tag=tag)  # not yet flushed
+        assert db.mark_superseded("training_stats", tag, round_ge=1) is True
+
+        assert db.query_training_stat(tag=tag) == []
+        stale = db.query_training_stat(tag=tag, include_superseded=True)
+        assert len(stale) == 1 and stale[0]["superseded"] == 1
+
+    def test_rows_written_after_mark_stay_live(self, db):
+        tag = "test_v3"
+        db.write_training_stat("beta_vae", "total_loss", 1.0, 2, 1, tag=tag)
+        assert db.mark_superseded("training_stats", tag, round_ge=2) is True
+        db.write_training_stat("beta_vae", "total_loss", 2.0, 2, 1, tag=tag)  # the re-run's row
+        assert db.flush(timeout=10) is True
+
+        live = db.query_training_stat(tag=tag)
+        assert [r["value"] for r in live] == [2.0]
+
+    def test_mark_scoped_to_tag(self, db):
+        self._write_rounds(db, "test_v4", rounds=(1,))
+        self._write_rounds(db, "test_v5", rounds=(1,))
+        assert db.mark_superseded("training_stats", "test_v4", round_ge=1) is True
+        assert db.query_training_stat(tag="test_v4") == []
+        assert len(db.query_training_stat(tag="test_v5")) == 1
+
+    def test_npy_path_marking_on_inference_results(self, db):
+        tag = "test_v6"
+        db.write_inference_result("/a.npy", 0, 1, 0.99, tag=tag)
+        db.write_inference_result("/b.npy", 0, 1, 0.88, tag=tag)
+        assert db.mark_superseded("inference_results", tag, npy_path="/a.npy") is True
+
+        live = db.query_inference_result(tag=tag)
+        assert [r["npy_path"] for r in live] == ["/b.npy"]
+        assert len(db.query_inference_result(tag=tag, include_superseded=True)) == 2
+
+    def test_stability_aggregation_excludes_superseded(self, db):
+        tag = "test_v7"
+        db.write_injection_stat("global_skew", 1.0, round_number=1, tag=tag)
+        db.write_injection_stat("global_skew", 2.0, round_number=2, tag=tag)
+        assert db.mark_superseded("injection_stats", tag, round_ge=2) is True
+
+        rows = db.query_injection_stat_stability(stat_name="global_skew", tag=tag)
+        assert [r["round_number"] for r in rows] == [1]
+        rows = db.query_injection_stat_stability(
+            stat_name="global_skew", tag=tag, include_superseded=True
+        )
+        assert [r["round_number"] for r in rows] == [1, 2]
+
+    def test_snapshot_keys_exclude_superseded(self, db):
+        tag = "test_v8"
+        self._write_rounds(db, tag, rounds=(1, 2))
+        assert db.mark_superseded("latent_snapshots", tag, round_ge=2) is True
+        keys = db.query_latent_snapshot_keys(tag=tag)
+        assert [k["round_number"] for k in keys] == [1]
+
+    def test_mark_without_writer_thread_runs_inline(self):
+        """With no writer thread there is nothing queued to order against, so the UPDATE
+        runs synchronously in the caller thread (unit-test and post-shutdown ergonomics)."""
+        database = Database()
+        database.start()
+        database.write_training_stat("beta_vae", "total_loss", 1.0, 1, 1, tag="test_v9")
+        assert database.flush(timeout=10) is True
+        database.stop()
+
+        assert database.mark_superseded("training_stats", "test_v9", round_ge=1) is True
+        assert database.query_training_stat(tag="test_v9") == []
+        assert len(database.query_training_stat(tag="test_v9", include_superseded=True)) == 1
+
+    def test_invalid_table_rejected(self, db):
+        with pytest.raises(ValueError, match="does not support table"):
+            db.mark_superseded("system_resources", "test_v1")
+
+    def test_invalid_filters_rejected(self, db):
+        with pytest.raises(ValueError, match="round_ge is not supported"):
+            db.mark_superseded("inference_results", "test_v1", round_ge=1)
+        with pytest.raises(ValueError, match="npy_path is only supported"):
+            db.mark_superseded("training_stats", "test_v1", npy_path="/a.npy")
+        with pytest.raises(ValueError, match="non-empty tag"):
+            db.mark_superseded("training_stats", "")
+
+
+class TestSchemaMigration:
+    # The v0 schema (pre-superseded) for the four tables the migration touches, trimmed to
+    # the columns the assertions need plus everything NOT NULL.
+    _V0_SCHEMA = """
+        CREATE TABLE training_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            model_name TEXT NOT NULL,
+            stat_name TEXT NOT NULL,
+            value REAL NOT NULL,
+            round_number INTEGER,
+            epoch_number INTEGER,
+            tag TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE injection_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            stat_name TEXT NOT NULL,
+            value REAL NOT NULL,
+            round_number INTEGER,
+            chunk_number INTEGER,
+            sample_index INTEGER,
+            background_index INTEGER,
+            signal_class TEXT,
+            signal_type TEXT,
+            injection_stage TEXT,
+            is_finite INTEGER DEFAULT 1,
+            slope_clamped INTEGER DEFAULT 0,
+            tag TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE latent_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            model_name TEXT NOT NULL,
+            round_number INTEGER NOT NULL,
+            epoch_number INTEGER NOT NULL,
+            step_number INTEGER NOT NULL,
+            cadence_index INTEGER NOT NULL,
+            signal_type TEXT NOT NULL,
+            latent_vector TEXT NOT NULL,
+            snr_base INTEGER,
+            snr_range INTEGER,
+            tag TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE inference_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            npy_path TEXT NOT NULL,
+            snippet_index INTEGER NOT NULL,
+            prediction INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            latent_vector TEXT,
+            target TEXT,
+            session TEXT,
+            cadence_id INTEGER,
+            band TEXT,
+            frequency_mhz REAL,
+            timestamp_observed REAL,
+            h5_path TEXT,
+            tag TEXT,
+            metadata TEXT
+        );
+    """
+
+    _MIGRATED_TABLES = (
+        "training_stats",
+        "injection_stats",
+        "latent_snapshots",
+        "inference_results",
+    )
+
+    def _create_v0_db(self, config):
+        """Lay down an old-schema (pre-superseded, user_version 0) db file with one row,
+        at the exact path Database will open."""
+        db_path = os.path.join(config.output_path, "db", "aetherscan.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.executescript(self._V0_SCHEMA)
+        conn.execute(
+            "INSERT INTO training_stats (timestamp, model_name, stat_name, value, round_number,"
+            " epoch_number, tag, metadata) VALUES (1.0, 'beta_vae', 'total_loss', 0.5, 1, 1,"
+            " 'test_v1', NULL)"
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _column_names(self, db_path, table):
+        conn = sqlite3.connect(db_path)
+        try:
+            return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        finally:
+            conn.close()
+
+    def _user_version(self, db_path):
+        conn = sqlite3.connect(db_path)
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_old_schema_gains_superseded_column(self):
+        db_path = self._create_v0_db(get_config())
+        assert self._user_version(db_path) == 0
+
+        database = Database()  # _init_database() runs the migration
+        try:
+            for table in self._MIGRATED_TABLES:
+                assert "superseded" in self._column_names(db_path, table)
+            assert self._user_version(db_path) == _SCHEMA_VERSION
+
+            # Pre-migration rows default to superseded = 0 and stay visible
+            rows = database.query_training_stat(tag="test_v1")
+            assert len(rows) == 1
+            assert rows[0]["superseded"] == 0
+        finally:
+            database.stop()
+
+    def test_migration_is_idempotent_across_reopens(self):
+        db_path = self._create_v0_db(get_config())
+
+        # First open migrates; second open must be a clean no-op (no duplicate-column error)
+        first = Database()
+        first.stop()
+        Database._reset()
+        second = Database()
+        try:
+            for table in self._MIGRATED_TABLES:
+                assert "superseded" in self._column_names(db_path, table)
+            assert self._user_version(db_path) == _SCHEMA_VERSION
+            assert len(second.query_training_stat(tag="test_v1")) == 1
+        finally:
+            second.stop()
+
+    def test_fresh_db_created_at_current_version(self, db):
+        for table in self._MIGRATED_TABLES:
+            assert "superseded" in self._column_names(db.db_path, table)
+        assert self._user_version(db.db_path) == _SCHEMA_VERSION
