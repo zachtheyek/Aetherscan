@@ -945,8 +945,9 @@ def generate_round_to_memmap(
         mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
         del mm  # Close immediately: creation only reserves the file; workers do the writing
 
-    # Sibling per-observation log-norm parameter arrays ((min_log, range_log) per obs — tiny),
-    # recorded so the latent-traversal plot can approximately invert the normalization
+    # Sibling per-observation log-norm parameter arrays ((min_log, range_log) per obs —
+    # n_samples x num_observations x 2 float32, so MBs, not GBs, per array), recorded so the
+    # latent-traversal plot can approximately invert the normalization
     lognorm_paths = paths.lognorm_paths
     lognorm_shape = (n_samples, num_observations, 2)
     for path in lognorm_paths.values():

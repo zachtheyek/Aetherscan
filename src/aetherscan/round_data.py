@@ -255,7 +255,8 @@ def load_round_arrays(paths: RoundDataPaths) -> dict[str, np.ndarray]:
     memmaps (np.load(mmap_mode="r")) so nothing is pulled into RAM until batches gather it —
     the OS page cache keeps hot pages resident and evicts them under memory pressure instead
     of OOM-killing the process. Labels and the main array's log-norm parameters ("lognorm",
-    consumed by the latent-traversal plot) are tiny and loaded eagerly.
+    consumed by the latent-traversal plot) are small (~24 MB for the main array at full scale)
+    and loaded eagerly.
     """
     return {
         "concatenated": np.load(paths.main_path, mmap_mode="r"),

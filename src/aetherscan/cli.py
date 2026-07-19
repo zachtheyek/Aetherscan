@@ -1365,8 +1365,11 @@ def collect_validation_errors(
                     field="training.latent_traversal_num_steps",
                     current=lts,
                     message=f"--latent-traversal-num-steps must be odd and >= 3 so the center column is the unperturbed decode, got {lts}",
+                    # No fix_kind captures "odd and >= 3"; clamp_low is closest and the
+                    # proposal seed is the field's default (7 — odd and valid), matching the
+                    # max_sigma block below. propose_simple_fix only ever suggests this value.
                     fix_kind="clamp_low",
-                    min_val=3,
+                    min_val=7,
                 )
             )
         ltms = _resolve(
@@ -1379,7 +1382,7 @@ def collect_validation_errors(
                     current=ltms,
                     message=f"--latent-traversal-max-sigma must be > 0, got {ltms}",
                     fix_kind="clamp_low",
-                    min_val=3.0,  # Proposal seed: the field's default
+                    min_val=3.0,  # Proposal seed: the field's default (matches num_steps above)
                 )
             )
 

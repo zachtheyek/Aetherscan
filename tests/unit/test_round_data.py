@@ -137,6 +137,13 @@ class TestManifest:
         os.remove(paths.true_path)
         assert validate_done_manifest(paths) is None
 
+    def test_missing_lognorm_sibling_invalid(self, tmp_path):
+        # A round dir predating the lognorm-sibling feature fails validation & regenerates.
+        paths = RoundDataPaths.for_round(str(tmp_path), 1)
+        _write_small_round(paths)
+        os.remove(paths.lognorm_paths["main"])
+        assert validate_done_manifest(paths) is None
+
     def test_shape_mismatch_invalid(self, tmp_path):
         paths = RoundDataPaths.for_round(str(tmp_path), 1)
         _write_small_round(paths)
@@ -318,16 +325,18 @@ class TestGenerateRoundToMemmap:
         # Labels mirror the contiguous per-chunk layout (chunk_size=4 -> quarter=1)
         assert list(data["labels"]) == _SIGNAL_TYPES + _SIGNAL_TYPES
 
-        # Per-observation log-norm params were recorded for every array & every row:
-        # range_log > 0 for chi-squared-noise inputs, and inverting the normalization
-        # recovers strictly positive linear intensities
+        # Per-observation log-norm params were recorded for every array & every row
+        # (range_log > 0 for chi-squared-noise inputs). This asserts the PLUMBING — params
+        # populated, right shape, and a finite inversion — not an exact roundtrip: the raw
+        # pre-normalization data isn't retained at generate time, so the exact
+        # exp(x*range+min) == data check lives at unit level (test_create_false_not_injected).
         for name, lognorm_path in paths.lognorm_paths.items():
             params = np.load(lognorm_path)
             assert params.shape == (8, 6, 2)
             assert np.all(params[..., 1] > 0), f"{name} lognorm range_log not populated"
         main_params = np.load(paths.lognorm_paths["main"])
         recovered = np.exp(data["concatenated"][0, 0] * main_params[0, 0, 1] + main_params[0, 0, 0])
-        assert np.all(recovered > 0)
+        assert np.all(np.isfinite(recovered))  # finite inversion (exp of a finite value is > 0)
 
         # Manifest validates and matches the generation request
         assert validate_done_manifest(paths, expected_n_samples=8) is not None

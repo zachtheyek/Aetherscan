@@ -4691,8 +4691,9 @@ class TrainingPipeline:
         n_cadences = batch.shape[0]
 
         # Encode the whole viz batch in one simple non-distributed pass, chunked by cadence
-        # so a large viz batch can't spike device memory (the encoder was created inside
-        # strategy.scope() but runs fine on the default device)
+        # (each chunk expands to chunk x num_obs observations at the encoder) so a large viz
+        # batch can't spike device memory (the encoder was created inside strategy.scope()
+        # but runs fine on the default device)
         chunk = max(1, self.config.training.per_replica_val_batch_size)
         z_parts = []
         for start in range(0, n_cadences, chunk):
@@ -4915,7 +4916,9 @@ class TrainingPipeline:
                 )
             ax.set_title(f"dim {d} (σ={sigmas[d]:.3f})", fontsize=11)
             ax.grid(True, alpha=0.3)
-            if d // ncols == nrows - 1:
+            # Label the bottom-most panel in each column (no panel d+ncols below it), so a
+            # partial last row (latent_dim not a multiple of ncols) still labels every column
+            if d + ncols >= latent_dim:
                 ax.set_xlabel("Frequency bin (full resolution)", fontsize=10)
             if d % ncols == 0:
                 ax.set_ylabel(intensity_label, fontsize=10)
