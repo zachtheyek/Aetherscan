@@ -214,6 +214,18 @@ def _add_train_flags_to(parser):
         default=None,
         help="Path to output directory (overrides AETHERSCAN_OUTPUT_PATH environment variable)",
     )
+    parser.add_argument(
+        "--dashboard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Auto-launch the live monitoring dashboard (utils/dashboard.py) for this run; SSH-forward the port to view it (default: on). Use --no-dashboard to disable",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=None,
+        help="Port for the auto-launched live dashboard (default: 8501)",
+    )
 
     # BetaVAE model configuration
     parser.add_argument(
@@ -691,6 +703,18 @@ def _add_inference_flags_to(parser):
         default=None,
         help="Path to output directory (overrides AETHERSCAN_OUTPUT_PATH environment variable)",
     )
+    parser.add_argument(
+        "--dashboard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Auto-launch the live monitoring dashboard (utils/dashboard.py) for this run; SSH-forward the port to view it (default: on). Use --no-dashboard to disable",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=None,
+        help="Port for the auto-launched live dashboard (default: 8501)",
+    )
 
     # GPU configuration
     parser.add_argument(
@@ -998,6 +1022,10 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.model_path = args.model_path
     if hasattr(args, "output_path") and args.output_path is not None:
         config.output_path = args.output_path
+    if hasattr(args, "dashboard") and args.dashboard is not None:
+        config.monitor.dashboard_enabled = args.dashboard
+    if hasattr(args, "dashboard_port") and args.dashboard_port is not None:
+        config.monitor.dashboard_port = args.dashboard_port
 
     # BetaVAE configuration
     if hasattr(args, "vae_latent_dim") and args.vae_latent_dim is not None:

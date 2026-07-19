@@ -404,7 +404,9 @@ The Aetherscan training pipeline exposes the following CLI flags to the user. Re
 
 ```
 usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
-             [--output-path OUTPUT_PATH] [--vae-latent-dim VAE_LATENT_DIM]
+             [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
+             [--dashboard-port DASHBOARD_PORT]
+             [--vae-latent-dim VAE_LATENT_DIM]
              [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
              [--vae-kernel-size VAE_KERNEL_SIZE VAE_KERNEL_SIZE]
              [--vae-beta VAE_BETA] [--vae-alpha VAE_ALPHA]
@@ -475,6 +477,14 @@ options:
   --output-path OUTPUT_PATH
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
+  --dashboard, --no-dashboard
+                        Auto-launch the live monitoring dashboard
+                        (utils/dashboard.py) for this run; SSH-forward the
+                        port to view it (default: on). Use --no-dashboard to
+                        disable
+  --dashboard-port DASHBOARD_PORT
+                        Port for the auto-launched live dashboard (default:
+                        8501)
   --vae-latent-dim VAE_LATENT_DIM
                         Dimensionality of the VAE latent space (bottleneck
                         size)
@@ -718,7 +728,9 @@ The Aetherscan inference pipeline exposes the following CLI flags to the user. R
 
 ```
 usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
-                 [--output-path OUTPUT_PATH] [--num-replicas NUM_REPLICAS]
+                 [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
+                 [--dashboard-port DASHBOARD_PORT]
+                 [--num-replicas NUM_REPLICAS]
                  [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
                  [--async-allocator | --no-async-allocator]
                  [--test-files TEST_FILES [TEST_FILES ...]]
@@ -761,6 +773,14 @@ options:
   --output-path OUTPUT_PATH
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
+  --dashboard, --no-dashboard
+                        Auto-launch the live monitoring dashboard
+                        (utils/dashboard.py) for this run; SSH-forward the
+                        port to view it (default: on). Use --no-dashboard to
+                        disable
+  --dashboard-port DASHBOARD_PORT
+                        Port for the auto-launched live dashboard (default:
+                        8501)
   --num-replicas NUM_REPLICAS
                         Number of GPUs to use for the distributed strategy. If
                         omitted, the strategy uses every GPU visible to TF;

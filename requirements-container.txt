@@ -31,3 +31,10 @@ huggingface_hub>=1.21,<1.22
 # once blimpy migrates off pkg_resources (upstream issue).
 setuptools>=70,<81
 setigen
+# Live monitoring dashboard (utils/dashboard.py, auto-launched by main.py). streamlit 1.39
+# per SECURITY.md's version policy (proven, >=6-month-old); it accepts protobuf>=3.20,<6 and
+# numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin and the numpy<2 ceiling (pyarrow
+# /tornado/altair pulled transitively). plotly is pure-Python (no numpy ABI coupling). pandas
+# is already shipped by the NGC base, so it is not repinned here.
+streamlit>=1.39,<1.41
+plotly>=5.24,<6

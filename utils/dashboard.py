@@ -2,29 +2,34 @@
 """
 Live dashboard for an Aetherscan pipeline run, read straight from its SQLite DB.
 
-Renders, in one auto-refreshing page: resource utilization (CPU/RAM/GPU over time),
-training-loss curves, and the stage timeline (pipeline_stages, from the #134 benchmarking
-layer). Like utils/benchmark_report.py it is STANDALONE — no `aetherscan` imports, only
-stdlib sqlite3 + pandas + plotly + streamlit — so it runs against a live run's DB or one
-fetched from a cluster with utils/fetch_run_outputs.sh.
+Renders, in one auto-refreshing page, every run metric that is reconstructable from the DB —
+resource utilization (CPU/RAM/GPU), beta-VAE loss + stability curves, the signal-injection
+stats suite, a live latent-space scatter, the stage timeline (PR #134), and inference candidate
+stats — plus a gallery of every saved plot PNG (RF diagnostics, latent traversals, inference
+figures) as it appears on disk.
 
-    pip install streamlit plotly pandas          # not pipeline/container deps
+Like utils/benchmark_report.py it is STANDALONE — no `aetherscan` imports, only stdlib sqlite3 +
+numpy + pandas + plotly + streamlit — so it runs against a live run's DB or one fetched from a
+cluster with utils/fetch_run_outputs.sh. main.py auto-launches it (--no-dashboard to opt out); it
+can also be run by hand:
+
     streamlit run utils/dashboard.py -- --db-path /path/to/aetherscan.db --tag final_v1
 
-To watch a run on a cluster, SSH-forward the port and read the DB where it lives:
-    ssh -L 8501:localhost:8501 blpc3
-    # then on the cluster: streamlit run utils/dashboard.py -- --db-path .../aetherscan.db
+To watch a run on a cluster, SSH-forward the port:  ssh -L 8501:localhost:8501 blpc3
 
-Read-only: opens the DB with mode=ro; the pipeline's writer-thread journaling makes
-concurrent reads safe. The data layer (load_* functions) is pure and unit-tested against a
-synthetic DB; the Streamlit UI is a thin rendering shell on top.
+Read-only (mode=ro); the pipeline's writer-thread journaling makes concurrent reads safe. The data
+layer (load_* / parse / pca helpers) is pure and unit-tested against a synthetic DB; the Streamlit
+UI (render*) is a thin rendering shell that imports plotly/streamlit lazily.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sqlite3
 
+import numpy as np
 import pandas as pd
 
 # --------------------------------------------------------------------------- #
@@ -34,6 +39,17 @@ import pandas as pd
 # Non-superseded filter reused across the supersede-aware tables
 _ALIVE = "COALESCE(superseded, 0) = 0"
 
+# beta-VAE stat_names split into the two training figures (train.py loss curves / stability)
+_LOSS_STATS = [
+    "total_loss",
+    "reconstruction_loss",
+    "kl_loss",
+    "true_loss",
+    "false_loss",
+    "learning_rate",
+]
+_STABILITY_STATS = ["clipping_rate", "gradient_norm_mean", "gradient_norm_std", "gradient_norm_max"]
+
 
 def connect_ro(db_path: str) -> sqlite3.Connection:
     """Open the DB strictly read-only (won't create/lock a missing file for writing)."""
@@ -42,13 +58,22 @@ def connect_ro(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
 def list_tags(conn: sqlite3.Connection) -> list[str]:
-    """All run tags present anywhere in the DB, most-recent-looking first."""
+    """All run tags present anywhere in the DB, sorted."""
     tags: set[str] = set()
-    for table in ("pipeline_stages", "system_resources", "training_stats"):
+    for table in ("pipeline_stages", "system_resources", "training_stats", "inference_cadences"):
         try:
             rows = conn.execute(
-                f"SELECT DISTINCT tag FROM {table} WHERE tag IS NOT NULL"  # noqa: S608 (fixed table names)
+                f"SELECT DISTINCT tag FROM {table} WHERE tag IS NOT NULL"  # noqa: S608 (fixed names)
             ).fetchall()
             tags.update(r[0] for r in rows)
         except sqlite3.OperationalError:
@@ -57,8 +82,7 @@ def list_tags(conn: sqlite3.Connection) -> list[str]:
 
 
 def load_resources(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
-    """system_resources rows for `tag` as a tidy frame (timestamp, resource_type,
-    resource_name, value, unit), ordered by time."""
+    """system_resources rows for `tag` (timestamp, resource_type, resource_name, value, unit)."""
     return pd.read_sql_query(
         "SELECT timestamp, resource_type, resource_name, value, unit "
         "FROM system_resources WHERE tag = ? ORDER BY timestamp",
@@ -67,21 +91,86 @@ def load_resources(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
     )
 
 
-def load_training_stats(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
-    """Non-superseded training_stats for `tag` (model_name, stat_name, value, round_number,
-    epoch_number, timestamp), ordered so loss curves plot in run order."""
-    return pd.read_sql_query(
-        "SELECT timestamp, model_name, stat_name, value, round_number, epoch_number "
-        f"FROM training_stats WHERE tag = ? AND {_ALIVE} "
+def load_training_stats(conn: sqlite3.Connection, tag: str, stats: list[str]) -> pd.DataFrame:
+    """Non-superseded beta_vae training_stats for `tag` limited to `stats` (and their val_
+    counterparts), ordered so curves plot in run order. Adds a monotonic `step` column."""
+    wanted = list(stats) + [f"val_{s}" for s in stats]
+    placeholders = ",".join("?" * len(wanted))
+    df = pd.read_sql_query(
+        "SELECT timestamp, stat_name, value, round_number, epoch_number "
+        f"FROM training_stats WHERE tag = ? AND model_name = 'beta_vae' AND {_ALIVE} "
+        f"AND stat_name IN ({placeholders}) "  # noqa: S608 (placeholders are bound params)
         "ORDER BY round_number, epoch_number, timestamp",
+        conn,
+        params=(tag, *wanted),
+    )
+    return df
+
+
+def load_injection_stats(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
+    """Non-superseded injection_stats for `tag` (stat_name, value, signal_type, injection_stage,
+    round_number, is_finite, slope_clamped, timestamp)."""
+    return pd.read_sql_query(
+        "SELECT timestamp, stat_name, value, signal_type, injection_stage, round_number, "
+        "is_finite, slope_clamped "
+        f"FROM injection_stats WHERE tag = ? AND {_ALIVE} ORDER BY timestamp",
+        conn,
+        params=(tag,),
+    )
+
+
+def load_latent_snapshots_latest(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
+    """The most recent latent_snapshots frame for `tag` (all rows sharing the max
+    round/epoch/step), as (signal_type, latent_vector[JSON]). Empty if none."""
+    if not _table_exists(conn, "latent_snapshots"):
+        return pd.DataFrame(columns=["signal_type", "latent_vector"])
+    key = conn.execute(
+        "SELECT round_number, epoch_number, step_number FROM latent_snapshots "
+        f"WHERE tag = ? AND {_ALIVE} "
+        "ORDER BY round_number DESC, epoch_number DESC, step_number DESC LIMIT 1",
+        (tag,),
+    ).fetchone()
+    if key is None:
+        return pd.DataFrame(columns=["signal_type", "latent_vector"])
+    return pd.read_sql_query(
+        "SELECT signal_type, latent_vector FROM latent_snapshots "
+        f"WHERE tag = ? AND {_ALIVE} AND round_number = ? AND epoch_number = ? AND step_number = ?",
+        conn,
+        params=(tag, key["round_number"], key["epoch_number"], key["step_number"]),
+    )
+
+
+def load_inference_results(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
+    """Non-superseded inference_results for `tag` (prediction, confidence, target, band,
+    frequency_mhz). Empty frame if the table is absent."""
+    if not _table_exists(conn, "inference_results"):
+        return pd.DataFrame(columns=["prediction", "confidence", "target", "band", "frequency_mhz"])
+    return pd.read_sql_query(
+        "SELECT prediction, confidence, target, band, frequency_mhz "
+        f"FROM inference_results WHERE tag = ? AND {_ALIVE}",
+        conn,
+        params=(tag,),
+    )
+
+
+def load_inference_cadences(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
+    """Non-superseded inference_cadences manifest rows for `tag` (status, duration_s, n_stamps,
+    n_candidates). Empty frame if the table is absent."""
+    if not _table_exists(conn, "inference_cadences"):
+        return pd.DataFrame(columns=["status", "duration_s", "n_stamps", "n_candidates"])
+    return pd.read_sql_query(
+        "SELECT status, duration_s, n_stamps, n_candidates "
+        f"FROM inference_cadences WHERE tag = ? AND {_ALIVE}",
         conn,
         params=(tag,),
     )
 
 
 def load_stages(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
-    """pipeline_stages spans for `tag` (stage, start_time, end_time, duration_s, metadata,
-    plus a derived `depth` = dot-name component count), ordered by start."""
+    """pipeline_stages spans for `tag` (stage, start_time, end_time, duration_s, metadata) plus a
+    derived `depth` (dot-name component count), ordered by start. Empty if the table is absent."""
+    if not _table_exists(conn, "pipeline_stages"):
+        return pd.DataFrame(columns=["stage", "start_time", "end_time", "duration_s", "metadata"])
     df = pd.read_sql_query(
         "SELECT stage, start_time, end_time, duration_s, metadata "
         "FROM pipeline_stages WHERE tag = ? ORDER BY start_time",
@@ -93,14 +182,75 @@ def load_stages(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
     return df
 
 
+def parse_latent_matrix(snapshots: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+    """Parse a latent_snapshots frame's JSON latent_vector column into an (n, d) float array +
+    the matching signal_type labels. Rows whose vector is malformed or ragged are dropped."""
+    vecs, labels = [], []
+    for _, row in snapshots.iterrows():
+        try:
+            v = json.loads(row["latent_vector"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, list) and v:
+            vecs.append(v)
+            labels.append(row["signal_type"])
+    if not vecs:
+        return np.empty((0, 0)), []
+    width = len(vecs[0])
+    keep = [(v, s) for v, s in zip(vecs, labels, strict=False) if len(v) == width]
+    mat = np.array([v for v, _ in keep], dtype=float)
+    return mat, [s for _, s in keep]
+
+
+def pca_2d(matrix: np.ndarray) -> np.ndarray:
+    """Project (n, d) -> (n, 2) via mean-centered SVD (numpy-only PCA; no sklearn). Returns a
+    (n, 2) array; if d < 2 the missing component(s) are zero-filled."""
+    if matrix.size == 0 or matrix.shape[0] == 0:
+        return np.empty((0, 2))
+    centered = matrix - matrix.mean(axis=0, keepdims=True)
+    # economy SVD; right singular vectors are the principal axes
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    comps = vt[:2] if vt.shape[0] >= 2 else vt
+    proj = centered @ comps.T
+    if proj.shape[1] == 1:  # degenerate d==1
+        proj = np.hstack([proj, np.zeros((proj.shape[0], 1))])
+    return proj
+
+
+def list_png_artifacts(plots_dir: str, limit: int = 60) -> list[dict]:
+    """Every *.png/*.gif under plots_dir (recursive), newest first: {path, name, rel, mtime}."""
+    if not plots_dir or not os.path.isdir(plots_dir):
+        return []
+    found = []
+    for root, _dirs, files in os.walk(plots_dir):
+        for f in files:
+            if f.lower().endswith((".png", ".gif")):
+                p = os.path.join(root, f)
+                try:
+                    mtime = os.path.getmtime(p)
+                except OSError:
+                    continue
+                found.append(
+                    {"path": p, "name": f, "rel": os.path.relpath(p, plots_dir), "mtime": mtime}
+                )
+    found.sort(key=lambda d: d["mtime"], reverse=True)
+    return found[:limit]
+
+
+def default_plots_dir(db_path: str) -> str:
+    """Infer {output_path}/plots from the DB path (…/{output_path}/db/aetherscan.db)."""
+    db_dir = os.path.dirname(os.path.abspath(db_path))  # …/db
+    return os.path.join(os.path.dirname(db_dir), "plots")
+
+
 def run_summary(resources: pd.DataFrame, stages: pd.DataFrame) -> dict:
-    """Small headline dict: wall-clock span, #stages, latest stage, peak system RAM %."""
-    starts = []
+    """Headline dict: wall-clock span, #stages, latest stage, peak system RAM %."""
+    bounds = []
     if not stages.empty:
-        starts = [stages["start_time"].min(), stages["end_time"].max()]
+        bounds = [stages["start_time"].min(), stages["end_time"].max()]
     elif not resources.empty:
-        starts = [resources["timestamp"].min(), resources["timestamp"].max()]
-    wall = (starts[1] - starts[0]) if starts else 0.0
+        bounds = [resources["timestamp"].min(), resources["timestamp"].max()]
+    wall = (bounds[1] - bounds[0]) if bounds else 0.0
 
     latest_stage = None
     if not stages.empty:
@@ -123,7 +273,7 @@ def run_summary(resources: pd.DataFrame, stages: pd.DataFrame) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Streamlit UI — thin shell over the data layer                               #
+# Streamlit UI — thin shell over the data layer (imports plotly/streamlit lazily)
 # --------------------------------------------------------------------------- #
 
 
@@ -131,9 +281,11 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Live Aetherscan run dashboard")
     ap.add_argument("--db-path", required=True, help="Path to aetherscan.db")
     ap.add_argument("--tag", default=None, help="Run tag (else pick in the sidebar)")
+    ap.add_argument(
+        "--plots-dir", default=None, help="Plots dir (default: inferred from --db-path)"
+    )
     ap.add_argument("--refresh", type=int, default=10, help="Auto-refresh seconds (0 = off)")
-    # Streamlit passes script args after `--`; ignore anything it injects
-    args, _ = ap.parse_known_args()
+    args, _ = ap.parse_known_args()  # streamlit injects extra args after `--`
     return args
 
 
@@ -149,7 +301,7 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Streamlit runtime
-    import plotly.express as px  # noqa: PLC0415 (kept out of module scope so the data layer imports without plotly/streamlit)
+    import plotly.express as px  # noqa: PLC0415 (lazy so the data layer imports without plotly)
     import plotly.graph_objects as go  # noqa: PLC0415
     import streamlit as st  # noqa: PLC0415
 
@@ -170,10 +322,10 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
         default_idx = tags.index(args.tag) if args.tag in tags else len(tags) - 1
         tag = st.selectbox("Tag", tags, index=default_idx)
         refresh = st.number_input("Auto-refresh (s, 0=off)", 0, 600, value=args.refresh)
+        plots_dir = st.text_input("Plots dir", value=args.plots_dir or default_plots_dir(db_path))
 
     resources = load_resources(conn, tag)
     stages = load_stages(conn, tag)
-    training = load_training_stats(conn, tag)
     summary = run_summary(resources, stages)
 
     st.title(f"Aetherscan — {tag}")
@@ -183,88 +335,173 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
     c3.metric("Latest stage", summary["latest_stage"] or "—")
     c4.metric("Peak sys RAM", f"{summary['peak_ram_pct']:.0f}%" if summary["peak_ram_pct"] else "—")
 
-    # --- Training loss -----------------------------------------------------
-    st.subheader("Training loss")
-    if training.empty:
-        st.caption("No training_stats yet.")
-    else:
-        training = training.copy()
-        training["step"] = range(len(training))
-        for stat in sorted(training["stat_name"].unique()):
-            sub = training[training["stat_name"] == stat]
+    tabs = st.tabs(
+        ["Training", "Injection", "Latent", "Resources", "Stages", "Inference", "All plots (PNG)"]
+    )
+
+    # --- Training loss + stability ----------------------------------------
+    with tabs[0]:
+        loss = load_training_stats(conn, tag, _LOSS_STATS)
+        stab = load_training_stats(conn, tag, _STABILITY_STATS)
+        if loss.empty and stab.empty:
+            st.caption("No beta_vae training_stats yet.")
+        for title, df in (("Loss curves", loss), ("Training stability", stab)):
+            if df.empty:
+                continue
+            st.subheader(title)
+            d = df.copy()
+            d["kind"] = d["stat_name"].str.replace("^val_", "", regex=True)
+            d["split"] = np.where(d["stat_name"].str.startswith("val_"), "val", "train")
+            for kind in sorted(d["kind"].unique()):
+                sub = d[d["kind"] == kind].copy()
+                sub["step"] = range(len(sub))
+                fig = px.line(sub, x="step", y="value", color="split", title=kind)
+                fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                st.plotly_chart(fig, use_container_width=True)
+
+    # --- Injection stats ---------------------------------------------------
+    with tabs[1]:
+        inj = load_injection_stats(conn, tag)
+        if inj.empty:
+            st.caption("No injection_stats yet.")
+        else:
+            st.subheader("Injection stability (per round)")
+            stability = (
+                inj.assign(nonfinite=1 - inj["is_finite"].fillna(1))
+                .groupby("round_number")[["nonfinite", "slope_clamped"]]
+                .mean()
+                .reset_index()
+            )
             fig = px.line(
-                sub,
-                x="step",
-                y="value",
-                color="round_number",
-                title=stat,
-                markers=False,
+                stability,
+                x="round_number",
+                y=["nonfinite", "slope_clamped"],
+                title="mean non-finite / slope-clamp rate",
+                markers=True,
             )
             fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
             st.plotly_chart(fig, use_container_width=True)
 
+            st.subheader("Injected-signal / intensity stat distributions")
+            stat = st.selectbox("stat_name", sorted(inj["stat_name"].unique()))
+            sub = inj[(inj["stat_name"] == stat) & inj["value"].notna()]
+            color = "signal_type" if sub["signal_type"].notna().any() else None
+            fig = px.histogram(sub, x="value", color=color, barmode="overlay", nbins=60, title=stat)
+            fig.update_layout(height=300, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+            st.plotly_chart(fig, use_container_width=True)
+
+    # --- Latent scatter (live PCA of the latest snapshot) ------------------
+    with tabs[2]:
+        snaps = load_latent_snapshots_latest(conn, tag)
+        mat, labels = parse_latent_matrix(snaps)
+        if mat.shape[0] == 0:
+            st.caption("No latent_snapshots yet.")
+        else:
+            proj = pca_2d(mat)
+            df = pd.DataFrame({"pc1": proj[:, 0], "pc2": proj[:, 1], "signal_type": labels})
+            st.subheader(f"Latent space — latest snapshot (PCA of {mat.shape[0]}×{mat.shape[1]})")
+            fig = px.scatter(df, x="pc1", y="pc2", color="signal_type", opacity=0.7)
+            fig.update_layout(height=520, margin={"l": 10, "r": 10, "t": 10, "b": 10})
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(
+                "Cheap PCA projection; the pipeline's saved UMAP animation is under All plots."
+            )
+
     # --- Resource utilization ---------------------------------------------
-    st.subheader("Resource utilization")
-    if resources.empty:
-        st.caption("No system_resources yet.")
-    else:
-        r = resources.copy()
-        r["t_min"] = (r["timestamp"] - r["timestamp"].min()) / 60.0
-        r["series"] = r["resource_type"] + ":" + r["resource_name"]
-        for rtype in ("cpu", "ram", "gpu"):
-            sub = r[r["resource_type"] == rtype]
-            if sub.empty:
-                continue
-            fig = px.line(sub, x="t_min", y="value", color="series", title=rtype.upper())
+    with tabs[3]:
+        if resources.empty:
+            st.caption("No system_resources yet.")
+        else:
+            r = resources.copy()
+            r["t_min"] = (r["timestamp"] - r["timestamp"].min()) / 60.0
+            r["series"] = r["resource_type"] + ":" + r["resource_name"]
+            for rtype in ("cpu", "ram", "gpu"):
+                sub = r[r["resource_type"] == rtype]
+                if sub.empty:
+                    continue
+                fig = px.line(sub, x="t_min", y="value", color="series", title=rtype.upper())
+                fig.update_layout(
+                    height=260,
+                    margin={"l": 10, "r": 10, "t": 40, "b": 10},
+                    xaxis_title="minutes",
+                    yaxis_title="%",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    # --- Stage timeline ----------------------------------------------------
+    with tabs[4]:
+        if stages.empty:
+            st.caption("No pipeline_stages yet (needs PR #134's benchmarking layer).")
+        else:
+            s = stages.copy()
+            t0 = s["start_time"].min()
+            s["start_min"] = (s["start_time"] - t0) / 60.0
+            s["dur_min"] = (s["end_time"] - s["start_time"]) / 60.0
+            s["family"] = s["stage"].str.split(".").str[0]
+            palette = px.colors.qualitative.Plotly
+            fig = go.Figure()
+            for i, fam in enumerate(sorted(s["family"].unique())):
+                sub = s[s["family"] == fam]
+                fig.add_bar(
+                    x=sub["dur_min"],
+                    base=sub["start_min"],
+                    y=sub["stage"],
+                    orientation="h",
+                    name=fam,
+                    marker_color=palette[i % len(palette)],
+                    customdata=sub[["duration_s", "depth"]],
+                    hovertemplate="%{y}<br>%{customdata[0]:.1f}s (depth %{customdata[1]})<extra></extra>",
+                )
+            fig.update_yaxes(autorange="reversed")
+            fig.update_xaxes(title="minutes since first stage")
             fig.update_layout(
-                height=260,
-                margin={"l": 10, "r": 10, "t": 40, "b": 10},
-                xaxis_title="minutes",
-                yaxis_title="%",
+                height=max(300, 22 * s["stage"].nunique()),
+                margin={"l": 10, "r": 10, "t": 20, "b": 10},
+                barmode="overlay",
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    # --- Stage timeline ----------------------------------------------------
-    st.subheader("Stage timeline")
-    if stages.empty:
-        st.caption("No pipeline_stages yet.")
-    else:
-        s = stages.copy()
-        t0 = s["start_time"].min()
-        s["start_min"] = (s["start_time"] - t0) / 60.0
-        s["dur_min"] = (s["end_time"] - s["start_time"]) / 60.0
-        s["family"] = s["stage"].str.split(".").str[0]
-        # Numeric Gantt via horizontal bars with an explicit base (px.timeline assumes
-        # datetime x-axes, which mis-renders float "minutes"). One trace per family for color.
-        palette = px.colors.qualitative.Plotly
-        fig = go.Figure()
-        for i, fam in enumerate(sorted(s["family"].unique())):
-            sub = s[s["family"] == fam]
-            fig.add_bar(
-                x=sub["dur_min"],
-                base=sub["start_min"],
-                y=sub["stage"],
-                orientation="h",
-                name=fam,
-                marker_color=palette[i % len(palette)],
-                customdata=sub[["duration_s", "depth"]],
-                hovertemplate="%{y}<br>%{customdata[0]:.1f}s (depth %{customdata[1]})<extra></extra>",
-            )
-        fig.update_yaxes(autorange="reversed")
-        fig.update_xaxes(title="minutes since first stage")
-        fig.update_layout(
-            height=max(300, 22 * s["stage"].nunique()),
-            margin={"l": 10, "r": 10, "t": 20, "b": 10},
-            barmode="overlay",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # --- Inference candidates ---------------------------------------------
+    with tabs[5]:
+        results = load_inference_results(conn, tag)
+        cadences = load_inference_cadences(conn, tag)
+        if results.empty and cadences.empty:
+            st.caption("No inference_results / inference_cadences yet.")
+        if not results.empty:
+            cands = results[results["prediction"] == 1]
+            st.subheader(f"Candidate confidence ({len(cands)} candidates)")
+            if not cands.empty:
+                fig = px.histogram(cands, x="confidence", nbins=40)
+                fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 10, "b": 10})
+                st.plotly_chart(fig, use_container_width=True)
+                for dim in ("target", "band"):
+                    if cands[dim].notna().any():
+                        counts = cands[dim].value_counts().reset_index()
+                        counts.columns = [dim, "candidates"]
+                        fig = px.bar(counts, x=dim, y="candidates", title=f"candidates per {dim}")
+                        fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                        st.plotly_chart(fig, use_container_width=True)
+        if not cadences.empty:
+            st.subheader("Per-cadence manifest")
+            st.dataframe(cadences, use_container_width=True)
+
+    # --- All plots (PNG gallery) ------------------------------------------
+    with tabs[6]:
+        pngs = list_png_artifacts(plots_dir)
+        if not pngs:
+            st.caption(f"No plot PNGs under {plots_dir} yet.")
+        else:
+            st.caption(f"{len(pngs)} figures under {plots_dir} (newest first)")
+            cols = st.columns(2)
+            for i, art in enumerate(pngs):
+                with cols[i % 2]:
+                    st.image(art["path"], caption=art["rel"], use_container_width=True)
 
     conn.close()
 
     if refresh and refresh > 0:
-        # Re-run the whole script every `refresh` seconds for a live view. sleep()+rerun() is
-        # the version-robust way (works on any Streamlit); for a smoother non-blocking refresh,
-        # `pip install streamlit-autorefresh` and swap in st_autorefresh().
+        # sleep()+rerun() is the version-robust live refresh (works on any Streamlit); for a
+        # smoother non-blocking refresh, `pip install streamlit-autorefresh` and swap it in.
         import time  # noqa: PLC0415
 
         time.sleep(refresh)
