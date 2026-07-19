@@ -312,23 +312,25 @@ Four independent bottlenecks contribute to this issue:
 
 **High.** Data generation dominates training time, significantly increasing total training duration.
 
-### Workaround
+### Fix
 
-No current workaround. Proposed solutions include:
+Resolved in [PR #117](https://github.com/zachtheyek/Aetherscan/pull/117) (commit 6e89608). The implemented design addresses all four bottlenecks:
 
-- Shared memory output arrays to eliminate IPC pickle overhead
-- Coarse task granularity (batching multiple cadences per task)
-- Unified batch submission to eliminate synchronization barriers
-- Process isolation to run data generation in a subprocess that never imports TensorFlow
+- **Memmap-backed rounds** — workers write directly into on-disk memmaps (`round_data.py`), eliminating per-sample IPC pickle overhead
+- **Batched tasks** — `--data-gen-task-size` groups multiple cadences per worker task, reducing dispatch overhead from 120k dispatches to a few hundred
+- **Unified dispatch** — one `pool.map` barrier replaces 8 sequential `batch_create_cadence()` calls
+- **Process-isolated generation** — background producer process (`RoundDataProducer`) is spawn-started and never imports TensorFlow, eliminating GIL contention from TF thread pools
+
+See also [GitHub Issue #114](https://github.com/zachtheyek/Aetherscan/issues/114).
 
 ### Status
 
-**Open.** See [GitHub Issue #15](https://github.com/zachtheyek/Aetherscan/issues/15).
+**Closed.** Fixed in [PR #117](https://github.com/zachtheyek/Aetherscan/pull/117).
 
 ### Related Code
 
-- `src/aetherscan/data_generation.py:generate_batch()`
-- `src/aetherscan/data_generation.py:batch_create_cadence()`
+- `src/aetherscan/round_data.py` — disk-backed per-round dataset lifecycle (memmap creation, manifests, cleanup)
+- `src/aetherscan/data_generation.py` — batched memmap workers + background producer integration
 
 ---
 
