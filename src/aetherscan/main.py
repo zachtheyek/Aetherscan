@@ -164,9 +164,9 @@ def _report_final_training_status(pipeline) -> None:
     Emit the terminal training status and exit nonzero on any permanently-failed stage.
 
     Extracted from train_command so the exit contract is unit-testable: a fully-successful run
-    exits 0, a run with any recorded non-critical stage failure (vae_plots/rf_plots that never
-    recovered across attempts) exits 1, and a missing pipeline exits 1 rather than reporting a
-    false success.
+    exits 0, a run with any recorded non-critical stage failure (vae_plots/rf_plots/hf_upload that
+    never recovered across attempts) exits 1, and a missing pipeline exits 1 rather than reporting
+    a false success.
     """
     if pipeline is None:
         # Defensive: the retry loop always sets pipeline or sys.exit(1)s first, and

@@ -165,6 +165,11 @@ class TestConfigFingerprint:
         "training": {"num_samples_beta_vae": 499200, "max_retries": 3, "retry_delay": 60},
         "gpu": {"num_replicas": None},
         "inference": {"max_retries": 3, "parallel_coarse_chans": None},
+        "hf": {
+            "upload_after_training": False,
+            "repo_id": "zachtheyek/aetherscan",
+            "revision": None,
+        },
         "checkpoint": {"save_tag": "final_v1", "load_tag": None, "start_round": 1},
     }
 
@@ -201,6 +206,10 @@ class TestConfigFingerprint:
             ("manager", "n_processes", 96),
             ("logger", "slack_enabled", False),
             ("inference", "max_retries", 9),
+            # HF upload config never affects the training result — toggling --hf-upload or
+            # changing its repo/revision must NOT discard the manifest (regression: #130).
+            ("hf", "upload_after_training", True),
+            ("hf", "repo_id", "other/repo"),
             ("checkpoint", "load_tag", "round_03"),
             ("checkpoint", "start_round", 4),
             ("training", "max_retries", 10),

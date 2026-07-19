@@ -9,7 +9,7 @@ where the previous attempt died:
   from it, so every DB query/plot spans the whole run rather than just the current attempt.
 - completed_rounds: beta-VAE rounds whose checkpoint was saved; resume starts at max + 1.
 - stages_done / stages_failed: drive run_training_pipeline's stage machine — done stages are
-  skipped, failed non-critical stages (plots) are retried on the next run and force a nonzero
+  skipped, failed non-critical stages (plots, hf_upload) are retried on the next run and force a nonzero
   exit if they never succeed.
 
 Writes are atomic (tmp -> os.replace, mirroring round_data's .done manifest protocol) so a
@@ -51,10 +51,12 @@ def run_state_path(output_path: str, tag: str) -> str:
 
 
 # Config sections excluded from a run's fingerprint: pure infra/runtime (db, manager, monitor,
-# logger), resume-control (checkpoint), environment paths, and the inference config — none of
-# which change the training result, so a change to any of them must NOT force a fresh run.
+# logger), resume-control (checkpoint), environment paths, the inference config, and the HF
+# upload config — none of which change the training result, so a change to any of them must NOT
+# force a fresh run. In particular, toggling --hf-upload or changing its repo/revision must never
+# be read as training drift (that would discard the manifest and overwrite a completed model).
 _FINGERPRINT_EXCLUDE_SECTIONS = frozenset(
-    {"db", "manager", "monitor", "logger", "inference", "paths", "checkpoint"}
+    {"db", "manager", "monitor", "logger", "inference", "paths", "checkpoint", "hf"}
 )
 # Retry knobs live in the training section but only control the retry loop, not the result.
 _FINGERPRINT_EXCLUDE_TRAINING_KEYS = frozenset({"max_retries", "retry_delay"})
