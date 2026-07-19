@@ -32,6 +32,7 @@ from aetherscan.logger import init_logger
 from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
 from aetherscan.preprocessing import DataPreprocessor, derive_cadence_provenance
+from aetherscan.run_state import inference_config_fingerprint
 from aetherscan.train import run_training_pipeline
 
 logger = logging.getLogger(__name__)
@@ -297,7 +298,11 @@ class NonRetryableInferenceError(RuntimeError):
 
 
 def _infer_cadence(
-    pipeline: InferencePipeline, preprocessor: DataPreprocessor, unit, cadence_result
+    pipeline: InferencePipeline,
+    preprocessor: DataPreprocessor,
+    unit,
+    cadence_result,
+    config_fingerprint: str,
 ) -> dict:
     """
     Run the inference stage for one preprocessed cadence: derive provenance, load its stamps
@@ -370,6 +375,7 @@ def _infer_cadence(
         n_candidates=results["n_candidates"],
         confidence_summary=confidence_summary,
         duration_s=duration_s,
+        config_fingerprint=config_fingerprint,
     )
 
     results["provenance"] = provenance
@@ -429,18 +435,29 @@ def _run_streaming_csv_inference(
     }
     collector = InferenceVizCollector() if config.inference.inference_viz_enabled else None
 
-    # Stage-aware resume: a live 'inferred' manifest row for (tag, npy_path) means the
-    # cadence completed on an earlier attempt — skip it entirely and reuse its aggregates.
+    # Stage-aware resume: a live 'inferred' manifest row for (tag, npy_path) means the cadence
+    # completed on an earlier attempt — skip it and reuse its aggregates, but ONLY when it was
+    # written under the same inference config. The fingerprint guard stops a reused --save-tag
+    # with a changed threshold/model/geometry from silently serving stale results (the inference
+    # counterpart of the training-side config_fingerprint guard).
     # Flush first so rows queued by this process (an in-process retry) are visible.
+    current_fingerprint = inference_config_fingerprint(config.to_dict())
     db.flush()
     inferred_rows = {
         row["npy_path"]: row for row in db.query_inference_cadences(tag=tag, status="inferred")
     }
 
     pending = []
+    stale_config = 0
     for unit in units:
         manifest_row = inferred_rows.get(unit.npy_path)
         if manifest_row is None:
+            pending.append(unit)
+            continue
+        if manifest_row.get("config_fingerprint") != current_fingerprint:
+            # Live 'inferred' row, but written under a different inference config -> don't reuse.
+            # Re-infer; _infer_cadence's supersede step retires the stale row.
+            stale_config += 1
             pending.append(unit)
             continue
         n_snippets = int(manifest_row.get("n_stamps") or 0)
@@ -460,6 +477,14 @@ def _run_streaming_csv_inference(
         logger.info(
             f"Cadence {unit.group.key}: already inferred under tag {tag} "
             f"({n_snippets} snippets, {n_candidates} candidate(s)); skipping"
+        )
+
+    if stale_config:
+        logger.warning(
+            f"{stale_config} cadence(s) under tag {tag} have an 'inferred' manifest row written "
+            f"with a DIFFERENT inference config; re-inferring rather than reusing stale results "
+            f"(a reused --save-tag with a changed threshold/model/geometry is not resumed). Use a "
+            f"fresh --save-tag to keep separate configs' results separate."
         )
 
     logger.info(
@@ -505,7 +530,9 @@ def _run_streaming_csv_inference(
                     # move on — one bad cadence must not abort the catalog. The pass
                     # raises after the loop so the retry loop re-attempts failed cadences.
                     try:
-                        results = _infer_cadence(pipeline, preprocessor, unit, cadence_result)
+                        results = _infer_cadence(
+                            pipeline, preprocessor, unit, cadence_result, current_fingerprint
+                        )
                     except Exception as e:
                         logger.error(
                             f"Cadence {cadence_result.key}: inference stage failed ({e}); "

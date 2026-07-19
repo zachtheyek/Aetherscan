@@ -89,6 +89,53 @@ def config_changed(state: TrainingRunState | None, current_fingerprint: str) -> 
     return state is not None and state.config_fingerprint != current_fingerprint
 
 
+# Inference-result-affecting config for inference_config_fingerprint(). We DENYLIST the inference
+# keys that don't change per-cadence results (I/O paths, batching, retry knobs, and viz/debug
+# toggles) rather than allowlisting the ones that do — a denylist can only over-invalidate (force a
+# harmless re-inference), never under-invalidate (the actual stale-reuse footgun). The data section
+# is the reverse: it is mostly training params, so we ALLOWLIST only the geometry fields that drive
+# stamp extraction and the encoder input.
+_INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS = frozenset(
+    {
+        "config_path",  # source-config file path, not a result input
+        "per_replica_batch_size",  # batching only; #120's pad+truncate makes results batch-invariant
+        "parallel_coarse_chans",  # progress-logging chunk size only (inert)
+        "bandpass_debug_plot",  # opt-in debug artifact
+        "preprocess_output_dir",  # where stamps are written (folded into npy_path, not values)
+        "inference_viz_enabled",  # viz toggle
+        "stamp_gallery_top_k",  # viz only
+        "max_candidate_plots",  # viz only
+        "max_retries",  # retry loop only
+        "retry_delay",  # retry loop only
+    }
+)
+_INFERENCE_FINGERPRINT_DATA_KEYS = frozenset(
+    {"downsample_factor", "width_bin", "num_observations", "time_bins"}
+)
+
+
+def inference_config_fingerprint(config_dict: dict) -> str:
+    """
+    Stable hash of the inference-result-affecting config (from Config.to_dict()) — the inference
+    counterpart of config_fingerprint. Used to detect that inference was re-run under a reused
+    --save-tag with a changed config so a stale 'inferred' manifest row is not silently reused as
+    a skip. Covers the inference section minus non-result knobs (see the denylist above) plus the
+    data-section geometry that drives stamp extraction and the encoder input.
+    """
+    inference = config_dict.get("inference") or {}
+    data = config_dict.get("data") or {}
+    relevant = {
+        "inference": {
+            k: v
+            for k, v in inference.items()
+            if k not in _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS
+        },
+        "data": {k: data[k] for k in _INFERENCE_FINGERPRINT_DATA_KEYS if k in data},
+    }
+    canonical = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 @dataclass
 class TrainingRunState:
     """Persisted state of one training run (identified by its save tag) across attempts."""

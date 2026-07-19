@@ -46,7 +46,11 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     statements in _init_database() run before migration for old and new databases alike —
 #     so the version bump exists to record the change and keep future `if version < N:`
 #     blocks ordered.
-_SCHEMA_VERSION = 2
+# v3: added `inference_cadences.config_fingerprint` so the stage-aware resume only skips a
+#     cadence whose stored 'inferred' row was written under the same inference config — guards
+#     the reused-tag-with-changed-config stale-reuse footgun (the inference counterpart of the
+#     training-side config_fingerprint guard).
+_SCHEMA_VERSION = 3
 
 
 def get_system_metadata() -> str:
@@ -349,6 +353,7 @@ class Database:
                     n_candidates INTEGER,
                     confidence_summary TEXT,
                     duration_s REAL,
+                    config_fingerprint TEXT,
                     superseded INTEGER DEFAULT 0
                 )
             """)
@@ -405,6 +410,15 @@ class Database:
         # for old and new databases alike by the CREATE TABLE IF NOT EXISTS statement in
         # _init_database(), which always runs before this method. Only the version stamp
         # below advances.
+
+        if version < 3:
+            # v3: config_fingerprint on inference_cadences. A fresh db already has the column
+            # from the CREATE TABLE above; this ALTER patches a db that created the v2 table
+            # before the column existed. The column-existence check keeps it idempotent.
+            columns = {row[1] for row in cursor.execute("PRAGMA table_info(inference_cadences)")}
+            if "config_fingerprint" not in columns:
+                cursor.execute("ALTER TABLE inference_cadences ADD COLUMN config_fingerprint TEXT")
+                logger.info("Schema migration: added inference_cadences.config_fingerprint")
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -805,8 +819,8 @@ class Database:
                         """
                         INSERT INTO inference_cadences
                         (timestamp, tag, csv_path, cadence_key, npy_path, status, n_stamps,
-                         n_candidates, confidence_summary, duration_s)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         n_candidates, confidence_summary, duration_s, config_fingerprint)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_cadences_records,
                     )
@@ -1068,6 +1082,7 @@ class Database:
         n_candidates: int | None = None,
         confidence_summary: dict | None = None,
         duration_s: float | None = None,
+        config_fingerprint: str | None = None,
         timestamp: float | None = None,
     ):
         """
@@ -1103,6 +1118,7 @@ class Database:
                     n_candidates,
                     confidence_summary_json,
                     duration_s,
+                    config_fingerprint,
                 ),
             )
         )
@@ -1195,6 +1211,7 @@ class Database:
         "n_candidates",
         "confidence_summary",
         "duration_s",
+        "config_fingerprint",
         "superseded",
     }
 

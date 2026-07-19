@@ -206,6 +206,39 @@ class TestStreamingResumeStateMachine:
         # No second pipeline was even constructed (nothing pending -> no model load)
         assert len(_StubPipeline.instances) == 1
 
+    def test_changed_config_reinfers_instead_of_reusing_stale(self, stubbed_streaming):
+        """A reused save-tag with a CHANGED inference config must NOT skip already-inferred
+        cadences: the manifest's config_fingerprint mismatches, so they are re-inferred rather
+        than silently serving stale results (guards the #122-class sticky-manifest footgun on
+        the inference side)."""
+        db, make_preprocessor = stubbed_streaming
+        config = get_config()
+
+        first = make_preprocessor()
+        _run_streaming_csv_inference(first, strategy=None)
+        assert db.flush(timeout=10) is True
+        fp_before = {
+            r["config_fingerprint"]
+            for r in db.query_inference_cadences(tag="test_v1", status="inferred")
+        }
+
+        # Change a result-affecting inference knob under the SAME save-tag.
+        config.inference.classification_threshold = 0.123
+
+        second = make_preprocessor()
+        totals = _run_streaming_csv_inference(second, strategy=None)
+
+        assert totals["n_skipped"] == 0  # live 'inferred' rows are NOT reused under the new config
+        assert totals["n_cadences"] == 2
+        assert second.processed_keys == [("A", "1"), ("B", "2")]  # both re-preprocessed
+        assert len(_StubPipeline.instances) == 2  # a second pipeline was built (re-inference ran)
+
+        assert db.flush(timeout=10) is True
+        live = db.query_inference_cadences(tag="test_v1", status="inferred")
+        assert len(live) == 2  # stale rows superseded, fresh rows live
+        fp_after = {r["config_fingerprint"] for r in live}
+        assert fp_after.isdisjoint(fp_before)  # fresh rows carry the new config fingerprint
+
     def test_failed_cadence_recorded_and_retried_alone(self, stubbed_streaming):
         """Inference-stage containment: cadence B's failure doesn't abort cadence A; the
         pass raises so the retry loop re-attempts, and the retry re-runs ONLY B."""
