@@ -170,6 +170,7 @@ Aetherscan/
 │   ├── config.py               # Configuration defaults
 │   ├── train.py                # Training orchestration
 │   ├── inference.py            # Inference orchestration
+│   ├── inference_viz.py         # Inference visualization suite
 │   ├── preprocessing.py        # Data preprocessing
 │   ├── data_generation.py      # Synthetic signal injection
 │   ├── models/
