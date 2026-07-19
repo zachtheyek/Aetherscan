@@ -54,9 +54,11 @@ _GLOBAL_DTYPE = None
 # PFB static-response sanity check: warn when a file's measured edge/mid power ratio
 # disagrees with the theoretical response's by more than this relative tolerance.
 _PFB_RATIO_MISMATCH_TOL = 0.05
-# Coarse channels sampled (evenly across the band) by the PFB sanity check and the opt-in
-# bandpass overlay debug plot.
+# Coarse channels sampled (evenly across the band) by the opt-in bandpass overlay debug plot.
 _BANDPASS_SAMPLE_CHANNELS = 3
+# The PFB static-response sanity check samples more channels and takes a median (not a mean),
+# so a single RFI-heavy channel doesn't skew the statistic.
+_PFB_MISMATCH_SAMPLE_CHANNELS = 9
 
 
 def _init_worker(shm_name, shape, dtype):
@@ -1751,9 +1753,11 @@ class DataPreprocessor:
         return path
 
     @staticmethod
-    def _sample_channel_indices(n_coarse_total: int) -> list[int]:
-        """Pick up to _BANDPASS_SAMPLE_CHANNELS coarse-channel indices evenly across the band."""
-        num = min(_BANDPASS_SAMPLE_CHANNELS, n_coarse_total)
+    def _sample_channel_indices(
+        n_coarse_total: int, num: int = _BANDPASS_SAMPLE_CHANNELS
+    ) -> list[int]:
+        """Pick up to `num` coarse-channel indices evenly across the band."""
+        num = min(num, n_coarse_total)
         return sorted({int(i) for i in np.linspace(0, n_coarse_total - 1, num=num)})
 
     def _read_despiked_channel(self, h5_path: str, channel_index: int) -> np.ndarray:
@@ -1769,24 +1773,41 @@ class DataPreprocessor:
 
     def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
         """
-        Cheap validation of the static PFB response against the recording (after the bliss
-        `validate` flag): compare the file's mean edge/mid power ratio — measured on a few
+        Heuristic sanity check of the static PFB response against the recording (after the bliss
+        `validate` flag): compare the file's median edge/mid power ratio — measured over several
         coarse channels sampled evenly across the band — with the theoretical response's, and
-        warn once per file (never per channel) when they disagree by more than
-        _PFB_RATIO_MISMATCH_TOL. A mismatch means the static response doesn't describe this
-        recording (wrong --pfb-taps-per-channel for the instrument that produced the .h5),
-        in which case the data-driven spline method may be preferable.
+        log an INFORMATIONAL warning once per file (never per channel) when they disagree by
+        more than _PFB_RATIO_MISMATCH_TOL.
+
+        This comparison is deliberately coarse and is EXPECTED to show a moderate mismatch even
+        when the response is correct: the measured ratio is taken on RAW (unflattened) data, so
+        it also carries the analog-frontend passband tilt and edge RFI that the pure response H
+        does not model. A median over several channels resists a single RFI-heavy channel, but
+        the frontend contribution is systematic and does not cancel — so a small disagreement is
+        normal, and only a LARGE or CONSISTENT one (across many files) is diagnostic of a wrong
+        --pfb-taps-per-channel. A principled threshold needs the analog-frontend baseline, which
+        is the deferred pfb_taps-vs-backend characterization.
         """
+        # TODO: replace this raw-vs-pure comparison with a residual-flatness statistic — flatten
+        # the sampled channels with the active response (divide by H) and compare the flattened
+        # edge/mid ratio against ~1.0. That directly measures whether dividing by H flattens the
+        # data and is far less confounded by the frontend tilt / RFI, giving a meaningful
+        # threshold. Land it with the pfb_taps-per-channel backend characterization (which fixes
+        # the legitimate baseline), and read the sampled channels more cheaply (float32/strided)
+        # — the full-resolution float64 reads make this check non-cheap at GBT scale. See #156.
         width = self.config.inference.coarse_channel_width
         taps = self.config.inference.pfb_taps_per_channel
         try:
             response = gen_coarse_channel_response(width, n_coarse_total, taps)
             expected = edge_mid_power_ratio(response)
+            # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
             ratios = [
                 edge_mid_power_ratio(self._read_despiked_channel(h5_path, ch).mean(axis=0))
-                for ch in self._sample_channel_indices(n_coarse_total)
+                for ch in self._sample_channel_indices(
+                    n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
+                )
             ]
-            measured = float(np.mean(ratios))
+            measured = float(np.median(ratios))
         except Exception as e:
             logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
             return
@@ -1794,11 +1815,13 @@ class DataPreprocessor:
         rel_diff = abs(measured - expected) / expected
         if rel_diff > _PFB_RATIO_MISMATCH_TOL:
             logger.warning(
-                f"{h5_path}: measured edge/mid power ratio {measured:.3f} differs from the "
-                f"static PFB response's {expected:.3f} by {rel_diff:.1%} "
-                f"(> {_PFB_RATIO_MISMATCH_TOL:.0%}). The configured response may not match "
-                f"the backend that produced this file — check --pfb-taps-per-channel "
-                f"(currently {taps}), or consider --bandpass-method spline"
+                f"{h5_path}: median edge/mid power ratio {measured:.3f} differs from the static "
+                f"PFB response's {expected:.3f} by {rel_diff:.1%} (heuristic sanity check — "
+                f"informational). The measured ratio is taken on raw data, so it also reflects "
+                f"analog-frontend tilt and edge RFI the pure response does not model; a moderate "
+                f"gap is expected. Investigate only a large or consistent mismatch across many "
+                f"files: it may mean --pfb-taps-per-channel (currently {taps}) is wrong for this "
+                f"backend, in which case --bandpass-method spline is the data-driven fallback."
             )
 
     def _plot_bandpass_overlay(
