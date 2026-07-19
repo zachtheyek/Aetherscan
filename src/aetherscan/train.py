@@ -354,6 +354,92 @@ def check_encoder_trained(encoder, threshold=0.2):
         return False
 
 
+def build_traversal_latents(
+    z_base: np.ndarray, sigmas: np.ndarray, num_steps: int, max_sigma: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build the latent grid for a traversal of every latent dimension around `z_base`.
+
+    Row (d, s) (row-major over dims then steps) is z_base + steps[s] * sigmas[d] * e_d, where
+    steps = linspace(-max_sigma, +max_sigma, num_steps) — with the validated odd num_steps the
+    center step is exactly 0, i.e. the unperturbed base decode. Returns (latents of shape
+    (latent_dim * num_steps, latent_dim) float32, steps of shape (num_steps,)).
+    """
+    z_base = np.asarray(z_base, dtype=np.float32)
+    sigmas = np.asarray(sigmas, dtype=np.float32)
+    if z_base.ndim != 1 or z_base.shape != sigmas.shape:
+        raise ValueError(
+            f"z_base and sigmas must be matching 1-D vectors, got {z_base.shape} and {sigmas.shape}"
+        )
+
+    latent_dim = z_base.shape[0]
+    steps = np.linspace(-max_sigma, max_sigma, num_steps).astype(np.float32)
+    if num_steps % 2 == 1:
+        # Snap the center step to exactly 0 — linspace can leave ~1e-16 residue for
+        # non-integral max_sigma, and the center column must be the exact base decode
+        steps[num_steps // 2] = 0.0
+    latents = np.tile(z_base, (latent_dim * num_steps, 1))
+    for d in range(latent_dim):
+        latents[d * num_steps : (d + 1) * num_steps, d] += steps * sigmas[d]
+    return latents, steps
+
+
+def compute_traversal_panels(
+    z_base: np.ndarray,
+    sigmas: np.ndarray,
+    num_steps: int,
+    max_sigma: float,
+    decode_fn: Callable[[np.ndarray], np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Decode a full traversal grid into per-(dim, step) reconstruction panels.
+
+    `decode_fn` maps a (n, latent_dim) latent batch to (n, time, freq) or (n, time, freq, 1)
+    reconstructions (production passes the VAE decoder; unit tests pass a stub). Returns
+    (panels of shape (latent_dim, num_steps, time, freq), steps of shape (num_steps,)).
+    """
+    latents, steps = build_traversal_latents(z_base, sigmas, num_steps, max_sigma)
+    recon = np.asarray(decode_fn(latents))
+    if recon.ndim == 4 and recon.shape[-1] == 1:
+        recon = recon[..., 0]
+    if recon.ndim != 3 or recon.shape[0] != latents.shape[0]:
+        raise ValueError(
+            f"decode_fn must return (n, time, freq[, 1]) reconstructions for n={latents.shape[0]} "
+            f"latents, got shape {recon.shape}"
+        )
+    latent_dim = latents.shape[1]
+    panels = recon.reshape(latent_dim, num_steps, recon.shape[1], recon.shape[2])
+    return panels, steps
+
+
+def unpreprocess_traversal_panels(
+    panels: np.ndarray, lognorm_params: tuple[float, float] | None, downsample_factor: int
+) -> tuple[np.ndarray, bool]:
+    """
+    Approximately undo generation-time preprocessing on decoded panels, for display only.
+
+    Exact inversion is impossible: downsampling is lossy and the log-norm parameters are
+    per-observation while a traversal decode blends many observations — so this is an honest
+    approximation (stated on the figures). Where `lognorm_params` = (min_log, range_log) is
+    available (and non-degenerate), the log-norm is inverted via exp(x * range_log + min_log);
+    otherwise panels stay in normalized log space. Downsampling is undone by nearest-neighbor
+    repetition along the frequency axis so the axis is in true (pre-downsample) bins.
+
+    Returns (display_panels, inverted) — `inverted` says whether the log-norm inversion was
+    applied (drives the figures' intensity-scale caption).
+    """
+    panels = np.asarray(panels)
+    inverted = False
+    if lognorm_params is not None:
+        min_log, range_log = lognorm_params
+        if range_log > 0:
+            panels = np.exp(panels * range_log + min_log)
+            inverted = True
+    if downsample_factor > 1:
+        panels = np.repeat(panels, downsample_factor, axis=-1)
+    return panels, inverted
+
+
 # Create data holder objects, to be paired with data generators, for TF's distributed datasets
 # Allows for explicit dereferencing of the backing arrays using holder.clear(), which lets
 # Python's garbage collector free up memory on-demand
@@ -826,6 +912,7 @@ class TrainingPipeline:
         # failure stay valid in the DB)
         self._latent_viz_batch = None
         self._latent_viz_labels = None
+        self._latent_viz_lognorm_params = None
         self._latent_viz_dataset = None
         self._latent_viz_n_padded = None
         self._latent_viz_n_samples = None
@@ -1180,12 +1267,10 @@ class TrainingPipeline:
                 self._round_producer.shutdown()
                 self._round_producer = None
 
-            # Free the latent viz batch once all rounds are complete (or on failure); a
-            # resumed attempt rebuilds it from the resumed round's val split
-            del self._latent_viz_batch, self._latent_viz_labels
-            self._latent_viz_batch = None
-            self._latent_viz_labels = None
-            gc.collect()
+            # NOTE: the latent viz batch intentionally survives this method — the vae_plots
+            # stage's plot_latent_traversal re-encodes/decodes it. It is freed by
+            # _clear_latent_viz_data(), called from the stage machine after vae_plots (and
+            # from run_training_pipeline's cleanup on any earlier failure)
 
     def train_round(self, round_idx: int, epochs: int, snr_base: int, snr_range: int):
         """
@@ -1227,10 +1312,12 @@ class TrainingPipeline:
         # batched generators gather from the OS page cache during training)
         train_data = load_round_arrays(paths)
 
-        # Extract labels before distributing (prepare_distributed_train_dataset keeps the
-        # original arrays alive via a shared train_holder — no copies — so we can free the
-        # dict reference immediately after)
+        # Extract labels and the (tiny, eagerly-loaded) log-norm parameter array before
+        # distributing (prepare_distributed_train_dataset keeps the original arrays alive via
+        # a shared train_holder — no copies — so we can free the dict reference immediately
+        # after)
         train_labels = train_data.get("labels")
+        train_lognorm = train_data.get("lognorm")
 
         # Distribute training data
         data = prepare_distributed_train_dataset(
@@ -1260,13 +1347,14 @@ class TrainingPipeline:
                     concat_data=data["_train_holder"].concat,
                     labels=train_labels,
                     candidate_indices=data["val_indices"],
+                    lognorm_params=train_lognorm,
                 )
         # On subsequent rounds, the latent viz batch is persisted,
         # but the distributed dataset needs to be rebuilt
         elif self._latent_viz_batch is not None and self._latent_viz_dataset is None:
             self._build_latent_viz_dataset()
 
-        del train_labels
+        del train_labels, train_lognorm
         gc.collect()
 
         train_dataset = data["train_dataset"]
@@ -1481,6 +1569,18 @@ class TrainingPipeline:
                 tag=f"round_{round_idx + 1:02d}",
                 dir="checkpoints",
             )
+
+            # Optional per-round latent traversal (config-gated; the canonical set renders
+            # once at end of training in the vae_plots stage). Failures are logged and
+            # swallowed — an optional plot mustn't fail the round and cost a retry cycle
+            # including data regeneration
+            if self.config.training.latent_traversal_every_round:
+                try:
+                    self.plot_latent_traversal(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to execute plot_latent_traversal for round {round_idx + 1}: {e}"
+                    )
 
             # NOTE: commented out to save compute. a final latent space gif at the end of training should suffice
             # Generate latent space GIF
@@ -2522,6 +2622,20 @@ class TrainingPipeline:
         if self._rf_shap_cache:
             logger.info(f"Clearing RF SHAP cache ({len(self._rf_shap_cache)} entries)")
             self._rf_shap_cache.clear()
+        gc.collect()
+
+    def _clear_latent_viz_data(self) -> None:
+        """
+        Free the withheld latent viz batch (plus its labels and log-norm parameters).
+
+        Called from the stage machine once the vae_plots stage has run (the traversal plot is
+        the batch's last consumer) and from run_training_pipeline's cleanup on any earlier
+        failure; a resumed attempt rebuilds the batch from the resumed round's val split.
+        Idempotent.
+        """
+        self._latent_viz_batch = None
+        self._latent_viz_labels = None
+        self._latent_viz_lognorm_params = None
         gc.collect()
 
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
@@ -4530,6 +4644,306 @@ class TrainingPipeline:
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
 
+    def plot_latent_traversal(self, tag: str | None = None, dir: str | None = None):
+        """
+        Decoder-based interpretation of the latent dimensions: for each signal type, decode
+        z_t + s·σ_d·e_d for every latent dim d and step s ∈ linspace(-max_sigma, +max_sigma,
+        num_steps), where z_t is the mean encoder z_mean over that type's ON observations
+        (indices 0/2/4) from the withheld latent viz batch and σ_d is the per-dim std of
+        z_mean over the whole batch. Two figures per signal type:
+
+        - latent_traversal_{signal_type}_{tag}.png: latent_dim × num_steps waterfall grid
+          (shared per-row color scale); the center column is the unperturbed class-mean decode.
+        - latent_traversal_spectra_{signal_type}_{tag}.png: per-dim time-integrated spectra,
+          one line per step (step colormap) — brightness/drift/width shifts read off easily.
+
+        Display un-preprocessing is an honest approximation, stated on each figure (see
+        unpreprocess_traversal_panels). Encoding/decoding uses the plain non-distributed
+        models (the viz batch is ≤ ~960 cadences — a trivial single pass, and keeping the
+        plot independent of the distributed dataset plumbing). Requires the in-memory viz
+        batch, which lives from the first trained round through the vae_plots stage; on a
+        resumed run whose beta-VAE rounds were already complete there is nothing to encode
+        and the plot is skipped with a warning.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        if self._latent_viz_batch is None or self._latent_viz_labels is None:
+            logger.warning(
+                "plot_latent_traversal: no latent viz batch available (e.g. a resumed run "
+                "whose beta-VAE rounds were already complete) — skipping traversal figures"
+            )
+            return
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        num_steps = self.config.training.latent_traversal_num_steps
+        max_sigma = self.config.training.latent_traversal_max_sigma
+        latent_dim = self.config.beta_vae.latent_dim
+        num_obs = self.config.data.num_observations
+        time_bins = self.config.data.time_bins
+        downsample_factor = self.config.data.downsample_factor
+        width_bin = self.config.data.width_bin // downsample_factor
+
+        batch = np.asarray(self._latent_viz_batch, dtype=np.float32)
+        labels = self._latent_viz_labels
+        n_cadences = batch.shape[0]
+
+        # Encode the whole viz batch in one simple non-distributed pass, chunked by cadence
+        # (each chunk expands to chunk x num_obs observations at the encoder) so a large viz
+        # batch can't spike device memory (the encoder was created inside strategy.scope()
+        # but runs fine on the default device)
+        chunk = max(1, self.config.training.per_replica_val_batch_size)
+        z_parts = []
+        for start in range(0, n_cadences, chunk):
+            observations = batch[start : start + chunk].reshape(-1, time_bins, width_bin, 1)
+            z_mean_part, _, _ = self.vae.encoder(tf.convert_to_tensor(observations), training=False)
+            z_parts.append(np.asarray(z_mean_part))
+        z_mean = np.concatenate(z_parts, axis=0).reshape(n_cadences, num_obs, latent_dim)
+        del z_parts
+
+        # Per-dim σ over the whole viz batch (all observations pooled) — sets each dim's
+        # traversal scale in units the encoder actually uses
+        sigmas = z_mean.reshape(-1, latent_dim).std(axis=0)
+        if np.all(sigmas == 0):
+            # Fully collapsed latents (e.g. a degenerate/untrained encoder): every traversal
+            # step would decode to the same image — skip rather than render 8 blank grids
+            logger.warning(
+                "plot_latent_traversal: all per-dim sigmas are zero (collapsed latents) — "
+                "skipping traversal figures"
+            )
+            return
+
+        on_indices = np.arange(0, num_obs, 2)  # ON observations (ABACAD -> indices 0/2/4)
+
+        def decode_fn(latents):
+            # Single-shot decode: the batch is bounded by latent_dim * num_steps rows (56 at
+            # defaults; even num_steps=99 is ~800 (16, 512, 1) reconstructions ≈ 26 MB) — no
+            # chunking needed, unlike the cadence-count-scaled encoding loop above
+            return np.asarray(self.vae.decoder(tf.convert_to_tensor(latents), training=False))
+
+        signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        type_display_names = {
+            "false_no_signal": "No Signal",
+            "false_with_rfi": "RFI Only",
+            "true_only_eti": "ETI Only",
+            "true_eti_rfi": "ETI + RFI",
+        }
+
+        for signal_type in signal_types:
+            mask = labels == signal_type
+            if not mask.any():
+                logger.warning(
+                    f"plot_latent_traversal: no viz cadences for {signal_type} — skipping"
+                )
+                continue
+            display_name = type_display_names[signal_type]
+
+            # Base vector: mean z_mean over this type's ON observations
+            z_t = z_mean[mask][:, on_indices, :].mean(axis=(0, 1))
+
+            # Class-mean log-norm params over this type's ON observations, for the approximate
+            # display inversion. Collapsing the per-observation (6, 2) params to one
+            # (min_log, range_log) pair is itself part of the approximation — a traversal decode
+            # blends observations — and combined with the lossy frequency downsampling the
+            # inverted intensity is DISPLAY-ONLY, never exact. None -> plot in normalized log space.
+            lognorm = None
+            if self._latent_viz_lognorm_params is not None:
+                on_params = self._latent_viz_lognorm_params[mask][:, on_indices, :]
+                lognorm = (float(on_params[..., 0].mean()), float(on_params[..., 1].mean()))
+
+            panels, steps = compute_traversal_panels(z_t, sigmas, num_steps, max_sigma, decode_fn)
+            panels, inverted = unpreprocess_traversal_panels(panels, lognorm, downsample_factor)
+
+            # State the approximation on the figure — exact inversion is impossible
+            # (downsampling is lossy; log-norm params are per-observation, a decode blends many)
+            if inverted:
+                caption = (
+                    "Approximate un-preprocessing: log-norm inverted with class-mean ON-obs "
+                    f"params (exp(x·range_log + min_log)); frequency ×{downsample_factor} "
+                    "nearest-neighbor upsampled. Exact inversion impossible (lossy downsample, "
+                    "per-observation params)."
+                )
+            else:
+                caption = (
+                    "Intensity in normalized log space (log-norm params unavailable or "
+                    f"degenerate); frequency ×{downsample_factor} nearest-neighbor upsampled. "
+                    "Exact un-preprocessing impossible (lossy downsample)."
+                )
+
+            self._render_traversal_waterfalls(
+                panels, steps, sigmas, display_name, signal_type, caption, tag, dir, machine_name
+            )
+            self._render_traversal_spectra(
+                panels,
+                steps,
+                sigmas,
+                inverted,
+                display_name,
+                signal_type,
+                caption,
+                tag,
+                dir,
+                machine_name,
+            )
+
+            del panels
+
+        del batch, z_mean
+        gc.collect()
+
+    def _save_traversal_figure(self, fig, filename: str, dir: str | None, slack_title: str):
+        """Standard plot tail shared by the two traversal renderers: save under the plots
+        directory (optionally nested in `dir`), close the figure, and upload to Slack."""
+        if dir is not None:
+            save_path = os.path.join(self.config.output_path, "plots", dir, filename)
+        else:
+            save_path = os.path.join(self.config.output_path, "plots", filename)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Latent traversal plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(save_path, title=slack_title)
+
+    def _render_traversal_waterfalls(
+        self, panels, steps, sigmas, display_name, signal_type, caption, tag, dir, machine_name
+    ):
+        """Primary traversal figure: latent_dim × num_steps grid of decoded waterfalls with a
+        shared color scale per row (per dim), rows labeled dim/σ, columns labeled step
+        multiples. panels has shape (latent_dim, num_steps, time, freq_display)."""
+        latent_dim, num_steps = panels.shape[0], panels.shape[1]
+
+        fig, axes = plt.subplots(
+            latent_dim,
+            num_steps,
+            figsize=(1.9 * num_steps + 1.5, 1.5 * latent_dim + 1.8),
+            squeeze=False,
+        )
+        fig.suptitle(
+            f"Latent Traversal — {display_name} ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+        fig.text(0.5, 0.955, caption, ha="center", fontsize=8, style="italic", wrap=True)
+
+        for d in range(latent_dim):
+            # Shared color scale per row so intensity changes read across steps
+            vmin = float(panels[d].min())
+            vmax = float(panels[d].max())
+            if vmax <= vmin:
+                vmax = vmin + 1e-12
+            for s in range(num_steps):
+                ax = axes[d][s]
+                ax.imshow(
+                    panels[d, s],
+                    aspect="auto",
+                    origin="lower",
+                    cmap="viridis",
+                    vmin=vmin,
+                    vmax=vmax,
+                    extent=(0, panels.shape[3], 0, panels.shape[2]),
+                )
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if d == 0:
+                    # The center column (odd, validated step count) is the unperturbed decode
+                    is_center = num_steps % 2 == 1 and s == num_steps // 2
+                    ax.set_title("0σ (base)" if is_center else f"{steps[s]:+.3g}σ", fontsize=10)
+                if s == 0:
+                    ax.set_ylabel(f"dim {d}\n(σ={sigmas[d]:.3f})", fontsize=9)
+        axes[-1][num_steps // 2].set_xlabel(
+            "Frequency bin (full resolution) — each panel: time × frequency", fontsize=10
+        )
+
+        plt.tight_layout(rect=(0, 0, 1, 0.94))
+
+        self._save_traversal_figure(
+            fig,
+            f"latent_traversal_{signal_type}_{tag}.png",
+            dir,
+            slack_title=f"Latent Traversal ({display_name}) - ({tag}, {machine_name})",
+        )
+
+    def _render_traversal_spectra(
+        self,
+        panels,
+        steps,
+        sigmas,
+        inverted,
+        display_name,
+        signal_type,
+        caption,
+        tag,
+        dir,
+        machine_name,
+    ):
+        """Secondary traversal figure: one panel per latent dim showing the time-integrated
+        spectrum of every traversal step (colormap over steps) — brightness/drift/width shifts
+        read off more easily than in the waterfall grid."""
+        latent_dim, num_steps = panels.shape[0], panels.shape[1]
+        ncols = 4
+        nrows = (latent_dim + ncols - 1) // ncols
+
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(4.5 * ncols, 3.2 * nrows + 1.0), squeeze=False
+        )
+        fig.suptitle(
+            f"Latent Traversal Spectra — {display_name} ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+        fig.text(0.5, 0.935, caption, ha="center", fontsize=8, style="italic", wrap=True)
+
+        cmap = plt.cm.coolwarm
+        norm = plt.Normalize(float(steps[0]), float(steps[-1]))
+        freq_bins = np.arange(panels.shape[3])
+        intensity_label = (
+            "Mean intensity (approx. linear)" if inverted else "Mean intensity (normalized log)"
+        )
+
+        for d in range(latent_dim):
+            ax = axes[d // ncols][d % ncols]
+            for s in range(num_steps):
+                ax.plot(
+                    freq_bins,
+                    panels[d, s].mean(axis=0),  # Time-integrated spectrum
+                    color=cmap(norm(float(steps[s]))),
+                    linewidth=1.2,
+                )
+            ax.set_title(f"dim {d} (σ={sigmas[d]:.3f})", fontsize=11)
+            ax.grid(True, alpha=0.3)
+            # Label the bottom-most panel in each column (no panel d+ncols below it), so a
+            # partial last row (latent_dim not a multiple of ncols) still labels every column
+            if d + ncols >= latent_dim:
+                ax.set_xlabel("Frequency bin (full resolution)", fontsize=10)
+            if d % ncols == 0:
+                ax.set_ylabel(intensity_label, fontsize=10)
+
+        # Hide any unused grid slots (latent_dim not divisible by ncols)
+        for idx in range(latent_dim, nrows * ncols):
+            axes[idx // ncols][idx % ncols].axis("off")
+
+        # Step colorbar (skip tight_layout — it doesn't cooperate with a stolen-axes colorbar)
+        mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        mappable.set_array([])
+        fig.colorbar(
+            mappable,
+            ax=axes.ravel().tolist(),
+            label="Traversal step (× per-dim σ)",
+            shrink=0.85,
+        )
+
+        self._save_traversal_figure(
+            fig,
+            f"latent_traversal_spectra_{signal_type}_{tag}.png",
+            dir,
+            slack_title=f"Latent Traversal Spectra ({display_name}) - ({tag}, {machine_name})",
+        )
+
     # TODO: implement plot_rf_snr_sensitivity_curve()
     def plot_rf_confusion_matrices(self, tag: str | None = None, dir: str | None = None):
         """
@@ -5778,7 +6192,9 @@ class TrainingPipeline:
         del pts_features, pts_subtype, pts_correct
         gc.collect()
 
-    def _prepare_latent_viz_batch(self, concat_data, labels, candidate_indices=None):
+    def _prepare_latent_viz_batch(
+        self, concat_data, labels, candidate_indices=None, lognorm_params=None
+    ):
         """
         Subsample cadences from concat_data for latent-space visualization, attempting an equal
         distribution across the 4 signal_type values in `labels` (n_per_type per type).
@@ -5788,7 +6204,9 @@ class TrainingPipeline:
         and reusing the same data across rounds removes distribution-shift artifacts from the
         curriculum schedule. concat_data is shape (n_total, 6, 16, width_bin); labels is shape
         (n_total,); candidate_indices, when given, restricts eligible samples (e.g. to validation
-        partition indices) without copying the full partition.
+        partition indices) without copying the full partition. lognorm_params, when given, is the
+        (n_total, 6, 2) per-observation log-norm parameter array recorded at generation time —
+        the selected cadences' rows are kept for plot_latent_traversal's display inversion.
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
@@ -5824,12 +6242,16 @@ class TrainingPipeline:
             logger.warning("No cadences found for any signal type — skipping viz batch")
             self._latent_viz_batch = None
             self._latent_viz_labels = None
+            self._latent_viz_lognorm_params = None
             return
 
         # Fancy indexing already creates a new independent array (no .copy() needed)
         all_indices = np.concatenate(selected_indices)
         self._latent_viz_batch = concat_data[all_indices]
         self._latent_viz_labels = np.array(selected_labels, dtype="U20")
+        self._latent_viz_lognorm_params = (
+            lognorm_params[all_indices] if lognorm_params is not None else None
+        )
 
         if len(all_indices) < n_per_type * len(signal_types):
             logger.warning(
@@ -6061,15 +6483,17 @@ class TrainingPipeline:
 
     # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
     def plot_vae_diagnostics(self) -> None:
-        """The vae_plots stage: final loss curves, training stability, injection stats, and
-        the latent-space GIF. Attempts every plot even if one fails, then raises listing the
-        failures — the stage machine records them without costing a data regeneration."""
+        """The vae_plots stage: final loss curves, training stability, injection stats, the
+        latent-space GIF, and the latent-dimension traversal. Attempts every plot even if one
+        fails, then raises listing the failures — the stage machine records them without
+        costing a data regeneration."""
         self._run_plot_group(
             [
                 (self.plot_beta_vae_loss_curves, "plot_beta_vae_loss_curves"),
                 (self.plot_beta_vae_training_stability, "plot_beta_vae_training_stability"),
                 (self.plot_injection_stats, "plot_injection_stats"),
                 (self.plot_latent_space_gif, "plot_latent_space_gif"),
+                (self.plot_latent_traversal, "plot_latent_traversal"),
             ]
         )
 
@@ -6153,6 +6577,10 @@ def _execute_training_stages(pipeline) -> None:
         except Exception as e:
             logger.error(f"Stage '{STAGE_VAE_PLOTS}' failed: {e}")
             pipeline._record_stage_failure(STAGE_VAE_PLOTS)
+        finally:
+            # The withheld viz batch's last consumer (plot_latent_traversal) has run —
+            # free it (a few hundred MB at full-scale defaults) before rf_train
+            pipeline._clear_latent_viz_data()
 
     # Stage 3/5: rf_train. On skip, the persisted RF from the attempt that completed the
     # stage is loaded back (rf_plots and final_save need a live model); if that reload
@@ -6225,7 +6653,10 @@ def run_training_pipeline(
         return pipeline
 
     finally:
-        # Free shared resources on exit
+        # Free shared resources on exit. The viz-batch clear matters on the failure path:
+        # a vae_rounds crash skips the vae_plots-stage clear, and the retry loop builds a
+        # fresh pipeline — don't let the dying one pin a few hundred MB of viz data
+        pipeline._clear_latent_viz_data()
         pipeline.data_generator.close()
 
 

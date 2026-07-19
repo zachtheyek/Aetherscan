@@ -379,6 +379,9 @@ class _StageMachineStub:
     def _clear_rf_caches(self):
         self.calls.append("_clear_rf_caches")
 
+    def _clear_latent_viz_data(self):
+        self.calls.append("_clear_latent_viz_data")
+
     # The real methods also persist the manifest; persistence is covered in test_run_state.
     def _mark_stage_done(self, stage):
         self.run_state.mark_stage_done(stage)
@@ -397,6 +400,7 @@ class TestExecuteTrainingStages:
         assert stub.calls == [
             "train_beta_vae",
             "plot_vae_diagnostics",
+            "_clear_latent_viz_data",
             "train_random_forest",
             "plot_rf_diagnostics",
             "_clear_rf_caches",
@@ -425,6 +429,8 @@ class TestExecuteTrainingStages:
         stub = _StageMachineStub(self._state(), fail={"plot_vae_diagnostics"})
         _execute_training_stages(stub)
         assert "final_save" in stub.calls
+        # The viz batch is freed even when the plot group fails
+        assert "_clear_latent_viz_data" in stub.calls
         assert stub.run_state.stages_failed == [STAGE_VAE_PLOTS]
         assert not stub.run_state.is_stage_done(STAGE_VAE_PLOTS)
         assert stub.run_state.is_stage_done(STAGE_FINAL_SAVE)
@@ -465,6 +471,10 @@ class TestExecuteTrainingStages:
         # reloads the persisted RF — cheap, and by design), and success clears the failure
         second = _StageMachineStub(state)
         _execute_training_stages(second)
-        assert second.calls == ["plot_vae_diagnostics", "try_load_rf_for_resume"]
+        assert second.calls == [
+            "plot_vae_diagnostics",
+            "_clear_latent_viz_data",
+            "try_load_rf_for_resume",
+        ]
         assert state.stages_failed == []
         assert state.stages_done[-1] == STAGE_VAE_PLOTS  # re-marked after the retry

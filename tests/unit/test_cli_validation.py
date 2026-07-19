@@ -376,6 +376,71 @@ class TestApplyArgsToConfig:
         assert config.checkpoint.start_round == 4
 
 
+class TestLatentTraversalFlags:
+    """Flags and validation for the latent-dimension traversal plot (PLAN PR-05)."""
+
+    def test_flags_apply_to_config(self):
+        apply_args_to_config(
+            _parse(
+                [
+                    "train",
+                    "--latent-traversal-every-round",
+                    "--latent-traversal-num-steps",
+                    "9",
+                    "--latent-traversal-max-sigma",
+                    "2.5",
+                ]
+            )
+        )
+        config = get_config()
+        assert config.training.latent_traversal_every_round is True
+        assert config.training.latent_traversal_num_steps == 9
+        assert config.training.latent_traversal_max_sigma == 2.5
+
+    def test_defaults_preserved_when_omitted(self):
+        apply_args_to_config(_parse(["train"]))
+        config = get_config()
+        assert config.training.latent_traversal_every_round is False
+        assert config.training.latent_traversal_num_steps == 7
+        assert config.training.latent_traversal_max_sigma == 3.0
+
+    def test_no_flag_forces_off(self):
+        apply_args_to_config(_parse(["train", "--no-latent-traversal-every-round"]))
+        assert get_config().training.latent_traversal_every_round is False
+
+    @staticmethod
+    def _traversal_errors(argv):
+        return [
+            e
+            for e in collect_validation_errors(_parse(argv), None)
+            if e.field.startswith("training.latent_traversal")
+        ]
+
+    @pytest.mark.parametrize("steps", [3, 5, 7, 9])
+    def test_odd_step_counts_accepted(self, steps):
+        assert self._traversal_errors(["train", "--latent-traversal-num-steps", str(steps)]) == []
+
+    @pytest.mark.parametrize("steps", [-1, 0, 1, 2, 4, 6, 8])
+    def test_even_or_too_small_step_counts_rejected(self, steps):
+        errors = self._traversal_errors(["train", "--latent-traversal-num-steps", str(steps)])
+        assert len(errors) == 1
+        assert errors[0].field == "training.latent_traversal_num_steps"
+        assert "odd" in errors[0].message
+
+    @pytest.mark.parametrize("max_sigma", ["0.5", "1", "3.0", "10"])
+    def test_positive_max_sigma_accepted(self, max_sigma):
+        assert self._traversal_errors(["train", "--latent-traversal-max-sigma", max_sigma]) == []
+
+    @pytest.mark.parametrize("max_sigma", ["0", "0.0", "-1.5"])
+    def test_nonpositive_max_sigma_rejected(self, max_sigma):
+        errors = self._traversal_errors(["train", "--latent-traversal-max-sigma", max_sigma])
+        assert len(errors) == 1
+        assert errors[0].field == "training.latent_traversal_max_sigma"
+
+    def test_defaults_pass_validation(self):
+        assert self._traversal_errors(["train"]) == []
+
+
 class TestRoundDataFlags:
     """Flags and validation for the disk-backed round-data pipeline (round_data.py)."""
 

@@ -53,6 +53,11 @@ def _write_small_round(paths: RoundDataPaths, n_samples=8, width_bin=16, snr_bas
         arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
         arr[:] = rng.random(shape, dtype=np.float32)
         del arr
+    lognorm_shape = (n_samples, 6, 2)
+    for path in paths.lognorm_paths.values():
+        arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=lognorm_shape)
+        arr[:] = rng.random(lognorm_shape, dtype=np.float32)
+        del arr
     labels = np.array(
         [_SIGNAL_TYPES[i % 4] for i in range(n_samples)],
         dtype="U20",
@@ -82,6 +87,9 @@ class TestRoundDataPaths:
         assert set(paths.array_paths.keys()) == {"main", "true", "false"}
         for name, path in paths.array_paths.items():
             assert path == os.path.join(paths.round_dir, f"{name}.npy")
+        assert set(paths.lognorm_paths.keys()) == {"main", "true", "false"}
+        for name, path in paths.lognorm_paths.items():
+            assert path == os.path.join(paths.round_dir, f"{name}_lognorm.npy")
         assert paths.labels_path == os.path.join(paths.round_dir, "labels.npy")
 
 
@@ -93,7 +101,15 @@ class TestManifest:
         assert manifest is not None
         assert manifest["n_samples"] == written["n_samples"] == 8
         assert manifest["round_idx"] == 1
-        assert set(manifest["checksums"].keys()) == {"main", "true", "false", "labels"}
+        assert set(manifest["checksums"].keys()) == {
+            "main",
+            "true",
+            "false",
+            "main_lognorm",
+            "true_lognorm",
+            "false_lognorm",
+            "labels",
+        }
 
     def test_missing_done_file_invalid(self, tmp_path):
         paths = RoundDataPaths.for_round(str(tmp_path), 1)
@@ -119,6 +135,13 @@ class TestManifest:
         paths = RoundDataPaths.for_round(str(tmp_path), 1)
         _write_small_round(paths)
         os.remove(paths.true_path)
+        assert validate_done_manifest(paths) is None
+
+    def test_missing_lognorm_sibling_invalid(self, tmp_path):
+        # A round dir predating the lognorm-sibling feature fails validation & regenerates.
+        paths = RoundDataPaths.for_round(str(tmp_path), 1)
+        _write_small_round(paths)
+        os.remove(paths.lognorm_paths["main"])
         assert validate_done_manifest(paths) is None
 
     def test_shape_mismatch_invalid(self, tmp_path):
@@ -148,13 +171,16 @@ class TestManifest:
         paths = RoundDataPaths.for_round(str(tmp_path), 1)
         _write_small_round(paths, n_samples=8, width_bin=16)
         data = load_round_arrays(paths)
-        assert set(data.keys()) == {"concatenated", "true", "false", "labels"}
+        assert set(data.keys()) == {"concatenated", "true", "false", "labels", "lognorm"}
         for key in ("concatenated", "true", "false"):
             assert isinstance(data[key], np.memmap)
             assert data[key].shape == (8, 6, 4, 16)
             assert data[key].dtype == np.float32
         assert data["labels"].shape == (8,)
         assert not isinstance(data["labels"], np.memmap)
+        # The main array's log-norm params are tiny and loaded eagerly
+        assert data["lognorm"].shape == (8, 6, 2)
+        assert not isinstance(data["lognorm"], np.memmap)
 
 
 class TestPrepareRoundDataDir:
@@ -298,6 +324,19 @@ class TestGenerateRoundToMemmap:
 
         # Labels mirror the contiguous per-chunk layout (chunk_size=4 -> quarter=1)
         assert list(data["labels"]) == _SIGNAL_TYPES + _SIGNAL_TYPES
+
+        # Per-observation log-norm params were recorded for every array & every row
+        # (range_log > 0 for chi-squared-noise inputs). This asserts the PLUMBING — params
+        # populated, right shape, and a finite inversion — not an exact roundtrip: the raw
+        # pre-normalization data isn't retained at generate time, so the exact
+        # exp(x*range+min) == data check lives at unit level (test_create_false_not_injected).
+        for name, lognorm_path in paths.lognorm_paths.items():
+            params = np.load(lognorm_path)
+            assert params.shape == (8, 6, 2)
+            assert np.all(params[..., 1] > 0), f"{name} lognorm range_log not populated"
+        main_params = np.load(paths.lognorm_paths["main"])
+        recovered = np.exp(data["concatenated"][0, 0] * main_params[0, 0, 1] + main_params[0, 0, 0])
+        assert np.all(np.isfinite(recovered))  # finite inversion (exp of a finite value is > 0)
 
         # Manifest validates and matches the generation request
         assert validate_done_manifest(paths, expected_n_samples=8) is not None

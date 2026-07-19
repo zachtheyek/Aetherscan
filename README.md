@@ -435,6 +435,9 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--latent-viz-umap-min-dist LATENT_VIZ_UMAP_MIN_DIST [LATENT_VIZ_UMAP_MIN_DIST ...]]
              [--latent-viz-gif-max-frames LATENT_VIZ_GIF_MAX_FRAMES]
              [--latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS]
+             [--latent-traversal-every-round | --no-latent-traversal-every-round]
+             [--latent-traversal-num-steps LATENT_TRAVERSAL_NUM_STEPS]
+             [--latent-traversal-max-sigma LATENT_TRAVERSAL_MAX_SIGMA]
              [--snr-base SNR_BASE] [--initial-snr-range INITIAL_SNR_RANGE]
              [--final-snr-range FINAL_SNR_RANGE]
              [--curriculum-schedule CURRICULUM_SCHEDULE]
@@ -614,6 +617,18 @@ options:
                         prioritizing earlier training steps)
   --latent-viz-gif-duration-ms LATENT_VIZ_GIF_DURATION_MS
                         Milliseconds per frame in latent space GIF output
+  --latent-traversal-every-round, --no-latent-traversal-every-round
+                        Render latent-dimension traversal figures at the end
+                        of every training round, in addition to the end-of-
+                        training set (default: disabled)
+  --latent-traversal-num-steps LATENT_TRAVERSAL_NUM_STEPS
+                        Number of traversal steps per latent dimension (must
+                        be odd and >= 3 so the center column is the
+                        unperturbed class-mean decode)
+  --latent-traversal-max-sigma LATENT_TRAVERSAL_MAX_SIGMA
+                        Latent traversal range in per-dimension standard
+                        deviations: steps span [-max_sigma, +max_sigma] (must
+                        be > 0)
   --snr-base SNR_BASE   Base signal-to-noise ratio for curriculum learning
                         (minimum SNR difficulty level)
   --initial-snr-range INITIAL_SNR_RANGE

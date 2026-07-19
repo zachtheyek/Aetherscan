@@ -58,7 +58,8 @@ _MANIFEST_SAMPLE_COUNT = 8
 
 @dataclass(frozen=True)
 class RoundDataPaths:
-    """On-disk layout of one round's dataset: {main,true,false,labels}.npy + a .done manifest."""
+    """On-disk layout of one round's dataset: {main,true,false,labels}.npy, sibling
+    {main,true,false}_lognorm.npy parameter arrays, + a .done manifest."""
 
     round_dir: str
     round_idx: int
@@ -92,6 +93,15 @@ class RoundDataPaths:
     def array_paths(self) -> dict[str, str]:
         """Mapping of array name -> .npy path for the three cadence arrays."""
         return {"main": self.main_path, "true": self.true_path, "false": self.false_path}
+
+    @property
+    def lognorm_paths(self) -> dict[str, str]:
+        """Mapping of array name -> sibling .npy path holding that array's per-observation
+        (min_log, range_log) log-norm parameters, shape (n_samples, num_observations, 2)."""
+        return {
+            name: os.path.join(self.round_dir, f"{name}_lognorm.npy")
+            for name in ("main", "true", "false")
+        }
 
 
 def _array_checksum(arr: np.ndarray) -> dict:
@@ -131,6 +141,15 @@ def _checksum_value_matches(recorded, actual) -> bool:
     return recorded == actual or (math.isnan(recorded) and math.isnan(actual))
 
 
+def _manifest_paths(paths: RoundDataPaths) -> dict[str, str]:
+    """Every array the .done manifest covers: cadence arrays, lognorm siblings, labels."""
+    return {
+        **paths.array_paths,
+        **{f"{name}_lognorm": p for name, p in paths.lognorm_paths.items()},
+        "labels": paths.labels_path,
+    }
+
+
 def build_manifest(
     paths: RoundDataPaths,
     n_samples: int,
@@ -142,7 +161,7 @@ def build_manifest(
     """Assemble the .done manifest dict by re-opening the finished arrays read-only."""
     shapes: dict[str, list[int]] = {}
     checksums: dict[str, dict] = {}
-    for name, path in {**paths.array_paths, "labels": paths.labels_path}.items():
+    for name, path in _manifest_paths(paths).items():
         arr = np.load(path, mmap_mode="r")
         shapes[name] = list(arr.shape)
         checksums[name] = _array_checksum(arr)
@@ -203,8 +222,7 @@ def validate_done_manifest(
             )
             return None
 
-        all_paths = {**paths.array_paths, "labels": paths.labels_path}
-        for name, path in all_paths.items():
+        for name, path in _manifest_paths(paths).items():
             if not os.path.isfile(path):
                 logger.warning(f"Manifest array missing on disk: {path}")
                 return None
@@ -236,13 +254,16 @@ def load_round_arrays(paths: RoundDataPaths) -> dict[str, np.ndarray]:
     Open one round's arrays for training. The three cadence arrays come back as read-only
     memmaps (np.load(mmap_mode="r")) so nothing is pulled into RAM until batches gather it —
     the OS page cache keeps hot pages resident and evicts them under memory pressure instead
-    of OOM-killing the process. Labels are tiny and loaded eagerly.
+    of OOM-killing the process. Labels and the main array's log-norm parameters ("lognorm",
+    consumed by the latent-traversal plot) are small (~24 MB for the main array at full scale)
+    and loaded eagerly.
     """
     return {
         "concatenated": np.load(paths.main_path, mmap_mode="r"),
         "true": np.load(paths.true_path, mmap_mode="r"),
         "false": np.load(paths.false_path, mmap_mode="r"),
         "labels": np.load(paths.labels_path),
+        "lognorm": np.load(paths.lognorm_paths["main"]),
     }
 
 

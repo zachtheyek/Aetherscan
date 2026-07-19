@@ -501,6 +501,24 @@ def _add_train_flags_to(parser):
         default=None,
         help="Milliseconds per frame in latent space GIF output",
     )
+    parser.add_argument(
+        "--latent-traversal-every-round",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Render latent-dimension traversal figures at the end of every training round, in addition to the end-of-training set (default: disabled)",
+    )
+    parser.add_argument(
+        "--latent-traversal-num-steps",
+        type=int,
+        default=None,
+        help="Number of traversal steps per latent dimension (must be odd and >= 3 so the center column is the unperturbed class-mean decode)",
+    )
+    parser.add_argument(
+        "--latent-traversal-max-sigma",
+        type=float,
+        default=None,
+        help="Latent traversal range in per-dimension standard deviations: steps span [-max_sigma, +max_sigma] (must be > 0)",
+    )
 
     parser.add_argument(
         "--snr-base",
@@ -1016,6 +1034,17 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.training.latent_viz_gif_max_frames = args.latent_viz_gif_max_frames
     if hasattr(args, "latent_viz_gif_duration_ms") and args.latent_viz_gif_duration_ms is not None:
         config.training.latent_viz_gif_duration_ms = args.latent_viz_gif_duration_ms
+    # latent_traversal_every_round uses argparse.BooleanOptionalAction with default=None
+    # (same tri-state as overlap_data_generation / keep_round_data above)
+    if (
+        hasattr(args, "latent_traversal_every_round")
+        and args.latent_traversal_every_round is not None
+    ):
+        config.training.latent_traversal_every_round = args.latent_traversal_every_round
+    if hasattr(args, "latent_traversal_num_steps") and args.latent_traversal_num_steps is not None:
+        config.training.latent_traversal_num_steps = args.latent_traversal_num_steps
+    if hasattr(args, "latent_traversal_max_sigma") and args.latent_traversal_max_sigma is not None:
+        config.training.latent_traversal_max_sigma = args.latent_traversal_max_sigma
     if hasattr(args, "snr_base") and args.snr_base is not None:
         config.training.snr_base = args.snr_base
     if hasattr(args, "initial_snr_range") and args.initial_snr_range is not None:
@@ -1320,6 +1349,40 @@ def collect_validation_errors(
                     message=f"--data-gen-task-size must be >= 1, got {dgts}",
                     fix_kind="clamp_low",
                     min_val=1,
+                )
+            )
+
+        # Latent traversal: odd step count >= 3 (so the center column is the unperturbed
+        # class-mean decode) and a strictly positive sigma range. No upper step bound:
+        # decode cost scales linearly and stays trivial at any plausible value (99 steps
+        # ~= 800 decoder calls), and an oversized figure is immediately self-evident
+        lts = _resolve(
+            args, "latent_traversal_num_steps", config.training.latent_traversal_num_steps
+        )
+        if lts is not None and (lts < 3 or lts % 2 == 0):
+            errors.append(
+                ValidationError(
+                    field="training.latent_traversal_num_steps",
+                    current=lts,
+                    message=f"--latent-traversal-num-steps must be odd and >= 3 so the center column is the unperturbed decode, got {lts}",
+                    # No fix_kind captures "odd and >= 3"; clamp_low is closest and the
+                    # proposal seed is the field's default (7 — odd and valid), matching the
+                    # max_sigma block below. propose_simple_fix only ever suggests this value.
+                    fix_kind="clamp_low",
+                    min_val=7,
+                )
+            )
+        ltms = _resolve(
+            args, "latent_traversal_max_sigma", config.training.latent_traversal_max_sigma
+        )
+        if ltms is not None and ltms <= 0:
+            errors.append(
+                ValidationError(
+                    field="training.latent_traversal_max_sigma",
+                    current=ltms,
+                    message=f"--latent-traversal-max-sigma must be > 0, got {ltms}",
+                    fix_kind="clamp_low",
+                    min_val=3.0,  # Proposal seed: the field's default (matches num_steps above)
                 )
             )
 
