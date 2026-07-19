@@ -18,6 +18,7 @@ import math
 import os
 import re
 import signal
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -1739,7 +1740,10 @@ class DataPreprocessor:
             except Exception as e:
                 logger.warning(f"PFB response cache {path} unreadable ({e}); rewriting")
 
-        tmp_path = path + ".tmp"
+        # Per-writer tmp name (pid + uuid) so two runs sharing this output_path don't clobber
+        # each other's in-progress write on a single shared "{path}.tmp"; os.replace stays
+        # atomic and the content is deterministic, so whichever writer lands last is harmless.
+        tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(tmp_path, "wb") as f:
             np.save(f, response)
         os.replace(tmp_path, path)

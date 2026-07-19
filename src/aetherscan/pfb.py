@@ -69,6 +69,10 @@ def gen_coarse_channel_response(
     """
     if fine_per_coarse < 2:
         raise ValueError(f"fine_per_coarse must be >= 2, got {fine_per_coarse}")
+    if fine_per_coarse % 2 != 0:
+        # Half a coarse channel (fine_per_coarse // 2) is sliced off each end below, so the
+        # remaining band is an exact multiple of fine_per_coarse only when it is even.
+        raise ValueError(f"fine_per_coarse must be even, got {fine_per_coarse}")
     if num_coarse_channels < 2:
         # The fold needs at least one full coarse-channel span after edge-slicing.
         raise ValueError(f"num_coarse_channels must be >= 2, got {num_coarse_channels}")
@@ -118,10 +122,11 @@ def edge_mid_power_ratio(spectrum: np.ndarray) -> float:
     Mean power in the coarse-channel edge bands relative to the mid band.
 
     spectrum is a 1-D per-bin power array over one coarse channel (either the theoretical
-    response H or a time-integrated data channel). The edge band is the outermost 1/16 of the
-    bins on each side; the mid band is the central 1/8. Comparing this ratio between H and
-    real data is the cheap sanity check (after the bliss `validate` flag) for whether the
-    configured static response actually matches the recording.
+    response H or a time-integrated data channel). Both the edge band (outermost n // 16 bins
+    on each side) and the mid band (a central band of the same n // 16 width) use
+    _RATIO_BAND_FRACTION. Comparing this ratio between H and real data is the cheap sanity
+    check (after the bliss `validate` flag) for whether the configured static response
+    actually matches the recording.
     """
     n = spectrum.shape[0]
     band = max(1, n // _RATIO_BAND_FRACTION)
