@@ -4742,8 +4742,11 @@ class TrainingPipeline:
             # Base vector: mean z_mean over this type's ON observations
             z_t = z_mean[mask][:, on_indices, :].mean(axis=(0, 1))
 
-            # Class-mean log-norm params over the same ON observations, for the approximate
-            # display inversion (None -> plot in normalized log space)
+            # Class-mean log-norm params over this type's ON observations, for the approximate
+            # display inversion. Collapsing the per-observation (6, 2) params to one
+            # (min_log, range_log) pair is itself part of the approximation — a traversal decode
+            # blends observations — and combined with the lossy frequency downsampling the
+            # inverted intensity is DISPLAY-ONLY, never exact. None -> plot in normalized log space.
             lognorm = None
             if self._latent_viz_lognorm_params is not None:
                 on_params = self._latent_viz_lognorm_params[mask][:, on_indices, :]

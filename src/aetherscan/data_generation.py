@@ -117,8 +117,11 @@ def log_norm(
     With return_params=True, also returns the (min_log, range_log) normalization parameters,
     which allow an approximate inversion back to linear intensity:
     linear ≈ exp(normalized * range_log + min_log). Used by the latent-traversal plot to
-    display decoded reconstructions on a near-physical scale (approximate because the
-    upstream downsampling is lossy).
+    display decoded reconstructions on a near-physical scale. The inversion is DISPLAY-ONLY
+    and never exact: (1) the upstream frequency downsampling is lossy and cannot be truly
+    undone, and (2) these params are per-observation, so the plot collapses them to a
+    per-class mean over the ON observations while a latent-traversal decode blends
+    observations. Do not treat inverted values as calibrated intensities.
     """
     # Add small epsilon to avoid log(0)
     data = data + 1e-10
