@@ -3,6 +3,7 @@ downgrade, and the stage/round bookkeeping helpers that drive the training stage
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from unittest import mock
@@ -17,6 +18,8 @@ from aetherscan.run_state import (
     STAGE_VAE_ROUNDS,
     TRAINING_STAGES,
     TrainingRunState,
+    config_changed,
+    config_fingerprint,
     load_run_state,
     run_state_path,
     save_run_state,
@@ -133,3 +136,88 @@ class TestBookkeeping:
         state.mark_round_completed(1)
         state.mark_round_completed(2)
         assert state.resume_round == 3
+
+
+class TestConfigFingerprint:
+    """config_fingerprint() + config_changed(): the config-drift guard that stops a reused
+    --save-tag from silently resuming/skipping under a changed config."""
+
+    BASE = {
+        "paths": {"data_path": "/data", "output_path": "/out", "model_path": "/models"},
+        "db": {"write_interval": 5.0},
+        "manager": {"n_processes": 32, "chunks_per_worker": 4},
+        "logger": {"slack_enabled": True},
+        "beta_vae": {"beta": 1.5, "alpha": 10.0, "latent_dim": 8},
+        "random_forest": {"n_estimators": 1000, "seed": 11},
+        "data": {"num_target_backgrounds": 45000},
+        "training": {"num_samples_beta_vae": 499200, "max_retries": 3, "retry_delay": 60},
+        "gpu": {"num_replicas": None},
+        "inference": {"max_retries": 3, "parallel_coarse_chans": None},
+        "checkpoint": {"save_tag": "final_v1", "load_tag": None, "start_round": 1},
+    }
+
+    def _mutate(self, section, key, value):
+        d = copy.deepcopy(self.BASE)
+        d[section][key] = value
+        return d
+
+    def test_stable_for_identical_config(self):
+        assert config_fingerprint(self.BASE) == config_fingerprint(copy.deepcopy(self.BASE))
+
+    @pytest.mark.parametrize(
+        "section,key,value",
+        [
+            ("beta_vae", "beta", 2.0),
+            ("beta_vae", "latent_dim", 16),
+            ("random_forest", "n_estimators", 500),
+            ("data", "num_target_backgrounds", 30000),
+            ("training", "num_samples_beta_vae", 8192),
+            ("gpu", "num_replicas", 6),
+        ],
+    )
+    def test_result_affecting_change_flips_fingerprint(self, section, key, value):
+        assert config_fingerprint(self._mutate(section, key, value)) != config_fingerprint(
+            self.BASE
+        )
+
+    @pytest.mark.parametrize(
+        "section,key,value",
+        [
+            ("paths", "data_path", "/elsewhere"),
+            ("paths", "output_path", "/other_out"),
+            ("db", "write_interval", 99.0),
+            ("manager", "n_processes", 96),
+            ("logger", "slack_enabled", False),
+            ("inference", "max_retries", 9),
+            ("checkpoint", "load_tag", "round_03"),
+            ("checkpoint", "start_round", 4),
+            ("training", "max_retries", 10),
+            ("training", "retry_delay", 5),
+        ],
+    )
+    def test_excluded_change_keeps_fingerprint(self, section, key, value):
+        assert config_fingerprint(self._mutate(section, key, value)) == config_fingerprint(
+            self.BASE
+        )
+
+    def test_config_changed_none_state_is_false(self):
+        assert config_changed(None, "abc") is False
+
+    def test_config_changed_matching_is_false(self):
+        state = TrainingRunState(tag="t", run_start_time=1.0, config_fingerprint="abc")
+        assert config_changed(state, "abc") is False
+
+    def test_config_changed_mismatch_is_true(self):
+        state = TrainingRunState(tag="t", run_start_time=1.0, config_fingerprint="abc")
+        assert config_changed(state, "xyz") is True
+
+    def test_config_changed_pre_fingerprint_manifest_is_true(self):
+        # A manifest written before fingerprinting has "" and must be treated as changed.
+        state = TrainingRunState(tag="t", run_start_time=1.0, config_fingerprint="")
+        assert config_changed(state, "abc") is True
+
+    def test_fingerprint_round_trips_through_manifest(self, tmp_path):
+        path = run_state_path(str(tmp_path), "final_v1")
+        state = TrainingRunState(tag="final_v1", run_start_time=1.0, config_fingerprint="deadbeef")
+        save_run_state(state, path)
+        assert load_run_state(path).config_fingerprint == "deadbeef"

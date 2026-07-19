@@ -20,6 +20,7 @@ or the new one.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +48,47 @@ def run_state_path(output_path: str, tag: str) -> str:
     return os.path.join(output_path, f"run_state_{tag}.json")
 
 
+# Config sections excluded from a run's fingerprint: pure infra/runtime (db, manager, monitor,
+# logger), resume-control (checkpoint), environment paths, and the inference config — none of
+# which change the training result, so a change to any of them must NOT force a fresh run.
+_FINGERPRINT_EXCLUDE_SECTIONS = frozenset(
+    {"db", "manager", "monitor", "logger", "inference", "paths", "checkpoint"}
+)
+# Retry knobs live in the training section but only control the retry loop, not the result.
+_FINGERPRINT_EXCLUDE_TRAINING_KEYS = frozenset({"max_retries", "retry_delay"})
+
+
+def config_fingerprint(config_dict: dict) -> str:
+    """
+    Stable hash of the training-result-affecting config (from Config.to_dict()), used to detect
+    that a run's config changed under a reused --save-tag. Excludes infra/runtime, resume-control,
+    environment paths, the inference config, and the retry knobs (see the constants above) so a
+    change to any of those does not spuriously force a fresh run.
+    """
+    relevant = {
+        section: values
+        for section, values in config_dict.items()
+        if section not in _FINGERPRINT_EXCLUDE_SECTIONS
+    }
+    training = relevant.get("training")
+    if isinstance(training, dict):
+        relevant["training"] = {
+            k: v for k, v in training.items() if k not in _FINGERPRINT_EXCLUDE_TRAINING_KEYS
+        }
+    canonical = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def config_changed(state: TrainingRunState | None, current_fingerprint: str) -> bool:
+    """
+    True when a persisted manifest exists but was written under a different config fingerprint —
+    i.e. the resolved training config changed under a reused save tag. The caller downgrades to a
+    fresh run so a stale model is never silently reused/reported as success (a manifest predating
+    fingerprinting carries an empty string, which mismatches any real fingerprint -> fresh run).
+    """
+    return state is not None and state.config_fingerprint != current_fingerprint
+
+
 @dataclass
 class TrainingRunState:
     """Persisted state of one training run (identified by its save tag) across attempts."""
@@ -54,6 +96,7 @@ class TrainingRunState:
     tag: str
     run_start_time: float  # Wall clock of attempt 1 — used by ALL DB queries/plots
     attempt: int = 1  # Incremented per retry (each TrainingPipeline rebuild)
+    config_fingerprint: str = ""  # Hash of the result-affecting config (config_fingerprint())
     completed_rounds: list[int] = field(default_factory=list)
     stages_done: list[str] = field(default_factory=list)
     stages_failed: list[str] = field(default_factory=list)
@@ -113,6 +156,7 @@ def load_run_state(path: str) -> TrainingRunState | None:
             tag=str(payload["tag"]),
             run_start_time=float(payload["run_start_time"]),
             attempt=int(payload.get("attempt", 1)),
+            config_fingerprint=str(payload.get("config_fingerprint", "")),
             completed_rounds=sorted(int(r) for r in payload.get("completed_rounds", [])),
             stages_done=[str(s) for s in payload.get("stages_done", [])],
             stages_failed=[str(s) for s in payload.get("stages_failed", [])],

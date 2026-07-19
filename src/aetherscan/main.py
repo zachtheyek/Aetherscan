@@ -154,6 +154,44 @@ def setup_gpu_strategy():
         return None
 
 
+def _report_final_training_status(pipeline) -> None:
+    """
+    Emit the terminal training status and exit nonzero on any permanently-failed stage.
+
+    Extracted from train_command so the exit contract is unit-testable: a fully-successful run
+    exits 0, a run with any recorded non-critical stage failure (vae_plots/rf_plots that never
+    recovered across attempts) exits 1, and a missing pipeline exits 1 rather than reporting a
+    false success.
+    """
+    if pipeline is None:
+        # Defensive: the retry loop always sets pipeline or sys.exit(1)s first, and
+        # --max-retries >= 1 is validated, so this is unreachable in practice — but never
+        # report success without a completed pipeline.
+        logger.error("Training produced no pipeline — treating as failure")
+        sys.exit(1)
+
+    # Plot stages are non-critical (a broken plot mustn't cost a retry cycle including data
+    # regeneration), but their failures are recorded in the run manifest — surface them
+    # loudly and exit nonzero so lost artifacts can't go unnoticed.
+    failed_stages = pipeline.run_state.stages_failed
+    if failed_stages:
+        logger.error("=" * 60)
+        logger.error(
+            f"Training finished, but non-critical stage(s) permanently failed: "
+            f"{', '.join(failed_stages)}"
+        )
+        logger.error(
+            "Re-run the identical command to retry them — completed stages are skipped "
+            "via the run manifest"
+        )
+        logger.error("=" * 60)
+        sys.exit(1)
+
+    logger.info("=" * 60)
+    logger.info("Training completed successfully!")
+    logger.info("=" * 60)
+
+
 def train_command():
     """Execute training pipeline with distributed strategy & fault tolerance"""
     logger.info("=" * 60)
@@ -244,27 +282,7 @@ def train_command():
 
     # Note, the training configuration JSON is saved by the pipeline's final_save stage
     # (so it's covered by the retry machinery), not here
-
-    # Plot stages are non-critical (a broken plot mustn't cost a retry cycle including data
-    # regeneration), but their failures are recorded in the run manifest — surface them
-    # loudly and exit nonzero so lost artifacts can't go unnoticed
-    failed_stages = pipeline.run_state.stages_failed if pipeline is not None else []
-    if failed_stages:
-        logger.error("=" * 60)
-        logger.error(
-            f"Training finished, but non-critical stage(s) permanently failed: "
-            f"{', '.join(failed_stages)}"
-        )
-        logger.error(
-            "Re-run the identical command to retry them — completed stages are skipped "
-            "via the run manifest"
-        )
-        logger.error("=" * 60)
-        sys.exit(1)
-
-    logger.info("=" * 60)
-    logger.info("Training completed successfully!")
-    logger.info("=" * 60)
+    _report_final_training_status(pipeline)
 
 
 # NOTE: we need to load the saved config from the corresponding training run, but when/where should we do that, and how does that play with apply_args_to_config()?

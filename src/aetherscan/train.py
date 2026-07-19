@@ -67,6 +67,8 @@ from aetherscan.run_state import (
     STAGE_VAE_PLOTS,
     STAGE_VAE_ROUNDS,
     TrainingRunState,
+    config_changed,
+    config_fingerprint,
     load_run_state,
     run_state_path,
     save_run_state,
@@ -906,10 +908,29 @@ class TrainingPipeline:
         self._run_state_path = run_state_path(self.config.output_path, tag)
 
         state = load_run_state(self._run_state_path)
+
+        # Config-drift guard: if the manifest was written under a different result-affecting
+        # config (reused --save-tag with changed hyperparameters, or a manifest that predates
+        # fingerprinting), do NOT silently resume/skip and ship the stale model — warn loudly
+        # and downgrade to a fresh run (the previous attempt's outputs get overwritten).
+        current_fingerprint = config_fingerprint(self.config.to_dict())
+        if config_changed(state, current_fingerprint):
+            logger.warning("=" * 60)
+            logger.warning(
+                f"Run manifest at {self._run_state_path} was written under a DIFFERENT "
+                f"training config (fingerprint mismatch) — starting a FRESH run and "
+                f"overwriting the previous attempt's outputs for tag '{tag}'. Use a new "
+                f"--save-tag to keep both, or restore the original config to resume."
+            )
+            logger.warning("=" * 60)
+            state = None
+
         self._resumed = state is not None
 
         if state is None:
-            state = TrainingRunState(tag=tag, run_start_time=time.time())
+            state = TrainingRunState(
+                tag=tag, run_start_time=time.time(), config_fingerprint=current_fingerprint
+            )
             logger.info(f"Starting a fresh training run manifest at {self._run_state_path}")
         else:
             state.attempt += 1
@@ -2033,10 +2054,12 @@ class TrainingPipeline:
         """Train Random Forest"""
         logger.info("Training Random Forest classifier...")
 
-        # Resume path: a previous attempt of this run already trained and persisted the RF
-        # for this tag — load it back instead of regenerating ~num_samples_rf cadences and
-        # retraining. Gated on self._resumed so a fresh run that happens to reuse an old tag
-        # never silently skips training on stale artifacts
+        # Resume path: a previous attempt of THIS run (same tag AND matching config
+        # fingerprint) already trained and persisted the RF — load it back instead of
+        # regenerating ~num_samples_rf cadences and retraining. self._resumed is False for a
+        # fresh run, and for a reused tag whose config changed (the fingerprint guard in
+        # _init_run_state downgraded it to a fresh run), so stale artifacts are never
+        # silently reused.
         if self._resumed and self.try_load_rf_for_resume():
             logger.info(
                 "Loaded existing Random Forest model + eval artifacts for this tag — "
