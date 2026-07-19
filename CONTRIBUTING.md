@@ -194,7 +194,9 @@ Aetherscan/
 │   ├── conftest.py                  # Singleton-reset fixtures, tmp paths, synthetic data factories
 │   ├── unit/                        # Fast, hardware-independent unit tests (run in CI)
 │   └── integration/                 # gpu+cluster-marked end-to-end smoke tests
+├── benchmarks/                 # Standalone micro-benchmarks (not collected by pytest); see benchmarks/README.md
 ├── utils/                      # Utility scripts
+│   ├── benchmark_report.py           # Benchmark report generator
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
 │   ├── find_optimal_configs.py      # Per-host config helper
 │   ├── get_system_info.sh           # System info helper
