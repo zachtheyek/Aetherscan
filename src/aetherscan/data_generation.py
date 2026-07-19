@@ -790,7 +790,7 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
                     timestamp=timestamp,
                 )
 
-        # NOTE: what happens when signal_info is empty for false_no_rfi signal types?
+        # TODO: handle or verify behavior when signal_info is empty for false_no_rfi signal types
         # Signal characteristics (eti_snr, rfi_drift_rate, etc.)
         # injection_stage=None since these describe the injection itself
         for stat_name, value in signal_info.items():
@@ -1103,7 +1103,7 @@ class DataGenerator:
             return
         self.pool = self.manager.create_pool(
             n_processes=self.n_processes,
-            name=f"DataGen_pool_{id(self)}",  # NOTE: come back to this later
+            name=f"DataGen_pool_{id(self)}",  # TODO: use a more descriptive pool name
             initializer=_init_worker,
             initargs=(self.shm.name, self._background_shape, self._background_dtype),
         )
