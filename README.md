@@ -122,6 +122,10 @@ AETHERSCAN_EXTRA_BINDS=/extra/host/paths
 # If none specified, Slack integration is automatically disabled
 SLACK_BOT_TOKEN=your-slack-bot-token
 SLACK_CHANNEL=your-slack-channel
+
+# Only needed for uploading model weights to the HuggingFace Hub (train --hf-upload);
+# downloads (the inference default) hit a public repo and need no token
+HF_TOKEN=your-huggingface-write-token
 ```
 
 > [!TIP]
@@ -137,7 +141,7 @@ export SLACK_CHANNEL="your-slack-channel"
 ./utils/run_container.sh python -m aetherscan.main train ...
 ```
 
-The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The `utils/run_container.sh` wrapper forwards `SLACK_*` and `AETHERSCAN_*` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
+The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The `utils/run_container.sh` wrapper forwards `SLACK_*`, `AETHERSCAN_*`, and `HF_TOKEN` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
 
 **5. Run pipeline**
 
@@ -455,8 +459,10 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--patience-threshold PATIENCE_THRESHOLD]
              [--lr-reduction-factor LR_REDUCTION_FACTOR]
              [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
+             [--hf-upload | --no-hf-upload] [--hf-repo-id HF_REPO_ID]
              [--load-dir LOAD_DIR] [--load-tag LOAD_TAG]
              [--start-round START_ROUND] [--save-tag SAVE_TAG]
+             [--force-tag | --no-force-tag]
 
 options:
   -h, --help            show this help message and exit
@@ -677,6 +683,15 @@ options:
   --retry-delay RETRY_DELAY
                         Delay in seconds between retry attempts after training
                         failure
+  --hf-upload, --no-hf-upload
+                        Upload the final model artifacts (encoder, decoder,
+                        random forest, config) plus a generated model card to
+                        the HuggingFace Hub after training completes, tagging
+                        the commit with --save-tag (default: disabled = local-
+                        only). Requires HF_TOKEN in the environment (via .env)
+  --hf-repo-id HF_REPO_ID
+                        HuggingFace model repo id (namespace/name) for weight
+                        upload/download (default: zachtheyek/aetherscan)
   --load-dir LOAD_DIR   Subdirectory for checkpoint loading (relative to
                         --model-path)
   --load-tag LOAD_TAG   Model tag for checkpoint loading. Accepted formats:
@@ -689,6 +704,12 @@ options:
   --save-tag SAVE_TAG   Tag for current pipeline run. Accepted formats:
                         final_vX, round_XX, test_vX. Current timestamp used
                         (YYYYMMDD_HHMMSS) if none specified
+  --force-tag, --no-force-tag
+                        Override the fail-early save-tag collision guard:
+                        proceed even when an explicitly-provided --save-tag
+                        matches existing artifacts, DB rows, or (with --hf-
+                        upload) an existing HuggingFace tag (default:
+                        disabled)
 ```
 
 ### Inference Command Help
@@ -726,7 +747,8 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--stamp-gallery-top-k STAMP_GALLERY_TOP_K]
                  [--max-candidate-plots MAX_CANDIDATE_PLOTS]
                  [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
-                 [--save-tag SAVE_TAG]
+                 [--hf-repo-id HF_REPO_ID] [--hf-revision HF_REVISION]
+                 [--save-tag SAVE_TAG] [--force-tag | --no-force-tag]
 
 options:
   -h, --help            show this help message and exit
@@ -765,11 +787,19 @@ options:
                         provided, triggers the energy detection preprocessing
                         pipeline and takes precedence over --test-files
   --encoder-path ENCODER_PATH
-                        Path to trained VAE encoder model file (.keras)
-  --rf-path RF_PATH     Path to trained Random Forest model file (.joblib)
+                        Path to trained VAE encoder model file (.keras).
+                        Optional: when none of --encoder-path/--rf-
+                        path/--config-path are given, the artifacts are
+                        downloaded from the HuggingFace Hub (see --hf-repo-
+                        id/--hf-revision); provide either all three local
+                        paths or none
+  --rf-path RF_PATH     Path to trained Random Forest model file (.joblib).
+                        Optional: see --encoder-path for the all-three-or-none
+                        rule
   --config-path CONFIG_PATH
                         Path to config file from corresponding training run
-                        (.json)
+                        (.json). Optional: see --encoder-path for the all-
+                        three-or-none rule
   --per-replica-batch-size PER_REPLICA_BATCH_SIZE
                         Batch size per GPU/device replica during inference
   --classification-threshold CLASSIFICATION_THRESHOLD
@@ -868,8 +898,22 @@ options:
                         (including preprocessing) on failure
   --retry-delay RETRY_DELAY
                         Delay in seconds between inference retry attempts
+  --hf-repo-id HF_REPO_ID
+                        HuggingFace model repo id (namespace/name) for weight
+                        upload/download (default: zachtheyek/aetherscan)
+  --hf-revision HF_REVISION
+                        HuggingFace revision (tag, branch, or commit hash) to
+                        pin the model download to when no local artifact paths
+                        are given (default: the repo's latest release tag —
+                        highest semver vX.Y.Z tag, falling back to the highest
+                        final_vX training tag)
   --save-tag SAVE_TAG   Tag for current pipeline run. Current timestamp used
                         (YYYYMMDD_HHMMSS) if none specified
+  --force-tag, --no-force-tag
+                        Override the fail-early save-tag collision guard:
+                        proceed even when an explicitly-provided --save-tag
+                        matches a previous run's saved config or DB rows
+                        (default: disabled)
 ```
 
 ---

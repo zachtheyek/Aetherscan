@@ -26,6 +26,7 @@ from aetherscan.cli import (
 )
 from aetherscan.config import get_config, init_config
 from aetherscan.db import get_db, init_db
+from aetherscan.hf_hub import resolve_inference_artifacts
 from aetherscan.inference import InferencePipeline, run_inference_pipeline, summarize_confidences
 from aetherscan.inference_viz import InferenceVizCollector, render_inference_visualizations
 from aetherscan.logger import init_logger
@@ -33,6 +34,7 @@ from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
 from aetherscan.preprocessing import DataPreprocessor, derive_cadence_provenance
 from aetherscan.run_state import inference_config_fingerprint
+from aetherscan.tag_guards import enforce_tag_guards
 from aetherscan.train import run_training_pipeline
 
 logger = logging.getLogger(__name__)
@@ -162,9 +164,9 @@ def _report_final_training_status(pipeline) -> None:
     Emit the terminal training status and exit nonzero on any permanently-failed stage.
 
     Extracted from train_command so the exit contract is unit-testable: a fully-successful run
-    exits 0, a run with any recorded non-critical stage failure (vae_plots/rf_plots that never
-    recovered across attempts) exits 1, and a missing pipeline exits 1 rather than reporting a
-    false success.
+    exits 0, a run with any recorded non-critical stage failure (vae_plots/rf_plots/hf_upload that
+    never recovered across attempts) exits 1, and a missing pipeline exits 1 rather than reporting
+    a false success.
     """
     if pipeline is None:
         # Defensive: the retry loop always sets pipeline or sys.exit(1)s first, and
@@ -610,9 +612,11 @@ def inference_command():
     if config is None:
         raise ValueError("get_config() returned None")
 
-    # Required artifacts (encoder/rf/config paths) and stamp_width == width_bin
-    # are enforced upstream by collect_validation_errors() in cli.py, so by the
-    # time inference_command() runs those preconditions are guaranteed to hold.
+    # The artifact trio (encoder/rf/config paths) is populated upstream — either explicit
+    # local paths validated by collect_validation_errors() in cli.py, or HuggingFace-
+    # downloaded cache paths from resolve_inference_artifacts() — and stamp_width ==
+    # width_bin is enforced by validation, so by the time inference_command() runs those
+    # preconditions are guaranteed to hold.
     # TODO: add a sanity check that verifies encoder, RF, and config path all have the same tag. throw a warning if false
 
     # NOTE: come back to this later (print more descriptive info)
@@ -794,6 +798,20 @@ def main():
         # so cleanup handlers still run via atexit
         raise
 
+    # Inference mode: resolve the model artifact trio before anything reads it. When the
+    # user provided none of --encoder-path/--rf-path/--config-path, the pinned
+    # (--hf-revision) or latest-release revision is downloaded from the HuggingFace Hub
+    # and the cached paths are written onto `args` — exactly as if they were passed on the
+    # CLI — so validation, apply_saved_config, and the model-load path run unchanged.
+    # Explicit local paths take precedence; a partial trio falls through to validate_args,
+    # which reports the missing paths.
+    if args.command == "inference":
+        try:
+            resolve_inference_artifacts(args)
+        except Exception as e:
+            logger.error(f"Failed to resolve inference model artifacts: {e}")
+            sys.exit(1)
+
     # NOTE: come back to this later
     # Inference mode: if the user pointed --config-path at a saved JSON config,
     # layer its values onto the singleton *before* validate_args runs. That way
@@ -848,6 +866,12 @@ def main():
         sys.exit(1)
 
     try:
+        # Fail-early save-tag dedup guards: hard-stop before any expensive work when an
+        # explicitly-provided --save-tag collides with a previous run's artifacts/DB rows
+        # (resumable-run manifests exempt same-tag retries), and check the HF repo for a
+        # tag collision when --hf-upload is set. --force-tag overrides.
+        enforce_tag_guards(args)
+
         # Execute command
         if args.command == "train":
             train_command()

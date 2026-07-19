@@ -37,6 +37,9 @@ _CURRICULUM_SCHEDULES = {"linear", "exponential", "step"}
 # Allowed values for bandpass_method (energy-detection bandpass flattening)
 _BANDPASS_METHODS = {"pfb", "spline"}
 
+# HuggingFace Hub repo ids are "namespace/name" (user or org namespace)
+_HF_REPO_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$")
+
 
 @dataclass
 class ValidationError:
@@ -608,6 +611,20 @@ def _add_train_flags_to(parser):
         help="Delay in seconds between retry attempts after training failure",
     )
 
+    # HuggingFace Hub configuration
+    parser.add_argument(
+        "--hf-upload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Upload the final model artifacts (encoder, decoder, random forest, config) plus a generated model card to the HuggingFace Hub after training completes, tagging the commit with --save-tag (default: disabled = local-only). Requires HF_TOKEN in the environment (via .env)",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default=None,
+        help="HuggingFace model repo id (namespace/name) for weight upload/download (default: zachtheyek/aetherscan)",
+    )
+
     # Checkpoint configuration
     parser.add_argument(
         "--load-dir",
@@ -632,6 +649,12 @@ def _add_train_flags_to(parser):
         type=str,
         default=None,
         help="Tag for current pipeline run. Accepted formats: final_vX, round_XX, test_vX. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
+    )
+    parser.add_argument(
+        "--force-tag",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the fail-early save-tag collision guard: proceed even when an explicitly-provided --save-tag matches existing artifacts, DB rows, or (with --hf-upload) an existing HuggingFace tag (default: disabled)",
     )
 
 
@@ -710,19 +733,19 @@ def _add_inference_flags_to(parser):
         "--encoder-path",
         type=str,
         default=None,
-        help="Path to trained VAE encoder model file (.keras)",
+        help="Path to trained VAE encoder model file (.keras). Optional: when none of --encoder-path/--rf-path/--config-path are given, the artifacts are downloaded from the HuggingFace Hub (see --hf-repo-id/--hf-revision); provide either all three local paths or none",
     )
     parser.add_argument(
         "--rf-path",
         type=str,
         default=None,
-        help="Path to trained Random Forest model file (.joblib)",
+        help="Path to trained Random Forest model file (.joblib). Optional: see --encoder-path for the all-three-or-none rule",
     )
     parser.add_argument(
         "--config-path",
         type=str,
         default=None,
-        help="Path to config file from corresponding training run (.json)",
+        help="Path to config file from corresponding training run (.json). Optional: see --encoder-path for the all-three-or-none rule",
     )
     parser.add_argument(
         "--per-replica-batch-size",
@@ -874,12 +897,32 @@ def _add_inference_flags_to(parser):
         help="Delay in seconds between inference retry attempts",
     )
 
+    # HuggingFace Hub configuration
+    parser.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default=None,
+        help="HuggingFace model repo id (namespace/name) for weight upload/download (default: zachtheyek/aetherscan)",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        type=str,
+        default=None,
+        help="HuggingFace revision (tag, branch, or commit hash) to pin the model download to when no local artifact paths are given (default: the repo's latest release tag — highest semver vX.Y.Z tag, falling back to the highest final_vX training tag)",
+    )
+
     # Checkpoint configuration
     parser.add_argument(
         "--save-tag",
         type=str,
         default=None,
         help="Tag for current pipeline run. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
+    )
+    parser.add_argument(
+        "--force-tag",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the fail-early save-tag collision guard: proceed even when an explicitly-provided --save-tag matches a previous run's saved config or DB rows (default: disabled)",
     )
 
 
@@ -1139,6 +1182,18 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     ):
         config.training.retry_delay = args.retry_delay
 
+    # HuggingFace Hub configuration
+    # hf_upload uses argparse.BooleanOptionalAction with default=None so that the CLI can
+    # express "leave the config default" (omit), "force on" (--hf-upload), and "force off"
+    # (--no-hf-upload). The `is not None` guard preserves the config default when the user
+    # passes neither
+    if hasattr(args, "hf_upload") and args.hf_upload is not None:
+        config.hf.upload_after_training = args.hf_upload
+    if hasattr(args, "hf_repo_id") and args.hf_repo_id is not None:
+        config.hf.repo_id = args.hf_repo_id
+    if hasattr(args, "hf_revision") and args.hf_revision is not None:
+        config.hf.revision = args.hf_revision
+
     # Checkpoint configuration
     if hasattr(args, "load_dir") and args.load_dir is not None:
         config.checkpoint.load_dir = args.load_dir
@@ -1149,6 +1204,10 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.checkpoint.start_round = args.start_round  # Override start_round if provided
     if hasattr(args, "save_tag") and args.save_tag is not None:
         config.checkpoint.save_tag = args.save_tag
+    # force_tag uses argparse.BooleanOptionalAction with default=None (same tri-state as
+    # hf_upload above)
+    if hasattr(args, "force_tag") and args.force_tag is not None:
+        config.checkpoint.force_tag = args.force_tag
 
     # Inference configuration
     if hasattr(args, "encoder_path") and args.encoder_path is not None:
@@ -1265,6 +1324,21 @@ def collect_validation_errors(
     # config.py. Within each section, fields appear in the same order they are
     # registered on the parser. Cross-parameter checks live in the section of the
     # primary constrained field.
+
+    # ============================================================================
+    # COMMON CHECKS — flags shared by both subcommands
+    # ============================================================================
+    # --hf-repo-id must look like an HF "namespace/name" repo id (shared Pattern B flag).
+    hf_repo_id = _resolve(args, "hf_repo_id", config.hf.repo_id)
+    if hf_repo_id is not None and not _HF_REPO_ID_PATTERN.match(hf_repo_id):
+        errors.append(
+            ValidationError(
+                field="hf.repo_id",
+                current=hf_repo_id,
+                message=f"--hf-repo-id must be a HuggingFace repo id of the form namespace/name, got {hf_repo_id!r}",
+                fix_kind="format",
+            )
+        )
 
     # ============================================================================
     # TRAINING-MODE CHECKS — match _add_train_flags_to layout
@@ -1870,27 +1944,35 @@ def collect_validation_errors(
     # INFERENCE-MODE CHECKS — match _add_inference_flags_to layout
     # ============================================================================
     if cmd == "inference":
-        # ----------------------------------------------------- Required inference artifacts
-        # Encoder, RF, and config paths are mandatory for any inference run. Checked
-        # here (rather than in inference_command at runtime) so failures surface during
-        # validate_args and the structured ValidationErrors flow into the helpful-fix
-        # proposer.
-        for arg_name, cfg_attr, flag in (
+        # ----------------------------------------------------- Inference model artifacts
+        # The encoder/RF/config artifact trio is all-or-none: with all three paths given
+        # they must each exist on disk; with none given, main.py's
+        # resolve_inference_artifacts() has already filled `args` with HuggingFace-
+        # downloaded cache paths before validation runs (utility scripts that skip that
+        # step simply defer to the Hub default). A partial trio is an error — mixing local
+        # and Hub-sourced artifacts would silently pair mismatched models.
+        artifact_specs = (
             ("encoder_path", "encoder_path", "--encoder-path"),
             ("rf_path", "rf_path", "--rf-path"),
             ("config_path", "config_path", "--config-path"),
-        ):
-            path = _resolve(args, arg_name, getattr(config.inference, cfg_attr))
-            if path is None:
+        )
+        artifact_paths = {
+            arg_name: _resolve(args, arg_name, getattr(config.inference, cfg_attr))
+            for arg_name, cfg_attr, _flag in artifact_specs
+        }
+        n_provided = sum(path is not None for path in artifact_paths.values())
+        for arg_name, cfg_attr, flag in artifact_specs:
+            path = artifact_paths[arg_name]
+            if path is None and 0 < n_provided < len(artifact_specs):
                 errors.append(
                     ValidationError(
                         field=f"inference.{cfg_attr}",
                         current=None,
-                        message=f"{flag} is required for inference; pass it on the CLI or set inference.{cfg_attr} in the saved config",
+                        message=f"{flag} is missing: provide all three of --encoder-path/--rf-path/--config-path, or omit all three to download the artifacts from the HuggingFace Hub",
                         fix_kind="file_exists",
                     )
                 )
-            elif not os.path.exists(path):
+            elif path is not None and not os.path.exists(path):
                 errors.append(
                     ValidationError(
                         field=f"inference.{cfg_attr}",

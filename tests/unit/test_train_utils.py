@@ -14,6 +14,7 @@ import pytest
 from aetherscan.config import get_config
 from aetherscan.run_state import (
     STAGE_FINAL_SAVE,
+    STAGE_HF_UPLOAD,
     STAGE_RF_PLOTS,
     STAGE_RF_TRAIN,
     STAGE_VAE_PLOTS,
@@ -340,14 +341,18 @@ class TestSelectPositiveClassShap:
 
 class _StageMachineStub:
     """Duck-typed TrainingPipeline for _execute_training_stages: records the call order,
-    raises inside any method named in `fail`, and reports rf-load success per `rf_load_ok`."""
+    raises inside any method named in `fail`, and reports rf-load success per `rf_load_ok`.
+    `hf_upload` toggles the opt-in hf_upload stage via the config singleton (which the real
+    pipeline also reads through self.config)."""
 
-    def __init__(self, state, fail=(), rf_load_ok=True):
+    def __init__(self, state, fail=(), rf_load_ok=True, hf_upload=False):
         self.run_state = state
         self.calls = []
         self.rf_model = "trained-rf"
         self._fail = set(fail)
         self._rf_load_ok = rf_load_ok
+        self.config = get_config()
+        self.config.hf.upload_after_training = hf_upload
 
     def _invoke(self, name):
         self.calls.append(name)
@@ -369,6 +374,9 @@ class _StageMachineStub:
     def final_save(self):
         self._invoke("final_save")
 
+    def upload_to_hf(self):
+        self._invoke("upload_to_hf")
+
     def save_models(self):
         self._invoke("save_models")
 
@@ -389,6 +397,10 @@ class _StageMachineStub:
     def _record_stage_failure(self, stage):
         self.run_state.record_stage_failure(stage)
 
+    def _clear_stage_failure(self, stage):
+        self.calls.append("_clear_stage_failure")
+        self.run_state.clear_stage_failure(stage)
+
 
 class TestExecuteTrainingStages:
     def _state(self, **kwargs):
@@ -406,7 +418,8 @@ class TestExecuteTrainingStages:
             "_clear_rf_caches",
             "final_save",
         ]
-        assert stub.run_state.stages_done == list(TRAINING_STAGES)
+        # hf_upload is opt-in and disabled by default: skipped, not marked done
+        assert stub.run_state.stages_done == [s for s in TRAINING_STAGES if s != STAGE_HF_UPLOAD]
         assert stub.run_state.stages_failed == []
 
     def test_done_stages_are_skipped(self):
@@ -423,7 +436,7 @@ class TestExecuteTrainingStages:
             "_clear_rf_caches",
             "final_save",
         ]
-        assert state.stages_done == list(TRAINING_STAGES)
+        assert state.stages_done == [s for s in TRAINING_STAGES if s != STAGE_HF_UPLOAD]
 
     def test_vae_plot_failure_is_recorded_but_does_not_abort(self):
         stub = _StageMachineStub(self._state(), fail={"plot_vae_diagnostics"})
@@ -478,3 +491,37 @@ class TestExecuteTrainingStages:
         ]
         assert state.stages_failed == []
         assert state.stages_done[-1] == STAGE_VAE_PLOTS  # re-marked after the retry
+
+    def test_hf_upload_enabled_runs_after_final_save(self):
+        stub = _StageMachineStub(self._state(), hf_upload=True)
+        _execute_training_stages(stub)
+        assert stub.calls[-2:] == ["final_save", "upload_to_hf"]
+        assert stub.run_state.stages_done == list(TRAINING_STAGES)
+        assert stub.run_state.stages_failed == []
+
+    def test_hf_upload_failure_recorded_but_never_fails_the_run(self):
+        stub = _StageMachineStub(self._state(), fail={"upload_to_hf"}, hf_upload=True)
+        _execute_training_stages(stub)  # must not raise — weights are already safe locally
+        assert stub.run_state.stages_failed == [STAGE_HF_UPLOAD]
+        assert not stub.run_state.is_stage_done(STAGE_HF_UPLOAD)
+        assert stub.run_state.is_stage_done(STAGE_FINAL_SAVE)
+
+    def test_hf_upload_done_is_skipped_on_relaunch(self):
+        state = self._state(stages_done=list(TRAINING_STAGES))
+        stub = _StageMachineStub(state, hf_upload=True)
+        _execute_training_stages(stub)
+        assert "upload_to_hf" not in stub.calls
+
+    def test_disabling_hf_upload_clears_stale_failure(self):
+        # A previous --hf-upload attempt failed; the user re-runs without it. The stale
+        # failure must be dropped so it can't force a nonzero exit forever.
+        state = self._state(
+            stages_done=[s for s in TRAINING_STAGES if s != STAGE_HF_UPLOAD],
+            stages_failed=[STAGE_HF_UPLOAD],
+        )
+        stub = _StageMachineStub(state, hf_upload=False)
+        _execute_training_stages(stub)
+        assert "upload_to_hf" not in stub.calls
+        assert "_clear_stage_failure" in stub.calls
+        assert state.stages_failed == []
+        assert not state.is_stage_done(STAGE_HF_UPLOAD)

@@ -7,6 +7,7 @@ outputs from concurrent writes (e.g. from worker processes)
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import sys
@@ -59,6 +60,28 @@ class StreamToLogger:
         # Flush all handlers attached to the logger
         for handler in self.logger.handlers:
             handler.flush()
+
+    # File-protocol probes: libraries that write to sys.stdout/sys.stderr (tqdm progress
+    # bars via huggingface_hub, click, rich, ...) probe the stream for interactivity and
+    # capabilities before writing. Without these, any such probe crashes with
+    # AttributeError (e.g. hf_upload failed with "'StreamToLogger' object has no
+    # attribute 'isatty'"), so answer like the non-interactive pipe this stream is.
+
+    def isatty(self) -> bool:
+        """Never a terminal — suppresses interactive control codes/progress rendering."""
+        return False
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self):
+        """No OS-level file descriptor backs this stream. io.UnsupportedOperation is the
+        io-module convention (what io.StringIO raises); it subclasses both OSError and
+        ValueError, which is what fileno() probers guard against."""
+        raise io.UnsupportedOperation("fileno")
 
 
 class Logger:

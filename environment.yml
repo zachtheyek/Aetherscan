@@ -57,3 +57,6 @@ dependencies:
       - shap>=0.46.0,<0.47
       - slack-sdk>=3.31.0,<4
       - python-dotenv>=1.0,<2
+      # Model weight distribution via the HuggingFace Hub — pin range mirrors
+      # requirements-container.txt (see the rationale there).
+      - huggingface_hub>=1.21,<1.22

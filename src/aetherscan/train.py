@@ -47,6 +47,7 @@ from tensorflow.keras.layers import Conv2D, Dense
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
+from aetherscan.hf_hub import upload_run_to_hf
 from aetherscan.logger import get_logger
 from aetherscan.models import (
     RandomForestModel,
@@ -62,6 +63,7 @@ from aetherscan.round_data import (
 )
 from aetherscan.run_state import (
     STAGE_FINAL_SAVE,
+    STAGE_HF_UPLOAD,
     STAGE_RF_PLOTS,
     STAGE_RF_TRAIN,
     STAGE_VAE_PLOTS,
@@ -1087,6 +1089,13 @@ class TrainingPipeline:
         self.run_state.record_stage_failure(stage)
         self._persist_run_state()
         logger.error(f"Stage '{stage}' failed (recorded in run manifest)")
+
+    def _clear_stage_failure(self, stage: str):
+        """Drop a recorded stage failure from the manifest and persist it (used when the
+        user opts out of an optional stage whose previous attempt failed — see
+        TrainingRunState.clear_stage_failure)."""
+        self.run_state.clear_stage_failure(stage)
+        self._persist_run_state()
 
     def _mark_round_completed(self, round_number: int):
         """Record a fully-trained round (checkpoint saved) in the manifest and persist it."""
@@ -6542,6 +6551,18 @@ class TrainingPipeline:
             json.dump(self.config.to_dict(), f, indent=2)
         logger.info(f"Training configuration saved to {config_path}")
 
+    def upload_to_hf(self) -> None:
+        """The hf_upload stage: publish the final artifacts (staged under stable names) plus
+        a generated model card to the configured HuggingFace Hub repo, then tag the commit
+        with this run's save_tag. Requires HF_TOKEN in the environment (via .env)."""
+        upload_run_to_hf(
+            repo_id=self.config.hf.repo_id,
+            tag=self.config.checkpoint.save_tag,
+            model_path=self.config.model_path,
+            output_path=self.config.output_path,
+            force=self.config.checkpoint.force_tag,
+        )
+
 
 def _execute_training_stages(pipeline) -> None:
     """
@@ -6550,9 +6571,10 @@ def _execute_training_stages(pipeline) -> None:
 
     Critical stages (vae_rounds, rf_train, final_save) raise on failure — the retry loop in
     main.py rebuilds the pipeline and the manifest resumes it here. Non-critical stages
-    (vae_plots, rf_plots) are recorded in stages_failed and execution continues: a broken
-    plot mustn't cost a retry cycle including data regeneration, but main.py exits nonzero
-    at the very end if any recorded failure never recovers, so lost artifacts stay loud.
+    (vae_plots, rf_plots, hf_upload) are recorded in stages_failed and execution continues:
+    a broken plot or Hub upload mustn't cost a retry cycle including data regeneration, but
+    main.py exits nonzero at the very end if any recorded failure never recovers, so lost
+    artifacts stay loud.
 
     `pipeline` is duck-typed (a TrainingPipeline in production) so unit tests can drive the
     stage logic with a lightweight stub.
@@ -6623,6 +6645,29 @@ def _execute_training_stages(pipeline) -> None:
         pipeline.final_save()
         pipeline._mark_stage_done(STAGE_FINAL_SAVE)
 
+    # Stage 6: hf_upload (opt-in via config.hf.upload_after_training; non-critical) —
+    # publish the final artifacts + model card to the HuggingFace Hub. Failure is recorded
+    # in the manifest but never fails the run (the weights are already safe locally);
+    # re-running the identical command retries just this stage.
+    if not pipeline.config.hf.upload_after_training:
+        if STAGE_HF_UPLOAD in state.stages_failed:
+            # The user opted out after a failed upload attempt — the upload is no longer
+            # pending, so drop the stale failure (it must not force a nonzero exit forever)
+            logger.info(
+                f"HF upload disabled — clearing the stale '{STAGE_HF_UPLOAD}' failure "
+                f"recorded by a previous attempt"
+            )
+            pipeline._clear_stage_failure(STAGE_HF_UPLOAD)
+    elif state.is_stage_done(STAGE_HF_UPLOAD):
+        logger.info(f"Stage '{STAGE_HF_UPLOAD}' already complete — skipping")
+    else:
+        try:
+            pipeline.upload_to_hf()
+            pipeline._mark_stage_done(STAGE_HF_UPLOAD)
+        except Exception as e:
+            logger.error(f"Stage '{STAGE_HF_UPLOAD}' failed: {e}")
+            pipeline._record_stage_failure(STAGE_HF_UPLOAD)
+
 
 def run_training_pipeline(
     background_data: np.ndarray, strategy: tf.distribute.Strategy = None
@@ -6630,8 +6675,8 @@ def run_training_pipeline(
     """
     End-to-end training entry point: construct a TrainingPipeline from preprocessed background
     data (shape (n, 6, 16, 512)) and an optional tf.distribute strategy, then run the ordered
-    training stages (vae_rounds -> vae_plots -> rf_train -> rf_plots -> final_save), skipping
-    any the persisted run manifest already records as done.
+    training stages (vae_rounds -> vae_plots -> rf_train -> rf_plots -> final_save ->
+    hf_upload), skipping any the persisted run manifest already records as done.
     """
     try:
         # Create pipeline (no cleanup needed on failure)

@@ -76,7 +76,8 @@ subcommand uses it:
 | `DataConfig`         | Data shape, file lists, chunk sizes                                                                                                |
 | `TrainingConfig`     | Anything specific to the `train` command — sample counts, batch sizes, LR schedule, curriculum, latent-viz, retries                |
 | `InferenceConfig`    | Anything specific to the `inference` command — encoder/RF paths, classification threshold, energy-detection preprocessing, retries |
-| `CheckpointConfig`   | Load/save tags, start round                                                                                                        |
+| `HFConfig`           | HuggingFace Hub integration — target repo id, opt-in post-training upload, inference revision pin                                  |
+| `CheckpointConfig`   | Load/save tags, start round, tag-collision-guard override                                                                          |
 
 Two important consequences:
 
@@ -162,7 +163,9 @@ Current Pattern B flags:
 - `--gpu-memory-limit-mb` → `config.gpu.per_gpu_memory_limit_mb`
 - `--async-allocator` → `config.gpu.use_async_allocator`
 - `--num-replicas` → `config.gpu.num_replicas`
+- `--hf-repo-id` → `config.hf.repo_id`
 - `--save-tag` → `config.checkpoint.save_tag`
+- `--force-tag` → `config.checkpoint.force_tag`
 
 #### Pattern C — shared flag, divergent destination
 
@@ -364,5 +367,5 @@ mode && /^ *"--/{
 
 The second command lists every shared flag (those appearing in both subparsers); each
 should match either a single Pattern B `apply_args` block or a pair of Pattern C blocks
-with a `command` discriminator. As of this writing it yields 10 shared flags —
-7 Pattern B + 3 Pattern C — matching the tables above.
+with a `command` discriminator. As of this writing it yields 12 shared flags —
+9 Pattern B + 3 Pattern C — matching the tables above.

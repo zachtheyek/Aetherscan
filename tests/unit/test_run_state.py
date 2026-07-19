@@ -12,6 +12,7 @@ import pytest
 
 from aetherscan.run_state import (
     STAGE_FINAL_SAVE,
+    STAGE_HF_UPLOAD,
     STAGE_RF_PLOTS,
     STAGE_RF_TRAIN,
     STAGE_VAE_PLOTS,
@@ -104,6 +105,7 @@ class TestBookkeeping:
             STAGE_RF_TRAIN,
             STAGE_RF_PLOTS,
             STAGE_FINAL_SAVE,
+            STAGE_HF_UPLOAD,
         )
 
     def test_mark_stage_done_is_idempotent(self):
@@ -122,6 +124,16 @@ class TestBookkeeping:
         state.mark_stage_done(STAGE_VAE_PLOTS)
         assert state.stages_failed == []
         assert state.is_stage_done(STAGE_VAE_PLOTS)
+
+    def test_clear_stage_failure_drops_without_marking_done(self):
+        state = TrainingRunState(tag="test_v1", run_start_time=1.0)
+        state.record_stage_failure(STAGE_HF_UPLOAD)
+        state.clear_stage_failure(STAGE_HF_UPLOAD)
+        assert state.stages_failed == []
+        assert not state.is_stage_done(STAGE_HF_UPLOAD)
+        # Clearing an unrecorded stage is a no-op
+        state.clear_stage_failure(STAGE_HF_UPLOAD)
+        assert state.stages_failed == []
 
     def test_mark_round_completed_sorted_and_deduped(self):
         state = TrainingRunState(tag="test_v1", run_start_time=1.0)
@@ -153,6 +165,11 @@ class TestConfigFingerprint:
         "training": {"num_samples_beta_vae": 499200, "max_retries": 3, "retry_delay": 60},
         "gpu": {"num_replicas": None},
         "inference": {"max_retries": 3, "parallel_coarse_chans": None},
+        "hf": {
+            "upload_after_training": False,
+            "repo_id": "zachtheyek/aetherscan",
+            "revision": None,
+        },
         "checkpoint": {"save_tag": "final_v1", "load_tag": None, "start_round": 1},
     }
 
@@ -189,6 +206,10 @@ class TestConfigFingerprint:
             ("manager", "n_processes", 96),
             ("logger", "slack_enabled", False),
             ("inference", "max_retries", 9),
+            # HF upload config never affects the training result — toggling --hf-upload or
+            # changing its repo/revision must NOT discard the manifest (regression: #130).
+            ("hf", "upload_after_training", True),
+            ("hf", "repo_id", "other/repo"),
             ("checkpoint", "load_tag", "round_03"),
             ("checkpoint", "start_round", 4),
             ("training", "max_retries", 10),

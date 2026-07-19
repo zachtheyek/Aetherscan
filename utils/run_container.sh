@@ -30,6 +30,8 @@
 #                               (default: none)
 #     SLACK_BOT_TOKEN           Slack bot token, forwarded into the container
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
+#     HF_TOKEN                  HuggingFace token (write access) for --hf-upload,
+#                               forwarded into the container; never logged
 #
 # Note, the runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
 # through untouched and are additive with the binds set up from AETHERSCAN_EXTRA_BINDS.
@@ -123,4 +125,5 @@ exec "$RUNTIME" exec --nv \
     --env AETHERSCAN_OUTPUT_PATH="$OUTPUT_PATH" \
     --env SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
     --env SLACK_CHANNEL="${SLACK_CHANNEL:-}" \
+    --env HF_TOKEN="${HF_TOKEN:-}" \
     "$SIF" "$@"
