@@ -658,7 +658,7 @@ class TestRoundDataFlags:
         assert config.training.round_data_dir is None
         assert config.training.overlap_data_generation is True
         assert config.training.keep_round_data is False
-        assert config.training.data_gen_task_size == 256
+        assert config.training.data_gen_task_size == 64
 
     def test_data_gen_task_size_below_one_rejected(self):
         errors = collect_validation_errors(_parse(["train", "--data-gen-task-size", "0"]), None)

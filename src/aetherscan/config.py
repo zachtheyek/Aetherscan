@@ -187,8 +187,11 @@ class TrainingConfig:
     signal_injection_chunk_size: int = (
         50000  # Maximum cadences to process at once during data generation
     )
-    # NOTE: is this the optimal size?
-    data_gen_task_size: int = 256  # Cadences per batched worker task (workers write results straight into the round memmap)
+    # Tuned to 64 via smoke-scale (n=8192) task-size sweeps on bla0 (96c) + blpc3 (32c):
+    # finer tasks load-balance the create_true_double straggler with negligible per-task
+    # overhead; 64 was near-optimal on both (256 ran ~2x slower on bla0).
+    # TODO: re-confirm at production sample sizes (~500k) before treating as final.
+    data_gen_task_size: int = 64  # Cadences per batched worker task (workers write results straight into the round memmap)
 
     # Round data pipeline params (disk-backed per-round datasets, see round_data.py)
     round_data_dir: str | None = None  # Defaults to get_training_file_path("round_data") at runtime
