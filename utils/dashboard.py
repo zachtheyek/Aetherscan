@@ -224,21 +224,31 @@ def pca_2d(matrix: np.ndarray) -> np.ndarray:
 
 
 def list_png_artifacts(plots_dir: str, limit: int = 60) -> list[dict]:
-    """Every *.png/*.gif under plots_dir (recursive), newest first: {path, name, rel, mtime}."""
+    """Every *.png/*.gif under plots_dir (recursive), newest first: {path, name, rel, mtime}.
+
+    Containment: plots_dir is realpath-resolved and every returned file's realpath is verified to
+    stay within that root, so a symlink inside the tree can't make the gallery serve a file from
+    outside the run's plots directory. (The dashboard is a single-operator local tool pointed at
+    their own run via the launch args, but this keeps the file-serving surface tightly bounded.)
+    """
     if not plots_dir or not os.path.isdir(plots_dir):
         return []
+    base = os.path.realpath(plots_dir)
     found = []
-    for root, _dirs, files in os.walk(plots_dir):
+    for root, _dirs, files in os.walk(base):
         for f in files:
-            if f.lower().endswith((".png", ".gif")):
-                p = os.path.join(root, f)
-                try:
-                    mtime = os.path.getmtime(p)
-                except OSError:
-                    continue
-                found.append(
-                    {"path": p, "name": f, "rel": os.path.relpath(p, plots_dir), "mtime": mtime}
-                )
+            if not f.lower().endswith((".png", ".gif")):
+                continue
+            real = os.path.realpath(os.path.join(root, f))
+            if real != base and not real.startswith(base + os.sep):
+                continue  # symlink escaping the plots tree — never serve it
+            try:
+                mtime = os.path.getmtime(real)
+            except OSError:
+                continue
+            found.append(
+                {"path": real, "name": f, "rel": os.path.relpath(real, base), "mtime": mtime}
+            )
     found.sort(key=lambda d: d["mtime"], reverse=True)
     return found[:limit]
 
@@ -315,7 +325,10 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
 
     with st.sidebar:
         st.header("Aetherscan run")
-        db_path = st.text_input("DB path", value=args.db_path)
+        # DB + plots paths come from the launch args only (NOT browser-editable text inputs), so a
+        # hosted instance can't be repointed at arbitrary filesystem paths from the browser.
+        db_path = args.db_path
+        st.caption(f"DB: `{db_path}`")
         try:
             conn = connect_ro(db_path)
         except sqlite3.OperationalError as e:
@@ -328,7 +341,8 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
         default_idx = tags.index(args.tag) if args.tag in tags else len(tags) - 1
         tag = st.selectbox("Tag", tags, index=default_idx)
         refresh = st.number_input("Auto-refresh (s, 0=off)", 0, 600, value=args.refresh)
-        plots_dir = st.text_input("Plots dir", value=args.plots_dir or default_plots_dir(db_path))
+        plots_dir = args.plots_dir or default_plots_dir(db_path)
+        st.caption(f"Plots: `{plots_dir}`")
 
     resources = load_resources(conn, tag)
     stages = load_stages(conn, tag)
