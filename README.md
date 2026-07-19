@@ -710,6 +710,7 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--detection-window-size DETECTION_WINDOW_SIZE]
                  [--detection-step-size DETECTION_STEP_SIZE]
                  [--stat-threshold STAT_THRESHOLD] [--stamp-width STAMP_WIDTH]
+                 [--store-downsampled-stamps | --no-store-downsampled-stamps]
                  [--overlap-search | --no-overlap-search]
                  [--overlap-fraction OVERLAP_FRACTION]
                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
@@ -776,8 +777,10 @@ options:
                         Number of fine channels per coarse channel (default:
                         1048576)
   --parallel-coarse-chans PARALLEL_COARSE_CHANS
-                        Number of coarse channels to process in parallel per
-                        block (default: 28)
+                        Progress-logging chunk size for energy detection, in
+                        coarse channels per log line (default: the number of
+                        worker processes). Parallelism itself comes from the
+                        persistent worker pool, not this knob.
   --spline-order SPLINE_ORDER
                         Spline order for bandpass fitting (default: 16)
   --detection-window-size DETECTION_WINDOW_SIZE
@@ -792,6 +795,13 @@ options:
   --stamp-width STAMP_WIDTH
                         Width in fine channels of the extracted stamp around
                         each hit (default: 4096; must equal --width-bin)
+  --store-downsampled-stamps, --no-store-downsampled-stamps
+                        Downsample stamps along frequency (by --downsample-
+                        factor) at extraction time, storing stamp_width //
+                        downsample_factor bins per stamp (~8x smaller at
+                        defaults; default: enabled). Pass --no-store-
+                        downsampled-stamps to archive raw-resolution stamps;
+                        loading handles both layouts.
   --overlap-search, --no-overlap-search
                         Additionally extract stamps offset by
                         ±overlap_fraction*stamp_width around each hit. Pass

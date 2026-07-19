@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import functools
 import gc
 import json
 import logging
+import math
 import os
 import re
 import signal
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from multiprocessing.pool import Pool
 from multiprocessing.shared_memory import SharedMemory
 
 import h5py
@@ -102,6 +106,17 @@ def _init_worker(shm_name, shape, dtype):
     _GLOBAL_DTYPE = dtype
 
 
+def _init_plain_worker():
+    """
+    Worker pool initializer for pools that don't attach shared memory (energy detection and
+    stamp extraction): set up queue-based logging and ignore SIGINT so the parent's
+    ResourceManager coordinates shutdown. No SIGTERM handler is installed — these workers hold
+    no shared-memory file descriptors, so the default termination behavior is safe.
+    """
+    init_worker_logging()
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 # NOTE: come back to this later
 def _downsample_worker(args):
     """
@@ -135,6 +150,33 @@ def _downsample_worker(args):
     else:
         logger.warning("No global chunk data available")
         return None
+
+
+def _lognorm_worker(args):
+    """
+    Log-normalize one already-downsampled cadence in parallel.
+
+    Counterpart to _downsample_worker for stamps that were downsampled at extraction time
+    (see _extract_stamps_worker): the stored .npy is already at final width, so loading only
+    needs the per-cadence log-norm. args is a (cadence_idx,) tuple — the cadence itself is
+    pulled from _GLOBAL_CHUNK_DATA to avoid pickling it across the pool boundary. Returns the
+    log-normalized cadence of shape (6, time_bins, final_width) as float32, or None if the
+    source cadence contained NaN/Inf or had non-positive max (treated as invalid, matching
+    _downsample_worker).
+    """
+    (cadence_idx,) = args
+
+    if _GLOBAL_CHUNK_DATA is None:
+        logger.warning("No global chunk data available")
+        return None
+
+    cadence = _GLOBAL_CHUNK_DATA[cadence_idx]
+
+    # Skip invalid cadences (same validity rule as _downsample_worker)
+    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+        return None
+
+    return log_norm(cadence.astype(np.float32))
 
 
 # NOTE: come back to this later (mirrors preprocess_fine.py:72-75 from the reference implementation)
@@ -183,90 +225,209 @@ def _fit_channel_bandpass(
     return interpolate.splev(x, spl)
 
 
-# NOTE: come back to this later
-def _read_coarse_channel_worker(args: tuple) -> np.ndarray:
+def _spline_flatten_bandpass(channel: np.ndarray, spl_order: int) -> np.ndarray:
     """
-    Worker: read one coarse channel from an .h5 file as an ndarray of shape
-    (time_bins, coarse_channel_width). args is (h5_path, channel_index, coarse_channel_width).
+    Default bandpass flattener: fit a spline to the time-integrated coarse channel and subtract
+    it from every time row. channel has shape (time_bins, coarse_channel_width); returns the
+    float64 residuals of the same shape.
 
-    Each worker opens its own h5py.File since h5py file handles are fork-unsafe to share.
+    Bandpass flattening is a pluggable stage: _process_cadence obtains a picklable callable via
+    DataPreprocessor._get_bandpass_flattener() and ships it to the pool workers, so alternative
+    flatteners (e.g. the PFB static equalization planned for a later PR) only need a
+    module-level function with the same (channel) -> residuals contract.
     """
-    h5_path, channel_index, coarse_channel_width = args
-    start = channel_index * coarse_channel_width
-    end = (channel_index + 1) * coarse_channel_width
-    with h5py.File(h5_path, "r") as hf:
-        return hf["data"][:, 0, start:end]
-
-
-# NOTE: come back to this later
-def _remove_bandpass_worker(args: tuple) -> np.ndarray:
-    """
-    Worker: subtract the spline bandpass from one coarse channel and return the cleaned slice
-    of shape (time_bins, coarse_channel_width). args is (channel_index, coarse_channel_width,
-    spl_order).
-
-    Reads its slice from _GLOBAL_CHUNK_DATA — a (time_bins, n_coarse * coarse_channel_width)
-    view of the current block's shared memory, set up by _init_worker.
-    """
-    channel_index, coarse_channel_width, spl_order = args
-
-    if _GLOBAL_CHUNK_DATA is None:
-        logger.warning("No global chunk data available for bandpass removal")
-        return np.zeros((0, coarse_channel_width))
-
-    start = channel_index * coarse_channel_width
-    end = (channel_index + 1) * coarse_channel_width
-    channel = _GLOBAL_CHUNK_DATA[:, start:end]
     integrated_channel = np.mean(channel, axis=0)
-    fit = _fit_channel_bandpass(integrated_channel, coarse_channel_width, spl_order)
+    fit = _fit_channel_bandpass(integrated_channel, channel.shape[1], spl_order)
     return channel - fit
 
 
-# NOTE: come back to this later
-def _threshold_hits_worker(args: tuple) -> list[tuple]:
+def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int) -> np.ndarray:
     """
-    Worker: slide a window across one coarse channel and emit hits whose D'Agostino-Pearson
-    normality statistic exceeds stat_threshold. Returns a list of (absolute_fine_channel_index,
-    statistic, pvalue) tuples.
+    D'Agostino-Pearson normality statistic (k2) for every sliding window across one coarse
+    channel, computed in closed form from per-block power sums instead of a per-window Python
+    loop over scipy.stats.normaltest (which was the #1 cost of inference preprocessing).
 
-    args is (channel_index, coarse_channel_width, window_size, step_size, stat_threshold,
-    block_offset). block_offset is added to each emitted index so callers see positions in the
-    full spectrum rather than block-relative ones. Reads its slice from _GLOBAL_CHUNK_DATA, which
-    holds the cleaned residuals for the current block.
+    channel has shape (time_bins, width). Window j covers columns
+    [j*step_size, j*step_size + window_size) — the same windows as the historical loop
+    `range(0, width - window_size, step_size)` — and each window's sample is the flattened
+    (time_bins, window_size) slice, so n = time_bins * window_size is constant across windows.
+    Returns a float64 array of shape (n_windows,) whose entries match
+    `scipy.stats.normaltest(window.flatten()).statistic` (unit tests pin the equivalence to
+    rtol=1e-9); windows with zero variance yield NaN, matching scipy's behavior of returning
+    NaN rather than a spurious statistic.
+
+    Derivation: normaltest = skewtest.Z**2 + kurtosistest.Z**2 where both Z transforms are
+    elementwise closed forms in (n, m2, m3, m4). The central moments come from per-block raw
+    power sums S1..S4 accumulated in float64: blocks are sized so that every window is an
+    exact run of adjacent blocks (block = step_size when step divides window — the fast
+    path — else gcd(window, step)), window sums are length-(window//block) moving sums over
+    the block sums, and m2/m3/m4 follow from the standard raw-to-central-moment identities.
+    Raw-moment differencing loses precision when |mean| >> std, so the channel mean is
+    subtracted up front (central moments are shift-invariant); bandpass-subtracted residuals
+    are near-zero-mean anyway, and the rtol=1e-9 unit-test gate is the arbiter.
+    """
+    time_bins, width = channel.shape
+    n = time_bins * window_size  # samples per window (scalar across all windows)
+    if n < 8:
+        # Mirror scipy.stats.skewtest's minimum-sample requirement
+        raise ValueError(f"normality test requires >= 8 samples per window, got {n}")
+    n_windows = len(range(0, width - window_size, step_size))
+    if n_windows <= 0:
+        return np.empty(0, dtype=np.float64)
+
+    # astype always copies, so the in-place shift below can't mutate the caller's array.
+    # Shift-invariance guard: subtracting the channel mean leaves every central moment
+    # mathematically unchanged while keeping the S2/n - mean**2 style differencing below
+    # well conditioned even when the residuals carry a DC offset.
+    data = channel.astype(np.float64)
+    data -= data.mean()
+
+    # Per-column power sums over the time axis, accumulated row by row so temporaries stay at
+    # (width,) rather than (time_bins, width) x 3.
+    # NOTE: the Python-level loop over time_bins rows is deliberate — it caps peak memory at a
+    # few (width,) float64 vectors per worker. With the default time_bins=16 the loop overhead
+    # is negligible; if time_bins ever grows large, vectorize via (channel**k).sum(axis=0).
+    p1 = np.zeros(width, dtype=np.float64)
+    p2 = np.zeros(width, dtype=np.float64)
+    p3 = np.zeros(width, dtype=np.float64)
+    p4 = np.zeros(width, dtype=np.float64)
+    for t in range(time_bins):
+        row = data[t]
+        row2 = row * row
+        p1 += row
+        p2 += row2
+        p3 += row2 * row
+        p4 += row2 * row2
+
+    # Aggregate columns into block sums. The fast path (step divides window — the default
+    # config: window 256, step 128) uses step-sized blocks; the general path falls back to
+    # gcd-sized blocks so windows are still exact runs of adjacent blocks.
+    block = step_size if window_size % step_size == 0 else math.gcd(window_size, step_size)
+    edges = np.arange(0, width, block)
+    blocks_per_window = window_size // block
+    blocks_per_step = step_size // block
+    # When block does not divide width (non-power-of-2 geometries), np.add.reduceat emits a
+    # short trailing block spanning the ragged tail [edges[-1], width). No in-range window ever
+    # reaches it — every window ends at a multiple of block that is < width, hence <= edges[-1]
+    # — but drop it explicitly so a partial sum can never leak into a window and silently
+    # corrupt k2. width // block == number of full blocks (== len(edges) when block divides
+    # width, so this is a no-op there); slicing to it keeps every window sum exact.
+    n_full_blocks = width // block
+
+    def _window_sums(col_sums: np.ndarray) -> np.ndarray:
+        block_sums = np.add.reduceat(col_sums, edges)[:n_full_blocks]
+        # Moving sum of blocks_per_window adjacent blocks, sampled every blocks_per_step
+        # blocks — one entry per window, no long cumulative accumulation (precision).
+        view = np.lib.stride_tricks.sliding_window_view(block_sums, blocks_per_window)
+        return view[::blocks_per_step].sum(axis=-1)[:n_windows]
+
+    s1 = _window_sums(p1)
+    s2 = _window_sums(p2)
+    s3 = _window_sums(p3)
+    s4 = _window_sums(p4)
+
+    # Raw power sums -> central moments (float64 throughout)
+    mean = s1 / n
+    m2 = s2 / n - mean**2
+    m3 = s3 / n - 3.0 * mean * (s2 / n) + 2.0 * mean**3
+    m4 = s4 / n - 4.0 * mean * (s3 / n) + 6.0 * mean**2 * (s2 / n) - 3.0 * mean**4
+
+    # Z transforms transcribed from scipy.stats._stats_py::skewtest / kurtosistest with
+    # scalar n, so every n-dependent constant is computed once. Variable names follow scipy.
+    with np.errstate(all="ignore"):
+        # Zero-variance windows can't support either test; scipy returns NaN there (and a
+        # tiny negative m2 from float cancellation would otherwise fabricate a huge k2).
+        degenerate = m2 <= 0.0
+        m2 = np.where(degenerate, np.nan, m2)
+
+        # --- skewtest: Z1 from g1 = m3 / m2**1.5
+        b2 = m3 / m2**1.5
+        y = b2 * math.sqrt(((n + 1) * (n + 3)) / (6.0 * (n - 2)))
+        beta2 = (
+            3.0
+            * (n**2 + 27 * n - 70)
+            * (n + 1)
+            * (n + 3)
+            / ((n - 2.0) * (n + 5) * (n + 7) * (n + 9))
+        )
+        w2 = -1 + math.sqrt(2 * (beta2 - 1))
+        delta = 1 / math.sqrt(0.5 * math.log(w2))
+        alpha = math.sqrt(2.0 / (w2 - 1))
+        y = np.where(y == 0, 1.0, y)
+        z1 = delta * np.log(y / alpha + np.sqrt((y / alpha) ** 2 + 1))
+
+        # --- kurtosistest: Z2 from b2 = m4 / m2**2
+        b2k = m4 / m2**2
+        e = 3.0 * (n - 1) / (n + 1)
+        varb2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) * (n + 1.0) * (n + 3) * (n + 5))
+        x = (b2k - e) / math.sqrt(varb2)
+        sqrtbeta1 = (
+            6.0
+            * (n * n - 5 * n + 2)
+            / ((n + 7) * (n + 9))
+            * math.sqrt((6.0 * (n + 3) * (n + 5)) / (n * (n - 2) * (n - 3)))
+        )
+        a = 6.0 + 8.0 / sqrtbeta1 * (2.0 / sqrtbeta1 + math.sqrt(1 + 4.0 / (sqrtbeta1**2)))
+        term1 = 1 - 2 / (9.0 * a)
+        denom = 1 + x * math.sqrt(2 / (a - 4.0))
+        term2 = np.sign(denom) * np.where(
+            denom == 0.0, np.nan, np.power((1 - 2.0 / a) / np.abs(denom), 1 / 3.0)
+        )
+        z2 = (term1 - term2) / math.sqrt(2 / (9.0 * a))
+
+        k2 = z1 * z1 + z2 * z2
+
+    return k2
+
+
+def _energy_detect_channel_worker(args: tuple) -> list[tuple]:
+    """
+    Fused worker: run the complete energy-detection chain for one coarse channel — read the
+    channel's h5 slice, remove the DC spike, flatten the bandpass, and threshold the vectorized
+    normality statistic. Returns a small list of (absolute_fine_channel_index, statistic,
+    pvalue) hit tuples; the bulky (time_bins, coarse_channel_width) intermediates never leave
+    the worker, so no shared memory or per-block parent arrays are needed.
+
+    args is (h5_path, channel_index, coarse_channel_width, time_bins, bandpass_flatten,
+    window_size, step_size, stat_threshold). bandpass_flatten is a picklable callable
+    (channel) -> residuals (see _spline_flatten_bandpass). Each worker opens its own h5py.File
+    since h5py file handles are fork-unsafe to share.
     """
     (
+        h5_path,
         channel_index,
         coarse_channel_width,
+        time_bins,
+        bandpass_flatten,
         window_size,
         step_size,
         stat_threshold,
-        block_offset,
     ) = args
-
-    if _GLOBAL_CHUNK_DATA is None:
-        logger.warning("No global chunk data available for hit thresholding")
-        return []
 
     start = channel_index * coarse_channel_width
     end = (channel_index + 1) * coarse_channel_width
-    channel = _GLOBAL_CHUNK_DATA[:, start:end]
+    with h5py.File(h5_path, "r") as hf:
+        channel = hf["data"][:time_bins, 0, start:end]
 
-    # TODO: profile on HPC and consider vectorizing. With default config this loop
-    # runs ~8190 windows per coarse channel × parallel_chans × num_blocks × 3
-    # ON-source files per cadence. scipy.stats.normaltest copies + flattens each
-    # window and re-derives skew/kurtosis via separate scipy calls. A stride_tricks
-    # view over the cleaned block followed by vectorized scipy.stats.skew /
-    # kurtosis (with axis arg) would replace the Python loop with a few large
-    # ndarray ops and could be substantially faster end-to-end.
-    hits: list[tuple] = []
-    for i in range(0, coarse_channel_width - window_size, step_size):
-        window = channel[:, i : i + window_size]
-        s, p = stats.normaltest(window.flatten())
-        if s > stat_threshold:
-            abs_idx = block_offset + channel_index * coarse_channel_width + i
-            hits.append((abs_idx, float(s), float(p)))
+    # In-place DC spike removal. The spike sits at the channel center and the interpolation
+    # offsets reach at most ±3 bins around it (see _remove_dc_spike), so per-channel
+    # processing touches exactly the same bins as the historical block-based path — the
+    # offsets can never cross a coarse-channel boundary.
+    _remove_dc_spike(channel, coarse_channel_width, 1)
 
-    return hits
+    residuals = bandpass_flatten(channel)
+
+    k2 = _sliding_normality_k2(residuals, window_size, step_size)
+    hit_windows = np.nonzero(k2 > stat_threshold)[0]
+    if hit_windows.size == 0:
+        return []
+
+    # p-values are only stored in metadata, so chi2.sf runs on the (small) hit subset only
+    pvalues = stats.chi2.sf(k2[hit_windows], 2)
+    return [
+        (start + int(j) * step_size, float(k2[j]), float(p))
+        for j, p in zip(hit_windows, pvalues, strict=True)
+    ]
 
 
 def _extract_stamps_worker(args: tuple) -> None:
@@ -274,18 +435,34 @@ def _extract_stamps_worker(args: tuple) -> None:
 
     Each worker opens its own hdf5 handle and its own r+ view of the shared .npy, then
     copies a stamp_width-wide window (over the first `time_bins` rows, polarization 0) around
-    each hit. Tasks address disjoint output regions — distinct obs_idx and/or non-overlapping
-    stamp indices — so concurrent writes from the pool never collide. `stamp_starts` is the
-    contiguous, start-sorted slice for this task; `base_idx` is its offset into the full stamp
-    list so the worker writes to the correct absolute rows.
+    each hit. When downsample_factor > 1 the stamp is downsampled along frequency with
+    downscale_local_mean before writing, so the memmap stores width
+    stamp_width // downsample_factor — this is the same operation load_inference_data used to
+    apply after the fact, moved to extraction time to cut storage by the same factor. Tasks
+    address disjoint output regions — distinct obs_idx and/or non-overlapping stamp indices —
+    so concurrent writes from the pool never collide. `stamp_starts` is the contiguous,
+    start-sorted slice for this task; `base_idx` is its offset into the full stamp list so the
+    worker writes to the correct absolute rows.
     """
-    npy_path, obs_idx, obs_h5, stamp_starts, base_idx, time_bins, stamp_width = args
+    (
+        npy_path,
+        obs_idx,
+        obs_h5,
+        stamp_starts,
+        base_idx,
+        time_bins,
+        stamp_width,
+        downsample_factor,
+    ) = args
     out = np.lib.format.open_memmap(npy_path, mode="r+")
     try:
         with h5py.File(obs_h5, "r") as hf:
             dset = hf["data"]
             for local_i, start in enumerate(stamp_starts):
-                out[base_idx + local_i, obs_idx] = dset[:time_bins, 0, start : start + stamp_width]
+                stamp = dset[:time_bins, 0, start : start + stamp_width]
+                if downsample_factor > 1:
+                    stamp = downscale_local_mean(stamp, (1, downsample_factor)).astype(np.float32)
+                out[base_idx + local_i, obs_idx] = stamp
         out.flush()
     finally:
         del out
@@ -334,6 +511,59 @@ class CadenceHit:
     frequency_mhz: float = field(default=float("nan"))
 
 
+@dataclass
+class PendingCadence:
+    """One unit of preprocessing work: a valid cadence group plus its target .npy path."""
+
+    group: CadenceGroup
+    npy_path: str
+
+
+def derive_cadence_provenance(key: tuple, group_by_cols: list[str], metadata: dict) -> dict:
+    """
+    Map one cadence's group-by key and stamp metadata JSON onto the observational-provenance
+    fields of the inference_results table.
+
+    key and group_by_cols come from the CadenceGroup (values zipped positionally onto column
+    names, matched case-insensitively so 'Target'/'target' both resolve); metadata is the
+    per-cadence JSON written by _process_cadence. Returns a dict with keys target, session,
+    band, cadence_id (int when parseable, else None), timestamp_observed (the header's tstart,
+    when present), h5_path (first observation of the cadence), and stamp_frequencies_mhz (the
+    per-stamp center frequencies, one per snippet row in the .npy).
+    """
+    # strict=False: a malformed key/cols pairing degrades to sparse provenance rather than
+    # aborting the cadence
+    key_map = {str(col).strip().lower(): val for col, val in zip(group_by_cols, key, strict=False)}
+
+    cadence_id: int | None = None
+    raw_cadence_id = key_map.get("cadence id")
+    if raw_cadence_id is not None:
+        try:
+            cadence_id = int(raw_cadence_id)
+        except (TypeError, ValueError):
+            logger.warning(f"Could not parse cadence id {raw_cadence_id!r} as int; storing None")
+
+    header = metadata.get("header") or {}
+    timestamp_observed: float | None = None
+    if "tstart" in header:
+        try:
+            timestamp_observed = float(header["tstart"])
+        except (TypeError, ValueError):
+            logger.warning(f"Could not parse header tstart {header['tstart']!r} as float")
+
+    h5_paths = metadata.get("h5_paths") or []
+
+    return {
+        "target": key_map.get("target"),
+        "session": key_map.get("session"),
+        "band": key_map.get("band"),
+        "cadence_id": cadence_id,
+        "timestamp_observed": timestamp_observed,
+        "h5_path": h5_paths[0] if h5_paths else None,
+        "stamp_frequencies_mhz": metadata.get("stamp_frequencies_mhz"),
+    }
+
+
 # NOTE: come back to this later (add sorting functionality to sort rows in csv after grouping, e.g. via timestamp metadata from filenames? edge case where multiple 6-cadence observations of the same target & with the same grouping params, but differed by time, e.g. t=X to t=X+ε, then t=Y to t=Y+σ, for some small numbers ε and σ, and where X and Y are far apart from each other. add a way to distinguish these cases from problematic cases where we actually want to invalidate a cadence with a weird number of grouped observations, e.g. if multiple of 6 and enough of a gap between X and Y, then count as separate cadences?)
 def group_observations_from_csv(
     csv_path: str,
@@ -372,9 +602,20 @@ def group_observations_from_csv(
                 f"Available columns: {available}"
             )
 
-        for row in reader:
+        for row_idx, row in enumerate(reader, start=1):
             key = tuple(row[c] for c in group_by_cols)
-            groups.setdefault(key, []).append(row[h5_path_col])
+            h5_path = row[h5_path_col]
+            # A ragged row (fewer fields than the header) makes csv.DictReader fill the path
+            # with None; an empty/whitespace-only cell is just as unusable. Skip such rows
+            # loudly instead of grouping them under a None/empty path, which would otherwise
+            # only surface much later as a cryptic failure when the .h5 is opened.
+            if h5_path is None or not str(h5_path).strip():
+                logger.warning(
+                    f"CSV {csv_path}: data row {row_idx} (key={key}) has a missing/empty "
+                    f"'{h5_path_col}' value ({h5_path!r}); skipping row"
+                )
+                continue
+            groups.setdefault(key, []).append(h5_path)
 
     valid: list[CadenceGroup] = []
     flagged: list[CadenceGroup] = []
@@ -424,6 +665,10 @@ class DataPreprocessor:
         if self.manager is None:
             raise ValueError("get_manager() returned None")
 
+        # Persistent worker pool for energy detection + stamp extraction, shared across all
+        # cadences of a run (see start/stop_energy_detection_pool)
+        self._ed_pool: Pool | None = None
+
     # NOTE: come back to this later
     def close(self):
         """Explicitly close the multiprocessing pool and shared memory"""
@@ -434,6 +679,10 @@ class DataPreprocessor:
         # if hasattr(self, "shm") and self.shm is not None:
         #     self.manager.close_shared_memory(self.shm)
         #     self.shm = None
+
+        # Defense-in-depth: ensure the persistent energy-detection pool is torn down even if a
+        # caller forgot to call stop_energy_detection_pool(). No-op when no pool was started.
+        self.stop_energy_detection_pool()
 
         logger.info("DataPreprocessor closed")
 
@@ -629,16 +878,24 @@ class DataPreprocessor:
         """
         Load and preprocess inference data into an array of shape
         (n, 6, 16, width_bin_downsampled). Uses a multiprocessing pool over shared memory to
-        downsample cadences in parallel, then applies per-cadence log-normalization in-process.
+        process cadences in parallel.
+
+        Each file's stored width decides its path: files already at the downsampled width
+        (written by _extract_stamps_worker with store_downsampled_stamps enabled) only need
+        per-cadence log-normalization, which runs vectorized in the pool workers; legacy
+        full-width files (width_bin, e.g. stamps preprocessed before downsample-at-extraction
+        landed) keep the historical downsample-then-log-norm behavior.
 
         override_filepaths, when given, supplies absolute paths to iterate directly instead of
-        resolving config.data.test_files via get_test_file_path — used by find_hits() to chain
-        per-cadence .npy outputs into inference without monkey-patching paths.
+        resolving config.data.test_files via get_test_file_path — used by the inference command
+        to chain per-cadence .npy outputs from preprocessing into inference without
+        monkey-patching paths.
         """
         logger.info(f"Loading backgrounds from {self.config.data_path} for inference")
 
         downsample_factor = self.config.data.downsample_factor
-        final_width = self.config.data.width_bin // downsample_factor
+        width_bin = self.config.data.width_bin
+        final_width = width_bin // downsample_factor
 
         chunk_size = self.config.data.inference_background_load_chunk_size
         n_processes = self.config.manager.n_processes
@@ -691,6 +948,46 @@ class DataPreprocessor:
 
             logger.info(f"  Raw data shape: {raw_data.shape}")
 
+            # A cadence plate must be 4-D (n, 6, time_bins, width); only the trailing width was
+            # validated historically, so a wrong-rank array would flow into the pool workers and
+            # either fail cryptically or silently mis-index the 6 observations. Skip-and-warn,
+            # matching the unsupported-width skip below, so one malformed file can't sink the run.
+            if raw_data.ndim != 4:
+                logger.error(
+                    f"  {filename} has ndim {raw_data.ndim} (shape {raw_data.shape}), "
+                    f"expected 4 (n, 6, time_bins, width); skipping file"
+                )
+                del raw_data
+                continue
+
+            # Everything downstream casts to float32; a non-float input (e.g. integer power
+            # counts) was previously coerced silently. Surface the coercion loudly — the values
+            # are unchanged, but the dtype change is worth naming so a mis-typed catalog is
+            # visible rather than hidden.
+            if not np.issubdtype(raw_data.dtype, np.floating):
+                logger.warning(
+                    f"  {filename} has non-float dtype {raw_data.dtype}; coercing to float32"
+                )
+
+            # Branch on the stored width: already-downsampled stamps (written by
+            # _extract_stamps_worker) only need log-norm; legacy full-width files keep the
+            # historical downsample-then-log-norm path.
+            stored_width = raw_data.shape[-1]
+            if stored_width == final_width:
+                already_downsampled = True
+                logger.info(f"  {filename} stored at final width {final_width}: log-norm only")
+            elif stored_width == width_bin:
+                already_downsampled = False
+                logger.info(f"  {filename} stored at full width {width_bin}: downsample + log-norm")
+            else:
+                logger.error(
+                    f"  {filename} width {stored_width} matches neither width_bin "
+                    f"({width_bin}) nor width_bin // downsample_factor ({final_width}); "
+                    f"skipping file"
+                )
+                del raw_data
+                continue
+
             # Divide background into equal chunks, then cutoff if exceeds max_chunks
             n_cadences_total = raw_data.shape[0]
             n_chunks = (n_cadences_total + chunk_size - 1) // chunk_size
@@ -706,16 +1003,17 @@ class DataPreprocessor:
 
                 # NOTE: is this access pattern the most efficient (least pickling)? see _downsample_worker()'s docstring on pulling the cadence from the shared-memory global to avoid per-cadence pickling
                 # NOTE: currently, loading the backgrounds takes WAY more time than processing the backgrounds
-                # Prepare arguments for downsampling (just indices, not data - data is in global state)
+                # Prepare arguments (just indices, not data - data is in global state).
+                # Downsampled files fold log-norm into the workers (resolving the old
+                # "downsample & log-norm simultaneously" TODO); legacy files downsample in
+                # the workers and log-norm in-process below, exactly as before.
                 n_cadences = chunk_data.shape[0]
-                args_list = [
-                    (
-                        i,
-                        downsample_factor,
-                        final_width,
-                    )  # Just pass the chunk index, not the full cadence data
-                    for i in range(n_cadences)
-                ]
+                if already_downsampled:
+                    worker_fn = _lognorm_worker
+                    args_list = [(i,) for i in range(n_cadences)]
+                else:
+                    worker_fn = _downsample_worker
+                    args_list = [(i, downsample_factor, final_width) for i in range(n_cadences)]
 
                 # NOTE: do we need to create & destroy the pool every chunk? or just the shared memory & pass new references in? is there a differenc?
                 if n_processes > 1:
@@ -749,15 +1047,7 @@ class DataPreprocessor:
                     # NOTE: should we use separate chunks_per_worker? how to benchmark?
                     chunksize = max(1, n_cadences // (n_workers * chunks_per_worker))
                     # TEST: does return order matter?
-                    results = chunk_pool.map(
-                        _downsample_worker,  # TODO: create separate function that performs downsampling & log-norm simultaneously
-                        args_list,
-                        chunksize=chunksize,
-                    )
-                    # results = chunk_pool.imap(_downsample_worker, args_list, chunksize=chunksize)
-                    # results = chunk_pool.imap_unordered(
-                    #     _downsample_worker, args_list, chunksize=chunksize
-                    # )
+                    results = chunk_pool.map(worker_fn, args_list, chunksize=chunksize)
 
                 else:
                     # Sequential processing
@@ -771,14 +1061,17 @@ class DataPreprocessor:
                     shared_chunk = chunk_data
                     _GLOBAL_CHUNK_DATA = shared_chunk
 
-                    # TODO: create separate function that performs downsampling & log-norm simultaneously
-                    results = [_downsample_worker(args) for args in args_list]
+                    results = [worker_fn(args) for args in args_list]
 
                 # NOTE: is there a more efficient/elegant way to do this (e.g. with list comprehension/slicing)?
                 # Collect valid results (filter out None from invalid cadences)
                 for result in results:
                     if result is not None:
-                        all_cadences.append(result)
+                        if already_downsampled:
+                            all_cadences.append(result)
+                        else:
+                            # Legacy path: per-cadence log-norm in-process, as before
+                            all_cadences.append(log_norm(result))
 
                 # Clear chunk data & shared resources
                 del chunk_data, shared_chunk
@@ -798,21 +1091,12 @@ class DataPreprocessor:
         if len(all_cadences) == 0:
             raise ValueError("No data loaded successfully")
 
-        # Stack all_cadences together
+        # Stack all_cadences together (every cadence is downsampled + log-normalized by now)
         cadence_array = np.array(all_cadences, dtype=np.float32)
 
         # Clear all_cadences reference
         del all_cadences
         gc.collect()
-
-        logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
-        logger.info(f"Cadence array shape before log norm: {cadence_array.shape}")
-
-        # TODO: create separate function that performs downsampling & log-norm simultaneously
-        # Apply log normalization to each cadence
-        logger.info("Applying log normalization")
-        for i in range(cadence_array.shape[0]):
-            cadence_array[i] = log_norm(cadence_array[i])
 
         # Sanity check: print descriptive stats
         min_val = np.min(cadence_array)
@@ -842,22 +1126,41 @@ class DataPreprocessor:
 
         return cadence_array
 
-    # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
-    def find_hits(self) -> list[CadenceResult]:
+    def start_energy_detection_pool(self) -> None:
         """
-        Convert raw .h5 cadence observations into (n_hits, 6, 16, stamp_width) .npy snippets,
-        returning one CadenceResult per successfully processed (or already cached) cadence.
+        Create the persistent worker pool used for energy detection and stamp extraction.
 
-        Driven by CSVs in config.data.inference_files. Each CSV is grouped into cadences via
-        group_observations_from_csv() and processed sequentially. Within each cadence, energy
-        detection runs on ON-source files (positions 0, 2, 4 in ABACAD); stamps are then
-        extracted from all 6 observations at the hit frequencies. Each cadence is checkpointed
-        to disk as soon as its .npy is ready, and on retry, cadences whose output already exists
-        are skipped.
+        One pool serves every cadence of the run (no per-block or per-cadence pool churn).
+        Call from the main thread before any cadence processing starts — forking from the main
+        thread before background threads spin up avoids inheriting mid-operation locks — and
+        pair with stop_energy_detection_pool() when the run is done. No-op when a pool already
+        exists or n_processes == 1 (sequential mode).
+        """
+        if self._ed_pool is not None:
+            return
+        n_processes = self.config.manager.n_processes
+        if n_processes > 1:
+            self._ed_pool = self.manager.create_pool(
+                n_processes=n_processes,
+                name="DataPreproc_energy_detection",
+                initializer=_init_plain_worker,
+            )
+
+    def stop_energy_detection_pool(self) -> None:
+        """Close the persistent energy-detection pool (no-op if never started)."""
+        if self._ed_pool is not None:
+            self.manager.close_pool(self._ed_pool)
+            self._ed_pool = None
+
+    def plan_cadences(self) -> list[PendingCadence]:
+        """
+        Group every CSV in config.data.inference_files into per-cadence work units without
+        processing anything. Returns one PendingCadence (valid group + target .npy path) per
+        valid cadence, in CSV order — the unit list the streaming inference loop iterates.
         """
         inference_files = self.config.data.inference_files
         if not inference_files:
-            logger.warning("find_hits() called with no inference_files configured")
+            logger.warning("plan_cadences() called with no inference_files configured")
             return []
 
         # Resolve output directory
@@ -871,7 +1174,7 @@ class DataPreprocessor:
         h5_path_col = self.config.inference.cadence_h5_path_col
         expected_obs = self.config.inference.cadence_expected_obs
 
-        results: list[CadenceResult] = []
+        units: list[PendingCadence] = []
 
         for csv_filename in inference_files:
             csv_path = self.config.get_inference_file_path(csv_filename)
@@ -896,49 +1199,88 @@ class DataPreprocessor:
 
             for group in valid_groups:
                 npy_filename = self._cadence_npy_filename(csv_stem, group.key)
-                npy_path = os.path.join(output_dir, npy_filename)
+                units.append(
+                    PendingCadence(group=group, npy_path=os.path.join(output_dir, npy_filename))
+                )
 
-                if os.path.exists(npy_path):
-                    # Resume path: rebuild a minimal CadenceResult from the existing file
-                    metadata_path = self._cadence_metadata_path(npy_path)
-                    try:
-                        existing = np.load(npy_path, mmap_mode="r")
-                        n_hits = existing.shape[0]
-                        del existing
-                    except Exception as e:
-                        logger.warning(
-                            f"Existing .npy at {npy_path} could not be inspected ({e}); "
-                            f"reprocessing cadence"
-                        )
-                        # Fall through (no continue) to the _process_cadence call
-                        # below so a corrupted .npy gets regenerated rather than
-                        # silently skipped.
-                    else:
-                        logger.info(
-                            f"Skipping cadence {group.key}: {npy_path} already exists "
-                            f"({n_hits} hits)"
-                        )
-                        results.append(
-                            CadenceResult(
-                                npy_path=npy_path,
-                                h5_paths=group.h5_paths,
-                                key=group.key,
-                                n_hits=n_hits,
-                                metadata_path=metadata_path,
-                            )
-                        )
-                        continue
+        logger.info(
+            f"Planned {len(units)} cadence work unit(s) across {len(inference_files)} CSV(s)"
+        )
+        return units
 
-                try:
-                    cadence_result = self._process_cadence(group, npy_path)
-                except Exception as e:
-                    # Single-cadence failures should not abort the whole CSV;
-                    # the retry loop at the inference_command level handles broader recovery
-                    logger.error(f"Failed to process cadence {group.key}: {e}")
-                    continue
+    def process_pending_cadence(self, unit: PendingCadence) -> CadenceResult | None:
+        """
+        Resume-or-process one cadence work unit. Returns a CadenceResult when a stamp .npy is
+        available (freshly written or already on disk), or None when the cadence produced no
+        hits or failed — single-cadence failures are logged and swallowed so one bad cadence
+        can't abort the whole catalog (the retry loop at the inference_command level handles
+        broader recovery).
+        """
+        group, npy_path = unit.group, unit.npy_path
 
+        if os.path.exists(npy_path):
+            # Resume path: rebuild a minimal CadenceResult from the existing file
+            metadata_path = self._cadence_metadata_path(npy_path)
+            try:
+                existing = np.load(npy_path, mmap_mode="r")
+                n_hits = existing.shape[0]
+                del existing
+            except Exception as e:
+                logger.warning(
+                    f"Existing .npy at {npy_path} could not be inspected ({e}); "
+                    f"reprocessing cadence"
+                )
+                # Fall through (no return) to the _process_cadence call below so a
+                # corrupted .npy gets regenerated rather than silently skipped.
+            else:
+                logger.info(
+                    f"Skipping cadence {group.key}: {npy_path} already exists ({n_hits} hits)"
+                )
+                return CadenceResult(
+                    npy_path=npy_path,
+                    h5_paths=group.h5_paths,
+                    key=group.key,
+                    n_hits=n_hits,
+                    metadata_path=metadata_path,
+                )
+
+        try:
+            return self._process_cadence(group, npy_path)
+        except Exception as e:
+            logger.error(f"Failed to process cadence {group.key}: {e}")
+            return None
+
+    # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
+    def find_hits(self) -> list[CadenceResult]:
+        """
+        Convert raw .h5 cadence observations into (n_hits, 6, 16, stored_width) .npy snippets,
+        returning one CadenceResult per successfully processed (or already cached) cadence.
+
+        Driven by CSVs in config.data.inference_files. Each CSV is grouped into cadences via
+        plan_cadences() and processed sequentially over one persistent worker pool. Within each
+        cadence, energy detection runs on ON-source files (positions 0, 2, 4 in ABACAD); stamps
+        are then extracted from all 6 observations at the hit frequencies. Each cadence is
+        checkpointed to disk as soon as its .npy is ready, and on retry, cadences whose output
+        already exists are skipped.
+
+        The streaming inference path in main.py drives plan_cadences() /
+        process_pending_cadence() directly instead (so preprocessing of cadence i+1 can overlap
+        inference of cadence i); this wrapper preserves the batch contract for callers that
+        want every cadence preprocessed up front.
+        """
+        units = self.plan_cadences()
+        if not units:
+            return []
+
+        results: list[CadenceResult] = []
+        self.start_energy_detection_pool()
+        try:
+            for unit in units:
+                cadence_result = self.process_pending_cadence(unit)
                 if cadence_result is not None:
                     results.append(cadence_result)
+        finally:
+            self.stop_energy_detection_pool()
 
         logger.info(f"find_hits completed: {len(results)} cadence .npy files available")
         return results
@@ -990,19 +1332,28 @@ class DataPreprocessor:
         Energy detection runs only on ON-source observations (positions 0, 2, 4 in ABACAD order);
         the hits found there define the frequency slices that get extracted from all 6
         observations. group is assumed to be a validated CadenceGroup with len(h5_paths) ==
-        expected_obs.
+        expected_obs. Each coarse channel is one fused task (read -> DC spike -> bandpass
+        flatten -> vectorized threshold) on the persistent pool from
+        start_energy_detection_pool(); only the small per-channel hit lists cross the process
+        boundary, so no blocks, block-sized shared memory, or per-stage pools exist anymore.
         """
         coarse_channel_width = self.config.inference.coarse_channel_width
+        # parallel_coarse_chans is a progress-logging chunk size only (None -> n_processes);
+        # actual parallelism is the persistent pool's worker count.
         parallel_chans = self.config.inference.parallel_coarse_chans
-        spl_order = self.config.inference.spline_order
         window_size = self.config.inference.detection_window_size
         step_size = self.config.inference.detection_step_size
         stat_threshold = self.config.inference.stat_threshold
         stamp_width = self.config.inference.stamp_width
         overlap_search = self.config.inference.overlap_search
         overlap_fraction = self.config.inference.overlap_fraction
+        store_downsampled = self.config.inference.store_downsampled_stamps
+        downsample_factor = self.config.data.downsample_factor if store_downsampled else 1
         time_bins = self.config.data.time_bins
         n_processes = self.config.manager.n_processes
+        progress_chunk = max(1, parallel_chans if parallel_chans is not None else n_processes)
+
+        bandpass_flatten = self._get_bandpass_flattener()
 
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
@@ -1011,6 +1362,19 @@ class DataPreprocessor:
         with h5py.File(primary_h5, "r") as hf:
             header = {k: hf["data"].attrs[k] for k in hf["data"].attrs}
             data_shape = hf["data"].shape
+
+        # Energy detection and stamp extraction index the dataset as [time, polarization,
+        # frequency] (see _energy_detect_channel_worker / _extract_stamps_worker), so a 'data'
+        # dataset that isn't rank-3 would otherwise blow up deep inside a worker with a cryptic
+        # IndexError. Reject it up front with the file path and expected-vs-actual rank; the
+        # caller (process_pending_cadence) turns this ValueError into a logged skip, so the
+        # skip-and-continue policy across a large catalog is preserved.
+        if len(data_shape) != 3:
+            raise ValueError(
+                f"Cadence {group.key}: primary ON-source file {primary_h5} has 'data' of rank "
+                f"{len(data_shape)} (shape {data_shape}), expected rank 3 "
+                f"(time, polarization, frequency)"
+            )
 
         n_chans = int(header.get("nchans", data_shape[-1]))
         foff = float(header["foff"])
@@ -1025,18 +1389,21 @@ class DataPreprocessor:
             )
             return None
 
-        num_blocks = n_chans // (coarse_channel_width * parallel_chans)
-        if num_blocks == 0:
+        # NOTE: every complete coarse channel is processed. The historical block-based path
+        # floored to a multiple of parallel_coarse_chans, silently dropping up to
+        # parallel_coarse_chans - 1 trailing coarse channels when n_chans wasn't an exact
+        # multiple of a block.
+        n_coarse_total = n_chans // coarse_channel_width
+        if n_coarse_total == 0:
             logger.warning(
-                f"Cadence {group.key}: n_chans={n_chans} is smaller than one block "
-                f"({coarse_channel_width * parallel_chans}); skipping"
+                f"Cadence {group.key}: n_chans={n_chans} is smaller than one coarse channel "
+                f"({coarse_channel_width}); skipping"
             )
             return None
 
-        block_width = coarse_channel_width * parallel_chans
         logger.info(
-            f"Cadence {group.key}: n_chans={n_chans}, num_blocks={num_blocks}, "
-            f"block_width={block_width}, ON-source files={len(on_source_paths)}"
+            f"Cadence {group.key}: n_chans={n_chans}, coarse channels={n_coarse_total}, "
+            f"ON-source files={len(on_source_paths)}"
         )
 
         # Aggregate hits across all ON-source files
@@ -1048,47 +1415,39 @@ class DataPreprocessor:
                 f"{on_source_idx + 1}/{len(on_source_paths)}: {on_h5}"
             )
 
-            for block_num in range(num_blocks):
-                block_offset = block_num * block_width
-                logger.info(
-                    f"  Block {block_num + 1}/{num_blocks} "
-                    f"(coarse {block_num * parallel_chans}..{(block_num + 1) * parallel_chans - 1})"
-                )
-
-                block_data = self._read_block(
-                    on_h5, block_num, parallel_chans, coarse_channel_width, n_processes
-                )
-
-                # Slice to first time_bins
-                block_data = block_data[:time_bins]
-
-                # In-place DC spike removal
-                _remove_dc_spike(block_data, coarse_channel_width, parallel_chans)
-
-                # _drop_side_channels(block_data, side_channel_count, coarse_channel_width)
-
-                cleaned_block = self._remove_block_bandpass(
-                    block_data, parallel_chans, coarse_channel_width, spl_order, n_processes
-                )
-
-                # Free original block memory; we only need the cleaned residuals downstream
-                del block_data
-
-                block_hits = self._threshold_block_hits(
-                    cleaned_block,
-                    parallel_chans,
+            tasks = [
+                (
+                    on_h5,
+                    ch,
                     coarse_channel_width,
+                    time_bins,
+                    bandpass_flatten,
                     window_size,
                     step_size,
                     stat_threshold,
-                    block_offset,
-                    n_processes,
                 )
+                for ch in range(n_coarse_total)
+            ]
 
-                all_hits.extend(block_hits)
+            if self._ed_pool is not None:
+                # imap (ordered, chunksize 1) keeps every worker busy across the whole file
+                # while results stream back for progress logging
+                channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
+            else:
+                if n_processes > 1:
+                    logger.info(
+                        "Energy detection running sequentially: no persistent pool started "
+                        "(call start_energy_detection_pool() to parallelize)"
+                    )
+                channel_hits_iter = map(_energy_detect_channel_worker, tasks)
 
-                del cleaned_block
-                gc.collect()
+            for done, channel_hits in enumerate(channel_hits_iter, start=1):
+                all_hits.extend(channel_hits)
+                if done % progress_chunk == 0 or done == n_coarse_total:
+                    logger.info(
+                        f"  Coarse channel {done}/{n_coarse_total} of ON-source "
+                        f"{on_source_idx + 1}/{len(on_source_paths)}"
+                    )
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
@@ -1139,22 +1498,38 @@ class DataPreprocessor:
         # over all 6 observations (single-threaded reads + bitshuffle chunk decompression)
         # was the dominant, GPU-idle cost of CSV inference.
         #
+        # Stamps are downsampled along frequency at extraction time (downsample_factor > 1,
+        # the store_downsampled_stamps default), so the stored width is stamp_width //
+        # downsample_factor — an ~8x storage cut at defaults that also removes the separate
+        # downsample pass from load_inference_data.
+        #
         # Atomicity is unchanged: the memmap is written to a .tmp sibling and we os.replace()
-        # it onto the canonical name only after every worker finishes, so find_hits' resume
-        # path (which treats npy_path's existence as proof of a complete write) still holds.
+        # it onto the canonical name only after every worker finishes, so the resume path
+        # (which treats npy_path's existence as proof of a complete write) still holds.
         n_stamps = len(stamp_centers)
+        stored_width = stamp_width // downsample_factor
         tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
+        # A leftover .tmp.npy means a previous attempt died (e.g. SIGKILL) between memmap
+        # creation and os.replace; it was never promoted to npy_path, so it's safe to drop
+        # (open_memmap would truncate it anyway — the warning is the point)
+        if os.path.exists(tmp_npy_path):
+            logger.warning(
+                f"Cadence {group.key}: removing stale partial output {tmp_npy_path} "
+                f"from an interrupted previous run"
+            )
+            os.remove(tmp_npy_path)
+        # NOTE: np.lib.format.open_memmap is a semi-public numpy API (stable across 1.x and
+        # documented via np.lib.format); revisit if a future numpy bump moves it
         memmap = np.lib.format.open_memmap(
             tmp_npy_path,
             mode="w+",
             dtype=np.float32,
-            shape=(n_stamps, len(group.h5_paths), time_bins, stamp_width),
+            shape=(n_stamps, len(group.h5_paths), time_bins, stored_width),
         )
         memmap.flush()
         del memmap  # header + full-size file are on disk; workers reopen it in r+ mode
 
         stamp_starts = [start for start, _, _ in stamp_centers]
-        n_processes = self.config.manager.n_processes
         # Split each obs file's (already start-sorted) stamps into contiguous chunks so more
         # than len(h5_paths) workers can run, while keeping each worker's reads sequential to
         # preserve the hdf5 chunk-cache reuse that the sort above buys us.
@@ -1169,20 +1544,16 @@ class DataPreprocessor:
                 base,
                 time_bins,
                 stamp_width,
+                downsample_factor,
             )
             for obs_idx, obs_h5 in enumerate(group.h5_paths)
             for base in range(0, n_stamps, chunk_size)
         ]
 
-        if n_processes > 1 and len(tasks) > 1:
-            pool = self.manager.create_pool(
-                n_processes=min(len(tasks), n_processes),
-                name="DataPreproc_extract_stamps",
-            )
-            try:
-                pool.map(_extract_stamps_worker, tasks)
-            finally:
-                self.manager.close_pool(pool)
+        if self._ed_pool is not None and len(tasks) > 1:
+            # Reuse the persistent energy-detection pool — extraction workers are plain
+            # (no shared memory), so the same pool serves both stages without churn
+            self._ed_pool.map(_extract_stamps_worker, tasks)
         else:
             for task in tasks:
                 _extract_stamps_worker(task)
@@ -1202,6 +1573,8 @@ class DataPreprocessor:
             "header": header,
             "stamp_starts": [int(start) for start, _, _ in stamp_centers],
             "stamp_width": stamp_width,
+            "stored_width": stored_width,
+            "downsample_factor_applied": downsample_factor,
             "stamp_frequencies_mhz": stamp_freqs_mhz,
             "stamp_statistics": stamp_stats,
             "stamp_pvalues": stamp_pvals,
@@ -1228,133 +1601,20 @@ class DataPreprocessor:
             metadata_path=metadata_path,
         )
 
-    def _read_block(
-        self,
-        h5_path: str,
-        block_num: int,
-        parallel_chans: int,
-        coarse_channel_width: int,
-        n_processes: int,
-    ) -> np.ndarray:
-        """Read parallel_chans coarse channels in parallel and concatenate."""
-        args_list = [
-            (h5_path, ch, coarse_channel_width)
-            for ch in range(block_num * parallel_chans, (block_num + 1) * parallel_chans)
-        ]
+    def _get_bandpass_flattener(self) -> Callable[[np.ndarray], np.ndarray]:
+        """
+        Return the configured bandpass-flattening callable for energy detection.
 
-        # NOTE: come back to this later (is this correct?)
-        # The read worker doesn't need shared memory; create a plain pool
-        if n_processes > 1:
-            pool = self.manager.create_pool(
-                n_processes=min(parallel_chans, n_processes),
-                name=f"DataPreproc_read_block_{block_num}",  # NOTE: come back to this later
-            )
-            try:
-                # NOTE: come back to this later (is pool.map correct here?)
-                results = pool.map(_read_coarse_channel_worker, args_list)
-            finally:
-                self.manager.close_pool(pool)
-        else:
-            results = [_read_coarse_channel_worker(a) for a in args_list]
+        The callable takes one coarse channel of shape (time_bins, coarse_channel_width) and
+        returns the flattened residuals; it must be picklable (a functools.partial over a
+        module-level function) so pool workers can receive it in their task args. Currently
+        only the spline flattener exists.
 
-        return np.concatenate(results, axis=1)
-
-    # NOTE: come back to this later
-    def _remove_block_bandpass(
-        self,
-        block_data: np.ndarray,
-        parallel_chans: int,
-        coarse_channel_width: int,
-        spl_order: int,
-        n_processes: int,
-    ) -> np.ndarray:
-        """Spline-fit + subtract bandpass per coarse channel, return cleaned block."""
-        args_list = [(ch, coarse_channel_width, spl_order) for ch in range(parallel_chans)]
-
-        if n_processes > 1:
-            shm = self.manager.create_shared_memory(
-                size=block_data.nbytes,
-                name="DataPreproc_bandpass_block",  # NOTE: come back to this later
-            )
-            shared = np.ndarray(block_data.shape, dtype=block_data.dtype, buffer=shm.buf)
-            shared[:] = block_data[:]
-
-            pool = self.manager.create_pool(
-                n_processes=min(parallel_chans, n_processes),
-                name="DataPreproc_bandpass_block",  # NOTE: come back to this later
-                initializer=_init_worker,
-                initargs=(shm.name, block_data.shape, block_data.dtype),
-            )
-            try:
-                results = pool.map(_remove_bandpass_worker, args_list)
-            finally:
-                del shared
-                self.manager.close_shared_memory(shm)
-                self.manager.close_pool(pool)
-        else:
-            global _GLOBAL_CHUNK_DATA
-            _GLOBAL_CHUNK_DATA = block_data
-            try:
-                results = [_remove_bandpass_worker(a) for a in args_list]
-            finally:
-                # Always clear the global, even if a worker raised, so subsequent
-                # calls in the same process don't see stale state
-                _GLOBAL_CHUNK_DATA = None
-
-        return np.concatenate(results, axis=1)
-
-    # NOTE: come back to this later
-    def _threshold_block_hits(
-        self,
-        cleaned_block: np.ndarray,
-        parallel_chans: int,
-        coarse_channel_width: int,
-        window_size: int,
-        step_size: int,
-        stat_threshold: float,
-        block_offset: int,
-        n_processes: int,
-    ) -> list[tuple]:
-        """Sliding-window normality test across one cleaned block, return all hits."""
-        args_list = [
-            (ch, coarse_channel_width, window_size, step_size, stat_threshold, block_offset)
-            for ch in range(parallel_chans)
-        ]
-
-        if n_processes > 1:
-            shm = self.manager.create_shared_memory(
-                size=cleaned_block.nbytes,
-                name="DataPreproc_threshold_block",  # NOTE: come back to this later
-            )
-            shared = np.ndarray(cleaned_block.shape, dtype=cleaned_block.dtype, buffer=shm.buf)
-            shared[:] = cleaned_block[:]
-
-            pool = self.manager.create_pool(
-                n_processes=min(parallel_chans, n_processes),
-                name="DataPreproc_threshold_block",  # NOTE: come back to this later
-                initializer=_init_worker,
-                initargs=(shm.name, cleaned_block.shape, cleaned_block.dtype),
-            )
-            try:
-                results = pool.map(_threshold_hits_worker, args_list)
-            finally:
-                del shared
-                self.manager.close_shared_memory(shm)
-                self.manager.close_pool(pool)
-        else:
-            global _GLOBAL_CHUNK_DATA
-            _GLOBAL_CHUNK_DATA = cleaned_block
-            try:
-                results = [_threshold_hits_worker(a) for a in args_list]
-            finally:
-                # Always clear the global, even if a worker raised, so subsequent
-                # calls in the same process don't see stale state
-                _GLOBAL_CHUNK_DATA = None
-
-        flat: list[tuple] = []
-        for r in results:
-            flat.extend(r)
-        return flat
+        # NOTE: PR-07 adds a PFB static-equalization flattener here (selected via config)
+        """
+        return functools.partial(
+            _spline_flatten_bandpass, spl_order=self.config.inference.spline_order
+        )
 
     # NOTE: come back to this later (what's the trade-off for doing dedup vs not? e.g. lower storage & compute, but higher FNR or lower DR sensitivity?)
     @staticmethod

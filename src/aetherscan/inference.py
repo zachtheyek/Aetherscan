@@ -57,7 +57,7 @@ class InfDataHolder:
 
 
 def prepare_distributed_inf_dataset(
-    data: dict,
+    data: np.ndarray,
     n_samples: int,
     per_replica_inf_batch_size: int,
     num_replicas: int,
@@ -65,40 +65,39 @@ def prepare_distributed_inf_dataset(
 ) -> dict:
     """
     Build a distributed inference dataset from `data` (shape (n_samples, 6, 16, 512)) and return
-    a dict with the dataset, trimmed sample count, step count, and the InfDataHolder.
+    a dict with the dataset, padded/real sample counts, step count, and the InfDataHolder.
 
     Distinct from train.py's RF-training counterpart: signal classes are not assumed to be known
     ahead of time, so the dataset yields raw cadences without label channels. Order is preserved
-    (no shuffle) since gradients aren't computed during inference. Currently no trimming is done
-    (n_inf_trimmed == n_samples); the trimming scaffolding is left in place for future
-    divisibility experiments.
+    (no shuffle) since gradients aren't computed during inference.
+
+    When n_samples isn't divisible by the global batch size, the data is padded with duplicate
+    rows up to the next batch multiple (mirroring train.py's viz-dataset padding pattern) so the
+    final partial batch is encoded rather than silently dropped — callers truncate the encoded
+    latents back to n_samples. The previous behavior (inf_steps = n // global_batch with
+    drop_remainder=True and no padding) never processed the tail; with per-cadence batches a
+    cadence smaller than one global batch would have processed nothing at all.
     """
     global_inf_batch_size = per_replica_inf_batch_size * num_replicas
 
-    # # NOTE: does trimming/divisibility matter for inference?
-    # # Trim datasets to fit batch sizes (prevents uneven batches on final step)
-    # # Note, n_samples should already be divisible by effective_batch_size
-    # # Trimming here is just a defensive measure to doubly ensure divisibility before creating &
-    # # distributing our datasets
-    # # Alternatively, we could also pad the data instead of trimming
-    # n_inf_trimmed = (n_samples // global_inf_batch_size) * global_inf_batch_size
-    n_inf_trimmed = n_samples
+    # Sanity check: verify there's at least one sample to run inference on
+    if n_samples == 0:
+        raise ValueError("Not enough samples (0) to run inference")
 
-    # Sanity check: verify there's enough samples to run inference
-    if n_inf_trimmed == 0:
-        raise ValueError(
-            f"Not enough samples ({n_samples}) for global batch size ({per_replica_inf_batch_size} * {num_replicas})"
-            f"Reduce per_replica_batch_size or provide more samples"
-        )
-    # logger.info(f"Data alignment: Inf {n_samples}→{n_inf_trimmed}")
-
-    # # Randomly subsample to trimmed size (avoids positional bias from slicing the tail)
-    # if n_inf_trimmed < n_samples:
-    #     indices = np.random.choice(n_samples, size=n_inf_trimmed, replace=False)
-    #     inf_data = data[indices]
-    # else:
-    #     inf_data = data[:n_inf_trimmed]
-    inf_data = data[:n_inf_trimmed]
+    # Pad with duplicate rows (cycled from the front, deterministic) to the next global-batch
+    # multiple; the encoded outputs for the padded rows are discarded by the caller.
+    # NOTE: np.concatenate materializes a full copy of the cadence's stamps, briefly doubling
+    # that cadence's memory footprint. Acceptable at per-cadence scale (the padding itself is
+    # under one global batch); revisit if batches ever wrap multi-cadence arrays again.
+    n_padded = int(np.ceil(n_samples / global_inf_batch_size)) * global_inf_batch_size
+    if n_padded > n_samples:
+        pad_count = n_padded - n_samples
+        pad_indices = np.arange(pad_count) % n_samples
+        inf_data = np.concatenate([data, data[pad_indices]], axis=0)
+        logger.info(f"Data alignment: Inf {n_samples}→{n_padded} (padded {pad_count})")
+    else:
+        inf_data = data
+        logger.info(f"Data alignment: Inf {n_samples} (no padding needed)")
     inf_holder = InfDataHolder(inf_data)
 
     # Create generator function for memory-efficient data loading
@@ -145,18 +144,13 @@ def prepare_distributed_inf_dataset(
 
     inf_dataset_distributed = strategy.experimental_distribute_dataset(inf_dataset)
 
-    # Calculate steps
-    inf_steps = n_inf_trimmed // global_inf_batch_size
-
-    # Sanity check: verify step sizes are valid before returning
-    if inf_steps < 1:
-        raise ValueError(
-            f"inf_steps < 1: n_inf_trimmed ({n_inf_trimmed}) must be >= per_replica_inf_batch_size * num_replicas ({per_replica_inf_batch_size} * {num_replicas})"
-        )
+    # Calculate steps (n_padded is an exact multiple of the global batch size by construction)
+    inf_steps = n_padded // global_inf_batch_size
 
     return {
         "inf_dataset": inf_dataset_distributed,
-        "n_inf_trimmed": n_inf_trimmed,
+        "n_padded": n_padded,
+        "n_samples": n_samples,
         "inf_steps": inf_steps,
         "_inf_holder": inf_holder,
     }
@@ -194,6 +188,11 @@ class InferencePipeline:
         self.per_replica_inf_batch_size = self.config.inference.per_replica_batch_size
         self.threshold = self.config.inference.classification_threshold
 
+        # Lazily-built tf.function for the distributed encode step, cached so repeated
+        # run_inference calls (one per cadence in the streaming loop) reuse one trace
+        # instead of accumulating a new concrete function per cadence
+        self._encode_step = None
+
     # TODO: implement model loading from HuggingFace (parametrize args to InferenceConfig)
     def init_models(self, encoder_path: str, rf_path: str):
         """Load the VAE encoder (inside strategy.scope) and the Random Forest classifier from disk."""
@@ -223,17 +222,16 @@ class InferencePipeline:
             logger.error(f"Error loading Random Forest: {e}")
             raise  # Re-raise to propagate error
 
-    # TODO: finish writing docstring (how will args be passed?)
     def run_inference(
         self,
         data: np.ndarray,
         npy_path: str,
-        # NOTE: how do we pass these in from preproc?
         target: str | None = None,
         session: str | None = None,
         cadence_id: int | None = None,
         band: str | None = None,
         frequency_mhz: float | None = None,
+        stamp_frequencies_mhz: list[float] | None = None,
         timestamp_observed: float | None = None,
         h5_path: str | None = None,
     ) -> dict:
@@ -244,17 +242,35 @@ class InferencePipeline:
         Encodes each snippet through the VAE encoder under the distribution strategy, then runs
         the Random Forest classifier on the latents and writes positive predictions to the
         database (along with the latent vector and observational provenance: target, session,
-        cadence_id, band, frequency_mhz, timestamp_observed, h5_path).
+        cadence_id, band, frequency, timestamp_observed, h5_path — typically derived by
+        preprocessing.derive_cadence_provenance from the cadence's metadata JSON).
+        stamp_frequencies_mhz, when given, carries one center frequency per snippet row (the
+        metadata's stamp_frequencies_mhz) and takes precedence over the scalar frequency_mhz.
+
+        Safe to call repeatedly on one pipeline instance (the per-cadence streaming loop does):
+        models stay loaded, and per-call dataset state is released in the finally block. The
+        caller owns tf.keras.backend.clear_session() — see run_inference_pipeline /
+        main.inference_command.
         """
         # Sanity check
         if not self.encoder or not self.rf_model:
             raise RuntimeError("Encoder and/or Random Forest not initialized")
 
+        inf_holder = None
+        inf_dataset = None
+
         try:
             n_samples = data.shape[0]
             logger.info(f"Running inference on {n_samples} cadence snippets from {npy_path}")
 
-            # Prepare distributed dataset for inference
+            if stamp_frequencies_mhz is not None and len(stamp_frequencies_mhz) != n_samples:
+                logger.warning(
+                    f"stamp_frequencies_mhz has {len(stamp_frequencies_mhz)} entries but "
+                    f"{n_samples} snippets were loaded; ignoring per-stamp frequencies"
+                )
+                stamp_frequencies_mhz = None
+
+            # Prepare distributed dataset for inference (pads to a global-batch multiple)
             results = prepare_distributed_inf_dataset(
                 data=data,
                 n_samples=n_samples,
@@ -267,7 +283,7 @@ class InferencePipeline:
             gc.collect()
 
             inf_dataset = results["inf_dataset"]
-            n_inf_trimmed = results["n_inf_trimmed"]
+            n_padded = results["n_padded"]
             inf_steps = results["inf_steps"]
             inf_holder = results["_inf_holder"]
 
@@ -275,10 +291,15 @@ class InferencePipeline:
             gc.collect()
 
             logger.info(
-                f"Generating latents for {n_inf_trimmed} cadence snippets using distributed inference"
+                f"Generating latents for {n_samples} cadence snippets "
+                f"({n_padded} padded) using distributed inference"
             )
 
-            latents = self._distributed_encode(inf_dataset, n_inf_trimmed, inf_steps)
+            latents = self._distributed_encode(inf_dataset, n_padded, inf_steps)
+
+            # Drop the encoded padding rows: the first n_samples * num_observations latent
+            # rows correspond exactly to the real snippets (row order is snippet-major)
+            latents = latents[: n_samples * self.num_observations]
 
             # Run RF classification
             logger.info("Running Random Forest classification")
@@ -295,6 +316,7 @@ class InferencePipeline:
                 cadence_id=cadence_id,
                 band=band,
                 frequency_mhz=frequency_mhz,
+                stamp_frequencies_mhz=stamp_frequencies_mhz,
                 timestamp_observed=timestamp_observed,
                 h5_path=h5_path,
             )
@@ -304,24 +326,18 @@ class InferencePipeline:
             raise  # Re-raise to propagate error
 
         finally:
-            # NOTE: should check to make sure holder & dataset exist first
-            # Clear intermediate data
-            inf_holder.clear()
+            # Clear per-call dataset state (guarded: an early failure may predate creation).
+            # Note tf.keras.backend.clear_session() is intentionally NOT called here — the
+            # streaming loop reuses this pipeline's loaded models across cadences; the caller
+            # clears the session once when the whole run is done.
+            if inf_holder is not None:
+                inf_holder.clear()
             del inf_dataset
-
-            # Force TensorFlow to release internal references to datasets/iterators
-            # This prevents generator closures from accumulating in memory between rounds
-            tf.keras.backend.clear_session()
-            logger.info("Cleared TensorFlow session state")
-
-            # NOTE: should check to make sure arrays exist first
-            del latents, predictions, confidence_scores
             gc.collect()
 
-        # NOTE: is this the right location for return statement?
         return {
             "n_cadence_snippets": n_samples,
-            "n_processed": n_inf_trimmed,
+            "n_processed": n_samples,
             "n_candidates": n_candidates,
         }
 
@@ -341,23 +357,28 @@ class InferencePipeline:
         # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
         latents = np.empty((n_samples * self.num_observations, self.latent_dim), dtype=np.float32)
 
-        # Cache dimensions for tf.function
-        time_bins = self.config.data.time_bins
-        width_bin = self.config.data.width_bin // self.config.data.downsample_factor
+        if self._encode_step is None:
+            # Cache dimensions for tf.function
+            time_bins = self.config.data.time_bins
+            width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
-        @tf.function
-        def encode_step(batch_data):
-            def encode_fn(data):
-                """Per-replica encoding step"""
-                # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
-                reshaped = tf.reshape(data, [-1, time_bins, width_bin, 1])
-                # Encode (returns mean, log_var, z)
-                _, _, z = self.encoder(reshaped, training=False)
-                return z
+            @tf.function
+            def encode_step(batch_data):
+                def encode_fn(data):
+                    """Per-replica encoding step"""
+                    # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
+                    reshaped = tf.reshape(data, [-1, time_bins, width_bin, 1])
+                    # Encode (returns mean, log_var, z)
+                    _, _, z = self.encoder(reshaped, training=False)
+                    return z
 
-            # Run encoding on all replicas
-            per_replica_z = self.strategy.run(encode_fn, args=(batch_data,))
-            return per_replica_z
+                # Run encoding on all replicas
+                per_replica_z = self.strategy.run(encode_fn, args=(batch_data,))
+                return per_replica_z
+
+            self._encode_step = encode_step
+
+        encode_step = self._encode_step
 
         # Process all batches
         iterator = iter(dataset)
@@ -411,10 +432,20 @@ class InferencePipeline:
         cadence_id: int | None = None,
         band: str | None = None,
         frequency_mhz: float | None = None,
+        stamp_frequencies_mhz: list[float] | None = None,
         timestamp_observed: float | None = None,
         h5_path: str | None = None,
     ) -> int:
-        """Write inference results to database."""
+        """Write inference results to database.
+
+        Predictions/confidences are indexed per snippet (dataset order is preserved end to end:
+        the .npy rows, the padded dataset, and the truncated latents all share snippet-major
+        ordering, so snippet_index == the row index in npy_path). stamp_frequencies_mhz, when
+        given, supplies the per-snippet center frequency (falling back to the scalar
+        frequency_mhz otherwise); latents rows are per observation, so snippet idx spans
+        latents[idx * num_observations : (idx + 1) * num_observations], flattened to one
+        (num_observations * latent_dim,) provenance vector.
+        """
         if self.db is None:
             raise RuntimeError("No database instance detected - cannot store inference results")
 
@@ -430,20 +461,27 @@ class InferencePipeline:
             if prediction == 1:
                 n_candidates += 1
 
+                snippet_frequency_mhz = frequency_mhz
+                if stamp_frequencies_mhz is not None:
+                    snippet_frequency_mhz = float(stamp_frequencies_mhz[idx])
+
+                # One latent row per observation -> flatten the snippet's num_observations
+                # rows into a single (num_observations * latent_dim,) vector
+                latent_rows = latents[
+                    idx * self.num_observations : (idx + 1) * self.num_observations
+                ]
+
                 self.db.write_inference_result(
                     npy_path=npy_path,
-                    # NOTE: is it guaranteed that snippets are processed sequentially?
                     snippet_index=idx,
                     prediction=prediction,
                     confidence=confidence,
-                    # NOTE: does latents need to be reshaped first before being passed as arg?
-                    latent_vector=latents[idx],
-                    # NOTE: how do we pass these in from preproc?
+                    latent_vector=latent_rows.reshape(-1),
                     target=target,
                     session=session,
                     cadence_id=cadence_id,
                     band=band,
-                    frequency_mhz=frequency_mhz,
+                    frequency_mhz=snippet_frequency_mhz,
                     timestamp_observed=timestamp_observed,
                     h5_path=h5_path,
                     tag=tag,
@@ -457,43 +495,54 @@ class InferencePipeline:
         pass
 
 
-# TODO: figure out how to pass preproc metadata into InferencePipeline (target, session, cadence_id, band, frequency_mhz, timestamp_observed, h5_path). should we roll these metadata + npy_path into a list/dict from preproc, then unroll them inside run_inference_pipeline()?
 # TODO: add try-except switch statements (see run_training_pipeline())
 def run_inference_pipeline(
     cadence_data: np.ndarray,
     npy_path: str,
     strategy: tf.distribute.Strategy,
-    # NOTE: how do we pass these in from preproc?
     target: str | None = None,
     session: str | None = None,
     cadence_id: int | None = None,
     band: str | None = None,
     frequency_mhz: float | None = None,
+    stamp_frequencies_mhz: list[float] | None = None,
     timestamp_observed: float | None = None,
     h5_path: str | None = None,
 ) -> dict:
     """
-    End-to-end inference entry point: build an InferencePipeline under `strategy` and run it
-    against `cadence_data` (shape (n, 6, 16, 512)) sourced from `npy_path`. The optional
-    target/session/cadence_id/band/frequency_mhz/timestamp_observed/h5_path arguments are
-    observational provenance that gets written to the inference_results table for any positive
-    candidates. Returns the {n_cadence_snippets, n_processed, n_candidates} dict from run_inference.
+    Single-shot inference entry point: build an InferencePipeline under `strategy`, run it once
+    against `cadence_data` (shape (n, 6, 16, 512)) sourced from `npy_path`, and clear the TF
+    session. Used by the legacy --test-files path, which loads one preprocessed array up front;
+    the CSV streaming path in main.inference_command instead builds one InferencePipeline and
+    calls run_inference per cadence so models load once.
+
+    The optional provenance arguments (target/session/cadence_id/band/frequency_mhz/
+    stamp_frequencies_mhz/timestamp_observed/h5_path) are written to the inference_results
+    table for any positive candidates. Returns the {n_cadence_snippets, n_processed,
+    n_candidates} dict from run_inference.
     """
     # Create pipeline
     pipeline = InferencePipeline(strategy=strategy)
 
-    # Run inference
-    results = pipeline.run_inference(
-        data=cadence_data,
-        # NOTE: how do we pass these in from preproc?
-        npy_path=npy_path,
-        target=target,
-        session=session,
-        cadence_id=cadence_id,
-        band=band,
-        frequency_mhz=frequency_mhz,
-        timestamp_observed=timestamp_observed,
-        h5_path=h5_path,
-    )
+    try:
+        # Run inference
+        results = pipeline.run_inference(
+            data=cadence_data,
+            npy_path=npy_path,
+            target=target,
+            session=session,
+            cadence_id=cadence_id,
+            band=band,
+            frequency_mhz=frequency_mhz,
+            stamp_frequencies_mhz=stamp_frequencies_mhz,
+            timestamp_observed=timestamp_observed,
+            h5_path=h5_path,
+        )
+    finally:
+        # Force TensorFlow to release internal references to datasets/iterators. Runs once
+        # per pipeline lifetime (after the loaded models are no longer needed) rather than
+        # inside run_inference, which may be called repeatedly on live models.
+        tf.keras.backend.clear_session()
+        logger.info("Cleared TensorFlow session state")
 
     return results
