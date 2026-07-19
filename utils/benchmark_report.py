@@ -253,6 +253,11 @@ def build_suggestions(root: StageNode, db_path: str, tag: str) -> list[str]:
             datagen = node.children.get("data_generation")
             if datagen is None or node.total_duration <= 0:
                 continue
+            # Guard against a data_generation node that is a pure grouping node (children but
+            # no own span): the producer-overlap branch below takes max/min over datagen.spans,
+            # which would raise on an empty sequence (mirrors Rule 3's empty-spans guard).
+            if not datagen.spans:
+                continue
             frac = datagen.total_duration / node.total_duration
             if frac >= DATA_GEN_ROUND_FRACTION:
                 source = None

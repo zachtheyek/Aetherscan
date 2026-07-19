@@ -52,6 +52,18 @@ def current_stage() -> str | None:
     return stack[-1] if stack else None
 
 
+def round_stage_name(round_number: int) -> str:
+    """Canonical umbrella stage name for a 1-based training round ("train.round_02").
+
+    Shared by the trainer (which opens the umbrella span) and the round-data producer
+    (which, running in another process, records the data_generation child by absolute name
+    and so can't rely on thread-local nesting). Routing both sites through this helper keeps
+    the two name constructions from drifting — a mismatch would orphan the producer's
+    data_generation span outside the round subtree in the report tree.
+    """
+    return f"train.round_{round_number:02d}"
+
+
 def record_stage(
     stage: str,
     start_time: float,

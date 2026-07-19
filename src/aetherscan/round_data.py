@@ -37,7 +37,7 @@ from logging.handlers import QueueListener
 
 import numpy as np
 
-from aetherscan.benchmark import record_stage
+from aetherscan.benchmark import record_stage, round_stage_name
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 
@@ -651,7 +651,7 @@ class RoundDataProducer:
             # because the DB writer queue is thread-only
             _, round_idx, start_ts, end_ts = message
             record_stage(
-                f"train.round_{round_idx:02d}.data_generation",
+                f"{round_stage_name(round_idx)}.data_generation",
                 start_ts,
                 end_ts,
                 tag=self._tag,

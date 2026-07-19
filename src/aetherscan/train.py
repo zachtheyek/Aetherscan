@@ -44,7 +44,7 @@ from sklearn.metrics import (
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
-from aetherscan.benchmark import stage_timer
+from aetherscan.benchmark import round_stage_name, stage_timer
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
@@ -1269,7 +1269,7 @@ class TrainingPipeline:
 
                 # Umbrella stage span for the whole round (data wait + epochs + plots +
                 # checkpoint save) — the sub-stages inside train_round nest under it
-                with stage_timer(f"train.round_{round_idx + 1:02d}"):
+                with stage_timer(round_stage_name(round_idx + 1)):
                     self.train_round(
                         round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
                     )
