@@ -32,7 +32,7 @@ dependencies:
   - astropy>=6.1,<7
   - matplotlib>=3.9,<3.10
   - joblib>=1.4,<2
-  # pandas backs the dashboard's data layer (utils/dashboard.py). The NGC base image
+  # pandas backs the dashboard's data layer (aetherscan/dashboard.py). The NGC base image
   # ships it, so requirements-container.txt omits it; conda must provide it here.
   - pandas>=2.0,<3
   # setuptools provides pkg_resources, which blimpy (transitive via setigen)
@@ -64,7 +64,7 @@ dependencies:
       # Model weight distribution via the HuggingFace Hub — pin range mirrors
       # requirements-container.txt (see the rationale there).
       - huggingface_hub>=1.21,<1.22
-      # Live monitoring dashboard (utils/dashboard.py). Kept in lockstep with
+      # Live monitoring dashboard (aetherscan/dashboard.py). Kept in lockstep with
       # requirements-container.txt; streamlit 1.39 coexists with TF 2.17 (protobuf 4.x)
       # and numpy<2. plotly is pure-Python.
       - streamlit>=1.39,<1.41
