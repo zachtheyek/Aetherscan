@@ -218,7 +218,7 @@ def _add_train_flags_to(parser):
         "--dashboard",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Auto-launch the live monitoring dashboard (utils/dashboard.py) for this run; SSH-forward the port to view it (default: on). Use --no-dashboard to disable",
+        help="Auto-launch the live monitoring Streamlit dashboard for this run; SSH-forward the port to view it (default: on). Use --no-dashboard to disable",
     )
     parser.add_argument(
         "--dashboard-port",
@@ -707,7 +707,7 @@ def _add_inference_flags_to(parser):
         "--dashboard",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Auto-launch the live monitoring dashboard (utils/dashboard.py) for this run; SSH-forward the port to view it (default: on). Use --no-dashboard to disable",
+        help="Auto-launch the live monitoring Streamlit dashboard for this run; SSH-forward the port to view it (default: on). Use --no-dashboard to disable",
     )
     parser.add_argument(
         "--dashboard-port",

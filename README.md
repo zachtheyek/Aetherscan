@@ -478,10 +478,9 @@ options:
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
   --dashboard, --no-dashboard
-                        Auto-launch the live monitoring dashboard
-                        (utils/dashboard.py) for this run; SSH-forward the
-                        port to view it (default: on). Use --no-dashboard to
-                        disable
+                        Auto-launch the live monitoring Streamlit dashboard
+                        for this run; SSH-forward the port to view it
+                        (default: on). Use --no-dashboard to disable
   --dashboard-port DASHBOARD_PORT
                         Port for the auto-launched live dashboard (default:
                         8501)
@@ -774,10 +773,9 @@ options:
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
   --dashboard, --no-dashboard
-                        Auto-launch the live monitoring dashboard
-                        (utils/dashboard.py) for this run; SSH-forward the
-                        port to view it (default: on). Use --no-dashboard to
-                        disable
+                        Auto-launch the live monitoring Streamlit dashboard
+                        for this run; SSH-forward the port to view it
+                        (default: on). Use --no-dashboard to disable
   --dashboard-port DASHBOARD_PORT
                         Port for the auto-launched live dashboard (default:
                         8501)

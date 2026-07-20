@@ -28,14 +28,14 @@ def _fake_config(enabled=True, port=8501, output_path="/out", save_tag="t1"):
 def test_build_dashboard_command_structure():
     cmd = build_dashboard_command(
         "/usr/bin/python",
-        "/repo/utils/dashboard.py",
+        "/pkg/aetherscan/dashboard.py",
         "/out/db/aetherscan.db",
         "final_v1",
         "/out/plots",
         8501,
     )
     # `python -m streamlit run <script>` up front
-    assert cmd[:5] == ["/usr/bin/python", "-m", "streamlit", "run", "/repo/utils/dashboard.py"]
+    assert cmd[:5] == ["/usr/bin/python", "-m", "streamlit", "run", "/pkg/aetherscan/dashboard.py"]
 
     # streamlit's own flags precede `--`; dashboard.py's argparse args follow it
     sep = cmd.index("--")
@@ -132,7 +132,7 @@ def test_launch_spawns_and_registers_teardown():
         mock.patch(f"{_MOD}._install_signal_teardown") as sig_teardown,
     ):
         script.is_file.return_value = True
-        script.__str__ = lambda self: "/repo/utils/dashboard.py"
+        script.__str__ = lambda self: "/pkg/aetherscan/dashboard.py"
         result = launch_dashboard()
         assert result is proc
         # detached so a filling pipe / group signal can't hang or kill the pipeline

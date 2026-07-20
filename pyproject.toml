@@ -26,9 +26,9 @@ dependencies = [
     # Mirrors requirements-container.txt's ranges for the packaged runtime — keep them (and
     # environment.yml / aetherscan.def) in lockstep per SECURITY.md's Version Selection Policy.
     # Documented ceilings (numpy<2.0, setuptools<81, the NGC TF 2.17 ABI) apply to the package
-    # exactly as to the container. The dashboard stack (streamlit/plotly/pandas) is deliberately
-    # NOT mirrored here: utils/dashboard.py is not shipped in the wheel (only src/aetherscan is),
-    # so it's repo-checkout/container-only observability, not a pip-install runtime dependency.
+    # exactly as to the container. The dashboard stack (streamlit/plotly/pandas) lives in the
+    # optional `dashboard` extra below — not core deps — so a bare install stays lean while
+    # `pip install aetherscan[dashboard]` still gets the packaged dashboard (aetherscan/dashboard.py).
     "numpy>=1.26,<2.0",
     "scipy>=1.13,<1.14",
     "scikit-learn>=1.5,<1.6",
@@ -91,6 +91,12 @@ Issues = "https://github.com/zachtheyek/Aetherscan/issues"
 
 [project.optional-dependencies]
 dev = ["ruff", "pre-commit", "pytest"]
+# Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). Opt-in extra so a
+# bare `pip install aetherscan` stays lean; `pip install aetherscan[dashboard]` pulls the stack.
+# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.39
+# coexists with TF 2.17's protobuf 4.x and numpy<2, plotly is pure-Python, pandas backs the data
+# layer (the NGC base ships pandas, so requirements-container.txt omits it there).
+dashboard = ["streamlit>=1.39,<1.41", "plotly>=5.24,<6", "pandas>=2.0,<3"]
 
 [tool.pytest.ini_options]
 # Make `import aetherscan` work without a PYTHONPATH=src prefix

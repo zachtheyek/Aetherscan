@@ -1,5 +1,5 @@
 """
-Auto-launch the live monitoring dashboard (utils/dashboard.py) alongside a train/inference run.
+Auto-launch the live monitoring dashboard (aetherscan/dashboard.py) alongside a train/inference run.
 
 main.py calls launch_dashboard() once at startup (after the DB is initialized). It spawns a
 headless Streamlit server as a detached subprocess pointed at this run's DB + tag, logs the
@@ -28,8 +28,9 @@ from aetherscan.db import get_db
 
 logger = logging.getLogger(__name__)
 
-# utils/dashboard.py sits at the repo root; this module is src/aetherscan/dashboard_launcher.py
-_DASHBOARD_SCRIPT = Path(__file__).resolve().parents[2] / "utils" / "dashboard.py"
+# dashboard.py ships alongside this module inside the package, so it resolves identically for a
+# source checkout, the container, and a pip install (streamlit runs it by file path).
+_DASHBOARD_SCRIPT = Path(__file__).resolve().parent / "dashboard.py"
 
 
 def build_dashboard_command(
@@ -135,8 +136,9 @@ def launch_dashboard() -> subprocess.Popen | None:
 
     if importlib.util.find_spec("streamlit") is None:
         logger.warning(
-            "Dashboard skipped: streamlit not installed. Rebuild the NGC container (.sif) or the "
-            "conda env after the streamlit/plotly deps landed, or run with --no-dashboard."
+            "Dashboard skipped: streamlit not installed. Install the extra "
+            "(pip install 'aetherscan[dashboard]'), rebuild the NGC container (.sif) / conda env "
+            "after the streamlit/plotly deps landed, or run with --no-dashboard."
         )
         return None
 
