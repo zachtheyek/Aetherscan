@@ -49,6 +49,10 @@ class MonitorConfig:
     # as labeled translucent bands on the resource plot's CPU panel, so utilization
     # plateaus are attributable to pipeline stages at a glance
     annotate_stages: bool = True
+    # Live monitoring dashboard (utils/dashboard.py) auto-launched by main.py at run start;
+    # --no-dashboard opts out. Served headless on dashboard_port (SSH-forward to reach it).
+    dashboard_enabled: bool = True
+    dashboard_port: int = 8501
 
 
 @dataclass
@@ -548,6 +552,8 @@ class Config:
                 "monitor_interval": self.monitor.monitor_interval,
                 "monitor_retry_delay": self.monitor.monitor_retry_delay,
                 "annotate_stages": self.monitor.annotate_stages,
+                "dashboard_enabled": self.monitor.dashboard_enabled,
+                "dashboard_port": self.monitor.dashboard_port,
             },
             "logger": {
                 "console_level": self.logger.console_level,

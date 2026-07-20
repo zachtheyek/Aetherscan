@@ -26,6 +26,7 @@ from aetherscan.cli import (
     validate_args,
 )
 from aetherscan.config import get_config, init_config
+from aetherscan.dashboard_launcher import launch_dashboard
 from aetherscan.db import get_db, init_db
 from aetherscan.hf_hub import resolve_inference_artifacts
 from aetherscan.inference import InferencePipeline, run_inference_pipeline, summarize_confidences
@@ -872,6 +873,14 @@ def main():
     except Exception as e:
         logger.error(f"Failed to initialize resource monitor: {e}")
         sys.exit(1)
+
+    # Auto-launch the live monitoring dashboard (opt out with --no-dashboard). Fully guarded:
+    # a missing streamlit or a spawn failure only warns — the dashboard is optional observability
+    # and must never abort the run.
+    try:
+        launch_dashboard()
+    except Exception as e:
+        logger.warning(f"Dashboard launch skipped: {e}")
 
     try:
         # Fail-early save-tag dedup guards: hard-stop before any expensive work when an
