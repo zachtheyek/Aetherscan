@@ -20,6 +20,11 @@ To watch a run on a cluster, SSH-forward the port:  ssh -L 8501:localhost:8501 b
 Read-only (mode=ro); the pipeline's writer-thread journaling makes concurrent reads safe. The data
 layer (load_* / parse / pca helpers) is pure and unit-tested against a synthetic DB; the Streamlit
 UI (render*) is a thin rendering shell that imports plotly/streamlit lazily.
+
+Auto-refresh uses a blocking `time.sleep(refresh) + st.rerun()` — deliberately version-robust (works
+on any Streamlit), at the cost of freezing sidebar/tooltip interaction during the sleep window. For
+a smoother non-blocking refresh, `pip install streamlit-autorefresh` (or use `st.fragment(run_every=)`
+on Streamlit >= 1.33) and swap it in.
 """
 
 from __future__ import annotations
@@ -261,12 +266,13 @@ def default_plots_dir(db_path: str) -> str:
 
 def run_summary(resources: pd.DataFrame, stages: pd.DataFrame) -> dict:
     """Headline dict: wall-clock span, #stages, latest stage, peak system RAM %."""
-    bounds = []
+    t_start: float | None = None
+    t_end: float | None = None
     if not stages.empty:
-        bounds = [stages["start_time"].min(), stages["end_time"].max()]
+        t_start, t_end = stages["start_time"].min(), stages["end_time"].max()
     elif not resources.empty:
-        bounds = [resources["timestamp"].min(), resources["timestamp"].max()]
-    wall = (bounds[1] - bounds[0]) if bounds else 0.0
+        t_start, t_end = resources["timestamp"].min(), resources["timestamp"].max()
+    wall = (t_end - t_start) if t_start is not None else 0.0
 
     latest_stage = None
     if not stages.empty:
@@ -336,6 +342,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
             st.stop()
         tags = list_tags(conn)
         if not tags:
+            conn.close()
             st.warning("No run tags found in this DB yet.")
             st.stop()
         default_idx = tags.index(args.tag) if args.tag in tags else len(tags) - 1
@@ -344,180 +351,200 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
         plots_dir = args.plots_dir or default_plots_dir(db_path)
         st.caption(f"Plots: `{plots_dir}`")
 
-    resources = load_resources(conn, tag)
-    stages = load_stages(conn, tag)
-    summary = run_summary(resources, stages)
+    try:
+        resources = load_resources(conn, tag)
+        stages = load_stages(conn, tag)
+        summary = run_summary(resources, stages)
 
-    st.title(f"Aetherscan — {tag}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Wall clock", _fmt_duration(summary["wall_s"]))
-    c2.metric("Stage spans", summary["n_stages"])
-    c3.metric("Latest stage", summary["latest_stage"] or "—")
-    c4.metric("Peak sys RAM", f"{summary['peak_ram_pct']:.0f}%" if summary["peak_ram_pct"] else "—")
+        st.title(f"Aetherscan — {tag}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Wall clock", _fmt_duration(summary["wall_s"]))
+        c2.metric("Stage spans", summary["n_stages"])
+        c3.metric("Latest stage", summary["latest_stage"] or "—")
+        c4.metric(
+            "Peak sys RAM", f"{summary['peak_ram_pct']:.0f}%" if summary["peak_ram_pct"] else "—"
+        )
 
-    tabs = st.tabs(
-        ["Training", "Injection", "Latent", "Resources", "Stages", "Inference", "All plots (PNG)"]
-    )
+        tabs = st.tabs(
+            [
+                "Training",
+                "Injection",
+                "Latent",
+                "Resources",
+                "Stages",
+                "Inference",
+                "All plots (PNG)",
+            ]
+        )
 
-    # --- Training loss + stability ----------------------------------------
-    with tabs[0]:
-        loss = load_training_stats(conn, tag, _LOSS_STATS)
-        stab = load_training_stats(conn, tag, _STABILITY_STATS)
-        if loss.empty and stab.empty:
-            st.caption("No beta_vae training_stats yet.")
-        for title, df in (("Loss curves", loss), ("Training stability", stab)):
-            if df.empty:
-                continue
-            st.subheader(title)
-            d = df.copy()
-            d["kind"] = d["stat_name"].str.replace("^val_", "", regex=True)
-            d["split"] = np.where(d["stat_name"].str.startswith("val_"), "val", "train")
-            for kind in sorted(d["kind"].unique()):
-                sub = d[d["kind"] == kind].copy()
-                sub["step"] = range(len(sub))
-                fig = px.line(sub, x="step", y="value", color="split", title=kind)
-                fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                st.plotly_chart(fig, use_container_width=True)
-
-    # --- Injection stats ---------------------------------------------------
-    with tabs[1]:
-        inj = load_injection_stats(conn, tag)
-        if inj.empty:
-            st.caption("No injection_stats yet.")
-        else:
-            st.subheader("Injection stability (per round)")
-            stability = (
-                inj.assign(nonfinite=1 - inj["is_finite"].fillna(1))
-                .groupby("round_number")[["nonfinite", "slope_clamped"]]
-                .mean()
-                .reset_index()
-            )
-            fig = px.line(
-                stability,
-                x="round_number",
-                y=["nonfinite", "slope_clamped"],
-                title="mean non-finite / slope-clamp rate",
-                markers=True,
-            )
-            fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.subheader("Injected-signal / intensity stat distributions")
-            stat = st.selectbox("stat_name", sorted(inj["stat_name"].unique()))
-            sub = inj[(inj["stat_name"] == stat) & inj["value"].notna()]
-            color = "signal_type" if sub["signal_type"].notna().any() else None
-            fig = px.histogram(sub, x="value", color=color, barmode="overlay", nbins=60, title=stat)
-            fig.update_layout(height=300, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-            st.plotly_chart(fig, use_container_width=True)
-
-    # --- Latent scatter (live PCA of the latest snapshot) ------------------
-    with tabs[2]:
-        snaps = load_latent_snapshots_latest(conn, tag)
-        mat, labels = parse_latent_matrix(snaps)
-        if mat.shape[0] == 0:
-            st.caption("No latent_snapshots yet.")
-        else:
-            proj = pca_2d(mat)
-            df = pd.DataFrame({"pc1": proj[:, 0], "pc2": proj[:, 1], "signal_type": labels})
-            st.subheader(f"Latent space — latest snapshot (PCA of {mat.shape[0]}×{mat.shape[1]})")
-            fig = px.scatter(df, x="pc1", y="pc2", color="signal_type", opacity=0.7)
-            fig.update_layout(height=520, margin={"l": 10, "r": 10, "t": 10, "b": 10})
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption(
-                "Cheap PCA projection; the pipeline's saved UMAP animation is under All plots."
-            )
-
-    # --- Resource utilization ---------------------------------------------
-    with tabs[3]:
-        if resources.empty:
-            st.caption("No system_resources yet.")
-        else:
-            r = resources.copy()
-            r["t_min"] = (r["timestamp"] - r["timestamp"].min()) / 60.0
-            r["series"] = r["resource_type"] + ":" + r["resource_name"]
-            for rtype in ("cpu", "ram", "gpu"):
-                sub = r[r["resource_type"] == rtype]
-                if sub.empty:
+        # --- Training loss + stability ----------------------------------------
+        with tabs[0]:
+            loss = load_training_stats(conn, tag, _LOSS_STATS)
+            stab = load_training_stats(conn, tag, _STABILITY_STATS)
+            if loss.empty and stab.empty:
+                st.caption("No beta_vae training_stats yet.")
+            for title, df in (("Loss curves", loss), ("Training stability", stab)):
+                if df.empty:
                     continue
-                fig = px.line(sub, x="t_min", y="value", color="series", title=rtype.upper())
+                st.subheader(title)
+                d = df.copy()
+                d["kind"] = d["stat_name"].str.replace("^val_", "", regex=True)
+                d["split"] = np.where(d["stat_name"].str.startswith("val_"), "val", "train")
+                for kind in sorted(d["kind"].unique()):
+                    sub = d[d["kind"] == kind].copy()
+                    sub["step"] = range(len(sub))
+                    fig = px.line(sub, x="step", y="value", color="split", title=kind)
+                    fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                    st.plotly_chart(fig, use_container_width=True)
+
+        # --- Injection stats ---------------------------------------------------
+        with tabs[1]:
+            inj = load_injection_stats(conn, tag)
+            if inj.empty:
+                st.caption("No injection_stats yet.")
+            else:
+                st.subheader("Injection stability (per round)")
+                stability = (
+                    inj.assign(nonfinite=1 - inj["is_finite"].fillna(1))
+                    .groupby("round_number")[["nonfinite", "slope_clamped"]]
+                    .mean()
+                    .reset_index()
+                )
+                fig = px.line(
+                    stability,
+                    x="round_number",
+                    y=["nonfinite", "slope_clamped"],
+                    title="mean non-finite / slope-clamp rate",
+                    markers=True,
+                )
+                fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.subheader("Injected-signal / intensity stat distributions")
+                stat = st.selectbox("stat_name", sorted(inj["stat_name"].unique()))
+                sub = inj[(inj["stat_name"] == stat) & inj["value"].notna()]
+                color = "signal_type" if sub["signal_type"].notna().any() else None
+                fig = px.histogram(
+                    sub, x="value", color=color, barmode="overlay", nbins=60, title=stat
+                )
+                fig.update_layout(height=300, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                st.plotly_chart(fig, use_container_width=True)
+
+        # --- Latent scatter (live PCA of the latest snapshot) ------------------
+        with tabs[2]:
+            snaps = load_latent_snapshots_latest(conn, tag)
+            mat, labels = parse_latent_matrix(snaps)
+            if mat.shape[0] == 0:
+                st.caption("No latent_snapshots yet.")
+            else:
+                proj = pca_2d(mat)
+                df = pd.DataFrame({"pc1": proj[:, 0], "pc2": proj[:, 1], "signal_type": labels})
+                st.subheader(
+                    f"Latent space — latest snapshot (PCA of {mat.shape[0]}×{mat.shape[1]})"
+                )
+                fig = px.scatter(df, x="pc1", y="pc2", color="signal_type", opacity=0.7)
+                fig.update_layout(height=520, margin={"l": 10, "r": 10, "t": 10, "b": 10})
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    "Cheap PCA projection; the pipeline's saved UMAP animation is under All plots."
+                )
+
+        # --- Resource utilization ---------------------------------------------
+        with tabs[3]:
+            if resources.empty:
+                st.caption("No system_resources yet.")
+            else:
+                r = resources.copy()
+                r["t_min"] = (r["timestamp"] - r["timestamp"].min()) / 60.0
+                r["series"] = r["resource_type"] + ":" + r["resource_name"]
+                for rtype in ("cpu", "ram", "gpu"):
+                    sub = r[r["resource_type"] == rtype]
+                    if sub.empty:
+                        continue
+                    fig = px.line(sub, x="t_min", y="value", color="series", title=rtype.upper())
+                    fig.update_layout(
+                        height=260,
+                        margin={"l": 10, "r": 10, "t": 40, "b": 10},
+                        xaxis_title="minutes",
+                        yaxis_title="%",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+        # --- Stage timeline ----------------------------------------------------
+        with tabs[4]:
+            if stages.empty:
+                st.caption("No pipeline_stages yet (needs PR #134's benchmarking layer).")
+            else:
+                s = stages.copy()
+                t0 = s["start_time"].min()
+                s["start_min"] = (s["start_time"] - t0) / 60.0
+                s["dur_min"] = (s["end_time"] - s["start_time"]) / 60.0
+                s["family"] = s["stage"].str.split(".").str[0]
+                palette = px.colors.qualitative.Plotly
+                fig = go.Figure()
+                for i, fam in enumerate(sorted(s["family"].unique())):
+                    sub = s[s["family"] == fam]
+                    fig.add_bar(
+                        x=sub["dur_min"],
+                        base=sub["start_min"],
+                        y=sub["stage"],
+                        orientation="h",
+                        name=fam,
+                        marker_color=palette[i % len(palette)],
+                        customdata=sub[["duration_s", "depth"]],
+                        hovertemplate="%{y}<br>%{customdata[0]:.1f}s (depth %{customdata[1]})<extra></extra>",
+                    )
+                fig.update_yaxes(autorange="reversed")
+                fig.update_xaxes(title="minutes since first stage")
                 fig.update_layout(
-                    height=260,
-                    margin={"l": 10, "r": 10, "t": 40, "b": 10},
-                    xaxis_title="minutes",
-                    yaxis_title="%",
+                    height=max(300, 22 * s["stage"].nunique()),
+                    margin={"l": 10, "r": 10, "t": 20, "b": 10},
+                    barmode="overlay",
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-    # --- Stage timeline ----------------------------------------------------
-    with tabs[4]:
-        if stages.empty:
-            st.caption("No pipeline_stages yet (needs PR #134's benchmarking layer).")
-        else:
-            s = stages.copy()
-            t0 = s["start_time"].min()
-            s["start_min"] = (s["start_time"] - t0) / 60.0
-            s["dur_min"] = (s["end_time"] - s["start_time"]) / 60.0
-            s["family"] = s["stage"].str.split(".").str[0]
-            palette = px.colors.qualitative.Plotly
-            fig = go.Figure()
-            for i, fam in enumerate(sorted(s["family"].unique())):
-                sub = s[s["family"] == fam]
-                fig.add_bar(
-                    x=sub["dur_min"],
-                    base=sub["start_min"],
-                    y=sub["stage"],
-                    orientation="h",
-                    name=fam,
-                    marker_color=palette[i % len(palette)],
-                    customdata=sub[["duration_s", "depth"]],
-                    hovertemplate="%{y}<br>%{customdata[0]:.1f}s (depth %{customdata[1]})<extra></extra>",
-                )
-            fig.update_yaxes(autorange="reversed")
-            fig.update_xaxes(title="minutes since first stage")
-            fig.update_layout(
-                height=max(300, 22 * s["stage"].nunique()),
-                margin={"l": 10, "r": 10, "t": 20, "b": 10},
-                barmode="overlay",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        # --- Inference candidates ---------------------------------------------
+        with tabs[5]:
+            results = load_inference_results(conn, tag)
+            cadences = load_inference_cadences(conn, tag)
+            if results.empty and cadences.empty:
+                st.caption("No inference_results / inference_cadences yet.")
+            if not results.empty:
+                cands = results[results["prediction"] == 1]
+                st.subheader(f"Candidate confidence ({len(cands)} candidates)")
+                if not cands.empty:
+                    fig = px.histogram(cands, x="confidence", nbins=40)
+                    fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 10, "b": 10})
+                    st.plotly_chart(fig, use_container_width=True)
+                    for dim in ("target", "band"):
+                        if cands[dim].notna().any():
+                            counts = cands[dim].value_counts().reset_index()
+                            counts.columns = [dim, "candidates"]
+                            fig = px.bar(
+                                counts, x=dim, y="candidates", title=f"candidates per {dim}"
+                            )
+                            fig.update_layout(
+                                height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10}
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+            if not cadences.empty:
+                st.subheader("Per-cadence manifest")
+                st.dataframe(cadences, use_container_width=True)
 
-    # --- Inference candidates ---------------------------------------------
-    with tabs[5]:
-        results = load_inference_results(conn, tag)
-        cadences = load_inference_cadences(conn, tag)
-        if results.empty and cadences.empty:
-            st.caption("No inference_results / inference_cadences yet.")
-        if not results.empty:
-            cands = results[results["prediction"] == 1]
-            st.subheader(f"Candidate confidence ({len(cands)} candidates)")
-            if not cands.empty:
-                fig = px.histogram(cands, x="confidence", nbins=40)
-                fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 10, "b": 10})
-                st.plotly_chart(fig, use_container_width=True)
-                for dim in ("target", "band"):
-                    if cands[dim].notna().any():
-                        counts = cands[dim].value_counts().reset_index()
-                        counts.columns = [dim, "candidates"]
-                        fig = px.bar(counts, x=dim, y="candidates", title=f"candidates per {dim}")
-                        fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                        st.plotly_chart(fig, use_container_width=True)
-        if not cadences.empty:
-            st.subheader("Per-cadence manifest")
-            st.dataframe(cadences, use_container_width=True)
+        # --- All plots (PNG gallery) ------------------------------------------
+        with tabs[6]:
+            pngs = list_png_artifacts(plots_dir)
+            if not pngs:
+                st.caption(f"No plot PNGs under {plots_dir} yet.")
+            else:
+                st.caption(f"{len(pngs)} figures under {plots_dir} (newest first)")
+                cols = st.columns(2)
+                for i, art in enumerate(pngs):
+                    with cols[i % 2]:
+                        st.image(art["path"], caption=art["rel"], use_container_width=True)
 
-    # --- All plots (PNG gallery) ------------------------------------------
-    with tabs[6]:
-        pngs = list_png_artifacts(plots_dir)
-        if not pngs:
-            st.caption(f"No plot PNGs under {plots_dir} yet.")
-        else:
-            st.caption(f"{len(pngs)} figures under {plots_dir} (newest first)")
-            cols = st.columns(2)
-            for i, art in enumerate(pngs):
-                with cols[i % 2]:
-                    st.image(art["path"], caption=art["rel"], use_container_width=True)
-
-    conn.close()
+    finally:
+        conn.close()
 
     if refresh and refresh > 0:
         # sleep()+rerun() is the version-robust live refresh (works on any Streamlit); for a

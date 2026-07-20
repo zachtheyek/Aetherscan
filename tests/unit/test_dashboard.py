@@ -284,6 +284,17 @@ def test_run_summary(conn):
     assert summ["peak_ram_pct"] == pytest.approx(42.2)
 
 
+def test_run_summary_no_stages_uses_resources(conn):
+    # exercise the `elif not resources.empty` wall-clock branch: no stages, so the span comes from
+    # the resource timestamps (220 - 100), and latest_stage is None
+    res = dashboard.load_resources(conn, "t1")
+    empty_stages = dashboard.load_stages(conn, "nope")
+    summ = dashboard.run_summary(res, empty_stages)
+    assert summ["wall_s"] == 120.0
+    assert summ["n_stages"] == 0
+    assert summ["latest_stage"] is None
+
+
 def test_list_png_artifacts_and_default_dir(tmp_path):
     plots = tmp_path / "plots"
     (plots / "inference" / "t1").mkdir(parents=True)
