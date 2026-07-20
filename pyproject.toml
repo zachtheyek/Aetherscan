@@ -23,10 +23,12 @@ description = "Breakthrough Listen's first end-to-end production-grade DL pipeli
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    # Mirrors requirements-container.txt's ranges — keep the two (and environment.yml /
-    # aetherscan.def) in lockstep per SECURITY.md's Version Selection Policy. Documented
-    # ceilings (numpy<2.0, setuptools<81, the NGC TF 2.17 ABI) apply to the package exactly
-    # as to the container.
+    # Mirrors requirements-container.txt's ranges for the packaged runtime — keep them (and
+    # environment.yml / aetherscan.def) in lockstep per SECURITY.md's Version Selection Policy.
+    # Documented ceilings (numpy<2.0, setuptools<81, the NGC TF 2.17 ABI) apply to the package
+    # exactly as to the container. The dashboard stack (streamlit/plotly/pandas) is deliberately
+    # NOT mirrored here: utils/dashboard.py is not shipped in the wheel (only src/aetherscan is),
+    # so it's repo-checkout/container-only observability, not a pip-install runtime dependency.
     "numpy>=1.26,<2.0",
     "scipy>=1.13,<1.14",
     "scikit-learn>=1.5,<1.6",

@@ -202,10 +202,19 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          # The static pre-release version isn't bumped between releases, so a repeated dry run
+          # re-uploads the same filename; skip-existing keeps the "recommended before the first
+          # real release" dry run idempotent instead of hard-failing on TestPyPI's 400.
+          skip-existing: true
 
       - name: Publish to PyPI
         if: needs.guard.outputs.dry_run != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Idempotent partial-failure recovery: if PyPI publish succeeds but a later gate
+          # (github-release) fails, re-running the whole workflow won't hard-fail here on the
+          # already-published (immutable) version. The guard job still pins tag == version.
+          skip-existing: true
 
   # Decorate the tag into a GitHub Release with generated notes and the built artifacts
   # attached. The generated notes are a starting point — curate the body from the per-PR
