@@ -206,9 +206,11 @@ Aetherscan/
 │   ├── unit/                        # Fast, hardware-independent unit tests (run in CI)
 │   └── integration/                 # gpu+cluster-marked end-to-end smoke tests
 ├── utils/                      # Utility scripts
+│   ├── benchmark_report.py          # Render the stage-timing benchmark report
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
 │   ├── find_optimal_configs.py      # Per-host config helper
 │   ├── get_system_info.sh           # System info helper
+│   ├── hf_tag_release.py            # Bless trained weights as a release tag on HF
 │   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
 │   ├── print_cli_help.py            # CLI reference regen helper
 │   ├── run_container.sh             # Apptainer/SingularityCE wrapper

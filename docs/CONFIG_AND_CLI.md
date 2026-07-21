@@ -373,5 +373,5 @@ mode && /^ *"--/{
 
 The second command lists every shared flag (those appearing in both subparsers); each
 should match either a single Pattern B `apply_args` block or a pair of Pattern C blocks
-with a `command` discriminator. As of this writing it yields 12 shared flags —
-9 Pattern B + 3 Pattern C — matching the tables above.
+with a `command` discriminator. As of this writing it yields 14 shared flags —
+11 Pattern B + 3 Pattern C — matching the tables above.

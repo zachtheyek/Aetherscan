@@ -118,8 +118,9 @@ src/aetherscan/
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
-utils/                   # fetch_run_outputs.sh, find_optimal_configs.py,
-                         # get_system_info.sh, kill_pipeline.sh, print_cli_help.py,
+utils/                   # benchmark_report.py, fetch_run_outputs.sh,
+                         # find_optimal_configs.py, get_system_info.sh,
+                         # hf_tag_release.py, kill_pipeline.sh, print_cli_help.py,
                          # run_container.sh, start_tmux_session.sh,
                          # verify_train_test_files.py
 docs/                    # Full technical doc suite, one doc per pipeline surface —

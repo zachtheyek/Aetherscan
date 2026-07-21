@@ -136,18 +136,21 @@ The order is load-bearing — each step depends on the previous:
 5. `register_logger()` — hands the logger to the manager so it is stopped **last** during
    cleanup (you can log during teardown of everything else).
 6. `setup_argument_parser()` / `parse_args()`.
-7. Inference only: `apply_saved_config(args.config_path)` — layers a saved training-run JSON
+7. Inference only: `resolve_inference_artifacts(args)` — downloads / locates the model artifact
+   trio (encoder, RF, config JSON) via the HF resolution chain and writes the cached paths onto
+   `args`, so `apply_saved_config` and `validate_args` see them as if passed on the CLI.
+8. Inference only: `apply_saved_config(args.config_path)` — layers a saved training-run JSON
    under CLI flags *before* validation, so `validate_args` checks the values inference will
    actually use. The saved `checkpoint` section is skipped (a training run's `save_tag` must
    not leak into an inference run).
-8. `validate_args(args)` — semantic + cross-replica divisibility checks; no mutation.
-9. `apply_args_to_config(args)` — CLI overrides land on the singleton.
-10. `init_db()` — schema creation + migration, writer thread starts.
-11. `init_monitor()` — 1 Hz sampling into `system_resources`.
-12. `launch_dashboard()` — auto-launch the live monitoring dashboard (opt out with
+9. `validate_args(args)` — semantic + cross-replica divisibility checks; no mutation.
+10. `apply_args_to_config(args)` — CLI overrides land on the singleton.
+11. `init_db()` — schema creation + migration, writer thread starts.
+12. `init_monitor()` — 1 Hz sampling into `system_resources`.
+13. `launch_dashboard()` — auto-launch the live monitoring dashboard (opt out with
     `--no-dashboard`); fully guarded, so a missing streamlit or a spawn failure only warns and
     never aborts the run.
-13. Dispatch to `train_command()` / `inference_command()`; a `finally` block calls
+14. Dispatch to `train_command()` / `inference_command()`; a `finally` block calls
     `manager.cleanup_all()` so non-daemon threads can't block exit.
 
 Priority order for any parameter: `runtime defaults < loaded config < CLI args`
@@ -162,7 +165,7 @@ singletons (double-checked locking in `__new__`, `_initialized` guard in `__init
 - **One authoritative instance per process.** Config values, the DB writer queue, the log
   queue, and the resource registry must be process-global — two `Database` instances would
   mean two writer threads racing on one SQLite file.
-- **Import-order freedom.** Any module calls `get_config()` / `get_db()` / `get_manager()`
+- **Import-order freedom.** Any module calls `get_config()` / `get_db()` / `get_manager()` / `get_logger()` / `get_monitor()`
   at *use* time instead of threading instances through every constructor.
 - **Deterministic teardown.** The manager holds references to the others and closes them in
   a strict order (processes → pools → shared memory → monitor → DB → logger).
