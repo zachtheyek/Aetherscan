@@ -26,6 +26,7 @@ from aetherscan.preprocessing import (
     ED_STAT_HIST_EDGES,
     DataPreprocessor,
     PendingCadence,
+    _decimate_for_plot,
     _energy_detect_channel_worker,
     _extract_stamps_worker,
     _fit_channel_bandpass,
@@ -797,6 +798,40 @@ class TestPfbResponseMismatchWarning:
         assert abs(edge_mid_power_ratio(np.ones(512)) - expected) / expected > 0.05
 
 
+class TestDecimateForPlot:
+    """_decimate_for_plot reduces long spectrum lines to a per-bin min/max envelope so the
+    bandpass debug/viz figures don't render ~1M-point matplotlib lines at GBT scale."""
+
+    def test_short_input_passes_through(self):
+        y = np.arange(100, dtype=np.float64)
+        x, out = _decimate_for_plot(y, max_points=64)
+        np.testing.assert_array_equal(x, np.arange(100))
+        np.testing.assert_array_equal(out, y)
+
+    def test_long_input_respects_point_budget(self):
+        rng = np.random.default_rng(11)
+        y = rng.normal(size=100_000)
+        x, out = _decimate_for_plot(y, max_points=1024)
+        assert out.shape[0] <= 2 * 1024
+        assert x.shape == out.shape
+
+    def test_envelope_preserves_narrowband_spike(self):
+        # The property a plain stride lacks: a single-bin spike (RFI/hit) must survive.
+        y = np.zeros(100_000)
+        y[54_321] = 7.0
+        x, out = _decimate_for_plot(y, max_points=1024)
+        assert out.max() == 7.0
+        assert 54_321 in x
+
+    def test_indices_are_sorted_and_in_range(self):
+        rng = np.random.default_rng(12)
+        y = rng.normal(size=99_991)  # prime length: exercises the padded tail bin
+        x, out = _decimate_for_plot(y, max_points=1024)
+        assert np.all(np.diff(x) >= 0)
+        assert x.min() >= 0 and x.max() <= y.shape[0] - 1
+        np.testing.assert_array_equal(out, y[x])
+
+
 class TestPlanCadencesOutputDir:
     """plan_cadences resolves the .npy output dir per CSV: tag-scoped default under
     {data_path}/inference/preprocessed/, with an explicit --preprocess-output-dir shared
@@ -822,10 +857,27 @@ class TestPlanCadencesOutputDir:
 
         config.checkpoint.save_tag = "test_v1"
         first = DataPreprocessor().plan_cadences()
+        # Plant a stale stamp from the old tag's attempt at exactly the path resume keys on
+        with open(first[0].npy_path, "wb") as f:
+            f.write(b"stale")
         config.checkpoint.save_tag = "test_v2"
         second = DataPreprocessor().plan_cadences()
 
         assert os.path.dirname(first[0].npy_path) != os.path.dirname(second[0].npy_path)
+        # The new tag's unit must not see the old stamp — process_pending_cadence would
+        # otherwise resume-skip the cadence off the stale file.
+        assert not os.path.exists(second[0].npy_path)
+
+    def test_duplicate_csv_basenames_rejected(self, initialized_runtime, make_inference_csv):
+        # Same basename in different subdirectories would collide into one tag-scoped
+        # output dir (and shared stamp filenames) — plan_cadences fails fast instead.
+        config = get_config()
+        make_inference_csv("run_a/subset.csv")
+        make_inference_csv("run_b/subset.csv")
+        config.data.inference_files = ["run_a/subset.csv", "run_b/subset.csv"]
+
+        with pytest.raises(ValueError, match="subset"):
+            DataPreprocessor().plan_cadences()
 
     def test_explicit_override_shared_across_csvs(
         self, initialized_runtime, make_inference_csv, tmp_path
