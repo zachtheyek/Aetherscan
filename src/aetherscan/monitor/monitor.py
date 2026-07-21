@@ -54,33 +54,46 @@ def select_annotation_spans(rows: list[dict], max_depth: int = _ANNOTATION_MAX_D
     return spans
 
 
-# BUG:
-# system total CPU usage appears "unnormalized" compared to aetherscan CPU usage (aetherscan CPU & RAM sometimes exceeds system total)
-# https://github.com/zachtheyek/Aetherscan/issues/12
-def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
+def get_process_tree_stats(
+    process: psutil.Process, proc_cache: dict[int, psutil.Process] | None = None
+) -> dict[str, float]:
     """
     Sum CPU and RAM usage across `process` and its descendants (the multiprocessing pool
     workers it spawned), returning {cpu_percent, ram_percent, ram_bytes, ram_gb}.
+
+    `proc_cache` maps PID -> psutil.Process and should persist across calls when CPU accuracy
+    matters: cpu_percent(interval=0) measures against the baseline recorded by the previous
+    call on the *same* Process object, so a freshly created object always reads 0.0 (issue
+    #12's undercount). With a persistent cache, each PID is accurate from its second sample
+    onward (a new PID contributes one 0.0 reading when first seen), and PIDs that leave the
+    tree are evicted. Without a cache (None), every call reads 0.0 CPU per process — fine for
+    RAM-only callers.
 
     cpu_percent is normalized against the system core count (0-100). ram_bytes uses PSS
     (Proportional Set Size) rather than RSS so shared pages aren't double-counted across the
     process tree — summing RSS would let the total exceed system RAM. Dead children that vanish
     mid-iteration are silently skipped.
     """
+    if proc_cache is None:
+        proc_cache = {}
+
     try:
         # Get all processes in tree (main + children)
         processes = [process]
         with contextlib.suppress(psutil.NoSuchProcess):
             processes.extend(process.children(recursive=True))
 
-        # Aggregate CPU and RAM usage across all processes
+        # Aggregate CPU and RAM usage across all processes, measuring through the cached
+        # Process object for any PID seen on a previous call — children() returns brand-new
+        # objects every call, which would reset the cpu_percent baseline each interval
         total_cpu = 0.0
         total_ram_bytes = 0
 
         for proc in processes:
+            cached = proc_cache.setdefault(proc.pid, proc)
             try:
                 # CPU: Get percentage (can be >100% for multi-core usage)
-                cpu = proc.cpu_percent(interval=0.0)  # Non-blocking
+                cpu = cached.cpu_percent(interval=0.0)  # Non-blocking
                 total_cpu += cpu
 
                 # RAM: Get PSS (Proportional Set Size)
@@ -88,12 +101,23 @@ def get_process_tree_stats(process: psutil.Process) -> dict[str, float]:
                 # RSS counts shared pages once per process, so summing RSS across a process tree
                 # can exceed system total RAM. PSS divides shared pages by # of sharing processes,
                 # making it additive and accurate when summing across multiple processes.
-                mem_info = proc.memory_full_info()
+                mem_info = cached.memory_full_info()
                 total_ram_bytes += mem_info.pss
 
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                # Process may have died between children() and cpu_percent() or memory_info() calls
+            except psutil.NoSuchProcess:
+                # Process died between children() and the stat calls — drop it immediately
+                proc_cache.pop(proc.pid, None)
                 continue
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                # Still exists (just unreadable/unreaped) — keep the cache entry; it gets
+                # evicted below once the PID leaves the tree
+                continue
+
+        # Evict cached entries for PIDs no longer in the tree so dead pool workers don't
+        # accumulate across a long run
+        tree_pids = {proc.pid for proc in processes}
+        for pid in set(proc_cache) - tree_pids:
+            del proc_cache[pid]
 
         # Convert CPU to percentage of total system CPU
         num_cores = psutil.cpu_count() or 0
@@ -173,6 +197,10 @@ class ResourceMonitor:
         # Get main process ID
         self.process = psutil.Process(os.getpid())
 
+        # PID -> psutil.Process cache reused across monitoring intervals so per-child
+        # cpu_percent(interval=0) has a baseline from the previous sample (issue #12)
+        self._proc_cache: dict[int, psutil.Process] = {}
+
         # Detect GPUs
         self._detect_gpus()
 
@@ -248,8 +276,9 @@ class ResourceMonitor:
 
     def _get_process_tree_stats(self):
         """Convenience wrapper returning (cpu_percent_total, ram_percent) from
-        get_process_tree_stats() against the monitor's own root process."""
-        stats = get_process_tree_stats(self.process)
+        get_process_tree_stats() against the monitor's own root process, threading the
+        persistent Process cache through so per-child CPU readings are accurate."""
+        stats = get_process_tree_stats(self.process, self._proc_cache)
         return stats["cpu_percent"], stats["ram_percent"]
 
     def _get_gpu_stats(self):
