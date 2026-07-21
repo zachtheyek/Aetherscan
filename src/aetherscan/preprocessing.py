@@ -40,7 +40,7 @@ from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
-from aetherscan.pfb import edge_mid_power_ratio, equalize_passband, gen_coarse_channel_response
+from aetherscan.pfb import edge_mid_band_slices, equalize_passband, gen_coarse_channel_response
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +53,12 @@ _GLOBAL_CHUNK_DATA = None
 _GLOBAL_SHAPE = None
 _GLOBAL_DTYPE = None
 
-# PFB static-response sanity check: warn when a file's measured edge/mid power ratio
-# disagrees with the theoretical response's by more than this relative tolerance.
-_PFB_RATIO_MISMATCH_TOL = 0.05
+# PFB static-response sanity check: warn when the median flattened (divided-by-H) edge/mid
+# power ratio deviates from 1.0 by more than this. ~0.10 is a provisional threshold — the
+# residual still carries the analog-frontend tilt, whose legitimate baseline is only fixed by
+# the deferred pfb_taps-vs-backend characterization — so the warning stays informational
+# (#180 bounds the response-model error itself at ~1e-5, so H is not the confounder).
+_PFB_RESIDUAL_FLATNESS_TOL = 0.10
 # Fixed log-spaced bin edges for the energy-detection statistic summary histograms
 # accumulated by _energy_detect_channel_worker. The edges are identical for every channel /
 # file / cadence, so per-channel counts combine by plain addition; the range spans sub-noise
@@ -1574,8 +1577,9 @@ class DataPreprocessor:
 
             # One stage span per ON file (read + DC spike + bandpass flatten + threshold)
             with stage_timer(f"read_ed_on{on_source_idx + 1}"):
-                if pfb_active:
-                    # Cheap static-response sanity check (once per file, not per channel)
+                if pfb_active and on_source_idx == 0:
+                    # Cheap residual-flatness sanity check — primary ON file only: the static
+                    # response is a property of the backend, shared by every file of the cadence
                     self._warn_on_pfb_response_mismatch(on_h5, n_coarse_total)
 
                 tasks = [
@@ -1895,57 +1899,96 @@ class DataPreprocessor:
         _remove_dc_spike(channel, width, 1)
         return channel
 
+    def _flattened_edge_mid_ratio(
+        self, h5_path: str, channel_index: int, response: np.ndarray
+    ) -> float:
+        """
+        Edge/mid power ratio of one coarse channel AFTER flattening by the static response H.
+
+        Reads only the bands edge_mid_power_ratio actually evaluates (edge_mid_band_slices:
+        the outermost width // 16 bins each side plus a central band of the same width) as
+        native float32 and time-integrates each immediately — ~10x less I/O than the
+        full-channel float64 read of _read_despiked_channel, and no fp64 blowup, which is what
+        keeps the per-file sanity check cheap at GBT scale. The DC spike (2 bins at
+        width // 2) sits inside the mid band; its interpolation (_remove_dc_spike) is linear,
+        so it commutes with the time mean and is replicated on the integrated slice. Matches
+        edge_mid_power_ratio(equalize_passband(channel, response).mean(axis=0)) on the
+        despiked full read, up to float32-read rounding (pinned by a unit test).
+        """
+        width = self.config.inference.coarse_channel_width
+        time_bins = self.config.data.time_bins
+        start = channel_index * width
+        left, mid, right = edge_mid_band_slices(width)
+        # Widen the mid slice so the DC-spike interpolation sources (up to 3 bins around
+        # width // 2, see _remove_dc_spike) are always present.
+        lo = max(0, min(mid.start, width // 2 - 3))
+        hi = max(mid.stop, width // 2 + 3)
+        with h5py.File(h5_path, "r") as hf:
+            data = hf["data"]
+            left_int = data[:time_bins, 0, start + left.start : start + left.stop].mean(axis=0)
+            right_int = data[:time_bins, 0, start + right.start : start + right.stop].mean(axis=0)
+            mid_int = data[:time_bins, 0, start + lo : start + hi].mean(axis=0)
+        dc = width // 2 - lo
+        mid_int[dc] = (mid_int[dc + 1] + mid_int[dc - 3]) / 2
+        mid_int[dc - 1] = (mid_int[dc + 2] + mid_int[dc - 2]) / 2
+        mid_int = mid_int[mid.start - lo : mid.stop - lo]
+
+        # Same divide-by-H (with equalize_passband's defensive floor) as the real flattener;
+        # per-bin division commutes with the time mean, so integrating first is equivalent.
+        floor = np.maximum(response, 1e-10)
+        edge = 0.5 * (
+            float((left_int / floor[left]).mean()) + float((right_int / floor[right]).mean())
+        )
+        return edge / float((mid_int / floor[mid]).mean())
+
     def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
         """
-        Heuristic sanity check of the static PFB response against the recording (after the bliss
-        `validate` flag): compare the file's median edge/mid power ratio — measured over several
-        coarse channels sampled evenly across the band — with the theoretical response's, and
-        log an INFORMATIONAL warning once per file (never per channel) when they disagree by
-        more than _PFB_RATIO_MISMATCH_TOL.
+        Residual-flatness sanity check of the static PFB response against the recording (after
+        the bliss `validate` flag): flatten several coarse channels — sampled evenly across the
+        band — with the active response H, and log an INFORMATIONAL warning once per file
+        (never per channel) when the median flattened edge/mid power ratio deviates from 1.0
+        by more than _PFB_RESIDUAL_FLATNESS_TOL.
 
-        This comparison is deliberately coarse and is EXPECTED to show a moderate mismatch even
-        when the response is correct: the measured ratio is taken on RAW (unflattened) data, so
-        it also carries the analog-frontend passband tilt and edge RFI that the pure response H
-        does not model. A median over several channels resists a single RFI-heavy channel, but
-        the frontend contribution is systematic and does not cancel — so a small disagreement is
-        normal, and only a LARGE or CONSISTENT one (across many files) is diagnostic of a wrong
-        --pfb-taps-per-channel. A principled threshold needs the analog-frontend baseline, which
-        is the deferred pfb_taps-vs-backend characterization.
+        This directly measures the operational question — does dividing by H actually flatten
+        the data? — so, unlike the raw-vs-pure-ratio comparison it replaced, the
+        analog-frontend passband tilt contributes only a small residual baseline rather than
+        the entire statistic (and #180's characterization bounds the response-model error at
+        ~1e-5, so H itself is not a confounder). The residual still includes that frontend
+        tilt and any edge RFI, so a moderate deviation can be benign and the threshold stays
+        provisional/informational until the deferred pfb_taps-vs-backend characterization
+        fixes the legitimate baseline; a LARGE or CONSISTENT deviation (across many files) is
+        the actionable signal of a wrong --pfb-taps-per-channel. Only the edge and mid bands
+        of each sampled channel are read (see _flattened_edge_mid_ratio), keeping the check
+        cheap; it runs on the cadence's primary ON file only, since the response is a static
+        property of the backend shared by every file.
         """
-        # TODO: replace this raw-vs-pure comparison with a residual-flatness statistic — flatten
-        # the sampled channels with the active response (divide by H) and compare the flattened
-        # edge/mid ratio against ~1.0. That directly measures whether dividing by H flattens the
-        # data and is far less confounded by the frontend tilt / RFI, giving a meaningful
-        # threshold. Land it with the pfb_taps-per-channel backend characterization (which fixes
-        # the legitimate baseline), and read the sampled channels more cheaply (float32/strided)
-        # — the full-resolution float64 reads make this check non-cheap at GBT scale. See #156.
         width = self.config.inference.coarse_channel_width
         taps = self.config.inference.pfb_taps_per_channel
         try:
             response = gen_coarse_channel_response(width, n_coarse_total, taps)
-            expected = edge_mid_power_ratio(response)
             # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
             ratios = [
-                edge_mid_power_ratio(self._read_despiked_channel(h5_path, ch).mean(axis=0))
+                self._flattened_edge_mid_ratio(h5_path, ch, response)
                 for ch in self._sample_channel_indices(
                     n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
                 )
             ]
-            measured = float(np.median(ratios))
+            median = float(np.median(ratios))
         except Exception as e:
             logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
             return
 
-        rel_diff = abs(measured - expected) / expected
-        if rel_diff > _PFB_RATIO_MISMATCH_TOL:
+        deviation = abs(median - 1.0)
+        if deviation > _PFB_RESIDUAL_FLATNESS_TOL:
             logger.warning(
-                f"{h5_path}: median edge/mid power ratio {measured:.3f} differs from the static "
-                f"PFB response's {expected:.3f} by {rel_diff:.1%} (heuristic sanity check — "
-                f"informational). The measured ratio is taken on raw data, so it also reflects "
-                f"analog-frontend tilt and edge RFI the pure response does not model; a moderate "
-                f"gap is expected. Investigate only a large or consistent mismatch across many "
-                f"files: it may mean --pfb-taps-per-channel (currently {taps}) is wrong for this "
-                f"backend, in which case --bandpass-method spline is the data-driven fallback."
+                f"{h5_path}: median flattened edge/mid power ratio {median:.3f} deviates from "
+                f"1.0 by {deviation:.1%} after dividing by the static PFB response "
+                f"(residual-flatness sanity check — informational). The residual also reflects "
+                f"analog-frontend tilt and edge RFI the response does not model, so a moderate "
+                f"deviation can be benign. Investigate a large or consistent deviation across "
+                f"many files: it may mean --pfb-taps-per-channel (currently {taps}) is wrong "
+                f"for this backend, in which case --bandpass-method spline is the data-driven "
+                f"fallback."
             )
 
     def _plot_bandpass_overlay(

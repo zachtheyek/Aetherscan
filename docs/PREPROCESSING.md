@@ -99,11 +99,17 @@ detection statistic below is built from skewness and kurtosis — *central* mome
 cancels) normalized by powers of the variance (scale cancels) — so only the bandpass *shape*
 matters, and both methods remove exactly that. `taps_per_channel` (default 12, the
 GBT/Breakthrough Listen value) is **instrument-dependent** and must match the backend that
-produced the `.h5`; a cheap per-file sanity check (`_warn_on_pfb_response_mismatch`) compares
-the measured edge/mid power ratio of a few sampled channels against the theoretical
-response's (`pfb.edge_mid_power_ratio`) and warns once per file when they disagree by > 5 % —
-the cue to fix the tap count or use `--bandpass-method spline`. `--bandpass-debug-plot` saves
-a raw-vs-flattened overlay for visual confirmation.
+produced the `.h5`; a cheap residual-flatness sanity check (`_warn_on_pfb_response_mismatch`)
+flattens several sampled channels of each cadence's primary ON file with the active response
+and compares the median flattened edge/mid power ratio (`pfb.edge_mid_power_ratio`) against
+1.0 — i.e. it asks directly whether dividing by `H` actually flattens the data — warning once
+per file when the deviation exceeds ~10 %. The warning is **informational**: the residual
+still carries analog-frontend tilt and edge RFI the response doesn't model, so only a large
+or consistent deviation across files points at a wrong tap count (fallback:
+`--bandpass-method spline`); the threshold stays provisional until the pfb_taps-vs-backend
+characterization fixes the legitimate baseline. Only the edge/mid bands of each sampled
+channel are read (float32, time-integrated on read), keeping the check cheap at GBT scale.
+`--bandpass-debug-plot` saves a raw-vs-flattened overlay for visual confirmation.
 
 **Provenance of the GBT/BL parameters.** The defaults `pfb_taps_per_channel = 12`, the Hamming
 window, and the sinc prototype aren't guesses: the GBT Breakthrough Listen backend PFB was

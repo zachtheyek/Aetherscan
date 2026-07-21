@@ -126,6 +126,21 @@ def equalize_passband(channel: np.ndarray, response: np.ndarray) -> np.ndarray:
     return channel / np.maximum(response, 1e-10)
 
 
+def edge_mid_band_slices(n: int) -> tuple[slice, slice, slice]:
+    """
+    Return the (left edge, mid, right edge) bin slices edge_mid_power_ratio evaluates over a
+    coarse channel of n bins: the outermost n // 16 bins on each side and a central band of
+    the same width (_RATIO_BAND_FRACTION). Exposed so callers that only need the ratio can
+    read just these bands from disk (see preprocessing._flattened_edge_mid_ratio) while
+    staying bin-exact with edge_mid_power_ratio.
+    """
+    band = max(1, n // _RATIO_BAND_FRACTION)
+    left = slice(0, band)
+    mid = slice(n // 2 - band // 2, n // 2 + band // 2 + 1)
+    right = slice(n - band, n)
+    return left, mid, right
+
+
 def edge_mid_power_ratio(spectrum: np.ndarray) -> float:
     """
     Mean power in the coarse-channel edge bands relative to the mid band.
@@ -133,14 +148,14 @@ def edge_mid_power_ratio(spectrum: np.ndarray) -> float:
     spectrum is a 1-D per-bin power array over one coarse channel (either the theoretical
     response H or a time-integrated data channel). Both the edge band (outermost n // 16 bins
     on each side) and the mid band (a central band of the same n // 16 width) use
-    _RATIO_BAND_FRACTION. Comparing this ratio between H and real data is the cheap sanity
-    check (after the bliss `validate` flag) for whether the configured static response
-    actually matches the recording.
+    _RATIO_BAND_FRACTION (see edge_mid_band_slices). Applied to a channel flattened by the
+    static response (data / H), a ratio near 1.0 is the cheap residual-flatness sanity check
+    (after the bliss `validate` flag) for whether the configured response actually matches
+    the recording.
     """
-    n = spectrum.shape[0]
-    band = max(1, n // _RATIO_BAND_FRACTION)
-    edge = 0.5 * (float(spectrum[:band].mean()) + float(spectrum[-band:].mean()))
-    mid = float(spectrum[n // 2 - band // 2 : n // 2 + band // 2 + 1].mean())
+    left, mid, right = edge_mid_band_slices(spectrum.shape[0])
+    edge = 0.5 * (float(spectrum[left].mean()) + float(spectrum[right].mean()))
+    mid_mean = float(spectrum[mid].mean())
     # Defensive floor (mirroring equalize_passband's): an all-zero — e.g. fully masked —
     # channel would otherwise raise ZeroDivisionError on the Python-float divide.
-    return edge / max(mid, 1e-30)
+    return edge / max(mid_mean, 1e-30)

@@ -21,7 +21,7 @@ from skimage.transform import downscale_local_mean
 
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
-from aetherscan.pfb import edge_mid_power_ratio, gen_coarse_channel_response
+from aetherscan.pfb import edge_mid_power_ratio, equalize_passband, gen_coarse_channel_response
 from aetherscan.preprocessing import (
     ED_STAT_HIST_EDGES,
     DataPreprocessor,
@@ -752,19 +752,21 @@ class TestBandpassFlattenerSelection:
         np.testing.assert_allclose(flattener(shaped), 1.0, rtol=1e-12)
 
 
-class TestPfbResponseMismatchWarning:
-    """_warn_on_pfb_response_mismatch compares the file's measured edge/mid power ratio with
-    the static response's, warning once per file when they disagree by more than 5%."""
+class TestPfbResidualFlatnessWarning:
+    """_warn_on_pfb_response_mismatch flattens sampled channels with the active response H and
+    warns once per file when the median flattened edge/mid power ratio deviates from 1.0 by
+    more than _PFB_RESIDUAL_FLATNESS_TOL."""
 
-    def _make_obs(self, tmp_path, shaped: bool, n_chans=1024, width=512):
+    def _make_obs(self, tmp_path, taps: int | None, n_chans=1024, width=512):
+        # taps=None -> flat noise (no PFB shaping); taps=k -> noise x H(k taps)
         import h5py  # noqa: PLC0415
 
         rng = np.random.default_rng(51)
         data = rng.normal(1000.0, 5.0, size=(16, 1, n_chans)).astype(np.float32)
-        if shaped:
-            response = gen_coarse_channel_response(width, n_chans // width, 12)
+        if taps is not None:
+            response = gen_coarse_channel_response(width, n_chans // width, taps)
             data *= np.tile(response, n_chans // width).astype(np.float32)
-        path = tmp_path / ("shaped.h5" if shaped else "flat.h5")
+        path = tmp_path / f"obs_taps_{taps}.h5"
         with h5py.File(path, "w") as hf:
             hf.create_dataset("data", data=data)
         return str(path)
@@ -776,26 +778,53 @@ class TestPfbResponseMismatchWarning:
         config.inference.pfb_taps_per_channel = 12
         return config
 
+    @staticmethod
+    def _flatness_warnings(caplog):
+        return [r for r in caplog.records if "flattened edge/mid power ratio" in r.message]
+
+    def test_true_taps_recording_does_not_warn(self, tmp_path, initialized_runtime, caplog):
+        # noise x H(true taps): dividing by the active H flattens it, ratio ~1.0
+        self._configure()
+        h5_path = self._make_obs(tmp_path, taps=12)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            DataPreprocessor()._warn_on_pfb_response_mismatch(h5_path, n_coarse_total=2)
+        assert self._flatness_warnings(caplog) == []
+
+    def test_wrong_taps_recording_warns(self, tmp_path, initialized_runtime, caplog):
+        # noise x H(4 taps) flattened by H(12 taps): the residual keeps a strong scallop
+        self._configure()
+        h5_path = self._make_obs(tmp_path, taps=4)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            DataPreprocessor()._warn_on_pfb_response_mismatch(h5_path, n_coarse_total=2)
+        assert len(self._flatness_warnings(caplog)) == 1  # once per file, not per channel
+
     def test_flat_recording_warns(self, tmp_path, initialized_runtime, caplog):
+        # Unshaped noise: dividing by H imprints the inverse scallop, ratio far from 1.0
         self._configure()
-        h5_path = self._make_obs(tmp_path, shaped=False)
+        h5_path = self._make_obs(tmp_path, taps=None)
         with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
             DataPreprocessor()._warn_on_pfb_response_mismatch(h5_path, n_coarse_total=2)
-        mismatch_warnings = [r for r in caplog.records if "edge/mid power ratio" in r.message]
-        assert len(mismatch_warnings) == 1  # once per file, not per channel
+        assert len(self._flatness_warnings(caplog)) == 1
 
-    def test_pfb_shaped_recording_does_not_warn(self, tmp_path, initialized_runtime, caplog):
+    def test_band_slice_reader_matches_full_read(self, tmp_path, initialized_runtime):
+        # The banded float32 reader must agree with the despiked full-channel float64
+        # reference (read, despike, time-integrate, divide by H, edge/mid ratio)
         self._configure()
-        h5_path = self._make_obs(tmp_path, shaped=True)
-        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
-            DataPreprocessor()._warn_on_pfb_response_mismatch(h5_path, n_coarse_total=2)
-        assert [r for r in caplog.records if "edge/mid power ratio" in r.message] == []
-
-    def test_ratio_statistic_separates_the_two(self):
-        # The underlying statistic the check relies on (sanity of the 5% tolerance)
+        h5_path = self._make_obs(tmp_path, taps=12)
         response = gen_coarse_channel_response(512, 2, 12)
-        expected = edge_mid_power_ratio(response)
-        assert abs(edge_mid_power_ratio(np.ones(512)) - expected) / expected > 0.05
+        preprocessor = DataPreprocessor()
+        for ch in (0, 1):
+            channel = preprocessor._read_despiked_channel(h5_path, ch)
+            reference = edge_mid_power_ratio(equalize_passband(channel, response).mean(axis=0))
+            banded = preprocessor._flattened_edge_mid_ratio(h5_path, ch, response)
+            assert banded == pytest.approx(reference, rel=1e-4)
+
+    def test_flatness_statistic_separates_true_from_wrong_taps(self):
+        # The underlying statistic the check relies on (sanity of the ~0.10 tolerance)
+        h_true = gen_coarse_channel_response(512, 2, 12)
+        h_wrong = gen_coarse_channel_response(512, 2, 4)
+        assert abs(edge_mid_power_ratio(h_true / h_true) - 1.0) < 0.10
+        assert abs(edge_mid_power_ratio(h_wrong / h_true) - 1.0) > 0.10
 
 
 class TestDecimateForPlot:
