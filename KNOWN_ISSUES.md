@@ -577,3 +577,27 @@ so this won't change upstream.
 ### Status
 
 **Won't fix.** Pre-existing conflict in the upstream NGC base image; documented here.
+
+---
+
+## 17. RF-Dataset Injection Stats Rows Not Superseded on Retry
+
+### Symptom
+
+After an `rf_train` retry that regenerates the RF dataset, stale RF-generation `injection_stats` rows (written with `round_number=NULL`) remain live in the DB.
+
+### Cause
+
+`mark_superseded(round_ge=k)` can't target rows with `round_number=NULL` (SQL comparisons against NULL never match).
+
+### Impact
+
+**Minor.** Bounded to partial-generation rows from a failed `rf_train` attempt; does not affect training correctness or final model quality.
+
+### Status
+
+**Open.** No fix implemented yet. A fix would need either a NULL-aware supersede variant for the RF phase or a sentinel round number on RF-generation rows.
+
+### Related Code
+
+`src/aetherscan/db/db.py` (`mark_superseded`), `src/aetherscan/train.py` (RF dataset generation), `src/aetherscan/data_generation.py` (writes the `round_number=NULL` rows)
