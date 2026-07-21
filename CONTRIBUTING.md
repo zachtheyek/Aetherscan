@@ -198,6 +198,7 @@ Aetherscan/
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
 │   ├── find_optimal_configs.py      # Per-host config helper
 │   ├── get_system_info.sh           # System info helper
+│   ├── hf_tag_release.py             # HF weight-blessing helper for releases
 │   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
 │   ├── print_cli_help.py            # CLI reference regen helper
 │   ├── run_container.sh             # Apptainer/SingularityCE wrapper
@@ -555,9 +556,7 @@ pytest tests/unit/test_db.py::TestFlushSentinel -q
 
 ## New Version Releases
 
-> [!WARNING]
->
-> # TODO: add tagged releases workflow when available
+Releases are automated via the CD workflow (`.github/workflows/release.yml`) triggered by signed `vX.Y.Z` tag pushes; see [`docs/RELEASE.md`](docs/RELEASE.md) for the full runbook.
 
 ---
 
