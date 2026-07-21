@@ -1,0 +1,280 @@
+# Release CD — the automation half of the release contract in docs/RELEASE.md.
+#
+# Trigger: pushing a release tag (git tag -s vX.Y.Z && git push origin vX.Y.Z). The gates run
+# in order — signed-tag + version guard -> unit tests -> HF weights verification -> build -> PyPI publish
+# (trusted publishing) -> GitHub Release — so a half-released state is impossible: nothing
+# publishes unless the tag matches pyproject.toml, the suite is green, and the blessed
+# weights tag already exists on the HF model repo (CD verifies weights, never creates them —
+# weights only come from cluster training runs).
+#
+# One-time maintainer prerequisites (see docs/RELEASE.md):
+#   - PyPI: create the `aetherscan` project with GitHub as a trusted publisher
+#     (repository zachtheyek/Aetherscan, workflow release.yml, environment pypi) and create
+#     the `pypi` environment in this repo's settings. No API token is stored anywhere.
+#   - For the TestPyPI dry run: the same trusted-publisher setup on test.pypi.org with
+#     environment `testpypi`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry-run path (recommended before the first real release): manual dispatch publishes to
+  # test.pypi.org. Real releases only ever happen via tag pushes — a manual run with
+  # test_pypi unchecked fails the guard.
+  workflow_dispatch:
+    inputs:
+      test_pypi:
+        description: "Publish to test.pypi.org (dry run)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # The HF model repo carrying the release weights. Must match config.hf.repo_id's default
+  # (src/aetherscan/config.py).
+  HF_WEIGHTS_REPO: zachtheyek/aetherscan
+
+jobs:
+  # Gate 1: fail loudly before anything runs if the pushed tag doesn't equal
+  # "v" + pyproject.toml's [project].version (i.e. the release PR's version bump didn't
+  # land on the tagged commit), or if a manual run tries to target the real PyPI.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Enforce a signed release tag
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Releases carry the same provenance as commits (this repo requires signed commits): the
+          # tag must be an ANNOTATED, GPG-signed tag whose signature GitHub verifies against a key
+          # registered to the tagger's account. Rejects lightweight tags and unsigned/unverified
+          # ones. No key material lives in CI — GitHub does the verification. (Dry-run
+          # workflow_dispatch has no tag, so this step is skipped there.)
+          ref_json=$(gh api "repos/$GH_REPO/git/ref/tags/$REF_NAME")
+          obj_type=$(jq -r '.object.type' <<<"$ref_json")
+          tag_sha=$(jq -r '.object.sha' <<<"$ref_json")
+          if [ "$obj_type" != "tag" ]; then
+            echo "::error::Release tag '$REF_NAME' is a lightweight tag. Cut it signed:" \
+                 "git tag -s $REF_NAME (docs/RELEASE.md step 5)."
+            exit 1
+          fi
+          tag_json=$(gh api "repos/$GH_REPO/git/tags/$tag_sha")
+          verified=$(jq -r '.verification.verified' <<<"$tag_json")
+          reason=$(jq -r '.verification.reason' <<<"$tag_json")
+          if [ "$verified" != "true" ]; then
+            echo "::error::Release tag '$REF_NAME' signature not verified (reason: $reason)." \
+                 "Sign with git tag -s using a GPG key registered on your GitHub account."
+            exit 1
+          fi
+          echo "Signed-tag check passed: '$REF_NAME' ($reason)."
+
+      - name: Resolve version and enforce tag match
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          TEST_PYPI: ${{ inputs.test_pypi }}
+        run: |
+          VERSION=$(python3 -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              print(tomllib.load(f)['project']['version'])
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$TEST_PYPI" != "true" ]; then
+              echo "::error::Manual runs only support the TestPyPI dry run (test_pypi: true)." \
+                   "Real releases must go through a signed tag push (docs/RELEASE.md step 5)."
+              exit 1
+            fi
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+            echo "Dry run: will publish aetherscan $VERSION to test.pypi.org"
+            exit 0
+          fi
+          echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::Release runs must be triggered by a tag push, got ref type '$REF_TYPE'."
+            exit 1
+          fi
+          if [ "$REF_NAME" != "v$VERSION" ]; then
+            echo "::error::Tag '$REF_NAME' does not match pyproject.toml version '$VERSION'" \
+                 "(expected tag 'v$VERSION'). Land the release PR that bumps the version," \
+                 "then tag its merge commit (docs/RELEASE.md steps 4-5)."
+            exit 1
+          fi
+          echo "Version guard passed: $REF_NAME == v$VERSION"
+
+  # Gate 2: a release build must not outrun a red suite. Calls tests.yml as a reusable
+  # workflow — the same suite and selection as regular CI, by construction.
+  tests:
+    needs: guard
+    uses: ./.github/workflows/tests.yml
+
+  # Gate 3: verify the blessed weights tag exists on the HF model repo (public read, no
+  # token). Verify, never create: if this fails, the release runbook's weight-blessing step
+  # was skipped — the fix is utils/hf_tag_release.py, not anything in CI.
+  verify-weights:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip on dry run
+        if: needs.guard.outputs.dry_run == 'true'
+        run: |
+          echo "Dry run: skipping HF weights verification — pre-release versions" \
+               "(${{ needs.guard.outputs.version }}) never have a blessed weights tag."
+
+      - name: Set up Python
+        if: needs.guard.outputs.dry_run != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify HF weights tag exists
+        if: needs.guard.outputs.dry_run != 'true'
+        env:
+          RELEASE_TAG: v${{ needs.guard.outputs.version }}
+        run: |
+          # Range mirrors requirements-container.txt
+          pip install "huggingface_hub>=1.21,<1.22"
+          python - <<'EOF'
+          import os
+          import sys
+
+          from huggingface_hub import HfApi
+
+          repo_id = os.environ["HF_WEIGHTS_REPO"]
+          tag = os.environ["RELEASE_TAG"]
+          tags = [ref.name for ref in HfApi().list_repo_refs(repo_id, repo_type="model").tags]
+          if tag in tags:
+              print(f"Weights tag '{tag}' exists on https://huggingface.co/{repo_id} — OK")
+              sys.exit(0)
+          print(
+              f"::error::Weights tag '{tag}' not found on https://huggingface.co/{repo_id} "
+              f"(existing tags: {', '.join(sorted(tags)) or 'none'}). CD verifies release "
+              f"weights but never creates them. Bless the trained weights first — "
+              f"python utils/hf_tag_release.py --save-tag <final_vN> --release {tag} — "
+              f"then re-run this workflow. The git tag is already correct; do not re-push it. "
+              f"See docs/RELEASE.md step 3."
+          )
+          sys.exit(1)
+          EOF
+
+  # Build the sdist + wheel from the tagged source, and smoke the wheel: it must install
+  # and report exactly the guarded version.
+  build:
+    needs: [guard, tests, verify-weights]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Smoke the wheel (installs and reports the guarded version)
+        env:
+          EXPECTED_VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          # --no-deps: the full dependency tree (TF + CUDA wheels) is exercised by the test
+          # jobs; here we only check packaging metadata and importability.
+          pip install --no-deps dist/*.whl
+          INSTALLED=$(python -c "import aetherscan; print(aetherscan.__version__)")
+          if [ "$INSTALLED" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Installed wheel reports version '$INSTALLED', expected '$EXPECTED_VERSION'."
+            exit 1
+          fi
+          echo "Wheel smoke passed: aetherscan.__version__ == $INSTALLED"
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # Publish via PyPI trusted publishing (OIDC): the `pypi` / `testpypi` GitHub environment
+  # plus id-token permission is the whole credential — no stored API token.
+  publish:
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.guard.outputs.dry_run == 'true' && 'testpypi' || 'pypi' }}
+      url: ${{ needs.guard.outputs.dry_run == 'true' && 'https://test.pypi.org/p/aetherscan' || 'https://pypi.org/p/aetherscan' }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI (dry run)
+        if: needs.guard.outputs.dry_run == 'true'
+        # SHA-pinned (not @release/v1) because this is the only job holding the PyPI publish
+        # credential (id-token); claude-dependency-check.yml flags a newer release weekly to bump.
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # The static pre-release version isn't bumped between releases, so a repeated dry run
+          # re-uploads the same filename; skip-existing keeps the "recommended before the first
+          # real release" dry run idempotent instead of hard-failing on TestPyPI's 400.
+          skip-existing: true
+
+      - name: Publish to PyPI
+        if: needs.guard.outputs.dry_run != 'true'
+        # SHA-pinned (not @release/v1) because this is the only job holding the PyPI publish
+        # credential (id-token); claude-dependency-check.yml flags a newer release weekly to bump.
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
+        with:
+          # Idempotent partial-failure recovery: if PyPI publish succeeds but a later gate
+          # (github-release) fails, re-running the whole workflow won't hard-fail here on the
+          # already-published (immutable) version. The guard job still pins tag == version.
+          skip-existing: true
+
+  # Decorate the tag into a GitHub Release with generated notes and the built artifacts
+  # attached. The generated notes are a starting point — curate the body from the per-PR
+  # claude-release-notes comments afterwards (docs/RELEASE.md step 6).
+  github-release:
+    needs: [guard, publish]
+    if: needs.guard.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ needs.guard.outputs.version }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --generate-notes

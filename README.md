@@ -6,6 +6,8 @@
     Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale
     <br />
     <br />
+    <a href="https://github.com/zachtheyek/Aetherscan/actions/workflows/tests.yml"><img src="https://github.com/zachtheyek/Aetherscan/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+    <a href="https://pypi.org/project/aetherscan/"><img src="https://img.shields.io/pypi/v/aetherscan.svg" alt="PyPI"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License"></a>
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%E2%80%933.12-blue.svg" alt="Python"></a>
     <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.17-orange.svg" alt="TensorFlow"></a>
@@ -478,10 +480,9 @@ options:
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
   --dashboard, --no-dashboard
-                        Auto-launch the live monitoring dashboard
-                        (utils/dashboard.py) for this run; SSH-forward the
-                        port to view it (default: on). Use --no-dashboard to
-                        disable
+                        Auto-launch the live monitoring Streamlit dashboard
+                        for this run; SSH-forward the port to view it
+                        (default: on). Use --no-dashboard to disable
   --dashboard-port DASHBOARD_PORT
                         Port for the auto-launched live dashboard (default:
                         8501)
@@ -774,10 +775,9 @@ options:
                         Path to output directory (overrides
                         AETHERSCAN_OUTPUT_PATH environment variable)
   --dashboard, --no-dashboard
-                        Auto-launch the live monitoring dashboard
-                        (utils/dashboard.py) for this run; SSH-forward the
-                        port to view it (default: on). Use --no-dashboard to
-                        disable
+                        Auto-launch the live monitoring Streamlit dashboard
+                        for this run; SSH-forward the port to view it
+                        (default: on). Use --no-dashboard to disable
   --dashboard-port DASHBOARD_PORT
                         Port for the auto-launched live dashboard (default:
                         8501)
@@ -924,9 +924,10 @@ options:
   --hf-revision HF_REVISION
                         HuggingFace revision (tag, branch, or commit hash) to
                         pin the model download to when no local artifact paths
-                        are given (default: the repo's latest release tag —
-                        highest semver vX.Y.Z tag, falling back to the highest
-                        final_vX training tag)
+                        are given (default: v{package version} when running as
+                        an installed release, else the repo's latest release
+                        tag — highest semver vX.Y.Z tag, falling back to the
+                        highest final_vX training tag)
   --save-tag SAVE_TAG   Tag for current pipeline run. Current timestamp used
                         (YYYYMMDD_HHMMSS) if none specified
   --force-tag, --no-force-tag

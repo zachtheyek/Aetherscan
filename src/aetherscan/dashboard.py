@@ -8,12 +8,16 @@ stats suite, a live latent-space scatter, the stage timeline (PR #134), and infe
 stats — plus a gallery of every saved plot PNG (RF diagnostics, latent traversals, inference
 figures) as it appears on disk.
 
-Like utils/benchmark_report.py it is STANDALONE — no `aetherscan` imports, only stdlib sqlite3 +
-numpy + pandas + plotly + streamlit — so it runs against a live run's DB or one fetched from a
-cluster with utils/fetch_run_outputs.sh. main.py auto-launches it (--no-dashboard to opt out); it
-can also be run by hand:
+It is STANDALONE — no `aetherscan` imports (like utils/benchmark_report.py), only stdlib sqlite3 +
+numpy + pandas + plotly + streamlit — so streamlit can execute it directly and it runs against a
+live run's DB or one fetched from a cluster with utils/fetch_run_outputs.sh. It ships inside the
+package (src/aetherscan/dashboard.py) so every install method (pip `aetherscan[dashboard]`, the
+container, or a source checkout) can auto-launch it. main.py auto-launches it (--no-dashboard to
+opt out); to run it by hand against a saved DB, point streamlit at the installed module file:
 
-    streamlit run utils/dashboard.py -- --db-path /path/to/aetherscan.db --tag final_v1
+    streamlit run "$(python -c 'import aetherscan, os; \
+        print(os.path.join(os.path.dirname(aetherscan.__file__), "dashboard.py"))')" \
+        -- --db-path /path/to/aetherscan.db --tag final_v1
 
 To watch a run on a cluster, SSH-forward the port:  ssh -L 8501:localhost:8501 blpc3
 

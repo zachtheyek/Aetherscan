@@ -9,7 +9,16 @@ exposes only the version string.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+# Version is single-sourced from pyproject.toml's [project].version via the installed
+# distribution's metadata. Source-tree runs (PYTHONPATH=src, the NGC container) have no
+# installed distribution — they fall back to a dev sentinel, which also keeps the
+# version-coupled HF weight resolution (hf_hub.version_default_revision) inactive there.
+try:
+    __version__ = version("aetherscan")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
 __author__ = "Zach Yek"
 
 # TODO: determine which components are necessary to expose for public API

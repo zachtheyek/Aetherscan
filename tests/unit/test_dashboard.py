@@ -1,6 +1,6 @@
-"""Unit tests for utils/dashboard.py's pure data layer (the SQL/shaping/PCA/artifact helpers that
-back the live Streamlit dashboard). The Streamlit/plotly render layer is not imported here — it is
-loaded lazily inside dashboard.render(), so this test needs only numpy + pandas + sqlite3."""
+"""Unit tests for aetherscan/dashboard.py's pure data layer (the SQL/shaping/PCA/artifact helpers
+that back the live Streamlit dashboard). The Streamlit/plotly render layer is not imported here — it
+is loaded lazily inside dashboard.render(), so this test needs only numpy + pandas + sqlite3."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# utils/ is not a package — load the dashboard tool straight from its file (same pattern as
-# test_benchmark.py loads benchmark_report).
-_DASHBOARD_PATH = Path(__file__).resolve().parents[2] / "utils" / "dashboard.py"
+# Load the dashboard module straight from its file — standalone (no aetherscan/TF import), so the
+# data layer is testable with just numpy + pandas + sqlite3 even though it now ships in the package.
+_DASHBOARD_PATH = Path(__file__).resolve().parents[2] / "src" / "aetherscan" / "dashboard.py"
 _spec = importlib.util.spec_from_file_location("dashboard", _DASHBOARD_PATH)
 dashboard = importlib.util.module_from_spec(_spec)
 sys.modules["dashboard"] = dashboard

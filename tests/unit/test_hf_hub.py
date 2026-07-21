@@ -12,6 +12,7 @@ import joblib
 import numpy as np
 import pytest
 
+import aetherscan
 from aetherscan import hf_hub
 from aetherscan.config import get_config
 from aetherscan.hf_hub import (
@@ -27,7 +28,15 @@ from aetherscan.hf_hub import (
     resolve_inference_artifacts,
     select_default_revision,
     upload_run_to_hf,
+    version_default_revision,
 )
+
+
+def _set_version(monkeypatch, value):
+    """Pin aetherscan.__version__ (read lazily by version_default_revision) for one test, so
+    resolution behavior never depends on whether the package happens to be pip-installed in
+    the environment running the suite."""
+    monkeypatch.setattr(aetherscan, "__version__", value)
 
 
 class _FakeHfApi:
@@ -157,6 +166,31 @@ class TestSelectDefaultRevision:
         assert select_default_revision([]) is None
 
 
+class TestVersionDefaultRevision:
+    """The version-coupled default only activates for real installed releases (strict X.Y.Z);
+    every other version shape — crucially the source-tree fallback and .dev pre-releases —
+    must return None so resolution falls through to the repo's latest release tag."""
+
+    def test_installed_release_yields_version_tag(self, monkeypatch):
+        _set_version(monkeypatch, "1.2.3")
+        assert version_default_revision() == "v1.2.3"
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "0.0.0.dev0",  # the importlib.metadata PackageNotFoundError fallback
+            "0.9.0.dev0",  # a pip install of a between-releases source tree
+            "1.0.0rc1",  # release candidate
+            "1.0.0.post1",  # post-release
+            "1.0.0+local",  # local version
+            "1.0",  # not a full X.Y.Z
+        ],
+    )
+    def test_non_release_versions_are_guarded(self, monkeypatch, version):
+        _set_version(monkeypatch, version)
+        assert version_default_revision() is None
+
+
 class TestResolveHfRevision:
     def test_explicit_revision_returned_without_listing(self, monkeypatch):
         def boom(repo_id):
@@ -165,11 +199,33 @@ class TestResolveHfRevision:
         monkeypatch.setattr(hf_hub, "list_hf_tags", boom)
         assert resolve_hf_revision("ns/repo", "test_v17") == "test_v17"
 
+    def test_explicit_revision_outranks_installed_release(self, monkeypatch):
+        _set_version(monkeypatch, "1.2.3")
+        assert resolve_hf_revision("ns/repo", "final_v9") == "final_v9"
+
+    def test_installed_release_pins_own_version_without_listing(self, monkeypatch):
+        # An installed release resolves v{__version__} directly — no tag listing, and no
+        # silent fallback to other weights (a missing tag must fail the download instead).
+        _set_version(monkeypatch, "1.2.3")
+
+        def boom(repo_id):
+            raise AssertionError("must not list tags for a version-pinned revision")
+
+        monkeypatch.setattr(hf_hub, "list_hf_tags", boom)
+        assert resolve_hf_revision("ns/repo", None) == "v1.2.3"
+
+    def test_dev_version_falls_through_to_latest_release(self, monkeypatch):
+        _set_version(monkeypatch, "0.9.0.dev0")
+        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["final_v1", "v0.2.0"])
+        assert resolve_hf_revision("ns/repo", None) == "v0.2.0"
+
     def test_latest_release_selected(self, monkeypatch):
+        _set_version(monkeypatch, "0.0.0.dev0")
         monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["final_v1", "v0.2.0"])
         assert resolve_hf_revision("ns/repo", None) == "v0.2.0"
 
     def test_no_resolvable_tag_raises_with_guidance(self, monkeypatch):
+        _set_version(monkeypatch, "0.0.0.dev0")
         monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["test_v1"])
         with pytest.raises(RuntimeError, match="--hf-revision"):
             resolve_hf_revision("ns/repo", None)
@@ -178,6 +234,7 @@ class TestResolveHfRevision:
         def boom(repo_id):
             raise ConnectionError("no route to host")
 
+        _set_version(monkeypatch, "0.0.0.dev0")
         monkeypatch.setattr(hf_hub, "list_hf_tags", boom)
         with pytest.raises(RuntimeError, match="--hf-revision"):
             resolve_hf_revision("ns/repo", None)
@@ -290,6 +347,7 @@ class TestResolveInferenceArtifacts:
         assert args.config_path == f"/cache/{HF_CONFIG_FILENAME}"
 
     def test_no_paths_no_revision_resolves_latest_and_records_provenance(self, monkeypatch):
+        _set_version(monkeypatch, "0.0.0.dev0")
         monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["v0.1.0", "final_v3"])
         monkeypatch.setattr(hf_hub, "_hf_hub_download", lambda **kw: f"/cache/{kw['filename']}")
         args = self._args()
@@ -297,6 +355,25 @@ class TestResolveInferenceArtifacts:
         # The resolved revision is written back to args so it lands in config.hf.revision
         # (and the saved inference config) via apply_args_to_config.
         assert args.hf_revision == "v0.1.0"
+
+    def test_installed_release_downloads_own_version_tag(self, monkeypatch):
+        # The release contract: pip install aetherscan==1.2.3 + bare inference downloads
+        # exactly the v1.2.3 weights, without ever listing the repo's tags.
+        _set_version(monkeypatch, "1.2.3")
+        monkeypatch.setattr(
+            hf_hub, "list_hf_tags", lambda repo_id: pytest.fail("must not list tags")
+        )
+        downloads = []
+
+        def fake_download(**kw):
+            downloads.append(kw["revision"])
+            return f"/cache/{kw['filename']}"
+
+        monkeypatch.setattr(hf_hub, "_hf_hub_download", fake_download)
+        args = self._args()
+        resolve_inference_artifacts(args)
+        assert set(downloads) == {"v1.2.3"}
+        assert args.hf_revision == "v1.2.3"
 
     def test_download_failure_wrapped_with_guidance(self, monkeypatch):
         def boom(**kwargs):

@@ -11,8 +11,10 @@ save_tag, e.g. final_v3, created by upload_run_to_hf after training) and release
 Upload (train, opt-in via --hf-upload) stages the four run artifacts under the stable names,
 commits them with the save_tag as the commit message, and tags the commit. Download
 (inference, the default when no local artifact paths are given) resolves a revision —
-explicit --hf-revision, else the highest semver vX.Y.Z tag, else the highest final_vX tag —
-and pulls the artifact trio revision-pinned via hf_hub_download.
+explicit --hf-revision, else v{__version__} when running as an installed release (see
+version_default_revision — this is what makes `pip install aetherscan==1.0.0` + bare
+inference pull exactly the v1.0.0 weights), else the highest semver vX.Y.Z tag, else the
+highest final_vX tag — and pulls the artifact trio revision-pinned via hf_hub_download.
 
 Auth: uploads require HF_TOKEN in the environment (loaded from the gitignored .env);
 huggingface_hub reads it implicitly. The repo is public, so downloads need no token. The
@@ -130,15 +132,48 @@ def select_default_revision(tags: list[str]) -> str | None:
     return None
 
 
+def version_default_revision() -> str | None:
+    """
+    The version-coupled default HF revision — f"v{__version__}" — or None when this run's
+    version can't name a release tag. This is the runtime half of the release contract
+    (docs/RELEASE.md): `pip install aetherscan==1.0.0` + inference with no model-path flags
+    downloads exactly the v1.0.0-blessed weights, because the installed package version is
+    the default revision.
+
+    Guard: the default only activates when v{__version__} lands in the release-tag family
+    (_SEMVER_TAG_PATTERN, strict vX.Y.Z). The importlib.metadata fallback ("0.0.0.dev0" —
+    source-tree/container runs), .dev pre-releases (e.g. "0.9.0.dev0" — a pip install of a
+    between-releases tree), and rc/post/local versions all fail the match and fall through
+    to latest-release resolution instead. Deliberately NOT existence-checked: an installed
+    release whose weights tag is missing must fail the download loudly (the release
+    runbook's blessing step was skipped) rather than silently pull some other version's
+    weights.
+    """
+    import aetherscan  # noqa: PLC0415  (late import so tests can monkeypatch __version__)
+
+    candidate = f"v{aetherscan.__version__}"
+    if not _SEMVER_TAG_PATTERN.match(candidate):
+        return None
+    return candidate
+
+
 def resolve_hf_revision(repo_id: str, revision: str | None) -> str:
     """
     Resolve the HF revision inference should download from: an explicitly requested revision
-    is returned as-is (existence is checked by the download itself), otherwise the repo's
-    tags are listed and select_default_revision picks the latest release. Raises RuntimeError
-    with guidance when nothing is resolvable.
+    is returned as-is (existence is checked by the download itself); otherwise an installed
+    release pins its own version's tag (version_default_revision — also download-checked);
+    otherwise the repo's tags are listed and select_default_revision picks the latest
+    release. Raises RuntimeError with guidance when nothing is resolvable.
     """
     if revision is not None:
         return revision
+    version_pinned = version_default_revision()
+    if version_pinned is not None:
+        logger.info(
+            f"Resolved HF revision '{version_pinned}' (pinned to the installed aetherscan "
+            f"release; override with --hf-revision)"
+        )
+        return version_pinned
     try:
         tags = list_hf_tags(repo_id)
     except Exception as e:
@@ -189,7 +224,8 @@ def resolve_inference_artifacts(args: argparse.Namespace) -> None:
     """
     Ensure the inference artifact trio (encoder/rf/config paths) is populated on `args`
     before validation runs, in resolution order: explicit local paths (highest) >
-    --hf-revision > latest release tag on the HF repo.
+    --hf-revision > v{__version__} when running as an installed release (see
+    version_default_revision) > latest release tag on the HF repo.
 
     When none of the three paths were given, the resolved revision's artifacts are
     downloaded and their cache paths written onto `args` — exactly as if the user had passed

@@ -49,7 +49,7 @@ class MonitorConfig:
     # as labeled translucent bands on the resource plot's CPU panel, so utilization
     # plateaus are attributable to pipeline stages at a glance
     annotate_stages: bool = True
-    # Live monitoring dashboard (utils/dashboard.py) auto-launched by main.py at run start;
+    # Live monitoring dashboard (aetherscan/dashboard.py) auto-launched by main.py at run start;
     # --no-dashboard opts out. Served headless on dashboard_port (SSH-forward to reach it).
     dashboard_enabled: bool = True
     dashboard_port: int = 8501
