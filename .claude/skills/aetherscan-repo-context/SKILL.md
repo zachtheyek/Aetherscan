@@ -28,7 +28,7 @@ CLI flags are identical between the two paths; only the launcher differs. `PYTHO
 - **Conda env:** `conda env create -f environment.yml && conda activate aetherscan`
 - **`utils/fetch_run_outputs.sh`** rsyncs one run's outputs from remote cluster node(s) to the local `outputs/` tree, selecting files by the universal `*_<save_tag>.*` suffix and renaming each to `<machine>_<basename>` (collision-free across nodes). `<train|inference> <save_tag> <machine>...`; `--all` adds train checkpoints/archive, `--db` pulls the SQLite DB into `outputs/data/db/`, `--dry-run`. Assumes tagged log filenames; the inference branch is provisional pending the inference pipeline.
 - **`utils/kill_pipeline.sh`** stops a running pipeline (main process + all worker children) from a separate shell on the same machine — works for both run modes, finds the process tree itself, and tries a graceful SIGTERM (lets `ResourceManager` close pools/SHM) before escalating to SIGKILL. Assumes a single running instance. `--force` / `--dry-run` / `--timeout N`.
-- **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container.
+- **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container. `AETHERSCAN_EXTRA_BINDS` (comma-separated host paths) appends additional 1:1 binds for data outside the standard dirs (e.g. raw `.h5` files under `/datag` for inference); the runtime's native `SINGULARITY_BIND` / `APPTAINER_BIND` still pass through and are additive.
 - **`utils/start_tmux_session.sh`** (optional) spins up a four-window monitoring tmux session (htop/CPU-MEM, `nvidia-smi`, `/dev/shm`, `tree` of models/outputs). Idempotent.
 
 **Common invocations:**
@@ -47,8 +47,9 @@ PYTHONPATH=src python -m aetherscan.main train --save-tag final_v1
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json
 
-# Inference from raw .h5 (triggers energy-detection preprocessing)
-./utils/run_container.sh python -m aetherscan.main inference \
+# Inference from raw .h5 (triggers energy-detection preprocessing) — bind
+# extra host paths if the .h5 files live outside the standard bind mounts
+AETHERSCAN_EXTRA_BINDS=/datag ./utils/run_container.sh python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
@@ -72,13 +73,16 @@ At runtime, the singleton `Config` is read via `get_config()` and may be modifie
 **Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards only `SLACK_*` and `AETHERSCAN_*` via `--env`; the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
 
 ```ini
-# .env example (Slack integration auto-disables if unset)
-SLACK_BOT_TOKEN=your-slack-bot-token
-SLACK_CHANNEL=your-slack-channel
+# .env example
 # Defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan; CLI flags override
 AETHERSCAN_DATA_PATH=/path/to/data
 AETHERSCAN_MODEL_PATH=/path/to/models
 AETHERSCAN_OUTPUT_PATH=/path/to/outputs
+# Optional: comma-separated extra host paths for run_container.sh to bind 1:1
+AETHERSCAN_EXTRA_BINDS=/extra/host/paths
+# Slack integration auto-disables if unset
+SLACK_BOT_TOKEN=your-slack-bot-token
+SLACK_CHANNEL=your-slack-channel
 ```
 
 **The CLI Reference in `README.md` is a tight source↔doc contract.** The three code blocks under `## CLI Reference` (Top-Level / Train / Inference Help) are pasted-verbatim argparse output. If `src/aetherscan/cli.py` changes (flags, help strings, subparsers), regenerate them from the repo root with:
