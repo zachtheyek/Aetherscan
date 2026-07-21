@@ -5,13 +5,16 @@ create_* cadence generators, and intensity statistics."""
 
 from __future__ import annotations
 
+import itertools
 import math
 import random
 
 import numpy as np
 import pytest
 
+from aetherscan import data_generation
 from aetherscan.data_generation import (
+    MAX_INTERSECTION_RETRIES,
     _compute_intensity_stats,
     check_valid_intersection,
     create_false,
@@ -19,6 +22,7 @@ from aetherscan.data_generation import (
     create_true_single,
     log_norm,
     new_cadence,
+    write_segment_stats,
 )
 
 # Keep injection fast: small frequency axis, real-ish resolutions.
@@ -273,6 +277,45 @@ class TestCreateCadences:
             sample_info["signal_info"]["rfi_y_intercept"],
             sample_info["signal_info"]["eti_y_intercept"],
         )
+        # Retry-cap telemetry (#118): real geometry accepts well before the cap.
+        assert sample_info["intersection_retries"] >= 1
+        assert sample_info["intersection_retry_capped"] is False
+
+    def _stub_injections(self, monkeypatch):
+        # Replace the expensive setigen injection with a shape-preserving stub whose slope
+        # differs on every call, so the slope_1 != slope_2 guard never causes a retry and
+        # the retry count is driven purely by the (patched) intersection check.
+        calls = itertools.count(1)
+
+        def fake_new_cadence(data, snr, width_bin, freq_resolution, time_resolution):
+            signal_info = {
+                "snr": float(snr),
+                "drift_rate": 1.0,
+                "signal_width": 1.0,
+                "starting_bin": 1.0,
+                "slope_pixel": float(next(calls)),
+                "y_intercept": 0.0,
+            }
+            return data, signal_info, False
+
+        monkeypatch.setattr(data_generation, "new_cadence", fake_new_cadence)
+
+    def test_true_double_retry_cap_clamps_and_flags(self, plate, monkeypatch):
+        # Always-rejecting geometry must terminate at the cap, keep the last drawn pair,
+        # and flag the sample — not raise and not spin forever (#118).
+        self._stub_injections(monkeypatch)
+        monkeypatch.setattr(data_generation, "check_valid_intersection", lambda *a: False)
+        final, sample_info = create_true_double(plate, **self._kwargs())
+        assert final.shape == (6, 16, _WIDTH_BIN)
+        assert sample_info["intersection_retries"] == MAX_INTERSECTION_RETRIES
+        assert sample_info["intersection_retry_capped"] is True
+
+    def test_true_double_first_attempt_accept_records_one_retry(self, plate, monkeypatch):
+        self._stub_injections(monkeypatch)
+        monkeypatch.setattr(data_generation, "check_valid_intersection", lambda *a: True)
+        _, sample_info = create_true_double(plate, **self._kwargs())
+        assert sample_info["intersection_retries"] == 1
+        assert sample_info["intersection_retry_capped"] is False
 
 
 class TestComputeIntensityStats:
@@ -302,3 +345,58 @@ class TestComputeIntensityStats:
         # is_finite=0 rather than rejecting the write.
         assert math.isnan(stats["global_skew"])
         assert math.isnan(stats["global_kurtosis"])
+
+
+class _RecordingDB:
+    """Minimal stand-in for the DB singleton: records write_injection_stat calls."""
+
+    def __init__(self):
+        self.calls = []
+
+    def write_injection_stat(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+class TestWriteSegmentStats:
+    def _sample_info(self, **extra):
+        info = {
+            "background_index": 0,
+            "intensity_stats": {s: dict.fromkeys(_STAT_KEYS, 0.0) for s in ("A", "B", "C")},
+            "signal_info": {},
+            "slope_was_clamped": False,
+        }
+        info.update(extra)
+        return info
+
+    def _segment(self, stats_list):
+        return {
+            "round_number": 0,
+            "chunk_number": 0,
+            "signal_class": "true",
+            "signal_type": "true_eti_rfi",
+            "timestamp": 123.0,
+            "stats_list": stats_list,
+            "snr_range_floor": 10.0,
+            "snr_range_ceil": 15.0,
+            "num_samples": len(stats_list),
+            "inject_duration": 1.0,
+        }
+
+    def test_emits_intersection_retry_rows_for_true_double_samples(self):
+        db = _RecordingDB()
+        sample = self._sample_info(intersection_retries=7, intersection_retry_capped=True)
+        write_segment_stats(db, "test_tag", self._segment([sample]))
+        rows = {c["stat_name"]: c for c in db.calls if c["stat_name"].startswith("intersection_")}
+        assert set(rows) == {"intersection_retries", "intersection_retry_capped"}
+        assert rows["intersection_retries"]["value"] == 7.0
+        assert rows["intersection_retry_capped"]["value"] == 1.0
+        for row in rows.values():
+            assert row["sample_index"] == 0
+            assert row["injection_stage"] is None
+            assert row["signal_type"] == "true_eti_rfi"
+
+    def test_no_retry_rows_for_samples_without_retry_keys(self):
+        # create_false / create_true_single samples carry no retry telemetry — no rows.
+        db = _RecordingDB()
+        write_segment_stats(db, "test_tag", self._segment([self._sample_info()]))
+        assert not [c for c in db.calls if c["stat_name"].startswith("intersection_")]
