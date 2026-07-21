@@ -12,7 +12,7 @@ One SQLite file — `{output_path}/db/aetherscan.db`, WAL mode — behind a thre
 `queue.Queue` drained by **one background writer thread** that batches rows and commits with
 `executemany()`; reads open short-lived connections directly. Failed-attempt rows are never
 deleted — they're flagged `superseded = 1`, and every query filters them out by default.
-Schema evolution is a minimal `PRAGMA user_version` gate (currently version 3).
+Schema evolution is a minimal `PRAGMA user_version` gate (currently version 4).
 
 > [!IMPORTANT]
 > The write queue is a **thread** queue, not process-safe. Worker *processes* must never call
@@ -99,7 +99,7 @@ span bounds instead.
 | `latent_snapshots` | per viz cadence per capture | yes | v0 (+ column v1) |
 | `inference_results` | positives only | yes | v0 (+ column v1) |
 | `inference_cadences` | per-cadence run manifest | yes | v2 |
-| `pipeline_stages` | per timed stage span | no (attempt-agnostic history) | v3 |
+| `pipeline_stages` | per timed stage span | no (attempt-agnostic history) | v4 |
 
 The `superseded` column and its default-filtering are what make same-tag retries safe; see
 [the migration section](#schema-migration) for how the `user_version` stamp maps to these.
@@ -200,11 +200,12 @@ resume ([`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)).
 | `n_stamps`, `n_candidates` | INTEGER | Aggregates (candidates only on `inferred` rows) |
 | `confidence_summary` | TEXT | JSON from `inference.summarize_confidences`: n, threshold, above-threshold count, mean/min/max, quantiles p01–p99 |
 | `duration_s` | REAL | Stage wall time |
+| `config_fingerprint` | TEXT | Fingerprint of the inference-result-affecting config; the stage-aware resume reuses an `inferred` row only if its stored fingerprint matches the current run (guards a reused `--save-tag` with a changed inference config) |
 | `superseded` | INTEGER | Default 0 |
 
 Index: `(tag, npy_path, status)` — the resume lookup.
 
-### `pipeline_stages` (stage timers, schema v3)
+### `pipeline_stages` (stage timers, schema v4)
 
 One row per timed pipeline-stage span, written by the always-on stage timers in
 [`aetherscan.benchmark`](../src/aetherscan/benchmark.py) (`stage_timer` / `record_stage`) via
@@ -225,23 +226,29 @@ attempt, each with its own span.
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 3`). The stamp maps to schema features as:
+(`_SCHEMA_VERSION = 4`). The stamp maps to schema features as:
 
 | `user_version` | What it added | Migration work |
 | --- | --- | --- |
 | v0 | pre-versioning baseline (any db with no stamp) | — |
 | v1 | `superseded INTEGER DEFAULT 0` on `training_stats`, `injection_stats`, `latent_snapshots`, `inference_results` | additive `ALTER TABLE ... ADD COLUMN` |
 | v2 | the `inference_cadences` run-manifest table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
-| v3 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
+| v3 | `config_fingerprint TEXT` on `inference_cadences` | additive `ALTER TABLE ... ADD COLUMN` |
+| v4 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
   what supersede semantics needed. A per-table column-existence check (`PRAGMA table_info`)
   keeps the step idempotent even if `user_version` was lost (a db file copied without its
   journal).
-- **v1 → v2** (`inference_cadences`) and **v2 → v3** (`pipeline_stages`): no migration step
+- **v1 → v2** (`inference_cadences`) and **v3 → v4** (`pipeline_stages`): no migration step
   needed — `CREATE TABLE IF NOT EXISTS` in `_init_database()` creates each new table for old
   and new databases alike *before* `_migrate_schema()` runs; only the version stamp advances.
+- **v2 → v3** (`inference_cadences.config_fingerprint`): additive
+  `ALTER TABLE inference_cadences ADD COLUMN config_fingerprint TEXT`, made idempotent by the
+  same `PRAGMA table_info` column-existence check as the v0 → v1 step (a fresh db already has
+  the column from `CREATE TABLE`, so the ALTER only patches a db that created the v2 table
+  before the column existed).
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped.
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a

@@ -108,6 +108,11 @@ src/aetherscan/
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
 ├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection (setigen)
+├── benchmark.py         # Always-on stage timing to the pipeline_stages table
+├── dashboard.py         # Streamlit live-monitoring dashboard (DB-driven)
+├── dashboard_launcher.py # Spawns the headless dashboard subprocess (guarded)
+├── hf_hub.py            # HuggingFace Hub artifact upload/download
+├── tag_guards.py        # Fail-early --save-tag dedup guards
 ├── models/{vae,random_forest}.py
 ├── db/db.py             # Thread-safe SQLite, async queue-based writes
 ├── logger/              # Multi-handler logging + Slack integration

@@ -105,6 +105,16 @@ response's (`pfb.edge_mid_power_ratio`) and warns once per file when they disagr
 the cue to fix the tap count or use `--bandpass-method spline`. `--bandpass-debug-plot` saves
 a raw-vs-flattened overlay for visual confirmation.
 
+**Provenance of the GBT/BL parameters.** The defaults `pfb_taps_per_channel = 12`, the Hamming
+window, and the sinc prototype aren't guesses: the GBT Breakthrough Listen backend PFB was
+confirmed as the CASPER `GBT512` configuration — `nchan=1024, ntaps=12, width=1.0,
+window=hamming, lpf=sinc` (from
+[PFBPassband.jl](https://github.com/david-macmahon/PFBPassband.jl)) — which is exactly what
+[`pfb.py`](../src/aetherscan/pfb.py) models. One caveat: that reference config also carries a
+`bug=true` flag capturing a sinc-approximation quirk in the real hardware, whereas `pfb.py`
+computes the sinc exactly. The resulting modeled-vs-hardware difference is small and is tracked
+in issue #180.
+
 ### The detection statistic: vectorized D'Agostino–Pearson
 
 Narrowband signals make the flattened residuals *non-Gaussian* within a small frequency

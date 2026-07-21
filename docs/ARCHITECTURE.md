@@ -58,6 +58,11 @@ Physical constants ride along in `DataConfig`: `freq_resolution` ≈ 2.79 Hz/bin
 | [`inference_viz.py`](../src/aetherscan/inference_viz.py) | End-of-run inference visualization suite (ED distributions, galleries, latent projection, summary card). |
 | [`models/vae.py`](../src/aetherscan/models/vae.py), [`models/random_forest.py`](../src/aetherscan/models/random_forest.py) | Model definitions. See [`MODELS.md`](MODELS.md). |
 | [`db/db.py`](../src/aetherscan/db/db.py) | Thread-safe SQLite singleton with a single background writer thread, schema migrations, and supersede semantics. See [`DATABASE.md`](DATABASE.md). |
+| [`benchmark.py`](../src/aetherscan/benchmark.py) | Always-on stage timing (`stage_timer` / `record_stage`) written to the `pipeline_stages` table. See [`BENCHMARKING.md`](BENCHMARKING.md). |
+| [`dashboard.py`](../src/aetherscan/dashboard.py) | Standalone Streamlit live-monitoring dashboard read from the run's SQLite DB; ships in-package so any install method can auto-launch it. |
+| [`dashboard_launcher.py`](../src/aetherscan/dashboard_launcher.py) | `launch_dashboard()` spawns the headless Streamlit subprocess (guarded, detached, atexit / SIGTERM teardown). |
+| [`hf_hub.py`](../src/aetherscan/hf_hub.py) | HuggingFace Hub artifact upload/download with version-coupled revision resolution. See [`RELEASE.md`](RELEASE.md). |
+| [`tag_guards.py`](../src/aetherscan/tag_guards.py) | Fail-early `--save-tag` dedup guards run before any expensive work. |
 | [`logger/`](../src/aetherscan/logger), [`manager/`](../src/aetherscan/manager), [`monitor/`](../src/aetherscan/monitor) | Queue-based logging (+ Slack), resource lifecycle management (pools/SHM/processes/signals), 1 Hz resource monitoring. See [`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md). |
 
 ## Data flow
@@ -139,7 +144,10 @@ The order is load-bearing — each step depends on the previous:
 9. `apply_args_to_config(args)` — CLI overrides land on the singleton.
 10. `init_db()` — schema creation + migration, writer thread starts.
 11. `init_monitor()` — 1 Hz sampling into `system_resources`.
-12. Dispatch to `train_command()` / `inference_command()`; a `finally` block calls
+12. `launch_dashboard()` — auto-launch the live monitoring dashboard (opt out with
+    `--no-dashboard`); fully guarded, so a missing streamlit or a spawn failure only warns and
+    never aborts the run.
+13. Dispatch to `train_command()` / `inference_command()`; a `finally` block calls
     `manager.cleanup_all()` so non-daemon threads can't block exit.
 
 Priority order for any parameter: `runtime defaults < loaded config < CLI args`
@@ -257,6 +265,7 @@ see [`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md)).
 - Model math: [`MODELS.md`](MODELS.md)
 - Storage & schema: [`DATABASE.md`](DATABASE.md)
 - Logging/cleanup/monitoring: [`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md)
+- Stage timing & benchmarking: [`BENCHMARKING.md`](BENCHMARKING.md)
 - Tests: [`TESTING.md`](TESTING.md)
 - CI/CD & assistant workflows: [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md)
 - Releases: [`RELEASE.md`](RELEASE.md)

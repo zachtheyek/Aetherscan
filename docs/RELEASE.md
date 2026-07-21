@@ -40,8 +40,11 @@ Two invariants to internalize:
 - **Dependencies**: `[project].dependencies` mirrors
   [`requirements-container.txt`](../requirements-container.txt)'s ranges **plus** the
   packages the NGC base image provides implicitly (`tensorflow[and-cuda]==2.17.*`, `h5py`,
-  `hdf5plugin`, `psutil`, `huggingface_hub`) — a pip install has no base image to lean on.
-  Optional extras: `dev = ["ruff", "pre-commit", "pytest"]`. Dependency *versions* follow
+  `hdf5plugin`, `psutil`) — a pip install has no base image to lean on.
+  Optional extras: `dev = ["ruff", "pre-commit", "pytest"]` and
+  `dashboard = ["streamlit>=1.39,<1.41", "plotly>=5.24,<6", "pandas>=2.0,<3"]` —
+  `pip install aetherscan[dashboard]` pulls the stack for the packaged live dashboard
+  ([`src/aetherscan/dashboard.py`](../src/aetherscan/dashboard.py)). Dependency *versions* follow
   [`SECURITY.md`](../SECURITY.md)'s selection policy, and the documented ceilings
   (`numpy<2.0`, the NGC TF 2.17 ABI) apply to the package exactly as to the container.
 - **Version single-sourcing**: the static `version` in `pyproject.toml` is the only place
@@ -92,21 +95,26 @@ never fails a training run — weights are already safe locally.
 `on: push: tags: ["v*"]`. Steps, in order — each gate exists to make a half-released state
 impossible:
 
-1. **Version guard** — the pushed tag must equal `v` + the `pyproject.toml` version;
+1. **Signed-tag gate** — the `guard` job's "Enforce a signed release tag" step rejects
+   lightweight tags and any tag whose GPG signature GitHub does not verify against a key
+   registered to the tagger's account (releases carry the same provenance as this repo's
+   signed commits). No key material lives in CI — GitHub does the verification. (Skipped on
+   the TestPyPI dry run, which has no tag.)
+2. **Version guard** — the pushed tag must equal `v` + the `pyproject.toml` version;
    otherwise fail loudly before anything publishes. (Prevents tagging a commit whose release
    PR didn't land.)
-2. **Unit tests** — the same selection as `tests.yml`
+3. **Unit tests** — the same selection as `tests.yml`
    (`pytest -m "not gpu and not cluster"`). A release build must not outrun a red suite.
-3. **HF weights verification** — confirm the matching `v*` tag exists on
+4. **HF weights verification** — confirm the matching `v*` tag exists on
    `zachtheyek/aetherscan` (public repo, no token needed). **Verify, never create**: if this
    fails, you skipped the weight-blessing step; the error says so and how to fix it.
-4. **Build** — `python -m build` (sdist + wheel) from the tagged source, then **smoke the
+5. **Build** — `python -m build` (sdist + wheel) from the tagged source, then **smoke the
    wheel**: install it `--no-deps` and assert `aetherscan.__version__` equals the guarded
    version (catches a packaging/version-single-sourcing mismatch before anything publishes).
-5. **Publish to PyPI via trusted publishing** — `pypa/gh-action-pypi-publish` with
-   `permissions: id-token: write` and the `pypi` environment. OIDC-based: **no long-lived
+6. **Publish to PyPI via trusted publishing** — `pypa/gh-action-pypi-publish` (SHA-pinned)
+   with `permissions: id-token: write` and the `pypi` environment. OIDC-based: **no long-lived
    PyPI API token is stored anywhere** in the repo or its secrets.
-6. **GitHub Release** — created from the tag (`gh release create --verify-tag
+7. **GitHub Release** — created from the tag (`gh release create --verify-tag
    --generate-notes`) with the built sdist + wheel attached; curate the body from the
    per-PR `claude-release-notes` comments (see
    [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md)) — they are the raw material, written one
@@ -119,7 +127,7 @@ recommended dry-run before the first real release.
 
 - **PyPI**: create the `aetherscan` project and add GitHub as a **trusted publisher** —
   repository `zachtheyek/Aetherscan`, workflow `release.yml`, environment `pypi`. This is
-  what step 5 authenticates against; no token to rotate, nothing to leak.
+  what step 6 authenticates against; no token to rotate, nothing to leak.
 - **HF**: confirm the model repo `zachtheyek/aetherscan` exists and that the clusters'
   `.env` files carry a write-scoped `HF_TOKEN` (for training uploads only — CD never
   writes to HF).

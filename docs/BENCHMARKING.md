@@ -81,12 +81,12 @@ are shown at full depth; the leaf component is what the report tool and resource
 | `inference.infer_cadence_{i:03d}` (`.load_lognorm`, `.encode`, `.rf`, `.db_write`) | `main.py` / `inference.py` | Per-cadence GPU inference + write |
 | `inference.viz` | `main.py` | Visualization suite |
 
-## The `pipeline_stages` table (schema v3)
+## The `pipeline_stages` table (schema v4)
 
 `record_stage()` calls `db.write_pipeline_stage()`, which queues a
 `("pipeline_stages", values)` record on the writer thread like every other write. The table
 (columns `stage`, `start_time`, `end_time`, `duration_s`, `tag`, `metadata`; index
-`(tag, start_time)`) is documented in full in [`DATABASE.md`](DATABASE.md#pipeline_stages-stage-timers-schema-v3).
+`(tag, start_time)`) is documented in full in [`DATABASE.md`](DATABASE.md#pipeline_stages-stage-timers-schema-v4).
 Retried stages simply append new rows — every attempt keeps its own span, so the report tool
 and resource plot see the full history. There is **no `superseded` column**: timing spans are
 attempt-agnostic history, like `system_resources`.

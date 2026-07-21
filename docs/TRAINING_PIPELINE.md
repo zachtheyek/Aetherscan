@@ -21,10 +21,13 @@ train_command() (main.py)
         3. rf_train     — generate RF data → encode latents → fit RF → persist model+artifacts
         4. rf_plots     — the ten RF diagnostics
         5. final_save   — final models + config_{tag}.json
+        6. hf_upload    — publish artifacts + model card to the HuggingFace Hub (opt-in)
 ```
 
-Stages 1/3/5 are critical (failures raise → retry); 2/4 are non-critical (failures are
+Stages 1/3/5 are critical (failures raise → retry); 2/4/6 are non-critical (failures are
 recorded in the manifest and retried on the next run, but never cost a data regeneration).
+Stage 6 (`hf_upload`) runs only when `config.hf.upload_after_training` is set — a failed
+upload is recorded but never fails the run, since the weights are already safe locally.
 Every stage is skipped if the persisted manifest (`run_state_{tag}.json`) already records it
 as done, so re-running the identical command resumes exactly where the last attempt died.
 
@@ -78,7 +81,7 @@ and `injection_stats` and shows up as background shading on the training plots.
 A full-scale round is three arrays (`main`, `true`, `false`) of shape
 `(499200, 6, 16, 512)` float32 ≈ 98 GB each — ~294 GB per round. Holding that in RAM is what
 used to OOM-kill 503 GB training nodes; instead each round lives on disk under
-`{round_data_dir}/{save_tag}/round_{k:02d}/` (default root `{output_path}/round_data`):
+`{round_data_dir}/{save_tag}/round_{k:02d}/` (default root `{data_path}/training/round_data`):
 
 ```
 round_02/
@@ -92,7 +95,7 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
 [`data_generation.py`](../src/aetherscan/data_generation.py)):
 
 - **Workers write straight into the memmaps.** `generate_round_to_memmap()` dispatches
-  batched tasks (`training.data_gen_task_size` cadences each, default 256) covering disjoint
+  batched tasks (`training.data_gen_task_size` cadences each, default 64) covering disjoint
   row ranges; each worker opens the `.npy` in `r+` mode, writes its rows in place, and
   returns only small stats dicts. No per-sample IPC pickling, one `pool.map` barrier per
   chunk.

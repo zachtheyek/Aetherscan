@@ -183,7 +183,7 @@ run's pipeline-stage spans as labeled translucent bands on the **CPU panel**
 (`_annotate_stage_spans`), turning the utilization curve into a self-explaining timeline: a CPU
 plateau reads as `round_03` (data generation), a GPU band as `epochs`, and so on. The spans
 come from the `pipeline_stages` table written by the always-on stage timers — see
-[`BENCHMARKING.md`](BENCHMARKING.md) for the timers and [`DATABASE.md`](DATABASE.md#pipeline_stages-stage-timers-schema-v3)
+[`BENCHMARKING.md`](BENCHMARKING.md) for the timers and [`DATABASE.md`](DATABASE.md#pipeline_stages-stage-timers-schema-v4)
 for the table.
 
 Two details keep it readable and correct:
@@ -198,3 +198,22 @@ Two details keep it readable and correct:
   the writer thread outlives the monitor in the cleanup order (monitor stops before db); a
   flush timeout just means the very newest spans are missing, never an error. Annotation
   failures are caught and logged — a benchmarking overlay must never break the resource plot.
+
+## Live monitoring dashboard
+
+An auto-launched Streamlit app ([`src/aetherscan/dashboard.py`](../src/aetherscan/dashboard.py))
+gives a live view of a run without waiting for the shutdown plot. `launch_dashboard()`
+([`src/aetherscan/dashboard_launcher.py`](../src/aetherscan/dashboard_launcher.py)) spawns it
+from `main.py` at run start, gated on `config.monitor.dashboard_enabled` (default `True`) and
+served on `config.monitor.dashboard_port` (default `8501`). It reads every plot the DB can
+reconstruct plus a PNG gallery.
+
+- **Served headless.** The subprocess runs `--server.headless`, so on a cluster you
+  SSH-forward the port to view it locally (`ssh -L 8501:localhost:8501 ...`); the launcher logs
+  the exact forward instructions.
+- **Opt out with `--no-dashboard`.** The `--dashboard` / `--no-dashboard` flag (and
+  `--dashboard-port`) is on both subcommands.
+- **Fully guarded.** A missing `streamlit` (it lives in the optional `dashboard` extra) or any
+  spawn failure only warns and never aborts the run — the dashboard is optional observability.
+  Teardown is registered via `atexit` and the `SIGTERM`/`SIGINT` handlers so the server is
+  reaped with the run.

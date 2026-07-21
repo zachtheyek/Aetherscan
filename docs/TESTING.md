@@ -36,6 +36,7 @@ tests/
 ├── unit/                        # fast, hardware-independent; the CI surface
 │   ├── test_config.py               # singleton semantics, to_dict round-trip
 │   ├── test_cli_validation.py       # tag pattern, divisibility matrix, saved-config precedence
+│   ├── test_cli_help_sync.py        # README CLI Reference vs generated help drift guard
 │   ├── test_tag_guards.py           # save-tag dedup matrix: local/HF collisions, --force-tag
 │   ├── test_data_generation.py      # log_norm, create_* shapes/labels, intersection checks,
 │   │                                #   chunk segments / batched task partitioning
@@ -54,6 +55,8 @@ tests/
 │   ├── test_db.py                   # writer thread, flush/supersede sentinels, migrations, queries
 │   ├── test_manager.py              # pool/SHM tracking and cleanup idempotence
 │   ├── test_benchmark.py            # stage_timer nesting/failures, report tree math + suggestions
+│   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
+│   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths
 │   └── test_logger.py               # StreamToLogger redirect probes: isatty/writable/readable/fileno
 └── integration/                 # marked integration+gpu+cluster: real subprocess runs
     ├── conftest.py                  # repo-root launcher + cluster path resolution

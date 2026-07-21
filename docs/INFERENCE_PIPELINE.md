@@ -153,8 +153,13 @@ than after ~30 h of training.)
 
 1. **Resume filter.** `db.flush()` (so rows queued by an in-process retry are visible), then
    every unit with a live `status='inferred'` row in `inference_cadences` for
-   `(tag, npy_path)` is skipped outright; its stored aggregates (`n_stamps`,
-   `n_candidates`, confidence summary) fold into the run totals and the viz collector.
+   `(tag, npy_path)` is skipped outright — **but only if that row's stored
+   `config_fingerprint` matches the current run's
+   `run_state.inference_config_fingerprint(config)`** (#129). On a match, its stored aggregates
+   (`n_stamps`, `n_candidates`, confidence summary) fold into the run totals and the viz
+   collector; on a mismatch the cadence is re-inferred instead of reused, so a reused
+   `--save-tag` with a changed inference config (threshold / model / geometry) never serves
+   stale results (the supersede step retires the old row).
 2. **Models load once** (`InferencePipeline`), reused by every cadence. The distributed
    encode step is a lazily-built, cached `tf.function` — repeated `run_inference` calls reuse
    one trace instead of retracing per cadence.
@@ -288,7 +293,7 @@ Inference-specific fields live on `InferenceConfig`
 | Models | `encoder_path`, `rf_path`, `config_path` |
 | Classification | `per_replica_batch_size`, `classification_threshold` |
 | Cadence grouping | `cadence_group_by_cols`, `cadence_h5_path_col`, `cadence_expected_obs` |
-| Energy detection | `coarse_channel_width`, `parallel_coarse_chans`, `bandpass_method`, `pfb_taps_per_channel`, `bandpass_debug_plot`, `spline_order`, `detection_window_size`, `detection_step_size`, `stat_threshold` |
+| Energy detection | `coarse_channel_width`, `coarse_channel_log_interval`, `bandpass_method`, `pfb_taps_per_channel`, `bandpass_debug_plot`, `spline_order`, `detection_window_size`, `detection_step_size`, `stat_threshold` |
 | Stamps | `stamp_width`, `store_downsampled_stamps`, `overlap_search`, `overlap_fraction`, `preprocess_output_dir` |
 | Visualization | `inference_viz_enabled`, `stamp_gallery_top_k`, `max_candidate_plots` |
 | Fault tolerance | `max_retries`, `retry_delay` |

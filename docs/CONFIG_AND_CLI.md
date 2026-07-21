@@ -72,7 +72,7 @@ subcommand uses it:
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `DBConfig`           | SQLite writer timeouts, buffer sizes                                                                                               |
 | `ManagerConfig`      | Multiprocessing pool sizing                                                                                                        |
-| `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle                                                           |
+| `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle, live-dashboard enable (`dashboard_enabled`) and port (`dashboard_port`) |
 | `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
 | `BetaVAEConfig`      | Beta-VAE model hyperparameters                                                                                                     |
 | `RandomForestConfig` | RF classifier hyperparameters                                                                                                      |
@@ -170,6 +170,8 @@ Current Pattern B flags:
 - `--hf-repo-id` → `config.hf.repo_id`
 - `--save-tag` → `config.checkpoint.save_tag`
 - `--force-tag` → `config.checkpoint.force_tag`
+- `--dashboard` / `--no-dashboard` (`BooleanOptionalAction`) → `config.monitor.dashboard_enabled`
+- `--dashboard-port` → `config.monitor.dashboard_port`
 
 #### Pattern C — shared flag, divergent destination
 

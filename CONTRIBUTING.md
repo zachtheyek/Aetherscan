@@ -176,6 +176,11 @@ Aetherscan/
 │   ├── preprocessing.py        # Data preprocessing + energy detection
 │   ├── pfb.py                  # PFB static passband equalization
 │   ├── data_generation.py      # Synthetic signal injection
+│   ├── benchmark.py            # Always-on stage timing → pipeline_stages table
+│   ├── dashboard.py            # Streamlit live-monitoring dashboard (DB-driven)
+│   ├── dashboard_launcher.py   # Spawns the headless dashboard subprocess (guarded)
+│   ├── hf_hub.py               # HuggingFace Hub artifact upload/download
+│   ├── tag_guards.py           # Fail-early --save-tag dedup guards
 │   ├── models/
 │   │   ├── __init__.py         # Model exports
 │   │   ├── vae.py              # Beta-VAE architecture
@@ -244,6 +249,11 @@ Aetherscan/
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `pfb.py`                  | Polyphase-filterbank static passband response (bandpass flattening)    |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
+| `benchmark.py`            | Always-on stage timing (`stage_timer`/`record_stage`) to `pipeline_stages` |
+| `dashboard.py`            | Streamlit live-monitoring dashboard read from the run SQLite DB        |
+| `dashboard_launcher.py`   | `launch_dashboard()` spawns/reaps the headless dashboard subprocess    |
+| `hf_hub.py`               | HuggingFace Hub artifact upload/download, version-coupled revisions    |
+| `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
 | `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
 | `models/random_forest.py` | Scikit-learn RF wrapper                                                |
 | `db/db.py`                | Thread-safe SQLite with async queue-based writes                       |
@@ -565,9 +575,7 @@ pytest tests/unit/test_db.py::TestFlushSentinel -q
 
 ## New Version Releases
 
-> [!WARNING]
->
-> # TODO: add tagged releases workflow when available
+Releases are cut through the CD workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)): pushing a signed `v*` tag builds the package, publishes it to PyPI, and creates the GitHub Release. The full contract — the PyPI/HuggingFace version-coupling, the signed-tag / version / weights CD gates, and the step-by-step runbook — lives in [`docs/RELEASE.md`](docs/RELEASE.md). Before tagging, bless the matching trained weights on the HF model repo with [`utils/hf_tag_release.py`](utils/hf_tag_release.py).
 
 ---
 
