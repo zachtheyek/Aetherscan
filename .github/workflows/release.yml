@@ -61,15 +61,17 @@ jobs:
           # registered to the tagger's account. Rejects lightweight tags and unsigned/unverified
           # ones. No key material lives in CI — GitHub does the verification. (Dry-run
           # workflow_dispatch has no tag, so this step is skipped there.)
-          obj_type=$(gh api "repos/$GH_REPO/git/ref/tags/$REF_NAME" --jq '.object.type')
+          ref_json=$(gh api "repos/$GH_REPO/git/ref/tags/$REF_NAME")
+          obj_type=$(jq -r '.object.type' <<<"$ref_json")
+          tag_sha=$(jq -r '.object.sha' <<<"$ref_json")
           if [ "$obj_type" != "tag" ]; then
             echo "::error::Release tag '$REF_NAME' is a lightweight tag. Cut it signed:" \
                  "git tag -s $REF_NAME (docs/RELEASE.md step 5)."
             exit 1
           fi
-          tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$REF_NAME" --jq '.object.sha')
-          verified=$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.verification.verified')
-          reason=$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.verification.reason')
+          tag_json=$(gh api "repos/$GH_REPO/git/tags/$tag_sha")
+          verified=$(jq -r '.verification.verified' <<<"$tag_json")
+          reason=$(jq -r '.verification.reason' <<<"$tag_json")
           if [ "$verified" != "true" ]; then
             echo "::error::Release tag '$REF_NAME' signature not verified (reason: $reason)." \
                  "Sign with git tag -s using a GPG key registered on your GitHub account."
