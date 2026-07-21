@@ -2533,12 +2533,16 @@ def _build_suggestion_block(errors: list[ValidationError], num_replicas: int | N
     config = get_config()
     simple = [e for e in errors if e.fix_kind != "cross_param"]
     cross = [e for e in errors if e.fix_kind == "cross_param"]
-    proposals: dict[str, object] = {}
+    # Keyed on (field, fix_kind): distinct violations of the SAME field (e.g. the
+    # stamp_width equality and divisibility checks both firing) must not silently
+    # overwrite each other's proposal — one flag line per violation is honest, even
+    # when that repeats a flag with different candidate values.
+    proposals: dict[tuple[str, str], object] = {}
 
     for err in simple:
         fix = propose_simple_fix(err)
         if fix is not None:
-            proposals[err.field] = fix
+            proposals[(err.field, err.fix_kind)] = fix
 
     if cross and num_replicas is not None and config is not None:
         base = {
@@ -2553,13 +2557,13 @@ def _build_suggestion_block(errors: list[ValidationError], num_replicas: int | N
         if solution is not None:
             for f_name in _CROSS_PARAM_FIELDS + ("train_val_split",):
                 if solution[f_name] != base[f_name]:
-                    proposals[f"training.{f_name}"] = solution[f_name]
+                    proposals[(f"training.{f_name}", "cross_param")] = solution[f_name]
 
     if not proposals:
         return ""
 
     flag_lines: list[str] = []
-    for f_name, value in proposals.items():
+    for (f_name, _fix_kind), value in proposals.items():
         # Drop the config-section prefix and switch underscores to hyphens.
         short = f_name.split(".", 1)[-1]
         flag = "--" + short.replace("_", "-")
