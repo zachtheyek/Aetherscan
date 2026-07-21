@@ -205,6 +205,8 @@ Aetherscan/
 │   ├── fixtures/                    # Small recorded data fixtures (e.g. real ED channel slice)
 │   ├── unit/                        # Fast, hardware-independent unit tests (run in CI)
 │   └── integration/                 # gpu+cluster-marked end-to-end smoke tests
+├── benchmarks/                 # Standalone micro-benchmarks (not collected by pytest;
+│                               #   see benchmarks/README.md + docs/BENCHMARKING.md)
 ├── utils/                      # Utility scripts
 │   ├── benchmark_report.py          # Render the stage-timing benchmark report
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
