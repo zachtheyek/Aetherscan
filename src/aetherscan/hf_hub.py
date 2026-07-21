@@ -312,7 +312,6 @@ def compute_rf_metrics(model_path: str, tag: str) -> dict[str, Any] | None:
 def generate_model_card(
     *,
     tag: str,
-    repo_id: str,
     config_dict: dict[str, Any],
     metrics: dict[str, Any] | None,
     versions: dict[str, str],
@@ -485,7 +484,6 @@ def upload_run_to_hf(
     public_config = _sanitize_config_for_upload(config_dict)
     card = generate_model_card(
         tag=tag,
-        repo_id=repo_id,
         config_dict=public_config,
         metrics=compute_rf_metrics(model_path, tag),
         versions=_collect_library_versions(),

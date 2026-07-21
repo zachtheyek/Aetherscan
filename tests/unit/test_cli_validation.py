@@ -249,6 +249,18 @@ class TestSemanticChecks:
         assert {"inference.rf_path", "inference.config_path"} <= fields
         assert "inference.encoder_path" not in fields
 
+    def test_inference_artifact_partial_trio_from_config_rejected(self, tmp_path):
+        # The trio check must count paths sourced from a loaded saved config (the
+        # `_resolve(args, ..., config.inference.*)` fallback), not just CLI flags: a
+        # config-side encoder_path with no flags is still a partial trio.
+        encoder = tmp_path / "vae_encoder_test_v1.keras"
+        encoder.touch()
+        get_config().inference.encoder_path = str(encoder)
+        errors = collect_validation_errors(_parse(["inference"]), None)
+        fields = {e.field for e in errors if e.fix_kind == "file_exists"}
+        assert {"inference.rf_path", "inference.config_path"} <= fields
+        assert "inference.encoder_path" not in fields
+
     def test_inference_artifact_full_trio_must_exist_on_disk(self):
         errors = collect_validation_errors(
             _parse(
