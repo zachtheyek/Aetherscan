@@ -81,9 +81,12 @@ def record_stage(
         # Late imports keep this module import-light and avoid any import-cycle risk
         # (db imports config + manager; nothing imports benchmark back).
         from aetherscan.config import get_config  # noqa: PLC0415
-        from aetherscan.db import get_db  # noqa: PLC0415
+        from aetherscan.db.db import Database  # noqa: PLC0415
 
-        db = get_db()
+        # Read the singleton directly (not via get_db()): a missing DB is an expected,
+        # already-handled case here, and get_db() logs a WARNING on every miss — noise
+        # that could reach Slack. This is a read, not an instantiation.
+        db = Database._instance
         if db is None:
             logger.debug(f"No database instance — dropping stage timing for {stage!r}")
             return

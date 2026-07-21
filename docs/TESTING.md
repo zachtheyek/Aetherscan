@@ -108,6 +108,16 @@ indirectly today; a direct test would only harden against future refactors):
   are only caught *implicitly* (via the broad `except` and the sampled checksum). The checksum
   is a probabilistic smoke test by design (see `round_data._array_checksum`), so these aren't
   integrity guarantees; a truncation test would at least pin the current behavior.
+- **Stage-timing *wiring* in the real train/inference paths** (issue #167 item 4): the
+  `stage_timer`/`record_stage` machinery and the report consumers are unit-tested against
+  synthetic `pipeline_stages` rows, but nothing at unit level asserts that the real pipeline
+  code paths emit the expected span names at the expected places (e.g. `train.round_NN`,
+  `train.round_NN.data_generation`, `inference.infer_cadence_NNN`). Driving the real
+  `train_round`/`_infer_cadence` in a unit test would need heavy TF-stack mocking for modest
+  signal, so this stays a cluster-smoke-only concern — mitigated by the shared
+  `round_stage_name()` helper (pins producer/trainer name agreement) and by
+  `test_round_data.py`'s timing test, which drives the real drainer-to-`record_stage` path
+  with a real span name.
 
 ## Markers
 

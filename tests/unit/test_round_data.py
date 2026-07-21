@@ -602,10 +602,14 @@ class TestRoundDataProducerDrainer:
 
     def test_timing_message_records_stage_span(self, producer, monkeypatch):
         recorded = []
-        monkeypatch.setattr(
-            "aetherscan.round_data.record_stage",
-            lambda *args, **kwargs: recorded.append((args, kwargs)),
-        )
+
+        def fake_record_stage(*args, **kwargs):
+            # FIFO guard: the span must be recorded BEFORE the done message resolves the
+            # round — a reversed (done-before-timing) drain order would trip this.
+            assert 3 not in producer._results
+            recorded.append((args, kwargs))
+
+        monkeypatch.setattr("aetherscan.round_data.record_stage", fake_record_stage)
         producer._result_queue.put(("timing", 3, 100.0, 160.0))
         producer._result_queue.put(("done", 3, {"n_samples": 8}))
         producer.await_round(3)  # FIFO: the timing message was handled before done

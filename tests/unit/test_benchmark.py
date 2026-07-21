@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -140,13 +141,19 @@ class TestStageTimer:
         # The worker thread's timer must NOT nest under the main thread's umbrella
         assert recorded == ["inference.preprocess_cadence_001"]
 
-    def test_no_db_is_a_noop(self):
+    def test_no_db_is_a_noop(self, caplog):
         # No Database instance exists (conftest resets singletons): timing must degrade
         # to a debug log, never an exception
         assert Database._instance is None
-        with stage_timer("train.round_01"):
-            pass
-        record_stage("train.round_02", 1.0, 2.0)
+        with caplog.at_level(logging.DEBUG, logger="aetherscan.benchmark"):
+            with stage_timer("train.round_01"):
+                pass
+            record_stage("train.round_02", 1.0, 2.0)
+        # The missing-DB path logs the documented debug message (one per dropped span)...
+        debug_messages = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert sum("No database instance" in m for m in debug_messages) == 2
+        # ...and nothing louder: no WARNING+ from any logger (INFO+ can reach Slack)
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     def test_record_stage_explicit_timestamps(self, db):
         record_stage(
