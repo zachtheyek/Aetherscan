@@ -217,3 +217,12 @@ reconstruct plus a PNG gallery.
   spawn failure only warns and never aborts the run — the dashboard is optional observability.
   Teardown is registered via `atexit` and the `SIGTERM`/`SIGINT` handlers so the server is
   reaped with the run.
+- **Manual runs against a saved DB.** The `aetherscan-dashboard` console script
+  ([`src/aetherscan/dashboard_cli.py`](../src/aetherscan/dashboard_cli.py), registered under
+  `[project.scripts]`) forwards its args verbatim to `dashboard.py`'s argparse:
+  `aetherscan-dashboard --db-path /path/to/aetherscan.db --tag final_v1`. In a source checkout /
+  the container (no installed entry point), run the same shim as
+  `PYTHONPATH=src python -m aetherscan.dashboard_cli <args>`. Either way it re-execs
+  `python -m streamlit run <packaged dashboard.py> -- <args>` — Streamlit must own the process,
+  so `python -m aetherscan.dashboard` does **not** work (`st.*` calls outside a
+  ScriptRunContext render nothing).
