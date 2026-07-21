@@ -31,6 +31,7 @@ from aetherscan.round_data import (
     validate_done_manifest,
     write_done_manifest,
 )
+from aetherscan.seeding import STREAM_DATA_GEN, derive_rng
 
 # Keep injection fast: small frequency axis, real-ish resolutions (mirrors
 # tests/unit/test_data_generation.py).
@@ -283,6 +284,29 @@ class TestChunkSegmentsAndTasks:
                 np.random.default_rng(0),
             )
 
+    def test_task_seeds_stable_for_root_seed_and_round(self):
+        """Seed-derivation stability: the same (root seed, round) always yields the same
+        per-task seed sequence (the invariant reproducible generation rests on), and a
+        different round yields a different one."""
+        segment = build_chunk_segments(0, 8)[0]
+
+        def _task_seeds(round_idx):
+            tasks = build_segment_tasks(
+                segment,
+                "arr.npy",
+                2,
+                10.0,
+                40.0,
+                _WIDTH_BIN,
+                _FREQ_RES,
+                _TIME_RES,
+                derive_rng(42, STREAM_DATA_GEN, round_idx),
+            )
+            return [task[11] for task in tasks]  # per-task seed slot
+
+        assert _task_seeds(1) == _task_seeds(1)
+        assert _task_seeds(1) != _task_seeds(2)
+
 
 class TestGenerateRoundToMemmap:
     @pytest.fixture
@@ -365,6 +389,48 @@ class TestGenerateRoundToMemmap:
         assert any(k.startswith("rfi_") for k in double_keys)
 
         assert progress == [(1, 2), (2, 2)]
+
+    def test_same_seed_regenerates_byte_identical_data(self, tmp_path, plate):
+        """The same-seed-twice test docs/TESTING.md calls for: with a root seed, two
+        generations of the same round are byte-identical regardless of ambient global RNG
+        state (the per-task reseed in _run_memmap_task must fully determine the output)."""
+        common = {
+            "n_samples": 8,
+            "snr_base": 10.0,
+            "snr_range": 5.0,
+            "width_bin": _WIDTH_BIN,
+            "num_observations": 6,
+            "time_bins": 16,
+            "chunk_size": 4,
+            "task_size": 3,
+            "freq_resolution": _FREQ_RES,
+            "time_resolution": _TIME_RES,
+            "backgrounds": plate,
+            "round_num": 1,
+        }
+        paths_a = RoundDataPaths.for_round(str(tmp_path / "a"), 1)
+        paths_b = RoundDataPaths.for_round(str(tmp_path / "b"), 1)
+        paths_c = RoundDataPaths.for_round(str(tmp_path / "c"), 1)
+
+        generate_round_to_memmap(paths_a, seed=123, **common)
+        # Perturb the legacy global RNGs between runs — per-task reseeding must make the
+        # second run independent of ambient state
+        random.seed(999)
+        np.random.seed(999)
+        generate_round_to_memmap(paths_b, seed=123, **common)
+        generate_round_to_memmap(paths_c, seed=124, **common)
+
+        data_a = load_round_arrays(paths_a)
+        data_b = load_round_arrays(paths_b)
+        data_c = load_round_arrays(paths_c)
+        for key in ("concatenated", "true", "false"):
+            np.testing.assert_array_equal(np.asarray(data_a[key]), np.asarray(data_b[key]))
+        np.testing.assert_array_equal(data_a["labels"], data_b["labels"])
+        np.testing.assert_array_equal(data_a["lognorm"], data_b["lognorm"])
+        # A different root seed must produce different data
+        assert not np.array_equal(
+            np.asarray(data_a["concatenated"]), np.asarray(data_c["concatenated"])
+        )
 
     def test_regeneration_clears_stale_dir(self, tmp_path, plate):
         paths = RoundDataPaths.for_round(str(tmp_path), 1)
