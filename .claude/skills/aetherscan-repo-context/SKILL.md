@@ -70,7 +70,7 @@ Hierarchical, dataclass-based config with a thread-safe singleton. Resolution or
 
 At runtime, the singleton `Config` is read via `get_config()` and may be modified programmatically. See `docs/CONFIG_AND_CLI.md`.
 
-**Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards only `SLACK_*` and `AETHERSCAN_*` via `--env`; the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
+**Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards `SLACK_*`, `AETHERSCAN_*`, and `HF_TOKEN` via `--env`; the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
 
 ```ini
 # .env example
@@ -80,6 +80,9 @@ AETHERSCAN_MODEL_PATH=/path/to/models
 AETHERSCAN_OUTPUT_PATH=/path/to/outputs
 # Optional: comma-separated extra host paths for run_container.sh to bind 1:1
 AETHERSCAN_EXTRA_BINDS=/extra/host/paths
+# Only needed for uploading model weights to the HuggingFace Hub (train --hf-upload);
+# downloads (the inference default) hit a public repo and need no token
+HF_TOKEN=your-huggingface-write-token
 # Slack integration auto-disables if unset
 SLACK_BOT_TOKEN=your-slack-bot-token
 SLACK_CHANNEL=your-slack-channel
@@ -234,8 +237,8 @@ pre-commit run ruff --all-files
 ## Security
 
 - **Never commit secrets** (tokens, credentials, private data, internal URLs/IPs). Use `.env` (gitignored). `gitleaks` pre-commit hook + GitHub Dependabot back this up but aren't foolproof.
-- **Secrets in use**: `SLACK_BOT_TOKEN` (Slack alerts/notifications). Use separate dev/prod tokens; store via a secrets manager or restricted-permission encrypted env files.
-- **If a token leaks** — rotate immediately. Slack: revoke in [Slack API](https://api.slack.com/apps) → OAuth & Permissions, reinstall with scopes `channels:read, chat:write, files:write, groups:read, incoming-webhook`, update `SLACK_BOT_TOKEN` everywhere, verify with `PYTHONPATH=src python utils/print_cli_help.py train` (no Slack errors).
+- **Secrets in use**: `SLACK_BOT_TOKEN` (Slack alerts/notifications); `HF_TOKEN` (HuggingFace Hub upload via `train --hf-upload` — inference downloads hit a public repo and need no token). Use separate dev/prod tokens; store via a secrets manager or restricted-permission encrypted env files.
+- **If a token leaks** — rotate immediately. Slack: revoke in [Slack API](https://api.slack.com/apps) → OAuth & Permissions, reinstall with scopes `channels:read, chat:write, files:write, groups:read, incoming-webhook`, update `SLACK_BOT_TOKEN` everywhere, verify with `PYTHONPATH=src python utils/print_cli_help.py train` (no Slack errors). HuggingFace: invalidate/delete the token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), create a replacement (**write** scope only if you upload), update `HF_TOKEN` everywhere — full steps in `SECURITY.md`.
 - **Incident response**: Contain (revoke creds) → Assess → Notify → Remediate (rotate secrets) → Document → Improve.
 - **Reporting**: non-critical → [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label; critical → contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack directly (do **not** open a public issue), expect a response in 48–72h.
 - **Data security**: major outputs (weights, code, search results, training/inference data) are publicly disclosed via HuggingFace / GitHub / publications / [BL Open Data Archive](https://breakthroughinitiatives.org/opendatasearch); intermediate products (DB records, plots) stay on access-controlled HPC servers.
