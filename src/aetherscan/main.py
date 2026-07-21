@@ -168,7 +168,8 @@ def _report_final_training_status(pipeline) -> None:
     Extracted from train_command so the exit contract is unit-testable: a fully-successful run
     exits 0, a run with any recorded non-critical stage failure (vae_plots/rf_plots/hf_upload that
     never recovered across attempts) exits 1, and a missing pipeline exits 1 rather than reporting
-    a false success.
+    a false success. A run that skipped RF training because a pre-loaded RF was already trained
+    exits 0 but with a warning annotation instead of the unqualified success line (issue #142).
     """
     if pipeline is None:
         # Defensive: the retry loop always sets pipeline or sys.exit(1)s first, and
@@ -193,6 +194,19 @@ def _report_final_training_status(pipeline) -> None:
         )
         logger.error("=" * 60)
         sys.exit(1)
+
+    # Qualified success (issue #142): a run whose RF stage was skipped because an
+    # already-trained Random Forest was pre-loaded (e.g. resumed from the wrong tag) must not
+    # report unqualified success — the saved RF was never trained on this run's encoder.
+    skipped_rf_tag = getattr(pipeline, "rf_training_skipped_from_tag", None)
+    if skipped_rf_tag:
+        logger.warning("=" * 60)
+        logger.warning(
+            f"Training completed, but Random Forest training was SKIPPED — the saved RF was "
+            f"loaded from tag '{skipped_rf_tag}', not trained during this run"
+        )
+        logger.warning("=" * 60)
+        return
 
     logger.info("=" * 60)
     logger.info("Training completed successfully!")

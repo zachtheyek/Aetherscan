@@ -6,7 +6,9 @@ training stage machine (skip-if-done / record-failure semantics against a stub p
 
 from __future__ import annotations
 
+import logging
 import os
+import types
 
 import numpy as np
 import pytest
@@ -128,6 +130,26 @@ class TestResolveLoadTag:
     def test_default_empty_dir_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             _resolve_load_tag(str(tmp_path), None)
+
+
+class TestTrainRandomForestSkipIsLoud:
+    def test_pretrained_rf_skip_warns_and_records_source_tag(self, caplog):
+        """The is_trained early-return (issue #142) must warn loudly, name the tag the stale
+        RF was loaded from, and set the marker main.py uses to qualify the terminal status."""
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline._resumed = False
+        pipeline.rf_model = types.SimpleNamespace(is_trained=True)
+        pipeline._rf_loaded_from_tag = "test_v27"
+        pipeline.rf_training_skipped_from_tag = None
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            pipeline.train_random_forest()
+
+        assert pipeline.rf_training_skipped_from_tag == "test_v27"
+        assert any(
+            "RF training SKIPPED" in r.message and "test_v27" in r.message for r in caplog.records
+        )
 
 
 class _PipelineStub:

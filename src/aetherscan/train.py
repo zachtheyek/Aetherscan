@@ -982,6 +982,14 @@ class TrainingPipeline:
         # Initialize RF model as None
         self.rf_model = None
 
+        # Tag an already-trained RF was loaded from (set by load_models); lets
+        # train_random_forest name the stale source when it skips retraining (issue #142)
+        self._rf_loaded_from_tag: str | None = None
+
+        # Set when train_random_forest skips because a pre-loaded RF was already trained —
+        # main.py annotates the terminal status instead of reporting unqualified success
+        self.rf_training_skipped_from_tag: str | None = None
+
         # Background round-data producer (created in train_beta_vae when
         # overlap_data_generation is enabled; None otherwise)
         self._round_producer: RoundDataProducer | None = None
@@ -2256,7 +2264,19 @@ class TrainingPipeline:
             self.rf_model = RandomForestModel()
 
         elif self.rf_model.is_trained:
-            logger.info("Random Forest classifier already trained. Exiting training loop.")
+            # A pre-loaded, already-trained RF short-circuits the whole stage — make the skip
+            # loud and record it, or a resume from the wrong tag ships a stale RF while the
+            # run reports unqualified success (issue #142)
+            source_tag = self._rf_loaded_from_tag or "unknown"
+            logger.warning("=" * 60)
+            logger.warning(
+                f"RF training SKIPPED: an already-trained Random Forest (loaded from tag "
+                f"'{source_tag}') is in memory — no new Random Forest will be trained for "
+                f"save tag '{self.config.checkpoint.save_tag}'; the loaded model is reused "
+                f"as-is"
+            )
+            logger.warning("=" * 60)
+            self.rf_training_skipped_from_tag = source_tag
             return
 
         # # BUG:
@@ -6522,6 +6542,7 @@ class TrainingPipeline:
                     self.rf_model = RandomForestModel()
 
                 self.rf_model.load(rf_path)
+                self._rf_loaded_from_tag = tag
                 logger.info("Random Forest loaded successfully")
             else:
                 logger.info(
