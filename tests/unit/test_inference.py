@@ -1,7 +1,7 @@
 """Unit tests for aetherscan.inference: the tail-padding fix in
 prepare_distributed_inf_dataset (regression for the silent partial-batch drop), the
-InfDataHolder clear semantics, and the confidence-summary math backing the
-inference_cadences manifest."""
+encoded-padding-row truncation in run_inference, the InfDataHolder clear semantics, and the
+confidence-summary math backing the inference_cadences manifest."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
+from aetherscan.config import get_config
 from aetherscan.inference import (
     InfDataHolder,
+    InferencePipeline,
     prepare_distributed_inf_dataset,
     summarize_confidences,
 )
@@ -109,6 +111,93 @@ class TestPrepareDistributedInfDataset:
         )
         out = _collect_batches(result)
         np.testing.assert_array_equal(out[:7, 0, 0, 0], np.arange(7, dtype=np.float32))
+
+    @pytest.mark.parametrize("num_replicas", [1, 2])
+    def test_multi_replica_global_batch_geometry(self, strategy, num_replicas):
+        """global_batch = per_replica x num_replicas — the production geometry the tail-drop
+        fix targets. num_replicas is a plain argument to the padding/step math (independent
+        of the CPU default strategy used here); true cross-replica distribution is only
+        exercised by the gpu-marked integration smoke."""
+        data = _make_data(5)
+        result = prepare_distributed_inf_dataset(
+            data=data,
+            n_samples=5,
+            per_replica_inf_batch_size=2,
+            num_replicas=num_replicas,
+            strategy=strategy,
+        )
+        global_batch = 2 * num_replicas
+        expected_padded = -(-5 // global_batch) * global_batch  # 6 for 1 replica, 8 for 2
+        assert result["n_padded"] == expected_padded
+        assert result["inf_steps"] == expected_padded // global_batch
+
+        out = _collect_batches(result)
+        assert out.shape[0] == expected_padded
+        np.testing.assert_array_equal(out[:5], data)
+        # Padding rows cycle deterministically from the front, whatever the replica count
+        np.testing.assert_array_equal(out[5:], data[np.arange(expected_padded - 5) % 5])
+
+
+class _StubEncoder:
+    """Keras-encoder stand-in usable inside the tf.function encode step: one latent
+    dimension per observation carrying the observation's mean power. _make_data gives
+    sample i the constant value i, so every latent row is traceable to its snippet."""
+
+    def __call__(self, reshaped, training=False):
+        z = tf.reduce_mean(reshaped, axis=[1, 2])  # (batch * 6, 4, 8, 1) -> (batch * 6, 1)
+        return z, z, z
+
+
+class _RecordingRF:
+    """predict_proba stub recording how many latent rows reached the classifier."""
+
+    def __init__(self):
+        self.n_rows_seen: int | None = None
+
+    def predict_proba(self, latents):
+        self.n_rows_seen = latents.shape[0]
+        return np.full((latents.shape[0], 2), [0.7, 0.3])  # P(true)=0.3: never a candidate
+
+
+class TestLatentPaddingRowTruncation:
+    """run_inference must drop the encoded padding rows before the RF sees them
+    (inference.py: latents = latents[: n_samples * self.num_observations]) — the
+    encoder-side half of the tail-drop fix, complementing the dataset-padding tests above."""
+
+    def test_encoded_padding_rows_are_dropped(self):
+        config = get_config()
+        config.data.time_bins = 4
+        config.data.width_bin = 64
+        config.data.downsample_factor = 8  # encode reshape width: 64 // 8 = 8
+
+        # Bypass __init__ (which loads real models); wire only what run_inference touches.
+        pipeline = InferencePipeline.__new__(InferencePipeline)
+        pipeline.config = config
+        pipeline.strategy = tf.distribute.get_strategy()
+        pipeline.num_replicas = 1
+        pipeline.encoder = _StubEncoder()
+        pipeline.rf_model = _RecordingRF()
+        pipeline.latent_dim = 1
+        pipeline.num_observations = 6
+        pipeline.per_replica_inf_batch_size = 2  # global batch 2: n=5 pads to 6
+        pipeline.threshold = 0.99
+        pipeline._encode_step = None
+        # DB writes are covered elsewhere; keep this test on the truncation seam.
+        pipeline._write_inference_results = lambda **kwargs: 0
+
+        data = _make_data(5)
+        results = pipeline.run_inference(data=data, npy_path="/fake/cadence.npy")
+
+        # 5 samples pad to 6 -> 36 latent rows encoded; only the 30 real ones may survive.
+        assert pipeline.rf_model.n_rows_seen == 5 * 6
+        assert results["latents"].shape == (5 * 6, 1)
+        assert results["n_cadence_snippets"] == 5
+        assert results["n_processed"] == 5
+        # Row signatures prove the survivors are the real snippets in snippet-major order
+        # (the dropped tail re-encoded sample 0 and would have carried signature 0.0).
+        np.testing.assert_allclose(
+            results["latents"][:, 0], np.repeat(np.arange(5, dtype=np.float32), 6)
+        )
 
 
 class TestInfDataHolder:
