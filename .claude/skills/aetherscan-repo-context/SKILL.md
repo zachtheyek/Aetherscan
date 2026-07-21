@@ -121,7 +121,7 @@ src/aetherscan/
 ├── hf_hub.py            # HuggingFace Hub artifact upload/download
 ├── tag_guards.py        # Fail-early --save-tag dedup guards
 ├── models/{vae,random_forest}.py
-├── db/db.py             # Thread-safe SQLite, async queue-based writes
+├── db/db.py             # Thread-safe SQLite, async queue-based writes, schema migration, supersede semantics
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
@@ -144,7 +144,7 @@ benchmarks/              # Standalone micro-benchmarks (not collected by pytest)
 
 - **Distributed training/inference** — Gradients sync via TF `MirroredStrategy` + NCCL AllReduce, with gradient accumulation for larger effective batches under low VRAM. All TensorFlow model ops **must** occur within `strategy.scope()`.
 - **Cadence-aware composite loss** — beta-VAE reconstruction + β-weighted KL divergence + α-weighted true/false clustering (ON-ON / OFF-OFF proximity, ON-OFF separation for true signals; uniform for false).
-- **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing + automatic retry with backoff.
+- **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing. A persisted run manifest (`run_state_{save_tag}.json`) drives fault-tolerant resume: an explicit stage machine (vae_rounds → vae_plots → rf_train → rf_plots → final_save) skips completed stages, and stale DB rows from failed attempts are marked superseded (never deleted).
 - **Thread-safe singletons** — `Config`, `Database`, `ResourceManager`. Always use the accessors `get_config()`, `get_db()`, `get_manager()`; never instantiate directly.
 - **Shared-memory zero-copy parallelism** — worker pools communicate via shared memory (no serialization). Allocate via `manager.create_shared_memory()`; ResourceManager owns cleanup. Only the **creator** may call `shm.unlink()`, never workers.
 - **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) and `InfDataHolder` (`inference.py`) wrap batches with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes.
@@ -162,7 +162,7 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 - **Logging** — `logger = logging.getLogger(__name__)`, f-strings for messages. `T20` rejects bare `print()` outside one-off `utils/` scripts (and the self-logging `slack_handler.py`); `G001`–`G003` reject `%`/`str.format()`/`+` pre-formatted log messages. The Slack handler attaches automatically when `SLACK_BOT_TOKEN` is set, so anything at `INFO+` may surface in Slack — keep messages information-dense and **free of secrets**.
 - **Config access** — `get_config()` returns `Config | None`; the canonical idiom guards `if config is None: raise ValueError(...)` (None only happens if `init_config()` hasn't run — a programming error).
 - **Dataclass mutable defaults** — always `field(default_factory=...)`, never a bare `[...]` (shared mutable state; `B`/bugbear flags it).
-- **Retry/error-handling** — pipeline retry loops catch `KeyboardInterrupt` separately and re-raise, log with `logger.error`, then either retry after `time.sleep(retry_delay)` or `sys.exit(1)`. Reference: `train_command` / `inference_command`.
+- **Retry/error-handling** — pipeline retry loops catch `KeyboardInterrupt` separately and re-raise, log with `logger.error`, then either retry after `time.sleep(retry_delay)` or `sys.exit(1)`. Resume is manifest-driven (no checkpoint hunting): the `TrainingRunState` manifest tells the new pipeline which rounds/stages already completed. Non-critical stages (plots) record failures without forcing a retry; `main.py` exits nonzero if they never recover. Reference: `train_command` / `inference_command`, `run_state.py`.
 - **Naming** — descriptive full words (`num_training_rounds`, not `n`/`bs`). Single letters only in tight loops / math / indexing.
 
 | Element       | Convention  | Example                  |
