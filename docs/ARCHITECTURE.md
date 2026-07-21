@@ -2,7 +2,7 @@
 
 This document is the system-level map of Aetherscan: what the pipeline computes, how the
 modules fit together, the process/thread topology, and where every artifact lands on disk.
-Per-surface deep dives live in the sibling documents indexed in [`README.md`](README.md); this
+Per-surface deep dives live in the sibling documents indexed in [`docs/README.md`](README.md); this
 one is the place to start when you need to orient yourself in the codebase.
 
 ## TL;DR
@@ -18,8 +18,8 @@ Aetherscan is a two-stage ML pipeline for SETI anomaly detection in radio spectr
    vector, and cadences whose P(true) clears `config.inference.classification_threshold`
    become candidates.
 
-Training data is synthetic (setigen signal injection over real observed backgrounds,
-[`src/aetherscan/data_generation.py`](../src/aetherscan/data_generation.py)); inference data is
+Training data are synthetic (setigen signal injection over real observed backgrounds,
+[`src/aetherscan/data_generation.py`](../src/aetherscan/data_generation.py)); inference data are
 real filterbank `.h5` observations reduced by an energy-detection preprocessing stage
 ([`src/aetherscan/preprocessing.py`](../src/aetherscan/preprocessing.py)). Both commands run
 single-node multi-GPU via `tf.distribute.MirroredStrategy` with NCCL all-reduce (falling back
@@ -31,39 +31,39 @@ to `HierarchicalCopyAllReduce`), set up in `setup_gpu_strategy()`
 
 ## Data model: observations, cadences, stamps, snippets
 
-| Term | Shape (defaults) | Meaning |
-| --- | --- | --- |
-| **Observation** | `(16, 4096)` raw → `(16, 512)` model-ready | One spectrogram: `time_bins` × frequency bins. The model input is downsampled ×8 along frequency (`data.width_bin // data.downsample_factor`) and log-normalized into [0, 1]. |
-| **Cadence** | `(6, 16, 512)` | 6 observations of the same sky position in ABACAD order: positions 0/2/4 are ON-source ("A"), 1/3/5 are OFF-source. A technosignature should appear in the ONs and vanish in the OFFs; RFI persists in both. This is the unit both models reason about. |
-| **Stamp** | `(6, 16, stamp_width // downsample_factor)` stored | Inference-side: a `stamp_width` (4096-bin) frequency window cut around one energy-detection hit, extracted from **all 6** observations. Stored downsampled by default (`inference.store_downsampled_stamps`). |
-| **Snippet** | `(6, 16, 512)` | A stamp after loading (log-normalized, model-ready) — one row of a per-cadence `.npy`. "Stamp" and "snippet" index the same objects; *stamp* emphasizes the on-disk extraction, *snippet* the model input. One inference cadence typically yields many snippets (one per deduplicated hit, ×3 with overlap search). |
+| Term            | Shape (defaults)                                   | Meaning                                                                                                                                                                                                                                                                                                             |
+| --------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Observation** | `(16, 4096)` raw → `(16, 512)` model-ready         | One spectrogram: `time_bins` × frequency bins. The model input is downsampled ×8 along frequency (`data.width_bin // data.downsample_factor`) and log-normalized into [0, 1].                                                                                                                                       |
+| **Cadence**     | `(6, 16, 512)`                                     | 6 observations of the same sky position in ABACAD order: positions 0/2/4 are ON-source ("A"), 1/3/5 are OFF-source ("B", "C", "D"). A technosignature should appear in the ONs and vanish in the OFFs; RFI persists in both, or appears in neither. This is the unit both models reason about.                      |
+| **Stamp**       | `(6, 16, stamp_width // downsample_factor)` stored | Inference-side: a `stamp_width` (4096-bin) frequency window cut around one energy-detection hit, extracted from **all 6** observations. Stored downsampled by default (`inference.store_downsampled_stamps`).                                                                                                       |
+| **Snippet**     | `(6, 16, 512)`                                     | A stamp after loading (log-normalized, model-ready) — one row of a per-cadence `.npy`. "Stamp" and "snippet" index the same objects; _stamp_ emphasizes the on-disk extraction, _snippet_ the model input. One inference cadence typically yields many snippets (one per deduplicated hit, ×3 with overlap search). |
 
 Physical constants ride along in `DataConfig`: `freq_resolution` ≈ 2.79 Hz/bin,
 `time_resolution` ≈ 18.25 s/bin (GBT high-frequency-resolution products).
 
 ## Module map
 
-| Module | Role |
-| --- | --- |
-| [`main.py`](../src/aetherscan/main.py) | Entry point. Initialization order, GPU strategy setup (NCCL warmup + fallback), `train_command()` / `inference_command()` retry loops, streaming per-cadence inference driver, final `manager.cleanup_all()`. |
-| [`cli.py`](../src/aetherscan/cli.py) | Argparse for both subcommands, semantic + cross-replica validation (`collect_validation_errors`), fix proposer, `apply_saved_config()` / `apply_args_to_config()`. See [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md). |
-| [`config.py`](../src/aetherscan/config.py) | Dataclass-of-dataclasses `Config` singleton; every runtime parameter with a default; `to_dict()` serialization to `config_{tag}.json`. |
-| [`train.py`](../src/aetherscan/train.py) | `TrainingPipeline`: curriculum rounds, distributed datasets, gradient accumulation, adaptive LR, checkpointing, the run-state stage machine, and all training diagnostics/plots. See [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md). |
-| [`round_data.py`](../src/aetherscan/round_data.py) | Disk-backed (memmap) per-round datasets: `RoundDataPaths`, the atomic `.done` manifest protocol, and the `RoundDataProducer` background-generation process. |
-| [`run_state.py`](../src/aetherscan/run_state.py) | Persisted `TrainingRunState` manifest (`run_state_{tag}.json`) that drives stage-aware training resume. |
-| [`data_generation.py`](../src/aetherscan/data_generation.py) | setigen signal injection: `create_false` / `create_true_single` / `create_true_double`, batched memmap generation (`generate_round_to_memmap`), injection statistics. See [`PREPROCESSING.md`](PREPROCESSING.md). |
-| [`preprocessing.py`](../src/aetherscan/preprocessing.py) | Training background loading; inference energy detection (fused per-coarse-channel workers, vectorized D'Agostino-Pearson test, spline/PFB bandpass flattening, stamp extraction). See [`PREPROCESSING.md`](PREPROCESSING.md). |
-| [`pfb.py`](../src/aetherscan/pfb.py) | Polyphase-filterbank static passband response (native NumPy port of the bliss reference) used by the default bandpass-flattening method. |
-| [`inference.py`](../src/aetherscan/inference.py) | `InferencePipeline`: distributed encoding of snippets, RF classification, positives-only result writes. See [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md). |
-| [`inference_viz.py`](../src/aetherscan/inference_viz.py) | End-of-run inference visualization suite (ED distributions, galleries, latent projection, summary card). |
-| [`models/vae.py`](../src/aetherscan/models/vae.py), [`models/random_forest.py`](../src/aetherscan/models/random_forest.py) | Model definitions. See [`MODELS.md`](MODELS.md). |
-| [`db/db.py`](../src/aetherscan/db/db.py) | Thread-safe SQLite singleton with a single background writer thread, schema migrations, and supersede semantics. See [`DATABASE.md`](DATABASE.md). |
-| [`benchmark.py`](../src/aetherscan/benchmark.py) | Always-on stage timing (`stage_timer` / `record_stage`) written to the `pipeline_stages` table. See [`BENCHMARKING.md`](BENCHMARKING.md). |
-| [`dashboard.py`](../src/aetherscan/dashboard.py) | Standalone Streamlit live-monitoring dashboard read from the run's SQLite DB; ships in-package so any install method can auto-launch it. |
-| [`dashboard_launcher.py`](../src/aetherscan/dashboard_launcher.py) | `launch_dashboard()` spawns the headless Streamlit subprocess (guarded, detached, atexit / SIGTERM teardown). |
-| [`hf_hub.py`](../src/aetherscan/hf_hub.py) | HuggingFace Hub artifact upload/download with version-coupled revision resolution. See [`RELEASE.md`](RELEASE.md). |
-| [`tag_guards.py`](../src/aetherscan/tag_guards.py) | Fail-early `--save-tag` dedup guards run before any expensive work. |
-| [`logger/`](../src/aetherscan/logger), [`manager/`](../src/aetherscan/manager), [`monitor/`](../src/aetherscan/monitor) | Queue-based logging (+ Slack), resource lifecycle management (pools/SHM/processes/signals), 1 Hz resource monitoring. See [`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md). |
+| Module                                                                                                                     | Role                                                                                                                                                                                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`main.py`](../src/aetherscan/main.py)                                                                                     | Entry point. Initialization order, GPU strategy setup (NCCL warmup + fallback), `train_command()` / `inference_command()` retry loops, streaming per-cadence inference driver, final `manager.cleanup_all()`.                        |
+| [`cli.py`](../src/aetherscan/cli.py)                                                                                       | Argparse for both subcommands, semantic + cross-replica validation (`collect_validation_errors`), fix proposer, `apply_saved_config()` / `apply_args_to_config()`. See [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md).                     |
+| [`config.py`](../src/aetherscan/config.py)                                                                                 | Dataclass-of-dataclasses `Config` singleton; every runtime parameter with a default; `to_dict()` serialization to `config_{tag}.json`.                                                                                               |
+| [`train.py`](../src/aetherscan/train.py)                                                                                   | `TrainingPipeline`: curriculum rounds, distributed datasets, gradient accumulation, adaptive LR, checkpointing, the run-state stage machine, and all training diagnostics/plots. See [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md). |
+| [`round_data.py`](../src/aetherscan/round_data.py)                                                                         | Disk-backed (memmap) per-round datasets: `RoundDataPaths`, the atomic `.done` manifest protocol, and the `RoundDataProducer` background-generation process.                                                                          |
+| [`run_state.py`](../src/aetherscan/run_state.py)                                                                           | Persisted `TrainingRunState` manifest (`run_state_{tag}.json`) that drives stage-aware training resume.                                                                                                                              |
+| [`data_generation.py`](../src/aetherscan/data_generation.py)                                                               | setigen signal injection: `create_false` / `create_true_single` / `create_true_double`, batched memmap generation (`generate_round_to_memmap`), injection statistics. See [`PREPROCESSING.md`](PREPROCESSING.md).                    |
+| [`preprocessing.py`](../src/aetherscan/preprocessing.py)                                                                   | Training background loading; inference energy detection (fused per-coarse-channel workers, vectorized D'Agostino-Pearson test, spline/PFB bandpass flattening, stamp extraction). See [`PREPROCESSING.md`](PREPROCESSING.md).        |
+| [`pfb.py`](../src/aetherscan/pfb.py)                                                                                       | Polyphase-filterbank static passband response (native NumPy port of the bliss reference) used by the default bandpass-flattening method.                                                                                             |
+| [`inference.py`](../src/aetherscan/inference.py)                                                                           | `InferencePipeline`: distributed encoding of snippets, RF classification, positives-only result writes. See [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).                                                                        |
+| [`inference_viz.py`](../src/aetherscan/inference_viz.py)                                                                   | End-of-run inference visualization suite (ED distributions, galleries, latent projection, summary card).                                                                                                                             |
+| [`models/vae.py`](../src/aetherscan/models/vae.py), [`models/random_forest.py`](../src/aetherscan/models/random_forest.py) | Model definitions. See [`MODELS.md`](MODELS.md).                                                                                                                                                                                     |
+| [`db/db.py`](../src/aetherscan/db/db.py)                                                                                   | Thread-safe SQLite singleton with a single background writer thread, schema migrations, and supersede semantics. See [`DATABASE.md`](DATABASE.md).                                                                                   |
+| [`benchmark.py`](../src/aetherscan/benchmark.py)                                                                           | Always-on stage timing (`stage_timer` / `record_stage`) written to the `pipeline_stages` table. See [`BENCHMARKING.md`](BENCHMARKING.md).                                                                                            |
+| [`dashboard.py`](../src/aetherscan/dashboard.py)                                                                           | Standalone Streamlit live-monitoring dashboard read from the run's SQLite DB; ships in-package so any install method can auto-launch it.                                                                                             |
+| [`dashboard_launcher.py`](../src/aetherscan/dashboard_launcher.py)                                                         | `launch_dashboard()` spawns the headless Streamlit subprocess (guarded, detached, atexit / SIGTERM teardown).                                                                                                                        |
+| [`hf_hub.py`](../src/aetherscan/hf_hub.py)                                                                                 | HuggingFace Hub artifact upload/download with version-coupled revision resolution. See [`RELEASE.md`](RELEASE.md).                                                                                                                   |
+| [`tag_guards.py`](../src/aetherscan/tag_guards.py)                                                                         | Fail-early `--save-tag` dedup guards run before any expensive work.                                                                                                                                                                  |
+| [`logger/`](../src/aetherscan/logger), [`manager/`](../src/aetherscan/manager), [`monitor/`](../src/aetherscan/monitor)    | Queue-based logging (+ Slack), resource lifecycle management (pools/SHM/processes/signals), 1 Hz resource monitoring. See [`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md).                                                              |
 
 ## Data flow
 
@@ -113,14 +113,14 @@ worker processes; everything I/O-ish runs on background threads of the main proc
   downsampling (training load), energy detection + stamp extraction (one persistent pool per
   inference run), and signal injection (owned by the producer, below).
 - **`RoundDataProducer`** (training only): a **spawn**-started process that owns its own
-  injection worker pool and generates round *k+1* while round *k* trains. Spawn, not fork —
+  injection worker pool and generates round _k+1_ while round _k_ trains. Spawn, not fork —
   the TF-laden parent holds locks a forked child could inherit mid-acquisition
   (see the `_MP_CONTEXT` note in [`round_data.py`](../src/aetherscan/round_data.py)).
 - **Shared memory** carries the background plates (training) and load-time chunks; memmapped
   `.npy` files carry everything bigger. Only the creator ever unlinks shared memory; the
   ResourceManager tracks and cleans up all of it.
 
-The DB writer queue is a *thread* queue — worker **processes** never write to the DB directly.
+The DB writer queue is a _thread_ queue — worker **processes** never write to the DB directly.
 Stats generated in workers travel back over multiprocessing queues/IPC and are written by
 main-process threads.
 
@@ -140,7 +140,7 @@ The order is load-bearing — each step depends on the previous:
    trio (encoder, RF, config JSON) via the HF resolution chain and writes the cached paths onto
    `args`, so `apply_saved_config` and `validate_args` see them as if passed on the CLI.
 8. Inference only: `apply_saved_config(args.config_path)` — layers a saved training-run JSON
-   under CLI flags *before* validation, so `validate_args` checks the values inference will
+   under CLI flags _before_ validation, so `validate_args` checks the values inference will
    actually use. The saved `checkpoint` section is skipped (a training run's `save_tag` must
    not leak into an inference run).
 9. `validate_args(args)` — semantic + cross-replica divisibility checks; no mutation.
@@ -166,7 +166,7 @@ singletons (double-checked locking in `__new__`, `_initialized` guard in `__init
   queue, and the resource registry must be process-global — two `Database` instances would
   mean two writer threads racing on one SQLite file.
 - **Import-order freedom.** Any module calls `get_config()` / `get_db()` / `get_manager()` / `get_logger()` / `get_monitor()`
-  at *use* time instead of threading instances through every constructor.
+  at _use_ time instead of threading instances through every constructor.
 - **Deterministic teardown.** The manager holds references to the others and closes them in
   a strict order (processes → pools → shared memory → monitor → DB → logger).
 
@@ -184,12 +184,12 @@ Every run is identified by `config.checkpoint.save_tag` — the **tag** — whic
 artifact filename and every DB row. Accepted formats
 (`cli.py:_TAG_PATTERN`):
 
-| Format | Example | Use |
-| --- | --- | --- |
-| `YYYYMMDD_HHMMSS` | `20260712_143000` | Default (import-time timestamp) — every untagged run gets a unique one. |
-| `final_vX` | `final_v1` | Release-grade training runs. |
-| `round_XX` | `round_05` | Per-round checkpoints (written by the pipeline; passed as `--load-tag` to resume from a specific round — `CheckpointConfig.infer_start_round()` derives the start round from it). |
-| `test_vX` | `test_v17` | Smoke/test runs. |
+| Format            | Example           | Use                                                                                                                                                                               |
+| ----------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `YYYYMMDD_HHMMSS` | `20260712_143000` | Default (import-time timestamp) — every untagged run gets a unique one.                                                                                                           |
+| `final_vX`        | `final_v1`        | Release-grade training runs.                                                                                                                                                      |
+| `round_XX`        | `round_05`        | Per-round checkpoints (written by the pipeline; passed as `--load-tag` to resume from a specific round — `CheckpointConfig.infer_start_round()` derives the start round from it). |
+| `test_vX`         | `test_v17`        | Smoke/test runs.                                                                                                                                                                  |
 
 `train.py:get_latest_tag()` ranks the families `final_vX > round_XX > timestamp > test_vX`
 when hunting for the newest checkpoint pair. Same-tag **retries** are first-class: the
@@ -242,7 +242,7 @@ only when their `.done` manifest validates.
 ## Fault-tolerance model (summary)
 
 Both commands wrap their pipeline in a bounded retry loop (`max_retries`/`retry_delay`,
-Pattern C flags — the two modes have independent settings). What makes retries *safe* is
+Pattern C flags — the two modes have independent settings). What makes retries _safe_ is
 persistent state, not the loop:
 
 - **Training**: `run_state_{tag}.json` records completed rounds and pipeline stages
