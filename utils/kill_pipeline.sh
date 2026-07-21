@@ -44,6 +44,13 @@
 # so orphaned /dev/shm segments may be left behind (the OS reclaims GPU memory and
 # RAM on process exit, but POSIX shared memory persists). See the cleanup hint
 # printed at the end and KNOWN_ISSUES.md ("Pool Cleanup Hangs").
+#
+# Post-mortem sweep: if no main process matches (it already died — e.g. kill -9,
+# OOM), a RoundDataProducer may have survived as an orphan (reparented to PID 1,
+# argv `... spawn_main ...` — invisible to $PATTERN). The producer records its PID
+# in {round_data_root}/{tag}/producer.pid (removed on graceful shutdown), so the
+# script reads any leftover pidfiles under the round-data root and reaps those
+# trees. Pass --round-data-root if the run used a non-default --round-data-dir.
 
 set -euo pipefail
 
@@ -52,6 +59,10 @@ set -euo pipefail
 # "... python -m aetherscan.main ..."). The `-m ` anchor keeps it from matching
 # unrelated processes that merely have "aetherscan" in a path.
 PATTERN='-m[[:space:]]+aetherscan\.main'
+
+# Where RoundDataProducer.start() drops its per-tag producer.pid (config default:
+# {data_path}/training/round_data — see config.py get_training_file_path).
+ROUND_DATA_ROOT="${AETHERSCAN_DATA_PATH:-/datax/scratch/zachy/data/aetherscan}/training/round_data"
 
 TIMEOUT=30
 FORCE=0
@@ -67,6 +78,9 @@ Usage: ./utils/kill_pipeline.sh [options]
   -n, --dry-run     show what would be killed, send nothing
   -f, --force       skip graceful shutdown, SIGKILL immediately
   -t, --timeout N   seconds to wait for graceful shutdown (default 30)
+  -r, --round-data-root DIR
+                    where to look for orphaned-producer pidfiles when the main
+                    process is already dead (default: AETHERSCAN_DATA_PATH-based)
   -h, --help        show this help
 EOF
     exit "${1:-0}"
@@ -80,6 +94,14 @@ while [[ $# -gt 0 ]]; do
         TIMEOUT="${2:-}"
         [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || {
             echo "Error: --timeout needs an integer (seconds)." >&2
+            exit 2
+        }
+        shift
+        ;;
+    --round-data-root | -r)
+        ROUND_DATA_ROOT="${2:-}"
+        [[ -n "$ROUND_DATA_ROOT" ]] || {
+            echo "Error: --round-data-root needs a directory." >&2
             exit 2
         }
         shift
@@ -138,9 +160,62 @@ find_main_pid() {
     [[ -n "$main" ]] && echo "$main"
 }
 
+# Post-mortem sweep for producers orphaned by an ungraceful main-process death:
+# read each leftover {round_data_root}/{tag}/producer.pid, and if that PID is
+# still a live python process, kill its whole tree (SIGTERM first so the
+# producer's own handler reaps its pool, unless --force) and remove the pidfile.
+reap_orphan_producers() {
+    local pidfile pid args found=0 waited p
+    for pidfile in "$ROUND_DATA_ROOT"/*/producer.pid; do
+        [[ -e "$pidfile" ]] || continue
+        pid=$(tr -cd '0-9' <"$pidfile")
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "Removing stale producer pidfile: $pidfile"
+            [[ "$DRYRUN" == 1 ]] || rm -f "$pidfile"
+            continue
+        fi
+        # PID-reuse guard: the recorded producer is a python process (spawn_main
+        # argv); anything else holding the PID now is not it.
+        args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        if ! grep -qE 'python|spawn_main' <<<"$args"; then
+            echo "Removing stale producer pidfile (PID $pid reused by: ${args:0:60}): $pidfile"
+            [[ "$DRYRUN" == 1 ]] || rm -f "$pidfile"
+            continue
+        fi
+        found=1
+        echo "Orphaned producer : $pid  (${args:0:72}...)  [$pidfile]"
+        mapfile -t TREE < <(descendants "$pid")
+        TREE=("$pid" ${TREE[@]+"${TREE[@]}"})
+        echo "Producer tree     : ${TREE[*]}"
+        if [[ "$DRYRUN" == 1 ]]; then
+            echo "[dry-run] would terminate ${#TREE[@]} process(es); no signals sent."
+            continue
+        fi
+        if [[ "$FORCE" == 0 ]]; then
+            # SIGTERM: the producer's handler terminates its own pool before dying.
+            kill -TERM "$pid" 2>/dev/null || true
+            waited=0
+            while ((waited < TIMEOUT)); do
+                any_alive "${TREE[@]}" || break
+                sleep 1
+                waited=$((waited + 1))
+            done
+        fi
+        for p in "${TREE[@]}"; do
+            kill -KILL "$p" 2>/dev/null || true
+        done
+        rm -f "$pidfile"
+        echo "Orphaned producer tree reaped."
+    done
+    if ((!found)); then
+        echo "No orphaned producers found under $ROUND_DATA_ROOT."
+    fi
+}
+
 MAIN_PID=$(find_main_pid)
 if [[ -z "${MAIN_PID:-}" ]]; then
     echo "No running Aetherscan pipeline found."
+    reap_orphan_producers
     exit 0
 fi
 

@@ -9,8 +9,10 @@ import random
 import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
+from types import SimpleNamespace
 
 import numpy as np
+import psutil
 import pytest
 
 from aetherscan.data_generation import (
@@ -22,6 +24,7 @@ from aetherscan.round_data import (
     RoundDataPaths,
     RoundDataProducer,
     _producer_main,
+    _reap_stale_producer,
     build_manifest,
     load_round_arrays,
     prepare_round_data_dir,
@@ -534,6 +537,142 @@ class TestProducerParentDeathWatch:
             except queue.Empty:
                 break
         assert kinds == ["stats", "progress", "timing", "done", "shutdown_ack"]
+
+
+class _FakeSpawnedProcess:
+    """Stand-in for _MP_CONTEXT.Process in pidfile tests — records nothing, spawns nothing."""
+
+    def __init__(self, *args, **kwargs):
+        self.pid = 31337
+
+    def start(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return False
+
+
+class TestProducerPidfile:
+    def test_pidfile_written_on_start_and_removed_on_shutdown(self, tmp_path, monkeypatch):
+        producer = RoundDataProducer(
+            base_dir=str(tmp_path),
+            n_samples=8,
+            shm_name="unused",
+            background_shape=(1, 6, 4, 16),
+            background_dtype="float32",
+            n_processes=1,
+            width_bin=16,
+            num_observations=6,
+            time_bins=4,
+            chunk_size=4,
+            task_size=2,
+            freq_resolution=_FREQ_RES,
+            time_resolution=_TIME_RES,
+            db=_FakeDB(),
+            tag="test_v1",
+        )
+        # Swap the spawn context for a no-op process AFTER construction (the queues in
+        # __init__ must stay real) and keep the manager out of the way.
+        monkeypatch.setattr(
+            "aetherscan.round_data._MP_CONTEXT", SimpleNamespace(Process=_FakeSpawnedProcess)
+        )
+        monkeypatch.setattr("aetherscan.round_data.get_manager", lambda: None)
+
+        producer.start()
+        pidfile = tmp_path / "producer.pid"
+        assert pidfile.read_text() == "31337"
+
+        producer.shutdown(timeout=2.0)
+        assert not pidfile.exists()
+
+
+class _FakeReapChild:
+    def __init__(self):
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+
+class _FakeReapProc:
+    def __init__(self, pid, create_time, children=()):
+        self.pid = pid
+        self._create_time = create_time
+        self._children = list(children)
+        self.terminated = False
+        self.killed = False
+
+    def create_time(self):
+        return self._create_time
+
+    def children(self, recursive=False):
+        return self._children
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        pass
+
+    def kill(self):
+        self.killed = True
+
+
+class TestReapStaleProducer:
+    """The restart-race guard run by prepare_round_data_dir before any rmtree (psutil mocked
+    — no real signals are sent)."""
+
+    def _write_pidfile(self, base_dir, pid=424242):
+        path = os.path.join(base_dir, "producer.pid")
+        with open(path, "w") as f:
+            f.write(str(pid))
+        return path
+
+    def _patch_psutil(self, monkeypatch, process_cls):
+        monkeypatch.setattr(
+            "aetherscan.round_data.psutil",
+            SimpleNamespace(
+                Process=process_cls,
+                NoSuchProcess=psutil.NoSuchProcess,
+                TimeoutExpired=psutil.TimeoutExpired,
+            ),
+        )
+
+    def test_missing_pidfile_is_a_noop(self, tmp_path):
+        _reap_stale_producer(str(tmp_path))  # must not raise
+
+    def test_dead_recorded_pid_removes_pidfile(self, tmp_path, monkeypatch):
+        path = self._write_pidfile(str(tmp_path))
+
+        def _no_such_process(pid):
+            raise psutil.NoSuchProcess(pid)
+
+        self._patch_psutil(monkeypatch, _no_such_process)
+        _reap_stale_producer(str(tmp_path))
+        assert not os.path.exists(path)
+
+    def test_live_recorded_producer_tree_is_reaped(self, tmp_path, monkeypatch):
+        path = self._write_pidfile(str(tmp_path))
+        children = [_FakeReapChild(), _FakeReapChild()]
+        # Created before the pidfile was written -> genuinely the recorded producer.
+        proc = _FakeReapProc(424242, os.path.getmtime(path) - 60.0, children=children)
+        self._patch_psutil(monkeypatch, lambda pid: proc)
+        _reap_stale_producer(str(tmp_path), term_timeout=0.1)
+        assert proc.terminated and proc.killed
+        assert all(child.killed for child in children)
+        assert not os.path.exists(path)
+
+    def test_recycled_pid_is_left_alone(self, tmp_path, monkeypatch):
+        path = self._write_pidfile(str(tmp_path))
+        # Created after the pidfile was written -> a PID recycled by an unrelated process.
+        proc = _FakeReapProc(424242, os.path.getmtime(path) + 60.0)
+        self._patch_psutil(monkeypatch, lambda pid: proc)
+        _reap_stale_producer(str(tmp_path))
+        assert not proc.terminated and not proc.killed
+        assert not os.path.exists(path)  # the stale pidfile is still cleared
 
 
 class _FakeProcess:
