@@ -94,6 +94,7 @@ class _StubPreprocessor:
         self.units = [self._make_unit(key) for key in keys]
         self.processed_keys: list[tuple] = []
         self.loaded_paths: list[str] = []
+        self.load_parallel_flags: list[bool] = []
 
     def _make_unit(self, key):
         group = CadenceGroup(
@@ -130,12 +131,13 @@ class _StubPreprocessor:
             metadata_path=metadata_path,
         )
 
-    def load_inference_data(self, override_filepaths=None):
+    def load_inference_data(self, override_filepaths=None, parallel=True):
         # override_filepaths=None mirrors the legacy --test-files call shape, which loads
         # the configured test_files with no arguments
         if override_filepaths is None:
             override_filepaths = [get_config().data.test_files[0]]
         self.loaded_paths.extend(override_filepaths)
+        self.load_parallel_flags.append(parallel)
         return np.load(override_filepaths[0])
 
 
@@ -204,6 +206,9 @@ class TestStreamingResumeStateMachine:
         assert totals["n_cadences"] == 2
         assert totals["n_skipped"] == 0
         assert totals["n_cadence_snippets"] == 8
+        # The streaming loader must run sequentially (parallel=False): the prefetch thread
+        # already saturates the CPU with the persistent energy-detection pool.
+        assert preprocessor.load_parallel_flags == [False, False]
         assert db.flush(timeout=10) is True
         rows = db.query_inference_cadences(tag="test_v1", status="inferred")
         assert len(rows) == 2

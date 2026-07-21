@@ -580,9 +580,9 @@ class TestProcessCadenceEndToEnd:
             DataPreprocessor()._process_cadence(group, npy_path)
 
     @staticmethod
-    def _rewrite_primary_rank(h5_path, shape):
-        """Replace the primary file's 'data' with an array of the given (wrong) shape, keeping
-        the original header attrs so only the rank is invalid."""
+    def _rewrite_rank(h5_path, shape):
+        """Replace one observation file's 'data' with an array of the given (wrong) shape,
+        keeping the original header attrs so only the rank is invalid."""
         import h5py  # noqa: PLC0415
 
         with h5py.File(h5_path, "r+") as hf:
@@ -601,7 +601,7 @@ class TestProcessCadenceEndToEnd:
 
         self._configure()
         h5_paths = self._make_cadence(tmp_path)
-        self._rewrite_primary_rank(h5_paths[0], bad_shape)
+        self._rewrite_rank(h5_paths[0], bad_shape)
         group = CadenceGroup(
             key=("T4", "S1", "L", "10", "2251"),
             h5_paths=h5_paths,
@@ -615,6 +615,72 @@ class TestProcessCadenceEndToEnd:
         with pytest.raises(ValueError, match=r"expected rank 3"):
             DataPreprocessor()._process_cadence(group, npy_path)
 
+    def test_wrong_rank_in_non_primary_file_rejected_up_front(self, tmp_path, initialized_runtime):
+        """The rank check covers all 6 observation files, not just the primary: a wrong-rank
+        OFF file (index 3) is rejected with the same up-front ValueError naming the file."""
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        self._rewrite_rank(h5_paths[3], (16, 2048))
+        group = CadenceGroup(
+            key=("T7", "S1", "L", "13", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cad_bad_rank_off.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        with pytest.raises(ValueError, match=r"expected rank 3") as exc_info:
+            DataPreprocessor()._process_cadence(group, npy_path)
+        assert h5_paths[3] in str(exc_info.value)
+
+    @pytest.mark.parametrize("short_obs_idx", [1, 2])
+    def test_short_time_bins_in_any_file_skips_whole_cadence(
+        self, tmp_path, initialized_runtime, caplog, short_obs_idx
+    ):
+        """One observation file with fewer than time_bins rows — an OFF file (index 1) or a
+        non-primary ON file (index 2) — skips the whole cadence up front with a warning
+        naming the file, instead of failing mid-extraction with a broadcast ValueError (and,
+        for a short ON file, silently degrading the k2 statistic first). The cadence is
+        dropped whole because the (n, 6, time_bins, width) stamp tensor and the downstream
+        num_observations=6 contract have no representation for a 5-observation cadence."""
+        import h5py  # noqa: PLC0415
+
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        config = self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        short_path = h5_paths[short_obs_idx]
+        with h5py.File(short_path, "r+") as hf:
+            attrs = dict(hf["data"].attrs)
+            short_data = hf["data"][: config.data.time_bins - 4]
+            del hf["data"]
+            dset = hf.create_dataset("data", data=short_data)
+            for k, v in attrs.items():
+                dset.attrs[k] = v
+        group = CadenceGroup(
+            key=("T6", "S1", "L", "12", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cad_short.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
+            result = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+
+        assert result is None
+        assert not os.path.exists(npy_path)
+        # The skip happens before extraction, so no partial .tmp.npy is ever created
+        assert not os.path.exists(os.path.splitext(npy_path)[0] + ".tmp.npy")
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(short_path in m and "time bins" in m for m in warnings)
+
     def test_wrong_rank_data_is_skipped_not_fatal(self, tmp_path, initialized_runtime):
         """process_pending_cadence swallows the rank ValueError into a logged skip (returns
         None, no .npy written), so one malformed cadence can't abort a large-catalog run."""
@@ -622,7 +688,7 @@ class TestProcessCadenceEndToEnd:
 
         self._configure()
         h5_paths = self._make_cadence(tmp_path)
-        self._rewrite_primary_rank(h5_paths[0], (16, 2048))
+        self._rewrite_rank(h5_paths[0], (16, 2048))
         group = CadenceGroup(
             key=("T5", "S1", "L", "11", "2251"),
             h5_paths=h5_paths,
@@ -1054,6 +1120,36 @@ class TestLoadInferenceDataPaths:
         assert loaded.shape == (2, 6, 16, final_width)
         for i in range(2):
             np.testing.assert_allclose(loaded[i], log_norm(good[i]), rtol=1e-6)
+
+    def test_parallel_false_uses_no_pool_or_shared_memory(
+        self, tmp_path, initialized_runtime, monkeypatch
+    ):
+        """parallel=False (the streaming per-cadence path in main._infer_cadence) must route
+        through the sequential in-process branch even when n_processes > 1 — no chunk pool,
+        no shared memory — so the loader can't double-subscribe the CPU against the
+        persistent energy-detection pool. The output is pinned to the same log-norm oracle
+        the parallel-path tests above use, so both paths provably agree."""
+        config = self._configure()
+        config.manager.n_processes = 4  # would fork a chunk pool on the parallel path
+        final_width = config.data.width_bin // config.data.downsample_factor
+        rng = np.random.default_rng(71)
+        arr = rng.chisquare(df=4, size=(3, 6, 16, final_width)).astype(np.float32)
+        path = tmp_path / "streaming_cadence.npy"
+        np.save(path, arr)
+
+        preprocessor = DataPreprocessor()
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("no pool/shared memory may be created when parallel=False")
+
+        monkeypatch.setattr(preprocessor.manager, "create_pool", _fail)
+        monkeypatch.setattr(preprocessor.manager, "create_shared_memory", _fail)
+
+        loaded = preprocessor.load_inference_data(override_filepaths=[str(path)], parallel=False)
+
+        assert loaded.shape == (3, 6, 16, final_width)
+        for i in range(3):
+            np.testing.assert_allclose(loaded[i], log_norm(arr[i]), rtol=1e-6)
 
     def test_mixed_legacy_and_downsampled_files(self, tmp_path, initialized_runtime):
         config = self._configure()

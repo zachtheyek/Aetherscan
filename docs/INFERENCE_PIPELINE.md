@@ -175,9 +175,12 @@ than after ~30 h of training.)
    - provenance derived from the group key + metadata JSON
      (`preprocessing.derive_cadence_provenance`): target, session, band, cadence id, header
      `tstart`, first `.h5` path, and the per-stamp center frequencies;
-   - stamps loaded via `load_inference_data(override_filepaths=[npy_path])` (log-norm only
-     for downsampled stamps; legacy full-width files also get downsampled — see
-     [`PREPROCESSING.md`](PREPROCESSING.md));
+   - stamps loaded via `load_inference_data(override_filepaths=[npy_path], parallel=False)`
+     (log-norm only for downsampled stamps; legacy full-width files also get downsampled —
+     see [`PREPROCESSING.md`](PREPROCESSING.md)). `parallel=False` forces the sequential
+     in-process branch: the prefetch thread is already driving the persistent
+     energy-detection pool at full width, and a second per-chunk pool would double-subscribe
+     the CPU for a single cheap vectorized log-norm;
    - `mark_superseded("inference_results", tag, npy_path=...)` — partial positives from a
      dead attempt are retired *before* fresh rows land;
    - `run_inference()` (below), then a superseding `inference_cadences` row with
