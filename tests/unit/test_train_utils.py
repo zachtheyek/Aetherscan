@@ -25,6 +25,7 @@ from aetherscan.run_state import (
 from aetherscan.train import (
     TrainingPipeline,
     _execute_training_stages,
+    _resolve_load_tag,
     _select_positive_class_shap,
     archive_directory,
     check_encoder_trained,
@@ -98,6 +99,35 @@ class TestGetLatestTag:
             f.write("stub")
         with pytest.raises(FileNotFoundError, match="No valid model pairs"):
             get_latest_tag(str(d))
+
+
+class TestResolveLoadTag:
+    """The load_models() tag decision (issue #142): an explicit missing tag must fail loud
+    instead of silently substituting the latest tag present in base_dir."""
+
+    def test_explicit_existing_tag_returned(self, tmp_path):
+        _touch_pair(tmp_path, "round_03")
+        assert _resolve_load_tag(str(tmp_path), "round_03") == "round_03"
+
+    def test_explicit_missing_tag_raises_instead_of_falling_back(self, tmp_path):
+        # The old fallback would have loaded the stale test_v27 model and reported success.
+        _touch_pair(tmp_path, "test_v27")
+        with pytest.raises(FileNotFoundError, match="round_01"):
+            _resolve_load_tag(str(tmp_path), "round_01")
+
+    def test_default_prefers_final(self, tmp_path):
+        _touch_pair(tmp_path, "final")
+        _touch_pair(tmp_path, "round_09")
+        assert _resolve_load_tag(str(tmp_path), None) == "final"
+
+    def test_default_falls_back_to_latest(self, tmp_path):
+        _touch_pair(tmp_path, "round_02")
+        _touch_pair(tmp_path, "test_v1")
+        assert _resolve_load_tag(str(tmp_path), None) == "round_02"
+
+    def test_default_empty_dir_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            _resolve_load_tag(str(tmp_path), None)
 
 
 class _PipelineStub:

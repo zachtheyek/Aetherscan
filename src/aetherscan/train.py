@@ -297,6 +297,50 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
+def _model_pair_exists(base_dir: str, tag: str) -> bool:
+    """True when the encoder/decoder pair for `tag` both exist in base_dir."""
+    return os.path.exists(os.path.join(base_dir, f"vae_encoder_{tag}.keras")) and os.path.exists(
+        os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+    )
+
+
+def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
+    """
+    Resolve the tag load_models() should load from base_dir.
+
+    An explicitly requested tag must exist: raising FileNotFoundError beats the old silent
+    get_latest_tag() fallback, which could resume training from a stale, unrelated model while
+    reporting success (issue #142). Only the tag=None default may fall back to the latest tag
+    present in base_dir.
+    """
+    if tag is not None:
+        if _model_pair_exists(base_dir, tag):
+            return tag
+        raise FileNotFoundError(
+            f"No models tagged '{tag}' in {base_dir} — refusing to fall back to the latest tag "
+            f"for an explicitly requested tag. If you meant to resume from a per-round "
+            f"checkpoint, pass --load-dir checkpoints"
+        )
+
+    # NOTE: use a more sensible default
+    logger.info("No tag specified. Defaulting to 'final'")
+    if _model_pair_exists(base_dir, "final"):
+        return "final"
+
+    logger.warning(f"No models tagged as 'final' in {base_dir}")
+    logger.warning(f"Looking for latest tag in {base_dir} instead")
+
+    latest = get_latest_tag(
+        base_dir
+    )  # get_latest_tag() will raise an error if no valid tags exist in base_dir
+    logger.info(f"Tag 'final' not found. Loading latest model with tag: '{latest}'")
+
+    # Sanity check: get_latest_tag() only returns tags whose pair existed at scan time
+    if not _model_pair_exists(base_dir, latest):
+        raise FileNotFoundError("Models not found")
+    return latest
+
+
 def compute_expected_std(layer):
     """Compute expected std based on initializer."""
     weights = layer.get_weights()
@@ -6439,43 +6483,23 @@ class TrainingPipeline:
             logger.info(f"Saved Random Forest to {rf_path}")
 
     def load_models(self, tag: str | None = None, dir: str | None = None):
-        """Load model weights"""
-        if tag is None:
-            # NOTE: use a more sensible default
-            logger.info("No tag specified. Defaulting to 'final'")
-            tag = "final"
-        original_tag = tag
+        """Load model weights.
 
-        # Construct filepaths
+        An explicit `tag` must exist in the target directory (FileNotFoundError otherwise);
+        only the tag=None default falls back to 'final' and then the latest tag present —
+        see _resolve_load_tag() and issue #142.
+        """
         if dir is not None:
             base_dir = os.path.join(self.config.model_path, dir)
-            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
         else:
             base_dir = self.config.model_path
-            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
-        if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
-            # If the specified path doesn't exist, try to find the latest tag from base_dir
-            logger.warning(f"No models tagged as '{original_tag}' in {base_dir}")
-            logger.warning(f"Looking for latest tag in {base_dir} instead")
+        tag = _resolve_load_tag(base_dir, tag)
 
-            tag = get_latest_tag(
-                base_dir
-            )  # get_latest_tag() will raise an error if no valid tags exist in base_dir
-            logger.info(f"Tag '{original_tag}' not found. Loading latest model with tag: '{tag}'")
-
-            # Reconstruct paths with new tag
-            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
-
-            # Sanity check: if paths still don't exist, raise an error
-            if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
-                raise FileNotFoundError("Models not found")
+        # Construct filepaths
+        encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
+        decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+        rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
         # Load the models
         try:
