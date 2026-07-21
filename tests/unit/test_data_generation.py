@@ -138,6 +138,32 @@ class TestCheckValidIntersection:
         # y = x and y = -x + 2*y_target intersect at (y_target, y_target).
         assert check_valid_intersection(1.0, -1.0, 0.0, 2 * y_target) is False
 
+    @pytest.mark.parametrize(
+        "b1, b2, positive_drift",
+        [
+            # Pairs whose float intersection lands at y* ~ -1e-14 instead of the exact 0:
+            # the un-padded inclusive comparison accepted all of these by rounding luck (#118).
+            (1, 187, True),
+            (173, 434, True),
+            (383, 511, True),
+            (1, 75, False),
+            (102, 500, False),
+            (239, 511, False),
+        ],
+    )
+    def test_boundary_intersections_rejected_despite_float_noise(self, b1, b2, positive_drift):
+        # Production geometry (new_cadence): positive-drift trajectories all pass through
+        # (0, 0) and negative-drift ones through (width_bin, 0), so same-sign pairs intersect
+        # exactly ON the first ON-band edge (y* = 0) and must be rejected (boundaries are
+        # inclusive) regardless of float rounding in slope/intercept/intersection arithmetic.
+        total_time, width_bin = 96, 512
+        slopes_intercepts = []
+        for b in (b1, b2):
+            slope = total_time / b if positive_drift else total_time / (b - width_bin)
+            slopes_intercepts.append((slope, total_time - slope * b))
+        (s1, e1), (s2, e2) = slopes_intercepts
+        assert check_valid_intersection(s1, s2, e1, e2) is False
+
 
 class TestNewCadence:
     def _background(self, rng=None):

@@ -256,9 +256,25 @@ def new_cadence(
     return modified_data, signal_info, slope_was_clamped
 
 
+# Float-rounding pad for the ON-band boundary comparison in check_valid_intersection (#118).
+# Same-sign trajectory pairs intersect exactly ON a band edge (y* = 0 in exact arithmetic:
+# positive-drift lines all pass through (0, 0) and negative-drift lines through (width_bin, 0),
+# see new_cadence's y_intercept construction), but the float intersection lands at y* ~ -1e-14,
+# so a bare inclusive comparison used to accept ~4.8% of them by rounding luck. 1e-9 is several
+# orders of magnitude above the observed rounding noise yet negligible against the pixel-scale
+# band geometry (an extra ~2e-9-wide rejection sliver per boundary).
+_ON_BAND_BOUNDARY_EPS = 1e-9
+
+
 def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
     """
-    Check if 2 drifting signals intersect in the ON regions
+    Check if 2 drifting signals intersect in the ON regions.
+
+    ON-band boundaries are deliberately INCLUSIVE: an intersection lying exactly on a band edge
+    counts as inside the ON region and invalidates the pair (returns False) — a boundary
+    crossing still overlaps ON-region pixels once the signals' finite width is considered. The
+    comparison is padded by _ON_BAND_BOUNDARY_EPS so float rounding cannot flip an
+    exact-boundary case to "valid".
     """
     if slope_1 == slope_2:
         return True  # Parallel lines never intersect. Avoids division by 0
@@ -267,7 +283,10 @@ def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
     y_intersect = slope_1 * x_intersect + intercept_1
 
     on_y_coords = [(0, 16), (32, 48), (64, 80)]
-    return all(not y_lower <= y_intersect <= y_upper for y_lower, y_upper in on_y_coords)
+    return all(
+        not (y_lower - _ON_BAND_BOUNDARY_EPS <= y_intersect <= y_upper + _ON_BAND_BOUNDARY_EPS)
+        for y_lower, y_upper in on_y_coords
+    )
 
 
 # TODO: add more sophisticated statistics for data leakage analysis
