@@ -1,7 +1,7 @@
 # Release CD — the automation half of the release contract in docs/RELEASE.md.
 #
 # Trigger: pushing a release tag (git tag -s vX.Y.Z && git push origin vX.Y.Z). The gates run
-# in order — version guard -> unit tests -> HF weights verification -> build -> PyPI publish
+# in order — signed-tag + version guard -> unit tests -> HF weights verification -> build -> PyPI publish
 # (trusted publishing) -> GitHub Release — so a half-released state is impossible: nothing
 # publishes unless the tag matches pyproject.toml, the suite is green, and the blessed
 # weights tag already exists on the HF model repo (CD verifies weights, never creates them —
@@ -48,6 +48,34 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+
+      - name: Enforce a signed release tag
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Releases carry the same provenance as commits (this repo requires signed commits): the
+          # tag must be an ANNOTATED, GPG-signed tag whose signature GitHub verifies against a key
+          # registered to the tagger's account. Rejects lightweight tags and unsigned/unverified
+          # ones. No key material lives in CI — GitHub does the verification. (Dry-run
+          # workflow_dispatch has no tag, so this step is skipped there.)
+          obj_type=$(gh api "repos/$GH_REPO/git/ref/tags/$REF_NAME" --jq '.object.type')
+          if [ "$obj_type" != "tag" ]; then
+            echo "::error::Release tag '$REF_NAME' is a lightweight tag. Cut it signed:" \
+                 "git tag -s $REF_NAME (docs/RELEASE.md step 5)."
+            exit 1
+          fi
+          tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$REF_NAME" --jq '.object.sha')
+          verified=$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.verification.verified')
+          reason=$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.verification.reason')
+          if [ "$verified" != "true" ]; then
+            echo "::error::Release tag '$REF_NAME' signature not verified (reason: $reason)." \
+                 "Sign with git tag -s using a GPG key registered on your GitHub account."
+            exit 1
+          fi
+          echo "Signed-tag check passed: '$REF_NAME' ($reason)."
 
       - name: Resolve version and enforce tag match
         id: resolve
@@ -199,7 +227,9 @@ jobs:
 
       - name: Publish to TestPyPI (dry run)
         if: needs.guard.outputs.dry_run == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # SHA-pinned (not @release/v1) because this is the only job holding the PyPI publish
+        # credential (id-token); claude-dependency-check.yml flags a newer release weekly to bump.
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
         with:
           repository-url: https://test.pypi.org/legacy/
           # The static pre-release version isn't bumped between releases, so a repeated dry run
@@ -209,7 +239,9 @@ jobs:
 
       - name: Publish to PyPI
         if: needs.guard.outputs.dry_run != 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # SHA-pinned (not @release/v1) because this is the only job holding the PyPI publish
+        # credential (id-token); claude-dependency-check.yml flags a newer release weekly to bump.
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247  # v1.14.1
         with:
           # Idempotent partial-failure recovery: if PyPI publish succeeds but a later gate
           # (github-release) fails, re-running the whole workflow won't hard-fail here on the
