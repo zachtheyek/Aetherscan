@@ -19,7 +19,8 @@ numbers and how to read the annotated resource plot.
   opened without name plumbing.
 - `python utils/benchmark_report.py --save-tag <tag>` prints the stage tree, writes a
   flame-style timeline PNG, and flags likely bottlenecks from `pipeline_stages` joined with
-  `system_resources`.
+  `system_resources`. The report PNG is also rendered and posted to Slack automatically at
+  the end of every `train`/`inference` run (`--no-benchmark-report` opts out).
 - The 1 Hz resource plot overlays the top-level stages as labeled bands
   (`monitor.annotate_stages`), so a CPU plateau reads as "round 3 data generation" at a
   glance.
@@ -118,6 +119,15 @@ python utils/benchmark_report.py --save-tag final_v1
 # Explicit db (e.g. a copy pulled off the cluster)
 python utils/benchmark_report.py --save-tag test_v18 --db-path /path/to/aetherscan.db
 ```
+
+The same report is also generated **automatically at the tail of every `train`/`inference`
+run** (`_post_benchmark_report` in [`main.py`](../src/aetherscan/main.py)): the hook flushes
+the DB write queue (stage spans land through it asynchronously), loads this tool by file path
+(preserving its no-`aetherscan`-imports contract), renders
+`{output_path}/plots/benchmark_report_{tag}.png`, and uploads it to Slack with the
+suggestions as the image comment. It is gated by `monitor.benchmark_report_enabled`
+(`--no-benchmark-report` to opt out) and fully guarded — any failure logs an error and never
+fails the run.
 
 It produces three things for one `--save-tag`:
 

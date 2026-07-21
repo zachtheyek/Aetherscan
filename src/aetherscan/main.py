@@ -7,12 +7,14 @@ Entry point for Aetherscan Pipeline
 from __future__ import annotations
 
 import gc
+import importlib.util
 import json
 import logging
 import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
@@ -31,7 +33,7 @@ from aetherscan.db import get_db, init_db
 from aetherscan.hf_hub import resolve_inference_artifacts
 from aetherscan.inference import InferencePipeline, run_inference_pipeline, summarize_confidences
 from aetherscan.inference_viz import InferenceVizCollector, render_inference_visualizations
-from aetherscan.logger import init_logger
+from aetherscan.logger import get_logger, init_logger
 from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
 from aetherscan.preprocessing import (
@@ -221,6 +223,76 @@ def _report_final_training_status(pipeline) -> None:
     logger.info("=" * 60)
 
 
+def _post_benchmark_report(tag: str) -> None:
+    """
+    Render the end-of-run benchmark report (utils/benchmark_report.py) and post it to Slack.
+
+    Runs at the tail of train_command/inference_command rather than after monitor shutdown:
+    the monitor never writes pipeline_stages rows (stage spans land via the async DB write
+    queue), and by the time main()'s finally block stops the monitor the Slack handler is
+    being torn down too. An explicit db.flush() is what guarantees every span row is on disk
+    before the report reads them. Fully guarded: any failure (including the report tool's
+    SystemExit) logs an error and never fails the run.
+    """
+    try:
+        config = get_config()
+        if config is None:
+            raise ValueError("get_config() returned None")
+        if not config.monitor.benchmark_report_enabled:
+            logger.info("Benchmark report disabled (--no-benchmark-report)")
+            return
+
+        db = get_db()
+        if db is None:
+            raise ValueError("get_db() returned None")
+        # Stage spans reach the DB through the async write queue — drain it so the report
+        # sees every row of this run
+        db.flush(timeout=config.db.flush_timeout)
+
+        # utils/benchmark_report.py is deliberately import-free of aetherscan (stdlib
+        # sqlite3 + numpy + matplotlib) so it stays cluster-portable — load it by file path
+        # instead of importing, same pattern as tests/unit/test_benchmark.py. The
+        # sys.modules registration must precede exec_module: the module's @dataclass
+        # resolves its own module by name at class-creation time (PEP 563 string
+        # annotations).
+        report_path = Path(__file__).resolve().parents[2] / "utils" / "benchmark_report.py"
+        if not report_path.exists():
+            # e.g. a pip-installed package without the repo checkout alongside
+            logger.warning(f"Benchmark report skipped: {report_path} does not exist")
+            return
+        spec = importlib.util.spec_from_file_location("benchmark_report", report_path)
+        benchmark_report = importlib.util.module_from_spec(spec)
+        sys.modules["benchmark_report"] = benchmark_report
+        spec.loader.exec_module(benchmark_report)
+
+        rows = benchmark_report.load_rows(db.db_path, tag)
+        if not rows:
+            logger.warning(f"Benchmark report skipped: no pipeline_stages rows for tag {tag!r}")
+            return
+        root = benchmark_report.build_stage_tree(rows)
+        png_path = os.path.join(config.output_path, "plots", f"benchmark_report_{tag}.png")
+        benchmark_report.render_report_png(root, rows, tag, png_path)
+        logger.info(f"Benchmark report saved to {png_path}")
+
+        # Bottleneck suggestions ride along as the upload's comment, landing in the run
+        # thread right next to the figure
+        suggestions = benchmark_report.build_suggestions(root, db.db_path, tag)
+        message = "\n".join(f"- {s}" for s in suggestions) if suggestions else None
+
+        logger_instance = get_logger()
+        if logger_instance is None:
+            raise ValueError("get_logger() returned None")
+        if not logger_instance.upload_image_to_slack(
+            png_path, title=f"Benchmark Report - {tag}", message=message
+        ):
+            logger.warning("Benchmark report rendered but Slack upload was skipped or failed")
+
+    except (Exception, SystemExit) as e:
+        # SystemExit included: load_rows raises it on a pre-benchmarking-schema DB.
+        # Observability must never fail an otherwise-finished run.
+        logger.error(f"Benchmark report generation failed: {e}")
+
+
 def train_command():
     """Execute training pipeline with distributed strategy & fault tolerance"""
     logger.info("=" * 60)
@@ -309,6 +381,11 @@ def train_command():
                 logger.error(f"Training attempts exceeded maximum retries ({max_retries})")
                 logger.error(f"Final error: {e}")
                 sys.exit(1)
+
+    # Post the end-of-run benchmark report before the terminal status report: the latter
+    # sys.exit(1)s when any non-critical stage permanently failed, and the timing data is
+    # exactly as valuable on those runs
+    _post_benchmark_report(config.checkpoint.save_tag)
 
     # Note, the training configuration JSON is saved by the pipeline's final_save stage
     # (so it's covered by the retry machinery), not here
@@ -805,6 +882,8 @@ def inference_command():
     logger.info(f"    Processed: {results['n_processed']}")
     logger.info(f"    Candidates found: {results['n_candidates']}")
     logger.info("=" * 60)
+
+    _post_benchmark_report(config.checkpoint.save_tag)
 
 
 def main():

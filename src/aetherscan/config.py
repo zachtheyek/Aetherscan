@@ -53,6 +53,9 @@ class MonitorConfig:
     # --no-dashboard opts out. Served headless on dashboard_port (SSH-forward to reach it).
     dashboard_enabled: bool = True
     dashboard_port: int = 8501
+    # End-of-run benchmark report (utils/benchmark_report.py) rendered at the tail of
+    # train/inference and posted to Slack; --no-benchmark-report opts out.
+    benchmark_report_enabled: bool = True
 
 
 @dataclass
@@ -567,6 +570,7 @@ class Config:
                 "annotate_stages": self.monitor.annotate_stages,
                 "dashboard_enabled": self.monitor.dashboard_enabled,
                 "dashboard_port": self.monitor.dashboard_port,
+                "benchmark_report_enabled": self.monitor.benchmark_report_enabled,
             },
             "logger": {
                 "console_level": self.logger.console_level,
