@@ -489,6 +489,53 @@ class TestProducerProtocol:
         assert [m[0] for m in messages] == ["shutdown_ack"]
 
 
+class TestProducerParentDeathWatch:
+    """The request loop's ppid watch: an ungraceful parent death (kill -9 / OOM) never sends
+    "shutdown", so the producer must notice the reparenting itself and exit (issue #141)."""
+
+    def _start(self, tmp_path, request_queue, result_queue, parent_pid):
+        thread = threading.Thread(
+            target=_producer_main,
+            args=(request_queue, result_queue, {"base_dir": str(tmp_path), "n_samples": 8}),
+            kwargs={
+                "generate_fn": _stub_generate_ok,
+                "parent_pid": parent_pid,
+                "poll_interval": 0.05,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def test_producer_exits_when_parent_is_gone(self, tmp_path):
+        result_queue: queue.Queue = queue.Queue()
+        # No message ever arrives and the captured parent PID never matches the real ppid —
+        # exactly the reparented-orphan state after a parent SIGKILL.
+        thread = self._start(tmp_path, queue.Queue(), result_queue, parent_pid=-1)
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        # Parent death is not a graceful shutdown: no shutdown_ack is emitted.
+        assert result_queue.empty()
+
+    def test_producer_keeps_serving_across_empty_polls_while_parent_lives(self, tmp_path):
+        request_queue: queue.Queue = queue.Queue()
+        result_queue: queue.Queue = queue.Queue()
+        # Matches what _producer_main would capture itself — the parent is "alive".
+        thread = self._start(tmp_path, request_queue, result_queue, parent_pid=os.getppid())
+        time.sleep(0.3)  # several empty polls — none may trigger an exit
+        request_queue.put(("generate", 1, 10, 40))
+        request_queue.put(("shutdown",))
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        kinds = []
+        while True:
+            try:
+                kinds.append(result_queue.get_nowait()[0])
+            except queue.Empty:
+                break
+        assert kinds == ["stats", "progress", "timing", "done", "shutdown_ack"]
+
+
 class _FakeProcess:
     """Stand-in for the producer multiprocessing.Process on the main-side handle."""
 

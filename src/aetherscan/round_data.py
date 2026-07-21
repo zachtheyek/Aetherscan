@@ -29,6 +29,7 @@ import queue
 import re
 import shutil
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -55,6 +56,10 @@ _ROUND_DIR_PATTERN = re.compile(r"^round_(\d+)$")
 
 # Number of values sampled per array for the manifest's cheap corruption check
 _MANIFEST_SAMPLE_COUNT = 8
+
+# How long the producer's request loop waits on its queue before re-checking that the parent
+# process is still alive (see the ppid watch in _producer_main).
+_PARENT_POLL_INTERVAL_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -336,7 +341,13 @@ def _default_generate(paths, round_idx, snr_base, snr_range, pool, params, stats
 
 
 def _producer_main(
-    request_queue, result_queue, params: dict, generate_fn=None, log_queue=None
+    request_queue,
+    result_queue,
+    params: dict,
+    generate_fn=None,
+    log_queue=None,
+    parent_pid: int | None = None,
+    poll_interval: float = _PARENT_POLL_INTERVAL_S,
 ) -> None:
     """
     Producer process entry point (spawn-started — see _MP_CONTEXT). Owns a private worker pool
@@ -364,8 +375,18 @@ def _producer_main(
     singleton, so it (and its pool workers) attach QueueHandlers to this queue explicitly.
     `generate_fn` is a test seam: when provided, no worker pool is created and the stub is
     called in place of the real memmap generation (see tests/unit/test_round_data.py).
+
+    `parent_pid` is the PID of the process this producer must not outlive (passed by
+    RoundDataProducer.start(); defaults to os.getppid() for the thread-driven tests, where
+    it never changes). The request loop polls it every `poll_interval` seconds: an
+    ungraceful parent death (SIGKILL/OOM — no cleanup runs, no "shutdown" is ever sent)
+    reparents this process, and the watch terminates the pool and exits instead of leaving
+    an orphan generating at full CPU and pinning the background SHM forever.
     """
     global _PRODUCER_POOL
+
+    if parent_pid is None:
+        parent_pid = os.getppid()
 
     is_main_thread = threading.current_thread() is threading.main_thread()
     if is_main_thread:
@@ -389,6 +410,21 @@ def _producer_main(
             os.kill(os.getpid(), signal.SIGTERM)
 
         signal.signal(signal.SIGTERM, _cleanup_on_sigterm)
+
+        if sys.platform == "linux":
+            # Belt-and-braces (Linux only): ask the kernel to SIGTERM this process the moment
+            # its parent dies — covers mid-generation parent death, when the request-loop
+            # ppid watch below isn't polling. PR_SET_PDEATHSIG is set here in the child's
+            # main entry (it fires on exit of the *thread* that set it, and is cleared
+            # across this process's own fork() — the pool workers don't inherit it, but the
+            # SIGTERM handler above terminates the pool for them).
+            with contextlib.suppress(Exception):
+                import ctypes  # noqa: PLC0415
+
+                _pr_set_pdeathsig = 1  # linux/prctl.h
+                ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+                    _pr_set_pdeathsig, signal.SIGTERM, 0, 0, 0
+                )
 
     pool = None
     if generate_fn is None:
@@ -414,7 +450,17 @@ def _producer_main(
 
     try:
         while True:
-            message = request_queue.get()
+            try:
+                message = request_queue.get(timeout=poll_interval)
+            except queue.Empty:
+                # Parent-death watch: reparenting (to init or a subreaper) changes our ppid.
+                # Exit without a shutdown_ack — there is no one left to ack to.
+                if os.getppid() != parent_pid:
+                    logger.warning(
+                        "RoundDataProducer: parent process died; terminating pool and exiting"
+                    )
+                    break
+                continue
             if message[0] == "shutdown":
                 logger.info("RoundDataProducer received shutdown request")
                 result_queue.put(("shutdown_ack",))
@@ -547,6 +593,10 @@ class RoundDataProducer:
                 self._params,
                 None,
                 self._producer_log_queue,
+                # This process's real PID, not the child's getppid(): if the parent dies
+                # before the child captures its ppid, the child would capture the reaper's
+                # PID and its parent-death watch could never fire.
+                os.getpid(),
             ),
             name="RoundDataProducer",
         )
