@@ -117,7 +117,11 @@ def _install_signal_teardown(proc: subprocess.Popen) -> None:
 
         def _handler(signum, frame, _prev=prev):
             _terminate(proc)
-            signal.signal(signum, _prev if callable(_prev) else signal.SIG_DFL)
+            # Restore callables AND SIG_IGN as-is (collapsing SIG_IGN to SIG_DFL would let the
+            # re-delivery below kill a process that was ignoring the signal); anything else
+            # (SIG_DFL, None from a non-Python handler) falls back to SIG_DFL.
+            restore = _prev if callable(_prev) or _prev == signal.SIG_IGN else signal.SIG_DFL
+            signal.signal(signum, restore)
             os.kill(os.getpid(), signum)  # re-deliver so the pipeline shuts down as it would have
 
         with contextlib.suppress(ValueError, OSError):
