@@ -28,6 +28,12 @@ on:
         type: boolean
         default: true
 
+# Never let two release runs for the same ref execute publish steps concurrently (e.g. an
+# accidental double tag-push). No cancellation — an in-flight publish must run to completion.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
