@@ -19,7 +19,7 @@ ruff check src/ && ruff format src/
 
 ## Testing
 
-Pytest suite in `tests/`: unit (the CI surface) + `gpu`/`cluster`-marked integration smokes. Layout, fixtures, and markers are in [CONTRIBUTING.md](CONTRIBUTING.md#testing).
+Pytest suite in `tests/`: unit (the CI surface) + `gpu`/`cluster`-marked integration smokes. Full layout, fixtures, markers, and coverage notes are in [docs/TESTING.md](docs/TESTING.md) (the contribution-workflow view is in [CONTRIBUTING.md](CONTRIBUTING.md#testing)).
 
 ```bash
 # Default selection = what CI runs (no GPUs / cluster data needed):
