@@ -41,6 +41,7 @@ tests/
 │   ├── test_data_generation.py      # log_norm, create_* shapes/labels, intersection checks,
 │   │                                #   chunk segments / batched task partitioning
 │   ├── test_round_data.py           # paths/manifest protocol, reuse/delete semantics, producer
+│   ├── test_seeding.py              # root-seed stream derivation (reproducible runs)
 │   ├── test_run_state.py            # manifest round-trip, stage machine transitions
 │   ├── test_train_utils.py          # get_latest_tag ladder, curriculum schedules, archiving
 │   ├── test_train_datasets.py       # batched generators: coverage, stratification, alignment
@@ -102,8 +103,10 @@ indirectly today; a direct test would only harden against future refactors):
   path. A CPU-strategy test that drives a deliberately mismatched geometry would pin it.
 - **Per-task RNG determinism** in `data_generation._run_memmap_task` — that the same
   `(task, seed)` produces byte-identical output regardless of worker scheduling or prior global
-  RNG state — is relied on but not asserted anywhere. A small same-seed-twice equality test
-  would catch a future refactor that drops the per-task reseed or adds in-process threads.
+  RNG state — is asserted by `test_round_data.py`'s same-seed-twice test
+  (`test_same_seed_regenerates_byte_identical_data`, which perturbs the global RNGs between
+  runs), but only through the sequential in-process path; worker-scheduling independence under
+  a real pool is still only exercised implicitly.
 - **Round-data manifest corruption cases**: `test_round_data.py` covers missing/mismatched
   manifests, shape mismatch, and whole-array value corruption, but truncation and array-swap
   are only caught *implicitly* (via the broad `except` and the sampled checksum). The checksum
