@@ -84,6 +84,32 @@ def _build_db(path):
         " VALUES (?,?,?,?,?,?,?,?)",
         (105.0, "rf", "total_loss", 7.0, 1, 1, "t1", 0),
     )
+    # rf eval metrics: scalars (epoch NULL) incl a stale duplicate (300.0, re-written at 400.0)
+    # + a superseded row, and an ensemble series (epoch = tree count) whose tree-2 row is
+    # re-written by an rf_plots retry (420.0)
+    for ts, name, v, ep, sup in [
+        (300.0, "val_accuracy", 0.90, None, 0),
+        (400.0, "val_accuracy", 0.95, None, 0),
+        (400.0, "val_roc_auc", 0.99, None, 0),
+        (400.0, "confusion_tn", 40.0, None, 0),
+        (400.0, "confusion_fp", 2.0, None, 0),
+        (400.0, "confusion_fn", 3.0, None, 0),
+        (400.0, "confusion_tp", 55.0, None, 0),
+        (400.0, "confusion_true_only_eti_pred_true", 28.0, None, 0),
+        (400.0, "confusion_true_only_eti_pred_false", 1.0, None, 0),
+        (400.0, "confusion_false_no_signal_pred_true", 1.0, None, 0),
+        (400.0, "confusion_false_no_signal_pred_false", 20.0, None, 0),
+        (500.0, "val_accuracy", 0.10, None, 1),
+        (410.0, "ensemble_val_accuracy", 0.80, 1, 0),
+        (410.0, "ensemble_val_accuracy", 0.90, 2, 0),
+        (420.0, "ensemble_val_accuracy", 0.92, 2, 0),
+    ]:
+        conn.execute(
+            "INSERT INTO training_stats"
+            " (timestamp,model_name,stat_name,value,round_number,epoch_number,tag,superseded)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (ts, "rf", name, v, None, ep, "t1", sup),
+        )
     # injection_stats
     for i, (sig, fin, clamp) in enumerate([("eti", 1, 0), ("rfi", 0, 1), ("eti", 1, 0)]):
         conn.execute(
@@ -186,6 +212,38 @@ def test_load_training_stats_filters_model_superseded_and_statset(conn):
     assert list(df["value"]) == [1.0, 0.5, 0.2]
     # a stat not in the requested set is not returned
     assert dashboard.load_training_stats(conn, "t1", ["clipping_rate"]).empty
+
+
+def test_load_rf_stats_filters_and_dedupes(conn):
+    rf = dashboard.load_rf_stats(conn, "t1")
+    # beta_vae rows excluded: the only total_loss row is the rf-model seed (7.0)
+    assert list(rf.loc[rf["stat_name"] == "total_loss", "value"]) == [7.0]
+    # superseded (0.10) excluded; the stale duplicate (0.90) collapses last-write-wins to 0.95
+    assert list(rf.loc[rf["stat_name"] == "val_accuracy", "value"]) == [0.95]
+    # ensemble series: per-tree dedup keeps the rf_plots-retry value for tree 2
+    curve = rf[rf["stat_name"] == "ensemble_val_accuracy"].sort_values("epoch_number")
+    assert list(curve["epoch_number"]) == [1, 2]
+    assert list(curve["value"]) == [0.80, 0.92]
+
+
+def test_load_rf_stats_empty_for_unknown_tag(conn):
+    assert dashboard.load_rf_stats(conn, "nope").empty
+
+
+def test_rf_confusion_matrices(conn):
+    rf = dashboard.load_rf_stats(conn, "t1")
+    binary, subtype = dashboard.rf_confusion_matrices(rf)
+    # binary 2x2: rows actual false/true, cols pred false/true
+    assert binary.to_numpy().tolist() == [[40.0, 2.0], [3.0, 55.0]]
+    assert list(binary.columns) == ["pred false", "pred true"]
+    # sub-type x prediction counts, one row per seeded sub-type
+    assert list(subtype.index) == ["false_no_signal", "true_only_eti"]
+    assert subtype.loc["true_only_eti"].tolist() == [1.0, 28.0]
+    assert subtype.loc["false_no_signal"].tolist() == [20.0, 1.0]
+
+
+def test_rf_confusion_matrices_absent_cells(conn):
+    assert dashboard.rf_confusion_matrices(dashboard.load_rf_stats(conn, "nope")) == (None, None)
 
 
 def test_load_injection_stats_excludes_superseded(conn):

@@ -3,10 +3,11 @@
 Live dashboard for an Aetherscan pipeline run, read straight from its SQLite DB.
 
 Renders, in one auto-refreshing page, every run metric that is reconstructable from the DB —
-resource utilization (CPU/RAM/GPU), beta-VAE loss + stability curves, the signal-injection
-stats suite, a live latent-space scatter, the stage timeline (PR #134), and inference candidate
-stats — plus a gallery of every saved plot PNG (RF diagnostics, latent traversals, inference
-figures) as it appears on disk.
+resource utilization (CPU/RAM/GPU), beta-VAE loss + stability curves, RF eval metrics
+(accuracy/AUC/AP/Brier tiles, confusion heatmaps, ensemble curve, confidence quantiles), the
+signal-injection stats suite, a live latent-space scatter, the stage timeline (PR #134), and
+inference candidate stats — plus a gallery of every saved plot PNG (RF diagnostics, latent
+traversals, inference figures) as it appears on disk.
 
 It is STANDALONE — no `aetherscan` imports (like utils/benchmark_report.py), only stdlib sqlite3 +
 numpy + pandas + plotly + streamlit — so streamlit can execute it directly and it runs against a
@@ -114,6 +115,58 @@ def load_training_stats(conn: sqlite3.Connection, tag: str, stats: list[str]) ->
         params=(tag, *wanted),
     )
     return df
+
+
+def load_rf_stats(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
+    """Non-superseded model_name='rf' training_stats for `tag` (timestamp, stat_name, value,
+    round_number, epoch_number). Duplicate (stat_name, epoch_number) rows — an rf_plots retry
+    re-writing the ensemble curve, or a reused tag's stale scalars — collapse last-write-wins
+    (rows are ordered by timestamp; scalar rows share a NULL epoch_number, which pandas
+    treats as equal when de-duplicating)."""
+    df = pd.read_sql_query(
+        "SELECT timestamp, stat_name, value, round_number, epoch_number "
+        f"FROM training_stats WHERE tag = ? AND model_name = 'rf' AND {_ALIVE} "
+        "ORDER BY timestamp",
+        conn,
+        params=(tag,),
+    )
+    if not df.empty:
+        df = df.drop_duplicates(subset=["stat_name", "epoch_number"], keep="last").reset_index(
+            drop=True
+        )
+    return df
+
+
+def rf_confusion_matrices(rf: pd.DataFrame) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Shape load_rf_stats rows into the RF tab's two confusion matrices: the binary 2x2
+    (actual x predicted, from confusion_{tn,fp,fn,tp}) and the sub-type x predicted-class
+    counts (from confusion_{subtype}_pred_{false,true}). Either is None when its cell rows
+    are absent."""
+    if rf.empty:
+        return None, None
+    scalars = dict(zip(rf["stat_name"], rf["value"], strict=False))
+
+    cells = [scalars.get(f"confusion_{c}") for c in ("tn", "fp", "fn", "tp")]
+    binary = None
+    if None not in cells:
+        binary = pd.DataFrame(
+            [[cells[0], cells[1]], [cells[2], cells[3]]],
+            index=["actual false", "actual true"],
+            columns=["pred false", "pred true"],
+        )
+
+    subtype = None
+    sub = rf[rf["stat_name"].str.match(r"^confusion_.+_pred_(true|false)$")].copy()
+    if not sub.empty:
+        parts = sub["stat_name"].str.extract(r"^confusion_(.+)_pred_(true|false)$")
+        sub["subtype"] = parts[0]
+        sub["pred"] = "pred " + parts[1]
+        subtype = (
+            sub.pivot_table(index="subtype", columns="pred", values="value", aggfunc="last")
+            .reindex(columns=["pred false", "pred true"])
+            .sort_index()
+        )
+    return binary, subtype
 
 
 def load_injection_stats(conn: sqlite3.Connection, tag: str) -> pd.DataFrame:
@@ -372,6 +425,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
         tabs = st.tabs(
             [
                 "Training",
+                "RF",
                 "Injection",
                 "Latent",
                 "Resources",
@@ -401,8 +455,96 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                     fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
                     st.plotly_chart(fig, use_container_width=True)
 
-        # --- Injection stats ---------------------------------------------------
+        # --- RF eval metrics ---------------------------------------------------
         with tabs[1]:
+            rf = load_rf_stats(conn, tag)
+            if rf.empty:
+                st.caption("No rf training_stats yet (written when the RF stage completes).")
+            else:
+                scalars = dict(zip(rf["stat_name"], rf["value"], strict=False))
+                tiles = [
+                    ("Val accuracy", "val_accuracy"),
+                    ("ROC-AUC", "val_roc_auc"),
+                    ("Avg precision", "val_average_precision"),
+                    ("Brier score", "val_brier_score"),
+                ]
+                cols = st.columns(len(tiles))
+                for col, (label, name) in zip(cols, tiles, strict=False):
+                    v = scalars.get(name)
+                    col.metric(label, f"{v:.4f}" if v is not None else "—")
+                thr = scalars.get("classification_threshold")
+                if thr is not None:
+                    st.caption(
+                        f"Accuracy + confusion cells at deployment threshold {thr:g}; "
+                        "the ensemble curve thresholds at 0.5."
+                    )
+
+                binary_cm, subtype_cm = rf_confusion_matrices(rf)
+                left, right = st.columns(2)
+                for col, cm, title in (
+                    (left, binary_cm, "Binary confusion (val)"),
+                    (right, subtype_cm, "Sub-type × prediction (val)"),
+                ):
+                    if cm is None:
+                        continue
+                    with col:
+                        st.subheader(title)
+                        fig = px.imshow(
+                            cm.to_numpy(),
+                            x=list(cm.columns),
+                            y=list(cm.index),
+                            text_auto=".0f",
+                            color_continuous_scale="Blues",
+                        )
+                        fig.update_layout(
+                            height=300,
+                            margin={"l": 10, "r": 10, "t": 10, "b": 10},
+                            coloraxis_showscale=False,
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                acc = rf[rf["stat_name"].str.startswith("val_accuracy_")].copy()
+                if not acc.empty:
+                    acc["subtype"] = acc["stat_name"].str.replace("val_accuracy_", "", regex=False)
+                    fig = px.bar(acc, x="subtype", y="value", title="Per-sub-type val accuracy")
+                    fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                    st.plotly_chart(fig, use_container_width=True)
+
+                curve = rf[rf["stat_name"] == "ensemble_val_accuracy"].sort_values("epoch_number")
+                if curve.empty:
+                    st.caption("No ensemble_val_accuracy series yet (written by rf_plots).")
+                else:
+                    fig = px.line(
+                        curve, x="epoch_number", y="value", title="Ensemble accuracy vs tree count"
+                    )
+                    fig.update_layout(
+                        height=280,
+                        margin={"l": 10, "r": 10, "t": 40, "b": 10},
+                        xaxis_title="number of trees",
+                        yaxis_title="val accuracy",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                quant = rf[rf["stat_name"].str.startswith("val_proba_q")].copy()
+                if not quant.empty:
+                    quant["quantile"] = quant["stat_name"].str.replace(
+                        "val_proba_q", "p", regex=False
+                    )
+                    fig = px.bar(
+                        quant.sort_values("quantile"),
+                        x="quantile",
+                        y="value",
+                        title="Val P(true) quantiles",
+                    )
+                    fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
+                    st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    "Richer RF figures (SHAP suite, decision boundary, calibration) live under "
+                    "All plots (PNG)."
+                )
+
+        # --- Injection stats ---------------------------------------------------
+        with tabs[2]:
             inj = load_injection_stats(conn, tag)
             if inj.empty:
                 st.caption("No injection_stats yet.")
@@ -435,7 +577,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 st.plotly_chart(fig, use_container_width=True)
 
         # --- Latent scatter (live PCA of the latest snapshot) ------------------
-        with tabs[2]:
+        with tabs[3]:
             snaps = load_latent_snapshots_latest(conn, tag)
             mat, labels = parse_latent_matrix(snaps)
             if mat.shape[0] == 0:
@@ -454,7 +596,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 )
 
         # --- Resource utilization ---------------------------------------------
-        with tabs[3]:
+        with tabs[4]:
             if resources.empty:
                 st.caption("No system_resources yet.")
             else:
@@ -475,7 +617,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                     st.plotly_chart(fig, use_container_width=True)
 
         # --- Stage timeline ----------------------------------------------------
-        with tabs[4]:
+        with tabs[5]:
             if stages.empty:
                 st.caption("No pipeline_stages yet (needs PR #134's benchmarking layer).")
             else:
@@ -508,7 +650,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 st.plotly_chart(fig, use_container_width=True)
 
         # --- Inference candidates ---------------------------------------------
-        with tabs[5]:
+        with tabs[6]:
             results = load_inference_results(conn, tag)
             cadences = load_inference_cadences(conn, tag)
             if results.empty and cadences.empty:
@@ -536,7 +678,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 st.dataframe(cadences, use_container_width=True)
 
         # --- All plots (PNG gallery) ------------------------------------------
-        with tabs[6]:
+        with tabs[7]:
             pngs = list_png_artifacts(plots_dir)
             if not pngs:
                 st.caption(f"No plot PNGs under {plots_dir} yet.")
