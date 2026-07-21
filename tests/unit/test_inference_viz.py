@@ -205,6 +205,37 @@ class TestFigureSmoke:
     def test_ed_stat_distributions(self, collector, metadatas):
         _assert_figure(plot_ed_stat_distributions(collector.records, metadatas))
 
+    def test_ed_stat_distributions_drops_mismatched_bins_consistently(
+        self, tmp_path, collector, metadatas, monkeypatch
+    ):
+        """A cadence dropped for mismatched ED-hist bins must be excluded from the title's
+        above-threshold and cadence counts too — otherwise the above/total pair mixes
+        different cadence subsets."""
+        npy_path, metadata_path, metadata = _write_cadence_artifacts(tmp_path, "cad_bad", ("C",))
+        metadata["ed_stat_hist"]["bin_edges"] = [
+            float(e) * 2.0 for e in metadata["ed_stat_hist"]["bin_edges"]
+        ]
+        metadata["n_raw_hits"] = 10_000  # would visibly poison 'above' if not excluded
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+        collector.record_processed(("C",), npy_path, metadata_path, {}, _fake_results(), 1.0)
+        metadatas[npy_path] = metadata
+
+        captured: dict[str, str] = {}
+
+        def _capture(fig, filename, slack_title):
+            captured["title"] = fig.axes[0].get_title()
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_ed_stat_distributions(collector.records, metadatas) is not None
+
+        title = captured["title"]
+        # Only the two good cadences contribute: 3 * N_STAMPS raw hits each
+        assert f"{2 * 3 * N_STAMPS} above threshold" in title
+        assert "(2 cadence(s))" in title
+        assert "finite windows" in title
+
     def test_ed_hit_spectrum(self, collector, metadatas):
         _assert_figure(plot_ed_hit_spectrum(collector.records, metadatas))
 
@@ -233,6 +264,28 @@ class TestFigureSmoke:
         coll.record_processed(("H",), npy_path, metadata_path, {}, _fake_results(), 1.0)
         with open(metadata_path) as f:
             metas = {npy_path: json.load(f)}
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, metas))
+
+    def test_bandpass_flattening_header_without_nchans(
+        self, tmp_path, initialized_runtime, collector, make_h5_observation
+    ):
+        """A header lacking nchans must fall back to the h5 data width (mirroring
+        preprocessing's fallback) and still render, not silently skip the figure."""
+        config = get_config()
+        config.manager.n_processes = 1
+        config.inference.coarse_channel_width = 512
+        config.inference.bandpass_method = "spline"
+        config.inference.spline_order = 4
+        h5_path = make_h5_observation("viz_obs_nonchans.h5", n_chans=2048)
+        npy_path, metadata_path, metadata = _write_cadence_artifacts(
+            tmp_path, "cad_h5_nonchans", ("H2",), h5_paths=[str(h5_path)] * 6
+        )
+        del metadata["header"]["nchans"]
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+        coll = InferenceVizCollector()
+        coll.record_processed(("H2",), npy_path, metadata_path, {}, _fake_results(), 1.0)
+        metas = {npy_path: metadata}
         _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, metas))
 
     def test_candidate_gallery_and_per_candidate(self, initialized_runtime, collector):

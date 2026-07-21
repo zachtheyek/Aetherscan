@@ -34,6 +34,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import h5py
 import numpy as np
 from matplotlib.figure import Figure
 
@@ -143,12 +144,14 @@ class InferenceVizCollector:
             )
         )
 
-        self._reservoir_add(results["latents"], predictions.astype(bool))
+        self._budget_fill_add(results["latents"], predictions.astype(bool))
 
-    def _reservoir_add(self, latents: np.ndarray, is_candidate: np.ndarray) -> None:
-        """Fold one cadence's latents into the bounded projection pool: cadence-level
-        features (obs latents concatenated), candidates always kept, non-candidates only
-        while the global budget lasts."""
+    def _budget_fill_add(self, latents: np.ndarray, is_candidate: np.ndarray) -> None:
+        """Fold one cadence's latents into the bounded projection pool by first-come greedy
+        budget-fill (not reservoir sampling): cadence-level features (obs latents
+        concatenated), candidates always kept; non-candidates fill whatever global budget
+        remains, uniformly subsampled WITHIN this cadence when they'd overflow it (later
+        cadences get nothing once the budget is spent)."""
         config = get_config()
         features = prepare_latent_features(
             np.asarray(latents), config.data.num_observations
@@ -268,15 +271,17 @@ def _key_label(key: tuple, max_len: int = 28) -> str:
 def plot_ed_stat_distributions(
     records: list[CadenceVizRecord], metadatas: dict[str, dict]
 ) -> str | None:
-    """Histogram of the D'Agostino-Pearson k2 statistic over ALL windows (not just hits),
-    log-log, per-ON-file overlay + total, with the detection threshold marked. Sourced from
-    the fixed-bin histograms the ED workers accumulate into each cadence's metadata."""
+    """Histogram of the D'Agostino-Pearson k2 statistic over all finite windows (not just
+    hits — the ED workers histogram only finite k2 values), log-log, per-ON-file overlay +
+    total, with the detection threshold marked. Sourced from the fixed-bin histograms the
+    ED workers accumulate into each cadence's metadata."""
     config = get_config()
     tag = config.checkpoint.save_tag
     stat_threshold = config.inference.stat_threshold
 
     edges: np.ndarray | None = None
     per_on_totals: np.ndarray | None = None
+    contributing: set[str] = set()  # npy_paths whose histograms actually landed in the totals
     for record in records:
         metadata = metadatas.get(record.npy_path)
         ed_hist = (metadata or {}).get("ed_stat_hist")
@@ -294,6 +299,7 @@ def plot_ed_stat_distributions(
             logger.warning(f"Viz: {record.npy_path} has unexpected ED hist shape; skipping it")
             continue
         per_on_totals += counts
+        contributing.add(record.npy_path)
 
     if edges is None or per_on_totals is None or per_on_totals.sum() == 0:
         logger.info("Viz: no ED statistic histograms available; skipping ed_stat_distributions")
@@ -318,8 +324,10 @@ def plot_ed_stat_distributions(
         stat_threshold, color="red", ls="--", lw=1.2, label=f"threshold ({stat_threshold:g})"
     )
     # Exact above-threshold count from the workers' hit lists (the histogram bins are fixed,
-    # so the threshold generally falls inside a bin — summing bins would be approximate)
-    above = sum(int((metadatas.get(r.npy_path) or {}).get("n_raw_hits") or 0) for r in records)
+    # so the threshold generally falls inside a bin — summing bins would be approximate).
+    # Summed over the SAME cadence subset that built the histogram, so the above/total pair
+    # stays consistent when a mismatched-bins/shape cadence was dropped above.
+    above = sum(int(metadatas[p].get("n_raw_hits") or 0) for p in contributing)
     total = int(per_on_totals.sum())
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -327,8 +335,8 @@ def plot_ed_stat_distributions(
     ax.set_ylabel("window count")
     ax.set_title(
         f"Energy-detection statistic distribution ({tag})\n"
-        f"{total:,} windows, {above:,} above threshold "
-        f"({len([r for r in records if metadatas.get(r.npy_path)])} cadence(s))"
+        f"{total:,} finite windows, {above:,} above threshold "
+        f"({len(contributing)} cadence(s))"
     )
     ax.legend(fontsize=8)
     ax.grid(True, which="both", alpha=0.2)
@@ -411,9 +419,20 @@ def plot_bandpass_flattening(
         logger.info("Viz: no readable ON-source .h5 available; skipping bandpass_flattening")
         return None
 
+    if n_chans <= 0:
+        # Header lacks nchans: fall back to the data width, mirroring preprocessing's
+        # int(header.get("nchans", data_shape[-1])) — detection processed such a cadence
+        # fine, so the figure must not silently lose it. Shape access reads h5 metadata
+        # only (no decompression), so plain h5py suffices.
+        with h5py.File(h5_path, "r") as hf:
+            n_chans = int(hf["data"].shape[-1])
+
     n_coarse_total = n_chans // width
     if n_coarse_total == 0:
-        logger.info("Viz: file narrower than one coarse channel; skipping bandpass_flattening")
+        logger.info(
+            f"Viz: file width ({n_chans} fine channels) is narrower than one coarse channel "
+            f"({width}); skipping bandpass_flattening"
+        )
         return None
 
     bandpass_flatten = preprocessor._get_bandpass_flattener(n_coarse_total)
