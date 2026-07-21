@@ -46,7 +46,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.guard.outputs.already_filed != 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
           # in the allowlist, so a shallow checkout is sufficient.
