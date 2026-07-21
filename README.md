@@ -6,6 +6,8 @@
     Breakthrough Listen's first end-to-end production-grade deep learning pipeline for SETI @ scale
     <br />
     <br />
+    <a href="https://github.com/zachtheyek/Aetherscan/actions/workflows/tests.yml"><img src="https://github.com/zachtheyek/Aetherscan/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+    <a href="https://pypi.org/project/aetherscan/"><img src="https://img.shields.io/pypi/v/aetherscan.svg" alt="PyPI"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License"></a>
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%E2%80%933.12-blue.svg" alt="Python"></a>
     <a href="https://www.tensorflow.org/"><img src="https://img.shields.io/badge/TensorFlow-2.17-orange.svg" alt="TensorFlow"></a>
