@@ -1811,9 +1811,10 @@ def collect_validation_errors(
         if all(v is not None for v in (prb, eb, prvb, lvc, nsb, nsr, tvs)):
             if num_replicas is None:
                 logger.warning(
-                    "GPU count unknown (no --num-replicas and TF reports 0 GPUs or is "
-                    "unavailable) — skipping cross-replica divisibility checks. Pass "
-                    "--num-replicas explicitly to run them."
+                    "GPU count unknown (TF reports 0 GPUs or is unavailable) — skipping "
+                    "cross-replica divisibility checks; they need a TF-visible GPU count "
+                    "even when --num-replicas is passed. The effective-batch-size check "
+                    "re-runs at training time once the real replica count is known."
                 )
             elif num_replicas < 1:
                 # _resolve_num_replicas would have raised before we got here for a real

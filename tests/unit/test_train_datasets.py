@@ -77,6 +77,17 @@ class TestPrepareDistributedTrainDataset:
         assert y.shape == (4, *_SAMPLE_SHAPE)
         results["_train_holder"].clear()
 
+    def test_indivisible_effective_batch_raises(self):
+        """Runtime backstop for the validation-time skip (#143): an effective batch size that
+        isn't a multiple of per_replica_batch_size * num_replicas must fail loudly with the
+        validator's guidance, not emit a partial trailing global batch every epoch."""
+        with pytest.raises(
+            ValueError,
+            match=r"--effective-batch-size \(8\) must be divisible by "
+            r"per_replica_batch_size \* num_replicas \(3\)",
+        ):
+            _build(_make_data(), shuffle=True, prb=3, eb=8)
+
     def test_epoch_covers_train_indices_exactly_once(self):
         results = _build(_make_data(), shuffle=True)
         n_batches_per_epoch = results["train_steps"] * results["accumulation_steps"]

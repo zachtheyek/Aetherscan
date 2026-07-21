@@ -534,6 +534,18 @@ def prepare_distributed_train_dataset(
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
 
+    # NOTE: runtime backstop for the cross-replica check cli.py's collect_validation_errors
+    # skips when TF can't see the GPUs at validation time (#143). n_train is trimmed to a
+    # multiple of effective_batch_size below, so an indivisible combination would make the
+    # train generator emit a partial trailing global batch every epoch (split unevenly across
+    # replicas) and silently degrade accumulation_steps. Message mirrors the validator's so
+    # guidance is identical.
+    if effective_batch_size % global_train_batch_size != 0:
+        raise ValueError(
+            f"--effective-batch-size ({effective_batch_size}) must be divisible by "
+            f"per_replica_batch_size * num_replicas ({global_train_batch_size})"
+        )
+
     # Stratified train/val split to ensure both sets contain proportional representation
     # of all 4 signal types (false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi).
     # This is necessary because generation arranges labels sequentially within
