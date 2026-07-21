@@ -119,6 +119,13 @@ indirectly today; a direct test would only harden against future refactors):
   `test_round_data.py`'s timing test, which drives the real drainer-to-`record_stage` path
   with a real span name.
 
+**Model-behavior gates** (issue #139): validation gates on model *quality*, as opposed to
+function-level correctness, need a trained model and therefore live outside the CI selection.
+Gate 1 — the opt-in `training.min_val_auc` floor on the RF's validation ROC-AUC (a loud
+WARNING at train time when unmet; see [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md)) — has its
+guard logic unit-tested in `test_train_utils.py`, but whether a given run *clears* it is only
+ever observed on real training runs.
+
 ## Markers
 
 | Marker | Meaning | In default selection? |
