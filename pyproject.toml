@@ -40,11 +40,13 @@ dependencies = [
     "umap-learn>=0.5.6,<0.6",
     "shap>=0.46.0,<0.47",
     "slack-sdk>=3.31.0,<4",
-    "python-dotenv>=1.0,<2",
+    # Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684; fixed in 1.2.2).
+    "python-dotenv>=1.2.2,<2",
     "huggingface_hub>=1.21,<1.22",
     # setuptools provides pkg_resources, which blimpy (transitive via setigen) imports at
     # module load; <81 because setuptools 81 removed the vendored pkg_resources.
-    "setuptools>=70,<81",
+    # Floor >=78.1.1 per GHSA-5rjg-fvgr-3xxf (CVE-2025-47273; fixed in 78.1.1).
+    "setuptools>=78.1.1,<81",
     "setigen>=2.6,<3",
     # The NGC base image provides these implicitly (so requirements-container.txt omits
     # them); a pip install has no base image to lean on and must declare them. Ranges

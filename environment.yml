@@ -39,8 +39,9 @@ dependencies:
   # imports at module load. Recent pip / Python releases dropped setuptools
   # from the bootstrap, so we install it explicitly. Upper-bound at <81 because
   # setuptools 81 removed pkg_resources as a vendored submodule -- revisit
-  # once blimpy migrates off pkg_resources (upstream issue).
-  - setuptools>=70,<81
+  # once blimpy migrates off pkg_resources (upstream issue). Floor >=78.1.1 per
+  # GHSA-5rjg-fvgr-3xxf (CVE-2025-47273, path traversal; fixed in 78.1.1).
+  - setuptools>=78.1.1,<81
   # Conda-only deps (the NGC base image already ships h5py / psutil / pytest
   # so requirements-container.txt doesn't pin them).
   - h5py=3.11.*
@@ -60,7 +61,9 @@ dependencies:
       - umap-learn>=0.5.6,<0.6
       - shap>=0.46.0,<0.47
       - slack-sdk>=3.31.0,<4
-      - python-dotenv>=1.0,<2
+      # Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684, set_key symlink
+      # following; fixed in 1.2.2).
+      - python-dotenv>=1.2.2,<2
       # Model weight distribution via the HuggingFace Hub — pin range mirrors
       # requirements-container.txt (see the rationale there).
       - huggingface_hub>=1.21,<1.22
