@@ -74,6 +74,7 @@ classifiers = [
     # revisit in every release PR per docs/RELEASE.md)
     "Development Status :: 2 - Pre-Alpha",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Operating System :: Unix",
     "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",

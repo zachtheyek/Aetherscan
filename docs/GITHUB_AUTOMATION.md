@@ -51,8 +51,9 @@ This is a required check — the same hooks you run locally, so a green local
 ### `tests.yml`
 
 **Trigger:** every PR, pushes to master, `workflow_dispatch`.
-Runs `pytest -m "not gpu and not cluster" -q` on Python 3.10 **and** 3.12 (the conda and NGC
-container runtimes; `fail-fast: false`), with `tensorflow-cpu==2.17.*` standing in for the
+Runs `pytest -m "not gpu and not cluster" -q` on Python 3.10, 3.11, **and** 3.12 (the full
+`requires-python` range — 3.10 and 3.12 are the conda and NGC container runtimes;
+`fail-fast: false`), with `tensorflow-cpu==2.17.*` standing in for the
 container's GPU build. Details in [`TESTING.md`](TESTING.md). Its run history is the data
 source for the flaky-test tracker below.
 

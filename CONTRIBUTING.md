@@ -567,7 +567,7 @@ pytest tests/unit/test_db.py::TestFlushSentinel -q
 
 - Every non-integration test runs isolated: `tests/conftest.py` points `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` at a pytest `tmp_path`, resets all singletons (`Config`, `ResourceManager`, `Database`, `Logger`, `ResourceMonitor`) via their `_reset()` hooks, and re-runs `init_config()` — so tests never touch real data or leak state into each other.
 - Synthetic data factories are provided as fixtures: `make_background_npy` (tiny background plates), `make_h5_observation` (tiny filterbank-style `.h5` files), and `make_inference_csv` (tiny cadence-grouping CSVs).
-- CI (`.github/workflows/tests.yml`) runs the default selection on Ubuntu with `tensorflow-cpu==2.17.*` + the pins from `requirements-container.txt`, on Python 3.10 and 3.12 (the conda and container runtimes respectively). A few tests assert Linux-only behavior (e.g. PSS-based memory accounting) and self-skip elsewhere.
+- CI (`.github/workflows/tests.yml`) runs the default selection on Ubuntu with `tensorflow-cpu==2.17.*` + the pins from `requirements-container.txt`, on Python 3.10, 3.11, and 3.12 (3.10 and 3.12 being the conda and container runtimes respectively, 3.11 the in-between version `requires-python` permits). A few tests assert Linux-only behavior (e.g. PSS-based memory accounting) and self-skip elsewhere.
 
 ### Writing tests
 
