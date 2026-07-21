@@ -54,6 +54,14 @@ If a security incident occurs:
 
 If you suspect a token has been compromised, rotate immediately:
 
+#### HuggingFace Hub Token
+
+1. Go to [HuggingFace access tokens](https://huggingface.co/settings/tokens)
+2. Locate the compromised token and invalidate (refresh) or delete it
+3. Create a replacement token — grant **write** access only if you upload artifacts (`train --hf-upload`); the default inference path downloads from a **public** repo and needs no token at all
+4. Update `HF_TOKEN` in all deployment environments (the gitignored `.env`, or exported in the shell)
+5. Verify the new token works by re-running an upload: `./utils/run_container.sh python -m aetherscan.main train --hf-upload ...` (the upload stage should authenticate without errors)
+
 #### Slack Bot Token
 
 1. Go to [Slack API](https://api.slack.com/apps)
@@ -63,14 +71,6 @@ If you suspect a token has been compromised, rotate immediately:
 5. Reinstall the Aetherscan app and generate a new token with the following scopes: `channels:read`, `chat:write`, `files:write`, `groups:read`, `incoming-webhook`
 6. Update `SLACK_BOT_TOKEN` in all deployment environments
 7. Verify the new token works: `PYTHONPATH=src python utils/print_cli_help.py train` (should not show Slack errors)
-
-#### HuggingFace Hub Token
-
-1. Go to [HuggingFace access tokens](https://huggingface.co/settings/tokens)
-2. Locate the compromised token and invalidate (refresh) or delete it
-3. Create a replacement token — grant **write** access only if you upload artifacts (`train --hf-upload`); the default inference path downloads from a **public** repo and needs no token at all
-4. Update `HF_TOKEN` in all deployment environments (the gitignored `.env`, or exported in the shell)
-5. Verify the new token works by re-running an upload: `./utils/run_container.sh python -m aetherscan.main train --hf-upload ...` (the upload stage should authenticate without errors)
 
 ---
 
