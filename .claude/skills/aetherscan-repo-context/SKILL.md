@@ -101,23 +101,32 @@ src/aetherscan/
 ├── cli.py               # Argument parsing, validation, config override
 ├── config.py            # Configuration dataclasses & defaults (singleton)
 ├── train.py             # Training orchestration, curriculum learning, checkpointing
+├── round_data.py        # Disk-backed (memmap) round datasets + background producer process
+├── run_state.py         # Persisted training-run manifest (stage-aware resume)
 ├── inference.py         # Inference orchestration, candidate detection
+├── inference_viz.py     # End-of-run inference visualization suite
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
+├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection (setigen)
+├── benchmark.py         # Always-on stage timing to the pipeline_stages table
+├── dashboard.py         # Streamlit live-monitoring dashboard (DB-driven)
+├── dashboard_launcher.py # Spawns the headless dashboard subprocess (guarded)
+├── hf_hub.py            # HuggingFace Hub artifact upload/download
+├── tag_guards.py        # Fail-early --save-tag dedup guards
 ├── models/{vae,random_forest}.py
 ├── db/db.py             # Thread-safe SQLite, async queue-based writes
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
-utils/                   # fetch_run_outputs.sh, find_optimal_configs.py,
-                         # get_system_info.sh, kill_pipeline.sh, print_cli_help.py,
+utils/                   # benchmark_report.py, fetch_run_outputs.sh,
+                         # find_optimal_configs.py, get_system_info.sh,
+                         # hf_tag_release.py, kill_pipeline.sh, print_cli_help.py,
                          # run_container.sh, start_tmux_session.sh,
                          # verify_train_test_files.py
-docs/                    # GPU_RUNTIME_GUIDE.md, CONFIG_AND_CLI.md, README.md, assets/
-tests/                   # Pytest suite: conftest.py (singleton-reset fixtures, synthetic
-                         # data factories), unit/, integration/ (gpu+cluster-marked smokes).
-                         # Default selection: pytest -m "not gpu and not cluster" -q
-                         # (runs in CI via .github/workflows/tests.yml); see CONTRIBUTING.md
+docs/                    # Full technical doc suite, one doc per pipeline surface —
+                         # indexed in docs/README.md; start at docs/ARCHITECTURE.md
+tests/                   # Pytest suite: unit/ (CI surface) + gpu/cluster-marked
+                         # integration/ smokes — see the "Testing" section below
 ```
 
 ---
@@ -155,7 +164,41 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 | Private       | \_prefix    | `_init_worker`           |
 | Config fields | snake_case  | `per_replica_batch_size` |
 
-**Grep-friendly inline comment markers** (used consistently): `# TODO:` (actionable work), `# NOTE:` (rationale/question), `# FIX:` (known issue, no time now), `# BUG:` (known bug, often with workaround), `# TEST:` (behavior to verify, no suite yet). Prefer `# NOTE:` over `# TODO:` when there's no obvious action.
+**Grep-friendly inline comment markers** (used consistently): `# TODO:` (actionable work), `# NOTE:` (rationale/question), `# FIX:` (known issue, no time now), `# BUG:` (known bug, often with workaround), `# TEST:` (behavior to verify — now backed by the `tests/` suite). Prefer `# NOTE:` over `# TODO:` when there's no obvious action.
+
+---
+
+## Testing
+
+The `tests/` suite splits along a hardware axis:
+
+- **`tests/unit/`** — fast, hardware-independent, one `test_<module>.py` per source module. This is the CI surface; everything here must pass on a CPU-only runner.
+- **`tests/integration/`** — `gpu`/`cluster`-marked end-to-end smokes (`test_train_smoke.py`, `test_inference_smoke.py`) that launch `python -m aetherscan.main ...` as a real subprocess on a cluster, against cluster-resident data/models. Not run in CI.
+
+**Default selection — exactly what CI runs** (`.github/workflows/tests.yml`, on Python 3.10 and 3.12), no GPUs or cluster data needed:
+
+```bash
+pytest -m "not gpu and not cluster" -q
+```
+
+`pyproject.toml`'s `[tool.pytest.ini_options]` sets `pythonpath = ["src"]`, so **pytest needs no `PYTHONPATH=src` prefix** (unlike running `main.py` from source); it also sets `testpaths = ["tests"]` and `--strict-markers` (a typo'd marker is a collection error, not a silently-ignored one).
+
+**Markers** (declared in `pyproject.toml`; `--strict-markers` rejects undeclared ones):
+
+| Marker        | Meaning                                          | In default selection?   |
+| ------------- | ------------------------------------------------ | ----------------------- |
+| `slow`        | Slower CPU tests (e.g. builds real TF graphs)    | **Yes** — CI runs them  |
+| `gpu`         | Needs one or more physical GPUs                  | No                      |
+| `cluster`     | Needs cluster-resident data/models (blpc3/bla0)  | No                      |
+| `integration` | End-to-end subprocess runs; **skips isolation**  | No (also `gpu`+`cluster`) |
+
+**Isolation.** The autouse `aetherscan_isolated_env` fixture in `tests/conftest.py` wraps every non-integration test: it points `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` at a fresh `tmp_path` tree, deletes `SLACK_BOT_TOKEN`/`SLACK_CHANNEL` (tests must never talk to Slack), resets all five singletons (`Config`, `Database`, `Logger`, `ResourceManager`, `ResourceMonitor`) via their `_reset()` hooks, then on teardown stops any leaked background threads/pools and restores the snapshotted SIGINT/SIGTERM handlers and stdout/stderr. Net effect: tests never touch real data and can't leak state into one another. Integration tests are exempt — they inherit the real environment and run the pipeline as a subprocess.
+
+**Discipline.** Run the suite (or the subset you can) before claiming a change works, and **ship unit tests with new logic** — every behavior change should land tests under `tests/unit/` in the matching `test_<module>.py` (create it if the module is new).
+
+**Gotcha.** Most unit modules import TensorFlow at collection time, so a bare `pytest` needs the full dependency stack (CI installs `tensorflow-cpu==2.17.*` plus the container requirements). If that stack isn't available locally, run the TF-free subset you can — e.g. `pytest tests/unit/test_config.py -q` — and **say exactly what you ran** rather than claiming the whole suite passed.
+
+Deep dive: `docs/TESTING.md` covers the full layout, the synthetic data factories, the coverage-and-deliberate-gaps notes (`monitor` / `logger` / `slack_handler`), CI specifics, how to run the cluster smokes, and the adding-tests checklist.
 
 ---
 
@@ -171,6 +214,8 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 6. **Review** — needs passing checks, ≥1 maintainer approval, all conversations resolved, branch up to date. Approvals are voided when new commits are pushed. Claude provides an initial review automatically.
 
 **Invoking vs. mentioning the assistant.** The assistant workflow (`claude.yml`) triggers whenever the assistant handle — an `@` immediately followed by `claude` — appears in the title/body of a Discussion, issue, or PR (or a comment on one). Write it only when you actually want to summon the assistant (e.g. an auto-filed docs issue asking it to open a PR). To refer to the handle as plain text anywhere else — a PR description, issue body, commit message, review comment — write it as `"@ claude"` (a space after the `@`, double quotes on both sides) so the `contains(…, '@claude')` trigger can't match. Tagging it unintentionally spawns a spurious assistant run and follow-up PR (this is what happened around issue #83).
+
+**Responding to the automated review.** Opening (or marking ready) a PR triggers `claude-code-review.yml`, which posts a first-pass review with inline comments (catalogued in `docs/GITHUB_AUTOMATION.md`). Treat it as input, not verdict: wait for the review to land, then work through each comment individually, weighing it against your own understanding of the codebase and the change you actually made — don't assume the reviewer is right. Where a comment exposes a genuine blind spot, fix it in a focused, self-contained commit pushed to the *same* PR; where you're convinced it's wrong, leave the code untouched and be ready to explain concretely why. Then post a single PR comment covering both halves — first the points you addressed (what you changed and the rationale), then the points you think the reviewer got wrong (with your reasoning) — and close that comment by deliberately tagging the assistant handle to kick off a second-pass review. This is precisely the "you actually want to summon it" case from the paragraph above, not a violation of the don't-tag-unintentionally rule. Then repeat the loop — wait, read, validate, address, rebut, comment, re-invoke — until the reviews either come back clean (no further notes / LGTM) or they start drifting out of scope (raising points unrelated to the PR's theme) or turn nonsensical. At that stopping point, post a comment explaining why you're stopping, and do **not** tag the assistant handle again.
 
 **Pre-commit hooks** (`pre-commit install` to activate): `ruff` (lint, `--fix`), `ruff-format`, general `pre-commit-hooks` (large files >1 MB, case conflict, merge conflict, YAML/TOML syntax, EOF/trailing-whitespace, private-key detection, `no-commit-to-branch` on master), and `gitleaks` (secret detection). Ruff-format auto-reformats on commit — **re-run `git add` after** it modifies files, then commit again. Bypass only sparingly with `git commit --no-verify`.
 
@@ -205,5 +250,16 @@ Paths relative to the repo root:
 - `SECURITY.md` — security policy, secrets management, token rotation
 - `KNOWN_ISSUES.md` — known bugs and workarounds
 - `AI_POLICY.md` — AI usage policy (read before AI-assisted contributions)
+- `docs/README.md` — index of the technical documentation suite (one doc per surface)
+- `docs/ARCHITECTURE.md` — system map: data model, module map, init order, artifact layout
+- `docs/TRAINING_PIPELINE.md` — rounds, round data + producer, retries, every training plot
+- `docs/INFERENCE_PIPELINE.md` — catalogs, streaming flow, manifest retries, inference figures
+- `docs/PREPROCESSING.md` — energy detection math (PFB/spline, k² derivation), signal injection
+- `docs/MODELS.md` — Beta-VAE architecture/loss math, RF features + threshold semantics
+- `docs/DATABASE.md` — schema, writer thread, flush/supersede protocols, migrations
+- `docs/RUNTIME_SERVICES.md` — logger/Slack, ResourceManager lifecycle, resource monitor
+- `docs/TESTING.md` — suite layout, markers, isolation fixtures, CI, cluster smokes
+- `docs/GITHUB_AUTOMATION.md` — every workflow, dedup guards, assistant-handle rules
+- `docs/RELEASE.md` — version-coupling contract, CD gates, release runbook
 - `docs/GPU_RUNTIME_GUIDE.md` — container build/runtime runbook
 - `docs/CONFIG_AND_CLI.md` — config system deep dive

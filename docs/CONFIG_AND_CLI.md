@@ -4,6 +4,10 @@ This document explains how Aetherscan's runtime configuration is structured, how
 flags map onto it, and how the `train` and `inference` subcommands stay isolated from
 each other. Read this before adding a new flag or config field — the patterns below
 exist precisely so that one mode's parameters can't silently contaminate the other.
+For where config initialization sits in the overall startup sequence (and the singleton
+pattern's rules), see [`ARCHITECTURE.md`](ARCHITECTURE.md); for what the individual
+training/inference fields *do*, see [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md) and
+[`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).
 
 ## TL;DR
 
@@ -68,7 +72,7 @@ subcommand uses it:
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `DBConfig`           | SQLite writer timeouts, buffer sizes                                                                                               |
 | `ManagerConfig`      | Multiprocessing pool sizing                                                                                                        |
-| `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle                                                           |
+| `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle, live-dashboard enable (`dashboard_enabled`) and port (`dashboard_port`) |
 | `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
 | `BetaVAEConfig`      | Beta-VAE model hyperparameters                                                                                                     |
 | `RandomForestConfig` | RF classifier hyperparameters                                                                                                      |
@@ -166,6 +170,8 @@ Current Pattern B flags:
 - `--hf-repo-id` → `config.hf.repo_id`
 - `--save-tag` → `config.checkpoint.save_tag`
 - `--force-tag` → `config.checkpoint.force_tag`
+- `--dashboard` / `--no-dashboard` (`BooleanOptionalAction`) → `config.monitor.dashboard_enabled`
+- `--dashboard-port` → `config.monitor.dashboard_port`
 
 #### Pattern C — shared flag, divergent destination
 
@@ -367,5 +373,5 @@ mode && /^ *"--/{
 
 The second command lists every shared flag (those appearing in both subparsers); each
 should match either a single Pattern B `apply_args` block or a pair of Pattern C blocks
-with a `command` discriminator. As of this writing it yields 12 shared flags —
-9 Pattern B + 3 Pattern C — matching the tables above.
+with a `command` discriminator. As of this writing it yields 14 shared flags —
+11 Pattern B + 3 Pattern C — matching the tables above.
