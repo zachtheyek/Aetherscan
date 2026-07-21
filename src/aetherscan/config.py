@@ -476,6 +476,19 @@ class Config:
             "AETHERSCAN_OUTPUT_PATH", "/datax/scratch/zachy/outputs/aetherscan"
         )
 
+        # Coupled-defaults guard: inference.stamp_width and data.width_bin are independent
+        # dataclass fields that must agree — energy-detection stamps are cut at stamp_width
+        # while every loader/model surface is sized off width_bin. A divergent source-level
+        # default edit would otherwise surface only at load time (load_inference_data fails
+        # safe, but late and per-file); fail here, at config init. CLI overrides are
+        # validated separately in cli.collect_validation_errors.
+        if self.inference.stamp_width != self.data.width_bin:
+            raise ValueError(
+                f"Config defaults diverged: inference.stamp_width "
+                f"({self.inference.stamp_width}) must equal data.width_bin "
+                f"({self.data.width_bin})"
+            )
+
     @classmethod
     def _reset(cls):
         """
