@@ -19,7 +19,7 @@ from multiprocessing.shared_memory import SharedMemory
 import pytest
 
 from aetherscan.manager import get_manager, init_manager
-from aetherscan.manager.manager import ResourceManager
+from aetherscan.manager.manager import ManagedProcess, ResourceManager
 
 
 @pytest.fixture
@@ -163,6 +163,27 @@ def _start_process(target):
     return process
 
 
+class _FakeSubtreeChild:
+    def __init__(self):
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+
+def _fake_psutil_process_cls(children):
+    """psutil.Process stand-in whose children(recursive=True) returns the given fakes."""
+
+    class _FakePsutilProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=False):
+            return children
+
+    return _FakePsutilProcess
+
+
 class TestProcessTracking:
     def test_register_and_close_process(self, manager):
         process = _start_process(_sleep_target)
@@ -199,3 +220,47 @@ class TestProcessTracking:
         # Closing an already-dead process must succeed without escalation
         manager.close_process(process)
         assert manager.stats.processes_closed == 1
+
+    def test_close_on_dead_process_reaps_recorded_children(self, manager, monkeypatch):
+        # A process that died before its own SIGTERM handler could reap its pool must still
+        # get a subtree sweep on close() — not a bare closed=True (issue #141).
+        process = _start_process(_sleep_target)
+        manager.register_process(process, name="test-process")
+        process.terminate()
+        process.join(timeout=10)
+
+        children = [_FakeSubtreeChild(), _FakeSubtreeChild()]
+        monkeypatch.setattr(
+            "aetherscan.manager.manager.psutil.Process", _fake_psutil_process_cls(children)
+        )
+        manager._processes[0].close(timeout=1.0)
+        assert all(child.killed for child in children)
+
+    def test_close_exception_fallback_reaps_subtree_before_kill(self, monkeypatch):
+        # If terminate() raises, the fallback must sweep the subtree before SIGKILLing the
+        # process — a bare kill() would orphan its children (issue #141).
+        kill_calls = []
+
+        class _ExplodingProcess:
+            pid = 424242
+
+            def is_alive(self):
+                return True
+
+            def terminate(self):
+                raise RuntimeError("terminate exploded")
+
+            def kill(self):
+                kill_calls.append("kill")
+
+        children = [_FakeSubtreeChild()]
+        monkeypatch.setattr(
+            "aetherscan.manager.manager.psutil.Process", _fake_psutil_process_cls(children)
+        )
+        managed = ManagedProcess(
+            process=_ExplodingProcess(), name="exploding", created_at=time.time()
+        )
+        managed.close(timeout=0.1)
+        assert managed.closed is True
+        assert children[0].killed
+        assert kill_calls == ["kill"]
