@@ -151,6 +151,15 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(["train", "--num-samples-beta-vae", "202"]), None)
         assert any(e.field == "training.num_samples_beta_vae" and e.divisor == 4 for e in errors)
 
+    def test_negative_seed_rejected(self):
+        errors = collect_validation_errors(_parse(["train", "--seed", "-1"]), None)
+        assert any(e.field == "training.seed" and e.fix_kind == "clamp_low" for e in errors)
+
+    @pytest.mark.parametrize("seed", ["0", "42"])
+    def test_non_negative_seed_passes(self, seed):
+        errors = collect_validation_errors(_parse(["train", "--seed", seed]), None)
+        assert not any(e.field == "training.seed" for e in errors)
+
     def test_curriculum_schedule_enum(self):
         errors = collect_validation_errors(
             _parse(["train", "--curriculum-schedule", "sigmoid"]), None
@@ -558,6 +567,20 @@ class TestApplyArgsToConfig:
         config = get_config()
         apply_args_to_config(_parse(["train", "--load-tag", "round_03"]))
         assert config.checkpoint.start_round == 4
+
+    def test_seed_flags_apply_to_training_config(self):
+        config = get_config()
+        assert config.training.seed is None  # default: OS entropy
+        assert config.training.tf_deterministic_ops is False
+        apply_args_to_config(_parse(["train", "--seed", "123", "--tf-deterministic-ops"]))
+        assert config.training.seed == 123
+        assert config.training.tf_deterministic_ops is True
+        # Omitting both flags leaves the applied values untouched (None-guarded application)
+        apply_args_to_config(_parse(["train"]))
+        assert config.training.seed == 123
+        assert config.training.tf_deterministic_ops is True
+        apply_args_to_config(_parse(["train", "--no-tf-deterministic-ops"]))
+        assert config.training.tf_deterministic_ops is False
 
     def test_bandpass_flags_apply_to_inference_config(self):
         config = get_config()

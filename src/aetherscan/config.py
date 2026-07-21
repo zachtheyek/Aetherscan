@@ -178,6 +178,18 @@ class DataConfig:
 
 @dataclass
 class TrainingConfig:
+    # Reproducibility params
+    # Root seed for the pipeline's random streams: synthetic data generation, dataset
+    # split/shuffles, TF weight init, and the VAE sampling layer (each consumer derives an
+    # independent stream — see aetherscan.seeding). None = OS entropy, i.e. non-reproducible
+    # runs (the historical behavior). The Random Forest stage is seeded independently via
+    # rf.seed. Bit-exact GPU reproducibility additionally needs tf_deterministic_ops and
+    # identical hardware/software (GPU count, TF version).
+    seed: int | None = None
+    # Force deterministic TF/cuDNN op implementations (tf.config.experimental
+    # .enable_op_determinism) at some training-speed cost. Only meaningful alongside `seed`.
+    tf_deterministic_ops: bool = False
+
     num_training_rounds: int = 20
     epochs_per_round: int = 100
 
@@ -624,6 +636,8 @@ class Config:
                 "inference_files": self.data.inference_files,
             },
             "training": {
+                "seed": self.training.seed,
+                "tf_deterministic_ops": self.training.tf_deterministic_ops,
                 "num_training_rounds": self.training.num_training_rounds,
                 "epochs_per_round": self.training.epochs_per_round,
                 "num_samples_beta_vae": self.training.num_samples_beta_vae,
