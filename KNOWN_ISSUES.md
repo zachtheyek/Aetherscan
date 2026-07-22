@@ -196,21 +196,17 @@ Aetherscan CPU usage is systematically lower than system total CPU usage in reso
 
 ### Cause
 
-The issue is in the `get_process_tree_stats()` function. Every monitoring interval, `process.children(recursive=True)` creates **new `psutil.Process` objects** for all child processes. When `cpu_percent(interval=0.0)` is called on a newly created Process object, psutil has no baseline CPU measurements to compare against, so it returns `0.0`.
+The issue was in the `get_process_tree_stats()` function. Every monitoring interval, `process.children(recursive=True)` created **new `psutil.Process` objects** for all child processes. When `cpu_percent(interval=0.0)` is called on a newly created Process object, psutil has no baseline CPU measurements to compare against, so it returns `0.0`.
 
-With 96+ child processes being recreated every interval, the majority report `0.0` CPU, leading to severe undercounting.
+With 96+ child processes being recreated every interval, the majority reported `0.0` CPU, leading to severe undercounting.
 
 ### Impact
 
-**Minor.** Resource utilization plots show inaccurate CPU values. Training and inference correctness are not affected.
-
-### Workaround
-
-For accurate CPU monitoring, use external tools like `htop`, `nvidia-smi`, or system monitoring dashboards.
+**Minor.** Resource utilization plots showed inaccurate CPU values. Training and inference correctness were not affected.
 
 ### Status
 
-**Open.** See [GitHub Issue #12](https://github.com/zachtheyek/Aetherscan/issues/12).
+**Closed.** `get_process_tree_stats()` now maintains a PID -> `psutil.Process` cache across monitoring intervals, so `cpu_percent(interval=0)` measures against the previous sample's baseline. Each newly spawned process contributes one `0.0` reading the first interval it is seen (accurate thereafter); PIDs that leave the tree are evicted from the cache. See [GitHub Issue #12](https://github.com/zachtheyek/Aetherscan/issues/12).
 
 ### Related Code
 
