@@ -7,6 +7,7 @@ preprocessing stubbed out."""
 from __future__ import annotations
 
 import json
+import logging
 import types
 
 import numpy as np
@@ -42,6 +43,16 @@ class TestReportFinalTrainingStatus:
         with pytest.raises(SystemExit) as exc:
             main._report_final_training_status(None)
         assert exc.value.code == 1
+
+    def test_rf_skip_annotates_success_instead_of_unqualified(self, caplog):
+        # A run whose RF stage was skipped (pre-loaded already-trained RF, issue #142) still
+        # exits 0, but the terminal message must be the skip warning, not plain success.
+        pipeline = _pipeline_with([])
+        pipeline.rf_training_skipped_from_tag = "test_v27"
+        with caplog.at_level(logging.INFO, logger="aetherscan.main"):
+            main._report_final_training_status(pipeline)  # no SystemExit
+        assert any("SKIPPED" in r.message and "test_v27" in r.message for r in caplog.records)
+        assert not any("completed successfully" in r.message for r in caplog.records)
 
 
 @pytest.fixture

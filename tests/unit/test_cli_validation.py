@@ -129,6 +129,23 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(["train", "--load-tag", "bogus"]), None)
         assert any(e.field == "checkpoint.load_tag" and e.fix_kind == "format" for e in errors)
 
+    def test_round_load_tag_without_checkpoints_load_dir_rejected(self):
+        # The #142 resume footgun: per-round checkpoints live under checkpoints/, so a bare
+        # `--load-tag round_XX` would search the models root and silently load a stale model.
+        errors = collect_validation_errors(_parse(["train", "--load-tag", "round_01"]), None)
+        assert any(e.field == "checkpoint.load_dir" and e.fix_kind == "cross_param" for e in errors)
+
+    def test_round_load_tag_with_checkpoints_load_dir_passes(self):
+        errors = collect_validation_errors(
+            _parse(["train", "--load-tag", "round_01", "--load-dir", "checkpoints"]), None
+        )
+        assert not any(e.field == "checkpoint.load_dir" for e in errors)
+
+    def test_final_load_tag_without_load_dir_passes(self):
+        # A final model legitimately lives in the models root — no load-dir required.
+        errors = collect_validation_errors(_parse(["train", "--load-tag", "final_v1"]), None)
+        assert not any(e.field == "checkpoint.load_dir" for e in errors)
+
     def test_num_samples_divisible_by_4(self):
         errors = collect_validation_errors(_parse(["train", "--num-samples-beta-vae", "202"]), None)
         assert any(e.field == "training.num_samples_beta_vae" and e.divisor == 4 for e in errors)

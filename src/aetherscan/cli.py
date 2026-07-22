@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # runs can be labelled meaningfully without being forced into the test_vX / final_vX shapes.
 _TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
 
+# The round_XX subset of _TAG_PATTERN: per-round checkpoints are saved under the checkpoints/
+# subdirectory, so loading one requires --load-dir checkpoints (issue #142)
+_ROUND_TAG_PATTERN = re.compile(r"^round_\d+$")
+
 # sklearn's RandomForestClassifier accepts these string values for max_features
 _RF_MAX_FEATURES_STR_VALUES = {"sqrt", "log2"}
 
@@ -1945,6 +1949,30 @@ def collect_validation_errors(
                     current=load_tag,
                     message=f"--load-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {load_tag!r}",
                     fix_kind="format",
+                )
+            )
+
+        # Resume footgun (issue #142): per-round checkpoints are saved under the checkpoints/
+        # subdirectory, so `--load-tag round_XX` without `--load-dir checkpoints` searches the
+        # models root instead and used to silently resume from a stale, unrelated model.
+        load_dir = _resolve(args, "load_dir", config.checkpoint.load_dir)
+        if (
+            load_tag is not None
+            and _ROUND_TAG_PATTERN.match(load_tag)
+            and load_dir != "checkpoints"
+        ):
+            errors.append(
+                ValidationError(
+                    field="checkpoint.load_dir",
+                    current=load_dir,
+                    message=(
+                        f"--load-tag {load_tag!r} names a per-round checkpoint, and those are "
+                        f"saved under the 'checkpoints/' subdirectory — pass --load-dir "
+                        f"checkpoints to resume from it. (If you genuinely keep a final model "
+                        f"tagged {load_tag!r} in the models root, re-save it under a final_vX "
+                        f"or test_vX tag and load that instead.)"
+                    ),
+                    fix_kind="cross_param",
                 )
             )
 

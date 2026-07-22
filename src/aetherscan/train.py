@@ -297,6 +297,56 @@ def get_latest_tag(checkpoints_dir: str) -> str:
     return tag
 
 
+def _model_pair_exists(base_dir: str, tag: str) -> bool:
+    """True when the encoder/decoder pair for `tag` both exist in base_dir."""
+    return os.path.exists(os.path.join(base_dir, f"vae_encoder_{tag}.keras")) and os.path.exists(
+        os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+    )
+
+
+def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
+    """
+    Resolve the tag load_models() should load from base_dir.
+
+    An explicitly requested tag must exist: raising FileNotFoundError beats the old silent
+    get_latest_tag() fallback, which could resume training from a stale, unrelated model while
+    reporting success (issue #142). Only the tag=None default may fall back to the latest tag
+    present in base_dir.
+    """
+    if tag is not None:
+        if _model_pair_exists(base_dir, tag):
+            return tag
+        msg = (
+            f"No models tagged '{tag}' in {base_dir} — refusing to fall back to the latest tag "
+            f"for an explicitly requested tag."
+        )
+        # The per-round-checkpoint hint only helps for a round_XX tag; for any other explicit
+        # tag (e.g. a typo'd final_v2) it's a red herring, so only append it for round tags.
+        if re.fullmatch(r"round_\d+", tag):
+            msg += (
+                " If you meant to resume from a per-round checkpoint, pass --load-dir checkpoints"
+            )
+        raise FileNotFoundError(msg)
+
+    # NOTE: use a more sensible default
+    logger.info("No tag specified. Defaulting to 'final'")
+    if _model_pair_exists(base_dir, "final"):
+        return "final"
+
+    logger.warning(f"No models tagged as 'final' in {base_dir}")
+    logger.warning(f"Looking for latest tag in {base_dir} instead")
+
+    latest = get_latest_tag(
+        base_dir
+    )  # get_latest_tag() will raise an error if no valid tags exist in base_dir
+    logger.info(f"Tag 'final' not found. Loading latest model with tag: '{latest}'")
+
+    # Sanity check: get_latest_tag() only returns tags whose pair existed at scan time
+    if not _model_pair_exists(base_dir, latest):
+        raise FileNotFoundError("Models not found")
+    return latest
+
+
 def compute_expected_std(layer):
     """Compute expected std based on initializer."""
     weights = layer.get_weights()
@@ -937,6 +987,14 @@ class TrainingPipeline:
 
         # Initialize RF model as None
         self.rf_model = None
+
+        # Tag an already-trained RF was loaded from (set by load_models); lets
+        # train_random_forest name the stale source when it skips retraining (issue #142)
+        self._rf_loaded_from_tag: str | None = None
+
+        # Set when train_random_forest skips because a pre-loaded RF was already trained —
+        # main.py annotates the terminal status instead of reporting unqualified success
+        self.rf_training_skipped_from_tag: str | None = None
 
         # Background round-data producer (created in train_beta_vae when
         # overlap_data_generation is enabled; None otherwise)
@@ -2212,7 +2270,19 @@ class TrainingPipeline:
             self.rf_model = RandomForestModel()
 
         elif self.rf_model.is_trained:
-            logger.info("Random Forest classifier already trained. Exiting training loop.")
+            # A pre-loaded, already-trained RF short-circuits the whole stage — make the skip
+            # loud and record it, or a resume from the wrong tag ships a stale RF while the
+            # run reports unqualified success (issue #142)
+            source_tag = self._rf_loaded_from_tag or "unknown"
+            logger.warning("=" * 60)
+            logger.warning(
+                f"RF training SKIPPED: an already-trained Random Forest (loaded from tag "
+                f"'{source_tag}') is in memory — no new Random Forest will be trained for "
+                f"save tag '{self.config.checkpoint.save_tag}'; the loaded model is reused "
+                f"as-is"
+            )
+            logger.warning("=" * 60)
+            self.rf_training_skipped_from_tag = source_tag
             return
 
         # # BUG:
@@ -6439,43 +6509,23 @@ class TrainingPipeline:
             logger.info(f"Saved Random Forest to {rf_path}")
 
     def load_models(self, tag: str | None = None, dir: str | None = None):
-        """Load model weights"""
-        if tag is None:
-            # NOTE: use a more sensible default
-            logger.info("No tag specified. Defaulting to 'final'")
-            tag = "final"
-        original_tag = tag
+        """Load model weights.
 
-        # Construct filepaths
+        An explicit `tag` must exist in the target directory (FileNotFoundError otherwise);
+        only the tag=None default falls back to 'final' and then the latest tag present —
+        see _resolve_load_tag() and issue #142.
+        """
         if dir is not None:
             base_dir = os.path.join(self.config.model_path, dir)
-            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
         else:
             base_dir = self.config.model_path
-            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
-        if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
-            # If the specified path doesn't exist, try to find the latest tag from base_dir
-            logger.warning(f"No models tagged as '{original_tag}' in {base_dir}")
-            logger.warning(f"Looking for latest tag in {base_dir} instead")
+        tag = _resolve_load_tag(base_dir, tag)
 
-            tag = get_latest_tag(
-                base_dir
-            )  # get_latest_tag() will raise an error if no valid tags exist in base_dir
-            logger.info(f"Tag '{original_tag}' not found. Loading latest model with tag: '{tag}'")
-
-            # Reconstruct paths with new tag
-            encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
-
-            # Sanity check: if paths still don't exist, raise an error
-            if not (os.path.exists(encoder_path) and os.path.exists(decoder_path)):
-                raise FileNotFoundError("Models not found")
+        # Construct filepaths
+        encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
+        decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+        rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
 
         # Load the models
         try:
@@ -6498,6 +6548,7 @@ class TrainingPipeline:
                     self.rf_model = RandomForestModel()
 
                 self.rf_model.load(rf_path)
+                self._rf_loaded_from_tag = tag
                 logger.info("Random Forest loaded successfully")
             else:
                 logger.info(

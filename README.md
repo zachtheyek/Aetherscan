@@ -270,6 +270,9 @@ PYTHONPATH=src python -m aetherscan.main train \
     --save-tag test_v1
 ```
 
+> [!WARNING]
+> Per-round checkpoints live under `checkpoints/` — `--load-tag round_XX` without `--load-dir checkpoints` is rejected at validation (it used to silently resume from the newest stale model in the models root instead).
+
 **Training with an explicit per-GPU memory cap (e.g. on an older Ampere GPU with lower VRAM)**
 
 ```bash
