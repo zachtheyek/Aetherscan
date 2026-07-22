@@ -19,7 +19,9 @@ imageio>=2.34,<3
 umap-learn>=0.5.6,<0.6
 shap>=0.46.0,<0.47
 slack-sdk>=3.31.0,<4
-python-dotenv>=1.0,<2
+# Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684, set_key symlink following;
+# fixed in 1.2.2).
+python-dotenv>=1.2.2,<2
 # Model weight distribution via the HuggingFace Hub (upload after training, download for
 # inference). 1.21 per SECURITY.md's version policy: two minors below the latest stable
 # (1.23) at pin time, newer than the newest >=6-month-old release.
@@ -28,8 +30,9 @@ huggingface_hub>=1.21,<1.22
 # imports at module load. Recent pip / Python releases dropped setuptools
 # from the bootstrap, so we install it explicitly. Upper-bound at <81 because
 # setuptools 81 removed pkg_resources as a vendored submodule -- revisit
-# once blimpy migrates off pkg_resources (upstream issue).
-setuptools>=70,<81
+# once blimpy migrates off pkg_resources (upstream issue). Floor >=78.1.1 per
+# GHSA-5rjg-fvgr-3xxf (CVE-2025-47273, path traversal; fixed in 78.1.1).
+setuptools>=78.1.1,<81
 # Range covers the proven 2.6/2.7 line (2.7.0 in current use) and blocks a future
 # major-version break; keep in lockstep with environment.yml and pyproject.toml.
 setigen>=2.6,<3
