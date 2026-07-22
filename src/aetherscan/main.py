@@ -198,6 +198,9 @@ def _report_final_training_status(pipeline) -> None:
     # Qualified success (issue #142): a run whose RF stage was skipped because an
     # already-trained Random Forest was pre-loaded (e.g. resumed from the wrong tag) must not
     # report unqualified success — the saved RF was never trained on this run's encoder.
+    # Ordering is intentional: the failed_stages branch above exits(1) first, so a run that
+    # both had a permanent stage failure AND skipped RF reports the failure (the stronger
+    # signal), never this qualified-success annotation.
     skipped_rf_tag = getattr(pipeline, "rf_training_skipped_from_tag", None)
     if skipped_rf_tag:
         logger.warning("=" * 60)

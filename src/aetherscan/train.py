@@ -316,11 +316,17 @@ def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
     if tag is not None:
         if _model_pair_exists(base_dir, tag):
             return tag
-        raise FileNotFoundError(
+        msg = (
             f"No models tagged '{tag}' in {base_dir} — refusing to fall back to the latest tag "
-            f"for an explicitly requested tag. If you meant to resume from a per-round "
-            f"checkpoint, pass --load-dir checkpoints"
+            f"for an explicitly requested tag."
         )
+        # The per-round-checkpoint hint only helps for a round_XX tag; for any other explicit
+        # tag (e.g. a typo'd final_v2) it's a red herring, so only append it for round tags.
+        if re.fullmatch(r"round_\d+", tag):
+            msg += (
+                " If you meant to resume from a per-round checkpoint, pass --load-dir checkpoints"
+            )
+        raise FileNotFoundError(msg)
 
     # NOTE: use a more sensible default
     logger.info("No tag specified. Defaulting to 'final'")

@@ -117,6 +117,20 @@ class TestResolveLoadTag:
         with pytest.raises(FileNotFoundError, match="round_01"):
             _resolve_load_tag(str(tmp_path), "round_01")
 
+    def test_missing_round_tag_message_hints_checkpoints(self, tmp_path):
+        # The per-round-checkpoint hint is relevant only for a round_XX tag.
+        _touch_pair(tmp_path, "test_v27")
+        with pytest.raises(FileNotFoundError, match="--load-dir checkpoints"):
+            _resolve_load_tag(str(tmp_path), "round_01")
+
+    def test_missing_non_round_tag_message_omits_checkpoints_hint(self, tmp_path):
+        # For a non-round explicit tag (e.g. a typo'd final_v2) the checkpoints hint is a
+        # red herring and must not appear.
+        _touch_pair(tmp_path, "final_v1")
+        with pytest.raises(FileNotFoundError) as excinfo:
+            _resolve_load_tag(str(tmp_path), "final_v2")
+        assert "--load-dir checkpoints" not in str(excinfo.value)
+
     def test_default_prefers_final(self, tmp_path):
         _touch_pair(tmp_path, "final")
         _touch_pair(tmp_path, "round_09")
