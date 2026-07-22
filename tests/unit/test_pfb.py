@@ -229,3 +229,8 @@ class TestEdgeMidPowerRatio:
         expected = edge_mid_power_ratio(response)
         measured = edge_mid_power_ratio(np.ones(_FINE))
         assert abs(measured - expected) / expected > 0.05
+
+    def test_all_zero_spectrum_does_not_raise(self):
+        # A fully masked channel: the defensive mid floor turns 0/0 into 0.0, not
+        # ZeroDivisionError.
+        assert edge_mid_power_ratio(np.zeros(_FINE)) == 0.0

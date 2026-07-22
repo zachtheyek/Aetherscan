@@ -141,4 +141,6 @@ def edge_mid_power_ratio(spectrum: np.ndarray) -> float:
     band = max(1, n // _RATIO_BAND_FRACTION)
     edge = 0.5 * (float(spectrum[:band].mean()) + float(spectrum[-band:].mean()))
     mid = float(spectrum[n // 2 - band // 2 : n // 2 + band // 2 + 1].mean())
-    return edge / mid
+    # Defensive floor (mirroring equalize_passband's): an all-zero — e.g. fully masked —
+    # channel would otherwise raise ZeroDivisionError on the Python-float divide.
+    return edge / max(mid, 1e-30)

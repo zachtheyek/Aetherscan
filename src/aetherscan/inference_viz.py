@@ -390,6 +390,7 @@ def plot_bandpass_flattening(
     # single source of truth for how a channel is read/despiked/flattened, and duplicating
     # that here would let the figure drift from what detection actually does.
     from aetherscan.preprocessing import (  # noqa: PLC0415
+        _decimate_for_plot,
         _fit_channel_bandpass,
         _pfb_flatten_bandpass,
     )
@@ -437,10 +438,25 @@ def plot_bandpass_flattening(
             overlay_label = "spline fit"
 
         ax_raw, ax_flat = axes[row]
-        ax_raw.plot(raw, lw=0.6, color="tab:blue", label="raw integrated spectrum")
-        ax_raw.plot(overlay, lw=1.2, ls="--", color="tab:orange", label=overlay_label)
+        # Decimated to a min/max envelope: full-resolution lines are ~1M points each at
+        # GBT scale, which makes rendering slow and memory-heavy for no visual gain.
+        ax_raw.plot(
+            *_decimate_for_plot(raw), lw=0.6, color="tab:blue", label="raw integrated spectrum"
+        )
+        ax_raw.plot(
+            *_decimate_for_plot(overlay),
+            lw=1.2,
+            ls="--",
+            color="tab:orange",
+            label=overlay_label,
+        )
         ax_raw.set_ylabel(f"coarse channel {ch}\nintegrated power")
-        ax_flat.plot(flat, lw=0.6, color="tab:green", label="flattened integrated spectrum")
+        ax_flat.plot(
+            *_decimate_for_plot(flat),
+            lw=0.6,
+            color="tab:green",
+            label="flattened integrated spectrum",
+        )
         if row == 0:
             ax_raw.legend(loc="upper right", fontsize=8)
             ax_flat.legend(loc="upper right", fontsize=8)

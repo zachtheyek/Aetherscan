@@ -67,6 +67,9 @@ _BANDPASS_SAMPLE_CHANNELS = 3
 # The PFB static-response sanity check samples more channels and takes a median (not a mean),
 # so a single RFI-heavy channel doesn't skew the statistic.
 _PFB_MISMATCH_SAMPLE_CHANNELS = 9
+# Target bin count for _decimate_for_plot: spectrum lines in the bandpass debug/viz figures
+# are reduced to at most 2 * this many points (a min/max pair per bin) before plotting.
+_PLOT_MAX_POINTS_PER_LINE = 4096
 
 
 def _init_worker(shm_name, shape, dtype):
@@ -296,6 +299,34 @@ def _pfb_flatten_bandpass(channel: np.ndarray, response_path: str) -> np.ndarray
     # The spline-vs-PFB detection comparison in the PR body is the empirical arbiter.
     """
     return equalize_passband(channel, _load_pfb_response(response_path))
+
+
+def _decimate_for_plot(
+    y: np.ndarray, max_points: int = _PLOT_MAX_POINTS_PER_LINE
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reduce a long 1-D line to at most 2 * max_points (x, y) points for plotting, via a per-bin
+    min/max envelope: each of max_points equal bins contributes its extremes at their true
+    indices, so narrowband features (RFI spikes, hits) survive where a plain stride would
+    usually miss them. At GBT scale this turns each ~1M-point matplotlib line in the bandpass
+    figures into ~8k points. Returns (x_indices, values); inputs already at or below the
+    budget pass through unchanged. Unpack into ax.plot(*_decimate_for_plot(y), ...).
+    """
+    y = np.asarray(y)
+    n = y.shape[0]
+    if n <= 2 * max_points:
+        return np.arange(n), y
+    bin_size = -(-n // max_points)  # ceil division
+    # Edge-pad the tail bin; padded positions duplicate y[-1], and any argmin/argmax landing
+    # there is clipped back to n - 1 below, so no synthetic value can be selected.
+    padded = np.pad(y, (0, bin_size * max_points - n), mode="edge")
+    binned = padded.reshape(max_points, bin_size)
+    offsets = np.arange(max_points) * bin_size
+    pairs = np.stack([offsets + binned.argmin(axis=1), offsets + binned.argmax(axis=1)], axis=1)
+    # np.unique dedupes + keeps ascending order: a constant-valued bin has argmin==argmax, which
+    # would otherwise emit the same (idx, y) point twice; deduping halves those bins for free.
+    idx = np.unique(np.minimum(np.sort(pairs, axis=1).reshape(-1), n - 1))
+    return idx, y[idx]
 
 
 def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int) -> np.ndarray:
@@ -1233,11 +1264,29 @@ class DataPreprocessor:
         Group every CSV in config.data.inference_files into per-cadence work units without
         processing anything. Returns one PendingCadence (valid group + target .npy path) per
         valid cadence, in CSV order — the unit list the streaming inference loop iterates.
+        Raises ValueError when two inference_files entries share a basename stem (their
+        output dir and stamp filenames would collide).
         """
         inference_files = self.config.data.inference_files
         if not inference_files:
             logger.warning("plan_cadences() called with no inference_files configured")
             return []
+
+        # Fail fast on duplicate CSV basename stems: both the tag-scoped default output dir
+        # and the per-cadence stamp .npy names are keyed on the stem, so two entries like
+        # runA/x.csv and runB/x.csv would silently share a directory (and/or stamp filenames)
+        # and cross-resume each other's cadences.
+        stem_sources: dict[str, str] = {}
+        for csv_filename in inference_files:
+            stem = os.path.splitext(os.path.basename(csv_filename))[0]
+            if stem in stem_sources:
+                raise ValueError(
+                    f"Duplicate inference CSV basename stem '{stem}' "
+                    f"('{stem_sources[stem]}' vs '{csv_filename}'): output directories and "
+                    f"stamp filenames are keyed on the basename, so these entries would "
+                    f"overwrite/resume each other. Rename one so basenames are unique."
+                )
+            stem_sources[stem] = csv_filename
 
         # Output directory resolution: an explicit --preprocess-output-dir is used as-is
         # (shared across CSVs); otherwise each CSV gets its own tag-scoped default,
@@ -1941,10 +1990,25 @@ class DataPreprocessor:
                 overlay_label = "spline fit"
 
             ax_raw, ax_flat = axes[row]
-            ax_raw.plot(raw, lw=0.6, color="tab:blue", label="raw integrated spectrum")
-            ax_raw.plot(overlay, lw=1.2, ls="--", color="tab:orange", label=overlay_label)
+            # Decimated to a min/max envelope: full-resolution lines are ~1M points each at
+            # GBT scale, which makes rendering slow and memory-heavy for no visual gain.
+            ax_raw.plot(
+                *_decimate_for_plot(raw), lw=0.6, color="tab:blue", label="raw integrated spectrum"
+            )
+            ax_raw.plot(
+                *_decimate_for_plot(overlay),
+                lw=1.2,
+                ls="--",
+                color="tab:orange",
+                label=overlay_label,
+            )
             ax_raw.set_ylabel(f"coarse channel {ch}\nintegrated power")
-            ax_flat.plot(flat, lw=0.6, color="tab:green", label="flattened integrated spectrum")
+            ax_flat.plot(
+                *_decimate_for_plot(flat),
+                lw=0.6,
+                color="tab:green",
+                label="flattened integrated spectrum",
+            )
             if row == 0:
                 ax_raw.legend(loc="upper right", fontsize=8)
                 ax_flat.legend(loc="upper right", fontsize=8)
