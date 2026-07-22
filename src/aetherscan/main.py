@@ -906,12 +906,44 @@ def main():
     try:
         init_config()
     except Exception as e:
-        # Note, can't log before init_logger()
+        # Note, can't log before init_logger() — write to stderr so the failure isn't silent
+        # (print() is banned outside utils/ by the T20 lint rule).
+        sys.stderr.write(f"Failed to initialize config: {e}\n")
         sys.exit(1)
 
-    # Initialize logger
+    # Set up the CLI parser and parse arguments BEFORE init_logger so the logger can name this
+    # run's log file with its effective save_tag (aetherscan_{save_tag}.log instead of a single
+    # overwritten aetherscan.log). Arg parsing has no dependency on the logger/manager; it is
+    # hoisted here only to resolve the tag. Like init_config above, these steps run before the
+    # logger exists and so cannot log.
     try:
-        init_logger()
+        parser = setup_argument_parser()
+    except Exception as e:
+        # Note, can't log before init_logger() — write to stderr so the failure isn't silent
+        # (print() is banned outside utils/ by the T20 lint rule).
+        sys.stderr.write(f"Failed to set up argument parser: {e}\n")
+        sys.exit(1)
+
+    # Parse arguments
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        # argparse calls sys.exit(2) on parse errors (invalid types, missing required args, etc.),
+        # which is why we catch SystemExit instead of Exception. argparse already prints its own
+        # error message + usage to stderr; we re-print full help and re-raise to preserve exit
+        # code 2. No logger exists yet (see above), so nothing is logged here.
+        if e.code == 2:  # argparse error (syntax/type error)
+            parser.print_help()
+        raise
+
+    # Initialize logger. Name the run's log file with its effective save_tag: the CLI --save-tag
+    # when provided (present on the train/inference subcommands as args.save_tag), else the config
+    # default timestamp tag. init_logger() runs before apply_args_to_config(), so the tag is
+    # resolved from args here rather than from the not-yet-updated config. Pass None straight
+    # through rather than pre-resolving the default here — Logger.__init__ already does the
+    # is-not-None fallback to config.checkpoint.save_tag internally.
+    try:
+        init_logger(save_tag=getattr(args, "save_tag", None))
         logger.info("Logger initialization successful, but not yet registered for cleanup.")
         logger.info("Awaiting resource manager initialization. Do not terminate the process!")
     except Exception as e:
@@ -933,33 +965,6 @@ def main():
     except Exception as e:
         logger.error(f"Failed to register logger: {e}")
         sys.exit(1)
-
-    # Setup CLI argument parser
-    try:
-        parser = setup_argument_parser()
-        logger.info("CLI argument parser setup successfully")
-    except Exception as e:
-        logger.error(f"Failed to setup argument parser: {e}")
-        sys.exit(1)
-
-    # Parse arguments
-    try:
-        args = parser.parse_args()
-        logger.info("CLI arguments parsed. No issues found")
-    except SystemExit as e:
-        # argparse calls sys.exit(2) on parse errors (invalid types, missing required args, etc.)
-        # which is why we catch with SystemExit instead of Exception
-        # Exit code 2 = command line syntax error (standard for CLI tools)
-        if e.code == 2:  # argparse error (syntax/type error)
-            # Print help message & exit if parse_args() fails
-            # Note, argparse prints its own error message, but we call print_help() again
-            # just to be safe
-            parser.print_help()
-            logger.error("Invalid CLI arguments received")
-            logger.error("See usage")
-        # Here, we simply let the original traceback propagate by re-raising
-        # so cleanup handlers still run via atexit
-        raise
 
     # Inference mode: resolve the model artifact trio before anything reads it. When the
     # user provided none of --encoder-path/--rf-path/--config-path, the pinned
