@@ -42,8 +42,10 @@ _ANNOTATION_COLOR = "dimgray"
 
 # GPU display names shown in the resource-plot legend ONLY (never the DB resource_name or
 # self.gpu_names): a raw name containing one of these substrings collapses to the short alias,
-# preserving the ":<idx>" suffix. Longer/more specific product strings are listed first so they
-# win. Anything outside the whitelist falls back to length-based truncation.
+# preserving the ":<idx>" suffix. _sanitize_gpu_display_name returns on the FIRST substring
+# match in dict (insertion) order, so if a future key is a substring of another, list the more
+# specific (longer) one first. The current two keys don't overlap, so order isn't load-bearing
+# yet. Anything outside the whitelist falls back to length-based truncation.
 _GPU_DISPLAY_NAME_WHITELIST = {
     "NVIDIA RTX PRO 6000 Blackwell": "PRO 6000",
     "NVIDIA RTX A4000": "A4000",
