@@ -188,7 +188,7 @@ The `tests/` suite splits along a hardware axis:
 - **`tests/unit/`** — fast, hardware-independent, one `test_<module>.py` per source module. This is the CI surface; everything here must pass on a CPU-only runner.
 - **`tests/integration/`** — `gpu`/`cluster`-marked tests that need real GPUs and cluster-resident data/models; not run in CI. Two end-to-end smokes (`test_train_smoke.py`, `test_inference_smoke.py`) launch `python -m aetherscan.main ...` as a real subprocess (hours of wall time each); the model-behavior gate (`test_model_behavior.py`, issue #139 Gate 2) instead drives generation and scoring in-process against the persisted VAE+RF (minutes, not hours).
 
-**Default selection — exactly what CI runs** (`.github/workflows/tests.yml`, on Python 3.10, 3.11, and 3.12), no GPUs or cluster data needed:
+**Default selection — matches what CI runs** (`.github/workflows/tests.yml`, on Python 3.10, 3.11, and 3.12), no GPUs or cluster data needed. CI adds an explicit `and not integration` as a defense-in-depth leak-guard (see the markers table below), so the exact CI expression is `pytest -m "not gpu and not cluster and not integration" -q`; today the two expressions select the same set because every `integration` test is also `gpu`+`cluster`.
 
 ```bash
 pytest -m "not gpu and not cluster" -q
@@ -203,7 +203,7 @@ pytest -m "not gpu and not cluster" -q
 | `slow`        | Slower CPU tests (e.g. builds real TF graphs)    | **Yes** — CI runs them  |
 | `gpu`         | Needs one or more physical GPUs                  | No                      |
 | `cluster`     | Needs cluster-resident data/models (blpc3/bla0)  | No                      |
-| `integration` | End-to-end subprocess runs; **skips isolation**  | No (also `gpu`+`cluster`) |
+| `integration` | End-to-end subprocess runs; **skips isolation**  | No — also `gpu`+`cluster`; CI excludes by marker too as a leak-guard |
 
 **Isolation.** The autouse `aetherscan_isolated_env` fixture in `tests/conftest.py` wraps every non-integration test: it points `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` at a fresh `tmp_path` tree, deletes `SLACK_BOT_TOKEN`/`SLACK_CHANNEL` (tests must never talk to Slack), resets all five singletons (`Config`, `Database`, `Logger`, `ResourceManager`, `ResourceMonitor`) via their `_reset()` hooks, then on teardown stops any leaked background threads/pools and restores the snapshotted SIGINT/SIGTERM handlers and stdout/stderr. Net effect: tests never touch real data and can't leak state into one another. Integration tests are exempt — they inherit the real environment and run the pipeline as a subprocess.
 

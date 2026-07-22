@@ -22,7 +22,8 @@ ruff check src/ && ruff format src/
 Pytest suite in `tests/`: unit (the CI surface) + `gpu`/`cluster`-marked integration smokes. Full layout, fixtures, markers, and coverage notes are in [docs/TESTING.md](docs/TESTING.md) (the contribution-workflow view is in [CONTRIBUTING.md](CONTRIBUTING.md#testing)).
 
 ```bash
-# Default selection = what CI runs (no GPUs / cluster data needed):
+# Default local-dev selection (no GPUs / cluster data needed); CI runs
+# essentially the same, plus `and not integration` as a leak-guard — see docs/TESTING.md:
 pytest -m "not gpu and not cluster" -q
 # gpu/cluster integration smokes — need a cluster (data + a persisted model under /datax) and the NGC container:
 ./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q

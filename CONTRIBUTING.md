@@ -549,7 +549,11 @@ The test suite lives in `tests/` and runs on [pytest](https://docs.pytest.org/) 
 
 ```bash
 # Default selection — everything that doesn't need GPUs or cluster-resident data.
-# This is exactly what CI runs (.github/workflows/tests.yml).
+# Matches what CI runs (.github/workflows/tests.yml); CI additionally appends
+# `and not integration` as a defense-in-depth leak-guard against a future test
+# marked only `integration` (which skips the isolation fixture) — today the two
+# expressions select the same set because every `integration` test is also
+# `gpu`+`cluster`.
 pytest -m "not gpu and not cluster" -q
 
 # Cluster integration smokes (end-to-end train + CSV inference), inside the NGC container:
