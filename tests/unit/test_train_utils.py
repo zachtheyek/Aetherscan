@@ -395,6 +395,20 @@ class TestCheckValAucFloor:
         assert "min_val_auc" in warnings[0].message
         assert "rf_eval_artifacts_test_v1.joblib" in warnings[0].message
 
+    def test_single_class_labels_with_gate_enabled_warns_instead_of_raising(self, caplog):
+        # roc_auc_score raises ValueError on single-class labels; with the gate enabled the
+        # guard must warn and return None rather than let that escape (mirrors
+        # compute_rf_eval_metrics' identical guard in rf_metrics.py).
+        labels = np.ones(4, dtype=np.int64)
+        probas = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = check_val_auc_floor(labels, probas, min_val_auc=0.9, tag="test_v1")
+        assert result is None
+        assert any(
+            "single-class" in r.message and "cannot be evaluated" in r.message
+            for r in caplog.records
+        )
+
 
 class TestSelectPositiveClassShap:
     N, F = 5, 8

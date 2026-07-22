@@ -414,13 +414,23 @@ def check_val_auc_floor(
 ) -> float | None:
     """
     Opt-in quality floor on the RF's validation ROC-AUC (issue #139 Gate 1). Returns None
-    without computing anything when the gate is disabled (min_val_auc <= 0.0, the default);
-    otherwise returns the computed AUC. When the floor is set and unmet, emits a loud WARNING
-    (which reaches the Slack summary) rather than failing the run — so a run that "completes"
-    but learned nothing (bad data, collapsed latent, mislabeled classes) is flagged before
-    its model is promoted.
+    without computing anything when the gate is disabled (min_val_auc <= 0.0, the default) or
+    when val_binary_labels is single-class (roc_auc_score is undefined there; guaranteed not
+    to happen by the data pipeline, but guarded per the gate's warn-don't-abort philosophy —
+    mirrors compute_rf_eval_metrics' identical guard in rf_metrics.py); otherwise returns the
+    computed AUC. When the floor is set and unmet, emits a loud WARNING (which reaches the
+    Slack summary) rather than failing the run — so a run that "completes" but learned nothing
+    (bad data, collapsed latent, mislabeled classes) is flagged before its model is promoted.
     """
     if min_val_auc <= 0.0:
+        return None
+
+    if np.unique(val_binary_labels).size < 2:
+        logger.warning(
+            f"Model quality gate cannot be evaluated: validation labels for tag '{tag}' are "
+            f"single-class, so ROC-AUC is undefined (training.min_val_auc={min_val_auc} was "
+            f"configured). This should not happen — data generation guarantees both classes."
+        )
         return None
 
     val_auc = float(roc_auc_score(val_binary_labels, val_probas))

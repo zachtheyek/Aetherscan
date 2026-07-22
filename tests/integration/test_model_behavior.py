@@ -37,6 +37,11 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.cluster]
 # for the decoupling suggestion).
 _MODEL_TAG = "test_v17"  # persisted dummy model on blpc3
 _BACKGROUND_FILE = "real_filtered_LARGE_HIP110750.npy"  # first default train file
+# Pinned to DataConfig's current defaults (config.py) rather than read live: test_v17 was
+# trained against these values, so a future default change must not silently alter what this
+# behavioral gate exercises.
+_FREQ_RESOLUTION = 2.7939677238464355  # Hz
+_TIME_RESOLUTION = 18.25361108  # seconds
 # Controlled SNRs spanning the training curriculum (snr_base=10, initial range 40 → the
 # model saw SNR 10-50 during training).
 _SNRS = (10.0, 20.0, 35.0, 50.0)
@@ -62,7 +67,6 @@ def test_snr_confidence_monotonicity(cluster_paths):
     import joblib  # noqa: PLC0415
     import tensorflow as tf  # noqa: PLC0415
 
-    from aetherscan.config import DataConfig  # noqa: PLC0415
     from aetherscan.data_generation import create_true_single  # noqa: PLC0415
     from aetherscan.models import prepare_latent_features  # noqa: PLC0415
 
@@ -78,7 +82,6 @@ def test_snr_confidence_monotonicity(cluster_paths):
     # background per cadence.
     plate = np.load(background_path, mmap_mode="r")
     _, num_observations, time_bins, width_bin = plate.shape
-    data_defaults = DataConfig()
 
     # Load the persisted models the same way inference does (encoder inside strategy scope).
     strategy = tf.distribute.get_strategy()
@@ -97,8 +100,8 @@ def test_snr_confidence_monotonicity(cluster_paths):
                     snr_base=snr,
                     snr_range=0.0,
                     width_bin=width_bin,
-                    freq_resolution=data_defaults.freq_resolution,
-                    time_resolution=data_defaults.time_resolution,
+                    freq_resolution=_FREQ_RESOLUTION,
+                    time_resolution=_TIME_RESOLUTION,
                 )[0]
                 for _ in range(_CADENCES_PER_SNR)
             ]
