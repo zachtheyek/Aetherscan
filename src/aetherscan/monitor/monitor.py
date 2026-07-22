@@ -141,10 +141,10 @@ def _legend_above_panel(
     ax, handles: list, labels: list, *, ncol: int, fontsize: int, y_anchor: float = _LEGEND_Y
 ) -> None:
     """
-    Place `ax`'s legend outside the panel, in the headroom band above it: the legend's
-    lower-right corner is pinned to (right spine, `y_anchor` in axes fraction) so it is
-    right-aligned to the y2 spine and grows upward into the reserved band beneath the title.
-    Keep `ncol` small for busy panels so the right-aligned legend clears the centered title.
+    Place `ax`'s legend outside the panel, in the headroom band between the panel and its title:
+    the legend's lower-centre is pinned to (0.5, `y_anchor` in axes fraction) so it is centred
+    horizontally under the (also-centred) title and grows upward into the reserved band. The
+    title pad must exceed the legend height so the two stay vertically stacked without overlap.
     No-op when there are no labelled artists.
     """
     if not handles:
@@ -152,8 +152,8 @@ def _legend_above_panel(
     ax.legend(
         handles,
         labels,
-        loc="lower right",
-        bbox_to_anchor=(1.0, y_anchor),
+        loc="lower center",
+        bbox_to_anchor=(0.5, y_anchor),
         ncol=ncol,
         fontsize=fontsize,
         frameon=True,
@@ -167,10 +167,11 @@ def _draw_stage_boundaries(
     """
     Draw the pipeline-stage overlay: one solid `dimgray` vertical line at each span's right
     edge (its end time, in minutes since `start_time`) on EVERY axis in `axes` (the panels
-    share an x-axis), and label each stage once on `axes[0]` — anchored just left of its line,
-    rotated 30 deg from horizontal near the top. Pure drawing helper (no DB or instance state)
-    so it's exercisable with synthetic spans in tests and the render harness. `axes` must be
-    non-empty; `axes[0]` is the labelled (CPU) panel.
+    share an x-axis), and label each stage once — anchored just left of its line and rotated
+    30 deg from horizontal, sitting just BELOW the x-axis of `axes[0]` (in the inter-panel band,
+    not inside the plot). Pure drawing helper (no DB or instance state) so it's exercisable with
+    synthetic spans in tests and the render harness. `axes` must be non-empty; `axes[0]` is the
+    top (CPU) panel whose x-axis the labels hang under.
     """
     label_ax = axes[0]
     for span in spans:
@@ -182,9 +183,10 @@ def _draw_stage_boundaries(
         label = str(span["stage"]).split(".")[-1]
         label_ax.annotate(
             label,
-            # x in data coords (the line), y in axes fraction (0.96 = near top) so the label
-            # position survives any change to the panel's y-limits.
-            xy=(end_min, 0.96),
+            # x in data coords (the line); y in axes fraction just BELOW the bottom spine
+            # (negative) so the label sits under the top panel's x-axis, in the inter-panel
+            # band, rather than inside the plot. y-fraction (not data) survives any y-limit change.
+            xy=(end_min, -0.02),
             xycoords=label_ax.get_xaxis_transform(),
             xytext=(-3, 0),
             textcoords="offset points",
@@ -194,7 +196,7 @@ def _draw_stage_boundaries(
             va="top",
             fontsize=7,
             color=_ANNOTATION_COLOR,
-            clip_on=True,
+            clip_on=False,  # label lives outside the axes (below the x-axis) — must not be clipped
             zorder=3,
         )
 
