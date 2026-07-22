@@ -649,7 +649,6 @@ def prepare_distributed_train_dataset(
     if rng is None:
         rng = np.random.default_rng()
 
-
     # Stratified train/val split to ensure both sets contain proportional representation
     # of all 4 signal types (false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi).
     # This is necessary because generation arranges labels sequentially within
@@ -1026,6 +1025,14 @@ class TrainingPipeline:
             # some training-speed cost. Only useful alongside a root seed
             tf.config.experimental.enable_op_determinism()
             logger.info("TF op determinism enabled (deterministic GPU kernels)")
+            if self.config.training.seed is None:
+                # Without a seed the deterministic kernels cost speed but buy no
+                # reproducibility (TF's global RNG stays unseeded) — warn so it isn't silent.
+                logger.warning(
+                    "tf_deterministic_ops is enabled but --seed is not set: deterministic "
+                    "kernels incur a speed cost without making the run reproducible. Pass "
+                    "--seed to seed the RNG streams."
+                )
 
         # Load (or create) the persisted run manifest for this tag. This resolves
         # self.start_time (wall clock of attempt 1 — used by every DB query/plot, so retries

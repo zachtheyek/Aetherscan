@@ -560,7 +560,7 @@ options:
                         generation, dataset split/shuffles, TF weight init,
                         and the VAE sampling layer (the random forest is
                         seeded separately via --rf-seed). Omit for OS-entropy
-                        (non-reproducible) behavior. Must be >= 0
+                        (non-reproducible) behavior. Must be >= 0.
   --tf-deterministic-ops, --no-tf-deterministic-ops
                         Force deterministic TensorFlow/cuDNN op
                         implementations

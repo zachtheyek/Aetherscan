@@ -396,7 +396,7 @@ def _add_train_flags_to(parser):
         "--seed",
         type=int,
         default=None,
-        help="Root random seed for reproducible runs: seeds data generation, dataset split/shuffles, TF weight init, and the VAE sampling layer (the random forest is seeded separately via --rf-seed). Omit for OS-entropy (non-reproducible) behavior. Must be >= 0",
+        help="Root random seed for reproducible runs: seeds data generation, dataset split/shuffles, TF weight init, and the VAE sampling layer (the random forest is seeded separately via --rf-seed). Omit for OS-entropy (non-reproducible) behavior. Must be >= 0.",
     )
     parser.add_argument(
         "--tf-deterministic-ops",
