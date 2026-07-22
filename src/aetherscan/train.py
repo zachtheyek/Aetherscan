@@ -39,6 +39,7 @@ from sklearn.metrics import (
     brier_score_loss,
     confusion_matrix,
     precision_recall_curve,
+    roc_auc_score,
     roc_curve,
 )
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
@@ -406,6 +407,46 @@ def check_encoder_trained(encoder, threshold=0.2):
     else:
         logger.info("Encoder appears untrained (all layers close to initializer).")
         return False
+
+
+def check_val_auc_floor(
+    val_binary_labels: np.ndarray, val_probas: np.ndarray, min_val_auc: float, tag: str
+) -> float | None:
+    """
+    Opt-in quality floor on the RF's validation ROC-AUC (issue #139 Gate 1). Returns None
+    without computing anything when the gate is disabled (min_val_auc <= 0.0, the default) or
+    when val_binary_labels is single-class (roc_auc_score is undefined there; guaranteed not
+    to happen by the data pipeline, but guarded per the gate's warn-don't-abort philosophy —
+    mirrors compute_rf_eval_metrics' identical guard in rf_metrics.py); otherwise returns the
+    computed AUC. When the floor is set and unmet, emits a loud WARNING (which reaches the
+    Slack summary) rather than failing the run — so a run that "completes" but learned nothing
+    (bad data, collapsed latent, mislabeled classes) is flagged before its model is promoted.
+    """
+    if min_val_auc <= 0.0:
+        return None
+
+    if np.unique(val_binary_labels).size < 2:
+        logger.warning(
+            f"Model quality gate cannot be evaluated: validation labels for tag '{tag}' are "
+            f"single-class, so ROC-AUC is undefined (training.min_val_auc={min_val_auc} was "
+            f"configured). This should not happen — data generation guarantees both classes."
+        )
+        return None
+
+    val_auc = float(roc_auc_score(val_binary_labels, val_probas))
+    if val_auc < min_val_auc:
+        logger.warning(
+            f"MODEL QUALITY GATE UNMET: validation ROC-AUC {val_auc:.4f} is below the "
+            f"configured floor training.min_val_auc={min_val_auc} for tag '{tag}'. The "
+            f"trained model may be degenerate — inspect rf_eval_artifacts_{tag}.joblib "
+            f"before promoting this model."
+        )
+    else:
+        logger.info(
+            f"Model quality gate passed: validation ROC-AUC {val_auc:.4f} >= "
+            f"training.min_val_auc={min_val_auc}"
+        )
+    return val_auc
 
 
 def build_traversal_latents(
@@ -2500,6 +2541,15 @@ class TrainingPipeline:
             os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
             joblib.dump(artifacts, artifact_path)
             logger.info(f"Saved RF eval artifacts to {artifact_path}")
+
+            # Opt-in model-quality gate on the val ROC-AUC (issue #139 Gate 1) — a loud
+            # WARNING when unmet, not a failure
+            check_val_auc_floor(
+                val_binary_labels=val_binary_labels,
+                val_probas=val_probas,
+                min_val_auc=self.config.training.min_val_auc,
+                tag=tag,
+            )
 
             # Persist the trained RF immediately (final_save re-saves it later): a retry that
             # resumes into rf_plots/final_save can then reload the model without regenerating

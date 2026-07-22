@@ -93,6 +93,13 @@ Two important consequences:
    own subsection. There is no runtime gating that prevents a developer from typing
    `config.inference.X` inside `train.py` — that's a code-review concern.
 
+Not every config field has a matching CLI flag — most tuning knobs are config-only and
+are changed by editing their default in `config.py`. One worth knowing:
+`training.min_val_auc` (default `0.0` = disabled) is an opt-in quality floor on the
+Random Forest's validation ROC-AUC. When set and unmet after the RF fit, training logs a
+loud WARNING (which reaches the Slack summary) rather than failing the run, so a run
+that "completes" but learned nothing is caught before its model is promoted.
+
 ## The CLI surface
 
 `setup_argument_parser()` registers two subparsers (`train`, `inference`) via

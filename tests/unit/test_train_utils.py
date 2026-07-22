@@ -1,8 +1,9 @@
 # NOTE: come back to this later
 
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
-schedules, directory archiving, encoder-trained heuristics, SHAP output normalization, and the
-training stage machine (skip-if-done / record-failure semantics against a stub pipeline)."""
+schedules, directory archiving, encoder-trained heuristics, the val-AUC quality floor, SHAP
+output normalization, and the training stage machine (skip-if-done / record-failure semantics
+against a stub pipeline)."""
 
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from aetherscan.train import (
     _select_positive_class_shap,
     archive_directory,
     check_encoder_trained,
+    check_val_auc_floor,
     compute_expected_std,
     get_latest_tag,
 )
@@ -358,6 +360,54 @@ class TestEncoderTrainedHeuristics:
         kernel, bias = layer.get_weights()
         layer.set_weights([kernel * 3.0, bias])  # 200% deviation from expected std
         assert check_encoder_trained(model) is True
+
+
+class TestCheckValAucFloor:
+    """check_val_auc_floor: the opt-in RF val-ROC-AUC quality gate (issue #139 Gate 1)."""
+
+    def test_disabled_by_default_computes_nothing(self, caplog):
+        # Single-class labels would make roc_auc_score raise — proving the disabled gate
+        # (min_val_auc=0.0) returns early without computing any metric.
+        labels = np.ones(4, dtype=np.int64)
+        probas = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        with caplog.at_level(logging.INFO, logger="aetherscan.train"):
+            result = check_val_auc_floor(labels, probas, min_val_auc=0.0, tag="test_v1")
+        assert result is None
+        assert not caplog.records
+
+    def test_floor_met_returns_auc_without_warning(self, caplog):
+        labels = np.array([0, 0, 1, 1], dtype=np.int64)
+        probas = np.array([0.1, 0.2, 0.8, 0.9], dtype=np.float32)  # perfect separation
+        with caplog.at_level(logging.INFO, logger="aetherscan.train"):
+            result = check_val_auc_floor(labels, probas, min_val_auc=0.9, tag="test_v1")
+        assert result == pytest.approx(1.0)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("Model quality gate passed" in r.message for r in caplog.records)
+
+    def test_floor_unmet_warns_loudly(self, caplog):
+        labels = np.array([0, 0, 1, 1], dtype=np.int64)
+        probas = np.array([0.9, 0.8, 0.2, 0.1], dtype=np.float32)  # inverted separation
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = check_val_auc_floor(labels, probas, min_val_auc=0.9, tag="test_v1")
+        assert result == pytest.approx(0.0)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "min_val_auc" in warnings[0].message
+        assert "rf_eval_artifacts_test_v1.joblib" in warnings[0].message
+
+    def test_single_class_labels_with_gate_enabled_warns_instead_of_raising(self, caplog):
+        # roc_auc_score raises ValueError on single-class labels; with the gate enabled the
+        # guard must warn and return None rather than let that escape (mirrors
+        # compute_rf_eval_metrics' identical guard in rf_metrics.py).
+        labels = np.ones(4, dtype=np.int64)
+        probas = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = check_val_auc_floor(labels, probas, min_val_auc=0.9, tag="test_v1")
+        assert result is None
+        assert any(
+            "single-class" in r.message and "cannot be evaluated" in r.message
+            for r in caplog.records
+        )
 
 
 class TestSelectPositiveClassShap:

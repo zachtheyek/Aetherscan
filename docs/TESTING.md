@@ -58,10 +58,11 @@ tests/
 │   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
 │   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths
 │   └── test_logger.py               # StreamToLogger redirect probes: isatty/writable/readable/fileno
-└── integration/                 # marked integration+gpu+cluster: real subprocess runs
+└── integration/                 # marked integration+gpu+cluster: needs real GPUs + cluster data
     ├── conftest.py                  # repo-root launcher + cluster path resolution
     ├── test_train_smoke.py          # known-good training smoke config, end to end
-    └── test_inference_smoke.py     # subset CSV inference against cluster-resident .h5 data
+    ├── test_inference_smoke.py      # subset CSV inference against cluster-resident .h5 data
+    └── test_model_behavior.py       # SNR→confidence monotonicity gate vs the persisted VAE+RF
 ```
 
 ## Coverage and deliberate gaps
@@ -118,6 +119,16 @@ indirectly today; a direct test would only harden against future refactors):
   `round_stage_name()` helper (pins producer/trainer name agreement) and by
   `test_round_data.py`'s timing test, which drives the real drainer-to-`record_stage` path
   with a real span name.
+
+**Model-behavior gates** (issue #139): validation gates on model *quality*, as opposed to
+function-level correctness, need a trained model and therefore live outside the CI selection.
+Gate 1 — the opt-in `training.min_val_auc` floor on the RF's validation ROC-AUC (a loud
+WARNING at train time when unmet; see [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md)) — has its
+guard logic unit-tested in `test_train_utils.py`, but whether a given run *clears* it is only
+ever observed on real training runs. Gate 2 — the SNR→confidence monotonicity check in
+`tests/integration/test_model_behavior.py` — generates cadences at controlled SNRs with the
+training pipeline's own injection code and scores them in-process against the persisted
+VAE+RF, so it is `gpu`+`cluster`-only by nature (it can never run in CI).
 
 ## Markers
 
@@ -198,10 +209,12 @@ workflow feeds the weekly flaky-test tracker.
 
 ## Running the cluster smokes
 
-The two integration tests launch `python -m aetherscan.main ...` as a subprocess from the
+The two end-to-end smokes launch `python -m aetherscan.main ...` as a subprocess from the
 repo root (their conftest prepends `<repo>/src` to `PYTHONPATH`) with the known-good smoke
-configs, and assert on return codes and produced artifacts. They need real GPUs, the
-cluster-resident data/models, and hours of wall time (subprocess timeout: 2 h each):
+configs, and assert on return codes and produced artifacts; `test_model_behavior.py` instead
+generates and scores synthetic cadences in-process against the persisted VAE+RF (minutes,
+not hours). The suite needs real GPUs, the cluster-resident data/models, and hours of wall
+time for the smokes (subprocess timeout: 2 h each):
 
 ```bash
 # On the cluster, inside the container:

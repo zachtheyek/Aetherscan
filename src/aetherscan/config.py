@@ -284,6 +284,9 @@ class TrainingConfig:
         5000  # Subsample val points for decision boundary plot legibility
     )
 
+    # Model-quality gate params (issue #139 Gate 1)
+    min_val_auc: float = 0.0  # Opt-in floor on the RF's validation ROC-AUC; 0.0 disables the check. When set and unmet after the RF fit, training logs a loud WARNING (reaches the Slack summary) rather than failing the run
+
     # Curriculum learning params
     snr_base: int = 10
     initial_snr_range: int = 40
@@ -651,6 +654,7 @@ class Config:
                 "shap_top_k_features_dependence": self.training.shap_top_k_features_dependence,
                 "rf_decision_boundary_grid_size": self.training.rf_decision_boundary_grid_size,
                 "rf_decision_boundary_max_points": self.training.rf_decision_boundary_max_points,
+                "min_val_auc": self.training.min_val_auc,
                 "snr_base": self.training.snr_base,
                 "initial_snr_range": self.training.initial_snr_range,
                 "final_snr_range": self.training.final_snr_range,
