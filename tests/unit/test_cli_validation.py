@@ -609,6 +609,17 @@ class TestApplyArgsToConfig:
         apply_args_to_config(_parse(["inference"]))
         assert config.checkpoint.force_tag is True
 
+    def test_benchmark_report_flag_routes_to_monitor_section(self):
+        config = get_config()
+        assert config.monitor.benchmark_report_enabled is True  # default: on
+        apply_args_to_config(_parse(["train", "--no-benchmark-report"]))
+        assert config.monitor.benchmark_report_enabled is False
+        # Omitting the flag leaves the config value untouched (tri-state BooleanOptionalAction)
+        apply_args_to_config(_parse(["inference"]))
+        assert config.monitor.benchmark_report_enabled is False
+        apply_args_to_config(_parse(["inference", "--benchmark-report"]))
+        assert config.monitor.benchmark_report_enabled is True
+
 
 class TestLatentTraversalFlags:
     """Flags and validation for the latent-dimension traversal plot (PLAN PR-05)."""

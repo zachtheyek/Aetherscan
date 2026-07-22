@@ -230,6 +230,12 @@ def _add_train_flags_to(parser):
         default=None,
         help="Port for the auto-launched live dashboard (default: 8501)",
     )
+    parser.add_argument(
+        "--benchmark-report",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Render the end-of-run benchmark report (stage timeline + bottleneck suggestions) and post it to Slack (default: on). Use --no-benchmark-report to disable",
+    )
 
     # BetaVAE model configuration
     parser.add_argument(
@@ -719,6 +725,12 @@ def _add_inference_flags_to(parser):
         default=None,
         help="Port for the auto-launched live dashboard (default: 8501)",
     )
+    parser.add_argument(
+        "--benchmark-report",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Render the end-of-run benchmark report (stage timeline + bottleneck suggestions) and post it to Slack (default: on). Use --no-benchmark-report to disable",
+    )
 
     # GPU configuration
     parser.add_argument(
@@ -1030,6 +1042,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.monitor.dashboard_enabled = args.dashboard
     if hasattr(args, "dashboard_port") and args.dashboard_port is not None:
         config.monitor.dashboard_port = args.dashboard_port
+    if hasattr(args, "benchmark_report") and args.benchmark_report is not None:
+        config.monitor.benchmark_report_enabled = args.benchmark_report
 
     # BetaVAE configuration
     if hasattr(args, "vae_latent_dim") and args.vae_latent_dim is not None:

@@ -1,19 +1,23 @@
 """Unit tests for main.py glue that isn't reachable through the higher-level commands: the
 terminal training-status / exit-code contract (_report_final_training_status), non-retryable
-streaming-inference failures, and the stage-aware inference retry state machine (manifest-driven
+streaming-inference failures, the stage-aware inference retry state machine (manifest-driven
 skip, per-cadence failure containment, supersede-on-retry) with the GPU pipeline and
-preprocessing stubbed out."""
+preprocessing stubbed out, and the end-of-run benchmark-report Slack hook
+(_post_benchmark_report)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import sqlite3
 import types
 
 import numpy as np
 import pytest
 
 from aetherscan import main
+from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.db import get_db
 from aetherscan.main import NonRetryableInferenceError, _run_streaming_csv_inference
@@ -413,3 +417,85 @@ class TestLegacyTestFilesSupersede:
         monkeypatch.setattr(_StubPreprocessor, "process_pending_cadence", lambda self, unit: None)
         with pytest.raises(NonRetryableInferenceError, match="No cadence results"):
             _run_streaming_csv_inference(preprocessor, strategy=None)
+
+
+class TestPostBenchmarkReport:
+    """End-of-run benchmark-report hook: flush -> render PNG -> Slack upload, fully guarded."""
+
+    @pytest.fixture
+    def slack_upload(self, monkeypatch):
+        """Stub main.get_logger with a recording uploader; returns the recorded calls."""
+        calls = []
+
+        def upload(png_path, title=None, message=None, **kwargs):
+            calls.append({"png_path": png_path, "title": title, "message": message})
+            return True
+
+        fake_logger = types.SimpleNamespace(upload_image_to_slack=upload)
+        monkeypatch.setattr(main, "get_logger", lambda: fake_logger)
+        return calls
+
+    def _png_path(self, tag):
+        return os.path.join(get_config().output_path, "plots", f"benchmark_report_{tag}.png")
+
+    def test_renders_png_and_uploads(self, initialized_runtime, slack_upload):
+        # The span is still sitting in the async DB write queue when the hook runs — the
+        # hook's own db.flush() must drain it before the report tool reads the DB
+        with stage_timer("train.load_backgrounds", tag="test_v1"):
+            pass
+
+        main._post_benchmark_report("test_v1")
+
+        png_path = self._png_path("test_v1")
+        assert os.path.exists(png_path)
+        assert len(slack_upload) == 1
+        assert slack_upload[0]["png_path"] == png_path
+        assert "test_v1" in slack_upload[0]["title"]
+
+    def test_disabled_by_config_skips_everything(self, initialized_runtime, slack_upload):
+        get_config().monitor.benchmark_report_enabled = False
+        with stage_timer("train.load_backgrounds", tag="test_v1"):
+            pass
+
+        main._post_benchmark_report("test_v1")
+
+        assert slack_upload == []
+        assert not os.path.exists(self._png_path("test_v1"))
+
+    def test_no_stage_rows_skips_upload(self, initialized_runtime, slack_upload):
+        main._post_benchmark_report("test_v1")
+        assert slack_upload == []
+        assert not os.path.exists(self._png_path("test_v1"))
+
+    def test_exception_inside_hook_is_swallowed(self, initialized_runtime, monkeypatch):
+        # Any blow-up inside the hook (here: resolving the Slack logger) must never
+        # escape and fail an otherwise-finished run
+        def boom():
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(main, "get_logger", boom)
+        with stage_timer("train.load_backgrounds", tag="test_v1"):
+            pass
+        main._post_benchmark_report("test_v1")  # must not raise
+
+    def test_system_exit_from_report_tool_is_swallowed(self, monkeypatch, tmp_path):
+        # A DB file predating the benchmarking schema (no pipeline_stages table) makes the
+        # report tool's load_rows raise SystemExit — which is NOT an Exception subclass,
+        # so the hook must swallow it explicitly rather than kill the run
+        legacy_db = tmp_path / "legacy.db"
+        sqlite3.connect(str(legacy_db)).close()
+        fake_db = types.SimpleNamespace(db_path=str(legacy_db), flush=lambda timeout=None: True)
+        monkeypatch.setattr(main, "get_db", lambda: fake_db)
+        main._post_benchmark_report("test_v1")  # must not raise
+
+    def test_missing_report_script_skips_without_raising(
+        self, initialized_runtime, slack_upload, monkeypatch
+    ):
+        # A pip-installed package without the repo checkout alongside has no utils/
+        # directory next to src/aetherscan — the report_path.exists() guard must skip
+        # gracefully (warn + return) rather than blow up on the missing file.
+        monkeypatch.setattr(main.Path, "exists", lambda self: False)
+        with stage_timer("train.load_backgrounds", tag="test_v1"):
+            pass
+        main._post_benchmark_report("test_v1")  # must not raise
+        assert slack_upload == []

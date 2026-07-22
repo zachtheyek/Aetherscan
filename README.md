@@ -398,6 +398,7 @@ The Aetherscan training pipeline exposes the following CLI flags to the user. Re
 usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
              [--dashboard-port DASHBOARD_PORT]
+             [--benchmark-report | --no-benchmark-report]
              [--vae-latent-dim VAE_LATENT_DIM]
              [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
              [--vae-kernel-size VAE_KERNEL_SIZE VAE_KERNEL_SIZE]
@@ -476,6 +477,10 @@ options:
   --dashboard-port DASHBOARD_PORT
                         Port for the auto-launched live dashboard (default:
                         8501)
+  --benchmark-report, --no-benchmark-report
+                        Render the end-of-run benchmark report (stage timeline
+                        + bottleneck suggestions) and post it to Slack
+                        (default: on). Use --no-benchmark-report to disable
   --vae-latent-dim VAE_LATENT_DIM
                         Dimensionality of the VAE latent space (bottleneck
                         size)
@@ -721,6 +726,7 @@ The Aetherscan inference pipeline exposes the following CLI flags to the user. R
 usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
                  [--dashboard-port DASHBOARD_PORT]
+                 [--benchmark-report | --no-benchmark-report]
                  [--num-replicas NUM_REPLICAS]
                  [--gpu-memory-limit-mb GPU_MEMORY_LIMIT_MB]
                  [--async-allocator | --no-async-allocator]
@@ -771,6 +777,10 @@ options:
   --dashboard-port DASHBOARD_PORT
                         Port for the auto-launched live dashboard (default:
                         8501)
+  --benchmark-report, --no-benchmark-report
+                        Render the end-of-run benchmark report (stage timeline
+                        + bottleneck suggestions) and post it to Slack
+                        (default: on). Use --no-benchmark-report to disable
   --num-replicas NUM_REPLICAS
                         Number of GPUs to use for the distributed strategy. If
                         omitted, the strategy uses every GPU visible to TF;
