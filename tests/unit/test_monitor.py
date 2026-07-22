@@ -14,9 +14,14 @@ from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import psutil
 import pytest
+from matplotlib.lines import Line2D
 
 from aetherscan.monitor import get_process_tree_stats
-from aetherscan.monitor.monitor import _draw_stage_boundaries, _sanitize_gpu_display_name
+from aetherscan.monitor.monitor import (
+    _draw_stage_boundaries,
+    _grouped_legend_entries,
+    _sanitize_gpu_display_name,
+)
 
 
 class FakeProcess:
@@ -270,3 +275,59 @@ class TestDrawStageBoundaries:
             assert axes[0].lines[0].get_xdata()[0] == pytest.approx(30.0)
         finally:
             plt.close(fig)
+
+
+class TestGroupedLegendEntries:
+    """The column-major legend grid helper (issue #217): two GPU-metric groups (usage + memory)
+    each occupy their own column block, padded with invisible handles so the second group always
+    starts a fresh column, and a group grows a second column only once it exceeds `max_rows`.
+    Pure helper — handles pass straight through, so plain sentinels stand in for Line2D artists."""
+
+    @pytest.mark.parametrize(
+        ("n_usage", "n_memory", "max_rows", "expected_ncol", "expected_slots"),
+        [
+            # No wrap (n <= max_rows -> cols_per_group=1, ncol=2): the two groups sit in one
+            # column each, and the memory group starts at the column boundary (slots).
+            pytest.param(3, 3, 5, 2, 3, id="no_wrap_equal"),
+            # No wrap with a shorter memory group: it is padded up to a whole column (slots).
+            pytest.param(3, 2, 5, 2, 3, id="no_wrap_padded"),
+            # The docstring's worked example: 5 GPUs at max_rows>=5 -> columns of 5 | 5.
+            pytest.param(5, 5, 5, 2, 5, id="docstring_5x5"),
+            # Wrap (n > max_rows -> cols_per_group=2, ncol=4): each group spans two columns.
+            pytest.param(6, 6, 5, 4, 6, id="wrap_equal"),
+            # Wrap with a shorter memory group: padded up to two whole columns (slots).
+            pytest.param(6, 4, 5, 4, 6, id="wrap_padded"),
+        ],
+    )
+    def test_grid_shape_and_column_major_padding(
+        self, n_usage, n_memory, max_rows, expected_ncol, expected_slots
+    ):
+        # Unique sentinels so real entries are identifiable by identity and padding entries
+        # (Line2D with alpha=0) are unambiguously distinguishable from them.
+        usage_handles = [object() for _ in range(n_usage)]
+        usage_labels = [f"usage{i}" for i in range(n_usage)]
+        memory_handles = [object() for _ in range(n_memory)]
+        memory_labels = [f"mem{i}" for i in range(n_memory)]
+
+        handles, labels, ncol = _grouped_legend_entries(
+            usage_handles, usage_labels, memory_handles, memory_labels, max_rows=max_rows
+        )
+
+        assert ncol == expected_ncol
+        # Both groups are padded to `slots`, so the output is exactly two column blocks.
+        assert len(handles) == len(labels) == 2 * expected_slots
+
+        def _assert_group(offset, real_handles, real_labels):
+            # Real entries land first, unchanged and in order...
+            assert handles[offset : offset + len(real_handles)] == real_handles
+            assert labels[offset : offset + len(real_labels)] == real_labels
+            # ...then invisible Line2D handles + "" labels pad the block up to `slots`.
+            for i in range(offset + len(real_handles), offset + expected_slots):
+                assert isinstance(handles[i], Line2D)
+                assert handles[i].get_alpha() == 0
+                assert labels[i] == ""
+
+        # Group 1 (usage) fills the first block; group 2 (memory) starts a fresh column block
+        # at index `slots` — the column-major invariant.
+        _assert_group(0, usage_handles, usage_labels)
+        _assert_group(expected_slots, memory_handles, memory_labels)

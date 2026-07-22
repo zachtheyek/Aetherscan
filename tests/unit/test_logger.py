@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -130,3 +132,34 @@ class TestLoggerUsesTaggedPath:
             assert os.path.exists(instance.log_path)
         finally:
             shutdown_logger()
+
+
+class TestLoggerStop:
+    """Regression guard for the #221 interpreter-hang fix in Logger.stop()."""
+
+    def test_stop_disposes_log_queue_feeder_thread(self):
+        # stop() must call BOTH log_queue.close() AND log_queue.cancel_join_thread(): once the
+        # QueueListener (consumer) is stopped, an mp.Queue with a live feeder thread hangs the
+        # interpreter's exit-time join unless both are called (issue #221, logger.py stop()).
+        # Dropping either call currently only surfaces as a >90s suite timeout — this converts
+        # it into a fast, localized failure. Build a real Logger (the conftest-initialized
+        # config singleton scopes output_path to tmp_path) and spy on the queue's disposal calls.
+        instance = Logger(save_tag="test_v31")
+        try:
+            with (
+                patch.object(instance.log_queue, "close") as mock_close,
+                patch.object(instance.log_queue, "cancel_join_thread") as mock_cancel,
+            ):
+                instance.stop()
+            mock_close.assert_called_once()
+            mock_cancel.assert_called_once()
+        finally:
+            # stop() ran with close()/cancel_join_thread() mocked out, so the real queue was
+            # never disposed — do it for real now so its feeder thread can't outlive the test
+            # (the very hang #221 fixed). Then drop the singleton via _reset() rather than
+            # shutdown_logger(): stop() is not idempotent (QueueListener.stop() raises on a
+            # second call), so shutdown_logger()'s stop() would crash after the explicit one above.
+            with contextlib.suppress(Exception):
+                instance.log_queue.close()
+                instance.log_queue.cancel_join_thread()
+            Logger._reset()
