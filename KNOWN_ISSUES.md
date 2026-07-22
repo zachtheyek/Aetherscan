@@ -592,8 +592,8 @@ After an `rf_train` retry that regenerates the RF dataset, stale RF-generation `
 
 ### Status
 
-**Open.** No fix implemented yet. A fix would need either a NULL-aware supersede variant for the RF phase or a sentinel round number on RF-generation rows.
+**Closed.** Fixed in [PR #211](https://github.com/zachtheyek/Aetherscan/pull/211): RF-generation rows now carry a sentinel round number (`num_training_rounds + 1`, one past the last beta-VAE round) instead of `NULL`, making them reachable by the existing `round_ge` supersede call — no NULL-aware special case needed.
 
 ### Related Code
 
-`src/aetherscan/db/db.py` (`mark_superseded`), `src/aetherscan/train.py` (RF dataset generation), `src/aetherscan/data_generation.py` (writes the `round_number=NULL` rows)
+`src/aetherscan/db/db.py` (`mark_superseded`), `src/aetherscan/train.py` (RF dataset generation), `src/aetherscan/data_generation.py` (writes the `round_number` rows)

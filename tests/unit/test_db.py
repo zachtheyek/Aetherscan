@@ -295,6 +295,37 @@ class TestMarkSuperseded:
         assert [r["npy_path"] for r in live] == ["/b.npy"]
         assert len(db.query_inference_result(tag=tag, include_superseded=True)) == 2
 
+    def test_null_round_number_escapes_round_ge(self, db):
+        """Documents the mechanism behind #210 / KNOWN_ISSUES entry 17: SQL comparisons against
+        NULL never match, so a row written without a round_number (the RF-generation call's old
+        default) is invisible to round_ge no matter the threshold — it stays live forever."""
+        tag = "test_v_null_round"
+        db.write_injection_stat("eti_snr", 12.5, round_number=None, tag=tag)
+        assert db.mark_superseded("injection_stats", tag, round_ge=1) is True
+
+        live = db.query_injection_stat(tag=tag)
+        assert len(live) == 1
+        assert live[0]["superseded"] == 0
+
+    def test_sentinel_round_number_is_supersedable(self, db):
+        """The fix for #210: giving RF-generation rows a real round_number (num_training_rounds
+        + 1, instead of the None default) makes them reachable by the exact same round_ge
+        supersede call _init_run_state already issues on every retry -- no NULL-aware special
+        case needed. A stale row from a crashed rf_train attempt (sentinel=21) is marked
+        superseded once the resumed attempt's round_ge reaches that sentinel; a live row from a
+        completed VAE round below it survives."""
+        tag = "test_v_sentinel_round"
+        sentinel = 21  # num_training_rounds=20 + 1, as train_random_forest computes it
+        db.write_injection_stat("eti_snr", 1.0, round_number=20, tag=tag)  # completed VAE round
+        db.write_injection_stat("eti_snr", 2.0, round_number=sentinel, tag=tag)  # stale RF attempt
+        assert db.mark_superseded("injection_stats", tag, round_ge=sentinel) is True
+
+        live = db.query_injection_stat(tag=tag)
+        assert [r["round_number"] for r in live] == [20]
+
+        everything = db.query_injection_stat(tag=tag, include_superseded=True)
+        assert {r["round_number"]: r["superseded"] for r in everything} == {20: 0, sentinel: 1}
+
     def test_stability_aggregation_excludes_superseded(self, db):
         tag = "test_v7"
         db.write_injection_stat("global_skew", 1.0, round_number=1, tag=tag)

@@ -2384,8 +2384,27 @@ class TrainingPipeline:
         else:
             # RF data is always generated in-process (no background producer for the RF phase);
             # tag source to match the per-round data_generation spans (producer / in-process)
+            #
+            # round_num: a sentinel one past the last beta-VAE round, NOT the literal RF phase
+            # (there is no "RF round" numbering). Passing it (instead of the default None) gives
+            # every injection_stats row from this call a real round_number, so a stale row from a
+            # crashed rf_train attempt is reachable by _init_run_state's round_ge supersede on the
+            # next retry. That call marks (tag, round_number >= self._start_round); SQL NULLs never
+            # satisfy ">=", so a NULL round_number (the previous default) permanently escaped it.
+            # resume_round (run_state.py) is max(completed_rounds) + 1, and completed_rounds only
+            # ever holds values <= num_training_rounds, so _start_round <= num_training_rounds + 1
+            # always — and rf_train only (re)starts once vae_rounds is fully done, i.e. exactly
+            # when _start_round == num_training_rounds + 1. round_number has no other consumer
+            # (plot_injection_stats/query_injection_stat don't filter or group by it), so this is
+            # safe to change without touching mark_superseded or the DB schema.
             with stage_timer("data_generation", metadata={"source": "in-process"}):
-                self.data_generator.generate_round(rf_paths, n_samples, snr_base, snr_range)
+                self.data_generator.generate_round(
+                    rf_paths,
+                    n_samples,
+                    snr_base,
+                    snr_range,
+                    round_num=self.config.training.num_training_rounds + 1,
+                )
         rf_data = load_round_arrays(rf_paths)
 
         # Prepare distributed train+val datasets (stratified split). shuffle=False so the
