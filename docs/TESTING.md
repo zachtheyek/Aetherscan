@@ -68,11 +68,13 @@ tests/
 
 A couple of modules are unit-tested lightly or not at all, by design rather than oversight:
 
-- **`monitor`** has no dedicated unit-test module. It's dominated by the 1 Hz background
-  sampling thread (PSS process-tree stats) and the matplotlib rendering of the resource plot,
-  both low-value to unit-test; its behavior is exercised by the integration smokes (real runs)
-  and verified by manual inspection of the resource-utilization plot uploaded to Slack. (Its
-  one pure helper, `select_annotation_spans`, *is* covered — in `test_benchmark.py`.)
+- **`monitor`** now has a dedicated unit-test module (`tests/unit/test_monitor.py`) covering
+  the `get_process_tree_stats()` cache logic — process-object reuse, warm-up, eviction,
+  access-denied retention, PSS aggregation, the no-cache RAM-only path, and the outer guard.
+  The 1 Hz background sampling thread and the matplotlib rendering of the resource plot remain
+  exercised only by the integration smokes (real runs) and verified by manual inspection of
+  the resource-utilization plot uploaded to Slack. (The pure helper `select_annotation_spans`
+  is also covered — in `test_benchmark.py`.)
 - **`logger`** is unit-tested only for the `StreamToLogger` stdout/stderr-redirect probes
   (`isatty`/`writable`/`readable`/`fileno`) in `test_logger.py`; the QueueListener,
   SlackHandler, and stderr-to-logger redirect are exercised by the integration smokes rather

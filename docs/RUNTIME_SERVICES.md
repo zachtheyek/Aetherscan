@@ -157,7 +157,7 @@ and happily report more than the machine has. PSS divides each shared page by th
 processes sharing it, making the per-process values **additive** — the tree sum is the tree's
 actual footprint. (PSS is Linux-specific; the corresponding tests self-skip elsewhere, and
 known accounting quirks are tracked in
-[`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) #6 and #11.) CPU is normalized against the system
+[`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) (#6, now resolved; #11).) CPU is normalized against the system
 core count, so 100 % means "all cores busy".
 
 ### The shutdown plot
