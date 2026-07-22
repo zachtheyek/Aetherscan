@@ -279,7 +279,7 @@ as a real drifting source would.
 | `false_no_signal` | `create_false(inject=False)` | Background, log-normed as-is | Pure noise |
 | `false_with_rfi` | `create_false(inject=True)` | One signal in **all 6** observations | RFI: persists in OFFs |
 | `true_only_eti` | `create_true_single` | One signal; ONs take the injected rows, OFFs keep the original background | Technosignature: ON-only |
-| `true_eti_rfi` | `create_true_double` | RFI signal everywhere + ETI signal in ONs, re-drawn until the two tracks don't intersect inside any ON region (`check_valid_intersection`) | Technosignature under RFI |
+| `true_eti_rfi` | `create_true_double` | RFI signal everywhere + ETI signal in ONs, re-drawn until the two tracks don't intersect inside any ON region (`check_valid_intersection`), up to `MAX_INTERSECTION_RETRIES` (100) attempts; if the cap is exhausted the last drawn pair is kept and the sample is flagged (`intersection_retry_capped`) | Technosignature under RFI |
 
 Each builder picks a random background plate, records **intensity statistics at three
 stages** — **A** (raw background, pre-injection), **B** (post-injection, pre-normalization),
