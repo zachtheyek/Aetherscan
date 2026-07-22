@@ -829,6 +829,14 @@ class TestDecimateForPlot:
         x, out = _decimate_for_plot(y, max_points=1024)
         assert np.all(np.diff(x) >= 0)
         assert x.min() >= 0 and x.max() <= y.shape[0] - 1
+
+    def test_constant_bins_are_deduped(self):
+        # A constant line makes every bin's argmin == argmax; the indices must be deduped to
+        # strictly increasing (one point per bin), not emit each index twice.
+        y = np.full(100_000, 3.14)
+        x, out = _decimate_for_plot(y, max_points=1024)
+        assert np.all(np.diff(x) > 0)  # strictly increasing → no duplicate points
+        assert x.shape[0] <= 1024
         np.testing.assert_array_equal(out, y[x])
 
 

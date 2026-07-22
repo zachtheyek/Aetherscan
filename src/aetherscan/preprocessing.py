@@ -323,7 +323,9 @@ def _decimate_for_plot(
     binned = padded.reshape(max_points, bin_size)
     offsets = np.arange(max_points) * bin_size
     pairs = np.stack([offsets + binned.argmin(axis=1), offsets + binned.argmax(axis=1)], axis=1)
-    idx = np.minimum(np.sort(pairs, axis=1).reshape(-1), n - 1)
+    # np.unique dedupes + keeps ascending order: a constant-valued bin has argmin==argmax, which
+    # would otherwise emit the same (idx, y) point twice; deduping halves those bins for free.
+    idx = np.unique(np.minimum(np.sort(pairs, axis=1).reshape(-1), n - 1))
     return idx, y[idx]
 
 
