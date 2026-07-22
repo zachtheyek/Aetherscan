@@ -28,7 +28,7 @@ CLI flags are identical between the two paths; only the launcher differs. `PYTHO
 - **Conda env:** `conda env create -f environment.yml && conda activate aetherscan`
 - **`utils/fetch_run_outputs.sh`** rsyncs one run's outputs from remote cluster node(s) to the local `outputs/` tree, selecting files by the universal `*_<save_tag>.*` suffix and renaming each to `<machine>_<basename>` (collision-free across nodes). `<train|inference> <save_tag> <machine>...`; `--all` adds train checkpoints/archive, `--db` pulls the SQLite DB into `outputs/data/db/`, `--dry-run`. Assumes tagged log filenames; the inference branch is provisional pending the inference pipeline.
 - **`utils/kill_pipeline.sh`** stops a running pipeline (main process + all worker children) from a separate shell on the same machine — works for both run modes, finds the process tree itself, and tries a graceful SIGTERM (lets `ResourceManager` close pools/SHM) before escalating to SIGKILL. Assumes a single running instance. `--force` / `--dry-run` / `--timeout N`.
-- **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container.
+- **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container. `AETHERSCAN_EXTRA_BINDS` (comma-separated host paths) appends additional 1:1 binds for data outside the standard dirs (e.g. raw `.h5` files under `/datag` for inference); the runtime's native `SINGULARITY_BIND` / `APPTAINER_BIND` still pass through and are additive.
 - **`utils/start_tmux_session.sh`** (optional) spins up a four-window monitoring tmux session (htop/CPU-MEM, `nvidia-smi`, `/dev/shm`, `tree` of models/outputs). Idempotent.
 
 **Common invocations:**
@@ -47,8 +47,9 @@ PYTHONPATH=src python -m aetherscan.main train --save-tag final_v1
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json
 
-# Inference from raw .h5 (triggers energy-detection preprocessing)
-./utils/run_container.sh python -m aetherscan.main inference \
+# Inference from raw .h5 (triggers energy-detection preprocessing) — bind
+# extra host paths if the .h5 files live outside the standard bind mounts
+AETHERSCAN_EXTRA_BINDS=/datag ./utils/run_container.sh python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
@@ -69,16 +70,22 @@ Hierarchical, dataclass-based config with a thread-safe singleton. Resolution or
 
 At runtime, the singleton `Config` is read via `get_config()` and may be modified programmatically. See `docs/CONFIG_AND_CLI.md`.
 
-**Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards only `SLACK_*` and `AETHERSCAN_*` via `--env`; the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
+**Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards `SLACK_*`, `AETHERSCAN_*`, and `HF_TOKEN` via `--env`; the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
 
 ```ini
-# .env example (Slack integration auto-disables if unset)
-SLACK_BOT_TOKEN=your-slack-bot-token
-SLACK_CHANNEL=your-slack-channel
+# .env example
 # Defaults to /datax/scratch/zachy/{data|models|outputs}/aetherscan; CLI flags override
 AETHERSCAN_DATA_PATH=/path/to/data
 AETHERSCAN_MODEL_PATH=/path/to/models
 AETHERSCAN_OUTPUT_PATH=/path/to/outputs
+# Optional: comma-separated extra host paths for run_container.sh to bind 1:1
+AETHERSCAN_EXTRA_BINDS=/extra/host/paths
+# Only needed for uploading model weights to the HuggingFace Hub (train --hf-upload);
+# downloads (the inference default) hit a public repo and need no token
+HF_TOKEN=your-huggingface-write-token
+# Slack integration auto-disables if unset
+SLACK_BOT_TOKEN=your-slack-bot-token
+SLACK_CHANNEL=your-slack-channel
 ```
 
 **The CLI Reference in `README.md` is a tight source↔doc contract.** The three code blocks under `## CLI Reference` (Top-Level / Train / Inference Help) are pasted-verbatim argparse output. If `src/aetherscan/cli.py` changes (flags, help strings, subparsers), regenerate them from the repo root with:
@@ -114,7 +121,7 @@ src/aetherscan/
 ├── hf_hub.py            # HuggingFace Hub artifact upload/download
 ├── tag_guards.py        # Fail-early --save-tag dedup guards
 ├── models/{vae,random_forest}.py
-├── db/db.py             # Thread-safe SQLite, async queue-based writes
+├── db/db.py             # Thread-safe SQLite, async queue-based writes, schema migration, supersede semantics
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
@@ -127,6 +134,8 @@ docs/                    # Full technical doc suite, one doc per pipeline surfac
                          # indexed in docs/README.md; start at docs/ARCHITECTURE.md
 tests/                   # Pytest suite: unit/ (CI surface) + gpu/cluster-marked
                          # integration/ smokes — see the "Testing" section below
+benchmarks/              # Standalone micro-benchmarks (not collected by pytest);
+                         # see benchmarks/README.md + docs/BENCHMARKING.md
 ```
 
 ---
@@ -135,7 +144,7 @@ tests/                   # Pytest suite: unit/ (CI surface) + gpu/cluster-marked
 
 - **Distributed training/inference** — Gradients sync via TF `MirroredStrategy` + NCCL AllReduce, with gradient accumulation for larger effective batches under low VRAM. All TensorFlow model ops **must** occur within `strategy.scope()`.
 - **Cadence-aware composite loss** — beta-VAE reconstruction + β-weighted KL divergence + α-weighted true/false clustering (ON-ON / OFF-OFF proximity, ON-OFF separation for true signals; uniform for false).
-- **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing + automatic retry with backoff.
+- **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing. A persisted run manifest (`run_state_{save_tag}.json`) drives fault-tolerant resume: an explicit stage machine (vae_rounds → vae_plots → rf_train → rf_plots → final_save) skips completed stages, and stale DB rows from failed attempts are marked superseded (never deleted).
 - **Thread-safe singletons** — `Config`, `Database`, `ResourceManager`. Always use the accessors `get_config()`, `get_db()`, `get_manager()`; never instantiate directly.
 - **Shared-memory zero-copy parallelism** — worker pools communicate via shared memory (no serialization). Allocate via `manager.create_shared_memory()`; ResourceManager owns cleanup. Only the **creator** may call `shm.unlink()`, never workers.
 - **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) and `InfDataHolder` (`inference.py`) wrap batches with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes.
@@ -153,7 +162,7 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 - **Logging** — `logger = logging.getLogger(__name__)`, f-strings for messages. `T20` rejects bare `print()` outside one-off `utils/` scripts (and the self-logging `slack_handler.py`); `G001`–`G003` reject `%`/`str.format()`/`+` pre-formatted log messages. The Slack handler attaches automatically when `SLACK_BOT_TOKEN` is set, so anything at `INFO+` may surface in Slack — keep messages information-dense and **free of secrets**.
 - **Config access** — `get_config()` returns `Config | None`; the canonical idiom guards `if config is None: raise ValueError(...)` (None only happens if `init_config()` hasn't run — a programming error).
 - **Dataclass mutable defaults** — always `field(default_factory=...)`, never a bare `[...]` (shared mutable state; `B`/bugbear flags it).
-- **Retry/error-handling** — pipeline retry loops catch `KeyboardInterrupt` separately and re-raise, log with `logger.error`, then either retry after `time.sleep(retry_delay)` or `sys.exit(1)`. Reference: `train_command` / `inference_command`.
+- **Retry/error-handling** — pipeline retry loops catch `KeyboardInterrupt` separately and re-raise, log with `logger.error`, then either retry after `time.sleep(retry_delay)` or `sys.exit(1)`. Resume is manifest-driven (no checkpoint hunting): the `TrainingRunState` manifest tells the new pipeline which rounds/stages already completed. Non-critical stages (plots) record failures without forcing a retry; `main.py` exits nonzero if they never recover. Reference: `train_command` / `inference_command`, `run_state.py`.
 - **Naming** — descriptive full words (`num_training_rounds`, not `n`/`bs`). Single letters only in tight loops / math / indexing.
 
 | Element       | Convention  | Example                  |
@@ -230,12 +239,12 @@ pre-commit run ruff --all-files
 ## Security
 
 - **Never commit secrets** (tokens, credentials, private data, internal URLs/IPs). Use `.env` (gitignored). `gitleaks` pre-commit hook + GitHub Dependabot back this up but aren't foolproof.
-- **Secrets in use**: `SLACK_BOT_TOKEN` (Slack alerts/notifications). Use separate dev/prod tokens; store via a secrets manager or restricted-permission encrypted env files.
-- **If a token leaks** — rotate immediately. Slack: revoke in [Slack API](https://api.slack.com/apps) → OAuth & Permissions, reinstall with scopes `channels:read, chat:write, files:write, groups:read, incoming-webhook`, update `SLACK_BOT_TOKEN` everywhere, verify with `PYTHONPATH=src python utils/print_cli_help.py train` (no Slack errors).
+- **Secrets in use**: `SLACK_BOT_TOKEN` (Slack alerts/notifications); `HF_TOKEN` (HuggingFace Hub upload via `train --hf-upload` — inference downloads hit a public repo and need no token). Use separate dev/prod tokens; store via a secrets manager or restricted-permission encrypted env files.
+- **If a token leaks** — rotate immediately. Slack: revoke in [Slack API](https://api.slack.com/apps) → OAuth & Permissions, reinstall with scopes `channels:read, chat:write, files:write, groups:read, incoming-webhook`, update `SLACK_BOT_TOKEN` everywhere, verify with `PYTHONPATH=src python utils/print_cli_help.py train` (no Slack errors). HuggingFace: invalidate/delete the token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), create a replacement (**write** scope only if you upload), update `HF_TOKEN` everywhere — full steps in `SECURITY.md`.
 - **Incident response**: Contain (revoke creds) → Assess → Notify → Remediate (rotate secrets) → Document → Improve.
 - **Reporting**: non-critical → [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label; critical → contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack directly (do **not** open a public issue), expect a response in 48–72h.
 - **Data security**: major outputs (weights, code, search results, training/inference data) are publicly disclosed via HuggingFace / GitHub / publications / [BL Open Data Archive](https://breakthroughinitiatives.org/opendatasearch); intermediate products (DB records, plots) stay on access-controlled HPC servers.
-- **Dependency versions**: when bumping a dep, don't chase the latest — target the **newer** of {two minors below the latest stable, the latest stable ≥6 months old}, stable releases only (no alpha/beta/rc/nightly). A known advisory on that target overrides the lag → jump to the minimum patched version. Never cross a documented ceiling (`numpy<2.0`, `setuptools<81`) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` in lockstep for shared deps. Full policy in `SECURITY.md` → Security Scanning → Version Selection Policy.
+- **Dependency versions**: when bumping a dep, don't chase the latest — target the **newer** of {two minors below the latest stable, the latest stable ≥6 months old}, stable releases only (no alpha/beta/rc/nightly). A known advisory on that target overrides the lag → jump to the minimum patched version. Never cross a documented ceiling (`numpy<2.0`, `setuptools<81`) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `pyproject.toml` in lockstep for shared deps. Full policy in `SECURITY.md` → Security Scanning → Version Selection Policy.
 - False positives: add `file:line` to `.gitleaksignore` or inline `# gitleaks:allow` (less preferred).
 
 ---
