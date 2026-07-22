@@ -16,8 +16,6 @@ import threading
 from logging.handlers import QueueHandler, QueueListener
 from multiprocessing import Queue
 
-import tensorflow as tf
-
 from aetherscan.config import get_config
 
 # NOTE: can this just be from aetherscan.logger import SlackHandler?
@@ -244,7 +242,11 @@ class Logger:
         if slack_init_message:
             logger.log(slack_init_level, slack_init_message)
 
-        # Redirect TensorFlow logs to Python logging
+        # Redirect TensorFlow logs to Python logging. Lazy import: TF is only needed for this
+        # one call, and log_path_for_tag (and this class's non-TF behavior) stay importable
+        # without pulling in the full TF stack — e.g. from a fast, TF-free test/tooling context.
+        import tensorflow as tf  # noqa: PLC0415
+
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"  # Show all TF logs
         tf.get_logger().setLevel(logging.INFO)
         tf_logger = tf.get_logger()
