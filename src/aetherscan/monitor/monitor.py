@@ -99,9 +99,11 @@ def _sanitize_gpu_display_name(name: str) -> str:
         if needle in name_part:
             return f"{alias}:{idx_part}" if sep else alias
 
-    # Fallback: hard cutoff, truncating to _GPU_NAME_MAX_LEN-1 chars + "..." keeping the suffix
-    if sep and len(name_part) > _GPU_NAME_MAX_LEN:
-        return f"{name_part[: _GPU_NAME_MAX_LEN - 1]}...:{idx_part}"
+    # Fallback: hard cutoff, truncating to _GPU_NAME_MAX_LEN-1 chars + "..." keeping the
+    # ":<idx>" suffix when present (fires with or without a colon).
+    if len(name_part) > _GPU_NAME_MAX_LEN:
+        truncated = f"{name_part[: _GPU_NAME_MAX_LEN - 1]}..."
+        return f"{truncated}:{idx_part}" if sep else truncated
     return name
 
 
@@ -180,7 +182,10 @@ def _draw_stage_boundaries(
         label = str(span["stage"]).split(".")[-1]
         label_ax.annotate(
             label,
-            xy=(end_min, 96),
+            # x in data coords (the line), y in axes fraction (0.96 = near top) so the label
+            # position survives any change to the panel's y-limits.
+            xy=(end_min, 0.96),
+            xycoords=label_ax.get_xaxis_transform(),
             xytext=(-3, 0),
             textcoords="offset points",
             rotation=30,

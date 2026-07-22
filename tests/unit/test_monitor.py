@@ -217,6 +217,11 @@ class TestSanitizeGpuDisplayName:
     def test_short_non_whitelisted_name_unchanged(self):
         assert _sanitize_gpu_display_name("GPU:1") == "GPU:1"
 
+    def test_long_non_whitelisted_name_without_colon_still_truncates(self):
+        # No ":<idx>" suffix — the truncation fallback must still fire (the suffixless case).
+        raw = "NVIDIA GeForce RTX 3090 Ti Founders"
+        assert _sanitize_gpu_display_name(raw) == f"{raw[:19]}..."
+
 
 class TestDrawStageBoundaries:
     """The boundary-line/label overlay (issue #214): a divider line on every panel at each
