@@ -574,9 +574,14 @@ def create_true_double(
 
         if intersection_retries >= MAX_INTERSECTION_RETRIES:
             intersection_retry_capped = True
+            # "Last drawn pair" is the pair the acceptance check just rejected above (the cap
+            # is only reached after check_valid_intersection fails) — NOT an unconditionally
+            # accepted 100th draw. At this probability (~1e-24) the sample is already a
+            # statistical non-event; keeping a known-intersecting pair rather than drawing
+            # (and not testing) a 101st is the simpler contract to reason about.
             logger.warning(
                 f"create_true_double: intersection retry cap ({MAX_INTERSECTION_RETRIES}) "
-                f"exhausted; keeping last drawn signal pair and flagging the sample"
+                f"exhausted; keeping last drawn (rejected) signal pair and flagging the sample"
             )
             break
 
