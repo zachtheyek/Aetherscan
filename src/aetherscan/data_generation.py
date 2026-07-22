@@ -256,9 +256,25 @@ def new_cadence(
     return modified_data, signal_info, slope_was_clamped
 
 
+# Float-rounding pad for the ON-band boundary comparison in check_valid_intersection (#118).
+# Same-sign trajectory pairs intersect exactly ON a band edge (y* = 0 in exact arithmetic:
+# positive-drift lines all pass through (0, 0) and negative-drift lines through (width_bin, 0),
+# see new_cadence's y_intercept construction), but the float intersection lands at y* ~ -1e-14,
+# so a bare inclusive comparison used to accept ~4.8% of them by rounding luck. 1e-9 is several
+# orders of magnitude above the observed rounding noise yet negligible against the pixel-scale
+# band geometry (an extra ~2e-9-wide rejection sliver per boundary).
+_ON_BAND_BOUNDARY_EPS = 1e-9
+
+
 def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
     """
-    Check if 2 drifting signals intersect in the ON regions
+    Check if 2 drifting signals intersect in the ON regions.
+
+    ON-band boundaries are deliberately INCLUSIVE: an intersection lying exactly on a band edge
+    counts as inside the ON region and invalidates the pair (returns False) — a boundary
+    crossing still overlaps ON-region pixels once the signals' finite width is considered. The
+    comparison is padded by _ON_BAND_BOUNDARY_EPS so float rounding cannot flip an
+    exact-boundary case to "valid".
     """
     if slope_1 == slope_2:
         return True  # Parallel lines never intersect. Avoids division by 0
@@ -267,7 +283,10 @@ def check_valid_intersection(slope_1, slope_2, intercept_1, intercept_2):
     y_intersect = slope_1 * x_intersect + intercept_1
 
     on_y_coords = [(0, 16), (32, 48), (64, 80)]
-    return all(not y_lower <= y_intersect <= y_upper for y_lower, y_upper in on_y_coords)
+    return all(
+        not (y_lower - _ON_BAND_BOUNDARY_EPS <= y_intersect <= y_upper + _ON_BAND_BOUNDARY_EPS)
+        for y_lower, y_upper in on_y_coords
+    )
 
 
 # TODO: add more sophisticated statistics for data leakage analysis
@@ -476,6 +495,12 @@ def create_true_single(
     return final, sample_info
 
 
+# Defensive cap on create_true_double's intersection-retry loop (#118). Acceptance is i.i.d.
+# geometric with p~=0.42, so P(a single sample needs >100 attempts) ~ 1e-24 — the cap exists so
+# one pathological draw can never stall a batched task, not because it is expected to fire.
+MAX_INTERSECTION_RETRIES = 100
+
+
 def create_true_double(
     plate: np.ndarray,
     snr_base: float,
@@ -490,8 +515,9 @@ def create_true_double(
     Create a true-double-class cadence (non-intersecting ETI and RFI signals injected into
     ON-only and ON-OFF respectively) and return (final, sample_info). final has shape
     (6, 16, width_bin); sample_info carries background_index, per-stage intensity_stats (A/B/C),
-    signal_info with both eti_* and rfi_* keys, slope_was_clamped, and per-observation
-    lognorm_params (shape (6, 2)).
+    signal_info with both eti_* and rfi_* keys, slope_was_clamped, intersection_retries /
+    intersection_retry_capped (retry-cap telemetry, #118), and per-observation lognorm_params
+    (shape (6, 2)).
     """
     # Select random background from plate
     background_index = int(plate.shape[0] * random.random())
@@ -515,13 +541,17 @@ def create_true_double(
     # Select a random SNR from the given range
     snr = random.random() * snr_range + snr_base
 
-    # Note, small but nonzero probability for "infinite" (long-running) loops
     # NOTE: quantified in #118 — acceptance is i.i.d. geometric with p~=0.42, so the worst
     # sample over a full 499200-round is ~25 retries (~3s); a >100-retry sample is effectively
     # impossible (P~1e-24). This loop is therefore NOT the ~10-min single-worker stall seen in
-    # the #117 smoke (that is gc/IO/scheduling, see #118). #118 tracks a defensive retry cap.
-    # Retry signal injection until we get valid non-intersecting signals
+    # the #117 smoke (that is gc/IO/scheduling, see #118). MAX_INTERSECTION_RETRIES is the
+    # defensive cap #118 called for: on exhaustion keep the last drawn pair and flag the sample
+    # (clamp-and-flag, mirroring slope_was_clamped) rather than raise and kill a whole round.
+    # Retry signal injection until we get valid non-intersecting signals (or the cap is hit)
+    intersection_retries = 0
+    intersection_retry_capped = False
     while True:
+        intersection_retries += 1
         # Inject RFI
         cadence_1, rfi_signal_info, rfi_slope_clamped = new_cadence(
             data, snr, width_bin, freq_resolution, time_resolution
@@ -540,6 +570,19 @@ def create_true_double(
         if slope_1 != slope_2 and check_valid_intersection(
             slope_1, slope_2, intercept_1, intercept_2
         ):
+            break
+
+        if intersection_retries >= MAX_INTERSECTION_RETRIES:
+            intersection_retry_capped = True
+            # "Last drawn pair" is the pair the acceptance check just rejected above (the cap
+            # is only reached after check_valid_intersection fails) — NOT an unconditionally
+            # accepted 100th draw. At this probability (~1e-24) the sample is already a
+            # statistical non-event; keeping a known-intersecting pair rather than drawing
+            # (and not testing) a 101st is the simpler contract to reason about.
+            logger.warning(
+                f"create_true_double: intersection retry cap ({MAX_INTERSECTION_RETRIES}) "
+                f"exhausted; keeping last drawn (rejected) signal pair and flagging the sample"
+            )
             break
 
     # Track if any slope was clamped (either RFI or ETI)
@@ -576,6 +619,8 @@ def create_true_double(
         "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
         "signal_info": signal_info,  # Both eti_* and rfi_* signal characteristics
         "slope_was_clamped": slope_was_clamped,
+        "intersection_retries": intersection_retries,
+        "intersection_retry_capped": intersection_retry_capped,
         "lognorm_params": lognorm_params,
     }
 
@@ -799,7 +844,8 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
     generate_round_to_memmap's stats_cb.
 
     Per-sample writes: 6 intensity stats x 3 stages = 18 rows, plus 0-12 signal-characteristic
-    rows depending on signal_type. Segment-level writes: 4 metadata rows.
+    rows depending on signal_type, plus 2 intersection-retry rows for true-double samples
+    (#118). Segment-level writes: 4 metadata rows.
     """
     if db is None:
         raise RuntimeError("No database instance detected - cannot write injection stats")
@@ -861,6 +907,30 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
                 tag=tag,
                 timestamp=timestamp,
             )
+
+        # Straggler observability (#118): true-double samples record how many injection
+        # attempts the intersection-retry loop took and whether it exhausted the cap.
+        # injection_stage=None since these describe the injection itself
+        if "intersection_retries" in sample_info:
+            retry_stats = [
+                ("intersection_retries", float(sample_info["intersection_retries"])),
+                ("intersection_retry_capped", float(sample_info["intersection_retry_capped"])),
+            ]
+            for stat_name, value in retry_stats:
+                db.write_injection_stat(
+                    stat_name=stat_name,
+                    value=value,
+                    round_number=round_number,
+                    chunk_number=chunk_number,
+                    sample_index=sample_idx,
+                    background_index=background_index,
+                    signal_class=signal_class,
+                    signal_type=signal_type,
+                    injection_stage=None,
+                    slope_clamped=slope_was_clamped,
+                    tag=tag,
+                    timestamp=timestamp,
+                )
 
     # Segment-level metadata stats (once per segment, not per sample)
     metadata_stats = [
