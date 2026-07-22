@@ -69,6 +69,25 @@ def test_all_values_are_floats_and_key_count():
     assert len(metrics) == 25
 
 
+def test_single_class_split_omits_ranking_metrics():
+    """A degenerate all-one-class val split must still yield the non-ranking metrics
+    (ranking metrics are undefined there: roc_auc_score raises, AP degenerates)."""
+    val_binary = np.array([0, 0, 0], dtype=np.int64)
+    val_subtype = np.array(["false_no_signal", "false_with_rfi", "false_no_signal"], dtype="U20")
+    val_probas = np.array([0.1, 0.8, 0.3], dtype=np.float32)
+    val_preds = (val_probas >= 0.7).astype(np.int64)  # -> [0, 1, 0]
+    metrics = compute_rf_eval_metrics(val_binary, val_subtype, val_probas, val_preds)
+    assert "val_roc_auc" not in metrics
+    assert "val_average_precision" not in metrics
+    assert metrics["val_accuracy"] == pytest.approx(2 / 3)
+    # mean((p - y)^2) = (0.01 + 0.64 + 0.09) / 3
+    assert metrics["val_brier_score"] == pytest.approx(0.74 / 3, abs=1e-6)
+    assert (metrics["confusion_tn"], metrics["confusion_fp"]) == (2.0, 1.0)
+    assert metrics["confusion_fn"] == 0.0 and metrics["confusion_tp"] == 0.0
+    assert metrics["val_proba_q50"] == pytest.approx(0.3, abs=1e-6)
+    assert all(isinstance(v, float) for v in metrics.values())
+
+
 def test_perfect_predictions():
     val_binary = np.array([0, 0, 1, 1], dtype=np.int64)
     val_subtype = np.array(

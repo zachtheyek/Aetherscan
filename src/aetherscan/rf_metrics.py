@@ -47,7 +47,10 @@ def compute_rf_eval_metrics(
       val_proba_q{05,...,95}                  confidence-distribution quantiles
 
     The ranking metrics (ROC-AUC / average precision) are threshold-free; accuracy and the
-    confusion cells reflect val_preds' operating point (the deployment threshold).
+    confusion cells reflect val_preds' operating point (the deployment threshold). On a
+    degenerate single-class val split the ranking metrics are undefined, so their two keys
+    are omitted (the dashboard renders absent tiles as an em dash) and everything else
+    still lands.
     """
     val_binary_labels = np.asarray(val_binary_labels)
     val_subtype_labels = np.asarray(val_subtype_labels)
@@ -56,10 +59,22 @@ def compute_rf_eval_metrics(
 
     metrics: dict[str, float] = {
         "val_accuracy": float(np.mean(val_preds == val_binary_labels)),
-        "val_roc_auc": float(roc_auc_score(val_binary_labels, val_probas)),
-        "val_average_precision": float(average_precision_score(val_binary_labels, val_probas)),
         "val_brier_score": float(brier_score_loss(val_binary_labels, val_probas)),
     }
+
+    # Ranking metrics are undefined when only one class is present: roc_auc_score raises
+    # ValueError and average_precision_score silently degenerates (all-negative labels
+    # -> -0.0 with a warning). Omit both keys in that case rather than letting the raise
+    # reach the caller's blanket best-effort guard and lose the whole dict.
+    if np.unique(val_binary_labels).size > 1:
+        metrics["val_roc_auc"] = float(roc_auc_score(val_binary_labels, val_probas))
+        metrics["val_average_precision"] = float(
+            average_precision_score(val_binary_labels, val_probas)
+        )
+    else:
+        logger.warning(
+            "Single-class val split: omitting undefined val_roc_auc / val_average_precision"
+        )
 
     # Binary 2x2 cells (explicit label order keeps the cell layout stable regardless of
     # which classes appear in the val split)
