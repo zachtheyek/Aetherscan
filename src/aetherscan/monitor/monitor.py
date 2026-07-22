@@ -34,12 +34,37 @@ logger = logging.getLogger(__name__)
 
 # Only pipeline_stages spans this shallow (dot-separated components) are overlaid on the
 # resource plot — deep spans (per-ON-file energy detection, encode/rf sub-stages, ...) stay
-# report-tool-only so the CPU panel doesn't drown in bands
+# report-tool-only so the panels don't drown in divider lines
 _ANNOTATION_MAX_DEPTH = 2
 
-# Alternating band face colors (matplotlib named colors), cycled across adjacent spans so
-# consecutive stages stay visually separable at low alpha
-_ANNOTATION_COLORS = ("tab:purple", "tab:olive", "tab:cyan")
+# Color shared by the stage boundary lines and their text labels (matplotlib named color)
+_ANNOTATION_COLOR = "dimgray"
+
+# GPU display names shown in the resource-plot legend ONLY (never the DB resource_name or
+# self.gpu_names): a raw name containing one of these substrings collapses to the short alias,
+# preserving the ":<idx>" suffix. Longer/more specific product strings are listed first so they
+# win. Anything outside the whitelist falls back to length-based truncation.
+_GPU_DISPLAY_NAME_WHITELIST = {
+    "NVIDIA RTX PRO 6000 Blackwell": "PRO 6000",
+    "NVIDIA RTX A4000": "A4000",
+}
+
+# GPU display names past this length fall back to <cutoff-1> chars + "..." (whitelist misses)
+_GPU_NAME_MAX_LEN = 20
+
+# Cap the GPU legend at this many rows per metric group before spilling into another column,
+# biasing the busy GPU legend toward fewer columns / more rows so it clears the centered title
+_GPU_LEGEND_MAX_ROWS = 6
+
+# Headroom-band layout for the per-panel legends moved outside/above each panel (issue #214):
+# each legend's lower edge is pinned at _LEGEND_Y (axes fraction, just above the top spine) so
+# it grows upward into the band, and the subplot title is lifted enough to sit above it. The
+# title pad must exceed its panel's legend height so the legend's upper edge stays no higher
+# than the title: a small pad clears the single-row CPU/RAM legends, a taller one clears the
+# multi-row GPU legend (up to _GPU_LEGEND_MAX_ROWS rows).
+_TITLE_PAD = 26
+_GPU_TITLE_PAD = 80
+_LEGEND_Y = 1.005
 
 
 def select_annotation_spans(rows: list[dict], max_depth: int = _ANNOTATION_MAX_DEPTH) -> list[dict]:
@@ -52,6 +77,121 @@ def select_annotation_spans(rows: list[dict], max_depth: int = _ANNOTATION_MAX_D
     spans = [row for row in rows if len(str(row["stage"]).split(".")) <= max_depth]
     spans.sort(key=lambda row: row["start_time"])
     return spans
+
+
+def _sanitize_gpu_display_name(name: str) -> str:
+    """
+    Map a raw GPU name to the short label shown in the resource-plot legend ONLY (never the DB
+    resource_name or self.gpu_names). Whitelisted product strings (_GPU_DISPLAY_NAME_WHITELIST)
+    collapse to a short alias; anything else falls back to the previous length-based truncation
+    (name parts longer than _GPU_NAME_MAX_LEN chars become _GPU_NAME_MAX_LEN-1 chars + "...").
+    The ":<idx>" suffix appended by _detect_gpus() is preserved in both cases. Pure helper,
+    unit-testable.
+
+    e.g. "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition:2" -> "PRO 6000:2",
+    "NVIDIA RTX A4000:0" -> "A4000:0", "GPU:1" -> "GPU:1" (short, unchanged).
+    """
+    name_part, sep, idx_part = name.rpartition(":")
+    if not sep:
+        name_part = name
+
+    for needle, alias in _GPU_DISPLAY_NAME_WHITELIST.items():
+        if needle in name_part:
+            return f"{alias}:{idx_part}" if sep else alias
+
+    # Fallback: hard cutoff, truncating to _GPU_NAME_MAX_LEN-1 chars + "..." keeping the suffix
+    if sep and len(name_part) > _GPU_NAME_MAX_LEN:
+        return f"{name_part[: _GPU_NAME_MAX_LEN - 1]}...:{idx_part}"
+    return name
+
+
+def _grouped_legend_entries(
+    handles1: list,
+    labels1: list,
+    handles2: list,
+    labels2: list,
+    *,
+    max_rows: int,
+) -> tuple[list, list, int]:
+    """
+    Arrange two metric groups (GPU usage + GPU memory) into a column-major legend grid that
+    keeps each group in its own column block and caps the row count at `max_rows`, adding a
+    column block to a group only once it exceeds `max_rows` entries. Matplotlib fills legends
+    column-major, so each group is padded with invisible handles up to a whole number of
+    columns — usage entries then occupy their own column(s) and memory entries always start a
+    fresh column (e.g. 5 GPUs at max_rows>=5 -> columns of 5 | 5). Returns (handles, labels,
+    ncol). Pure helper.
+    """
+    n = max(len(handles1), len(handles2))
+    cols_per_group = math.ceil(n / max_rows) if n else 1
+    nrows = math.ceil(n / cols_per_group) if n else 0
+    slots = nrows * cols_per_group
+
+    handles = list(handles1) + [Line2D([], [], alpha=0)] * (slots - len(handles1))
+    labels = list(labels1) + [""] * (slots - len(labels1))
+    handles += list(handles2) + [Line2D([], [], alpha=0)] * (slots - len(handles2))
+    labels += list(labels2) + [""] * (slots - len(labels2))
+
+    return handles, labels, 2 * cols_per_group
+
+
+def _legend_above_panel(
+    ax, handles: list, labels: list, *, ncol: int, fontsize: int, y_anchor: float = _LEGEND_Y
+) -> None:
+    """
+    Place `ax`'s legend outside the panel, in the headroom band above it: the legend's
+    lower-right corner is pinned to (right spine, `y_anchor` in axes fraction) so it is
+    right-aligned to the y2 spine and grows upward into the reserved band beneath the title.
+    Keep `ncol` small for busy panels so the right-aligned legend clears the centered title.
+    No-op when there are no labelled artists.
+    """
+    if not handles:
+        return
+    ax.legend(
+        handles,
+        labels,
+        loc="lower right",
+        bbox_to_anchor=(1.0, y_anchor),
+        ncol=ncol,
+        fontsize=fontsize,
+        frameon=True,
+        borderaxespad=0.0,
+    )
+
+
+def _draw_stage_boundaries(
+    axes: list, spans: list[dict], start_time: float, current_time: float
+) -> None:
+    """
+    Draw the pipeline-stage overlay: one solid `dimgray` vertical line at each span's right
+    edge (its end time, in minutes since `start_time`) on EVERY axis in `axes` (the panels
+    share an x-axis), and label each stage once on `axes[0]` — anchored just left of its line,
+    rotated 30 deg from horizontal near the top. Pure drawing helper (no DB or instance state)
+    so it's exercisable with synthetic spans in tests and the render harness. `axes` must be
+    non-empty; `axes[0]` is the labelled (CPU) panel.
+    """
+    label_ax = axes[0]
+    for span in spans:
+        end_min = (min(span["end_time"], current_time) - start_time) / 60
+        for ax in axes:
+            ax.axvline(end_min, color=_ANNOTATION_COLOR, linewidth=1.0, alpha=0.7, zorder=2)
+        # Leaf name only ("round_03", not "train.round_03"), anchored just left of the line and
+        # angled so long names stay legible without overrunning into the neighbouring stage
+        label = str(span["stage"]).split(".")[-1]
+        label_ax.annotate(
+            label,
+            xy=(end_min, 96),
+            xytext=(-3, 0),
+            textcoords="offset points",
+            rotation=30,
+            rotation_mode="anchor",
+            ha="right",
+            va="top",
+            fontsize=7,
+            color=_ANNOTATION_COLOR,
+            clip_on=True,
+            zorder=3,
+        )
 
 
 def get_process_tree_stats(
@@ -432,12 +572,14 @@ class ResourceMonitor:
         # Save plot on shutdown
         self._save_plot()
 
-    def _annotate_stage_spans(self, ax, current_time: float) -> None:
+    def _annotate_stage_spans(self, axes: list, current_time: float) -> None:
         """
-        Overlay this run's top-level pipeline_stages spans (depth <= 2 dot-names) as
-        labeled translucent vertical bands on `ax` (the CPU panel). X units match the
-        panel: minutes since monitor start. Flushes the DB first so spans recorded moments
-        before shutdown (final_save, viz) make it onto the plot.
+        Overlay this run's top-level pipeline_stages spans (depth <= 2 dot-names) as `dimgray`
+        vertical boundary lines at each span's right edge on every panel in `axes`, labelled
+        once (left of the line, angled 30 deg) on `axes[0]` (the CPU panel). X units match the
+        panels: minutes since monitor start. Flushes and queries the DB exactly once even
+        though the lines span all three panels, so spans recorded moments before shutdown
+        (final_save, viz) make it onto the plot.
         """
         # The writer thread outlives the monitor (manager cleanup order: monitor before
         # db), so a flush here is safe; a timeout just means the newest spans are missing
@@ -453,28 +595,10 @@ class ResourceMonitor:
             logger.info("No top-level pipeline stage spans to annotate")
             return
 
-        for idx, span in enumerate(spans):
-            start_min = (span["start_time"] - self.start_time) / 60
-            end_min = (min(span["end_time"], current_time) - self.start_time) / 60
-            color = _ANNOTATION_COLORS[idx % len(_ANNOTATION_COLORS)]
-            ax.axvspan(start_min, end_min, alpha=0.12, color=color, zorder=0)
-            # Label with the leaf name component ("round_03", not "train.round_03"),
-            # anchored near the top of the band, clipped to the axes
-            label = str(span["stage"]).split(".")[-1]
-            ax.text(
-                (start_min + end_min) / 2,
-                97,
-                label,
-                rotation=90,
-                ha="center",
-                va="top",
-                fontsize=7,
-                color="dimgray",
-                clip_on=True,
-                zorder=1,
-            )
-
-        logger.info(f"Annotated {len(spans)} pipeline stage span(s) on the CPU panel")
+        _draw_stage_boundaries(axes, spans, self.start_time, current_time)
+        logger.info(
+            f"Annotated {len(spans)} pipeline stage boundary line(s) across {len(axes)} panel(s)"
+        )
 
     def _save_plot(self):
         """Generate and save resource utilization plot from database"""
@@ -544,8 +668,9 @@ class ResourceMonitor:
         del timestamps_dict, values_dict
         gc.collect()
 
-        # Create figure with 3 subplots
-        fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+        # Create figure with 3 subplots. Extra height over the classic 3-panel figure buys the
+        # headroom band above each panel that now holds the external legend (issue #214).
+        fig, axes = plt.subplots(3, 1, figsize=(14, 15), sharex=True)
 
         # Late import to avoid circular dependency (db imports from manager)
         from aetherscan.db import get_system_metadata  # noqa: PLC0415
@@ -587,18 +712,10 @@ class ResourceMonitor:
         ax_cpu.set_ylabel("CPU Usage (%)", fontsize=12, fontweight="bold")
         ax_cpu.set_ylim(0, 100)
         ax_cpu.grid(True, alpha=0.3)
-        # TODO: place legend outside of plot (see plot_beta_vae_training_progress()) (only for gpu plot?)
-        ax_cpu.legend(loc="upper right", fontsize=10)
-        ax_cpu.set_title(f"CPU Pressure (n={psutil.cpu_count()} cores)", fontsize=12)
-
-        # Overlay top-level pipeline stage spans as labeled translucent bands so CPU
-        # plateaus are attributable at a glance ("this plateau = round 3 data gen").
-        # Fully exception-guarded: a broken overlay must never cost the resource plot
-        if self.config.monitor.annotate_stages:
-            try:
-                self._annotate_stage_spans(ax_cpu, current_time)
-            except Exception as e:
-                logger.error(f"Failed to annotate pipeline stages on resource plot: {e}")
+        ax_cpu.set_title(
+            f"CPU Pressure (n={psutil.cpu_count()} cores)", fontsize=12, pad=_TITLE_PAD
+        )
+        _legend_above_panel(ax_cpu, *ax_cpu.get_legend_handles_labels(), ncol=2, fontsize=10)
 
         # RAM plot
         ax_ram = axes[1]
@@ -628,11 +745,12 @@ class ResourceMonitor:
         ax_ram.set_ylabel("RAM Usage (%)", fontsize=12, fontweight="bold")
         ax_ram.set_ylim(0, 100)
         ax_ram.grid(True, alpha=0.3)
-        ax_ram.legend(loc="upper right", fontsize=10)
         ax_ram.set_title(
             f"Memory Pressure (total={psutil.virtual_memory().total / (1024**3):.2f} GB)",
             fontsize=12,
+            pad=_TITLE_PAD,
         )
+        _legend_above_panel(ax_ram, *ax_ram.get_legend_handles_labels(), ncol=2, fontsize=10)
 
         # GPU plot
         ax_gpu = axes[2]
@@ -645,17 +763,10 @@ class ResourceMonitor:
             for gpu_idx, (gpu_name, metrics) in enumerate(gpu_data.items()):
                 color = colors[gpu_idx]
 
-                # Truncate overly long GPU names (e.g., "NVIDIA RTX PRO 6000
-                # Blackwell Max-Q Workstation Edition") while preserving the
-                # ":<idx>" suffix appended by _collect_gpu_info().
-                # NOTE: cutoff is hard-coded to 20 chars — GPU name parts
-                # longer than this get truncated to 19 chars + "...".
-                # Revisit if this threshold becomes an issue.
-                name_part, sep, idx_part = gpu_name.rpartition(":")
-                if sep and len(name_part) > 20:
-                    display_name = f"{name_part[:19]}...:{idx_part}"
-                else:
-                    display_name = gpu_name
+                # Shorten the GPU name for the legend only (whitelist -> short alias, else the
+                # length-based truncation), preserving the ":<idx>" suffix. The DB
+                # resource_name and self.gpu_names are untouched.
+                display_name = _sanitize_gpu_display_name(gpu_name)
 
                 # Usage (solid line, y1)
                 if "utilization" in metrics:
@@ -687,27 +798,15 @@ class ResourceMonitor:
             ax_gpu.set_ylim(0, 100)
             ax_gpu_mem.set_ylim(0, 100)
 
-            # Combine legends, grouped by metric. Matplotlib fills legends
-            # column-major, so pad each metric's entries with invisible
-            # handles up to a whole number of columns — usage entries then
-            # occupy their own column(s) and memory entries always start a
-            # fresh column (e.g. 5 GPUs -> columns of 3,2 | 3,2).
+            # Combine both y-axes' legends, grouping usage and memory into their own column
+            # blocks and biasing toward more rows / fewer columns so the busy legend stays
+            # narrow enough to clear the centered title once moved above the panel.
             lines1, labels1 = ax_gpu.get_legend_handles_labels()
             lines2, labels2 = ax_gpu_mem.get_legend_handles_labels()
-            cols_per_metric = math.ceil(len(gpu_data) / 3)  # cap the legend at 3 rows
-            nrows = math.ceil(len(gpu_data) / cols_per_metric)
-            slots = nrows * cols_per_metric
-            lines1 += [Line2D([], [], alpha=0)] * (slots - len(lines1))
-            labels1 += [""] * (slots - len(labels1))
-            lines2 += [Line2D([], [], alpha=0)] * (slots - len(lines2))
-            labels2 += [""] * (slots - len(labels2))
-            ax_gpu.legend(
-                lines1 + lines2,
-                labels1 + labels2,
-                ncol=2 * cols_per_metric,
-                fontsize=8,
-                loc="upper right",
+            handles, labels, ncol = _grouped_legend_entries(
+                lines1, labels1, lines2, labels2, max_rows=_GPU_LEGEND_MAX_ROWS
             )
+            _legend_above_panel(ax_gpu, handles, labels, ncol=ncol, fontsize=8)
         else:
             ax_gpu.text(
                 0.5,
@@ -721,11 +820,29 @@ class ResourceMonitor:
             ax_gpu.set_ylabel("GPU Usage (%)", fontsize=12, fontweight="bold")
 
         ax_gpu.grid(True, alpha=0.3)
-        ax_gpu.set_title(f"GPU Pressure (n={self.num_gpus} devices)", fontsize=12)
+        ax_gpu.set_title(
+            f"GPU Pressure (n={self.num_gpus} devices)", fontsize=12, pad=_GPU_TITLE_PAD
+        )
         ax_gpu.set_xlabel("Time (minutes)", fontsize=12, fontweight="bold")
 
-        # Adjust layout and save
-        plt.tight_layout()
+        # Overlay top-level pipeline stage boundaries as dimgray divider lines on all three
+        # panels (labelled once on the CPU panel) so resource plateaus are attributable at a
+        # glance ("this plateau = round 3 data gen"). Done after all panels exist so the lines
+        # land on every shared-x axis. Fully exception-guarded: a broken overlay must never
+        # cost the resource plot.
+        if self.config.monitor.annotate_stages:
+            try:
+                self._annotate_stage_spans([ax_cpu, ax_ram, ax_gpu], current_time)
+            except Exception as e:
+                logger.error(f"Failed to annotate pipeline stages on resource plot: {e}")
+
+        # Reserve the headroom band above each panel for the external legends and lifted titles
+        # (per-axes bbox_to_anchor handles the right-alignment). `top` leaves room above the CPU
+        # panel for its lifted title to clear the suptitle; `hspace` sizes the inter-panel band
+        # that holds the (tallest) GPU legend. tight_layout is intentionally not used: it doesn't
+        # account for the out-of-axes legends and warns on the twinx GPU panel;
+        # savefig(bbox_inches="tight") still trims the final canvas.
+        fig.subplots_adjust(left=0.07, right=0.91, top=0.91, bottom=0.05, hspace=0.5)
 
         # Save plot
         output_path = os.path.join(
