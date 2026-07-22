@@ -487,3 +487,15 @@ class TestPostBenchmarkReport:
         fake_db = types.SimpleNamespace(db_path=str(legacy_db), flush=lambda timeout=None: True)
         monkeypatch.setattr(main, "get_db", lambda: fake_db)
         main._post_benchmark_report("test_v1")  # must not raise
+
+    def test_missing_report_script_skips_without_raising(
+        self, initialized_runtime, slack_upload, monkeypatch
+    ):
+        # A pip-installed package without the repo checkout alongside has no utils/
+        # directory next to src/aetherscan — the report_path.exists() guard must skip
+        # gracefully (warn + return) rather than blow up on the missing file.
+        monkeypatch.setattr(main.Path, "exists", lambda self: False)
+        with stage_timer("train.load_backgrounds", tag="test_v1"):
+            pass
+        main._post_benchmark_report("test_v1")  # must not raise
+        assert slack_upload == []

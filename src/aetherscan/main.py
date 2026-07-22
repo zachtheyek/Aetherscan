@@ -289,7 +289,12 @@ def _post_benchmark_report(tag: str) -> None:
 
     except (Exception, SystemExit) as e:
         # SystemExit included: load_rows raises it on a pre-benchmarking-schema DB.
-        # Observability must never fail an otherwise-finished run.
+        # Observability must never fail an otherwise-finished run. Runs at the very tail
+        # of the command (after all real work is done), so this also swallowing a
+        # KeyboardInterrupt-adjacent exit here has minimal blast radius — a Ctrl-C during
+        # report generation still leaves the run's actual results intact.
+        # TODO: if utils/benchmark_report.py's load_rows ever stops raising SystemExit for
+        # a pre-benchmarking-schema DB, narrow this back to `except Exception`.
         logger.error(f"Benchmark report generation failed: {e}")
 
 
