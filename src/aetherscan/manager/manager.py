@@ -44,6 +44,20 @@ class ResourceStats:
     cleanup_time_seconds: float = 0.0
 
 
+def _reap_process_subtree(pid: int | None) -> None:
+    """Best-effort kill of every live descendant of `pid`. A process that is SIGKILLed (or
+    crashed before its own SIGTERM handler ran) gets no chance to reap its children (e.g. the
+    producer's pool workers), which would otherwise survive as orphans. Descendants of a
+    process that already died have reparented to init and can no longer be found through its
+    PID — the producer's own parent-death watch (round_data._producer_main) covers those."""
+    if pid is None:
+        return
+    with contextlib.suppress(Exception):
+        for child in psutil.Process(pid).children(recursive=True):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.kill()
+
+
 @dataclass
 class ManagedProcess:
     """Wrapper for a tracked multiprocessing.Process (e.g. the RoundDataProducer)"""
@@ -72,10 +86,7 @@ class ManagedProcess:
                     # SIGKILL gives the process no chance to reap its own children (e.g. the
                     # producer's pool workers), so kill any survivors in its subtree first —
                     # otherwise they'd be orphaned and keep running
-                    with contextlib.suppress(Exception):
-                        for child in psutil.Process(self.process.pid).children(recursive=True):
-                            with contextlib.suppress(psutil.NoSuchProcess):
-                                child.kill()
+                    _reap_process_subtree(self.process.pid)
                     self.process.kill()
                     self.process.join(timeout)
 
@@ -85,13 +96,22 @@ class ManagedProcess:
                         logger.error(
                             f"Process '{self.name}' survived SIGKILL (uninterruptible state?)"
                         )
+            else:
+                # Already dead on entry (e.g. it crashed before its own SIGTERM handler could
+                # terminate its pool) — the cleanup-ordering rationale ("processes before
+                # SHM") assumes the subtree is gone, so reap any children still findable
+                # rather than silently marking closed
+                _reap_process_subtree(self.process.pid)
 
             self.closed = True
             logger.info(f"Process '{self.name}' closed")
 
         except Exception as e:
             logger.warning(f"Error terminating process '{self.name}': {e}")
+            # Same subtree sweep as the normal escalation path: a bare kill() here would
+            # orphan the process's children
             with contextlib.suppress(Exception):
+                _reap_process_subtree(self.process.pid)
                 self.process.kill()
             self.closed = True
 
