@@ -22,7 +22,7 @@ record through one consumer instead:
 main process:  logging.* → QueueHandler ─┐
 pool workers:  logging.* → QueueHandler ─┼→ multiprocessing.Queue → QueueListener thread
 producer tree: QueueHandler (own queue,  ─┘        │
-               relayed by RoundDataProducer)       ├→ FileHandler   logs/aetherscan.log (mode="w")
+               relayed by RoundDataProducer)       ├→ FileHandler   logs/aetherscan_{tag}.log (mode="w")
                                                    ├→ StreamHandler stdout
                                                    └→ SlackHandler  (optional)
 ```
@@ -32,8 +32,9 @@ producer tree: QueueHandler (own queue,  ─┘        │
 thread that drains it into the real handlers, each with its own configured level
 (`logger.{console,file,slack}_level`, all INFO by default). Consequences:
 
-- The log file is **the current run only** (`mode="w"` truncates at startup); pull it off the
-  cluster before relaunching if you need history.
+- Each run's log file is **tag-scoped** (`logs/aetherscan_{tag}.log`, named from the effective
+  `--save-tag`); `mode="w"` truncates at startup, so a same-tag rerun overwrites that tag's own
+  log while differently-tagged runs no longer clobber each other.
 - **Fork-started workers** inherit the queue: `init_worker_logging()` (called from every pool
   initializer) resets the worker's root logger to a single `QueueHandler` — and resets
   `sys.stdout`/`sys.stderr` to the real streams, because the inherited `StreamToLogger`

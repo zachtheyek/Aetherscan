@@ -63,11 +63,9 @@
 #   * Machine name is used both as the ssh host and the filename prefix, so it must
 #     resolve (a Host alias in ~/.ssh/config or DNS). User/port go in ssh config.
 #   * Re-running is cheap: rsync -t skips files already present and unchanged.
-### TODO:
+# Note:
 #   * Log filenames are tagged like every other output, i.e. aetherscan_<tag>.log
-#     in logs/. (The logger writes a single untagged aetherscan.log TODAY; per-tag
-#     log names are a planned change. This script is written for that future state,
-#     so it will report "no match" against today's untagged log until that lands.)
+#     in logs/, so this script pulls each run's log by its tag.
 
 set -euo pipefail
 

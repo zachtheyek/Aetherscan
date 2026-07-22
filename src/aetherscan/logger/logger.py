@@ -1,4 +1,4 @@
-# TODO: add tag to file log & archive old logs
+# TODO: archive old logs
 """
 Logger for Aetherscan Pipeline
 Runs as background thread & uses thread-safe queue-based logging to avoid deadlocks and corrupted
@@ -37,6 +37,17 @@ def _parse_level(level_str: str) -> int:
         "CRITICAL": logging.CRITICAL,
     }
     return level_map.get(level_str.upper(), logging.INFO)
+
+
+def log_path_for_tag(output_path: str, tag: str) -> str:
+    """Return this run's log-file path: ``{output_path}/logs/aetherscan_{tag}.log``.
+
+    Pure and dependency-free so the tag->path derivation is unit-testable on its own. Naming the
+    log file with the run's save_tag mirrors how every other artifact is already tag-scoped
+    (config_{tag}.json, model files, plots, DB rows), so each run gets its own log instead of
+    overwriting a single shared aetherscan.log.
+    """
+    return os.path.join(output_path, "logs", f"aetherscan_{tag}.log")
 
 
 class StreamToLogger:
@@ -102,7 +113,9 @@ class Logger:
     # since __new__ is called before __init__ every time we instantiate a class,
     # by overriding __new__, we can short-circuit object creation entirely, and control whether a
     # new instance is created, or just return the existing instance
-    def __new__(cls):
+    def __new__(cls, *args, **kwargs):
+        # *args/**kwargs are accepted (and ignored here) so the constructor can forward
+        # __init__ arguments like save_tag; object.__new__ takes no extra args itself.
         # Double-checked locking pattern:
         # First check if _instance is None, without lock (for performance)
         if cls._instance is None:
@@ -118,8 +131,13 @@ class Logger:
         # Return the same instance for all subsequent constructor calls
         return cls._instance
 
-    def __init__(self):
-        """Initialize logger"""
+    def __init__(self, save_tag: str | None = None):
+        """Initialize logger.
+
+        `save_tag` names this run's log file (aetherscan_{save_tag}.log). Callers pass the run's
+        effective tag (the CLI --save-tag if given, else the config default timestamp tag); when
+        omitted, it falls back to config.checkpoint.save_tag directly.
+        """
         # Note, __init__ is triggered every time the class's constructor is called,
         # even if __new__ returned the existing singleton instance
         # Hence, we use the _initialized flag to make sure __init__ only runs once
@@ -132,7 +150,12 @@ class Logger:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
-        self.log_path = os.path.join(self.config.output_path, "logs", "aetherscan.log")
+        # Per-run, tag-scoped log file: each run writes aetherscan_{tag}.log, so a new run no
+        # longer overwrites the previous run's log. init_logger() runs before the CLI --save-tag
+        # is applied to the config, so main.py resolves the effective tag from args and passes it
+        # in here; the config default is the fallback for any other caller.
+        tag = save_tag if save_tag is not None else self.config.checkpoint.save_tag
+        self.log_path = log_path_for_tag(self.config.output_path, tag)
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)  # Create dir if it doesn't exist
 
         # Create queue for worker processes (no size limit)
@@ -304,11 +327,15 @@ class Logger:
         )
 
 
-def init_logger() -> Logger:
+def init_logger(save_tag: str | None = None) -> Logger:
     """
-    Initialize global logger instance (call once at startup)
+    Initialize global logger instance (call once at startup).
+
+    `save_tag` names this run's log file (aetherscan_{save_tag}.log). Pass the run's effective tag
+    (the CLI --save-tag if given, else the config default timestamp tag); when omitted, the Logger
+    falls back to config.checkpoint.save_tag.
     """
-    logger_instance = Logger()
+    logger_instance = Logger(save_tag=save_tag)
 
     # Note, unlike other modules, due to dependency chains,
     # we wait to call register_logger() inside main.py:main()

@@ -223,7 +223,7 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 ├── config_{tag}.json                  # resolved config snapshot (written by final_save / inference)
 ├── run_state_{tag}.json               # training run manifest (stage machine + completed rounds)
 ├── db/aetherscan.db                   # SQLite (WAL) — all stats/results tables
-├── logs/aetherscan.log                # current run's log (mode="w": overwritten each run)
+├── logs/aetherscan_{tag}.log          # this run's log (mode="w": overwrites the same tag's log on rerun)
 ├── pfb_cache/pfb_response_*.npy       # content-addressed PFB passband responses
 ├── round_data/{tag}/round_XX/         # per-round training memmaps (deleted after the round trains)
 │   └── rf/                            #   plus the RF training dataset
