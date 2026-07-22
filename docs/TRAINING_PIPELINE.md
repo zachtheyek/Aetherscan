@@ -346,7 +346,7 @@ share `rf_shap_values_{tag}.joblib` (computed once, cached).
 | `rf_shap_loss_monitoring_{tag}.png` | Per-sample log-loss histogram by class + per-feature loss-increasing/decreasing decomposition. | The high-loss tail is your inspection queue; any feature whose net contribution *increases* loss is actively harmful. |
 | `rf_shap_explanation_clustering_{tag}.png` | UMAP of SHAP explanation vectors, colored by subtype, markers for correct/incorrect. | Errors concentrated in one explanation cluster = a single confusable mode (fixable with targeted data); errors scattered everywhere = noise-floor performance. |
 | `rf_calibration_curve_{tag}.png` | Reliability diagram (quantile-binned) + Brier/ECE + probability histogram. | With a 0.99 threshold, calibration in the top bins is what matters: if the top-bin empirical frequency is well below its predicted probability, the threshold is less conservative than it looks. |
-| `rf_oob_accuracy_curve_{tag}.png` (from `plot_rf_ensemble_accuracy_curve`) | Cumulative accuracy vs number of trees (val + train-subsample baseline), elbow annotated. | Should saturate well before 1000 trees; if it's still climbing at the end, raise `rf.n_estimators`. |
+| `rf_oob_accuracy_curve_{tag}.png` (from `plot_rf_ensemble_accuracy_curve`) | Cumulative accuracy vs number of trees (val + train-subsample baseline), elbow annotated. Also persists the per-tree `ensemble_val_accuracy` series to `training_stats` (`model_name='rf'`, `epoch_number` = tree count) for the dashboard RF tab — so the DB series only lands when `rf_plots` succeeds. | Should saturate well before 1000 trees; if it's still climbing at the end, raise `rf.n_estimators`. |
 | `rf_latent_decision_boundary_nn{n}_md{m}_{tag}.png` | RF P(true) contour over each persisted cadence-level UMAP plane, val points + 0.5 contour. | A coherent boundary separating the true classes; ragged islands = the forest partitioning noise. Depends on the UMAPs from `plot_latent_space_gif`, so `vae_plots` must have succeeded. |
 
 ### `resource_utilization_{tag}.png`
@@ -368,6 +368,20 @@ val cadences through the (frozen) encoder with `_distributed_encode` — note th
 artifacts immediately so a retry can skip straight to plots. A `check_encoder_trained()`
 heuristic (weight-std deviation from initializer expectations) guards against accidentally
 encoding with untrained weights and falls back to loading the newest checkpoint.
+
+At the tail of the stage, `train_random_forest()` also persists scalar RF eval metrics
+(accuracy, ROC-AUC, average precision, Brier score, per-sub-type accuracies, binary +
+sub-type × prediction confusion cell counts, val P(true) quantiles) to `training_stats`
+under `model_name='rf'` via the pure (TF-free) helper
+[`compute_rf_eval_metrics()`](../src/aetherscan/rf_metrics.py); the deployment
+`inference.classification_threshold` used to derive `val_accuracy` is written alongside as
+its own `classification_threshold` row. `plot_rf_ensemble_accuracy_curve()` (in the
+downstream `rf_plots` stage) then writes the per-tree `ensemble_val_accuracy` series
+(`epoch_number` = tree count) so the dashboard's RF tab is live end-to-end. The ensemble
+curve keeps its pre-existing hard-coded 0.5 threshold (the dashboard shows a caption to
+disambiguate it from the deployment-threshold scalar). Metric persistence is best-effort:
+an sklearn edge case (e.g. a single-class val split) logs a warning and never fails the
+training run.
 
 ## Configuration quick reference
 

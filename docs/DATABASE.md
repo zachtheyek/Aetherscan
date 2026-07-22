@@ -137,14 +137,21 @@ Index: `(tag, timestamp, stat_name, signal_type, injection_stage)`.
 
 ### `training_stats`
 
-Per-epoch training telemetry (~21 rows per epoch): losses (`total_loss`,
+Per-epoch beta-VAE training telemetry (~21 rows per epoch): losses (`total_loss`,
 `reconstruction_loss`, `kl_loss`, `true_loss`, `false_loss` + `val_` variants), gradient
 statistics (`gradient_norm_{mean,max,std}`, `clipping_rate`), `learning_rate`, durations,
-step counts, and the round's SNR floor/ceiling.
+step counts, and the round's SNR floor/ceiling. The RF stage also writes here: at the tail
+of `rf_train`, `train_random_forest()` persists ~25 scalar eval metrics (accuracy, ROC-AUC,
+average precision, Brier score, per-sub-type accuracies, binary + sub-type × prediction
+confusion cell counts, val P(true) quantiles) plus a `classification_threshold` row; the
+`rf_plots` stage additionally writes the per-tree `ensemble_val_accuracy` series
+(`epoch_number` = tree count) from inside `plot_rf_ensemble_accuracy_curve()`. All RF rows
+use `model_name='rf'`; the dashboard reads them last-write-wins so `rf_plots` retries and
+reused-tag stale scalars are absorbed.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| `model_name` | TEXT | Currently always `beta_vae` |
+| `model_name` | TEXT | `beta_vae` for per-epoch training telemetry; `rf` for the RF stage's eval metrics (scalars + the `ensemble_val_accuracy` per-tree series) |
 | `stat_name`, `value` | TEXT, REAL | |
 | `round_number`, `epoch_number` | INTEGER | 1-based |
 | `superseded` | INTEGER | Default 0 |
@@ -292,7 +299,9 @@ Rules of thumb at full-scale defaults (dominant terms only):
   path, and why the injection plots subsample (`plot_injection_subsampling_count`). If the
   database size becomes a problem, this table is where the budget goes — smoke-scale runs
   (`--num-samples-beta-vae 3072`) keep it trivial.
-- **`training_stats`**: ~21 rows/epoch → ~42 k rows for 20 × 100 epochs. Negligible.
+- **`training_stats`**: ~21 rows/epoch → ~42 k rows for 20 × 100 epochs; the RF stage adds
+  a negligible tail (~25 scalars + `classification_threshold` + the per-tree
+  `ensemble_val_accuracy` series ≈ `rf.n_estimators` rows). Still negligible.
 - **`latent_snapshots`**: one row per viz cadence per capture — 960 cadences × one capture
   every `latent_viz_step_interval` steps (plus the final step) × epochs. At full scale
   (130 steps/epoch → 13 captures/epoch): ~25 M rows over 20 × 100 epochs, each carrying a

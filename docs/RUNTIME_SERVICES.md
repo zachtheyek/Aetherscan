@@ -208,6 +208,14 @@ from `main.py` at run start, gated on `config.monitor.dashboard_enabled` (defaul
 served on `config.monitor.dashboard_port` (default `8501`). It reads every plot the DB can
 reconstruct plus a PNG gallery.
 
+- **First-class RF tab.** Alongside the beta-VAE views, the dashboard surfaces the RF stage's
+  eval metrics as a dedicated **RF** tab: metric tiles (accuracy, ROC-AUC, average precision,
+  Brier score), binary + sub-type confusion heatmaps, per-sub-type accuracy bars, the
+  ensemble-accuracy-vs-tree-count curve, and val P(true) confidence quantiles. These are
+  driven by the scalars and `ensemble_val_accuracy` series that `train.py` writes to
+  `training_stats` under `model_name='rf'` (see [`DATABASE.md`](DATABASE.md) and
+  [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)); the SHAP, decision-boundary, and
+  calibration figures stay available under the PNG gallery.
 - **Served headless.** The subprocess runs `--server.headless`, so on a cluster you
   SSH-forward the port to view it locally (`ssh -L 8501:localhost:8501 ...`); the launcher logs
   the exact forward instructions.
