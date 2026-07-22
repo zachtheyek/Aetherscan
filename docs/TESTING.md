@@ -158,7 +158,7 @@ Two further gaps are accepted as-is (neither affects pipeline correctness):
 | `slow` | Slower CPU tests (e.g. builds real TF graphs) | **Yes** — CI runs them |
 | `gpu` | Needs one or more physical GPUs | No |
 | `cluster` | Needs cluster-resident data/models (blpc3/bla0 paths) | No |
-| `integration` | End-to-end subprocess runs; **skips the isolation fixture** | No (they're also gpu+cluster) — CI also excludes them by marker as a defense-in-depth guard |
+| `integration` | End-to-end subprocess runs; **skips the isolation fixture** | No — also `gpu`+`cluster`; CI excludes by marker too as a leak-guard |
 
 `--strict-markers` rejects anything not declared in `pyproject.toml` — add new markers there
 first.
