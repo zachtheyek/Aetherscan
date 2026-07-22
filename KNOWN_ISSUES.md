@@ -206,7 +206,7 @@ With 96+ child processes being recreated every interval, the majority reported `
 
 ### Status
 
-**Resolved.** `get_process_tree_stats()` now maintains a PID -> `psutil.Process` cache across monitoring intervals, so `cpu_percent(interval=0)` measures against the previous sample's baseline. Each newly spawned process contributes one `0.0` reading the first interval it is seen (accurate thereafter); PIDs that leave the tree are evicted from the cache. See [GitHub Issue #12](https://github.com/zachtheyek/Aetherscan/issues/12).
+**Closed.** `get_process_tree_stats()` now maintains a PID -> `psutil.Process` cache across monitoring intervals, so `cpu_percent(interval=0)` measures against the previous sample's baseline. Each newly spawned process contributes one `0.0` reading the first interval it is seen (accurate thereafter); PIDs that leave the tree are evicted from the cache. See [GitHub Issue #12](https://github.com/zachtheyek/Aetherscan/issues/12).
 
 ### Related Code
 
