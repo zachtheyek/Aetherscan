@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from aetherscan.pfb import (
+    edge_mid_band_slices,
     edge_mid_power_ratio,
     equalize_passband,
     firdes,
@@ -222,15 +223,24 @@ class TestEdgeMidPowerRatio:
         # Edge bands sit on the rolloff, mid band on the passband peak
         assert 0.3 < ratio < 0.8
 
-    def test_flat_vs_response_disagree_beyond_tolerance(self):
-        # The pair the mismatch warning distinguishes: a recording without the PFB shape
-        # (ratio ~1) vs the theoretical response — far more than 5% apart.
+    def test_flat_recording_divided_by_response_deviates_from_one(self):
+        # The pair the residual-flatness warning distinguishes: a correctly flattened channel
+        # (ratio ~1) vs an unshaped recording divided by H — far more than 10% from 1.0.
         response = gen_coarse_channel_response(_FINE, _NUM_COARSE, _TAPS)
-        expected = edge_mid_power_ratio(response)
-        measured = edge_mid_power_ratio(np.ones(_FINE))
-        assert abs(measured - expected) / expected > 0.05
+        residual_ratio = edge_mid_power_ratio(np.ones(_FINE) / response)
+        assert abs(residual_ratio - 1.0) > 0.10
 
     def test_all_zero_spectrum_does_not_raise(self):
         # A fully masked channel: the defensive mid floor turns 0/0 into 0.0, not
         # ZeroDivisionError.
         assert edge_mid_power_ratio(np.zeros(_FINE)) == 0.0
+
+    def test_band_slices_agree_with_ratio(self):
+        # The banded reader relies on edge_mid_band_slices covering exactly the bins
+        # edge_mid_power_ratio evaluates
+        spectrum = np.linspace(1.0, 3.0, _FINE) ** 2
+        left, mid, right = edge_mid_band_slices(_FINE)
+        edge = 0.5 * (spectrum[left].mean() + spectrum[right].mean())
+        assert edge / spectrum[mid].mean() == pytest.approx(
+            edge_mid_power_ratio(spectrum), rel=1e-12
+        )
