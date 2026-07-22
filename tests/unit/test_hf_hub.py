@@ -437,7 +437,6 @@ class TestGenerateModelCard:
     def _card(self, metrics=None):
         return generate_model_card(
             tag="test_v17",
-            repo_id="zachtheyek/aetherscan",
             config_dict=get_config().to_dict(),
             metrics=metrics,
             versions={"python": "3.10.0", "tensorflow": "2.17.1"},

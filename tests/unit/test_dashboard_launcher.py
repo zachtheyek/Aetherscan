@@ -5,11 +5,13 @@ mocked here."""
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 from unittest import mock
 
 from aetherscan.dashboard_launcher import (
+    _install_signal_teardown,
     _terminate,
     build_dashboard_command,
     launch_dashboard,
@@ -76,6 +78,9 @@ def test_launch_returns_none_when_script_missing():
     with (
         mock.patch(f"{_MOD}.get_config", return_value=_fake_config()),
         mock.patch(f"{_MOD}._DASHBOARD_SCRIPT") as script,
+        # Truthy spec: in a streamlit-absent env the later find_spec guard also returns None,
+        # which would mask a deleted is_file guard — pin the None to the guard under test.
+        mock.patch(f"{_MOD}.importlib.util.find_spec", return_value=object()),
     ):
         script.is_file.return_value = False
         assert launch_dashboard() is None
@@ -143,6 +148,27 @@ def test_launch_spawns_and_registers_teardown():
         assert kwargs["start_new_session"] is True
         atexit_reg.assert_called_once_with(_terminate, proc)
         sig_teardown.assert_called_once_with(proc)
+
+
+def test_signal_teardown_restores_sig_ign_disposition():
+    # A prior SIG_IGN disposition must be restored as SIG_IGN, not collapsed to SIG_DFL —
+    # the handler's re-delivery would otherwise terminate a process that was ignoring the
+    # signal (latent: the real pipeline always installs a callable handler first).
+    proc = mock.MagicMock()
+    proc.poll.return_value = 0  # already exited -> _terminate is a no-op
+    originals = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        _install_signal_teardown(proc)
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler)
+        with mock.patch(f"{_MOD}.os.kill") as kill:
+            handler(signal.SIGTERM, None)
+            kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    finally:
+        for sig, prev in originals.items():
+            signal.signal(sig, prev)
 
 
 def test_terminate_noop_when_already_dead():
