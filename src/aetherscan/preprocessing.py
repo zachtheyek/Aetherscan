@@ -1536,9 +1536,14 @@ class DataPreprocessor:
         # representation for a 5-observation cadence.
         rank_problems: list[str] = []
         short_problems: list[str] = []
-        for obs_h5 in group.h5_paths:
-            with h5py.File(obs_h5, "r") as hf:
-                obs_shape = hf["data"].shape
+        for idx, obs_h5 in enumerate(group.h5_paths):
+            if idx == 0:
+                # group.h5_paths[0] == primary_h5, already opened above for header/data_shape —
+                # reuse it instead of a redundant second h5py.File open.
+                obs_shape = data_shape
+            else:
+                with h5py.File(obs_h5, "r") as hf:
+                    obs_shape = hf["data"].shape
             if len(obs_shape) != 3:
                 rank_problems.append(
                     f"{obs_h5} has 'data' of rank {len(obs_shape)} (shape {obs_shape})"
