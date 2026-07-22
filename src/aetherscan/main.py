@@ -754,7 +754,11 @@ def _run_legacy_test_files_inference(
     would leave duplicate live candidate rows for the same npy_path.
     """
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     db = get_db()
+    if db is None:
+        raise ValueError("get_db() returned None")
     npy_path = config.data.test_files[0]  # TODO: handle multiple test_files properly
 
     with stage_timer("inference.load_lognorm"):

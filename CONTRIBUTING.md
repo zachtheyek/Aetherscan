@@ -176,11 +176,14 @@ Aetherscan/
 │   ├── preprocessing.py        # Data preprocessing + energy detection
 │   ├── pfb.py                  # PFB static passband equalization
 │   ├── data_generation.py      # Synthetic signal injection
+│   ├── seeding.py              # Root-seed stream derivation (reproducible training runs)
 │   ├── benchmark.py            # Always-on stage timing → pipeline_stages table
 │   ├── dashboard.py            # Streamlit live-monitoring dashboard (DB-driven)
 │   ├── dashboard_launcher.py   # Spawns the headless dashboard subprocess (guarded)
+│   ├── dashboard_cli.py        # Console entry point for manual dashboard runs (aetherscan-dashboard)
 │   ├── hf_hub.py               # HuggingFace Hub artifact upload/download
 │   ├── tag_guards.py           # Fail-early --save-tag dedup guards
+│   ├── rf_metrics.py           # Pure RF eval-metric helper (persisted to training_stats via train.py)
 │   ├── models/
 │   │   ├── __init__.py         # Model exports
 │   │   ├── vae.py              # Beta-VAE architecture
@@ -253,11 +256,14 @@ Aetherscan/
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `pfb.py`                  | Polyphase-filterbank static passband response (bandpass flattening)    |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
+| `seeding.py`              | Root-seed stream derivation (reproducible training runs)               |
 | `benchmark.py`            | Always-on stage timing (`stage_timer`/`record_stage`) to `pipeline_stages` |
 | `dashboard.py`            | Streamlit live-monitoring dashboard read from the run SQLite DB        |
 | `dashboard_launcher.py`   | `launch_dashboard()` spawns/reaps the headless dashboard subprocess    |
+| `dashboard_cli.py`        | `aetherscan-dashboard` console script; re-execs Streamlit for manual DB inspection |
 | `hf_hub.py`               | HuggingFace Hub artifact upload/download, version-coupled revisions    |
 | `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
+| `rf_metrics.py`           | Pure RF eval-metric helper written to `training_stats` (`model_name='rf'`) |
 | `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
 | `models/random_forest.py` | Scikit-learn RF wrapper                                                |
 | `db/db.py`                | Thread-safe SQLite with async queue-based writes                       |

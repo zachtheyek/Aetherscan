@@ -262,7 +262,15 @@ pools / shared memory) before escalating to SIGKILL:
 
 # Preview the process tree without sending any signals
 ./utils/kill_pipeline.sh --dry-run
+
+# Override the round-data root used for orphan-producer pidfile discovery
+./utils/kill_pipeline.sh --round-data-root /path/to/round_data
 ```
+
+When no main process is found, `kill_pipeline.sh` sweeps
+`{round_data_root}/*/producer.pid` for orphaned `RoundDataProducer` process
+trees left behind by an ungraceful main-process death, and reaps any that are
+still alive.
 
 A forced kill skips `ResourceManager` cleanup, so clean up any orphaned shared
 memory afterwards (the script prints a reminder):
@@ -597,3 +605,31 @@ After an `rf_train` retry that regenerates the RF dataset, stale RF-generation `
 ### Related Code
 
 `src/aetherscan/db/db.py` (`mark_superseded`), `src/aetherscan/train.py` (RF dataset generation), `src/aetherscan/data_generation.py` (writes the `round_number` rows)
+
+---
+
+## 18. setuptools sdist MANIFEST.in Bypass (Dependabot Alert)
+
+### Symptom
+
+Dependabot flags [alert #1](https://github.com/zachtheyek/Aetherscan/security/dependabot/1): setuptools `< 83.0.0` is affected by [CVE-2026-59890](https://github.com/advisories/GHSA-h35f-9h28-mq5c) (GHSA-h35f-9h28-mq5c, **medium**) — a `MANIFEST.in` exclusion bypass when building an sdist, via a Unicode normalization (NFC/NFD) filename collision on macOS APFS/HFS+ filesystems. Our pin is `setuptools>=78.1.1,<81`, which is inside the vulnerable range.
+
+### Cause
+
+`setuptools` is a transitive dependency only: it is installed so that `pkg_resources` is importable (`blimpy`, pulled in via `setigen`, imports it at module load — see issue #4). Nothing in Aetherscan imports `setuptools` or `pkg_resources` directly.
+
+### Impact
+
+**None.** The vulnerable code path is sdist construction (`setuptools` reading `MANIFEST.in` while packaging a source distribution). Aetherscan's build backend is **hatchling**, not setuptools (`pyproject.toml` `[build-system]`), so setuptools never builds a distribution here — the affected path is never exercised. The bypass additionally requires a macOS APFS/HFS+ filesystem's Unicode normalization; production runs are on Linux clusters.
+
+### Workaround
+
+No action required. The alert is not exploitable in this project's usage.
+
+### Status
+
+**Won't fix.** Not reachable (setuptools is present only for `pkg_resources`, never used to build), and the fix is unreachable under our constraints anyway: the patched release is `83.0.0`, which crosses the documented `setuptools<81` ceiling. That ceiling exists because setuptools 81 removed the vendored `pkg_resources` submodule that `blimpy` still imports (issue #4); raising the ceiling to reach 83.0.0 would break `blimpy`. Revisit if `blimpy` migrates off `pkg_resources` (letting the `setuptools` dependency be dropped entirely) or if setuptools becomes a direct build-time dependency.
+
+### Related Code
+
+`pyproject.toml` / `requirements-container.txt` / `environment.yml` (the `setuptools>=78.1.1,<81` pin and its rationale comment), issue #4 (the `pkg_resources`/`blimpy` coupling that fixes the `<81` ceiling).

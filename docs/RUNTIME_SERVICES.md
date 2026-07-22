@@ -97,7 +97,7 @@ resources — they go through the manager so cleanup is centralized and ordered.
 | Wrapper | Created via | Cleanup behavior |
 | --- | --- | --- |
 | `ManagedPool` | `create_pool(n_processes, name, initializer, initargs)` | `terminate()` → `join()` with `manager.pool_terminate_timeout`; workers still alive after the timeout are **SIGKILL-escalated** individually (`_force_kill_workers`). Termination sends SIGTERM first, which is what triggers the workers' cleanup handlers. |
-| `ManagedProcess` | `register_process(process, name)` (e.g. the RoundDataProducer) | `terminate()` → `join(timeout)` → `kill()` escalation (`close_process`). |
+| `ManagedProcess` | `register_process(process, name)` (e.g. the RoundDataProducer) | `terminate()` → `join(timeout)` → `kill()` escalation (`close_process`). `_reap_process_subtree()` (best-effort recursive-children kill) now runs in **all three** `close()` paths — survived-SIGTERM, exception fallback, and dead-on-entry — not just the SIGKILL escalation. The dead-on-entry path is best-effort (children have already been reparented); on the producer side this is covered by the ppid watch. |
 | `ManagedSharedMemory` | `create_shared_memory(size, name)` | `close()` + `unlink()` in the creator, then a verification probe (`_check_unlinked`) that re-attaches by name to confirm the segment is really gone — leaked `/dev/shm` blocks survive process death and eat node RAM. |
 
 The **creator-unlinks rule** ([`CLAUDE.md`](../CLAUDE.md)): workers attaching to a shared
@@ -158,7 +158,7 @@ and happily report more than the machine has. PSS divides each shared page by th
 processes sharing it, making the per-process values **additive** — the tree sum is the tree's
 actual footprint. (PSS is Linux-specific; the corresponding tests self-skip elsewhere, and
 known accounting quirks are tracked in
-[`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) #6 and #11.) CPU is normalized against the system
+[`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) (#6, now resolved; #11).) CPU is normalized against the system
 core count, so 100 % means "all cores busy".
 
 ### The shutdown plot
@@ -180,10 +180,13 @@ Missing stretches in the panels are a known symptom
 ### Stage annotations
 
 When `monitor.annotate_stages` is enabled (config default `True`), `_save_plot()` overlays the
-run's pipeline-stage spans as labeled translucent bands on the **CPU panel**
-(`_annotate_stage_spans`), turning the utilization curve into a self-explaining timeline: a CPU
-plateau reads as `round_03` (data generation), a GPU band as `epochs`, and so on. The spans
-come from the `pipeline_stages` table written by the always-on stage timers — see
+run's pipeline-stage spans as solid `dimgray` vertical boundary lines at each span's right edge
+on **every panel** (CPU, RAM, GPU — they share an x-axis) via `_annotate_stage_spans`; the leaf
+stage name is labeled once, just left of each line and angled 30° from horizontal, on the
+**CPU (top) panel only** so the other panels stay uncluttered. This turns the utilization curves
+into a self-explaining timeline: the region ending at a `round_03` line is round 3 data
+generation, the region ending at an `epochs` line is training, and so on. The spans come from
+the `pipeline_stages` table written by the always-on stage timers — see
 [`BENCHMARKING.md`](BENCHMARKING.md) for the timers and [`DATABASE.md`](DATABASE.md#pipeline_stages-stage-timers-schema-v4)
 for the table.
 
@@ -191,9 +194,9 @@ Two details keep it readable and correct:
 
 - **Depth ≤ 2 only.** `select_annotation_spans` keeps spans whose dot-name has at most two
   components (`train.round_03`, not `train.round_03.epochs`) — the deep per-ON-file and
-  encode/rf sub-stages stay report-tool-only so the panel doesn't drown in bands. Bands are
-  labeled with the leaf component (`round_03`) and cycle three face colors so adjacent stages
-  stay separable at low alpha.
+  encode/rf sub-stages stay report-tool-only so the panels don't drown in divider lines. Every
+  line uses the same `dimgray` color (`_ANNOTATION_COLOR`) and is labeled (once, on the CPU
+  panel) with the leaf component (`round_03`).
 - **Flush first.** The method calls `db.flush()` before querying, so spans recorded moments
   before shutdown (`final_save`, `inference.viz`) make it onto the plot. This is safe because
   the writer thread outlives the monitor in the cleanup order (monitor stops before db); a
@@ -209,6 +212,14 @@ from `main.py` at run start, gated on `config.monitor.dashboard_enabled` (defaul
 served on `config.monitor.dashboard_port` (default `8501`). It reads every plot the DB can
 reconstruct plus a PNG gallery.
 
+- **First-class RF tab.** Alongside the beta-VAE views, the dashboard surfaces the RF stage's
+  eval metrics as a dedicated **RF** tab: metric tiles (accuracy, ROC-AUC, average precision,
+  Brier score), binary + sub-type confusion heatmaps, per-sub-type accuracy bars, the
+  ensemble-accuracy-vs-tree-count curve, and val P(true) confidence quantiles. These are
+  driven by the scalars and `ensemble_val_accuracy` series that `train.py` writes to
+  `training_stats` under `model_name='rf'` (see [`DATABASE.md`](DATABASE.md) and
+  [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)); the SHAP, decision-boundary, and
+  calibration figures stay available under the PNG gallery.
 - **Served headless.** The subprocess runs `--server.headless`, so on a cluster you
   SSH-forward the port to view it locally (`ssh -L 8501:localhost:8501 ...`); the launcher logs
   the exact forward instructions.

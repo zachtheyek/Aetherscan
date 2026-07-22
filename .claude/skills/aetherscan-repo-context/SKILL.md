@@ -13,7 +13,7 @@ Aetherscan is Breakthrough Listen's first end-to-end production-grade deep-learn
 
 ## Entry Point & How to Run
 
-`src/aetherscan/main.py` is the **only** designated entry point. Non-development workflows should never call other scripts/modules directly. It dispatches to one of two subcommands via the first positional argument: `train` or `inference`.
+`src/aetherscan/main.py` is the **primary** designated entry point for the pipeline. Non-development workflows should never call other scripts/modules directly — the one exception is `aetherscan-dashboard`, the console script for manual dashboard runs against a saved DB (see `dashboard_cli.py`). `main.py` dispatches to one of two subcommands via the first positional argument: `train` or `inference`.
 
 There are two install paths off the same source tree:
 
@@ -26,8 +26,8 @@ CLI flags are identical between the two paths; only the launcher differs. `PYTHO
 
 - **Container build:** `singularity build aetherscan-ngc25.02.sif aetherscan.def` (or `apptainer build ...`) — same `aetherscan.def` recipe builds with either runtime. Build on the cluster you intend to run on.
 - **Conda env:** `conda env create -f environment.yml && conda activate aetherscan`
-- **`utils/fetch_run_outputs.sh`** rsyncs one run's outputs from remote cluster node(s) to the local `outputs/` tree, selecting files by the universal `*_<save_tag>.*` suffix and renaming each to `<machine>_<basename>` (collision-free across nodes). `<train|inference> <save_tag> <machine>...`; `--all` adds train checkpoints/archive, `--db` pulls the SQLite DB into `outputs/data/db/`, `--dry-run`. Assumes tagged log filenames; the inference branch is provisional pending the inference pipeline.
-- **`utils/kill_pipeline.sh`** stops a running pipeline (main process + all worker children) from a separate shell on the same machine — works for both run modes, finds the process tree itself, and tries a graceful SIGTERM (lets `ResourceManager` close pools/SHM) before escalating to SIGKILL. Assumes a single running instance. `--force` / `--dry-run` / `--timeout N`.
+- **`utils/fetch_run_outputs.sh`** rsyncs one run's outputs from remote cluster node(s) to the local `outputs/` tree, selecting files by the universal `*_<save_tag>.*` suffix and renaming each to `<machine>_<basename>` (collision-free across nodes). `<train|inference> <save_tag> <machine>...`; `--all` adds train checkpoints/archive, `--db` pulls the SQLite DB into `outputs/data/db/`, `--dry-run`. Per-run logs are tag-scoped (`logs/aetherscan_<save_tag>.log`, since PR #221), so the script picks each run's log up by its tag like every other output; the inference branch is provisional pending the inference pipeline.
+- **`utils/kill_pipeline.sh`** stops a running pipeline (main process + all worker children) from a separate shell on the same machine — works for both run modes, finds the process tree itself, and tries a graceful SIGTERM (lets `ResourceManager` close pools/SHM) before escalating to SIGKILL. When no main process is found, sweeps `{round_data_root}/*/producer.pid` for orphaned `RoundDataProducer` trees left by an ungraceful main-process death and reaps them. Assumes a single running instance. `--force` / `--dry-run` / `--timeout N` / `--round-data-root DIR`.
 - **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container. `AETHERSCAN_EXTRA_BINDS` (comma-separated host paths) appends additional 1:1 binds for data outside the standard dirs (e.g. raw `.h5` files under `/datag` for inference); the runtime's native `SINGULARITY_BIND` / `APPTAINER_BIND` still pass through and are additive.
 - **`utils/start_tmux_session.sh`** (optional) spins up a four-window monitoring tmux session (htop/CPU-MEM, `nvidia-smi`, `/dev/shm`, `tree` of models/outputs). Idempotent.
 
@@ -114,12 +114,15 @@ src/aetherscan/
 ├── inference_viz.py     # End-of-run inference visualization suite
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
 ├── pfb.py               # PFB static passband equalization (bandpass flattening)
-├── data_generation.py   # Synthetic signal injection (setigen)
+├── data_generation.py   # Synthetic signal injection — batched memmap workers + background producer
+├── seeding.py           # Root-seed stream derivation (reproducible training runs)
 ├── benchmark.py         # Always-on stage timing to the pipeline_stages table
 ├── dashboard.py         # Streamlit live-monitoring dashboard (DB-driven)
 ├── dashboard_launcher.py # Spawns the headless dashboard subprocess (guarded)
+├── dashboard_cli.py     # Console entry point for manual dashboard runs (aetherscan-dashboard)
 ├── hf_hub.py            # HuggingFace Hub artifact upload/download
 ├── tag_guards.py        # Fail-early --save-tag dedup guards
+├── rf_metrics.py        # Pure RF eval-metric helper (persisted to training_stats by train.py)
 ├── models/{vae,random_forest}.py
 ├── db/db.py             # Thread-safe SQLite, async queue-based writes, schema migration, supersede semantics
 ├── logger/              # Multi-handler logging + Slack integration
@@ -146,8 +149,9 @@ benchmarks/              # Standalone micro-benchmarks (not collected by pytest)
 - **Cadence-aware composite loss** — beta-VAE reconstruction + β-weighted KL divergence + α-weighted true/false clustering (ON-ON / OFF-OFF proximity, ON-OFF separation for true signals; uniform for false).
 - **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing. A persisted run manifest (`run_state_{save_tag}.json`) drives fault-tolerant resume: an explicit stage machine (vae_rounds → vae_plots → rf_train → rf_plots → final_save) skips completed stages, and stale DB rows from failed attempts are marked superseded (never deleted).
 - **Thread-safe singletons** — `Config`, `Database`, `ResourceManager`. Always use the accessors `get_config()`, `get_db()`, `get_manager()`; never instantiate directly.
-- **Shared-memory zero-copy parallelism** — worker pools communicate via shared memory (no serialization). Allocate via `manager.create_shared_memory()`; ResourceManager owns cleanup. Only the **creator** may call `shm.unlink()`, never workers.
-- **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) and `InfDataHolder` (`inference.py`) wrap batches with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes.
+- **Shared-memory zero-copy parallelism** — worker pools communicate via shared memory (no serialization). Allocate via `manager.create_shared_memory()`; ResourceManager owns cleanup. Only the **creator** may call `shm.unlink()`, never workers. Training-round datasets are disk-backed memmaps (`round_data.py`): workers write disjoint row ranges in-place, eliminating per-sample IPC; steady-state reads come from page cache.
+- **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) and `InfDataHolder` (`inference.py`) wrap memmap references (or arrays) with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes.
+- **Background data producer** — `RoundDataProducer` (spawn-started process with its own worker pool) generates round k+1 while round k trains; registered with ResourceManager as a `ManagedProcess`. `CUDA_VISIBLE_DEVICES` is blanked so the producer tree never initializes CUDA; logging crosses the spawn boundary via a `QueueListener` relay.
 - **Worker cleanup** — custom SIGTERM handlers free resources on interruption. **Never log inside SIGTERM handlers** (deadlock risk).
 
 ---
@@ -182,7 +186,7 @@ Enforced by **ruff** (lint + format) via pre-commit; full config in `pyproject.t
 The `tests/` suite splits along a hardware axis:
 
 - **`tests/unit/`** — fast, hardware-independent, one `test_<module>.py` per source module. This is the CI surface; everything here must pass on a CPU-only runner.
-- **`tests/integration/`** — `gpu`/`cluster`-marked end-to-end smokes (`test_train_smoke.py`, `test_inference_smoke.py`) that launch `python -m aetherscan.main ...` as a real subprocess on a cluster, against cluster-resident data/models. Not run in CI.
+- **`tests/integration/`** — `gpu`/`cluster`-marked tests that need real GPUs and cluster-resident data/models; not run in CI. Two end-to-end smokes (`test_train_smoke.py`, `test_inference_smoke.py`) launch `python -m aetherscan.main ...` as a real subprocess (hours of wall time each); the model-behavior gate (`test_model_behavior.py`, issue #139 Gate 2) instead drives generation and scoring in-process against the persisted VAE+RF (minutes, not hours).
 
 **Default selection — exactly what CI runs** (`.github/workflows/tests.yml`, on Python 3.10, 3.11, and 3.12), no GPUs or cluster data needed:
 
@@ -207,7 +211,7 @@ pytest -m "not gpu and not cluster" -q
 
 **Gotcha.** Most unit modules import TensorFlow at collection time, so a bare `pytest` needs the full dependency stack (CI installs `tensorflow-cpu==2.17.*` plus the container requirements). If that stack isn't available locally, run the TF-free subset you can — e.g. `pytest tests/unit/test_config.py -q` — and **say exactly what you ran** rather than claiming the whole suite passed.
 
-Deep dive: `docs/TESTING.md` covers the full layout, the synthetic data factories, the coverage-and-deliberate-gaps notes (`monitor` / `logger` / `slack_handler`), CI specifics, how to run the cluster smokes, and the adding-tests checklist.
+Deep dive: `docs/TESTING.md` covers the full layout, the synthetic data factories, the coverage-and-deliberate-gaps notes (`logger` / `slack_handler` / `benchmark` stage-timing wiring), CI specifics, how to run the cluster smokes, and the adding-tests checklist.
 
 ---
 

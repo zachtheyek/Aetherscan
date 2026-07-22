@@ -125,7 +125,7 @@ Signal-injection provenance, written per generated cadence by the round-data dra
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| `stat_name`, `value` | TEXT, REAL | Intensity statistics (`global_{mean,median,std,mad,skew,kurtosis}`), signal characteristics (`eti_*` / `rfi_*`: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept), or segment metadata (`snr_range_floor/ceil`, `num_samples`, `inject_duration`) |
+| `stat_name`, `value` | TEXT, REAL | Intensity statistics (`global_{mean,median,std,mad,skew,kurtosis}`), signal characteristics (`eti_*` / `rfi_*`: snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept), intersection-retry telemetry for `true_eti_rfi` samples (`intersection_retries`, `intersection_retry_capped`; `injection_stage=NULL`), or segment metadata (`snr_range_floor/ceil`, `num_samples`, `inject_duration`) |
 | `round_number`, `chunk_number`, `sample_index`, `background_index` | INTEGER | Position of the sample in the generation layout (`sample_index`/`background_index` NULL for segment metadata) |
 | `signal_class`, `signal_type` | TEXT | `main`/`true`/`false`; `false_no_signal`/`false_with_rfi`/`true_only_eti`/`true_eti_rfi` |
 | `injection_stage` | TEXT | `A` (raw background) / `B` (post-injection) / `C` (post-normalization); NULL for signal characteristics and metadata |
@@ -137,14 +137,21 @@ Index: `(tag, timestamp, stat_name, signal_type, injection_stage)`.
 
 ### `training_stats`
 
-Per-epoch training telemetry (~21 rows per epoch): losses (`total_loss`,
+Per-epoch beta-VAE training telemetry (~21 rows per epoch): losses (`total_loss`,
 `reconstruction_loss`, `kl_loss`, `true_loss`, `false_loss` + `val_` variants), gradient
 statistics (`gradient_norm_{mean,max,std}`, `clipping_rate`), `learning_rate`, durations,
-step counts, and the round's SNR floor/ceiling.
+step counts, and the round's SNR floor/ceiling. The RF stage also writes here: at the tail
+of `rf_train`, `train_random_forest()` persists ~25 scalar eval metrics (accuracy, ROC-AUC,
+average precision, Brier score, per-sub-type accuracies, binary + sub-type × prediction
+confusion cell counts, val P(true) quantiles) plus a `classification_threshold` row; the
+`rf_plots` stage additionally writes the per-tree `ensemble_val_accuracy` series
+(`epoch_number` = tree count) from inside `plot_rf_ensemble_accuracy_curve()`. All RF rows
+use `model_name='rf'`; the dashboard reads them last-write-wins so `rf_plots` retries and
+reused-tag stale scalars are absorbed.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| `model_name` | TEXT | Currently always `beta_vae` |
+| `model_name` | TEXT | `beta_vae` for per-epoch training telemetry; `rf` for the RF stage's eval metrics (scalars + the `ensemble_val_accuracy` per-tree series) |
 | `stat_name`, `value` | TEXT, REAL | |
 | `round_number`, `epoch_number` | INTEGER | 1-based |
 | `superseded` | INTEGER | Default 0 |
@@ -284,15 +291,20 @@ size — logged at startup.
 Rules of thumb at full-scale defaults (dominant terms only):
 
 - **`injection_stats` is the giant.** Every generated cadence writes 18 intensity rows
-  (6 statistics × 3 stages A/B/C) plus 0–12 signal-characteristic rows depending on its type
-  (0 / 6 / 6 / 12 for the four equal-weighted `main`-class types — 0 for the no-signal type,
-  6 per injected signal, so their mean is 6). That is **~24 rows per cadence** (18 + 6). A
-  training round generates `3 × num_samples_beta_vae` cadences (main + true + false), so at
-  defaults: `3 × 499 200 × ~24 ≈ 36 M rows per round`, times 20 rounds plus the RF dataset. This is why writes are batched, why the drainer runs off the training critical
+  (6 statistics × 3 stages A/B/C) plus 0–14 signal/telemetry rows depending on its type
+  (0 / 6 / 6 / 14 for the four equal-weighted `main`-class types — 0 for the no-signal type,
+  6 per injected signal, and an extra 2 intersection-retry telemetry rows on top of the 12
+  signal-characteristic rows for `true_eti_rfi`, so their mean is 6.5). That is
+  **~24.5 rows per cadence** (18 + 6.5). A training round generates `3 × num_samples_beta_vae`
+  cadences (main + true + false), so at defaults:
+  `3 × 499 200 × ~24.5 ≈ 37 M rows per round`, times 20 rounds plus the RF dataset. This is
+  why writes are batched, why the drainer runs off the training critical
   path, and why the injection plots subsample (`plot_injection_subsampling_count`). If the
   database size becomes a problem, this table is where the budget goes — smoke-scale runs
   (`--num-samples-beta-vae 3072`) keep it trivial.
-- **`training_stats`**: ~21 rows/epoch → ~42 k rows for 20 × 100 epochs. Negligible.
+- **`training_stats`**: ~21 rows/epoch → ~42 k rows for 20 × 100 epochs; the RF stage adds
+  a negligible tail (~25 scalars + `classification_threshold` + the per-tree
+  `ensemble_val_accuracy` series ≈ `rf.n_estimators` rows). Still negligible.
 - **`latent_snapshots`**: one row per viz cadence per capture — 960 cadences × one capture
   every `latent_viz_step_interval` steps (plus the final step) × epochs. At full scale
   (130 steps/epoch → 13 captures/epoch): ~25 M rows over 20 × 100 epochs, each carrying a

@@ -135,6 +135,20 @@ than round 1's):
   child's TF import can never initialize CUDA.
 - Registered with the ResourceManager (`ManagedProcess`), so cleanup escalates
   terminate → join → kill.
+- **Parent-death watch.** The request loop's `get(timeout=5)` doubles as a
+  heartbeat: each timeout re-checks `os.getppid()`, and if the parent PID has
+  changed (reparented to init/systemd after an ungraceful main-process death),
+  the producer terminates its pool and exits — no `shutdown_ack` is sent. On
+  Linux, `prctl(PR_SET_PDEATHSIG, SIGTERM)` provides immediate coverage for
+  mid-generation parent death via the existing SIGTERM handler.
+- **Pidfile (`producer.pid`).** `start()` writes
+  `{round_data_root}/{tag}/producer.pid`; `shutdown()` removes it on graceful
+  exit. The pidfile enables post-mortem discovery by `kill_pipeline.sh` and
+  `_reap_stale_producer()`.
+- **Restart-race guard.** `prepare_round_data_dir()` calls
+  `_reap_stale_producer()` before any `rmtree`, terminating a live orphan
+  recorded in the pidfile (with a PID-reuse guard via `create_time()` vs
+  pidfile mtime) so a new run cannot race an orphan's live writes.
 
 `--no-overlap-data-generation` falls back to sequential in-process generation (the debugging
 path, also used automatically when `manager.n_processes == 1`).
@@ -181,6 +195,42 @@ to `base_learning_rate` (1e-3) at each round start. Rule of thumb from the docst
 can only bottom out within a round if
 `base_learning_rate · (1 − reduction_factor)^(epochs_per_round / patience_threshold)`
 reaches `min_learning_rate`.
+
+## Reproducibility
+
+Training randomness is reproducible only behind an opt-in root seed; with no seed the pipeline
+draws from OS entropy and runs are non-reproducible (the historical default).
+
+- **`--seed`** (mirrors `config.training.seed`; `int | None`, default `None`, must be `>= 0`).
+  When set it seeds every training-side source of randomness: synthetic data generation
+  (per-round worker-task seeds derived from `(seed, round_number)`, identical on the
+  background-producer and the sequential in-process paths), the dataset split/trim/per-epoch
+  train shuffles (`prepare_distributed_train_dataset`, one stream per round), latent-visualization
+  batch selection and padding, injection-bias plot subsampling, and the TensorFlow global RNG via
+  `tf.random.set_seed` (fixing `HeNormal`/`GlorotNormal` weight init and the VAE `Sampling`
+  layer). `tf.random.set_seed` runs in `TrainingPipeline.__init__`, before any model is built.
+- **Independently seeded surfaces** are unaffected by `--seed`: the Random Forest keeps its own
+  `config.rf.seed` / `--rf-seed`, and the latent-viz UMAP/KMeans fits use fixed `random_state`s.
+  The RF dataset borrows the round-`0` stream key while curriculum (beta-VAE) rounds are 1-based,
+  so their streams never collide.
+- **`--tf-deterministic-ops`** (`config.training.tf_deterministic_ops`, off by default) forces
+  deterministic TF/cuDNN kernels via `tf.config.experimental.enable_op_determinism()`. It costs
+  some training speed and is only meaningful alongside `--seed` — enabling it without a seed logs
+  a warning and buys nothing.
+- **Approximate vs. bit-exact.** Seeding alone gives *approximate* run-to-run reproducibility;
+  *bit-exact* GPU reproducibility additionally requires `--tf-deterministic-ops` plus identical
+  hardware and software.
+
+Stream derivation lives in [`seeding.py`](../src/aetherscan/seeding.py): `derive_rng(root_seed,
+*stream_key)` builds an independent NumPy `Generator` per consumer from
+`SeedSequence([root_seed, *stream_key])`, so distinct keys are statistically independent and each
+consumer's stream is stable regardless of what the others draw.
+
+Both `seed` and `tf_deterministic_ops` are emitted by `Config.to_dict()["training"]`, so they are
+part of the run-manifest config fingerprint: a tag started before these fields existed — or under
+a different seed — cannot resume across the change under the same `--save-tag`; the guard
+downgrades to a fresh run with a loud warning. See [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md) for the
+config/CLI plumbing and the [CLI Reference](../README.md#cli-reference) for the exact flag help.
 
 ## Checkpointing, the run manifest, and retries
 
@@ -346,7 +396,7 @@ share `rf_shap_values_{tag}.joblib` (computed once, cached).
 | `rf_shap_loss_monitoring_{tag}.png` | Per-sample log-loss histogram by class + per-feature loss-increasing/decreasing decomposition. | The high-loss tail is your inspection queue; any feature whose net contribution *increases* loss is actively harmful. |
 | `rf_shap_explanation_clustering_{tag}.png` | UMAP of SHAP explanation vectors, colored by subtype, markers for correct/incorrect. | Errors concentrated in one explanation cluster = a single confusable mode (fixable with targeted data); errors scattered everywhere = noise-floor performance. |
 | `rf_calibration_curve_{tag}.png` | Reliability diagram (quantile-binned) + Brier/ECE + probability histogram. | With a 0.99 threshold, calibration in the top bins is what matters: if the top-bin empirical frequency is well below its predicted probability, the threshold is less conservative than it looks. |
-| `rf_oob_accuracy_curve_{tag}.png` (from `plot_rf_ensemble_accuracy_curve`) | Cumulative accuracy vs number of trees (val + train-subsample baseline), elbow annotated. | Should saturate well before 1000 trees; if it's still climbing at the end, raise `rf.n_estimators`. |
+| `rf_oob_accuracy_curve_{tag}.png` (from `plot_rf_ensemble_accuracy_curve`) | Cumulative accuracy vs number of trees (val + train-subsample baseline), elbow annotated. Also persists the per-tree `ensemble_val_accuracy` series to `training_stats` (`model_name='rf'`, `epoch_number` = tree count) for the dashboard RF tab — so the DB series only lands when `rf_plots` succeeds. | Should saturate well before 1000 trees; if it's still climbing at the end, raise `rf.n_estimators`. |
 | `rf_latent_decision_boundary_nn{n}_md{m}_{tag}.png` | RF P(true) contour over each persisted cadence-level UMAP plane, val points + 0.5 contour. | A coherent boundary separating the true classes; ragged islands = the forest partitioning noise. Depends on the UMAPs from `plot_latent_space_gif`, so `vae_plots` must have succeeded. |
 
 ### `resource_utilization_{tag}.png`
@@ -368,6 +418,20 @@ val cadences through the (frozen) encoder with `_distributed_encode` — note th
 artifacts immediately so a retry can skip straight to plots. A `check_encoder_trained()`
 heuristic (weight-std deviation from initializer expectations) guards against accidentally
 encoding with untrained weights and falls back to loading the newest checkpoint.
+
+At the tail of the stage, `train_random_forest()` also persists scalar RF eval metrics
+(accuracy, ROC-AUC, average precision, Brier score, per-sub-type accuracies, binary +
+sub-type × prediction confusion cell counts, val P(true) quantiles) to `training_stats`
+under `model_name='rf'` via the pure (TF-free) helper
+[`compute_rf_eval_metrics()`](../src/aetherscan/rf_metrics.py); the deployment
+`inference.classification_threshold` used to derive `val_accuracy` is written alongside as
+its own `classification_threshold` row. `plot_rf_ensemble_accuracy_curve()` (in the
+downstream `rf_plots` stage) then writes the per-tree `ensemble_val_accuracy` series
+(`epoch_number` = tree count) so the dashboard's RF tab is live end-to-end. The ensemble
+curve keeps its pre-existing hard-coded 0.5 threshold (the dashboard shows a caption to
+disambiguate it from the deployment-threshold scalar). Metric persistence is best-effort:
+an sklearn edge case (e.g. a single-class val split) logs a warning and never fails the
+training run.
 
 ## Configuration quick reference
 

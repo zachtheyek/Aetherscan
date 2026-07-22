@@ -58,7 +58,11 @@ each paired with a deterministic output path
 same-tag retry resumes off its own stamps while a fresh run (new datetime tag) starts clean
 and can never pick up a dead run's partial output. Pass `--preprocess-output-dir` explicitly
 to share/reuse one directory across runs (the deliberate trade of tag isolation for
-cross-run caching).
+cross-run caching). Because both the tag-scoped output directory and per-cadence stamp
+filenames are keyed on the CSV basename stem, all `inference_files` entries must have
+**unique basename stems** — `plan_cadences()` raises `ValueError` naming both colliding
+entries if two share a stem (e.g. `runA/x.csv` and `runB/x.csv`). The fix is to rename one
+CSV so basenames are distinct.
 
 ## Model loading
 
