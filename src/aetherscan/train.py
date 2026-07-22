@@ -55,6 +55,7 @@ from aetherscan.models import (
     create_beta_vae_model,
     prepare_latent_features,
 )
+from aetherscan.rf_metrics import compute_rf_eval_metrics
 from aetherscan.round_data import (
     RoundDataPaths,
     RoundDataProducer,
@@ -2508,6 +2509,35 @@ class TrainingPipeline:
             logger.info(f"Saved Random Forest to {rf_model_path}")
 
             rf_trained = True
+
+            # Persist scalar eval metrics to training_stats (model_name='rf') so the RF is
+            # first-class on the live dashboard (issue #171). Written only after both
+            # joblibs above landed: any later retry then resumes via try_load_rf_for_resume()
+            # and skips retraining, so these rows are never duplicated (a reused tag's stale
+            # rows are handled by the dashboard's last-write-wins read). Best-effort:
+            # metric persistence must never fail the training run.
+            try:
+                rf_metrics = compute_rf_eval_metrics(
+                    val_binary_labels=val_binary_labels,
+                    val_subtype_labels=val_subtype_labels,
+                    val_probas=val_probas,
+                    val_preds=val_preds,
+                )
+                rf_metrics["classification_threshold"] = float(classification_threshold)
+                metrics_timestamp = time.time()
+                for stat_name, value in rf_metrics.items():
+                    self.db.write_training_stat(
+                        model_name="rf",
+                        stat_name=stat_name,
+                        value=value,
+                        tag=tag,
+                        timestamp=metrics_timestamp,
+                    )
+                logger.info(
+                    f"Wrote {len(rf_metrics)} RF eval metrics to training_stats (tag={tag})"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write RF eval metrics to db: {e}")
 
             # NOTE: come back to this later (are we dereferencing the correct things? can we instead write things to db instead of storing in memory?)
             del (
@@ -6057,6 +6087,24 @@ class TrainingPipeline:
         final_val_acc = val_acc[-1]
         near_final = np.where(val_acc >= final_val_acc - 0.01)[0]
         elbow_idx = int(near_final[0]) if near_final.size else n_trees - 1
+
+        # Persist the per-tree series to training_stats (model_name='rf', epoch_number =
+        # tree count) for the dashboard's live ensemble curve (issue #171). Written here —
+        # not in train_random_forest() — to reuse the O(n_trees) per-tree predict_proba
+        # loop above, so these rows only land when the rf_plots stage runs and this plot
+        # succeeds; an rf_plots retry re-writes them (the dashboard reads last-write-wins).
+        # NOTE: this series thresholds the running ensemble mean at the hard-coded 0.5
+        # above, unlike the scalar val_accuracy stat (deployment classification_threshold).
+        series_timestamp = time.time()
+        for t in range(n_trees):
+            self.db.write_training_stat(
+                model_name="rf",
+                stat_name="ensemble_val_accuracy",
+                value=float(val_acc[t]),
+                epoch_number=t + 1,
+                tag=tag,
+                timestamp=series_timestamp,
+            )
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 6))
         fig.suptitle(
