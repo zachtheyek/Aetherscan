@@ -44,7 +44,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.dedup.outputs.already_commented != 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # The diff comes from `gh pr diff` (GitHub API), and no local git tools are
           # in the allowlist, so a shallow checkout is sufficient.
@@ -52,7 +52,7 @@ jobs:
 
       - name: Run Claude Release Notes
         if: steps.dedup.outputs.already_commented != 'true'
-        uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1.0.85
+        uses: anthropics/claude-code-action@5d5c10a4f389689f992ea10bb14dcb6fcc83146d # v1.0.102
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
