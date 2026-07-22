@@ -18,6 +18,13 @@ markers keep it in the same GPU-host-only selection as the other smokes (determi
 kernels are only meaningful on real GPUs). All TF/aetherscan imports are deferred into the test
 body so collecting this module never pulls TensorFlow into the pytest parent process.
 
+NOTE: `tf.config.experimental.enable_op_determinism()` is a process-global toggle with no
+"disable" counterpart, so once this test runs the deterministic-kernel mode persists for the
+rest of the pytest invocation. Alphabetical collection puts this module before
+`test_train_smoke.py`, so the train smoke inherits deterministic kernels (a mild train-speed
+cost only — no correctness impact). Left as-is; splitting it into its own pytest process to
+isolate the toggle would cost more than the speed hit it saves.
+
     ./utils/run_container.sh python -m pytest tests/integration -m "gpu or cluster" -q
 """
 
