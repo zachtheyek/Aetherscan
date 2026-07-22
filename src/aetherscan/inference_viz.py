@@ -961,7 +961,10 @@ def render_inference_visualizations(
     """Render every figure of the suite, each individually exception-guarded. Called by
     main._run_streaming_csv_inference after a fully successful pass (and gated on
     config.inference.inference_viz_enabled by the caller)."""
-    tag = get_config().checkpoint.save_tag
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+    tag = config.checkpoint.save_tag
     logger.info(f"Rendering inference visualization suite under plots/inference/{tag}/")
 
     records = collector.records
