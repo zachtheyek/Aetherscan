@@ -184,7 +184,7 @@ The `tests/` suite splits along a hardware axis:
 - **`tests/unit/`** — fast, hardware-independent, one `test_<module>.py` per source module. This is the CI surface; everything here must pass on a CPU-only runner.
 - **`tests/integration/`** — `gpu`/`cluster`-marked end-to-end smokes (`test_train_smoke.py`, `test_inference_smoke.py`) that launch `python -m aetherscan.main ...` as a real subprocess on a cluster, against cluster-resident data/models. Not run in CI.
 
-**Default selection — exactly what CI runs** (`.github/workflows/tests.yml`, on Python 3.10 and 3.12), no GPUs or cluster data needed:
+**Default selection — exactly what CI runs** (`.github/workflows/tests.yml`, on Python 3.10, 3.11, and 3.12), no GPUs or cluster data needed:
 
 ```bash
 pytest -m "not gpu and not cluster" -q

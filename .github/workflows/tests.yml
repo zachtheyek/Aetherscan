@@ -20,11 +20,12 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     strategy:
-      # Let both Python versions report rather than cancelling the sibling on first failure
+      # Let every Python version report rather than cancelling the siblings on first failure
       fail-fast: false
       matrix:
-        # The two supported runtimes: conda env (3.10) and NGC container (3.12)
-        python-version: ["3.10", "3.12"]
+        # The two supported runtimes — conda env (3.10) and NGC container (3.12) — plus 3.11,
+        # which requires-python (pyproject.toml) permits and the classifiers claim
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       # Pull repo contents into GitHub Actions runner

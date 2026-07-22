@@ -181,8 +181,8 @@ identical hit sets on real data (see [`PREPROCESSING.md`](PREPROCESSING.md)).
 ## CI
 
 [`.github/workflows/tests.yml`](../.github/workflows/tests.yml) runs on every PR and on
-pushes to master, on Python **3.10 and 3.12** (the conda and NGC-container runtimes,
-`fail-fast: false` so both report):
+pushes to master, on Python **3.10, 3.11, and 3.12** (the full `requires-python` range —
+3.10 and 3.12 are the conda and NGC-container runtimes; `fail-fast: false` so all report):
 
 ```
 pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
