@@ -15,6 +15,15 @@ zero with a truncated cosine product (cos(x/2)*cos(x/4)*cos(x/8) for |x| < 0.01)
 numerical shortcut, while np.sinc evaluates the same normalized sinc exactly — the unit tests
 pin the two filter designs against each other.
 
+A separate, unrelated quirk lives in the instrument itself: the CASPER GBT512 configuration
+(PFBPassband.jl) carries bug=true — the hardware's coefficient generation omits the
+half-sample offset from the sinc argument (sinc evaluated at (n - N/2) / nchan instead of the
+bug-free (n + 0.5 - N/2) / nchan, N = taps * nchan), mis-centering the sinc by half a sample
+relative to the Hamming window. firdes below is exactly the bug-free design; the two folded
+power responses agree to ~1e-5 (relative) at a typical GBT geometry (64 coarse channels,
+12 taps — bounded < 1e-4 by the unit tests, shrinking as N grows), orders of magnitude below
+the 5% mismatch-warning tolerance, so the exact bug-free form is kept (issue #180).
+
 The response depends on (fine_per_coarse, num_coarse_channels, taps_per_channel) only, so
 gen_coarse_channel_response is lru_cached: each process pays the one-time FFT (seconds at
 full GBT resolution), after which equalizing a channel is a single vectorized divide.

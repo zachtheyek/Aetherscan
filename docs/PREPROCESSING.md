@@ -110,10 +110,15 @@ window, and the sinc prototype aren't guesses: the GBT Breakthrough Listen backe
 confirmed as the CASPER `GBT512` configuration — `nchan=1024, ntaps=12, width=1.0,
 window=hamming, lpf=sinc` (from
 [PFBPassband.jl](https://github.com/david-macmahon/PFBPassband.jl)) — which is exactly what
-[`pfb.py`](../src/aetherscan/pfb.py) models. One caveat: that reference config also carries a
-`bug=true` flag capturing a sinc-approximation quirk in the real hardware, whereas `pfb.py`
-computes the sinc exactly. The resulting modeled-vs-hardware difference is small and is tracked
-in issue #180.
+[`pfb.py`](../src/aetherscan/pfb.py) models. That reference config also carries a `bug=true`
+flag: the CASPER coefficient generator omits the half-sample offset from the sinc argument
+(`sinc((n − N/2) / nchan)` instead of the bug-free `sinc((n + 0.5 − N/2) / nchan)`,
+`N = ntaps × nchan`), so the real hardware runs a sinc mis-centered by half a sample relative
+to its Hamming window while `pfb.py` models the bug-free design. That deviation is quantified
+and negligible (issue #180): the folded per-channel power responses agree to ~10⁻⁵ (relative)
+at a typical GBT geometry (64 coarse channels, 12 taps) — bounded below 10⁻⁴ by a unit test in
+[`test_pfb.py`](../tests/unit/test_pfb.py) and 3–4 orders of magnitude under the 5 %
+mismatch-warning tolerance — so `pfb.py` keeps the exact bug-free form.
 
 ### The detection statistic: vectorized D'Agostino–Pearson
 
