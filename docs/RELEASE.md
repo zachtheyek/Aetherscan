@@ -120,6 +120,14 @@ impossible:
    [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md)) — they are the raw material, written one
    merge at a time for exactly this purpose.
 
+A workflow-level `concurrency:` block groups runs by ref
+(`group: release-${{ github.ref }}`, `cancel-in-progress: false`), so two runs for the same
+tag — e.g. an accidental double tag-push, or a `test_pypi: true` dry run overlapping a real
+release for the same ref — are serialized rather than run in parallel, and an in-flight
+publish is never cancelled by a newer run. The grouping is at the release-workflow level, so
+it covers the whole gate chain above (not just the publish step). Unrelated tags do not
+serialize against each other.
+
 An optional `workflow_dispatch` input (`test_pypi: true`) publishing to test.pypi.org is the
 recommended dry-run before the first real release.
 
