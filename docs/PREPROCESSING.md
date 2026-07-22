@@ -236,6 +236,9 @@ downsample-at-extraction) need only per-cadence log-norm, run vectorized in the 
 (`_lognorm_worker`); legacy full-width files (4096) keep the historical
 downsample-then-log-norm path. Any other width is an error (skipped with a log). The loaded
 array must survive strict [0, 1] / NaN / Inf checks before inference proceeds.
+`parallel=False` forces the sequential in-process branch (no chunk pool / SHM) — the
+streaming per-cadence path uses it so the loader never competes with the persistent
+energy-detection pool for cores.
 
 **Log-normalization** (`data_generation.log_norm`): `y = log(x + 10⁻¹⁰)` shifted by its
 minimum and scaled by its range into [0, 1], per observation. With `return_params=True` it

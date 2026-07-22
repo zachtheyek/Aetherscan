@@ -376,10 +376,14 @@ def _infer_cadence(
     # Umbrella stage span for this cadence's inference phase — the load_lognorm /
     # encode / rf / db_write sub-stages inside nest under it via thread-local naming
     with stage_timer(f"inference.infer_cadence_{unit.index:03d}"):
-        # copy=False: the loader already returns float32; don't duplicate GBs of stamps
+        # copy=False: the loader already returns float32; don't duplicate GBs of stamps.
+        # parallel=False: this loads exactly one already-downsampled cadence .npy whose
+        # per-cadence work is a cheap vectorized log-norm, while the prefetch thread is
+        # driving the persistent energy-detection pool at full n_processes width — forking
+        # a second n_processes chunk pool here would double-subscribe the CPU.
         with stage_timer("load_lognorm"):
             cadence_data = preprocessor.load_inference_data(
-                override_filepaths=[cadence_result.npy_path]
+                override_filepaths=[cadence_result.npy_path], parallel=False
             ).astype(np.float32, copy=False)
 
         # Step 1: retire any partial rows from a dead attempt before fresh ones land

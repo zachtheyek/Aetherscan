@@ -1,6 +1,7 @@
 # NOTE: come back to this later
 
-"""Unit tests for aetherscan.config: singleton semantics and to_dict() field coverage."""
+"""Unit tests for aetherscan.config: singleton semantics, to_dict() field coverage, and the
+coupled-defaults guard (inference.stamp_width == data.width_bin)."""
 
 from __future__ import annotations
 
@@ -8,7 +9,10 @@ import dataclasses
 import json
 import os
 
-from aetherscan.config import Config, get_config, init_config
+import pytest
+
+import aetherscan.config as config_module
+from aetherscan.config import Config, InferenceConfig, get_config, init_config
 
 # Keys to_dict() emits that are not sub-dataclass sections (derived/grouped scalars).
 _NON_SECTION_KEYS = frozenset({"paths"})
@@ -114,3 +118,26 @@ class TestToDict:
     def test_json_serializable(self):
         # Saved run configs are json.dump'ed — the dict must be JSON-native throughout.
         json.dumps(get_config().to_dict())
+
+
+class TestCoupledDefaultsGuard:
+    """Config init must fail fast when the coupled defaults inference.stamp_width and
+    data.width_bin diverge (a source-level edit to one but not the other), instead of
+    surfacing only at load time deep inside load_inference_data."""
+
+    def test_equal_defaults_initialize_cleanly(self):
+        # The autouse fixture already ran init_config() without raising; pin the invariant.
+        config = get_config()
+        assert config.inference.stamp_width == config.data.width_bin
+
+    def test_diverged_defaults_raise_at_init(self, monkeypatch):
+        # Simulate a source-level default edit: Config.__init__ resolves InferenceConfig
+        # through the module global, so patch it to construct a diverged instance.
+        monkeypatch.setattr(
+            config_module, "InferenceConfig", lambda: InferenceConfig(stamp_width=2048)
+        )
+        Config._reset()
+        with pytest.raises(ValueError, match=r"stamp_width \(2048\) must equal data.width_bin"):
+            Config()
+        # Don't leave the half-built diverged singleton behind for the fixture teardown.
+        Config._reset()

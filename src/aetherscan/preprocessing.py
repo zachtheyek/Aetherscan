@@ -984,7 +984,9 @@ class DataPreprocessor:
 
     # NOTE: shared resources currently created & destroyed within function itself. think about abstractions once preprocessing.py is complete
     # NOTE: calculate intensity statistics to overlay with training distributions (C' vs C)?
-    def load_inference_data(self, override_filepaths: list[str] | None = None) -> np.ndarray:
+    def load_inference_data(
+        self, override_filepaths: list[str] | None = None, parallel: bool = True
+    ) -> np.ndarray:
         """
         Load and preprocess inference data into an array of shape
         (n, 6, 16, width_bin_downsampled). Uses a multiprocessing pool over shared memory to
@@ -1000,6 +1002,13 @@ class DataPreprocessor:
         resolving config.data.test_files via get_test_file_path — used by the inference command
         to chain per-cadence .npy outputs from preprocessing into inference without
         monkey-patching paths.
+
+        parallel=False routes every chunk through the sequential in-process branch (no chunk
+        pool, no shared memory) regardless of manager.n_processes. The streaming per-cadence
+        path (main._infer_cadence) uses this: it loads exactly one already-downsampled cadence
+        .npy whose per-cadence work is a cheap vectorized log-norm, while the prefetch thread
+        is already driving the persistent energy-detection pool at full n_processes width —
+        forking a second n_processes pool for that would double-subscribe the CPU.
         """
         logger.info(f"Loading backgrounds from {self.config.data_path} for inference")
 
@@ -1126,7 +1135,7 @@ class DataPreprocessor:
                     args_list = [(i, downsample_factor, final_width) for i in range(n_cadences)]
 
                 # NOTE: do we need to create & destroy the pool every chunk? or just the shared memory & pass new references in? is there a differenc?
-                if n_processes > 1:
+                if parallel and n_processes > 1:
                     # Create shared memory block for chunk data
                     chunk_shm = self.manager.create_shared_memory(
                         size=chunk_data.nbytes,
@@ -1161,7 +1170,10 @@ class DataPreprocessor:
 
                 else:
                     # Sequential processing
-                    logger.info("DataPreprocessor running in sequential mode (n_processes=1)")
+                    logger.info(
+                        f"DataPreprocessor running in sequential mode "
+                        f"(parallel={parallel}, n_processes={n_processes})"
+                    )
 
                     chunk_shm = None
                     chunk_pool = None
@@ -1508,31 +1520,55 @@ class DataPreprocessor:
             header = {k: hf["data"].attrs[k] for k in hf["data"].attrs}
             data_shape = hf["data"].shape
 
-        # Energy detection and stamp extraction index the dataset as [time, polarization,
-        # frequency] (see _energy_detect_channel_worker / _extract_stamps_worker), so a 'data'
-        # dataset that isn't rank-3 would otherwise blow up deep inside a worker with a cryptic
-        # IndexError. Reject it up front with the file path and expected-vs-actual rank; the
-        # caller (process_pending_cadence) turns this ValueError into a logged skip, so the
-        # skip-and-continue policy across a large catalog is preserved.
-        if len(data_shape) != 3:
+        # Up-front geometry validation of ALL 6 observation files, not just the primary.
+        # Energy detection and stamp extraction index every dataset as [time, polarization,
+        # frequency] and read exactly the first time_bins rows (see
+        # _energy_detect_channel_worker / _extract_stamps_worker — extra rows beyond
+        # time_bins are simply ignored), so a malformed file anywhere in the cadence would
+        # otherwise fail deep inside a worker: a wrong-rank dataset mis-slices cryptically,
+        # and a short row count in ANY of the 6 files (ON or OFF) raises a broadcast
+        # ValueError mid-extraction when the short stamp is assigned into its fixed
+        # (n_stamps, 6, time_bins, stored_width) memmap slot — a short ON file additionally
+        # degrades the k2 statistic silently first, since _sliding_normality_k2 derives its
+        # sample count from the rows it receives. The whole cadence is skipped rather than
+        # just the offending file: the 6-observation stamp tensor and the num_observations
+        # contract downstream (encoder reshape, RF features, ABACAD viz) have no
+        # representation for a 5-observation cadence.
+        rank_problems: list[str] = []
+        short_problems: list[str] = []
+        for idx, obs_h5 in enumerate(group.h5_paths):
+            if idx == 0:
+                # group.h5_paths[0] == primary_h5, already opened above for header/data_shape —
+                # reuse it instead of a redundant second h5py.File open.
+                obs_shape = data_shape
+            else:
+                with h5py.File(obs_h5, "r") as hf:
+                    obs_shape = hf["data"].shape
+            if len(obs_shape) != 3:
+                rank_problems.append(
+                    f"{obs_h5} has 'data' of rank {len(obs_shape)} (shape {obs_shape})"
+                )
+            elif int(obs_shape[0]) < time_bins:
+                short_problems.append(f"{obs_h5} has only {int(obs_shape[0])} time bins")
+        if rank_problems:
+            # The caller (process_pending_cadence) turns this ValueError into a logged skip,
+            # so the skip-and-continue policy across a large catalog is preserved.
             raise ValueError(
-                f"Cadence {group.key}: primary ON-source file {primary_h5} has 'data' of rank "
-                f"{len(data_shape)} (shape {data_shape}), expected rank 3 "
-                f"(time, polarization, frequency)"
+                f"Cadence {group.key}: expected rank 3 (time, polarization, frequency) "
+                f"'data' in every observation file; offending file(s): "
+                f"{'; '.join(rank_problems)}"
             )
+        if short_problems:
+            logger.warning(
+                f"Cadence {group.key}: every observation file needs >= {time_bins} time "
+                f"bins; skipping whole cadence — offending file(s): "
+                f"{'; '.join(short_problems)}"
+            )
+            return None
 
         n_chans = int(header.get("nchans", data_shape[-1]))
         foff = float(header["foff"])
         fch1 = float(header["fch1"])
-        n_time_avail = int(data_shape[0])
-
-        # NOTE: come back to this later (why do we only check if n_time_avail < time_bins? what happens if n_time_avail > time_bins?)
-        if n_time_avail < time_bins:
-            logger.warning(
-                f"Cadence {group.key}: primary file has only {n_time_avail} time bins, "
-                f"expected >= {time_bins}; skipping"
-            )
-            return None
 
         # NOTE: every complete coarse channel is processed. The historical block-based path
         # floored to a multiple of the old parallel_coarse_chans knob, silently dropping up to

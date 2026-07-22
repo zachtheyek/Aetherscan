@@ -13,6 +13,7 @@ import pytest
 from aetherscan import cli
 from aetherscan.cli import (
     _TAG_PATTERN,
+    _build_suggestion_block,
     _check_cross_constraints,
     _solve_cross_param_constraints,
     apply_args_to_config,
@@ -320,6 +321,22 @@ class TestSemanticChecks:
         ]
         errors = collect_validation_errors(_parse(argv), None)
         assert any("divisible by" in e.message and "downsample-factor" in e.message for e in errors)
+
+    def test_colliding_stamp_width_fixes_both_survive_in_suggestions(self, make_inference_csv):
+        # --stamp-width 2047 violates BOTH stamp_width checks (equality with the default
+        # width_bin 4096 and divisibility by the default downsample_factor 8) on the same
+        # field. The suggestion block keys proposals on (field, fix_kind), so both proposed
+        # fixes must appear — 4096 from the equality fix, 2048 from the divisibility fix —
+        # instead of one silently overwriting the other.
+        csv_path = make_inference_csv("subset.csv")
+        argv = ["inference", "--inference-files", csv_path.name, "--stamp-width", "2047"]
+        errors = collect_validation_errors(_parse(argv), None)
+        stamp_errors = [e for e in errors if e.field == "inference.stamp_width"]
+        assert len(stamp_errors) == 2
+
+        block = _build_suggestion_block(errors, None)
+        assert "--stamp-width 4096" in block
+        assert "--stamp-width 2048" in block
 
     def test_bandpass_method_enum(self):
         errors = collect_validation_errors(
