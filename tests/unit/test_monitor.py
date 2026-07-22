@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import matplotlib.pyplot as plt
 import psutil
 import pytest
 
 from aetherscan.monitor import get_process_tree_stats
+from aetherscan.monitor.monitor import _draw_stage_boundaries, _sanitize_gpu_display_name
 
 
 class FakeProcess:
@@ -192,3 +194,79 @@ class TestAggregation:
             "ram_bytes": 0,
             "ram_gb": 0.0,
         }
+
+
+class TestSanitizeGpuDisplayName:
+    """The resource-plot legend name sanitization (issue #214): whitelist hits collapse to a
+    short alias, misses fall back to the pre-existing 20-char truncation, and the ":<idx>"
+    suffix is preserved throughout. Plot-legend only — DB resource_name / gpu_names untouched."""
+
+    def test_a4000_whitelist_hit(self):
+        assert _sanitize_gpu_display_name("NVIDIA RTX A4000:0") == "A4000:0"
+
+    def test_pro6000_whitelist_hit_preserves_maxq_and_idx(self):
+        raw = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition:2"
+        assert _sanitize_gpu_display_name(raw) == "PRO 6000:2"
+
+    def test_non_whitelisted_long_name_truncates_to_19_chars_plus_ellipsis(self):
+        raw = "NVIDIA GeForce RTX 3090 Ti Founders:4"
+        # Name part is 35 chars (> 20) -> first 19 chars + "..." + preserved ":4"
+        expected = f"{'NVIDIA GeForce RTX 3090 Ti Founders'[:19]}...:4"
+        assert _sanitize_gpu_display_name(raw) == expected == "NVIDIA GeForce RTX ...:4"
+
+    def test_short_non_whitelisted_name_unchanged(self):
+        assert _sanitize_gpu_display_name("GPU:1") == "GPU:1"
+
+    def test_long_non_whitelisted_name_without_colon_still_truncates(self):
+        # No ":<idx>" suffix — the truncation fallback must still fire (the suffixless case).
+        raw = "NVIDIA GeForce RTX 3090 Ti Founders"
+        assert _sanitize_gpu_display_name(raw) == f"{raw[:19]}..."
+
+
+class TestDrawStageBoundaries:
+    """The boundary-line/label overlay (issue #214): a divider line on every panel at each
+    span's right edge, with the leaf stage name labelled once on the CPU (first) panel."""
+
+    def test_lines_on_all_panels_labels_on_cpu_only(self):
+        fig, axes = plt.subplots(3, 1)
+        try:
+            spans = [
+                {"stage": "load_backgrounds", "start_time": 0, "end_time": 600},
+                {"stage": "train.round_01", "start_time": 600, "end_time": 1200},
+                {"stage": "train.round_02", "start_time": 1200, "end_time": 1800},
+            ]
+            _draw_stage_boundaries(list(axes), spans, start_time=0, current_time=1800)
+
+            # One axvline per span on every panel (no data plotted -> ax.lines are the lines)
+            for ax in axes:
+                assert len(ax.lines) == len(spans)
+
+            # Labels only on the CPU (first) panel, one per span, leaf name only
+            assert [t.get_text() for t in axes[0].texts] == [
+                "load_backgrounds",
+                "round_01",
+                "round_02",
+            ]
+            assert len(axes[1].texts) == 0
+            assert len(axes[2].texts) == 0
+
+            # Boundaries sit at each span's end time in minutes since start (600s -> 10min, ...)
+            xs = [line.get_xdata()[0] for line in axes[0].lines]
+            assert xs == pytest.approx([10.0, 20.0, 30.0])
+
+            # Labels are dimgray and angled 30 deg from horizontal
+            assert axes[0].texts[0].get_color() == "dimgray"
+            assert axes[0].texts[0].get_rotation() == pytest.approx(30.0)
+        finally:
+            plt.close(fig)
+
+    def test_end_time_clamped_to_current_time(self):
+        # A span still open at teardown (end_time in the future) is clamped to current_time
+        fig, axes = plt.subplots(3, 1)
+        try:
+            spans = [{"stage": "final_save", "start_time": 0, "end_time": 9_999}]
+            _draw_stage_boundaries(list(axes), spans, start_time=0, current_time=1800)
+            # min(9999, 1800) = 1800s -> 30 min
+            assert axes[0].lines[0].get_xdata()[0] == pytest.approx(30.0)
+        finally:
+            plt.close(fig)
