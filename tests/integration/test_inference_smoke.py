@@ -28,22 +28,21 @@ import pytest
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.cluster]
 
 # NOTE: this smoke is coupled to a specific dummy model that must exist on the cluster; the
-# skip guard below handles its absence gracefully. Future improvement for a contributor who
-# wants to decouple it: make the tag configurable via an env var (e.g.
-# AETHERSCAN_SMOKE_MODEL_TAG) or a pytest option/marker so the smoke isn't wired to one artifact.
-_MODEL_TAG = "test_v17"  # persisted dummy model on blpc3
+# skip guard below handles its absence gracefully. The tag is overridable via the shared
+# smoke_model_tag fixture (AETHERSCAN_SMOKE_MODEL_TAG, default test_v17) so this smoke can point
+# at whatever tag test_train_smoke just produced instead of being wired to one fixed artifact.
 _CSV_NAME = "subset_test.csv"  # 2 complete 6-observation cadences
 
 
-def test_inference_smoke(cluster_paths, run_pipeline):
+def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
     if shutil.which("nvidia-smi") is None:
         pytest.skip("requires a GPU host (nvidia-smi not found)")
 
     data_path, model_path, output_path = cluster_paths
 
-    encoder = os.path.join(model_path, f"vae_encoder_{_MODEL_TAG}.keras")
-    rf = os.path.join(model_path, f"random_forest_{_MODEL_TAG}.joblib")
-    saved_config = os.path.join(model_path, f"config_{_MODEL_TAG}.json")
+    encoder = os.path.join(model_path, f"vae_encoder_{smoke_model_tag}.keras")
+    rf = os.path.join(model_path, f"random_forest_{smoke_model_tag}.joblib")
+    saved_config = os.path.join(model_path, f"config_{smoke_model_tag}.json")
     csv_path = os.path.join(data_path, "inference", _CSV_NAME)
     for required in (encoder, rf, saved_config, csv_path):
         if not os.path.exists(required):
@@ -83,3 +82,7 @@ def test_inference_smoke(cluster_paths, run_pipeline):
     assert proc.returncode == 0, f"inference smoke run failed (tag={tag}); last output:\n{tail}"
     assert "Inference completed successfully!" in proc.stdout
     assert os.path.exists(os.path.join(output_path, f"config_{tag}.json"))
+
+    # End-of-run benchmark report: pins the #203 _post_benchmark_report hook's real
+    # db.flush -> render path end-to-end (output_path/plots/benchmark_report_{tag}.png).
+    assert os.path.exists(os.path.join(output_path, "plots", f"benchmark_report_{tag}.png"))

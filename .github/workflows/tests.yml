@@ -59,4 +59,4 @@ jobs:
       # GPU- and cluster-marked tests need physical GPUs / cluster-resident data;
       # everything else (including slow CPU TF graph tests) runs here
       - name: Run test suite
-        run: pytest -m "not gpu and not cluster" -q
+        run: pytest -m "not gpu and not cluster and not integration" -q

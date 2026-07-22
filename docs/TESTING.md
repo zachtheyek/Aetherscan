@@ -138,6 +138,17 @@ ever observed on real training runs. Gate 2 — the SNR→confidence monotonicit
 training pipeline's own injection code and scores them in-process against the persisted
 VAE+RF, so it is `gpu`+`cluster`-only by nature (it can never run in CI).
 
+Two further gaps are accepted as-is (neither affects pipeline correctness):
+
+- **`slack_handler.py`** carries no unit tests — it is observability-only (a `logging.Handler`
+  that posts records to Slack), so its absence never affects pipeline results. Its network-free
+  helpers — the consecutive-failure cooldown, exponential backoff, and level-to-color coding —
+  would be cheap to unit-test in isolation if the module is ever hardened.
+- **End-to-end training-loop resume and clean SIGTERM/SIGINT shutdown mid-run** are exercised
+  only by real cluster runs: nothing today asserts that a mid-run interrupt tears down resources
+  cleanly and resumes from the persisted checkpoint/manifest. This promotes the standing
+  [`tests/conftest.py`](../tests/conftest.py) TODO into the visible gaps list.
+
 ## Markers
 
 | Marker | Meaning | In default selection? |
