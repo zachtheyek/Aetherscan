@@ -906,7 +906,9 @@ def main():
     try:
         init_config()
     except Exception as e:
-        # Note, can't log before init_logger()
+        # Note, can't log before init_logger() — write to stderr so the failure isn't silent
+        # (print() is banned outside utils/ by the T20 lint rule).
+        sys.stderr.write(f"Failed to initialize config: {e}\n")
         sys.exit(1)
 
     # Set up the CLI parser and parse arguments BEFORE init_logger so the logger can name this
@@ -917,7 +919,9 @@ def main():
     try:
         parser = setup_argument_parser()
     except Exception as e:
-        # Note, can't log before init_logger()
+        # Note, can't log before init_logger() — write to stderr so the failure isn't silent
+        # (print() is banned outside utils/ by the T20 lint rule).
+        sys.stderr.write(f"Failed to set up argument parser: {e}\n")
         sys.exit(1)
 
     # Parse arguments
@@ -935,10 +939,11 @@ def main():
     # Initialize logger. Name the run's log file with its effective save_tag: the CLI --save-tag
     # when provided (present on the train/inference subcommands as args.save_tag), else the config
     # default timestamp tag. init_logger() runs before apply_args_to_config(), so the tag is
-    # resolved from args here rather than from the not-yet-updated config.
+    # resolved from args here rather than from the not-yet-updated config. Pass None straight
+    # through rather than pre-resolving the default here — Logger.__init__ already does the
+    # is-not-None fallback to config.checkpoint.save_tag internally.
     try:
-        effective_save_tag = getattr(args, "save_tag", None) or get_config().checkpoint.save_tag
-        init_logger(save_tag=effective_save_tag)
+        init_logger(save_tag=getattr(args, "save_tag", None))
         logger.info("Logger initialization successful, but not yet registered for cleanup.")
         logger.info("Awaiting resource manager initialization. Do not terminate the process!")
     except Exception as e:

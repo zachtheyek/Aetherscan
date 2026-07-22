@@ -115,3 +115,18 @@ class TestLoggerUsesTaggedPath:
             assert os.path.exists(instance.log_path)
         finally:
             shutdown_logger()
+
+    def test_logger_falls_back_to_config_tag_when_omitted(self):
+        # No save_tag passed (the untagged-run / default-timestamp-tag path, arguably more
+        # common than the explicit-tag path) — Logger must fall back to
+        # config.checkpoint.save_tag rather than name the file after a None/sentinel tag.
+        from aetherscan.config import get_config  # noqa: PLC0415
+
+        config = get_config()
+        try:
+            instance = Logger()
+            expected = log_path_for_tag(config.output_path, config.checkpoint.save_tag)
+            assert instance.log_path == expected
+            assert os.path.exists(instance.log_path)
+        finally:
+            shutdown_logger()

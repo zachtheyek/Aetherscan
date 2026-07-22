@@ -7,6 +7,7 @@ outputs from concurrent writes (e.g. from worker processes)
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os
@@ -289,6 +290,17 @@ class Logger:
             self.log_listener.stop()
             # Note, can't log after this point -- listener thread has stopped
             # All subsequent logs will get queued but never logged
+
+        # Dispose of the multiprocessing.Queue's feeder thread. Once the listener (the
+        # consumer) is stopped, a mp.Queue with buffered records left its feeder thread
+        # blocked in _feed/_send_bytes on a pipe nobody drains; its exit-time join finalizer
+        # then hangs the interpreter (surfaces when a real Logger is built in-process, e.g.
+        # the unit tests). close() + cancel_join_thread() drops those undelivered
+        # shutdown-time records and lets the process exit cleanly.
+        if self.log_queue is not None:
+            with contextlib.suppress(Exception):
+                self.log_queue.close()
+                self.log_queue.cancel_join_thread()
 
     # NOTE:
     # currently only title is broadcasted to main channel,
