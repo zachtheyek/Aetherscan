@@ -47,6 +47,7 @@ tests/
 │   ├── test_train_datasets.py       # batched generators: coverage, stratification, alignment
 │   ├── test_latent_traversal.py     # traversal grid math with a stub decoder
 │   ├── test_models.py               # feature layout, RF train/predict, encoder/decoder symmetry
+│   ├── test_rf_metrics.py          # pure RF eval-metric helper: AUC/AP/Brier/confusion/quantile hand-computed cases, degenerate single-class split
 │   ├── test_preprocessing.py        # k² equivalence gates, dedup, grouping, DC spike, spline
 │   ├── test_pfb.py                  # response shape/symmetry/flatness, C++ sinc cross-check
 │   ├── test_inference.py            # padding fix, provenance mapping, confidence summaries
@@ -57,8 +58,9 @@ tests/
 │   ├── test_manager.py              # pool/SHM tracking and cleanup idempotence
 │   ├── test_benchmark.py            # stage_timer nesting/failures, report tree math + suggestions
 │   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
+│   ├── test_dashboard_cli.py        # aetherscan-dashboard console entry: exec-argv builder + streamlit-missing guard
 │   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths
-│   └── test_logger.py               # StreamToLogger redirect probes: isatty/writable/readable/fileno
+│   └── test_logger.py               # StreamToLogger redirect probes + log_path_for_tag / tagged FileHandler
 └── integration/                 # marked integration+gpu+cluster: needs real GPUs + cluster data
     ├── conftest.py                  # repo-root launcher + cluster path resolution
     ├── test_train_smoke.py          # known-good training smoke config, end to end
@@ -70,13 +72,16 @@ tests/
 
 A couple of modules are unit-tested lightly or not at all, by design rather than oversight:
 
-- **`monitor`** has no dedicated unit-test module. It's dominated by the 1 Hz background
-  sampling thread (PSS process-tree stats) and the matplotlib rendering of the resource plot,
-  both low-value to unit-test; its behavior is exercised by the integration smokes (real runs)
-  and verified by manual inspection of the resource-utilization plot uploaded to Slack. (Its
-  one pure helper, `select_annotation_spans`, *is* covered — in `test_benchmark.py`.)
-- **`logger`** is unit-tested only for the `StreamToLogger` stdout/stderr-redirect probes
-  (`isatty`/`writable`/`readable`/`fileno`) in `test_logger.py`; the QueueListener,
+- **`monitor`** now has a dedicated unit-test module (`tests/unit/test_monitor.py`) covering
+  the `get_process_tree_stats()` cache logic — process-object reuse, warm-up, eviction,
+  access-denied retention, PSS aggregation, the no-cache RAM-only path, and the outer guard.
+  The 1 Hz background sampling thread and the matplotlib rendering of the resource plot remain
+  exercised only by the integration smokes (real runs) and verified by manual inspection of
+  the resource-utilization plot uploaded to Slack. (The pure helper `select_annotation_spans`
+  is also covered — in `test_benchmark.py`.)
+- **`logger`** is unit-tested in `test_logger.py` for the `StreamToLogger` stdout/stderr-redirect
+  probes (`isatty`/`writable`/`readable`/`fileno`), the pure `log_path_for_tag` tag→path
+  derivation, and that a `Logger` builds its `FileHandler` from the tagged path; the QueueListener,
   SlackHandler, and stderr-to-logger redirect are exercised by the integration smokes rather
   than unit tests. In particular `src/aetherscan/logger/slack_handler.py` — a `logging.Handler`
   that batches records, posts them as threaded replies to a per-run summary message, color-codes
