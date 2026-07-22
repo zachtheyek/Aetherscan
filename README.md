@@ -416,7 +416,8 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--num-target-backgrounds NUM_TARGET_BACKGROUNDS]
              [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
              [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
-             [--train-files TRAIN_FILES [TRAIN_FILES ...]]
+             [--train-files TRAIN_FILES [TRAIN_FILES ...]] [--seed SEED]
+             [--tf-deterministic-ops | --no-tf-deterministic-ops]
              [--num-training-rounds NUM_TRAINING_ROUNDS]
              [--epochs-per-round EPOCHS_PER_ROUND]
              [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
@@ -555,6 +556,18 @@ options:
   --train-files TRAIN_FILES [TRAIN_FILES ...]
                         Space-separated list of training data file names
                         (e.g., real_filtered_LARGE_HIP110750.npy)
+  --seed SEED           Root random seed for reproducible runs: seeds data
+                        generation, dataset split/shuffles, TF weight init,
+                        and the VAE sampling layer (the random forest is
+                        seeded separately via --rf-seed). Omit for OS-entropy
+                        (non-reproducible) behavior. Must be >= 0.
+  --tf-deterministic-ops, --no-tf-deterministic-ops
+                        Force deterministic TensorFlow/cuDNN op
+                        implementations
+                        (tf.config.experimental.enable_op_determinism) for
+                        bit-exact GPU reproducibility at some training-speed
+                        cost. Only meaningful together with --seed (default:
+                        disabled)
   --num-training-rounds NUM_TRAINING_ROUNDS
                         Total number of training rounds in curriculum learning
                         schedule

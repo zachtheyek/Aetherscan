@@ -35,7 +35,7 @@ def _make_data(n_samples=40):
     }
 
 
-def _build(data, shuffle, train_val_split=0.8, prb=4, eb=8, prvb=4):
+def _build(data, shuffle, train_val_split=0.8, prb=4, eb=8, prvb=4, rng=None):
     return prepare_distributed_train_dataset(
         data=data,
         train_val_split=train_val_split,
@@ -45,6 +45,7 @@ def _build(data, shuffle, train_val_split=0.8, prb=4, eb=8, prvb=4):
         num_replicas=1,
         strategy=tf.distribute.get_strategy(),
         shuffle=shuffle,
+        rng=rng,
     )
 
 
@@ -141,6 +142,28 @@ class TestPrepareDistributedTrainDataset:
             assert int(np.sum(labels[val_indices] == signal_type)) == 2
         results["_train_holder"].clear()
 
+    def test_seeded_rng_reproduces_split_and_epoch_order(self):
+        """Reproducibility contract (issue #49): the same seeded Generator reproduces the
+        stratified split AND every epoch's shuffled batch order; successive epochs still
+        differ from each other (the rng advances, randomness is not removed)."""
+
+        def _run():
+            results = _build(_make_data(), shuffle=True, rng=np.random.default_rng(11))
+            n_batches = results["train_steps"] * results["accumulation_steps"]
+            iterator = iter(results["train_dataset"])
+            epochs = [
+                [_batch_row_ids(next(iterator)).tolist() for _ in range(n_batches)]
+                for _ in range(2)
+            ]
+            out = (results["train_indices"].tolist(), results["val_indices"].tolist(), epochs)
+            results["_train_holder"].clear()
+            return out
+
+        first, second = _run(), _run()
+        assert first == second
+        # Epoch-level randomness survives seeding: epoch 2's batch membership differs
+        assert first[2][0] != first[2][1]
+
     def test_memmap_inputs_supported(self, tmp_path):
         """Round data arrives as np.load(mmap_mode='r') memmaps — gathers must produce plain
         in-RAM batches from them."""
@@ -165,12 +188,13 @@ class TestPrepareDistributedTrainDataset:
 
 
 class TestPrepareDistributedVizDataset:
-    def _build_viz(self, concat, prib=4):
+    def _build_viz(self, concat, prib=4, rng=None):
         return prepare_distributed_viz_dataset(
             concat_data=concat,
             per_replica_inf_batch_size=prib,
             num_replicas=1,
             strategy=tf.distribute.get_strategy(),
+            rng=rng,
         )
 
     def test_order_preserved_with_padding(self):
@@ -202,3 +226,19 @@ class TestPrepareDistributedVizDataset:
         assert results["n_padded"] == n
         assert results["viz_steps"] == 2
         results["_viz_holder"].clear()
+
+    def test_seeded_rng_reproduces_padding(self):
+        n = 10
+        base = np.arange(n, dtype=np.float32)[:, None, None, None]
+        concat = base * np.ones((n, *_SAMPLE_SHAPE), dtype=np.float32)
+
+        def _padded_tail():
+            results = self._build_viz(concat, rng=np.random.default_rng(7))
+            iterator = iter(results["viz_dataset"])
+            seen = []
+            for _ in range(results["viz_steps"]):
+                seen.extend(next(iterator).numpy()[:, 0, 0, 0].astype(np.int64).tolist())
+            results["_viz_holder"].clear()
+            return seen[n:]
+
+        assert _padded_tail() == _padded_tail()

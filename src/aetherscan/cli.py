@@ -393,6 +393,18 @@ def _add_train_flags_to(parser):
 
     # Training configuration
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Root random seed for reproducible runs: seeds data generation, dataset split/shuffles, TF weight init, and the VAE sampling layer (the random forest is seeded separately via --rf-seed). Omit for OS-entropy (non-reproducible) behavior. Must be >= 0.",
+    )
+    parser.add_argument(
+        "--tf-deterministic-ops",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some training-speed cost. Only meaningful together with --seed (default: disabled)",
+    )
+    parser.add_argument(
         "--num-training-rounds",
         type=int,
         default=None,
@@ -1110,6 +1122,13 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.data.inference_files = args.inference_files
 
     # Training configuration
+    if hasattr(args, "seed") and args.seed is not None:
+        config.training.seed = args.seed
+    # tf_deterministic_ops uses argparse.BooleanOptionalAction with default=None so the CLI
+    # can express "leave the config default" (omit), "force on", and "force off" — same
+    # pattern as async_allocator above
+    if hasattr(args, "tf_deterministic_ops") and args.tf_deterministic_ops is not None:
+        config.training.tf_deterministic_ops = args.tf_deterministic_ops
     if hasattr(args, "num_training_rounds") and args.num_training_rounds is not None:
         config.training.num_training_rounds = args.num_training_rounds
     if hasattr(args, "epochs_per_round") and args.epochs_per_round is not None:
@@ -1484,6 +1503,20 @@ def collect_validation_errors(
             config.training.latent_viz_num_cadences_per_type,
         )
         cs = _resolve(args, "curriculum_schedule", config.training.curriculum_schedule)
+
+        # Root seed must be non-negative (np.random.SeedSequence and tf.random.set_seed both
+        # reject negatives at runtime)
+        seed = _resolve(args, "seed", config.training.seed)
+        if seed is not None and seed < 0:
+            errors.append(
+                ValidationError(
+                    field="training.seed",
+                    current=seed,
+                    message=f"--seed must be a non-negative integer, got {seed}",
+                    fix_kind="clamp_low",
+                    min_val=0,
+                )
+            )
 
         # NOTE: come back to this later (should we parametrize num_signal_types = 4 in config.py?)
         # num_samples_beta_vae divisible by 4 (balanced class generation)

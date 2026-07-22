@@ -33,6 +33,7 @@ from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 from aetherscan.round_data import RoundDataPaths, build_manifest, write_done_manifest
+from aetherscan.seeding import STREAM_DATA_GEN, derive_rng
 
 logger = logging.getLogger(__name__)
 
@@ -787,9 +788,10 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     # are single-threaded processes, and the only in-process (pool=None) generation is the RF
     # dataset, which runs after the training datasets/iterators are torn down (train_round's
     # finally: holder.clear() -> del datasets -> clear_session -> gc), so no tf.data generator
-    # thread is alive mutating global RNG state during it. Note per-task seeds come from OS
-    # entropy (round_data seed_rng) and are not persisted, so runs are not reproducible anyway;
-    # what this guarantees is independence of results from worker scheduling within a run.
+    # thread is alive mutating global RNG state during it. Per-task seeds are drawn from the
+    # per-round seed_rng in generate_round_to_memmap — derived from config.training.seed
+    # when set (making generation reproducible across runs), OS entropy otherwise; either
+    # way this reseed keeps results independent of worker scheduling within a run.
     random.seed(seed)
     np.random.seed(seed % (2**32))
 
@@ -972,6 +974,7 @@ def generate_round_to_memmap(
     pool: Pool | None = None,
     backgrounds: np.ndarray | None = None,
     round_num: int | None = None,
+    seed: int | None = None,
     stats_cb=None,
     progress_cb=None,
 ) -> dict:
@@ -993,6 +996,10 @@ def generate_round_to_memmap(
 
     stats_cb(segment_dict) fires once per class-segment per chunk; progress_cb(chunk,
     n_chunks) once per chunk. Returns the manifest dict.
+
+    `seed` is the pipeline root seed (config.training.seed): when set, per-task seeds derive
+    deterministically from (seed, round_num) and the same call regenerates byte-identical
+    data; None keeps the OS-entropy behavior.
     """
     if n_samples % 4 != 0:
         raise ValueError(f"n_samples must be divisible by 4, got {n_samples}")
@@ -1027,7 +1034,12 @@ def generate_round_to_memmap(
     labels = np.empty(n_samples, dtype="U20")
 
     n_chunks = max(1, (n_samples + chunk_size - 1) // chunk_size)
-    seed_rng = np.random.default_rng()  # OS entropy; per-task seeds are drawn from this
+    # Per-task seeds are drawn from this stream. With a root `seed` it derives
+    # deterministically from (seed, round), so the same seed regenerates identical data;
+    # with seed=None it falls back to OS entropy (non-reproducible, the historical
+    # behavior). The RF dataset passes round_num=None and maps onto the round-0 key —
+    # beta-VAE rounds are 1-based, so the streams never collide.
+    seed_rng = derive_rng(seed, STREAM_DATA_GEN, round_num if round_num is not None else 0)
 
     logger.info(
         f"Generating {n_samples} samples into {paths.round_dir} "
@@ -1313,5 +1325,6 @@ class DataGenerator:
             pool=self.pool,
             backgrounds=self.backgrounds if self.pool is None else None,
             round_num=round_num,
+            seed=self.config.training.seed,
             stats_cb=_stats_cb,
         )

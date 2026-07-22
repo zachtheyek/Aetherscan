@@ -78,6 +78,7 @@ from aetherscan.run_state import (
     run_state_path,
     save_run_state,
 )
+from aetherscan.seeding import STREAM_DATASET, STREAM_PLOT, STREAM_VIZ, derive_rng
 
 logger = logging.getLogger(__name__)
 
@@ -593,11 +594,16 @@ def prepare_distributed_train_dataset(
     num_replicas: int,
     strategy: tf.distribute.Strategy,
     shuffle: bool = True,
+    rng: np.random.Generator | None = None,
 ) -> dict:
     """
     Build distributed training and validation datasets from the `data` dict, returning a dict
     with the two tf.data datasets, sample/step counts, the shared TrainDataHolder, and the
     stratified train/val indices into the original arrays.
+
+    `rng` supplies all randomness (stratified split, trim subsampling, per-epoch shuffles):
+    callers pass a Generator derived from the pipeline root seed for reproducible runs (see
+    aetherscan.seeding.derive_rng); None falls back to OS entropy (the historical behavior).
 
     `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the read-only
     memmaps returned by round_data.load_round_arrays(), though plain in-RAM ndarrays work too.
@@ -638,6 +644,11 @@ def prepare_distributed_train_dataset(
             f"per_replica_batch_size * num_replicas ({global_train_batch_size})"
         )
 
+    # The train generator below closes over this rng, so epoch k's shuffle consumes the
+    # stream's k-th state — deterministic given a seeded Generator, different every epoch
+    if rng is None:
+        rng = np.random.default_rng()
+
     # Stratified train/val split to ensure both sets contain proportional representation
     # of all 4 signal types (false_no_signal, false_with_rfi, true_only_eti, true_eti_rfi).
     # This is necessary because generation arranges labels sequentially within
@@ -650,7 +661,7 @@ def prepare_distributed_train_dataset(
 
     for label in unique_labels:
         label_indices = np.where(labels == label)[0]
-        np.random.shuffle(label_indices)
+        rng.shuffle(label_indices)
         n_label_train = int(len(label_indices) * train_val_split)
         train_indices.append(label_indices[:n_label_train])
         val_indices.append(label_indices[n_label_train:])
@@ -673,9 +684,9 @@ def prepare_distributed_train_dataset(
 
     # Randomly subsample to trimmed size (avoids positional bias from slicing the tail)
     if n_train_trimmed < n_train:
-        train_indices = np.random.choice(train_indices, size=n_train_trimmed, replace=False)
+        train_indices = rng.choice(train_indices, size=n_train_trimmed, replace=False)
     if n_val_trimmed < n_val:
-        val_indices = np.random.choice(val_indices, size=n_val_trimmed, replace=False)
+        val_indices = rng.choice(val_indices, size=n_val_trimmed, replace=False)
 
     # Sort both index sets ascending. For shuffle=False this pins the generators' yield order
     # to the returned train_indices/val_indices arrays (the alignment contract
@@ -709,11 +720,11 @@ def prepare_distributed_train_dataset(
                 false = train_holder.false
 
             # Work with local references (safe from clearing, no per-batch lock needed)
-            # Copy train_indices because np.random.shuffle mutates in-place
+            # Copy train_indices because rng.shuffle mutates in-place
             indices = train_indices.copy()
             if shuffle:
                 # Perform global shuffle on each epoch so each pass through the data is unique
-                np.random.shuffle(indices)
+                rng.shuffle(indices)
             for start in range(0, len(indices), global_train_batch_size):
                 batch_indices = indices[start : start + global_train_batch_size]
                 if shuffle:
@@ -821,6 +832,7 @@ def prepare_distributed_viz_dataset(
     per_replica_inf_batch_size: int,
     num_replicas: int,
     strategy: tf.distribute.Strategy,
+    rng: np.random.Generator | None = None,
 ) -> dict:
     """
     Build a distributed dataset for latent-space visualization from `concat_data` (shape
@@ -830,10 +842,14 @@ def prepare_distributed_viz_dataset(
     The dataset yields cadences in original order (no shuffle) — plot_latent_space_gif() depends
     on this ordering. If n_samples isn't divisible by the global batch size, the input is padded
     with random duplicates to keep all replicas evenly fed; downstream code can use n_samples vs.
-    n_padded to drop the padded tail when needed.
+    n_padded to drop the padded tail when needed. `rng` seeds the padding choice (a Generator
+    derived from the pipeline root seed, or None for OS entropy).
     """
     global_viz_batch_size = per_replica_inf_batch_size * num_replicas
     n_samples = concat_data.shape[0]
+
+    if rng is None:
+        rng = np.random.default_rng()
 
     # NOTE: does padding/divisibility matter for inference?
     # Pad datasets to fit batch sizes (prevents uneven batches on final step)
@@ -845,7 +861,7 @@ def prepare_distributed_viz_dataset(
 
     if n_padded > n_samples:
         pad_count = n_padded - n_samples
-        pad_indices = np.random.choice(n_samples, size=pad_count, replace=True)
+        pad_indices = rng.choice(n_samples, size=pad_count, replace=True)
         padded_data = np.concatenate([concat_data, concat_data[pad_indices]], axis=0)
         logger.info(f"Data alignment: Viz {n_samples}→{n_padded} (padded {pad_count})")
     else:
@@ -995,6 +1011,28 @@ class TrainingPipeline:
         self.db = get_db()
         if self.db is None:
             raise ValueError("get_db() returned None")
+
+        # Reproducibility: seed TF's global RNG before any model/variable creation so weight
+        # initialization (HeNormal/GlorotNormal) and the VAE Sampling layer draw
+        # deterministic streams. numpy/python randomness is NOT globally seeded here — each
+        # consumer derives its own independent stream from the same root seed (see
+        # aetherscan.seeding.derive_rng and its call sites). No-op when seed is None
+        if self.config.training.seed is not None:
+            tf.random.set_seed(self.config.training.seed)
+            logger.info(f"Seeded TF global RNG from root seed {self.config.training.seed}")
+        if self.config.training.tf_deterministic_ops:
+            # Deterministic cuDNN/reduction kernels for bit-exact GPU reproducibility, at
+            # some training-speed cost. Only useful alongside a root seed
+            tf.config.experimental.enable_op_determinism()
+            logger.info("TF op determinism enabled (deterministic GPU kernels)")
+            if self.config.training.seed is None:
+                # Without a seed the deterministic kernels cost speed but buy no
+                # reproducibility (TF's global RNG stays unseeded) — warn so it isn't silent.
+                logger.warning(
+                    "tf_deterministic_ops is enabled but --seed is not set: deterministic "
+                    "kernels incur a speed cost without making the run reproducible. Pass "
+                    "--seed to seed the RNG streams."
+                )
 
         # Load (or create) the persisted run manifest for this tag. This resolves
         # self.start_time (wall clock of attempt 1 — used by every DB query/plot, so retries
@@ -1343,6 +1381,7 @@ class TrainingPipeline:
                     time_resolution=self.data_generator.time_resolution,
                     db=self.db,
                     tag=self.config.checkpoint.save_tag,
+                    seed=self.config.training.seed,
                 )
                 self._round_producer.start()
                 # Kick off the first round's data right away (nothing to overlap with yet —
@@ -1450,7 +1489,8 @@ class TrainingPipeline:
         train_labels = train_data.get("labels")
         train_lognorm = train_data.get("lognorm")
 
-        # Distribute training data
+        # Distribute training data (rng keyed on the round so each round's split/epoch
+        # shuffles are an independent — but seed-reproducible — stream)
         data = prepare_distributed_train_dataset(
             data=train_data,
             train_val_split=self.config.training.train_val_split,
@@ -1460,6 +1500,7 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=True,
+            rng=derive_rng(self.config.training.seed, STREAM_DATASET, round_number),
         )
 
         # Free the dict shell (original arrays stay alive via the shared train_holder)
@@ -2422,6 +2463,9 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=False,
+            # RF dataset uses the round-0 stream key, mirroring its data generation
+            # (beta-VAE rounds are 1-based, so no collision)
+            rng=derive_rng(self.config.training.seed, STREAM_DATASET, 0),
         )
 
         # NOTE: come back to this later
@@ -2485,7 +2529,7 @@ class TrainingPipeline:
             #
             # Disjointness contract: the train and val passes below read from the same
             # TrainDataHolder backing arrays via train_indices / val_indices, which are
-            # built by stratified per-label split + np.random.choice subsampling — disjoint
+            # built by stratified per-label split + rng.choice subsampling — disjoint
             # by construction. The .repeat()-ed datasets cannot leak across splits because
             # each generator only yields rows from its own index subset.
             train_encode_steps = train_steps * accumulation_steps
@@ -4140,6 +4184,7 @@ class TrainingPipeline:
 
         max_points = self.config.training.plot_injection_subsampling_count
         outlier_pct = self.config.training.plot_injection_outlier_percentile
+        rng = derive_rng(self.config.training.seed, STREAM_PLOT)
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
@@ -4176,7 +4221,7 @@ class TrainingPipeline:
                         # Subsample normal points to fill remaining budget
                         remaining = max(0, max_points - len(outlier_indices))
                         if remaining < len(normal_indices):
-                            sampled_normal = np.random.choice(
+                            sampled_normal = rng.choice(
                                 normal_indices, size=remaining, replace=False
                             )
                             keep_indices = np.concatenate([outlier_indices, sampled_normal])
@@ -6442,6 +6487,7 @@ class TrainingPipeline:
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        rng = derive_rng(self.config.training.seed, STREAM_VIZ, 0)
 
         # Restrict to candidate subset if provided (avoids copying the entire partition)
         if candidate_indices is not None:
@@ -6466,7 +6512,7 @@ class TrainingPipeline:
                 )
                 sampled = type_global_indices
             else:
-                sampled = np.random.choice(type_global_indices, size=n_per_type, replace=False)
+                sampled = rng.choice(type_global_indices, size=n_per_type, replace=False)
             selected_indices.append(sampled)
             selected_labels.extend([stype] * len(sampled))
 
@@ -6507,6 +6553,7 @@ class TrainingPipeline:
             per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
+            rng=derive_rng(self.config.training.seed, STREAM_VIZ, 1),
         )
 
         self._latent_viz_dataset = viz_results["viz_dataset"]

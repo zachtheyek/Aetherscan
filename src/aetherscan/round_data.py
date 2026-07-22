@@ -393,6 +393,7 @@ def _default_generate(paths, round_idx, snr_base, snr_range, pool, params, stats
         time_resolution=params["time_resolution"],
         pool=pool,
         round_num=round_idx,
+        seed=params["seed"],
         stats_cb=stats_cb,
         progress_cb=progress_cb,
     )
@@ -598,6 +599,7 @@ class RoundDataProducer:
         time_resolution: float,
         db,
         tag: str,
+        seed: int | None = None,
     ):
         self._params = {
             "base_dir": base_dir,
@@ -613,6 +615,10 @@ class RoundDataProducer:
             "task_size": task_size,
             "freq_resolution": freq_resolution,
             "time_resolution": time_resolution,
+            # Pipeline root seed (config.training.seed) — crosses the spawn boundary with the
+            # rest of the params so producer-generated rounds derive the same per-round
+            # streams as in-process generation. None = OS entropy
+            "seed": seed,
         }
         self._db = db
         self._tag = tag
