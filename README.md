@@ -23,14 +23,6 @@ Aetherscan is a deep learning pipeline for detecting anomalies in radio spectrog
 
 The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) ("_A deep-learning search for technosignatures from 820 unique stars_"), extending the research prototype into a production-ready system capable of near real-time inference.
 
-### Key Features
-
-- **Data-parallel distributed training/inference** — Gradients synchronized via TensorFlow MirroredStrategy with NCCL AllReduce. Gradient accumulation allows for larger effective batch sizes under low VRAM constraints. Generator-based distributed datasets stream data from CPU to GPU on-demand, further lowering VRAM pressure.
-- **Cadence-aware clustering loss** — The composite loss combines standard beta-VAE reconstruction and KL divergence (β-weighted), with true/false clustering (α-weighted) that encourages ON-ON and OFF-OFF proximity + ON-OFF separation for true signals, and uniform clustering for false signals. This implicitly teaches the model to mimic traditional signal locality filters.
-- **Curriculum-based training regime** — Progressive SNR difficulty schedules paired with adaptive learning rates that decay on validation plateaus but reset each round, enabling aggressive fine-tuning within difficulty stages while preserving exploration capacity across rounds. Per-round checkpointing and automatic retry with constant backoff ensure graceful recovery from transient failures.
-- **Multiprocess-accelerated data pipelines with zero-copy parallelism** — Preprocessing and data generation modules execute in parallel worker pools, while shared memory architecture enables inter-process communication without serialization overhead. Custom SIGTERM handlers in workers ensure proper resource cleanup even during interruptions.
-- **Infrastructure services** — Thread-safe singletons for async database writes (queue-based SQLite), multiprocess logging (QueueListener pattern with Slack webhooks), background resource monitoring, and centralized resource lifecycle management with graceful shutdown handling.
-
 ---
 
 ## Installation
@@ -347,11 +339,6 @@ PYTHONPATH=src python -m aetherscan.main inference \
     --config-path /path/to/config.json \
     --save-tag run_v1
 ```
-
-> [!NOTE]
-> Energy detection flattens each coarse channel's bandpass before thresholding. The default method (`--bandpass-method pfb`) divides by the instrument's static polyphase-filterbank response — computed once per run — instead of fitting a spline per channel per file (`--bandpass-method spline`). The PFB response is instrument-dependent: `--pfb-taps-per-channel` defaults to 12 (the GBT/Breakthrough Listen backend) and must match the backend that produced the `.h5` files; a warning is logged when the recording's measured bandpass shape disagrees with the static response.
->
-> Preprocessed per-cadence `.npy` stamps land in a per-CSV, tag-scoped directory by default (`{data_path}/inference/preprocessed/<csv_stem>_<save_tag>/`): retrying with the same `--save-tag` resumes from the existing `.npy` files, while a new tag starts from a clean directory that stale stamps from an older failed attempt can't leak into. To reuse an earlier run's preprocessing instead, pass its directory explicitly via `--preprocess-output-dir`.
 
 **Inference with async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
 
