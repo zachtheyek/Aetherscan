@@ -33,9 +33,8 @@ import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.cluster]
 
-# NOTE: coupled to the same persisted dummy model as the smokes (see test_inference_smoke.py
-# for the decoupling suggestion).
-_MODEL_TAG = "test_v17"  # persisted dummy model on blpc3
+# NOTE: coupled to the same persisted dummy model as the smokes, resolved through the shared
+# smoke_model_tag fixture (AETHERSCAN_SMOKE_MODEL_TAG, default test_v17).
 _BACKGROUND_FILE = "real_filtered_LARGE_HIP110750.npy"  # first default train file
 # Pinned to DataConfig's current defaults (config.py) rather than read live: test_v17 was
 # trained against these values, so a future default change must not silently alter what this
@@ -52,13 +51,13 @@ _TOLERANCE = 0.05
 _SEED = 139
 
 
-def test_snr_confidence_monotonicity(cluster_paths):
+def test_snr_confidence_monotonicity(cluster_paths, smoke_model_tag):
     if shutil.which("nvidia-smi") is None:
         pytest.skip("requires a GPU host (nvidia-smi not found)")
 
     data_path, model_path, _ = cluster_paths
-    encoder_path = os.path.join(model_path, f"vae_encoder_{_MODEL_TAG}.keras")
-    rf_path = os.path.join(model_path, f"random_forest_{_MODEL_TAG}.joblib")
+    encoder_path = os.path.join(model_path, f"vae_encoder_{smoke_model_tag}.keras")
+    rf_path = os.path.join(model_path, f"random_forest_{smoke_model_tag}.joblib")
     background_path = os.path.join(data_path, "training", _BACKGROUND_FILE)
     for required in (encoder_path, rf_path, background_path):
         if not os.path.exists(required):

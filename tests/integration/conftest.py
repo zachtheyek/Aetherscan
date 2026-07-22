@@ -30,6 +30,14 @@ def cluster_paths():
     )
 
 
+@pytest.fixture
+def smoke_model_tag():
+    """The persisted model tag the consumer smokes (inference + model-behavior) score against,
+    overridable via AETHERSCAN_SMOKE_MODEL_TAG. Defaults to the blpc3 dummy model (test_v17);
+    point it at whatever tag test_train_smoke just produced on a fresh cluster."""
+    return os.environ.get("AETHERSCAN_SMOKE_MODEL_TAG", "test_v17")
+
+
 # NOTE: come back to this later
 @pytest.fixture
 def run_pipeline():

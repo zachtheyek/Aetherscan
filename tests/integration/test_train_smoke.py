@@ -88,6 +88,10 @@ def test_train_smoke(cluster_paths, run_pipeline):
         assert os.path.exists(os.path.join(model_path, artifact)), f"missing {artifact}"
     assert os.path.exists(os.path.join(output_path, f"config_{tag}.json"))
 
+    # End-of-run benchmark report: pins the #203 _post_benchmark_report hook's real
+    # db.flush -> render path end-to-end (output_path/plots/benchmark_report_{tag}.png).
+    assert os.path.exists(os.path.join(output_path, "plots", f"benchmark_report_{tag}.png"))
+
     # Per-round checkpoints for both rounds.
     checkpoints = os.path.join(model_path, "checkpoints")
     for round_tag in ("round_01", "round_02"):
