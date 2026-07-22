@@ -34,7 +34,12 @@ from aetherscan.inference_viz import InferenceVizCollector, render_inference_vis
 from aetherscan.logger import init_logger
 from aetherscan.manager import get_manager, init_manager, register_logger
 from aetherscan.monitor import init_monitor
-from aetherscan.preprocessing import DataPreprocessor, derive_cadence_provenance
+from aetherscan.preprocessing import (
+    CadenceResult,
+    DataPreprocessor,
+    PendingCadence,
+    derive_cadence_provenance,
+)
 from aetherscan.run_state import inference_config_fingerprint
 from aetherscan.tag_guards import enforce_tag_guards
 from aetherscan.train import run_training_pipeline
@@ -322,8 +327,8 @@ class NonRetryableInferenceError(RuntimeError):
 def _infer_cadence(
     pipeline: InferencePipeline,
     preprocessor: DataPreprocessor,
-    unit,
-    cadence_result,
+    unit: PendingCadence,
+    cadence_result: CadenceResult,
     config_fingerprint: str,
 ) -> dict:
     """
@@ -500,12 +505,20 @@ def _run_streaming_csv_inference(
         totals["n_cadences"] += 1
         totals["n_skipped"] += 1
         if collector is not None:
-            collector.record_skipped(
-                unit.group.key,
-                unit.npy_path,
-                DataPreprocessor.cadence_metadata_path(unit.npy_path),
-                manifest_row,
-            )
+            # Viz collection must never fail the pass: a collector bug degrades the plots,
+            # not the science (the render phase has the same contract via _viz_safe)
+            try:
+                collector.record_skipped(
+                    unit.group.key,
+                    unit.npy_path,
+                    DataPreprocessor.cadence_metadata_path(unit.npy_path),
+                    manifest_row,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Viz collection failed for skipped cadence {unit.group.key} ({e}); "
+                    f"plots will be degraded; run continues"
+                )
         logger.info(
             f"Cadence {unit.group.key}: already inferred under tag {tag} "
             f"({n_snippets} snippets, {n_candidates} candidate(s)); skipping"
@@ -591,14 +604,23 @@ def _run_streaming_csv_inference(
                     totals["n_cadences"] += 1
 
                     if collector is not None:
-                        collector.record_processed(
-                            cadence_result.key,
-                            cadence_result.npy_path,
-                            cadence_result.metadata_path,
-                            results["provenance"],
-                            results,
-                            results["duration_s"],
-                        )
+                        # Same contract as record_skipped above: an exception here would
+                        # abort the whole pass after the cadence's inference already
+                        # succeeded — swallow it and degrade the plots instead
+                        try:
+                            collector.record_processed(
+                                cadence_result.key,
+                                cadence_result.npy_path,
+                                cadence_result.metadata_path,
+                                results["provenance"],
+                                results,
+                                results["duration_s"],
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Viz collection failed for cadence {cadence_result.key} "
+                                f"({e}); plots will be degraded; run continues"
+                            )
 
                     logger.info(
                         f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "
@@ -630,6 +652,36 @@ def _run_streaming_csv_inference(
             render_inference_visualizations(collector, preprocessor, totals)
 
     return totals
+
+
+def _run_legacy_test_files_inference(
+    preprocessor: DataPreprocessor, strategy: tf.distribute.Strategy
+) -> dict:
+    """Legacy --test-files path: load + infer in one shot. The load repeats on retry (the
+    old cross-attempt cadence_data cache is gone — the manifest made it obsolete on the
+    streaming path, and holding a catalog-sized array across attempts was its only
+    remaining use).
+
+    Before the fresh positives land, any inference_results rows a dead attempt wrote for
+    this npy_path are retired — the legacy counterpart of _infer_cadence's
+    supersede-on-retry step 1; without it a failure after partial writes plus a retry
+    would leave duplicate live candidate rows for the same npy_path.
+    """
+    config = get_config()
+    db = get_db()
+    npy_path = config.data.test_files[0]  # TODO: handle multiple test_files properly
+
+    with stage_timer("inference.load_lognorm"):
+        cadence_data = preprocessor.load_inference_data().astype(np.float32)
+
+    db.mark_superseded("inference_results", config.checkpoint.save_tag, npy_path=npy_path)
+    results = run_inference_pipeline(
+        cadence_data=cadence_data,
+        npy_path=npy_path,
+        strategy=strategy,
+    )
+    del cadence_data
+    return results
 
 
 # NOTE: we need to load the saved config from the corresponding training run, but when/where should we do that, and how does that play with apply_args_to_config()?
@@ -703,18 +755,9 @@ def inference_command():
                         "nothing to load for inference"
                     )
                     sys.exit(1)
-                # Legacy --test-files path: load + infer in one shot. The load repeats on
-                # retry (the old cross-attempt cadence_data cache is gone — the manifest
-                # made it obsolete on the streaming path, and holding a catalog-sized
-                # array across attempts was its only remaining use).
-                with stage_timer("inference.load_lognorm"):
-                    cadence_data = preprocessor.load_inference_data().astype(np.float32)
-                results = run_inference_pipeline(
-                    cadence_data=cadence_data,
-                    npy_path=config.data.test_files[0],  # TODO: handle multiple test_files properly
-                    strategy=strategy,
-                )
-                del cadence_data
+                # Legacy --test-files path: load + infer in one shot, with stale rows from
+                # a dead attempt superseded first (see _run_legacy_test_files_inference)
+                results = _run_legacy_test_files_inference(preprocessor, strategy)
             break  # success
 
         except KeyboardInterrupt:

@@ -15,6 +15,7 @@ import pytest
 
 from aetherscan import main
 from aetherscan.config import get_config
+from aetherscan.db import get_db
 from aetherscan.main import NonRetryableInferenceError, _run_streaming_csv_inference
 from aetherscan.preprocessing import CadenceGroup, CadenceResult, DataPreprocessor, PendingCadence
 from aetherscan.run_state import STAGE_RF_PLOTS, STAGE_VAE_PLOTS, TrainingRunState
@@ -129,7 +130,11 @@ class _StubPreprocessor:
             metadata_path=metadata_path,
         )
 
-    def load_inference_data(self, override_filepaths):
+    def load_inference_data(self, override_filepaths=None):
+        # override_filepaths=None mirrors the legacy --test-files call shape, which loads
+        # the configured test_files with no arguments
+        if override_filepaths is None:
+            override_filepaths = [get_config().data.test_files[0]]
         self.loaded_paths.extend(override_filepaths)
         return np.load(override_filepaths[0])
 
@@ -155,6 +160,12 @@ class _StubPipeline:
         n = data.shape[0]
         proba = np.linspace(0.05, 0.95, n)
         predictions = (proba > 0.9).astype(int)
+        # Mirror the real pipeline's side effect: positives land in inference_results, so
+        # supersede-on-retry tests gate on actual candidate rows (not an empty query)
+        db = get_db()
+        tag = get_config().checkpoint.save_tag
+        for idx in np.nonzero(predictions)[0]:
+            db.write_inference_result(npy_path, int(idx), 1, float(proba[idx]), tag=tag)
         return {
             "n_cadence_snippets": n,
             "n_processed": n,
@@ -297,8 +308,13 @@ class TestStreamingResumeStateMachine:
         _run_streaming_csv_inference(preprocessor, strategy=None)
         assert db.flush(timeout=10) is True
 
+        # Exactly the fresh attempt's candidate row is live (the stub writes one positive
+        # per cadence at confidence 0.95): no double-up, and it wasn't swept up by the
+        # supersede that retired the stale row
         live = db.query_inference_result(tag="test_v1", npy_path=npy_path)
-        assert all(r["superseded"] == 0 for r in live)
+        assert len(live) == 1
+        assert live[0]["superseded"] == 0
+        assert live[0]["confidence"] == pytest.approx(0.95)
         everything = db.query_inference_result(
             tag="test_v1", npy_path=npy_path, include_superseded=True
         )
@@ -306,10 +322,12 @@ class TestStreamingResumeStateMachine:
         assert len(stale) == 1
         assert stale[0]["confidence"] == 0.999
 
-    def test_preprocessing_artifacts_skip_to_inference(self, stubbed_streaming, tmp_path):
-        """A cadence with a stamp .npy but no 'inferred' manifest row (killed between
-        stages) must skip preprocessing and go straight to inference — via the real
-        DataPreprocessor.process_pending_cadence resume path."""
+    def test_preprocessing_artifact_resume_skips_reprocessing(self, stubbed_streaming, tmp_path):
+        """A cadence with a stamp .npy on disk resumes off it: the real
+        DataPreprocessor.process_pending_cadence returns the stored stamp count without
+        re-running energy detection. (Preprocessing-artifact resume only — the streaming
+        loop's handoff of the resumed cadence to the inference stage is not exercised
+        here.)"""
         db, make_preprocessor = stubbed_streaming
         stub = make_preprocessor(keys=[("A", "1")])
         unit = stub.units[0]
@@ -319,6 +337,70 @@ class TestStreamingResumeStateMachine:
         result = real.process_pending_cadence(unit)
         assert result is not None
         assert result.n_hits == 4  # from the existing .npy, not a re-run
+
+    def test_viz_collection_failure_never_fails_the_pass(self, stubbed_streaming, monkeypatch):
+        """A collector bug must degrade the plots, not the science: cadences still complete
+        (and resume) normally when record_processed / record_skipped raise."""
+        db, make_preprocessor = stubbed_streaming
+        get_config().inference.inference_viz_enabled = True
+
+        class _ExplodingCollector:
+            def __init__(self, *args, **kwargs):
+                self.records: list = []
+
+            def record_processed(self, *args, **kwargs):
+                raise RuntimeError("simulated collector bug")
+
+            def record_skipped(self, *args, **kwargs):
+                raise RuntimeError("simulated collector bug")
+
+        monkeypatch.setattr(main, "InferenceVizCollector", _ExplodingCollector)
+        monkeypatch.setattr(main, "render_inference_visualizations", lambda *a, **k: None)
+
+        totals = _run_streaming_csv_inference(make_preprocessor(), strategy=None)
+        assert totals["n_cadences"] == 2  # record_processed raised for both; pass unaffected
+
+        # Retry pass resumes both cadences off the manifest -> exercises the
+        # record_skipped guard the same way
+        totals = _run_streaming_csv_inference(make_preprocessor(), strategy=None)
+        assert totals["n_skipped"] == 2
+
+
+class TestLegacyTestFilesSupersede:
+    def test_stale_rows_superseded_before_rerun(self, stubbed_streaming, monkeypatch):
+        """The legacy --test-files path must retire a dead attempt's partial positives
+        before the re-run's rows land — one live set for the npy_path, no duplicates
+        (mirrors _infer_cadence's supersede-on-retry step on the streaming path)."""
+        db, make_preprocessor = stubbed_streaming
+        stub = make_preprocessor(keys=[("A", "1")])
+        unit = stub.units[0]
+        stub.process_pending_cadence(unit)  # lay down a real .npy for the no-arg load
+        get_config().data.test_files = [unit.npy_path]
+
+        # Simulate a dead attempt's partial write for this file under the same tag
+        db.write_inference_result(unit.npy_path, 0, 1, 0.999, tag="test_v1")
+        assert db.flush(timeout=10) is True
+
+        def fake_run_inference_pipeline(cadence_data, npy_path, strategy):
+            db.write_inference_result(npy_path, 1, 1, 0.7, tag="test_v1")
+            n = int(cadence_data.shape[0])
+            return {"n_cadence_snippets": n, "n_processed": n, "n_candidates": 1}
+
+        monkeypatch.setattr(main, "run_inference_pipeline", fake_run_inference_pipeline)
+
+        results = main._run_legacy_test_files_inference(stub, strategy=None)
+        assert results["n_candidates"] == 1
+
+        assert db.flush(timeout=10) is True
+        live = db.query_inference_result(tag="test_v1", npy_path=unit.npy_path)
+        assert len(live) == 1  # exactly the fresh attempt's row survives un-superseded
+        assert live[0]["superseded"] == 0
+        assert live[0]["confidence"] == pytest.approx(0.7)
+        everything = db.query_inference_result(
+            tag="test_v1", npy_path=unit.npy_path, include_superseded=True
+        )
+        stale = [r for r in everything if r["superseded"] == 1]
+        assert [r["confidence"] for r in stale] == [0.999]
 
     def test_all_cadences_no_stamps_is_non_retryable(self, stubbed_streaming, monkeypatch):
         db, make_preprocessor = stubbed_streaming
