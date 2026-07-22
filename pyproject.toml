@@ -91,6 +91,12 @@ classifiers = [
 Homepage = "https://github.com/zachtheyek/Aetherscan"
 Issues = "https://github.com/zachtheyek/Aetherscan/issues"
 
+[project.scripts]
+# Manual dashboard runs against a saved DB (main.py auto-launches it during a run). Re-execs
+# `python -m streamlit run <packaged dashboard.py>` because streamlit must own the process —
+# a plain `python -m aetherscan.dashboard` renders nothing. Needs the `dashboard` extra.
+aetherscan-dashboard = "aetherscan.dashboard_cli:main"
+
 [project.optional-dependencies]
 dev = ["ruff", "pre-commit", "pytest"]
 # Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). Opt-in extra so a
