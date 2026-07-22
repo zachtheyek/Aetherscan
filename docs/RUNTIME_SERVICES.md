@@ -96,7 +96,7 @@ resources — they go through the manager so cleanup is centralized and ordered.
 | Wrapper | Created via | Cleanup behavior |
 | --- | --- | --- |
 | `ManagedPool` | `create_pool(n_processes, name, initializer, initargs)` | `terminate()` → `join()` with `manager.pool_terminate_timeout`; workers still alive after the timeout are **SIGKILL-escalated** individually (`_force_kill_workers`). Termination sends SIGTERM first, which is what triggers the workers' cleanup handlers. |
-| `ManagedProcess` | `register_process(process, name)` (e.g. the RoundDataProducer) | `terminate()` → `join(timeout)` → `kill()` escalation (`close_process`). |
+| `ManagedProcess` | `register_process(process, name)` (e.g. the RoundDataProducer) | `terminate()` → `join(timeout)` → `kill()` escalation (`close_process`). `_reap_process_subtree()` (best-effort recursive-children kill) now runs in **all three** `close()` paths — survived-SIGTERM, exception fallback, and dead-on-entry — not just the SIGKILL escalation. The dead-on-entry path is best-effort (children have already been reparented); on the producer side this is covered by the ppid watch. |
 | `ManagedSharedMemory` | `create_shared_memory(size, name)` | `close()` + `unlink()` in the creator, then a verification probe (`_check_unlinked`) that re-attaches by name to confirm the segment is really gone — leaked `/dev/shm` blocks survive process death and eat node RAM. |
 
 The **creator-unlinks rule** ([`CLAUDE.md`](../CLAUDE.md)): workers attaching to a shared

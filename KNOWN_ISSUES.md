@@ -262,7 +262,15 @@ pools / shared memory) before escalating to SIGKILL:
 
 # Preview the process tree without sending any signals
 ./utils/kill_pipeline.sh --dry-run
+
+# Override the round-data root used for orphan-producer pidfile discovery
+./utils/kill_pipeline.sh --round-data-root /path/to/round_data
 ```
+
+When no main process is found, `kill_pipeline.sh` sweeps
+`{round_data_root}/*/producer.pid` for orphaned `RoundDataProducer` process
+trees left behind by an ungraceful main-process death, and reaps any that are
+still alive.
 
 A forced kill skips `ResourceManager` cleanup, so clean up any orphaned shared
 memory afterwards (the script prints a reminder):

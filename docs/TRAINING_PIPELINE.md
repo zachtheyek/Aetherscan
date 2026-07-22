@@ -135,6 +135,20 @@ than round 1's):
   child's TF import can never initialize CUDA.
 - Registered with the ResourceManager (`ManagedProcess`), so cleanup escalates
   terminate → join → kill.
+- **Parent-death watch.** The request loop's `get(timeout=5)` doubles as a
+  heartbeat: each timeout re-checks `os.getppid()`, and if the parent PID has
+  changed (reparented to init/systemd after an ungraceful main-process death),
+  the producer terminates its pool and exits — no `shutdown_ack` is sent. On
+  Linux, `prctl(PR_SET_PDEATHSIG, SIGTERM)` provides immediate coverage for
+  mid-generation parent death via the existing SIGTERM handler.
+- **Pidfile (`producer.pid`).** `start()` writes
+  `{round_data_root}/{tag}/producer.pid`; `shutdown()` removes it on graceful
+  exit. The pidfile enables post-mortem discovery by `kill_pipeline.sh` and
+  `_reap_stale_producer()`.
+- **Restart-race guard.** `prepare_round_data_dir()` calls
+  `_reap_stale_producer()` before any `rmtree`, terminating a live orphan
+  recorded in the pidfile (with a PID-reuse guard via `create_time()` vs
+  pidfile mtime) so a new run cannot race an orphan's live writes.
 
 `--no-overlap-data-generation` falls back to sequential in-process generation (the debugging
 path, also used automatically when `manager.n_processes == 1`).
