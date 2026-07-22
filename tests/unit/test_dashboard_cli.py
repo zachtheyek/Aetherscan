@@ -60,3 +60,17 @@ def test_main_exits_when_streamlit_absent():
         with pytest.raises(SystemExit, match="streamlit is not installed"):
             main([])
         execv.assert_not_called()
+
+
+def test_main_exits_when_script_missing():
+    # streamlit present but the packaged dashboard.py absent → clear error, never exec
+    fake_script = mock.Mock()
+    fake_script.is_file.return_value = False
+    with (
+        mock.patch(f"{_MOD}.importlib.util.find_spec", return_value=object()),
+        mock.patch(f"{_MOD}._DASHBOARD_SCRIPT", fake_script),
+        mock.patch(f"{_MOD}.os.execv") as execv,
+    ):
+        with pytest.raises(SystemExit, match="dashboard script not found"):
+            main([])
+        execv.assert_not_called()

@@ -40,6 +40,10 @@ def main(argv: list[str] | None = None) -> None:
             "aetherscan-dashboard: streamlit is not installed. "
             "Install the dashboard extra: pip install 'aetherscan[dashboard]'"
         )
+    # Parity with dashboard_launcher._DASHBOARD_SCRIPT.is_file(): fail with a clear message
+    # instead of a cryptic os.execv OSError / Streamlit error if the packaged script is absent.
+    if not _DASHBOARD_SCRIPT.is_file():
+        raise SystemExit(f"aetherscan-dashboard: dashboard script not found: {_DASHBOARD_SCRIPT}")
     os.execv(sys.executable, build_exec_argv(sys.argv[1:] if argv is None else argv))
 
 
