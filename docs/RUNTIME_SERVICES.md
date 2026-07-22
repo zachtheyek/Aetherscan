@@ -225,4 +225,8 @@ reconstruct plus a PNG gallery.
   `PYTHONPATH=src python -m aetherscan.dashboard_cli <args>`. Either way it re-execs
   `python -m streamlit run <packaged dashboard.py> -- <args>` — Streamlit must own the process,
   so `python -m aetherscan.dashboard` does **not** work (`st.*` calls outside a
-  ScriptRunContext render nothing).
+  ScriptRunContext render nothing). Everything after the script is forwarded to `dashboard.py`'s
+  argparse (`--db-path` / `--tag` / `--plots-dir` / `--refresh`), so `aetherscan-dashboard` does
+  **not** expose Streamlit's own `--server.*` flags; to set those (e.g. a custom `--server.port`),
+  run the verbose form directly:
+  `python -m streamlit run <packaged dashboard.py> --server.port 9000 -- --db-path … --tag …`.
