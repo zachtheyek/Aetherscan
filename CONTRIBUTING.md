@@ -179,6 +179,7 @@ Aetherscan/
 │   ├── benchmark.py            # Always-on stage timing → pipeline_stages table
 │   ├── dashboard.py            # Streamlit live-monitoring dashboard (DB-driven)
 │   ├── dashboard_launcher.py   # Spawns the headless dashboard subprocess (guarded)
+│   ├── dashboard_cli.py        # Console entry point for manual dashboard runs (aetherscan-dashboard)
 │   ├── hf_hub.py               # HuggingFace Hub artifact upload/download
 │   ├── tag_guards.py           # Fail-early --save-tag dedup guards
 │   ├── models/
@@ -256,6 +257,7 @@ Aetherscan/
 | `benchmark.py`            | Always-on stage timing (`stage_timer`/`record_stage`) to `pipeline_stages` |
 | `dashboard.py`            | Streamlit live-monitoring dashboard read from the run SQLite DB        |
 | `dashboard_launcher.py`   | `launch_dashboard()` spawns/reaps the headless dashboard subprocess    |
+| `dashboard_cli.py`        | `aetherscan-dashboard` console script; re-execs Streamlit for manual DB inspection |
 | `hf_hub.py`               | HuggingFace Hub artifact upload/download, version-coupled revisions    |
 | `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
 | `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
