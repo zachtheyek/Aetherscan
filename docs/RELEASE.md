@@ -104,7 +104,12 @@ impossible:
    otherwise fail loudly before anything publishes. (Prevents tagging a commit whose release
    PR didn't land.)
 3. **Unit tests** — the same selection as `tests.yml`
-   (`pytest -m "not gpu and not cluster"`). A release build must not outrun a red suite.
+   (`pytest -m "not gpu and not cluster and not integration"`; the trailing
+   `and not integration` is a defense-in-depth leak-guard — see
+   [`TESTING.md`](TESTING.md#ci)). The release workflow reuses `tests.yml`
+   directly ([`.github/workflows/release.yml`](../.github/workflows/release.yml)),
+   so the two selections stay in sync automatically. A release build must not
+   outrun a red suite.
 4. **HF weights verification** — confirm the matching `v*` tag exists on
    `zachtheyek/aetherscan` (public repo, no token needed). **Verify, never create**: if this
    fails, you skipped the weight-blessing step; the error says so and how to fix it.

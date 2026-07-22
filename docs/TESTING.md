@@ -8,7 +8,9 @@ integration smokes, and the checklist for adding tests. The quick-start version 
 ## TL;DR
 
 ```bash
-# Default selection — exactly what CI runs (no GPUs, no cluster data needed):
+# Default selection — matches what CI runs (no GPUs, no cluster data needed).
+# CI additionally appends `and not integration` as a leak-guard; see the `## CI`
+# section below. The two expressions select the same set today.
 pytest -m "not gpu and not cluster" -q
 
 # One file / one test while iterating:
@@ -156,7 +158,7 @@ Two further gaps are accepted as-is (neither affects pipeline correctness):
 | `slow` | Slower CPU tests (e.g. builds real TF graphs) | **Yes** — CI runs them |
 | `gpu` | Needs one or more physical GPUs | No |
 | `cluster` | Needs cluster-resident data/models (blpc3/bla0 paths) | No |
-| `integration` | End-to-end subprocess runs; **skips the isolation fixture** | No (they're also gpu+cluster) |
+| `integration` | End-to-end subprocess runs; **skips the isolation fixture** | No (they're also gpu+cluster) — CI also excludes them by marker as a defense-in-depth guard |
 
 `--strict-markers` rejects anything not declared in `pyproject.toml` — add new markers there
 first.
@@ -216,8 +218,14 @@ pushes to master, on Python **3.10, 3.11, and 3.12** (the full `requires-python`
 
 ```
 pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
-pytest -m "not gpu and not cluster" -q
+pytest -m "not gpu and not cluster and not integration" -q
 ```
+
+The trailing `and not integration` is a defense-in-depth leak-guard: it catches
+any future test marked *only* `integration` (which skips the singleton-isolation
+fixture) that would otherwise leak into CI without a `gpu` or `cluster`
+co-marker. Today every `integration` test is also `gpu`+`cluster`, so the
+`and not integration` clause is a no-op on the current suite.
 
 `tensorflow-cpu` stands in for the container's GPU TF 2.17 build; `h5py`/`hdf5plugin`/
 `pandas`/`psutil` are installed explicitly because the NGC base image ships them (so
