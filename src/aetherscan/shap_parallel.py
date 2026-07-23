@@ -7,18 +7,22 @@ pass. SHAP values are per-sample independent, though, so we chunk the samples ac
 call a **stock** ``shap.TreeExplainer`` in each worker (not a fork of the algorithm — just
 parallelism). Measured ~40-45x on a 96-core node, byte-identical to the single-threaded result.
 
-This module is deliberately **TensorFlow-free**: ``train.py`` imports TF at module level, and the
-workers use the ``spawn`` start method (which re-imports the worker's module), so keeping the worker
-code here means each worker starts a lightweight sklearn+shap process instead of dragging TF (and its
-GPU context) into every core. See ``_compute_or_load_shap_values`` in ``train.py`` for the caller and
+This module is deliberately kept small and off the TF/training import graph. ``train.py`` imports
+TensorFlow at module level (and pulls in matplotlib/umap/…), and multiprocessing's ``spawn`` re-imports
+the parent's ``__main__`` (``aetherscan.main`` → TF → the whole training stack) into every worker. So
+the pool runs under the **forkserver** start method with an **empty preload**: the fork server is
+spawned once, clean (no ``__main__`` re-import), and workers fork from it — importing only this module
++ shap, never TF. See ``_compute_or_load_shap_values`` in ``train.py`` for the caller and
 ``docs/TRAINING_PIPELINE.md`` for the CPU-vs-GPU comparison behind this choice.
 
 Design notes:
   * **Rebuild the explainer inside each worker** from the picklable sklearn RF — never pickle a
     pre-built ``TreeExplainer`` into workers (segfaults large-model workers; shap #1204). Workers
     load the RF from its persisted joblib path so the model isn't re-serialised through the pool.
-  * **Pin BLAS/OpenMP threads to 1 per worker** (set before numpy/shap import in each fresh spawn
-    process) so N workers don't each spin up a full thread pool and oversubscribe the CPU.
+  * **forkserver + empty preload** keeps workers off the TF/training stack (see above); the fork
+    server is spawned once and forks lightweight workers.
+  * **Pin BLAS/OpenMP threads to 1 per worker** so N workers don't oversubscribe the CPU (best-effort:
+    shap's TreeSHAP is single-threaded, so this only tames incidental numpy/BLAS threads).
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ _RAW_KINDS = ("summary", "interaction")
 _LOGLOSS_KIND = "logloss"
 
 # Per-worker globals, populated once by the pool initializer (or in-process for the n_workers==1
-# fallback). Module-level so the spawn workers can resolve them.
+# fallback). Module-level so the forkserver workers can resolve them.
 _RF = None
 _BACKGROUND = None
 
@@ -150,9 +154,13 @@ def parallel_shap(
 
     chunks = np.array_split(np.arange(n), n_workers)
     tasks = [(i, kind, x[c], (None if y is None else y[c])) for i, c in enumerate(chunks) if len(c)]
+    # forkserver with an EMPTY preload: the fork server is spawned clean and does NOT re-import the
+    # parent's __main__ (aetherscan.main -> TF -> the whole training stack), so workers stay light.
+    ctx = mp.get_context("forkserver")
+    ctx.set_forkserver_preload([])
     with ProcessPoolExecutor(
         max_workers=n_workers,
-        mp_context=mp.get_context("spawn"),
+        mp_context=ctx,
         initializer=_worker_init,
         initargs=(rf_path, background),
     ) as pool:
