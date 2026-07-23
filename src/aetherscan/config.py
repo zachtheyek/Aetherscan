@@ -197,9 +197,24 @@ class TrainingConfig:
     num_samples_rf: int = 99840  # NOTE: come back to this later
     train_val_split: float = 0.8
 
-    per_replica_batch_size: int = 128
-    effective_batch_size: int = 3072  # Effective batch size for gradient accumulation
-    per_replica_val_batch_size: int = 80  # Used for both model validation, viz batch latent generation, and random forest latent generation
+    per_replica_batch_size: int = (
+        128  # Throughput-optimal per GPU (see benchmarks/README.md GPU sweep)
+    )
+    # Gradient-accumulation target. 7680 = lcm(per_replica_batch_size * {4,5,6}), so effective_batch_size
+    # is divisible by per_replica_batch_size * num_replicas on 4-, 5-, or 6-GPU hosts (and divides the
+    # 399360-sample train split); it makes the defaults valid on every supported GPU count, including
+    # the 5-GPU Blackwell cluster where the previous 3072 failed. On a fixed GPU count you can override
+    # with a smaller multiple (e.g. --effective-batch-size 3072 on 4 or 6 GPUs) to accumulate over fewer
+    # micro-batches; per-GPU throughput is unchanged (set by per_replica_batch_size).
+    effective_batch_size: int = 7680
+    # Validation / viz / RF-latent-generation batch per GPU. Its global size (64 * num_replicas) must
+    # divide the val split (99840), num_samples_rf (99840), and latent_viz_num_cadences_per_type * 4;
+    # 64 is paired with latent_viz_num_cadences_per_type=960 (below) so all three hold on 4-, 5-, or
+    # 6-GPU hosts. Runs off the training hot path, but 64 (vs the bare divisibility floor of 16 at
+    # latent_viz=240) keeps validation / latent-generation out of the small-batch launch-overhead
+    # regime (see the encode sweep in benchmarks/README.md) — a net win over a full run's ~2000
+    # validations. Raising V requires raising latent_viz in lockstep (V=128 needs latent_viz=1920).
+    per_replica_val_batch_size: int = 64
 
     # Signal injection params
     # TODO: experiment with larger chunk sizes (how to track chunk processing efficiency)
@@ -230,9 +245,11 @@ class TrainingConfig:
     )
 
     # Latent space visualization params
-    latent_viz_num_cadences_per_type: int = (
-        240  # Cadences per signal type for viz batch (total = 4×)
-    )
+    # Cadences per signal type for the latent-space viz batch (total = 4×). 960 rather than a smaller
+    # value so latent_viz*4 (3840) is divisible by per_replica_val_batch_size * num_replicas on 4-, 5-,
+    # or 6-GPU hosts (this is the binding constraint that lets per_replica_val_batch_size be 64 instead
+    # of 16); it also yields denser latent-space plots. Must stay <= the val split (99840).
+    latent_viz_num_cadences_per_type: int = 960
     latent_viz_step_interval: int = 10  # Capture snapshot every N training steps
     latent_viz_umap_fit_max_samples: int = (
         100_000  # Max pooled vectors for UMAP fit (rest are projected via .transform())
