@@ -117,17 +117,11 @@ def _peak_vram_gb(devices: list[str]) -> float:
     return max(tf.config.experimental.get_memory_info(d)["peak"] for d in devices) / 1e9
 
 
-def _make_step_fn(model, mode: str):
-    """Per-replica step run via strategy.run. Train: compute the grads for one micro-batch (no
-    apply — the reduce/accumulate/clip/apply happens once per optimizer step in _measure, mirroring
-    train.py's _distributed_train_step + _apply_gradients). Encode: an encoder forward."""
+def _make_encode_step_fn(model):
+    """Per-replica encoder forward, run via strategy.run for `--mode encode`. (The train path builds
+    its own gradient-accumulating step inside _measure, so it does not use this.)"""
 
     def step_fn(inputs):
-        if mode == "train":
-            main, true_, false_, target = inputs
-            with tf.GradientTape() as tape:
-                losses = model.compute_total_loss(main, true_, false_, target, training=True)
-            return tape.gradient(losses["total_loss"], model.trainable_variables)
         z_mean, _, _ = model.encoder(inputs[0], training=False)
         return z_mean
 
@@ -150,28 +144,42 @@ def _measure(
         return tuple(tf.constant(_rand((batch, *shape))) for _ in range(n_inputs))
 
     @tf.function
-    def run(dist_inputs):
-        if mode != "train":
-            return strategy.run(step_fn, args=(dist_inputs,))
-        # One optimizer step: accumulate the cross-replica MEAN-reduced grads over
-        # accumulation_steps micro-batches, then apply once (global-norm clip + Adam) — the
-        # accumulate-then-apply cadence of _train_epoch / _distributed_train_step / _apply_gradients.
-        accumulated = None
-        for _ in range(accumulation_steps):
-            per_replica_grads = strategy.run(step_fn, args=(dist_inputs,))
-            reduced = [
-                strategy.reduce(tf.distribute.ReduceOp.MEAN, g, axis=None)
-                for g in per_replica_grads
+    def encode_run(dist_inputs):
+        return strategy.run(step_fn, args=(dist_inputs,))
+
+    if mode == "train":
+        # Per-replica gradient accumulators (created in scope so they mirror across replicas).
+        with strategy.scope():
+            accumulators = [
+                tf.Variable(tf.zeros_like(v), trainable=False) for v in model.trainable_variables
             ]
-            accumulated = (
-                reduced
-                if accumulated is None
-                else [a + r for a, r in zip(accumulated, reduced, strict=False)]
-            )
-        averaged = [g / accumulation_steps for g in accumulated]
-        clipped, _ = tf.clip_by_global_norm(averaged, _CLIP_NORM)
-        model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
-        return None
+
+        def _accumulate(inputs):
+            main, true_, false_, target = inputs
+            with tf.GradientTape() as tape:
+                losses = model.compute_total_loss(main, true_, false_, target, training=True)
+            grads = tape.gradient(losses["total_loss"], model.trainable_variables)
+            for acc, g in zip(accumulators, grads, strict=False):
+                acc.assign_add(g)
+
+        def _apply_and_reset():
+            grads = [acc / accumulation_steps for acc in accumulators]
+            clipped, _ = tf.clip_by_global_norm(grads, _CLIP_NORM)
+            model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
+            for acc in accumulators:
+                acc.assign(tf.zeros_like(acc))
+
+        @tf.function
+        def run(dist_inputs):
+            # Accumulate grads over accumulation_steps micro-batches into the per-replica
+            # accumulators, then apply once. The apply runs INSIDE strategy.run, so MirroredStrategy
+            # all-reduces on apply — the correct multi-GPU accumulate-then-apply cadence, and it
+            # sidesteps the cross-device error from applying pre-reduced grads in cross-replica context.
+            for _ in range(accumulation_steps):
+                strategy.run(_accumulate, args=(dist_inputs,))
+            strategy.run(_apply_and_reset)
+    else:
+        run = encode_run
 
     def sync(out) -> None:
         # Force queued device work to finish before the clock is read. Train applies mutate the
@@ -280,7 +288,7 @@ def main() -> None:
     strategy = tf.distribute.MirroredStrategy(devices=[f"/{d}" for d in devices])
     with strategy.scope():
         model = create_beta_vae_model()
-    step_fn = _make_step_fn(model, args.mode)
+    step_fn = _make_encode_step_fn(model)
 
     unit = "cadences/s" if args.mode == "train" else "obs/s"
     shape = _CADENCE_SHAPE if args.mode == "train" else _OBS_SHAPE
