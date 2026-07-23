@@ -13,8 +13,8 @@ Examples:
     # Check default config against a 4-GPU setup
     %(prog)s --num-gpus 4 train
 
-    # Check defaults overridden by --effective-batch-size and search across 4 & 6 GPUs
-    %(prog)s --num-gpus 4,6 train --effective-batch-size 3072
+    # An override that's invalid for 5 GPUs — propose the nearest valid combination
+    %(prog)s --num-gpus 5 train --effective-batch-size 3072
 
     # Check inference defaults with an invalid overlap-fraction
     %(prog)s inference --overlap-fraction 1.5
@@ -188,6 +188,7 @@ def main() -> int:
             "per_replica_batch_size": config.training.per_replica_batch_size,
             "effective_batch_size": config.training.effective_batch_size,
             "per_replica_val_batch_size": config.training.per_replica_val_batch_size,
+            "latent_total": config.training.latent_viz_num_cadences_per_type * 4,
         }
         print(
             f"\n  Searching for a coordinated patch across {len(num_replicas_list)} replica count(s)..."

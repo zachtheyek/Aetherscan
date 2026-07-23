@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, field, is_dataclass
-from itertools import product
+from math import gcd, lcm
 from typing import Any
 
 from aetherscan.config import get_config
@@ -2396,13 +2396,16 @@ def collect_validation_errors(
 # cross-replica violations can't be fixed by clamping one field — the solver
 # below grid-searches these ranges minimizing L1 distance to the current
 # values.
+# Neighborhoods for the fields the solver prefers to keep near their base value (data sizes +
+# the throughput-optimal per-replica batch). effective_batch_size and per_replica_val_batch_size
+# are deliberately NOT here: they are generated exactly from the divisibility structure (divisors
+# of the train split / of the gcd of the val-side counts), so the search is small and complete
+# rather than a coarse grid that either explodes or steps over the only valid values.
 _SEARCH_RANGES: dict[str, tuple[int, int, int]] = {
     # (min, max, step)
     "num_samples_beta_vae": (400_000, 600_000, 10_240),
     "num_samples_rf": (80_000, 120_000, 2_048),
-    "per_replica_batch_size": (64, 256, 1),
-    "effective_batch_size": (2_048, 6_144, 64),
-    "per_replica_val_batch_size": (256, 768, 1),
+    "per_replica_batch_size": (64, 256, 64),
 }
 
 _CROSS_PARAM_FIELDS = (
@@ -2414,6 +2417,22 @@ _CROSS_PARAM_FIELDS = (
 )
 
 
+def _divisors(n: int) -> list[int]:
+    """Sorted positive divisors of ``n`` (empty for n < 1)."""
+    if n < 1:
+        return []
+    small: list[int] = []
+    large: list[int] = []
+    i = 1
+    while i * i <= n:
+        if n % i == 0:
+            small.append(i)
+            if i != n // i:
+                large.append(n // i)
+        i += 1
+    return small + large[::-1]
+
+
 def _check_cross_constraints(
     num_samples_beta_vae: int,
     num_samples_rf: int,
@@ -2422,10 +2441,14 @@ def _check_cross_constraints(
     effective_batch_size: int,
     per_replica_val_batch_size: int,
     num_replicas_list: list[int],
+    latent_total: int | None = None,
 ) -> bool:
     """Return True iff the six-tuple satisfies all cross-replica constraints for every
     num_replicas in the list. Mirrors the cross-replica checks in
-    :func:`collect_validation_errors`."""
+    :func:`collect_validation_errors`. When ``latent_total`` (= latent_viz_num_cadences_per_type
+    * 4) is supplied, the latent-viz divisibility check is included too, so a returned solution is
+    valid against every cross-replica constraint the pipeline enforces — pass None to skip it (e.g.
+    when the caller doesn't vary anything the latent batch depends on)."""
     if not (0 <= train_val_split <= 1):
         return False
     if num_samples_rf % 2 != 0:
@@ -2452,87 +2475,109 @@ def _check_cross_constraints(
             return False
         if num_samples_rf % gval != 0:
             return False
+        if latent_total is not None and latent_total % gval != 0:
+            return False
     return True
 
 
 def _solve_cross_param_constraints(
     base: dict[str, int | float],
     num_replicas_list: list[int],
-    max_candidates: int = 10_000_000,
+    max_candidates: int = 5_000_000,
 ) -> dict[str, int | float] | None:
-    """Grid-search the six batch/sample params for a configuration satisfying all
-    cross-replica constraints, minimizing L1 distance from ``base``. Returns None if no
-    solution found within the search ranges or the candidate budget."""
-    if _check_cross_constraints(
-        base["num_samples_beta_vae"],
-        base["num_samples_rf"],
-        base["train_val_split"],
-        base["per_replica_batch_size"],
-        base["effective_batch_size"],
-        base["per_replica_val_batch_size"],
-        num_replicas_list,
-    ):
-        return dict(base)
+    """Find the batch/sample configuration nearest (L1) to ``base`` that satisfies every
+    cross-replica constraint for all replica counts in ``num_replicas_list``, or None if none
+    exists. ``base`` may carry an optional ``latent_total`` key (= latent_viz_num_cadences_per_type
+    * 4) so the latent-viz constraint is honored.
 
-    ranges: dict[str, list[int]] = {}
-    for f_name in _CROSS_PARAM_FIELDS:
-        lo, hi, step = _SEARCH_RANGES[f_name]
-        ranges[f_name] = list(range(lo, hi + 1, step))
+    Rather than a blind grid (which both explodes past the candidate budget and steps over the only
+    valid values), the effective batch and per-replica val batch — the two purely divisibility-bound
+    fields — are enumerated *exactly* from the structure: the effective batch must be a divisor of
+    the train split that is a multiple of ``per_replica_batch_size * num_replicas`` for every replica
+    count; the global val batch must divide the gcd of the val split, num_samples_rf, and (if given)
+    latent_total. The data sizes and per-replica batch are only nudged across small neighborhoods
+    (changing them is a last resort). Every candidate is confirmed with the shared
+    :func:`_check_cross_constraints`, which stays the single source of truth."""
+    latent_total = base.get("latent_total")
+    tvs = base["train_val_split"]
+    b_nsb = base["num_samples_beta_vae"]
+    b_nsr = base["num_samples_rf"]
+    b_p = base["per_replica_batch_size"]
+    b_e = base["effective_batch_size"]
+    b_v = base["per_replica_val_batch_size"]
 
-    total = 1
-    for r in ranges.values():
-        total *= len(r)
-    if total > max_candidates:
-        logger.debug(
-            "Cross-param solver search space (%d) exceeds budget (%d); skipping.",
-            total,
-            max_candidates,
+    def _ok(nsb, nsr, p, e, v):
+        return _check_cross_constraints(
+            nsb, nsr, tvs, p, e, v, num_replicas_list, latent_total=latent_total
         )
-        return None
 
-    train_val_split = base["train_val_split"]  # held fixed across the search
+    if _ok(b_nsb, b_nsr, b_p, b_e, b_v):
+        return {
+            "num_samples_beta_vae": b_nsb,
+            "num_samples_rf": b_nsr,
+            "train_val_split": tvs,
+            "per_replica_batch_size": b_p,
+            "effective_batch_size": b_e,
+            "per_replica_val_batch_size": b_v,
+        }
+
+    def _neighborhood(field: str) -> list[int]:
+        lo, hi, step = _SEARCH_RANGES[field]
+        return sorted({base[field]} | set(range(lo, hi + 1, step)))
+
+    nsb_cands = _neighborhood("num_samples_beta_vae")
+    nsr_cands = _neighborhood("num_samples_rf")
+    p_cands = _neighborhood("per_replica_batch_size")
+
     best: dict[str, int | float] | None = None
     best_dist = float("inf")
-    for (
-        num_samples_beta_vae,
-        num_samples_rf,
-        per_replica_batch_size,
-        effective_batch_size,
-        per_replica_val_batch_size,
-    ) in product(
-        ranges["num_samples_beta_vae"],
-        ranges["num_samples_rf"],
-        ranges["per_replica_batch_size"],
-        ranges["effective_batch_size"],
-        ranges["per_replica_val_batch_size"],
-    ):
-        if not _check_cross_constraints(
-            num_samples_beta_vae,
-            num_samples_rf,
-            train_val_split,
-            per_replica_batch_size,
-            effective_batch_size,
-            per_replica_val_batch_size,
-            num_replicas_list,
-        ):
-            continue
-        dist = (
-            abs(num_samples_beta_vae - base["num_samples_beta_vae"])
-            + abs(num_samples_rf - base["num_samples_rf"])
-            + abs(per_replica_batch_size - base["per_replica_batch_size"])
-            + abs(effective_batch_size - base["effective_batch_size"])
-            + abs(per_replica_val_batch_size - base["per_replica_val_batch_size"])
-        )
-        if dist < best_dist:
-            best_dist = dist
-            best = {
-                "num_samples_beta_vae": num_samples_beta_vae,
-                "num_samples_rf": num_samples_rf,
-                "train_val_split": train_val_split,
-                "per_replica_batch_size": per_replica_batch_size,
-                "effective_batch_size": effective_batch_size,
-                "per_replica_val_batch_size": per_replica_val_batch_size,
-            }
+    checked = 0
+    for nsb in nsb_cands:
+        train_samples = round(nsb * tvs)
+        val_samples = round(nsb * (1 - tvs))
+        train_divisors = _divisors(train_samples)
+        for p in p_cands:
+            gtrains = [p * nr for nr in num_replicas_list]
+            lcm_gtrain = 1
+            for gt in gtrains:
+                lcm_gtrain = lcm(lcm_gtrain, gt)
+            min_e = max(gtrains)
+            e_cands = [d for d in train_divisors if d >= min_e and d % lcm_gtrain == 0]
+            if not e_cands:
+                continue
+            for nsr in nsr_cands:
+                if nsr % 2 != 0:
+                    continue
+                g = gcd(val_samples, nsr)
+                if latent_total is not None:
+                    g = gcd(g, latent_total)
+                v_cands = [
+                    d for d in _divisors(g) if all(g % (d * nr) == 0 for nr in num_replicas_list)
+                ]
+                for e in e_cands:
+                    for v in v_cands:
+                        if checked >= max_candidates:
+                            return best
+                        checked += 1
+                        if not _ok(nsb, nsr, p, e, v):
+                            continue
+                        dist = (
+                            abs(nsb - b_nsb)
+                            + abs(nsr - b_nsr)
+                            + abs(p - b_p)
+                            + abs(e - b_e)
+                            + abs(v - b_v)
+                        )
+                        if dist < best_dist:
+                            best_dist = dist
+                            best = {
+                                "num_samples_beta_vae": nsb,
+                                "num_samples_rf": nsr,
+                                "train_val_split": tvs,
+                                "per_replica_batch_size": p,
+                                "effective_batch_size": e,
+                                "per_replica_val_batch_size": v,
+                            }
     return best
 
 
@@ -2599,6 +2644,7 @@ def _build_suggestion_block(errors: list[ValidationError], num_replicas: int | N
             "per_replica_batch_size": config.training.per_replica_batch_size,
             "effective_batch_size": config.training.effective_batch_size,
             "per_replica_val_batch_size": config.training.per_replica_val_batch_size,
+            "latent_total": config.training.latent_viz_num_cadences_per_type * 4,
         }
         solution = _solve_cross_param_constraints(base, [num_replicas])
         if solution is not None:

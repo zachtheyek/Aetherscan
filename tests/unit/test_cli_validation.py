@@ -91,22 +91,13 @@ class TestTagPattern:
 
 
 class TestCrossReplicaDivisibilityMatrix:
-    """Default config divides cleanly across 4 or 6 replicas but NOT 5; the blpc3 smoke config
-    is the inverse. collect_validation_errors must reproduce that matrix exactly."""
+    """The default config divides cleanly across 4, 5, AND 6 replicas (issue #254 — Option B
+    defaults); the blpc3 smoke config is valid for 5 only. collect_validation_errors must
+    reproduce that matrix exactly."""
 
-    @pytest.mark.parametrize("num_replicas", [4, 6])
-    def test_defaults_valid_for_4_and_6_replicas(self, num_replicas):
+    @pytest.mark.parametrize("num_replicas", [4, 5, 6])
+    def test_defaults_valid_for_4_5_6_replicas(self, num_replicas):
         assert _cross_param_errors(_parse(["train"]), num_replicas) == []
-
-    def test_defaults_invalid_for_5_replicas(self):
-        errors = _cross_param_errors(_parse(["train"]), 5)
-        violated = {e.field for e in errors}
-        assert violated == {
-            "training.effective_batch_size",
-            "training.num_samples_beta_vae",
-            "training.num_samples_rf",
-            "training.latent_viz_num_cadences_per_type",
-        }
 
     def test_smoke_config_valid_for_5_replicas(self):
         assert _cross_param_errors(_parse(["train", *_SMOKE_FLAGS_5_REPLICAS]), 5) == []
@@ -366,8 +357,8 @@ class TestSemanticChecks:
 
 
 class TestCrossParamSolver:
-    _VALID_BASE = {
-        # The repo defaults: valid for 4 and 6 replicas.
+    # A config valid for 4 and 6 replicas but not 5 — the shape of the pre-Option-B defaults.
+    _BASE_4_6 = {
         "num_samples_beta_vae": 499200,
         "num_samples_rf": 99840,
         "train_val_split": 0.8,
@@ -375,91 +366,59 @@ class TestCrossParamSolver:
         "effective_batch_size": 3072,
         "per_replica_val_batch_size": 80,
     }
+    _LATENT_TOTAL = 960  # latent_viz_num_cadences_per_type (240) * 4
 
     def test_check_cross_constraints_matrix(self):
-        assert _check_cross_constraints(**self._VALID_BASE, num_replicas_list=[4])
-        assert _check_cross_constraints(**self._VALID_BASE, num_replicas_list=[6])
-        assert not _check_cross_constraints(**self._VALID_BASE, num_replicas_list=[5])
+        assert _check_cross_constraints(**self._BASE_4_6, num_replicas_list=[4])
+        assert _check_cross_constraints(**self._BASE_4_6, num_replicas_list=[6])
+        assert not _check_cross_constraints(**self._BASE_4_6, num_replicas_list=[5])
+
+    def test_check_cross_constraints_latent_is_optional_and_enforced(self):
+        # per_replica_val_batch_size 13 -> global 78 on 6 GPUs, which divides the val split and
+        # num_samples_rf (both 99840) but NOT latent_viz*4 = 960.
+        base = {**self._BASE_4_6, "per_replica_val_batch_size": 13}
+        assert _check_cross_constraints(**base, num_replicas_list=[6])  # latent skipped by default
+        assert not _check_cross_constraints(**base, num_replicas_list=[6], latent_total=960)
 
     def test_solver_returns_base_when_already_valid(self):
-        assert _solve_cross_param_constraints(self._VALID_BASE, [4, 6]) == self._VALID_BASE
+        assert _solve_cross_param_constraints(self._BASE_4_6, [4, 6]) == self._BASE_4_6
+
+    def test_solver_keeps_data_and_batch_when_fixing_5_replicas(self):
+        # The signature failure (valid for 6, not 5): the solver must keep the data sizes and the
+        # throughput-optimal per-replica batch, moving only the two divisibility-bound batches.
+        base = {**self._BASE_4_6, "latent_total": self._LATENT_TOTAL}
+        sol = _solve_cross_param_constraints(base, [5])
+        assert sol is not None
+        assert sol["num_samples_beta_vae"] == base["num_samples_beta_vae"]
+        assert sol["num_samples_rf"] == base["num_samples_rf"]
+        assert sol["per_replica_batch_size"] == base["per_replica_batch_size"]
+        assert sol["train_val_split"] == base["train_val_split"]
+        assert _check_cross_constraints(
+            **sol, num_replicas_list=[5], latent_total=self._LATENT_TOTAL
+        )
+
+    def test_solver_is_latent_aware(self):
+        # Every proposed global val batch must divide latent_total when it is supplied.
+        base = {**self._BASE_4_6, "effective_batch_size": 3070, "latent_total": self._LATENT_TOTAL}
+        sol = _solve_cross_param_constraints(base, [5])
+        assert sol is not None
+        assert self._LATENT_TOTAL % (sol["per_replica_val_batch_size"] * 5) == 0
+
+    def test_solver_satisfies_all_requested_replica_counts(self):
+        # A multi-count solve must hold for every requested replica count simultaneously.
+        base = {**self._BASE_4_6, "effective_batch_size": 3070, "latent_total": self._LATENT_TOTAL}
+        sol = _solve_cross_param_constraints(base, [4, 5, 6])
+        assert sol is not None
+        fields = {k: sol[k] for k in self._BASE_4_6}
+        for nr in (4, 5, 6):
+            assert _check_cross_constraints(
+                **fields, num_replicas_list=[nr], latent_total=self._LATENT_TOTAL
+            )
 
     def test_solver_respects_candidate_budget(self):
-        # The default search ranges exceed a tiny budget, so the solver must bail with None
-        # rather than grind through the grid.
-        base = dict(self._VALID_BASE)
-        base["effective_batch_size"] = 3070  # invalidate so the grid search is attempted
-        assert _solve_cross_param_constraints(base, [4], max_candidates=10) is None
-
-    def test_solver_finds_nearest_valid_config(self, monkeypatch):
-        # Shrink the search ranges to a tractable grid and verify the solver picks the
-        # L1-nearest satisfying combination.
-        monkeypatch.setattr(
-            cli,
-            "_SEARCH_RANGES",
-            {
-                "num_samples_beta_vae": (160, 320, 80),
-                "num_samples_rf": (40, 80, 20),
-                "per_replica_batch_size": (4, 8, 4),
-                "effective_batch_size": (16, 64, 16),
-                "per_replica_val_batch_size": (4, 8, 4),
-            },
-        )
-        base = {
-            "num_samples_beta_vae": 250,
-            "num_samples_rf": 50,
-            "train_val_split": 0.8,
-            "per_replica_batch_size": 5,
-            "effective_batch_size": 20,
-            "per_replica_val_batch_size": 5,
-        }
-        solution = _solve_cross_param_constraints(base, [4])
-        assert solution is not None
-        assert solution["train_val_split"] == base["train_val_split"]  # held fixed
-        assert _check_cross_constraints(**solution, num_replicas_list=[4])
-        # Every solved field must come from the (patched) search grid.
-        for field_name, (lo, hi, step) in cli._SEARCH_RANGES.items():
-            assert solution[field_name] in range(lo, hi + 1, step)
-        # And the solution must be L1-minimal among all valid grid points.
-        assert self._l1(solution, base) == min(
-            self._l1(candidate, base) for candidate in self._valid_grid_points(base)
-        )
-
-    @staticmethod
-    def _l1(candidate, base):
-        return sum(
-            abs(candidate[f] - base[f])
-            for f in (
-                "num_samples_beta_vae",
-                "num_samples_rf",
-                "per_replica_batch_size",
-                "effective_batch_size",
-                "per_replica_val_batch_size",
-            )
-        )
-
-    @staticmethod
-    def _valid_grid_points(base):
-        from itertools import product  # noqa: PLC0415
-
-        ranges = {f: range(lo, hi + 1, step) for f, (lo, hi, step) in cli._SEARCH_RANGES.items()}
-        for nsb, nsr, prb, eb, prvb in product(
-            ranges["num_samples_beta_vae"],
-            ranges["num_samples_rf"],
-            ranges["per_replica_batch_size"],
-            ranges["effective_batch_size"],
-            ranges["per_replica_val_batch_size"],
-        ):
-            candidate = {
-                "num_samples_beta_vae": nsb,
-                "num_samples_rf": nsr,
-                "train_val_split": base["train_val_split"],
-                "per_replica_batch_size": prb,
-                "effective_batch_size": eb,
-                "per_replica_val_batch_size": prvb,
-            }
-            if _check_cross_constraints(**candidate, num_replicas_list=[4]):
-                yield candidate
+        # The budget is a backstop; zero means bail before checking any candidate.
+        base = {**self._BASE_4_6, "effective_batch_size": 3070}
+        assert _solve_cross_param_constraints(base, [5], max_candidates=0) is None
 
 
 class TestApplySavedConfigPrecedence:

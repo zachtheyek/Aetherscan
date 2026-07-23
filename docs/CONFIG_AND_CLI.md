@@ -350,8 +350,8 @@ Examples (from the script's docstring):
 # Check default config against a 4-GPU setup
 python utils/find_optimal_configs.py --num-gpus 4 train
 
-# Override --effective-batch-size and search for a fix valid on both 4 and 6 GPUs
-python utils/find_optimal_configs.py --num-gpus 4,6 train --effective-batch-size 3072
+# An override that's invalid for 5 GPUs — the solver proposes the nearest valid combination
+python utils/find_optimal_configs.py --num-gpus 5 train --effective-batch-size 3072
 
 # Check inference defaults with an invalid --overlap-fraction
 python utils/find_optimal_configs.py inference --overlap-fraction 1.5
