@@ -147,6 +147,32 @@ large-VRAM card (e.g. the 96 GB Blackwell) the spare memory cannot be converted 
 this compact model, so the defaults (train 128, inference 2048) are already near-optimal — size the
 per-replica batch for constraint-divisibility and convenience, not to fill VRAM.
 
-The numbers above are single-GPU on blpc3. Multi-GPU scaling (`--num-gpus`), the
-`--accumulation-steps` cadence, and the bla0 (6× A4000 16 GB) baselines are captured on the
-release-benchmark runs and land with the System-Requirements update (#183).
+### Baseline: bla0 (6× RTX A4000 16 GB, NGC 25.02, July 2026)
+
+bla0 is the release-training host. Single-GPU training step and encoder inference:
+
+| per-replica batch | train cadences/s | train VRAM | encode obs/s | encode VRAM |
+|---|---|---|---|---|
+| 128 | 795 | 2.76 GB | 47,868 | 0.12 GB |
+| 256 | 819 | 5.26 GB | 50,364 | 0.19 GB |
+| 512 | 820 | 9.99 GB | 51,016 | 0.36 GB |
+| 1024 | OOM | — | 52,462 | 0.61 GB |
+| 2048 | — | — | 53,077 | 1.18 GB |
+| 4096 | — | — | 53,001 | 2.32 GB |
+
+Multi-GPU (all 6 A4000s, per-replica batch 128, **aggregate** throughput):
+
+| config | throughput | scaling | VRAM/GPU |
+|---|---|---|---|
+| train, 1 GPU | 795 cad/s | 1.0× | 2.76 GB |
+| train, 6 GPUs | 3,087 cad/s | 3.9× | 3.21 GB |
+| train, 6 GPUs, `--accumulation-steps 4` | 4,272 cad/s | — | 9.91 GB |
+| encode, 6 GPUs (batch 1024) | 214,451 obs/s | 4.1× | 0.78 GB |
+
+The A4000 is ~3.8× slower per GPU than the Blackwell (795 vs 2,986 cad/s at batch 128), consistent
+with its lower compute; the model is still compute-bound (throughput flat as batch grows toward the
+16 GB ceiling — training OOMs above batch 512). MirroredStrategy scales ~3.9–4.1× across the 6
+replicas (all-reduce overhead eats the rest). `--accumulation-steps 4` raises throughput (4,272 vs
+3,087 cad/s — one optimizer apply per 4 micro-batches instead of every step) at the cost of the
+persistent gradient accumulator's VRAM (3.21 → 9.91 GB/GPU). At the default batch 128, training uses
+~2.8 GB/GPU — comfortably within the 16 GB budget.
