@@ -29,7 +29,6 @@ from aetherscan.train import (
     TrainingPipeline,
     _execute_training_stages,
     _resolve_load_tag,
-    _select_positive_class_shap,
     archive_directory,
     check_encoder_trained,
     check_val_auc_floor,
@@ -408,51 +407,6 @@ class TestCheckValAucFloor:
             "single-class" in r.message and "cannot be evaluated" in r.message
             for r in caplog.records
         )
-
-
-class TestSelectPositiveClassShap:
-    N, F = 5, 8
-
-    def test_list_of_class_arrays_selects_positive(self):
-        neg = np.zeros((self.N, self.F))
-        pos = np.ones((self.N, self.F))
-        result = _select_positive_class_shap([neg, pos])
-        np.testing.assert_array_equal(result, pos)
-
-    def test_trailing_class_axis_values(self):
-        values = np.stack(
-            [np.zeros((self.N, self.F)), np.ones((self.N, self.F))], axis=-1
-        )  # (N, F, 2)
-        result = _select_positive_class_shap(values)
-        assert result.shape == (self.N, self.F)
-        assert np.all(result == 1.0)
-
-    def test_trailing_class_axis_interactions(self):
-        values = np.stack(
-            [np.zeros((self.N, self.F, self.F)), np.ones((self.N, self.F, self.F))], axis=-1
-        )  # (N, F, F, 2)
-        result = _select_positive_class_shap(values)
-        assert result.shape == (self.N, self.F, self.F)
-        assert np.all(result == 1.0)
-
-    def test_single_output_passthrough(self):
-        values = np.arange(self.N * self.F, dtype=float).reshape(self.N, self.F)
-        np.testing.assert_array_equal(_select_positive_class_shap(values), values)
-
-    def test_log_loss_list_selects_first(self):
-        first = np.ones((self.N, self.F))
-        result = _select_positive_class_shap([first, np.zeros((self.N, self.F))], log_loss=True)
-        np.testing.assert_array_equal(result, first)
-
-    def test_log_loss_trailing_class_axis(self):
-        values = np.stack([np.zeros((self.N, self.F)), np.ones((self.N, self.F))], axis=-1)
-        result = _select_positive_class_shap(values, log_loss=True)
-        assert result.shape == (self.N, self.F)
-        assert np.all(result == 1.0)
-
-    def test_log_loss_passthrough(self):
-        values = np.arange(self.N * self.F, dtype=float).reshape(self.N, self.F)
-        np.testing.assert_array_equal(_select_positive_class_shap(values, log_loss=True), values)
 
 
 class _StageMachineStub:

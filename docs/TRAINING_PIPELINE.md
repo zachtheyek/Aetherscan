@@ -403,6 +403,58 @@ share `rf_shap_values_{tag}.joblib` (computed once, cached).
 | `rf_oob_accuracy_curve_{tag}.png` (from `plot_rf_ensemble_accuracy_curve`) | Cumulative accuracy vs number of trees (val + train-subsample baseline), elbow annotated. Also persists the per-tree `ensemble_val_accuracy` series to `training_stats` (`model_name='rf'`, `epoch_number` = tree count) for the dashboard RF tab — so the DB series only lands when `rf_plots` succeeds. | Should saturate well before 1000 trees; if it's still climbing at the end, raise `rf.n_estimators`. |
 | `rf_latent_decision_boundary_nn{n}_md{m}_{tag}.png` | RF P(true) contour over each persisted cadence-level UMAP plane, val points + 0.5 contour. | A coherent boundary separating the true classes; ragged islands = the forest partitioning noise. Depends on the UMAPs from `plot_latent_space_gif`, so `vae_plots` must have succeeded. |
 
+### SHAP explainability performance (CPU multiprocessing; GPU is a documented alternative)
+
+The five SHAP figures share `rf_shap_values_{tag}.joblib`, computed once by
+`_compute_or_load_shap_values`. shap's TreeSHAP C extension is **single-threaded** (no OpenMP, no
+`n_jobs`; the RF's own `n_jobs` does not apply — shap re-walks the trees itself), so on a 1000-tree
+forest the step is dominated by the **interaction** pass and runs for hours-to-days if left serial
+(measured ~183 s/sample on a depth-53 RF → ~76 h for 1500 interaction samples; the whole tail is
+~95% interaction).
+
+SHAP values are per-sample independent, so we **chunk the samples across all cores**
+(`aetherscan.shap_parallel`, driven by `manager.n_processes` = `cpu_count()` by default): each worker
+rebuilds a *stock* `TreeExplainer` and explains its chunk, and the results are byte-identical to the
+serial computation (measured ~40-45x on a 96-core node). This is the shipped path for all three
+passes (summary, interaction, log-loss).
+
+#### GPU is faster on interaction, but we don't use it — here's why, and how to switch
+
+shap's `GPUTreeExplainer` (GPUTreeShap) runs each pass in ~seconds regardless of sample count (~1000x
+on interaction). We benchmarked it on both clusters; it works and is **correct** for the summary and
+interaction passes (`np.allclose` vs CPU). We still ship CPU multiprocessing, because the GPU route
+buys only a few minutes at the very end of a multi-day/-week run in exchange for maintaining an extra
+CUDA + from-source dependency on an experimental shap code path:
+
+- **Not in the stock wheel.** `GPUTreeExplainer` needs a `_cext_gpu` CUDA extension that exists only
+  if shap is built from source with `SHAP_ENABLE_CUDA=1` + a CUDA toolkit — a bespoke build baked into
+  the container/conda and re-verified on every container/shap/CUDA bump.
+- **Hard depth limit (fixed lane overflow).** GPUTreeShap maps one path element per CUDA warp *lane*
+  (`warpSize == 32`, fixed on every NVIDIA arch), so an over-long root-to-leaf path overflows and the
+  kernel aborts (`Tree depth must be < 32`, core dump). Precisely, it caps the number of **distinct
+  features per root-to-leaf path at ≤ 31** (paths are de-duplicated by feature before the length
+  check), so `max_depth ≤ 31` is a *sufficient*, guaranteed-safe setting; a deeper forest can still
+  run if no path uses > 31 features, but that is not guaranteed. It is **not** fixable by a different
+  build.
+- **Log-loss is broken on GPU.** The interventional `model_output="log_loss"` path silently returns
+  raw-margin numbers (the GPU kernel drops the output-transform pointer — shap #4270/#3936/#1726,
+  unfixed as of 0.46.0) and fails the additivity axiom, so log-loss would have to stay on CPU anyway.
+
+**To switch to GPU later** (if interaction runtime ever becomes the bottleneck): (1) cap the RF at
+`max_depth = 31` in `RandomForestConfig` and confirm val-AUC is unaffected with an A/B; (2) bake a
+CUDA-built shap into `aetherscan.def` / `environment.yml`
+(`SHAP_ENABLE_CUDA=1 CUDA_PATH=/usr/local/cuda pip install --no-binary shap shap==<pinned>`);
+(3) route **summary + interaction** through `shap.explainers.GPUTree`, keeping **log-loss** on the CPU
+multiprocessing path; (4) CPU-validate the GPU output with `np.allclose` before trusting it.
+
+**On the depth cap:** we keep `max_depth` **unbounded** (its sklearn default; not set in
+`RandomForestConfig`) — the `< 32` limit only matters *if* we adopt GPU SHAP. A cap would be low-risk
+in practice: the Beta-VAE's objective is to make the classes separable in latent space, so a
+well-trained VAE yields simple decision boundaries and naturally shallow trees, and the cap then just
+acts as a mild regularizer aligned with the upstream objective. It could bite an **undertrained** VAE
+(muddy latents → deep trees) or a future extension to more complex signal morphologies whose latents
+genuinely need deeper trees for accuracy — which the val-AUC A/B in step (1) would catch.
+
 ### `resource_utilization_{tag}.png`
 
 Written by the resource monitor at shutdown, not by `train.py` — see
