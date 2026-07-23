@@ -85,7 +85,8 @@ def test_parallel_matches_single_process(small_rf, kind):
     pooled = parallel_shap(rf_path, val_x, kind, 4, **extra)
     assert serial.shape == pooled.shape
     assert serial.shape[0] == len(val_x)  # sample axis preserved
-    np.testing.assert_allclose(pooled, serial, atol=1e-8)
+    # TreeSHAP is per-sample deterministic, so chunking yields a bitwise-identical result.
+    np.testing.assert_array_equal(pooled, serial)
 
 
 def test_more_workers_than_samples_is_safe(small_rf):

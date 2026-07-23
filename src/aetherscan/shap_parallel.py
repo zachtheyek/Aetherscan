@@ -103,9 +103,9 @@ def _worker_init(rf_path: str, background) -> None:
 
 
 def _worker(task):
-    """Compute one SHAP pass on one chunk of samples using the module-global RF. Returns
-    ``(chunk_index, positive_class_array)`` so the caller can restore sample order."""
-    chunk_index, kind, x_chunk, y_chunk = task
+    """Compute one SHAP pass on one chunk of samples using the module-global RF. Returns the
+    positive-class array for the chunk; ProcessPoolExecutor.map preserves input order."""
+    kind, x_chunk, y_chunk = task
     import shap  # noqa: PLC0415  (deferred so the spawn worker pins threads before shap/BLAS init)
 
     # Suppress shap's tqdm (it writes to stderr, which the pipeline logger forwards to Slack).
@@ -120,7 +120,7 @@ def _worker(task):
                 if kind == "interaction"
                 else explainer.shap_values(x_chunk)
             )
-    return chunk_index, select_positive_class_shap(raw, log_loss=(kind == _LOGLOSS_KIND))
+    return select_positive_class_shap(raw, log_loss=(kind == _LOGLOSS_KIND))
 
 
 def parallel_shap(
@@ -134,26 +134,27 @@ def parallel_shap(
 ) -> np.ndarray:
     """
     Compute the positive-class SHAP values for ``x`` under one pass ``kind`` in
-    ``{"summary", "interaction", "logloss"}``, chunked across up to ``n_workers`` spawn processes.
+    ``{"summary", "interaction", "logloss"}``, chunked across up to ``n_workers`` worker processes.
 
     ``rf_path`` is the persisted sklearn RF joblib (each worker loads it). ``background`` and ``y`` are
-    required only for the ``"logloss"`` (interventional) pass. Result is concatenated back into
-    original sample order and is byte-identical to the single-threaded computation.
+    required only for the ``"logloss"`` (interventional) pass. TreeSHAP is per-sample deterministic, so
+    the concatenated result is bitwise-identical to the single-process computation.
     """
     if kind != _LOGLOSS_KIND and kind not in _RAW_KINDS:
         raise ValueError(f"unknown SHAP kind {kind!r}")
 
     n = len(x)
+    if n == 0:
+        raise ValueError("cannot explain zero samples")
     n_workers = max(1, min(n_workers, n))
 
     # n_workers == 1: run in-process (no pool) — used on single-core hosts or tiny inputs.
     if n_workers == 1:
         _worker_init(rf_path, background)
-        _, out = _worker((0, kind, x, y))
-        return out
+        return _worker((kind, x, y))
 
     chunks = np.array_split(np.arange(n), n_workers)
-    tasks = [(i, kind, x[c], (None if y is None else y[c])) for i, c in enumerate(chunks) if len(c)]
+    tasks = [(kind, x[c], (None if y is None else y[c])) for c in chunks if len(c)]
     # forkserver with an EMPTY preload: the fork server is spawned clean and does NOT re-import the
     # parent's __main__ (aetherscan.main -> TF -> the whole training stack), so workers stay light.
     ctx = mp.get_context("forkserver")
@@ -164,5 +165,6 @@ def parallel_shap(
         initializer=_worker_init,
         initargs=(rf_path, background),
     ) as pool:
-        results = sorted(pool.map(_worker, tasks), key=lambda r: r[0])
-    return np.concatenate([r[1] for r in results], axis=0)
+        # ProcessPoolExecutor.map yields results in input (chunk) order — no re-sort needed.
+        results = list(pool.map(_worker, tasks))
+    return np.concatenate(results, axis=0)

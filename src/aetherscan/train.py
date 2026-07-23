@@ -2780,8 +2780,9 @@ class TrainingPipeline:
         # (aetherscan.shap_parallel), each rebuilding a stock TreeExplainer — byte-identical to the
         # serial result. Workers load the RF from its persisted joblib, so make sure it is on disk.
         rf_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
-        if not os.path.exists(rf_path):
-            joblib.dump(self.rf_model.model, rf_path)
+        # Always (re)dump so the workers load exactly the in-process model — a stale on-disk RF under
+        # a reused tag would otherwise silently diverge from the expected_value computed below.
+        joblib.dump(self.rf_model.model, rf_path)
 
         # Expected value (positive-class base value): one lightweight in-process explainer.
         # _silence_stderr() drops SHAP's tqdm (which the logger would otherwise forward to Slack).
