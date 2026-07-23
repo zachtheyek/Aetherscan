@@ -173,6 +173,7 @@ The A4000 is ~3.8× slower per GPU than the Blackwell (795 vs 2,986 cad/s at bat
 with its lower compute; the model is still compute-bound (throughput flat as batch grows toward the
 16 GB ceiling — training OOMs above batch 512). MirroredStrategy scales ~3.9–4.1× across the 6
 replicas (all-reduce overhead eats the rest). `--accumulation-steps 4` raises throughput (4,272 vs
-3,087 cad/s — one optimizer apply per 4 micro-batches instead of every step) at the cost of the
-persistent gradient accumulator's VRAM (3.21 → 9.91 GB/GPU). At the default batch 128, training uses
-~2.8 GB/GPU — comfortably within the 16 GB budget.
+3,087 cad/s) because it runs one optimizer apply — and therefore one clip + one cross-replica
+all-reduce — per 4 micro-batches instead of every step, amortizing that fixed per-apply overhead over
+4× as many cadences; the cost is the persistent gradient accumulator's VRAM (3.21 → 9.91 GB/GPU). At
+the default batch 128, training uses ~2.8 GB/GPU — comfortably within the 16 GB budget.

@@ -34,8 +34,10 @@ What this does and does NOT cover:
     cross-replica gradient all-reduce and multi-GPU scaling. fp32, matching the pipeline (which
     uses no mixed precision or XLA).
   - Models gradient accumulation with `--accumulation-steps K`: one optimizer step accumulates
-    all-reduced grads over K micro-batches then applies once with the global-norm clip, exactly as
-    train.py's `_train_epoch` (K=1, the default, is a plain apply-every-step). Peak VRAM then
+    all-reduced grads over K micro-batches then applies once with the global-norm clip — the
+    accumulate-then-apply *cadence* of train.py's `_train_epoch` (K=1, the default, is a plain
+    apply-every-step). The reduce/clip *ordering* differs slightly from production; `_apply_and_reset`
+    documents why it's immaterial to the throughput/VRAM this benchmark measures. Peak VRAM then
     includes the persistent accumulator and throughput reflects the once-per-K apply cadence.
   - Does NOT model the input pipeline (synthetic in-memory tensors, no `tf.data`-from-memmap +
     prefetch + host->device copy) or the CPU-side Random Forest stage (see bench_rf.py).
@@ -163,6 +165,13 @@ def _measure(
                 acc.assign_add(g)
 
         def _apply_and_reset():
+            # NOTE: reduce/clip *order* differs from production `_apply_gradients`, which reduces
+            # across replicas (MEAN) THEN clips the mean once; here each replica clips its own acc/K
+            # and the all-reduce happens inside apply_gradients — so the effective grad is
+            # mean_r(clip(acc_r/K)) vs production's clip(mean_r(acc_r)/K). These differ only when a
+            # replica's global norm exceeds _CLIP_NORM, and the per-step compute (one tree-reduce +
+            # one clip over the params) is identical either way, so the throughput/VRAM this
+            # benchmark measures are faithful; only the accumulate-then-apply *cadence* is modelled.
             grads = [acc / accumulation_steps for acc in accumulators]
             clipped, _ = tf.clip_by_global_norm(grads, _CLIP_NORM)
             model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
@@ -182,8 +191,11 @@ def _measure(
         run = encode_run
 
     def sync(out) -> None:
-        # Force queued device work to finish before the clock is read. Train applies mutate the
-        # model variables, so reading one is a sufficient barrier; encode syncs on its output.
+        # Force queued device work to finish before the clock is read. Every train apply ends in a
+        # collective all-reduce, so if one replica's stream has drained past step N then all replicas
+        # finished that step's all-reduce too — reading a single (mutated) MirroredVariable is
+        # therefore a sufficient *cross-replica* barrier, not just a primary-replica one. Encode has
+        # no such collective, so it syncs on its own per-replica output instead.
         if mode == "train":
             model.trainable_variables[0].numpy()
         elif out is not None:
