@@ -13,6 +13,8 @@ NGC container on a cluster:
     # explicit sizes, and multi-GPU scaling across all 6 replicas:
     ./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --batch-sizes 128,256
     ./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --num-gpus 6 --batch-sizes 128
+    # model the real accumulate-then-apply cadence (one apply per 4 micro-batches):
+    ./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --num-gpus 6 --batch-sizes 128 --accumulation-steps 4
 
 It builds the real Beta-VAE (`create_beta_vae_model`) under a `MirroredStrategy` over the first
 `--num-gpus` GPUs and drives synthetic batches of the true pipeline shapes. A training example is
@@ -31,11 +33,12 @@ What this does and does NOT cover:
     the decoder (inside the train step), and — with `--num-gpus > 1` — the MirroredStrategy
     cross-replica gradient all-reduce and multi-GPU scaling. fp32, matching the pipeline (which
     uses no mixed precision or XLA).
-  - Does NOT model gradient accumulation (the real loop accumulates `accumulation_steps`
-    micro-batches then applies once; here every step applies — the per-micro-batch VRAM that
-    sets the max batch is captured exactly, the throughput effect is small), the input pipeline
-    (synthetic in-memory tensors, no `tf.data`-from-memmap + prefetch + host->device copy), or
-    the CPU-side Random Forest stage.
+  - Models gradient accumulation with `--accumulation-steps K`: one optimizer step accumulates
+    all-reduced grads over K micro-batches then applies once with the global-norm clip, exactly as
+    train.py's `_train_epoch` (K=1, the default, is a plain apply-every-step). Peak VRAM then
+    includes the persistent accumulator and throughput reflects the once-per-K apply cadence.
+  - Does NOT model the input pipeline (synthetic in-memory tensors, no `tf.data`-from-memmap +
+    prefetch + host->device copy) or the CPU-side Random Forest stage (see bench_rf.py).
 
 Note: `--find-max` is capped at `--max-batch` (default 4096) because an encoder forward whose
 conv feature maps exceed ~2^31 elements (roughly batch >= 8192, an intermediate map is
@@ -115,29 +118,31 @@ def _peak_vram_gb(devices: list[str]) -> float:
 
 
 def _make_step_fn(model, mode: str):
-    """Per-replica step, run via strategy.run so MirroredStrategy handles the cross-replica
-    gradient all-reduce on apply_gradients: a full training step (compute_total_loss -> grads ->
-    global-norm clip -> Adam) or an encoder forward."""
+    """Per-replica step run via strategy.run. Train: compute the grads for one micro-batch (no
+    apply — the reduce/accumulate/clip/apply happens once per optimizer step in _measure, mirroring
+    train.py's _distributed_train_step + _apply_gradients). Encode: an encoder forward."""
 
     def step_fn(inputs):
         if mode == "train":
             main, true_, false_, target = inputs
             with tf.GradientTape() as tape:
                 losses = model.compute_total_loss(main, true_, false_, target, training=True)
-            grads = tape.gradient(losses["total_loss"], model.trainable_variables)
-            grads, _ = tf.clip_by_global_norm(grads, _CLIP_NORM)
-            model.optimizer.apply_gradients(zip(grads, model.trainable_variables, strict=False))
-            return losses["total_loss"]
+            return tape.gradient(losses["total_loss"], model.trainable_variables)
         z_mean, _, _ = model.encoder(inputs[0], training=False)
         return z_mean
 
     return step_fn
 
 
-def _measure(strategy, devices, step_fn, mode, batch, warmup, steps) -> dict | None:
-    """Run `warmup` + `steps` iterations at per-replica batch `batch` on every replica. Returns
-    aggregate throughput (per_replica_batch * num_replicas * steps / elapsed) and per-GPU peak
-    VRAM, or None if a GPU OOMs (the caller stops the sweep there)."""
+def _measure(
+    strategy, devices, model, step_fn, mode, batch, warmup, steps, accumulation_steps
+) -> dict | None:
+    """Run `warmup` + `steps` optimizer steps at per-replica batch `batch` on every replica. A
+    train optimizer step accumulates all-reduced grads over `accumulation_steps` micro-batches then
+    applies once with the global-norm clip (train.py's `_train_epoch`); an encode step is a single
+    encoder forward (`accumulation_steps` ignored). Returns aggregate throughput (per_replica_batch
+    * num_replicas * micro_batches / elapsed) and per-GPU peak VRAM, or None if a GPU OOMs (the
+    caller stops the sweep there)."""
     shape = _CADENCE_SHAPE if mode == "train" else _OBS_SHAPE
     n_inputs = 4 if mode == "train" else 1
 
@@ -146,21 +151,48 @@ def _measure(strategy, devices, step_fn, mode, batch, warmup, steps) -> dict | N
 
     @tf.function
     def run(dist_inputs):
-        return strategy.run(step_fn, args=(dist_inputs,))
+        if mode != "train":
+            return strategy.run(step_fn, args=(dist_inputs,))
+        # One optimizer step: accumulate the cross-replica MEAN-reduced grads over
+        # accumulation_steps micro-batches, then apply once (global-norm clip + Adam) — the
+        # accumulate-then-apply cadence of _train_epoch / _distributed_train_step / _apply_gradients.
+        accumulated = None
+        for _ in range(accumulation_steps):
+            per_replica_grads = strategy.run(step_fn, args=(dist_inputs,))
+            reduced = [
+                strategy.reduce(tf.distribute.ReduceOp.MEAN, g, axis=None)
+                for g in per_replica_grads
+            ]
+            accumulated = (
+                reduced
+                if accumulated is None
+                else [a + r for a, r in zip(accumulated, reduced, strict=False)]
+            )
+        averaged = [g / accumulation_steps for g in accumulated]
+        clipped, _ = tf.clip_by_global_norm(averaged, _CLIP_NORM)
+        model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
+        return None
+
+    def sync(out) -> None:
+        # Force queued device work to finish before the clock is read. Train applies mutate the
+        # model variables, so reading one is a sufficient barrier; encode syncs on its output.
+        if mode == "train":
+            model.trainable_variables[0].numpy()
+        elif out is not None:
+            strategy.experimental_local_results(out)[0].numpy()
 
     try:
         dist_inputs = strategy.experimental_distribute_values_from_function(value_fn)
         out = None
         for _ in range(warmup):
             out = run(dist_inputs)
-        if out is not None:
-            strategy.experimental_local_results(out)[0].numpy()  # sync (also absorbs tracing)
+        sync(out)  # also absorbs tracing
         for d in devices:
             tf.config.experimental.reset_memory_stats(d)
         start = time.perf_counter()
         for _ in range(steps):
             out = run(dist_inputs)
-        strategy.experimental_local_results(out)[0].numpy()  # force queued steps to finish
+        sync(out)  # force queued steps to finish
         elapsed = time.perf_counter() - start
     except tf.errors.ResourceExhaustedError:
         return None
@@ -168,11 +200,13 @@ def _measure(strategy, devices, step_fn, mode, batch, warmup, steps) -> dict | N
     peak = _peak_vram_gb(devices)
     gc.collect()
     n = len(devices)
-    aggregate = (batch * n * steps) / elapsed if elapsed > 0 else float("inf")
+    micro_batches = steps * (accumulation_steps if mode == "train" else 1)
+    aggregate = (batch * n * micro_batches) / elapsed if elapsed > 0 else float("inf")
     return {
         "per_replica_batch_size": batch,
         "num_gpus": n,
         "steps": steps,
+        "accumulation_steps": accumulation_steps if mode == "train" else 1,
         "elapsed_s": elapsed,
         "aggregate_samples_per_s": aggregate,
         "peak_vram_gb_per_gpu": peak,
@@ -229,6 +263,13 @@ def main() -> None:
         "--warmup", type=_positive_int, default=3, help="Untimed warmup steps per size."
     )
     parser.add_argument("--steps", type=_positive_int, default=20, help="Timed steps per size.")
+    parser.add_argument(
+        "--accumulation-steps",
+        type=_positive_int,
+        default=1,
+        help="Train only: micro-batches accumulated per optimizer step (mirrors _train_epoch). "
+        "Default 1 = apply every step. Ignored for --mode encode.",
+    )
     parser.add_argument("--output", default=None, help="Result JSON path.")
     args = parser.parse_args()
 
@@ -243,10 +284,15 @@ def main() -> None:
 
     unit = "cadences/s" if args.mode == "train" else "obs/s"
     shape = _CADENCE_SHAPE if args.mode == "train" else _OBS_SHAPE
+    train_note = (
+        f"  accumulation_steps={args.accumulation_steps}  "
+        f"(18*B encoder + 6*B decoder forwards/micro-batch)"
+        if args.mode == "train"
+        else ""
+    )
     print(
         f"mode={args.mode}  num_gpus={len(devices)}  latent_dim={config.beta_vae.latent_dim}  "
-        f"example_shape={shape}"
-        + ("  (18*B encoder + 6*B decoder forwards/step)" if args.mode == "train" else "")
+        f"example_shape={shape}" + train_note
     )
     print(
         f"throughput = aggregate across {len(devices)} GPU(s); VRAM = peak per GPU (SI GB, 1e9 B)"
@@ -256,7 +302,17 @@ def main() -> None:
     measured: list[dict] = []
     max_fit: dict | None = None
     for batch in _batch_schedule(args):
-        res = _measure(strategy, devices, step_fn, args.mode, batch, args.warmup, args.steps)
+        res = _measure(
+            strategy,
+            devices,
+            model,
+            step_fn,
+            args.mode,
+            batch,
+            args.warmup,
+            args.steps,
+            args.accumulation_steps,
+        )
         if res is None:
             print(f"{batch:>8}  {'OOM':>16}  {'-':>14}")
             break
@@ -286,6 +342,7 @@ def main() -> None:
             "latent_dim": config.beta_vae.latent_dim,
             "warmup": args.warmup,
             "steps": args.steps,
+            "accumulation_steps": args.accumulation_steps if args.mode == "train" else 1,
             "gpu": machine_info()["hostname"],
         },
         results,
