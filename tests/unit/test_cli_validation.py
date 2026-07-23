@@ -420,6 +420,19 @@ class TestCrossParamSolver:
         base = {**self._BASE_4_6, "effective_batch_size": 3070}
         assert _solve_cross_param_constraints(base, [5], max_candidates=0) is None
 
+    def test_solver_picks_the_l1_nearest_not_the_first_valid(self):
+        # Strict L1-minimality guard: for the 5-GPU fix, keeping the data sizes + per-replica batch,
+        # the nearest valid effective batch to 3072 is 2560 (2560 divides the 399360 train split and
+        # is a multiple of 128*5=640; 3840 is the next one up and is farther), and the val batch lands
+        # 16 from 80 (64 or 96). A refactor that returned the first valid candidate instead of the
+        # closest would drift off these exact values.
+        base = {**self._BASE_4_6, "latent_total": self._LATENT_TOTAL}
+        sol = _solve_cross_param_constraints(base, [5])
+        assert sol is not None
+        assert sol["per_replica_batch_size"] == 128
+        assert sol["effective_batch_size"] == 2560
+        assert abs(sol["per_replica_val_batch_size"] - 80) == 16
+
 
 class TestApplySavedConfigPrecedence:
     def test_saved_config_overrides_defaults(self, tmp_path):

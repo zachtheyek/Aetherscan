@@ -177,7 +177,10 @@ Each training step accumulates `accumulation_steps = effective_batch_size /
 (per_replica_batch_size × num_replicas)` micro-batch gradients before applying
 (`_train_epoch()` → `_distributed_train_step()` → `_apply_gradients()`), giving an effective
 batch of 7680 at defaults (chosen so it divides evenly on 4-, 5-, or 6-GPU hosts) regardless of
-per-GPU memory. Guards along the way: all-None
+per-GPU memory. **Note:** 7680 is ~2.5× the previous 3072, so there are ~2.5× fewer optimizer
+updates per epoch; LR-schedule behavior calibrated to the old cadence may differ. On a fixed 4- or
+6-GPU host you can pass `--effective-batch-size 3072` to restore the old cadence (it stays valid
+there). Guards along the way: all-None
 gradient micro-batches are skipped, accumulated gradients are averaged over successful
 micro-steps, NaN/Inf gradients raise immediately, and the global gradient norm is clipped at
 1.0 with the pre-clip norm recorded per step (that's the `clipping_rate` statistic).

@@ -2391,11 +2391,6 @@ def collect_validation_errors(
 # gymnastics, and so the validation + proposal logic stays colocated.
 # ---------------------------------------------------------------------------
 
-# Grid-search ranges for the six interdependent training params that govern
-# how data is divided across replicas, batches, and train/val splits. Most
-# cross-replica violations can't be fixed by clamping one field — the solver
-# below grid-searches these ranges minimizing L1 distance to the current
-# values.
 # Neighborhoods for the fields the solver prefers to keep near their base value (data sizes +
 # the throughput-optimal per-replica batch). effective_batch_size and per_replica_val_batch_size
 # are deliberately NOT here: they are generated exactly from the divisibility structure (divisors
@@ -2495,9 +2490,13 @@ def _solve_cross_param_constraints(
     fields — are enumerated *exactly* from the structure: the effective batch must be a divisor of
     the train split that is a multiple of ``per_replica_batch_size * num_replicas`` for every replica
     count; the global val batch must divide the gcd of the val split, num_samples_rf, and (if given)
-    latent_total. The data sizes and per-replica batch are only nudged across small neighborhoods
-    (changing them is a last resort). Every candidate is confirmed with the shared
-    :func:`_check_cross_constraints`, which stays the single source of truth."""
+    latent_total. The data sizes and per-replica batch are only searched over small neighborhoods
+    (seeded with the base value, so they're preferred when a solution keeps them) — but because the
+    result is chosen purely by L1 distance, a multi-count solve can still move per_replica_batch when
+    doing so is closer than raising the effective batch to the larger multiple all counts share (e.g.
+    a 4/5/6-GPU solve drops it to 64 rather than lifting the effective batch to lcm(128*{4,5,6})).
+    Every candidate is confirmed with the shared :func:`_check_cross_constraints`, which stays the
+    single source of truth."""
     latent_total = base.get("latent_total")
     tvs = base["train_val_split"]
     b_nsb = base["num_samples_beta_vae"]
