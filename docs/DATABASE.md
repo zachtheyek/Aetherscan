@@ -305,11 +305,12 @@ Rules of thumb at full-scale defaults (dominant terms only):
 - **`training_stats`**: ~21 rows/epoch → ~42 k rows for 20 × 100 epochs; the RF stage adds
   a negligible tail (~25 scalars + `classification_threshold` + the per-tree
   `ensemble_val_accuracy` series ≈ `rf.n_estimators` rows). Still negligible.
-- **`latent_snapshots`**: one row per viz cadence per capture — 960 cadences × one capture
-  every `latent_viz_step_interval` steps (plus the final step) × epochs. At full scale
-  (130 steps/epoch → 13 captures/epoch): ~25 M rows over 20 × 100 epochs, each carrying a
-  48-float JSON vector. The second heaviest table; `latent_viz_step_interval` and
-  `latent_viz_num_cadences_per_type` are the knobs.
+- **`latent_snapshots`**: one row per viz cadence per capture — 3840 cadences
+  (`latent_viz_num_cadences_per_type=960` × 4 signal types) × one capture every
+  `latent_viz_step_interval` steps (plus the final step) × epochs. At full scale
+  (130 steps/epoch → 13 captures/epoch): ~100 M rows over 20 × 100 epochs, each carrying a
+  48-float JSON vector. Still the second heaviest table (behind `signal_characteristics`);
+  `latent_viz_step_interval` and `latent_viz_num_cadences_per_type` are the knobs.
 - **`system_resources`**: (4 + 2 × n_GPUs) rows/second — ~1.2 M rows/day on a 6-GPU node.
 - **`inference_results`**: positives only; at a 0.99 threshold this stays small by
   construction. `inference_cadences`: a handful of rows per cadence.

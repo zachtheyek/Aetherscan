@@ -340,9 +340,17 @@ wrapper around it.
 
 **Why it exists**: many cross-replica violations (e.g. `effective_batch_size` divisible
 by `per_replica_batch_size * num_replicas`) can't be fixed by clamping one field — the
-six interdependent batch/sample params have to move together. The bounded grid search
-minimizes L1 distance to the current values so suggestions stay close to what the user
-asked for.
+six interdependent batch/sample params have to move together. The solver enumerates the
+two purely divisibility-bound fields (`effective_batch_size`, `per_replica_val_batch_size`)
+exactly from the structure — divisors of the train split, and divisors of the gcd of the
+val-side counts (val split, `num_samples_rf`, and `latent_viz_num_cadences_per_type * 4`)
+— while the data sizes and per-replica batch are only searched over small neighborhoods
+around the current values. Every candidate is confirmed by the latent-aware
+`_check_cross_constraints`, and the returned config is the L1-nearest satisfying
+combination. `_check_cross_constraints` now accepts an optional `latent_total` argument
+(callers in `_build_suggestion_block` and `find_optimal_configs.py` pass
+`config.training.latent_viz_num_cadences_per_type * 4`), so the latent-viz divisibility
+check is part of the solver's guarantee, not only of `collect_validation_errors`.
 
 Examples (from the script's docstring):
 
