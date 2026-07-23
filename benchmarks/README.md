@@ -14,6 +14,7 @@ python benchmarks/bench_normality.py            # sliding-window normality test 
 python benchmarks/bench_injection.py            # setigen signal injection (training data gen)
 python benchmarks/bench_lognorm_downsample.py   # per-cadence downsample + log-norm (load path)
 python benchmarks/bench_pfb_vs_spline.py        # PFB static equalization vs per-channel spline fit
+python benchmarks/bench_rf.py                    # Random Forest stage: latent prep + fit + predict
 # On the clusters, run through the container:
 ./utils/run_container.sh python benchmarks/bench_normality.py
 ```
@@ -35,7 +36,8 @@ comparing against the baselines.
 | `bench_injection.py` | `data_generation.new_cadence` (setigen narrowband injection into a stacked 96x4096 cadence) | Training data generation (`train.round_XX.data_generation`) |
 | `bench_lognorm_downsample.py` | per-observation `downscale_local_mean` (x8) and per-cadence `log_norm` | Stamp extraction downsample + inference load (`inference.*.load_lognorm`) |
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` (static response divide) vs `preprocessing._spline_flatten_bandpass` (order-16 fit) on one 1M-bin coarse channel | Bandpass flattening inside energy detection |
-| `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one GPU | VAE training (`train.round_XX`) and encoder inference — **GPU-only, see below** |
+| `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one or more GPUs | VAE training (`train.round_XX`) and encoder inference — **GPU-only, see below** |
+| `bench_rf.py` | `RandomForestClassifier` fit + `predict_proba` and the `prepare_latent_features` reshape (sklearn, CPU) | Second-stage RF training + inference (`train.train_random_forest`) |
 
 ## Baseline numbers
 
@@ -54,6 +56,13 @@ update this table in the same PR.
 | `bench_lognorm_downsample` — lognorm | 4,861 cadences/s |
 | `bench_pfb_vs_spline` — pfb | 46.3 channels/s (plus a 7.7 s one-time response FFT) |
 | `bench_pfb_vs_spline` — spline | 6.0 channels/s → **7.7x speedup** |
+| `bench_rf` — prep (latent reshape) | 1,936,313 cadences/s (0.05 s) |
+| `bench_rf` — fit (1000 trees) | 340 cadences/s (235 s) — random-label upper bound¹ |
+| `bench_rf` — predict | 15,989 cadences/s |
+
+¹ `bench_rf` uses random binary labels, so the trees grow until pure — a conservative *upper*
+bound on fit time; real (separable) latents yield shallower trees that fit faster. The prep
+reshape is negligible (~0.05 s for the full 99,840-cadence set).
 
 ### blpc3 (EPYC 7313, 32 cores, NGC 25.02 container, July 2026)
 
@@ -80,9 +89,9 @@ Notes:
 `bench_gpu.py` profiles the part of the pipeline the CPU micro-benchmarks above can't reach: the
 Beta-VAE on the GPU. It needs a physical GPU and the full TensorFlow / aetherscan stack, so it
 only runs inside the NGC container on a cluster. It builds the real model
-(`create_beta_vae_model`) on a single GPU and drives synthetic batches of the true pipeline
-shapes, measuring per-GPU throughput and peak VRAM and sweeping the per-replica batch size to
-find the largest that fits.
+(`create_beta_vae_model`) under a `MirroredStrategy` over the first `--num-gpus` GPUs (default 1)
+and drives synthetic batches of the true pipeline shapes, measuring aggregate throughput and
+per-GPU peak VRAM and sweeping the per-replica batch size to find the largest that fits.
 
 ```bash
 # Largest per-replica batch that fits, with throughput + VRAM at each size (stops at the first OOM):
@@ -90,13 +99,20 @@ find the largest that fits.
 ./utils/run_container.sh python benchmarks/bench_gpu.py --mode encode --find-max
 # Or measure specific sizes:
 ./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --batch-sizes 128,256,512
+# Multi-GPU scaling (MirroredStrategy all-reduce across all replicas):
+./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --num-gpus 6 --batch-sizes 128
+# Model the accumulate-then-apply cadence of the real training loop (one apply per K micro-batches):
+./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --num-gpus 6 --batch-sizes 128 --accumulation-steps 4
 ```
 
 A training example is a *cadence* `(6, 16, 512)`, so one step runs `18*B` encoder + `6*B` decoder
 passes (`B` = per-replica batch of cadences, matching `_distributed_train_step`); `encode` mode
 drives single observations `(16, 512, 1)` like inference. Peak VRAM is reported **per GPU** — each
 replica holds a full copy of the model, so combined VRAM is roughly this figure times the replica
-count. `--find-max` is capped at `--max-batch 4096`: a single encoder forward whose conv feature
+count. With `--accumulation-steps K`, one optimizer step accumulates the all-reduced grads over K
+micro-batches and applies once (as `_train_epoch`), so peak VRAM then includes the persistent
+accumulator and throughput reflects the once-per-K apply cadence. `--find-max` is capped at
+`--max-batch 4096`: a single encoder forward whose conv feature
 maps exceed 2^31 elements (batch ≳ 8192) trips an uncatchable TensorFlow int32 launch-config abort
 rather than a clean OOM, and 4096 already covers the training VRAM ceiling and a generous inference
 range (the pipeline's inference default is 2048).
@@ -130,3 +146,7 @@ toward the 76 GB VRAM ceiling; inference throughput peaks near batch ~1024 using
 large-VRAM card (e.g. the 96 GB Blackwell) the spare memory cannot be converted into throughput for
 this compact model, so the defaults (train 128, inference 2048) are already near-optimal — size the
 per-replica batch for constraint-divisibility and convenience, not to fill VRAM.
+
+The numbers above are single-GPU on blpc3. Multi-GPU scaling (`--num-gpus`), the
+`--accumulation-steps` cadence, and the bla0 (6× A4000 16 GB) baselines are captured on the
+release-benchmark runs and land with the System-Requirements update (#183).
