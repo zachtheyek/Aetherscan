@@ -18,6 +18,10 @@ python benchmarks/bench_pfb_vs_spline.py        # PFB static equalization vs per
 ./utils/run_container.sh python benchmarks/bench_normality.py
 ```
 
+`bench_gpu.py` is a different animal — it profiles the Beta-VAE on a real GPU (throughput +
+peak VRAM, with a batch-size sweep) rather than a CPU kernel, so it only runs inside the
+container on a cluster. See [GPU benchmark](#gpu-benchmark) below.
+
 Common flags: `--repeats N` (default 3; ops/s is reported from the best repeat) and
 `--output PATH` for the JSON result. Each script also exposes size knobs (`--width`,
 `--injections`, `--cadences`) — the defaults match production shapes, so stick to them when
@@ -31,6 +35,7 @@ comparing against the baselines.
 | `bench_injection.py` | `data_generation.new_cadence` (setigen narrowband injection into a stacked 96x4096 cadence) | Training data generation (`train.round_XX.data_generation`) |
 | `bench_lognorm_downsample.py` | per-observation `downscale_local_mean` (x8) and per-cadence `log_norm` | Stamp extraction downsample + inference load (`inference.*.load_lognorm`) |
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` (static response divide) vs `preprocessing._spline_flatten_bandpass` (order-16 fit) on one 1M-bin coarse channel | Bandpass flattening inside energy detection |
+| `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one GPU | VAE training (`train.round_XX`) and encoder inference — **GPU-only, see below** |
 
 ## Baseline numbers
 
@@ -69,3 +74,59 @@ Notes:
   (e.g. energy detection runs one fused task per coarse channel on the persistent pool).
 - `bench_injection` is dominated by setigen frame construction, which is why data
   generation gets a dedicated producer process and worker pool in training.
+
+## GPU benchmark
+
+`bench_gpu.py` profiles the part of the pipeline the CPU micro-benchmarks above can't reach: the
+Beta-VAE on the GPU. It needs a physical GPU and the full TensorFlow / aetherscan stack, so it
+only runs inside the NGC container on a cluster. It builds the real model
+(`create_beta_vae_model`) on a single GPU and drives synthetic batches of the true pipeline
+shapes, measuring per-GPU throughput and peak VRAM and sweeping the per-replica batch size to
+find the largest that fits.
+
+```bash
+# Largest per-replica batch that fits, with throughput + VRAM at each size (stops at the first OOM):
+./utils/run_container.sh python benchmarks/bench_gpu.py --mode train  --find-max
+./utils/run_container.sh python benchmarks/bench_gpu.py --mode encode --find-max
+# Or measure specific sizes:
+./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --batch-sizes 128,256,512
+```
+
+A training example is a *cadence* `(6, 16, 512)`, so one step runs `18*B` encoder + `6*B` decoder
+passes (`B` = per-replica batch of cadences, matching `_distributed_train_step`); `encode` mode
+drives single observations `(16, 512, 1)` like inference. Peak VRAM is reported **per GPU** — each
+replica holds a full copy of the model, so combined VRAM is roughly this figure times the replica
+count. `--find-max` is capped at `--max-batch 4096`: a single encoder forward whose conv feature
+maps exceed 2^31 elements (batch ≳ 8192) trips an uncatchable TensorFlow int32 launch-config abort
+rather than a clean OOM, and 4096 already covers the training VRAM ceiling and a generous inference
+range (the pipeline's inference default is 2048).
+
+### Baseline: blpc3 (1× RTX PRO 6000 Blackwell, 96 GB, NGC 25.02, July 2026)
+
+Training step — per-replica batch of cadences:
+
+| per-replica batch | cadences/s | peak VRAM |
+|---|---|---|
+| 128 | 2,986 | 2.81 GB |
+| 256 | 2,892 | 5.21 GB |
+| 512 | 2,852 | 10.15 GB |
+| 1024 | 2,826 | 19.79 GB |
+| 2048 | 2,786 | 38.76 GB |
+| 4096 | 2,742 | 76.52 GB |
+| 8192 | OOM | — |
+
+Encoder inference — per-replica batch of observations:
+
+| per-replica batch | obs/s | peak VRAM |
+|---|---|---|
+| 512 | 198,963 | 0.52 GB |
+| 1024 | 231,065 | 1.01 GB |
+| 2048 | 197,361 | 1.72 GB |
+| 4096 | 192,104 | 3.39 GB |
+
+**Takeaway — the Beta-VAE is compute-bound, not VRAM-bound.** Training throughput peaks at
+per-replica batch ~128 (2.81 GB) and does *not* improve — it slightly declines — as the batch grows
+toward the 76 GB VRAM ceiling; inference throughput peaks near batch ~1024 using under 2 GB. On a
+large-VRAM card (e.g. the 96 GB Blackwell) the spare memory cannot be converted into throughput for
+this compact model, so the defaults (train 128, inference 2048) are already near-optimal — size the
+per-replica batch for constraint-divisibility and convenience, not to fill VRAM.
