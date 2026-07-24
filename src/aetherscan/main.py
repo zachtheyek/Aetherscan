@@ -964,6 +964,17 @@ def main():
         # Note, can't log if init_logger() fails
         sys.exit(1)
 
+    # A full --load-tag resumes that run in place (its tag is adopted as the save_tag). If the user
+    # ALSO passed an explicit --save-tag prefix, it was silently overridden — surface that so the
+    # save-tag not taking effect isn't a mystery.
+    if getattr(args, "save_tag", None) and config.checkpoint.save_tag == getattr(
+        args, "load_tag", None
+    ):
+        logger.info(
+            f"Resuming in place under --load-tag '{args.load_tag}' — the provided --save-tag "
+            f"'{args.save_tag}' was ignored (a full --load-tag adopts that run's tag)."
+        )
+
     # Initialize resource manager
     try:
         init_manager()

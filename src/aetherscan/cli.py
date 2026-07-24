@@ -54,7 +54,16 @@ def resolve_save_tag(command: str | None, save_tag: str | None, load_tag: str | 
     """
     if load_tag is not None and _FULL_TAG_PATTERN.match(load_tag):
         return load_tag
-    prefix = save_tag if save_tag is not None else _COMMAND_TAG_PREFIX.get(command, "run")
+    if save_tag is not None:
+        prefix = save_tag
+    elif command in _COMMAND_TAG_PREFIX:
+        prefix = _COMMAND_TAG_PREFIX[command]
+    else:
+        # Fail loudly rather than emit an unloadable tag (a prefix outside {test,train,inf,bench}
+        # would not match _LOAD_TAG_PATTERN, so its artifacts could never be --load-tag'd).
+        raise ValueError(
+            f"Cannot derive a save-tag prefix for command {command!r}; pass --save-tag explicitly."
+        )
     return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 

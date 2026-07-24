@@ -24,6 +24,9 @@ from aetherscan.run_state import (
     STAGE_VAE_ROUNDS,
     TRAINING_STAGES,
     TrainingRunState,
+    config_fingerprint,
+    run_state_path,
+    save_run_state,
 )
 from aetherscan.train import (
     TrainingPipeline,
@@ -111,6 +114,40 @@ class TestTrainingPlotsDir:
         assert pipeline._training_plots_dir("checkpoints") == os.path.join(
             pipeline.config.output_path, "plots", "training", "run_a", "checkpoints"
         )
+
+
+class TestResumeInPlace:
+    """Resume-in-place (--load-tag {full} == save_tag) is a continuation of the same run, not a
+    user override: _init_run_state must let the manifest's completed_rounds drive _start_round (so
+    the round-checkpoint resume fallback is reachable) instead of resetting it to 1 and wiping the
+    manifest."""
+
+    def test_manifest_rounds_drive_start_round(self, tmp_path):
+        config = get_config()
+        config.output_path = str(tmp_path)
+        tag = "train_20260101_120000"
+        config.checkpoint.save_tag = tag
+        config.checkpoint.load_tag = tag  # resume-in-place: the full load-tag was adopted
+        config.checkpoint.load_dir = None
+        config.checkpoint.start_round = 1  # the default — must NOT clobber the manifest
+
+        # Manifest for THIS tag: rounds 1-3 done, VAE unfinished; fingerprint matches the config.
+        state = TrainingRunState(
+            tag=tag,
+            run_start_time=123.0,
+            config_fingerprint=config_fingerprint(config.to_dict()),
+            completed_rounds=[1, 2, 3],
+        )
+        save_run_state(state, run_state_path(str(tmp_path), tag))
+
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = config
+        pipeline.db = types.SimpleNamespace(mark_superseded=lambda *a, **k: True)
+        pipeline._init_run_state()
+
+        # Manifest drives resume: start at round 4 (max completed + 1); rounds are NOT wiped.
+        assert pipeline._start_round == 4
+        assert pipeline.run_state.completed_rounds == [1, 2, 3]
 
 
 class TestTrainRandomForestSkipIsLoud:

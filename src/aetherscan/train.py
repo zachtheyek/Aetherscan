@@ -974,11 +974,10 @@ class TrainingPipeline:
             # adopted by resolve_save_tag). If the run's final weights aren't on disk yet (the VAE
             # didn't finish before the interruption), fall back to the manifest's last completed
             # round for THIS tag — never to another run's checkpoints; fail loudly if neither.
-            resume_in_place = (
-                load_tag is not None
-                and load_tag == save_tag
-                and not re.fullmatch(r"round_\d+", load_tag)
-            )
+            # --load-tag equals this run's adopted save_tag (always a full {prefix}_{datetime}
+            # tag — resolve_save_tag never adopts a round_XX load-tag), so this is a resume of the
+            # same run whose VAE may not have finished.
+            resume_in_place = load_tag is not None and load_tag == save_tag
             if resume_in_place and not _model_pair_exists(self.config.model_path, load_tag):
                 if self._start_round > 1:
                     resume_tag = f"round_{self._start_round - 1:02d}"
@@ -1079,7 +1078,15 @@ class TrainingPipeline:
                 f"stages done: {state.stages_done}, stages failed: {state.stages_failed})"
             )
 
-        explicit_checkpoint = (
+        # Resume-in-place (--load-tag {full_tag} == this run's save_tag) is a CONTINUATION of the
+        # same run, not a user override — so the manifest (completed_rounds) drives resume, exactly
+        # as a same-command rerun would. Only a genuinely explicit checkpoint (a round_XX/other
+        # --load-tag, or --load-dir) is treated as an override that restarts from start_round and
+        # clears the manifest.
+        resume_in_place = (
+            self.config.checkpoint.load_tag is not None and self.config.checkpoint.load_tag == tag
+        )
+        explicit_checkpoint = (not resume_in_place) and (
             self.config.checkpoint.load_tag is not None
             or self.config.checkpoint.load_dir is not None
         )
