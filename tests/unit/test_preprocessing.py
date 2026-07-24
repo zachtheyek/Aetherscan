@@ -437,6 +437,10 @@ class TestProcessCadenceEndToEnd:
 
     def _configure(self, bandpass_method="spline"):
         config = get_config()
+        # In production main() resolves save_tag to {command}_{datetime} before any stage runs
+        # (the dataclass default is None); mirror that here so tag-scoped output paths (e.g. the
+        # bandpass debug overlay under plots/inference/{save_tag}/) resolve to a real directory.
+        config.checkpoint.save_tag = "inf_20260101_120000"
         config.manager.n_processes = 1  # sequential: no pools/shm in unit tests
         config.data.time_bins = 16
         config.data.width_bin = 256
