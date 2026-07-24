@@ -349,7 +349,7 @@ AETHERSCAN_EXTRA_BINDS=/datag ./utils/run_container.sh python -m aetherscan.main
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json \
-    --save-tag run_v1
+    --save-tag inf
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
@@ -357,7 +357,7 @@ PYTHONPATH=src python -m aetherscan.main inference \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json \
-    --save-tag run_v1
+    --save-tag inf
 ```
 
 **Inference with async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
@@ -366,12 +366,12 @@ PYTHONPATH=src python -m aetherscan.main inference \
 # Container
 ./utils/run_container.sh python -m aetherscan.main inference \
     --no-async-allocator \
-    --save-tag run_v1
+    --save-tag inf
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
     --no-async-allocator \
-    --save-tag run_v1
+    --save-tag inf
 ```
 
 ---

@@ -122,8 +122,8 @@ paths:
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
   was trained with. The saved `checkpoint` section is deliberately skipped — most damagingly
   `save_tag`: without the skip, an inference run would masquerade under the training run's
-  tag, corrupting DB provenance and output paths. The CLI `--save-tag` (or the default
-  timestamp) stays authoritative.
+  tag, corrupting DB provenance and output paths. This run's resolved save_tag (the
+  `{command}_{datetime}` tag set once in `main()`) stays authoritative.
 
 `collect_validation_errors` enforces the trio all-or-none (a partial set is the error above);
 every path that *is* set must exist on disk. The three artifacts should carry the same training
@@ -145,11 +145,11 @@ markers (`find_inference_tag_collisions`) are:
   non-superseded `inference_results` rows for the tag.
 
 Manifest rows are deliberately **not** a collision: they mark an in-progress streaming run that
-the resume flow below consumes, so same-tag DB state there is expected. Default datetime tags
-are immune by construction (a fresh second-resolution timestamp can't collide), so the guard
-only fires for explicit tags; `--force-tag` consciously overrides it. (The same module also
-guards training tags and, under `--hf-upload`, checks the Hub for the tag at startup rather
-than after ~30 h of training.)
+the resume flow below consumes, so same-tag DB state there is expected. Every resolved tag
+carries a fresh second-resolution `{command}_{datetime}` stamp, so a fresh inference run can't
+collide; `--force-tag` overrides the guard if it ever fires. (The same module also guards
+training tags and, under `--hf-upload`, checks the Hub for the tag at startup rather than after
+~30 h of training.)
 
 ## The streaming loop
 
@@ -202,7 +202,9 @@ than after ~30 h of training.)
 The retry loop wraps all of it: transient failures (I/O hiccups, GPU errors) retry up to
 `inference.max_retries` with `inference.retry_delay` between passes; `KeyboardInterrupt`
 propagates; state-based resume (stamp `.npy` for preprocessing, manifest rows for inference)
-makes an in-process retry and a full relaunch of the identical command behave identically.
+lets the in-process retry loop pick up where the last pass died. A full relaunch mints a fresh
+datetime tag and starts clean — to reuse a prior run's preprocessing, point
+`--preprocess-output-dir` at its stamp directory.
 
 ## The GPU stage: `InferencePipeline.run_inference()`
 

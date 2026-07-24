@@ -35,10 +35,10 @@ CLI flags are identical between the two paths; only the launcher differs. `PYTHO
 
 ```bash
 # Train (container, canonical)
-./utils/run_container.sh python -m aetherscan.main train --save-tag final_v1
+./utils/run_container.sh python -m aetherscan.main train --save-tag train
 
 # Train (conda source, Ampere)
-PYTHONPATH=src python -m aetherscan.main train --save-tag final_v1
+PYTHONPATH=src python -m aetherscan.main train --save-tag train
 
 # Inference from a pre-processed .npy
 ./utils/run_container.sh python -m aetherscan.main inference \

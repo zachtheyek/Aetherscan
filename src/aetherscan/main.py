@@ -358,7 +358,9 @@ def train_command():
             # Reinitialize the training pipeline on each attempt so no corrupted state is
             # persisted. The persisted run manifest (run_state_{save_tag}.json) tells the new
             # pipeline which rounds/stages already completed, so the attempt resumes exactly
-            # where the previous one died (works identically for a full process relaunch)
+            # where the previous one died. The save_tag is fixed for the life of the process, so
+            # these in-process retries resume automatically; a full process relaunch mints a fresh
+            # datetime tag and only resumes when re-invoked with --load-tag {full-tag}.
             pipeline = run_training_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded

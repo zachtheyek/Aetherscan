@@ -408,8 +408,8 @@ The complete configuration is in `{HF_CONFIG_FILENAME}`.
 
 ## Usage
 
-Aetherscan inference downloads these weights by default when no local artifact paths are
-given (pin a version with `--hf-revision`):
+Pin this training tag with `--hf-revision` to download exactly these weights (a bare no-artifact
+inference download resolves to the latest `vX.Y.Z` release tag instead, never a training tag):
 
 ```bash
 python -m aetherscan.main inference --hf-revision {tag} --inference-files <catalog.csv>

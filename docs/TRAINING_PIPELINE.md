@@ -29,7 +29,9 @@ recorded in the manifest and retried on the next run, but never cost a data rege
 Stage 6 (`hf_upload`) runs only when `config.hf.upload_after_training` is set — a failed
 upload is recorded but never fails the run, since the weights are already safe locally.
 Every stage is skipped if the persisted manifest (`run_state_{tag}.json`) already records it
-as done, so re-running the identical command resumes exactly where the last attempt died.
+as done, so the in-process retry loop resumes exactly where the last attempt died. Resuming
+across a full process relaunch is explicit: pass `--load-tag {full-tag}` (a bare re-run mints a
+fresh datetime tag and starts a new run).
 
 ## Round lifecycle
 
@@ -288,8 +290,9 @@ clear `stages_done` so downstream stages re-run against the re-trained rounds.
 `training.retry_delay` between attempts. Each attempt rebuilds the `TrainingPipeline` from
 scratch (no corrupted in-memory state survives); the manifest tells the new pipeline where to
 resume. Background plates are loaded once in `train_command` and reused across attempts.
-Because the manifest is on disk, a **full process relaunch of the identical command resumes
-identically** — the in-process loop and a crash-and-relaunch are the same code path.
+The manifest is on disk, so the in-process retry loop resumes off it automatically; a
+crash-and-relaunch resumes identically **only when re-invoked with `--load-tag {full-tag}`** (a
+bare relaunch mints a fresh datetime tag and starts a new run).
 
 Non-critical plot stages (`vae_plots`, `rf_plots`) never trigger a retry: each plot in the
 group is attempted even if a sibling fails (`_run_plot_group`), failures are recorded in
