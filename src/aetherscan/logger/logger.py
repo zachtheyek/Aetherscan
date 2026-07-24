@@ -134,8 +134,8 @@ class Logger:
         """Initialize logger.
 
         `save_tag` names this run's log file (aetherscan_{save_tag}.log). Callers pass the run's
-        effective tag (the CLI --save-tag if given, else the config default timestamp tag); when
-        omitted, it falls back to config.checkpoint.save_tag directly.
+        resolved {command}_{datetime} tag (main() resolves it via cli.resolve_save_tag before
+        calling init_logger); when omitted, it falls back to config.checkpoint.save_tag directly.
         """
         # Note, __init__ is triggered every time the class's constructor is called,
         # even if __new__ returned the existing singleton instance
@@ -150,9 +150,9 @@ class Logger:
             raise ValueError("get_config() returned None")
 
         # Per-run, tag-scoped log file: each run writes aetherscan_{tag}.log, so a new run no
-        # longer overwrites the previous run's log. init_logger() runs before the CLI --save-tag
-        # is applied to the config, so main.py resolves the effective tag from args and passes it
-        # in here; the config default is the fallback for any other caller.
+        # longer overwrites the previous run's log. main.py resolves the run's {command}_{datetime}
+        # tag onto config.checkpoint.save_tag before calling init_logger and passes it in here; the
+        # config value is the fallback for any other caller.
         tag = save_tag if save_tag is not None else self.config.checkpoint.save_tag
         self.log_path = log_path_for_tag(self.config.output_path, tag)
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)  # Create dir if it doesn't exist
@@ -345,9 +345,9 @@ def init_logger(save_tag: str | None = None) -> Logger:
     """
     Initialize global logger instance (call once at startup).
 
-    `save_tag` names this run's log file (aetherscan_{save_tag}.log). Pass the run's effective tag
-    (the CLI --save-tag if given, else the config default timestamp tag); when omitted, the Logger
-    falls back to config.checkpoint.save_tag.
+    `save_tag` names this run's log file (aetherscan_{save_tag}.log). Pass the run's resolved
+    {command}_{datetime} tag (main() resolves it via cli.resolve_save_tag beforehand); when
+    omitted, the Logger falls back to config.checkpoint.save_tag.
     """
     logger_instance = Logger(save_tag=save_tag)
 
