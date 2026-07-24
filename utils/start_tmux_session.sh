@@ -35,17 +35,13 @@ tmux send-keys -t "$TOP" 'export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$COND
 tmux send-keys -t "$TOP" 'export TF_CPP_MIN_LOG_LEVEL=1' C-m
 tmux send-keys -t "$TOP" 'cd Aetherscan/' C-m
 
-# Top pane stays full-width; A is bottom-left, B is bottom-right.
-A=$(tmux split-window -v -t "$TOP" -P -F '#{pane_id}')
-B=$(tmux split-window -h -t "$A" -P -F '#{pane_id}')
-
-tmux send-keys -t "$A" 'watch -n 1 tree -L 3 /datax/scratch/zachy/models/aetherscan/' C-m
-tmux send-keys -t "$B" 'watch -n 1 tree -L 4 /datax/scratch/zachy/outputs/aetherscan/' C-m
+# Single full-window working pane (the filesystem watches now live in the "data" window).
 
 # ───── Window 2: htop ─────
 tmux new-window -t "$SESSION" -n htop
+# htop keeps the top 75%; the CPU/MEM ticker takes the bottom 25%.
 C=$(tmux display-message -p -t "$SESSION:htop" '#{pane_id}')
-D=$(tmux split-window -v -t "$C" -P -F '#{pane_id}')
+D=$(tmux split-window -v -l 25% -t "$C" -P -F '#{pane_id}')
 
 tmux send-keys -t "$C" 'htop' C-m
 tmux send-keys -t "$D" 'conda activate aetherscan' C-m
@@ -59,9 +55,19 @@ tmux select-pane -t "$C"
 tmux new-window -t "$SESSION" -n nvidia-smi
 tmux send-keys -t "$SESSION:nvidia-smi" 'watch -n 1 nvidia-smi' C-m
 
-# ───── Window 4: shm ─────
-tmux new-window -t "$SESSION" -n shm
-tmux send-keys -t "$SESSION:shm" 'watch -n 1 ls -lh /dev/shm' C-m
+# ───── Window 4: data ─────
+# Four even-vertical panes (top→bottom): /dev/shm, then the data / models / outputs trees.
+tmux new-window -t "$SESSION" -n data
+E=$(tmux display-message -p -t "$SESSION:data" '#{pane_id}')
+F=$(tmux split-window -v -t "$E" -P -F '#{pane_id}')
+G=$(tmux split-window -v -t "$F" -P -F '#{pane_id}')
+H=$(tmux split-window -v -t "$G" -P -F '#{pane_id}')
+tmux select-layout -t "$SESSION:data" even-vertical
+
+tmux send-keys -t "$E" 'watch -n 1 ls -lh /dev/shm' C-m
+tmux send-keys -t "$F" 'watch -n 1 tree -L 3 /datax/scratch/zachy/data/aetherscan' C-m
+tmux send-keys -t "$G" 'watch -n 1 tree -L 2 /datax/scratch/zachy/models/aetherscan' C-m
+tmux send-keys -t "$H" 'watch -n 1 tree -L 2 /datax/scratch/zachy/outputs/aetherscan' C-m
 
 # Land on the pipeline window, top pane (where you actually type).
 tmux select-window -t "$SESSION:pipeline"

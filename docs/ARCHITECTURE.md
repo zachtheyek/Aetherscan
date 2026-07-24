@@ -233,13 +233,15 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 ├── run_state_{tag}.json               # training run manifest (stage machine + completed rounds)
 ├── db/aetherscan.db                   # SQLite (WAL) — all stats/results tables
 ├── logs/aetherscan_{tag}.log          # this run's log (mode="w": overwrites the same tag's log on rerun)
-├── pfb_cache/pfb_response_*.npy       # content-addressed PFB passband responses
+├── cache/pfb/pfb_response_*.npy       # content-addressed PFB passband responses (tag-independent)
 ├── round_data/{tag}/round_XX/         # per-round training memmaps (deleted after the round trains)
 │   └── rf/                            #   plus the RF training dataset
 └── plots/
-    ├── *_{tag}.png                    # end-of-training diagnostics + resource_utilization plot
-    ├── checkpoints/*_round_XX.png     # per-round diagnostics (archived like model checkpoints)
-    └── inference/{tag}/*.png          # inference visualization suite
+    ├── resource_utilization_{tag}.png # monitor resource plot (mode-agnostic)
+    ├── benchmark_report_{tag}.png      # end-of-run resource report (mode-agnostic)
+    ├── training/{tag}/*.png            # end-of-training diagnostics
+    │   └── checkpoints/*_round_XX.png  #   per-round diagnostics (archived like model checkpoints)
+    └── inference/{tag}/*.png           # inference visualization suite
 ```
 
 Startup hygiene: `train.py:archive_directory()` moves (fresh run) or copies (resume) existing

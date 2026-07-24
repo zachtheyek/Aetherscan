@@ -287,6 +287,23 @@ PYTHONPATH=src python -m aetherscan.main train \
     --save-tag test_v1
 ```
 
+**Watching the live dashboard from your local browser (SSH port forwarding)**
+
+Each `train`/`inference` run auto-launches a Streamlit dashboard on the cluster node (enabled by
+default), served on that node's `localhost:8501` (`config.monitor.dashboard_port`, default `8501`).
+It reads the run's live SQLite DB, so it updates as the pipeline progresses. Because it binds to the
+node's loopback interface, view it locally by opening an SSH tunnel that forwards the port, then
+browsing to the forwarded address:
+
+```bash
+# From your local machine — forward the dashboard port from the cluster node running the pipeline:
+ssh -L 8501:localhost:8501 <cluster-host>
+# ...then open http://localhost:8501 in your local browser. Keep the tunnel open while you watch.
+```
+
+If you launched the run on a non-default port, forward that port instead. The pipeline also logs the
+exact `ssh -L …` command when it starts the dashboard.
+
 ### Inference
 
 > [!TIP]
@@ -869,8 +886,8 @@ options:
   --bandpass-debug-plot, --no-bandpass-debug-plot
                         Save a per-cadence bandpass-flattening overlay debug
                         plot (raw vs flattened integrated spectrum for a few
-                        sampled coarse channels) under plots/inference/
-                        (default: off)
+                        sampled coarse channels) under plots/inference/{save-
+                        tag}/ (default: off)
   --spline-order SPLINE_ORDER
                         Spline order for bandpass fitting with --bandpass-
                         method spline (default: 16)

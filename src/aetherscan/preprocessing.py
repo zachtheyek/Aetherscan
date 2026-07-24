@@ -1877,7 +1877,7 @@ class DataPreprocessor:
     ) -> str:
         """
         Compute the PFB passband response in the parent process and persist it to a
-        deterministic sidecar .npy under {output_path}/pfb_cache/, returning its path.
+        deterministic sidecar .npy under {output_path}/cache/pfb/, returning its path.
 
         The heavy work (an ~n_chans-point FFT) runs exactly once per parameter combination in
         the parent — gen_coarse_channel_response is process-cached and the file is reused when
@@ -1890,7 +1890,7 @@ class DataPreprocessor:
             fine_per_coarse, num_coarse_channels, taps_per_channel
         )
 
-        cache_dir = os.path.join(self.config.output_path, "pfb_cache")
+        cache_dir = os.path.join(self.config.output_path, "cache", "pfb")
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(
             cache_dir,
@@ -2038,7 +2038,7 @@ class DataPreprocessor:
         Opt-in debug artifact (--bandpass-debug-plot): for a few coarse channels sampled evenly
         across the band of the cadence's primary ON-source file, plot the time-integrated
         spectrum raw vs flattened, overlaying the model being removed (the scaled PFB response
-        H, or the spline fit). Saved under {output_path}/plots/inference/. Deliberately
+        H, or the spline fit). Saved under {output_path}/plots/inference/{save_tag}/. Deliberately
         minimal — PR-08's inference visualization suite formalizes this figure.
 
         Uses matplotlib's object-oriented Figure API rather than pyplot: _process_cadence runs
@@ -2099,10 +2099,10 @@ class DataPreprocessor:
         fig.suptitle(f"Bandpass flattening overlay ({method}): {os.path.basename(h5_path)}")
         fig.tight_layout()
 
-        save_dir = os.path.join(self.config.output_path, "plots", "inference")
+        tag = self.config.checkpoint.save_tag
+        save_dir = os.path.join(self.config.output_path, "plots", "inference", tag)
         os.makedirs(save_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(npy_path))[0]
-        tag = self.config.checkpoint.save_tag
         out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{tag}.png")
         # No close/registry bookkeeping needed: an OO-API Figure is garbage-collected
         fig.savefig(out_path, dpi=120)

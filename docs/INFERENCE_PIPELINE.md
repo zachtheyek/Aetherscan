@@ -258,7 +258,33 @@ flagged while later writes stay live (`Database.mark_superseded`).
 | Config snapshot | `{output_path}/config_{tag}.json` | The resolved (saved-config + CLI) view this run actually used. |
 | Figures | `{output_path}/plots/inference/{tag}/` | The visualization suite below; also uploaded to the run's Slack thread. |
 | Resource plot | `{output_path}/plots/resource_utilization_{tag}.png` | Written by the monitor at shutdown. |
-| PFB response cache | `{output_path}/pfb_cache/pfb_response_*.npy` | Content-addressed; reused across runs. |
+| PFB response cache | `{output_path}/cache/pfb/pfb_response_*.npy` | Content-addressed by channelization geometry; one file per `(width, coarse count, taps)`, shared across all `.h5` and all runs. See [The PFB response cache](#the-pfb-response-cache). |
+
+### The PFB response cache
+
+`{output_path}/cache/pfb/pfb_response_w{W}_c{C}_t{T}.npy` caches the **static PFB coarse-channel
+passband response** — the filter shape that `pfb.equalize_passband` divides each coarse channel by
+during bandpass flattening. It is **not** a cache of preprocessed `.h5` output: it holds a single
+~8 MB array, computed once per channelization *geometry* by an ~`n_chans`-point FFT
+(`gen_coarse_channel_response`) and content-addressed by its parameters — `W` = fine channels per
+coarse, `C` = coarse-channel count, `T` = `pfb_taps_per_channel`.
+
+- **What hits the cache:** every `.h5` that shares the same `(W, C, T)` channelization — which, for a
+  given telescope/receiver/product, is all of them. The first cadence of a run computes the response
+  (the one-time FFT — ~7–12 s at GBT scale) and writes the sidecar; every later cadence *in that run*,
+  and every *future run* on any `.h5` of the same geometry, reads the cached array instead of
+  recomputing.
+- **What misses:** an `.h5` with a *different* channelization (different fine-per-coarse, coarse count,
+  or `--pfb-taps-per-channel`) is a distinct key and computes + caches its own response. Mixing
+  geometries in one campaign simply yields one cached file per geometry — none of them ever collide.
+- **What it does and doesn't speed up:** it removes the one-time response FFT from all but the first
+  cadence of each geometry. It does **not** change the per-channel flattening cost — `equalize_passband`
+  (a vectorized divide) still runs for every coarse channel of every file. So the win is "compute the
+  response once, not once per file," not "preprocess each `.h5` once."
+- **Tag-independent by design:** the cache key is the geometry, never `--save-tag`, so it is shared
+  across runs and never invalidated by a new tag. Because it is content-addressed, a corrupt or
+  mismatched sidecar is transparently rewritten — stale-run leftovers are impossible, and the cache is
+  safe to delete at any time (it just rebuilds on next use).
 
 ## The visualization suite — what each figure shows
 
