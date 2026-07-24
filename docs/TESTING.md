@@ -47,10 +47,10 @@ tests/
 │   ├── test_run_state.py            # manifest round-trip, stage machine transitions
 │   ├── test_train_utils.py          # get_latest_tag ladder, curriculum schedules, archiving
 │   ├── test_train_datasets.py       # batched generators: coverage, stratification, alignment
-│   ├── test_shap_parallel.py        # positive-class shape normalization + MP-vs-single-process byte-identity (all three passes)
 │   ├── test_latent_traversal.py     # traversal grid math with a stub decoder
 │   ├── test_models.py               # feature layout, RF train/predict, encoder/decoder symmetry
 │   ├── test_rf_metrics.py           # pure RF eval-metric helper: AUC/AP/Brier/confusion/quantile hand-computed cases, degenerate single-class split
+│   ├── test_shap_parallel.py        # positive-class shape normalization + MP-vs-single-process byte-identity (all three passes)
 │   ├── test_preprocessing.py        # k² equivalence gates, dedup, grouping, DC spike, spline
 │   ├── test_pfb.py                  # response shape/symmetry/flatness, C++ sinc cross-check
 │   ├── test_inference.py            # padding fix, provenance mapping, confidence summaries
