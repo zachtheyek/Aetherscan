@@ -886,8 +886,8 @@ options:
   --bandpass-debug-plot, --no-bandpass-debug-plot
                         Save a per-cadence bandpass-flattening overlay debug
                         plot (raw vs flattened integrated spectrum for a few
-                        sampled coarse channels) under plots/inference/
-                        (default: off)
+                        sampled coarse channels) under plots/inference/{save-
+                        tag}/ (default: off)
   --spline-order SPLINE_ORDER
                         Spline order for bandpass fitting with --bandpass-
                         method spline (default: 16)

@@ -860,7 +860,7 @@ def _add_inference_flags_to(parser):
         "--bandpass-debug-plot",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Save a per-cadence bandpass-flattening overlay debug plot (raw vs flattened integrated spectrum for a few sampled coarse channels) under plots/inference/ (default: off)",
+        help="Save a per-cadence bandpass-flattening overlay debug plot (raw vs flattened integrated spectrum for a few sampled coarse channels) under plots/inference/{save-tag}/ (default: off)",
     )
     parser.add_argument(
         "--spline-order",
