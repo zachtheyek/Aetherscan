@@ -48,7 +48,7 @@ as done, so re-running the identical command resumes exactly where the last atte
 5. **Epoch loop** — `_train_epoch()` + `_validate_epoch()`, ~21 `training_stats` rows per
    epoch (losses, gradient norms, LR, durations, SNR range), adaptive LR update.
 6. **Per-round plots** — loss curves, training stability, injection stats (tagged
-   `round_XX`, saved under `plots/checkpoints/`), plus the latent traversal when
+   `round_XX`, saved under `plots/training/{save_tag}/checkpoints/`), plus the latent traversal when
    `--latent-traversal-every-round` is set.
 7. **Checkpoint** — `save_models(tag="round_XX", dir="checkpoints")`, then the round is
    recorded in the run manifest (`completed_rounds`).
@@ -112,6 +112,15 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
   (`_estimate_round_data_nbytes`: 2.2× one round with overlap, 1.1× without) and hard-fails
   with the computed numbers. Round *k*'s directory is deleted as soon as round *k* finishes
   training (`--keep-round-data` retains it for debugging).
+
+> [!TIP]
+> **For official tagged training releases, pass `--keep-round-data`.** By default each round's
+> memmaps are deleted the moment that round finishes training (delete-as-you-go keeps the disk
+> footprint at ~590 GB). `--keep-round-data` retains every round's exact on-disk dataset (plus the
+> RF training set) under `{data_path}/training/round_data/{save_tag}/{round_XX,rf}/`, so a release
+> model's training data is reproducible/inspectable after the fact — at the cost of holding the full
+> run on disk (~295 GB × num_training_rounds, e.g. ~6 TB for a 20-round run). Nothing in the pipeline
+> *reads* an earlier round once it has trained, so this flag is purely for post-hoc retention.
 
 ### The producer process
 
@@ -292,8 +301,9 @@ artifacts already exist from a previous attempt, they are loaded instead of rege
 
 ## Training plots — what each one shows
 
-Per-round copies (tagged `round_XX`) land in `{output_path}/plots/checkpoints/`; the
-end-of-training set (tagged with the run tag) in `{output_path}/plots/`. Every figure is also
+Per-round copies (tagged `round_XX`) land in `{output_path}/plots/training/{save_tag}/checkpoints/`;
+the end-of-training set (tagged with the run tag) in `{output_path}/plots/training/{save_tag}/`. Every
+figure is also
 uploaded to the run's Slack thread. All of them query the DB with `start_time =
 run_start_time`, so multi-attempt runs plot complete histories with superseded rows filtered
 out.

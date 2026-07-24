@@ -1265,7 +1265,13 @@ class TrainingPipeline:
         model_checkpoints_dir = os.path.join(self.config.model_path, "checkpoints")
         archive_directory(model_checkpoints_dir, target_dirs=None, round_num=start_round)
 
-        plot_checkpoints_dir = os.path.join(self.config.output_path, "plots", "checkpoints")
+        plot_checkpoints_dir = os.path.join(
+            self.config.output_path,
+            "plots",
+            "training",
+            self.config.checkpoint.save_tag,
+            "checkpoints",
+        )
         archive_directory(plot_checkpoints_dir, target_dirs=None, round_num=start_round)
 
         # Disk-backed round-data directory for this tag: delete round dirs >= start_round,
@@ -3027,11 +3033,20 @@ class TrainingPipeline:
         # Save plot
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"beta_vae_loss_curves_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"beta_vae_loss_curves_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"beta_vae_loss_curves_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"beta_vae_loss_curves_{tag}.png",
             )
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)  # Create dir if it doesn't exist
@@ -3272,11 +3287,20 @@ class TrainingPipeline:
         # Save plot
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"beta_vae_training_stability_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"beta_vae_training_stability_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"beta_vae_training_stability_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"beta_vae_training_stability_{tag}.png",
             )
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -3432,9 +3456,13 @@ class TrainingPipeline:
             tag = self.config.checkpoint.save_tag
 
         if dir is not None:
-            save_dir = os.path.join(self.config.output_path, "plots", dir)
+            save_dir = os.path.join(
+                self.config.output_path, "plots", "training", self.config.checkpoint.save_tag, dir
+            )
         else:
-            save_dir = os.path.join(self.config.output_path, "plots")
+            save_dir = os.path.join(
+                self.config.output_path, "plots", "training", self.config.checkpoint.save_tag
+            )
         os.makedirs(save_dir, exist_ok=True)
 
         metadata_json = get_system_metadata()
@@ -4387,9 +4415,13 @@ class TrainingPipeline:
             tag = self.config.checkpoint.save_tag
 
         if dir is not None:
-            save_dir = os.path.join(self.config.output_path, "plots", dir)
+            save_dir = os.path.join(
+                self.config.output_path, "plots", "training", self.config.checkpoint.save_tag, dir
+            )
         else:
-            save_dir = os.path.join(self.config.output_path, "plots")
+            save_dir = os.path.join(
+                self.config.output_path, "plots", "training", self.config.checkpoint.save_tag
+            )
 
         os.makedirs(save_dir, exist_ok=True)  # Create dir if it doesn't exist
 
@@ -5024,9 +5056,22 @@ class TrainingPipeline:
         """Standard plot tail shared by the two traversal renderers: save under the plots
         directory (optionally nested in `dir`), close the figure, and upload to Slack."""
         if dir is not None:
-            save_path = os.path.join(self.config.output_path, "plots", dir, filename)
+            save_path = os.path.join(
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                filename,
+            )
         else:
-            save_path = os.path.join(self.config.output_path, "plots", filename)
+            save_path = os.path.join(
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                filename,
+            )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -5282,11 +5327,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_confusion_matrices_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_confusion_matrices_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_confusion_matrices_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_confusion_matrices_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -5461,11 +5515,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_classification_curves_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_classification_curves_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_classification_curves_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_classification_curves_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -5539,10 +5602,21 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_shap_summary_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_shap_summary_{tag}.png",
             )
         else:
-            save_path = os.path.join(self.config.output_path, "plots", f"rf_shap_summary_{tag}.png")
+            save_path = os.path.join(
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_shap_summary_{tag}.png",
+            )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -5629,11 +5703,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_shap_dependence_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_shap_dependence_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_shap_dependence_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_shap_dependence_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -5706,11 +5789,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_shap_interactions_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_shap_interactions_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_shap_interactions_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_shap_interactions_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -5815,11 +5907,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_shap_loss_monitoring_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_shap_loss_monitoring_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_shap_loss_monitoring_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_shap_loss_monitoring_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -5978,11 +6079,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_shap_explanation_clustering_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_shap_explanation_clustering_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_shap_explanation_clustering_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_shap_explanation_clustering_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -6092,11 +6202,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_calibration_curve_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_calibration_curve_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_calibration_curve_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_calibration_curve_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -6220,11 +6339,20 @@ class TrainingPipeline:
 
         if dir is not None:
             save_path = os.path.join(
-                self.config.output_path, "plots", dir, f"rf_oob_accuracy_curve_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                dir,
+                f"rf_oob_accuracy_curve_{tag}.png",
             )
         else:
             save_path = os.path.join(
-                self.config.output_path, "plots", f"rf_oob_accuracy_curve_{tag}.png"
+                self.config.output_path,
+                "plots",
+                "training",
+                self.config.checkpoint.save_tag,
+                f"rf_oob_accuracy_curve_{tag}.png",
             )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -6410,9 +6538,22 @@ class TrainingPipeline:
 
                 filename = f"rf_latent_decision_boundary_nn{nn}_md{md}_{tag}.png"
                 if dir is not None:
-                    save_path = os.path.join(self.config.output_path, "plots", dir, filename)
+                    save_path = os.path.join(
+                        self.config.output_path,
+                        "plots",
+                        "training",
+                        self.config.checkpoint.save_tag,
+                        dir,
+                        filename,
+                    )
                 else:
-                    save_path = os.path.join(self.config.output_path, "plots", filename)
+                    save_path = os.path.join(
+                        self.config.output_path,
+                        "plots",
+                        "training",
+                        self.config.checkpoint.save_tag,
+                        filename,
+                    )
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 plt.savefig(save_path, dpi=300, bbox_inches="tight")
                 plt.close(fig)

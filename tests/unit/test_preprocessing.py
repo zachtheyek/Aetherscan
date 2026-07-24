@@ -748,7 +748,7 @@ class TestBandpassFlattenerSelection:
         response_path = flattener.keywords["response_path"]
         # The sidecar file lives under the run's output path and holds exactly the response
         # the parent computed for (width, coarse count, taps)
-        assert response_path.startswith(os.path.join(config.output_path, "pfb_cache"))
+        assert response_path.startswith(os.path.join(config.output_path, "cache", "pfb"))
         expected = gen_coarse_channel_response(512, 4, config.inference.pfb_taps_per_channel)
         np.testing.assert_array_equal(np.load(response_path), expected)
 

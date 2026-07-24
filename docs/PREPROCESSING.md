@@ -89,7 +89,7 @@ reference implementation):
 
 At GBT scale the one-time FFT is an ~`n_chans`-point transform with a tens-of-GB transient,
 so it runs **once in the parent**, is persisted to a content-addressed sidecar
-(`{output_path}/pfb_cache/pfb_response_w{W}_c{C}_t{T}.npy`, atomic write), and workers just
+(`{output_path}/cache/pfb/pfb_response_w{W}_c{C}_t{T}.npy`, atomic write), and workers just
 read the ~8 MB file (cached per process by `_load_pfb_response`). Afterwards, flattening a
 channel is a single vectorized divide — versus a fresh spline fit per channel per file.
 

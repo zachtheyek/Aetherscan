@@ -1877,7 +1877,7 @@ class DataPreprocessor:
     ) -> str:
         """
         Compute the PFB passband response in the parent process and persist it to a
-        deterministic sidecar .npy under {output_path}/pfb_cache/, returning its path.
+        deterministic sidecar .npy under {output_path}/cache/pfb/, returning its path.
 
         The heavy work (an ~n_chans-point FFT) runs exactly once per parameter combination in
         the parent — gen_coarse_channel_response is process-cached and the file is reused when
@@ -1890,7 +1890,7 @@ class DataPreprocessor:
             fine_per_coarse, num_coarse_channels, taps_per_channel
         )
 
-        cache_dir = os.path.join(self.config.output_path, "pfb_cache")
+        cache_dir = os.path.join(self.config.output_path, "cache", "pfb")
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(
             cache_dir,
