@@ -4,9 +4,9 @@ Aetherscan carries always-on stage timing plus a set of offline tools to read it
 document covers the four pieces: the `stage_timer` instrumentation
 ([`src/aetherscan/benchmark.py`](../src/aetherscan/benchmark.py)), the `pipeline_stages` DB
 table it writes to, the annotated resource plot the monitor renders, the report tool
-([`utils/benchmark_report.py`](../utils/benchmark_report.py)), and the standalone
-micro-benchmarks ([`benchmarks/`](../benchmarks/)). It closes with the current baseline
-numbers and how to read the annotated resource plot.
+([`utils/benchmark_report.py`](../utils/benchmark_report.py)), and the standalone benchmarks
+([`benchmarks/`](../benchmarks/)). It closes with the current baseline numbers and how to
+read the annotated resource plot.
 
 ## TL;DR
 
@@ -25,7 +25,11 @@ numbers and how to read the annotated resource plot.
   at each span's right edge on all three (CPU/RAM/GPU) panels — labeled once on the CPU panel
   (angled 30°, left of the line) — via `monitor.annotate_stages`, so a CPU plateau reads as
   "round 3 data generation" at a glance.
-- `benchmarks/*.py` time the hot CPU kernels in isolation, in seconds instead of a full run.
+- `benchmarks/*.py` time individual pipeline kernels in isolation, in seconds instead of a
+  full run. Most are CPU (`bench_normality`, `bench_injection`, `bench_lognorm_downsample`,
+  `bench_pfb_vs_spline`, `bench_rf`); `bench_gpu` is the exception — a real-GPU profiler for
+  the Beta-VAE (throughput + peak VRAM across a per-replica batch-size sweep), NGC-container-only.
+  See [`benchmarks/README.md`](../benchmarks/README.md).
 
 ## Stage timers (`benchmark.py`)
 
@@ -162,22 +166,32 @@ Thresholds are module constants (`DATA_GEN_ROUND_FRACTION`, `GPU_UTIL_INPUT_BOUN
 `PREPROCESS_WALL_FRACTION`, `RAM_PEAK_WARN`) — tune them there if a rule is too eager for your
 hardware.
 
-## Micro-benchmarks (`benchmarks/`)
+## Standalone benchmarks (`benchmarks/`)
 
-Small standalone scripts that time the pipeline's hot CPU kernels in isolation, so a change to
-one can be measured in seconds instead of via a full run. **Not** collected by pytest
-(`testpaths = ["tests"]`); run on demand. Each prints ops/s and writes a JSON result to
+Small standalone scripts that time individual pipeline kernels in isolation, so a change to
+one can be measured in seconds instead of via a full run. Most are CPU micro-benchmarks
+(`bench_normality`, `bench_injection`, `bench_lognorm_downsample`, `bench_pfb_vs_spline`,
+`bench_rf`) that print ops/s; `bench_gpu` is a real-GPU profiler for the Beta-VAE that reports
+throughput + peak VRAM across a per-replica batch-size sweep (NGC-container-only). **Not**
+collected by pytest (`testpaths = ["tests"]`); run on demand. Each writes a JSON result to
 `benchmarks/results/` (gitignored). See [`benchmarks/README.md`](../benchmarks/README.md) for
-the maintained baseline table and per-flag detail.
+the maintained baseline tables and per-flag detail.
 
 ```bash
 python benchmarks/bench_normality.py            # sliding-window normality test (energy detection)
 python benchmarks/bench_injection.py            # setigen signal injection (training data gen)
 python benchmarks/bench_lognorm_downsample.py   # per-cadence downsample + log-norm (load path)
-python benchmarks/bench_pfb_vs_spline.py         # PFB static equalization vs per-channel spline fit
+python benchmarks/bench_pfb_vs_spline.py        # PFB static equalization vs per-channel spline fit
+python benchmarks/bench_rf.py                   # Random Forest stage: latent prep + fit + predict
 # On the clusters, through the container:
 ./utils/run_container.sh python benchmarks/bench_normality.py
+# GPU-only, container required — real Beta-VAE profiler on a cluster GPU:
+./utils/run_container.sh python benchmarks/bench_gpu.py --mode train --find-max
 ```
+
+See the [GPU benchmark section of `benchmarks/README.md`](../benchmarks/README.md#gpu-benchmark)
+for `bench_gpu.py` flags (`--mode`, `--num-gpus`, `--batch-sizes`, `--accumulation-steps`) and
+the maintained per-host baseline tables.
 
 | Script | Kernel it isolates | Pipeline stage it models |
 | --- | --- | --- |
@@ -185,9 +199,15 @@ python benchmarks/bench_pfb_vs_spline.py         # PFB static equalization vs pe
 | `bench_injection.py` | `data_generation.new_cadence` narrowband injection | `train.round_XX.data_generation` |
 | `bench_lognorm_downsample.py` | per-obs `downscale_local_mean` (×8) + per-cadence `log_norm` | stamp downsample + `inference.*.load_lognorm` |
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` vs `_spline_flatten_bandpass` on one 1M-bin coarse channel | bandpass flattening inside ED |
+| `bench_rf.py` | `RandomForestClassifier.fit` + `predict_proba` and the `prepare_latent_features` reshape (sklearn, CPU) | Second-stage RF training + inference (`train.train_random_forest`) |
+| `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one or more GPUs | VAE training (`train.round_XX`) and encoder inference — **GPU-only, container required** |
 
-All numbers are single-process; the pipeline parallelizes each kernel across
-`manager.n_processes` workers, so whole-stage throughput scales roughly with core count.
+Only the four CPU micro-benchmarks (`bench_normality`, `bench_injection`,
+`bench_lognorm_downsample`, `bench_pfb_vs_spline`) are single-process; the pipeline
+parallelizes each of those across `manager.n_processes` workers, so whole-stage throughput
+scales roughly with core count. `bench_rf` uses sklearn `n_jobs=-1`, matching production.
+`bench_gpu` reports aggregate throughput across `--num-gpus` MirroredStrategy replicas plus
+per-GPU peak VRAM.
 
 ## Baseline numbers
 
