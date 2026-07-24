@@ -129,6 +129,13 @@ class TestResolveSaveTag:
         tag = resolve_save_tag("train", "train", "round_05")
         assert tag.startswith("train_") and tag != "round_05"
 
+    @pytest.mark.parametrize("command", [None, "benchmark"])
+    def test_underivable_prefix_raises(self, command):
+        # No --save-tag and a command with no default prefix: refuse rather than emit an
+        # unloadable tag (main() guards the None case earlier via the required subparser).
+        with pytest.raises(ValueError, match="Cannot derive a save-tag prefix"):
+            resolve_save_tag(command, None, None)
+
 
 class TestCrossReplicaDivisibilityMatrix:
     """The default config divides cleanly across 4, 5, AND 6 replicas (issue #254 — Option B

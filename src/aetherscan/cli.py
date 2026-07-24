@@ -209,8 +209,11 @@ def setup_argument_parser() -> argparse.ArgumentParser:
         description="Aetherscan Pipeline -- Breakthrough Listen's first end-to-end production-grade DL pipeline for SETI @ scale"
     )
 
-    # Add commands
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    # Add commands. required=True: a subcommand is mandatory. Without it a bare
+    # `python -m aetherscan.main` leaves command=None, and main()'s resolve_save_tag(None, ...)
+    # would raise a ValueError traceback before the logger exists; argparse instead emits a clean
+    # usage error (caught by main()'s SystemExit handler, which prints full help).
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Command to execute")
 
     # Train command
     _add_train_arguments(subparsers)
@@ -1035,8 +1038,8 @@ def apply_saved_config(config_path: str) -> None:
     The `checkpoint` section is skipped entirely: a saved *training* config's
     checkpoint fields (most damagingly `save_tag`) are never what an inference run
     wants — layering them would make this run masquerade under the training run's
-    tag, corrupting DB provenance and output paths. The CLI `--save-tag` (or the
-    default import-time timestamp) stays authoritative.
+    tag, corrupting DB provenance and output paths. This run's resolved save_tag
+    (set once in main() by resolve_save_tag) stays authoritative.
 
     Raises `ValueError` if the file is missing or malformed — caught by main.py's
     wrapper alongside `validate_args` failures.
