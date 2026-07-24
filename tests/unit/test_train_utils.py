@@ -150,6 +150,64 @@ class TestResumeInPlace:
         assert pipeline.run_state.completed_rounds == [1, 2, 3]
 
 
+class TestResumeLoadPlan:
+    """__init__'s checkpoint-load decision, factored into TrainingPipeline._resume_load_plan so
+    it is testable without building the TF graph. Composes with TestResumeInPlace: _init_run_state
+    derives _start_round from the manifest, then _resume_load_plan turns it into the actual
+    (tag, dir) to load — resume-in-place with no final weights must fall back to the last
+    completed round, or fail loudly."""
+
+    def _pipeline(self, tmp_path, *, load_tag, save_tag, start_round, final_on_disk):
+        config = get_config()
+        config.model_path = str(tmp_path)
+        config.checkpoint.load_tag = load_tag
+        config.checkpoint.load_dir = None
+        config.checkpoint.save_tag = save_tag
+        if final_on_disk:
+            _touch_pair(str(tmp_path), save_tag)  # final weights at the model root
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = config
+        pipeline._start_round = start_round
+        return pipeline
+
+    def test_resume_in_place_no_final_falls_back_to_last_round(self, tmp_path):
+        # The whole point of the refactor: no final weights yet → load round_{start_round-1}.
+        tag = "train_20260101_120000"
+        pipeline = self._pipeline(
+            tmp_path, load_tag=tag, save_tag=tag, start_round=4, final_on_disk=False
+        )
+        assert pipeline._resume_load_plan() == ("round_03", "checkpoints")
+
+    def test_resume_in_place_no_final_no_rounds_raises(self, tmp_path):
+        # No final weights and no completed rounds → fail loudly, never load another run's model.
+        tag = "train_20260101_120000"
+        pipeline = self._pipeline(
+            tmp_path, load_tag=tag, save_tag=tag, start_round=1, final_on_disk=False
+        )
+        with pytest.raises(FileNotFoundError, match="Cannot resume run"):
+            pipeline._resume_load_plan()
+
+    def test_resume_in_place_with_final_loads_final(self, tmp_path):
+        # Final weights present (VAE finished, a later stage died) → load them from the model
+        # root (dir=None), not a per-round checkpoint.
+        tag = "train_20260101_120000"
+        pipeline = self._pipeline(
+            tmp_path, load_tag=tag, save_tag=tag, start_round=21, final_on_disk=True
+        )
+        assert pipeline._resume_load_plan() == (tag, None)
+
+    def test_fresh_run_returns_none(self, tmp_path):
+        # No --load-tag, start_round 1 → nothing to load.
+        pipeline = self._pipeline(
+            tmp_path,
+            load_tag=None,
+            save_tag="train_20260101_120000",
+            start_round=1,
+            final_on_disk=False,
+        )
+        assert pipeline._resume_load_plan() is None
+
+
 class TestTrainRandomForestSkipIsLoud:
     def test_pretrained_rf_skip_warns_and_records_source_tag(self, caplog):
         """The is_trained early-return (issue #142) must warn loudly, name the tag the stale

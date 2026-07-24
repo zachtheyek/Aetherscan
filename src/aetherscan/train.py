@@ -965,39 +965,13 @@ class TrainingPipeline:
         self._rf_shap_cache: dict[str, dict] = {}
 
         try:
-            # Load models from checkpoints: explicit user flags win; otherwise a
-            # manifest-driven resume reloads the last completed round's checkpoint.
-            load_tag = self.config.checkpoint.load_tag
-            load_dir = self.config.checkpoint.load_dir
-            save_tag = self.config.checkpoint.save_tag
-            # Resume-in-place: a full-tag --load-tag that equals this run's save-tag (the tag was
-            # adopted by resolve_save_tag). If the run's final weights aren't on disk yet (the VAE
-            # didn't finish before the interruption), fall back to the manifest's last completed
-            # round for THIS tag — never to another run's checkpoints; fail loudly if neither.
-            # --load-tag equals this run's adopted save_tag (always a full {prefix}_{datetime}
-            # tag — resolve_save_tag never adopts a round_XX load-tag), so this is a resume of the
-            # same run whose VAE may not have finished.
-            resume_in_place = load_tag is not None and load_tag == save_tag
-            if resume_in_place and not _model_pair_exists(self.config.model_path, load_tag):
-                if self._start_round > 1:
-                    resume_tag = f"round_{self._start_round - 1:02d}"
-                    logger.info(
-                        f"No final weights for run {load_tag!r} yet; resuming from {resume_tag} "
-                        f"(this run's last completed round, per manifest)"
-                    )
-                    self.load_models(tag=resume_tag, dir="checkpoints")
-                else:
-                    raise FileNotFoundError(
-                        f"Cannot resume run {load_tag!r}: no final weights on disk and no completed "
-                        f"rounds recorded in its manifest. Refusing to load another run's checkpoints."
-                    )
-            elif load_tag or load_dir:
-                logger.info("Resuming from checkpoint")
-                self.load_models(tag=load_tag, dir=load_dir)
-            elif self._start_round > 1:
-                resume_tag = f"round_{self._start_round - 1:02d}"
-                logger.info(f"Resuming from checkpoint {resume_tag} (per run manifest)")
-                self.load_models(tag=resume_tag, dir="checkpoints")
+            # Load models from checkpoints per the resume plan (explicit user flags win;
+            # otherwise a manifest-driven resume reloads the last completed round's checkpoint).
+            # The decision is factored into _resume_load_plan() so it stays unit-testable
+            # without building the TF graph.
+            plan = self._resume_load_plan()
+            if plan is not None:
+                self.load_models(tag=plan[0], dir=plan[1])
 
         except Exception as e:
             logger.error(f"Error loading models from checkpoint: {e}")
@@ -1023,6 +997,45 @@ class TrainingPipeline:
     #         self.train_writer.close()
     #     if hasattr(self, "val_writer"):
     #         self.val_writer.close()
+
+    def _resume_load_plan(self) -> tuple[str | None, str | None] | None:
+        """Decide which checkpoint ``(tag, dir)`` __init__ should load, or ``None`` for a fresh
+        run (no load).
+
+        Raises ``FileNotFoundError`` when a resume-in-place run has neither its own final weights
+        nor a completed round to fall back to. This is a pure decision — its only I/O is the
+        on-disk model-pair existence check — so the resume logic is unit-testable without building
+        the TF graph.
+        """
+        load_tag = self.config.checkpoint.load_tag
+        load_dir = self.config.checkpoint.load_dir
+        save_tag = self.config.checkpoint.save_tag
+        # Resume-in-place: a full-tag --load-tag that equals this run's save-tag (the tag was
+        # adopted by resolve_save_tag, which never adopts a round_XX load-tag — so load_tag here is
+        # always a full {prefix}_{datetime} tag). If the run's final weights aren't on disk yet
+        # (the VAE didn't finish before the interruption), fall back to the manifest's last
+        # completed round for THIS tag — never another run's checkpoints; fail loudly if neither.
+        resume_in_place = load_tag is not None and load_tag == save_tag
+        if resume_in_place and not _model_pair_exists(self.config.model_path, load_tag):
+            if self._start_round > 1:
+                resume_tag = f"round_{self._start_round - 1:02d}"
+                logger.info(
+                    f"No final weights for run {load_tag!r} yet; resuming from {resume_tag} "
+                    f"(this run's last completed round, per manifest)"
+                )
+                return resume_tag, "checkpoints"
+            raise FileNotFoundError(
+                f"Cannot resume run {load_tag!r}: no final weights on disk and no completed "
+                f"rounds recorded in its manifest. Refusing to load another run's checkpoints."
+            )
+        if load_tag or load_dir:
+            logger.info("Resuming from checkpoint")
+            return load_tag, load_dir
+        if self._start_round > 1:
+            resume_tag = f"round_{self._start_round - 1:02d}"
+            logger.info(f"Resuming from checkpoint {resume_tag} (per run manifest)")
+            return resume_tag, "checkpoints"
+        return None
 
     def _init_run_state(self):
         """
@@ -6508,8 +6521,8 @@ class TrainingPipeline:
         """Load model weights.
 
         An explicit `tag` must exist in the target directory (FileNotFoundError otherwise);
-        only the tag=None default falls back to 'final' and then the latest tag present —
-        see _resolve_load_tag() and issue #142.
+        the tag=None default loads only the conventional 'final' pair, else fails loudly —
+        there is no scan for "the latest tag present" (see _resolve_load_tag() and issue #142).
         """
         if dir is not None:
             base_dir = os.path.join(self.config.model_path, dir)
