@@ -147,6 +147,29 @@ class TestResolveLoadTag:
             _resolve_load_tag(str(tmp_path), None)
 
 
+class TestTrainingPlotsDir:
+    """_training_plots_dir centralizes this run's plots base:
+    {output_path}/plots/training/{save_tag}[/subdir]."""
+
+    def _pipeline(self, tag):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline.config.checkpoint.save_tag = tag
+        return pipeline
+
+    def test_base_dir(self):
+        pipeline = self._pipeline("run_a")
+        assert pipeline._training_plots_dir() == os.path.join(
+            pipeline.config.output_path, "plots", "training", "run_a"
+        )
+
+    def test_subdir(self):
+        pipeline = self._pipeline("run_a")
+        assert pipeline._training_plots_dir("checkpoints") == os.path.join(
+            pipeline.config.output_path, "plots", "training", "run_a", "checkpoints"
+        )
+
+
 class TestTrainRandomForestSkipIsLoud:
     def test_pretrained_rf_skip_warns_and_records_source_tag(self, caplog):
         """The is_trained early-return (issue #142) must warn loudly, name the tag the stale
