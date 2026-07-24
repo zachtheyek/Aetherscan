@@ -79,6 +79,7 @@ from aetherscan.run_state import (
     save_run_state,
 )
 from aetherscan.seeding import STREAM_DATASET, STREAM_PLOT, STREAM_VIZ, derive_rng
+from aetherscan.shap_parallel import parallel_shap
 
 logger = logging.getLogger(__name__)
 
@@ -936,39 +937,8 @@ def prepare_distributed_viz_dataset(
     }
 
 
-def _select_positive_class_shap(values, log_loss: bool = False) -> np.ndarray:
-    """
-    Normalize SHAP output across shap versions into a single positive-class ndarray.
-
-    TreeExplainer historically returns results in several shapes depending on shap version & task:
-    - classic binary classification:
-        list [neg, pos] of (n, F) arrays
-    - newer shap, last axis is class:
-        ndarray of shape (n, F, 2) for values, or (n, F, F, 2) for interactions
-    - log-loss model_output — single scalar output:
-        ndarray of shape (n, F) or (n, F, F)
-
-    This helper picks the positive-class slice in all cases.
-    For log-loss model output, there is only one output, so we return as-is.
-    """
-    if log_loss:
-        if isinstance(values, list):
-            return np.asarray(values[0])
-        values = np.asarray(values)
-        # newer shap preserves the class axis even for model_output="log_loss":
-        # (n, F, 2) → (n, F); (n, F, F, 2) → (n, F, F)
-        if values.ndim >= 3 and values.shape[-1] == 2:
-            return values[..., 1]
-        return values
-
-    if isinstance(values, list):
-        return np.asarray(values[1])
-
-    values = np.asarray(values)
-    # (n, F, 2) → (n, F); (n, F, F, 2) → (n, F, F)
-    if values.ndim >= 3 and values.shape[-1] == 2:
-        return values[..., 1]
-    return values
+# _select_positive_class_shap now lives in aetherscan.shap_parallel (shared with the TF-free SHAP
+# worker processes) and is imported at the top of this module under the same name.
 
 
 @contextlib.contextmanager
@@ -2800,60 +2770,58 @@ class TrainingPipeline:
         summary_indices = np.sort(rng.choice(n_val, size=n_summary, replace=False))
         interaction_indices = np.sort(rng.choice(n_val, size=n_interact, replace=False))
 
+        n_workers = self.config.manager.n_processes
         logger.info(
-            f"Computing SHAP summary ({n_summary} samples) and interaction "
-            f"({n_interact} samples) values for RF model"
+            f"Computing SHAP across {n_workers} worker(s) — summary ({n_summary}), interaction "
+            f"({n_interact}), log-loss ({n_summary}). See docs/TRAINING_PIPELINE.md for the passes."
         )
 
-        # NOTE: come back to this later (is this the right way to extract SHAP summary/interaction values? what's the difference between summary vs interaction? what is _select_positive_class_shap() for?)
-        # _silence_stderr() suppresses SHAP's tqdm progress bar (which writes to
-        # stderr and would otherwise flood Slack via the StreamToLogger redirect).
-        # Real exceptions still propagate; only stderr text is dropped.
+        # shap's TreeSHAP C extension is single-threaded, so we chunk the samples across processes
+        # (aetherscan.shap_parallel), each rebuilding a stock TreeExplainer — byte-identical to the
+        # serial result. Workers load the RF from its persisted joblib, so make sure it is on disk.
+        rf_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+        # Always (re)dump so the workers load exactly the in-process model — a stale on-disk RF under
+        # a reused tag would otherwise silently diverge from the expected_value computed below.
+        joblib.dump(self.rf_model.model, rf_path)
+
+        # Expected value (positive-class base value): one lightweight in-process explainer.
+        # _silence_stderr() drops SHAP's tqdm (which the logger would otherwise forward to Slack).
         with _silence_stderr():
-            explainer = shap.TreeExplainer(self.rf_model.model)
+            ev = shap.TreeExplainer(self.rf_model.model).expected_value
+        if isinstance(ev, list | tuple | np.ndarray):
+            ev_arr = np.asarray(ev)
+            expected_value = float(ev_arr[1]) if ev_arr.size > 1 else float(ev_arr.flat[0])
+        else:
+            expected_value = float(ev)
 
-            summary_vals_raw = explainer.shap_values(val_features[summary_indices])
-            shap_values_summary = _select_positive_class_shap(summary_vals_raw)
-            del summary_vals_raw
+        shap_values_summary = parallel_shap(
+            rf_path, val_features[summary_indices], "summary", n_workers
+        )
+        shap_values_interaction = parallel_shap(
+            rf_path, val_features[interaction_indices], "interaction", n_workers
+        )
 
-            interaction_vals_raw = explainer.shap_interaction_values(
-                val_features[interaction_indices]
+        # Log-loss (interventional) decomposition: needs a background subset + per-sample y.
+        n_bg = min(1000, train_features.shape[0])
+        bg_indices = rng.choice(train_features.shape[0], size=n_bg, replace=False)
+        background = train_features[bg_indices]
+        try:
+            shap_values_logloss = parallel_shap(
+                rf_path,
+                val_features[summary_indices],
+                "logloss",
+                n_workers,
+                background=background,
+                y=val_binary_labels[summary_indices],
             )
-            shap_values_interaction = _select_positive_class_shap(interaction_vals_raw)
-            del interaction_vals_raw
+        except Exception as e:
+            logger.warning(
+                f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
+                f"loss-monitoring plot will be empty"
+            )
+            shap_values_logloss = np.zeros_like(shap_values_summary)
 
-            # NOTE: come back to this later (what is SHAP EV?)
-            # Expected value (base value for positive class)
-            ev = explainer.expected_value
-            if isinstance(ev, list | tuple | np.ndarray):
-                ev_arr = np.asarray(ev)
-                expected_value = float(ev_arr[1]) if ev_arr.size > 1 else float(ev_arr.flat[0])
-            else:
-                expected_value = float(ev)
-
-            # NOTE: come back to this later (what is log-loss SHAP? why does it require a subset of training data? why is min n_bg hard-coded to 1000? why do we need a separate loss_explainer? what does model_output="log_loss" mean? what happens if shap_values_logloss is zeroes?)
-            # Log-loss SHAP decomposition. Uses a background dataset and y_true per sample
-            n_bg = min(1000, train_features.shape[0])
-            bg_indices = rng.choice(train_features.shape[0], size=n_bg, replace=False)
-            background = train_features[bg_indices]
-
-            try:
-                loss_explainer = shap.TreeExplainer(
-                    self.rf_model.model, data=background, model_output="log_loss"
-                )
-                loss_vals_raw = loss_explainer.shap_values(
-                    val_features[summary_indices], y=val_binary_labels[summary_indices]
-                )
-                shap_values_logloss = _select_positive_class_shap(loss_vals_raw, log_loss=True)
-                del loss_vals_raw, loss_explainer
-            except Exception as e:
-                logger.warning(
-                    f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
-                    f"loss-monitoring plot will be empty"
-                )
-                shap_values_logloss = np.zeros_like(shap_values_summary)
-
-        del background, bg_indices, explainer
+        del background, bg_indices
 
         # NOTE: come back to this later (what does any of this mean?)
         result = {
