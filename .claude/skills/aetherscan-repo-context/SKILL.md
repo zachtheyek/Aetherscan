@@ -137,8 +137,9 @@ docs/                    # Full technical doc suite, one doc per pipeline surfac
                          # indexed in docs/README.md; start at docs/ARCHITECTURE.md
 tests/                   # Pytest suite: unit/ (CI surface) + gpu/cluster-marked
                          # integration/ smokes — see the "Testing" section below
-benchmarks/              # Standalone micro-benchmarks (not collected by pytest);
-                         # see benchmarks/README.md + docs/BENCHMARKING.md
+benchmarks/              # Standalone benchmarks — CPU micro-benchmarks + a GPU
+                         # benchmark (bench_gpu.py, container-only); not collected
+                         # by pytest. See benchmarks/README.md + docs/BENCHMARKING.md
 ```
 
 ---
