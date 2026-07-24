@@ -726,6 +726,7 @@ class TestProcessCadenceEndToEnd:
             config.output_path,
             "plots",
             "inference",
+            config.checkpoint.save_tag,
             f"bandpass_overlay_cadence_dbg_{config.checkpoint.save_tag}.png",
         )
         assert os.path.exists(plot_path)
