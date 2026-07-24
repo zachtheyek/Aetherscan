@@ -123,6 +123,7 @@ src/aetherscan/
 ├── hf_hub.py            # HuggingFace Hub artifact upload/download
 ├── tag_guards.py        # Fail-early --save-tag dedup guards
 ├── rf_metrics.py        # Pure RF eval-metric helper (persisted to training_stats by train.py)
+├── shap_parallel.py     # RF SHAP process-pool wrapper (TF-free; called by train.py)
 ├── models/{vae,random_forest}.py
 ├── db/db.py             # Thread-safe SQLite, async queue-based writes, schema migration, supersede semantics
 ├── logger/              # Multi-handler logging + Slack integration

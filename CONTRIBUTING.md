@@ -184,6 +184,7 @@ Aetherscan/
 │   ├── hf_hub.py               # HuggingFace Hub artifact upload/download
 │   ├── tag_guards.py           # Fail-early --save-tag dedup guards
 │   ├── rf_metrics.py           # Pure RF eval-metric helper (persisted to training_stats via train.py)
+│   ├── shap_parallel.py        # RF SHAP process-pool wrapper (TF-free; called by train.py)
 │   ├── models/
 │   │   ├── __init__.py         # Model exports
 │   │   ├── vae.py              # Beta-VAE architecture
@@ -264,6 +265,7 @@ Aetherscan/
 | `hf_hub.py`               | HuggingFace Hub artifact upload/download, version-coupled revisions    |
 | `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
 | `rf_metrics.py`           | Pure RF eval-metric helper written to `training_stats` (`model_name='rf'`) |
+| `shap_parallel.py`        | Process-pool wrapper for RF SHAP passes (TF-free; forkserver + empty preload; called by `train.py`) |
 | `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
 | `models/random_forest.py` | Scikit-learn RF wrapper                                                |
 | `db/db.py`                | Thread-safe SQLite with async queue-based writes                       |
