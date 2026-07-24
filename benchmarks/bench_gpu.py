@@ -296,6 +296,8 @@ def main() -> None:
     devices = _select_gpus(args.num_gpus)
     init_config()
     config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
     # Build the model once (weights are batch-independent) and reuse across sizes.
     strategy = tf.distribute.MirroredStrategy(devices=[f"/{d}" for d in devices])
     with strategy.scope():
