@@ -33,7 +33,6 @@ from aetherscan.train import (
     check_encoder_trained,
     check_val_auc_floor,
     compute_expected_std,
-    get_latest_tag,
 )
 
 
@@ -43,65 +42,6 @@ def _touch_pair(checkpoints_dir, tag):
     for prefix in ("vae_encoder", "vae_decoder"):
         with open(os.path.join(checkpoints_dir, f"{prefix}_{tag}.keras"), "w") as f:
             f.write("stub")
-
-
-class TestGetLatestTag:
-    def test_priority_ladder(self, tmp_path):
-        d = str(tmp_path / "ckpt")
-        for tag in ("test_v3", "20240101_000000", "round_02", "final_v1"):
-            _touch_pair(d, tag)
-        assert get_latest_tag(d) == "final_v1"
-
-    def test_round_beats_timestamp_and_test(self, tmp_path):
-        d = str(tmp_path / "ckpt")
-        for tag in ("test_v9", "20991231_235959", "round_02", "round_10"):
-            _touch_pair(d, tag)
-        # Numeric compare, not lexicographic: round_10 > round_02.
-        assert get_latest_tag(d) == "round_10"
-
-    def test_timestamp_beats_test(self, tmp_path):
-        d = str(tmp_path / "ckpt")
-        for tag in ("test_v9", "20240101_000000", "20250101_000000"):
-            _touch_pair(d, tag)
-        assert get_latest_tag(d) == "20250101_000000"
-
-    def test_test_tags_ranked_by_version(self, tmp_path):
-        d = str(tmp_path / "ckpt")
-        for tag in ("test_v2", "test_v17", "test_v9"):
-            _touch_pair(d, tag)
-        assert get_latest_tag(d) == "test_v17"
-
-    def test_final_ranked_by_version(self, tmp_path):
-        d = str(tmp_path / "ckpt")
-        for tag in ("final_v1", "final_v12", "final_v3"):
-            _touch_pair(d, tag)
-        assert get_latest_tag(d) == "final_v12"
-
-    def test_encoder_without_decoder_ignored(self, tmp_path):
-        d = str(tmp_path / "ckpt")
-        _touch_pair(d, "round_01")
-        # Higher-priority final_v2 lacks its decoder — must not win.
-        with open(os.path.join(d, "vae_encoder_final_v2.keras"), "w") as f:
-            f.write("stub")
-        assert get_latest_tag(d) == "round_01"
-
-    def test_missing_directory_raises(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="doesn't exist"):
-            get_latest_tag(str(tmp_path / "nope"))
-
-    def test_empty_directory_raises(self, tmp_path):
-        d = tmp_path / "empty"
-        d.mkdir()
-        with pytest.raises(FileNotFoundError, match="No encoder files"):
-            get_latest_tag(str(d))
-
-    def test_no_complete_pair_raises(self, tmp_path):
-        d = tmp_path / "orphans"
-        d.mkdir()
-        with open(d / "vae_encoder_round_01.keras", "w") as f:
-            f.write("stub")
-        with pytest.raises(FileNotFoundError, match="No valid model pairs"):
-            get_latest_tag(str(d))
 
 
 class TestResolveLoadTag:
@@ -125,11 +65,11 @@ class TestResolveLoadTag:
             _resolve_load_tag(str(tmp_path), "round_01")
 
     def test_missing_non_round_tag_message_omits_checkpoints_hint(self, tmp_path):
-        # For a non-round explicit tag (e.g. a typo'd final_v2) the checkpoints hint is a
+        # For a non-round explicit tag (e.g. a typo'd full run tag) the checkpoints hint is a
         # red herring and must not appear.
-        _touch_pair(tmp_path, "final_v1")
+        _touch_pair(tmp_path, "train_20260101_120000")
         with pytest.raises(FileNotFoundError) as excinfo:
-            _resolve_load_tag(str(tmp_path), "final_v2")
+            _resolve_load_tag(str(tmp_path), "train_20260101_130000")
         assert "--load-dir checkpoints" not in str(excinfo.value)
 
     def test_default_prefers_final(self, tmp_path):
@@ -137,10 +77,13 @@ class TestResolveLoadTag:
         _touch_pair(tmp_path, "round_09")
         assert _resolve_load_tag(str(tmp_path), None) == "final"
 
-    def test_default_falls_back_to_latest(self, tmp_path):
+    def test_default_no_final_raises_loudly(self, tmp_path):
+        # tag=None loads only the conventional "final" model — it never scans for the "latest"
+        # tag present (which could be a stale, unrelated run's model). No "final" → fail loudly.
         _touch_pair(tmp_path, "round_02")
-        _touch_pair(tmp_path, "test_v1")
-        assert _resolve_load_tag(str(tmp_path), None) == "round_02"
+        _touch_pair(tmp_path, "train_20260101_120000")
+        with pytest.raises(FileNotFoundError, match="final"):
+            _resolve_load_tag(str(tmp_path), None)
 
     def test_default_empty_dir_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, field, is_dataclass
+from datetime import datetime
 from math import gcd, lcm
 from typing import Any
 
@@ -22,15 +23,40 @@ logger = logging.getLogger(__name__)
 # Validation primitives are expressed as global variables and shared by
 # validate_args() and utility scripts (e.g. utils/find_optimal_configs.py)
 
-# Accepted formats for --load-tag and --save-tag (cli.py help strings document these)
-# NOTE: this whitelist is fairly restrictive — consider broadening it with more accepted
-# tag formats (e.g. free-form descriptive slugs like `smoke_blackwell` or `ampere_v1`) so
-# runs can be labelled meaningfully without being forced into the test_vX / final_vX shapes.
-_TAG_PATTERN = re.compile(r"^(?:\d{8}_\d{6}|final_v\d+|round_\d+|test_v\d+)$")
+# Tag scheme (see resolve_save_tag): a run's save-tag is `{command}_{YYYYMMDD_HHMMSS}`. The user
+# supplies only the command prefix on --save-tag; the datetime is appended at runtime. --load-tag
+# takes a full resolved tag (resume that run in place) or a per-round checkpoint (round_XX).
+_SAVE_TAG_PREFIXES = ("test", "train", "inf", "bench")
+# --save-tag accepts one of the prefixes above (bare); the datetime is auto-appended.
+_SAVE_TAG_PATTERN = re.compile(r"^(?:test|train|inf|bench)$")
+# A fully-resolved run tag `{prefix}_{YYYYMMDD_HHMMSS}` — used to detect a resume-in-place --load-tag.
+_FULL_TAG_PATTERN = re.compile(r"^(?:test|train|inf|bench)_\d{8}_\d{6}$")
+# --load-tag accepts a full resolved tag (resume that run in place) or a per-round checkpoint.
+_LOAD_TAG_PATTERN = re.compile(r"^(?:(?:test|train|inf|bench)_\d{8}_\d{6}|round_\d+)$")
 
-# The round_XX subset of _TAG_PATTERN: per-round checkpoints are saved under the checkpoints/
+# The round_XX subset of _LOAD_TAG_PATTERN: per-round checkpoints are saved under the checkpoints/
 # subdirectory, so loading one requires --load-dir checkpoints (issue #142)
 _ROUND_TAG_PATTERN = re.compile(r"^round_\d+$")
+
+# Default --save-tag prefix per subcommand when --save-tag is omitted.
+_COMMAND_TAG_PREFIX = {"train": "train", "inference": "inf"}
+
+
+def resolve_save_tag(command: str | None, save_tag: str | None, load_tag: str | None) -> str:
+    """Resolve the run's full `{prefix}_{YYYYMMDD_HHMMSS}` save-tag at runtime.
+
+    - A full `{prefix}_{datetime}` ``--load-tag`` resumes that run **in place**: its tag is
+      adopted so the resumed attempt writes under the same ``run_state`` / DB rows / artifacts.
+      (A ``round_XX`` ``--load-tag`` does NOT adopt — it seeds a fresh run from that checkpoint.)
+    - Otherwise the tag is ``{prefix}_{datetime}``, where the prefix is ``--save-tag``
+      (``test|train|inf|bench``) or, when omitted, the subcommand default (``train`` → ``train``,
+      ``inference`` → ``inf``). The datetime is stamped once, here, at run time.
+    """
+    if load_tag is not None and _FULL_TAG_PATTERN.match(load_tag):
+        return load_tag
+    prefix = save_tag if save_tag is not None else _COMMAND_TAG_PREFIX.get(command, "run")
+    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
 
 # sklearn's RandomForestClassifier accepts these string values for max_features
 _RF_MAX_FEATURES_STR_VALUES = {"sqrt", "log2"}
@@ -670,7 +696,7 @@ def _add_train_flags_to(parser):
         "--load-tag",
         type=str,
         default=None,
-        help="Model tag for checkpoint loading. Accepted formats: final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX. If round_XX format used, and --start-round not specified, training will resume from round following loaded checkpoint (i.e., XX + 1)",
+        help="Checkpoint to load. A full run tag ({command}_YYYYMMDD_HHMMSS) resumes that run in place (its tag is adopted, so the resumed attempt writes under the same run). round_XX (requires --load-dir checkpoints) seeds a fresh run from that per-round checkpoint, resuming from round XX+1 unless --start-round is given.",
     )
     parser.add_argument(
         "--start-round",
@@ -682,7 +708,7 @@ def _add_train_flags_to(parser):
         "--save-tag",
         type=str,
         default=None,
-        help="Tag for current pipeline run. Accepted formats: final_vX, round_XX, test_vX. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
+        help="Run label prefix: one of test, train, inf, bench. The datetime is appended automatically at runtime (e.g. train_20260101_120000). Defaults to the subcommand (train->train, inference->inf) if omitted.",
     )
     parser.add_argument(
         "--force-tag",
@@ -960,7 +986,7 @@ def _add_inference_flags_to(parser):
         "--hf-revision",
         type=str,
         default=None,
-        help="HuggingFace revision (tag, branch, or commit hash) to pin the model download to when no local artifact paths are given (default: v{package version} when running as an installed release, else the repo's latest release tag — highest semver vX.Y.Z tag, falling back to the highest final_vX training tag)",
+        help="HuggingFace revision (tag, branch, or commit hash) to pin the model download to when no local artifact paths are given (default: v{package version} when running as an installed release, else the repo's latest release tag — highest semver vX.Y.Z tag; a release tag is required for a no-artifact download)",
     )
 
     # Checkpoint configuration
@@ -968,7 +994,7 @@ def _add_inference_flags_to(parser):
         "--save-tag",
         type=str,
         default=None,
-        help="Tag for current pipeline run. Current timestamp used (YYYYMMDD_HHMMSS) if none specified",
+        help="Run label prefix: one of test, train, inf, bench. The datetime is appended automatically at runtime (e.g. inf_20260101_120000). Defaults to the subcommand (train->train, inference->inf) if omitted.",
     )
     parser.add_argument(
         "--force-tag",
@@ -1267,8 +1293,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.checkpoint.infer_start_round()  # Try inferring start_round from load_tag first
     if hasattr(args, "start_round") and args.start_round is not None:
         config.checkpoint.start_round = args.start_round  # Override start_round if provided
-    if hasattr(args, "save_tag") and args.save_tag is not None:
-        config.checkpoint.save_tag = args.save_tag
+    # NOTE: config.checkpoint.save_tag is resolved once in main() (before init_logger, so the log
+    # file / config / artifacts share one datetime) via resolve_save_tag — not applied from args here.
     # force_tag uses argparse.BooleanOptionalAction with default=None (same tri-state as
     # hf_upload above)
     if hasattr(args, "force_tag") and args.force_tag is not None:
@@ -1989,12 +2015,12 @@ def collect_validation_errors(
         # TODO: Deferred -- save_tag uniqueness check requires the DB (init_db runs
         # after validate_args).
         load_tag = _resolve(args, "load_tag", config.checkpoint.load_tag)
-        if load_tag is not None and not _TAG_PATTERN.match(load_tag):
+        if load_tag is not None and not _LOAD_TAG_PATTERN.match(load_tag):
             errors.append(
                 ValidationError(
                     field="checkpoint.load_tag",
                     current=load_tag,
-                    message=f"--load-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {load_tag!r}",
+                    message=f"--load-tag must be a full run tag ({{test|train|inf|bench}}_YYYYMMDD_HHMMSS) or round_XX; got {load_tag!r}",
                     fix_kind="format",
                 )
             )
@@ -2016,8 +2042,8 @@ def collect_validation_errors(
                         f"--load-tag {load_tag!r} names a per-round checkpoint, and those are "
                         f"saved under the 'checkpoints/' subdirectory — pass --load-dir "
                         f"checkpoints to resume from it. (If you genuinely keep a final model "
-                        f"tagged {load_tag!r} in the models root, re-save it under a final_vX "
-                        f"or test_vX tag and load that instead.)"
+                        f"tagged {load_tag!r} in the models root, re-save it under a full run "
+                        f"tag ({{test|train|inf|bench}}_YYYYMMDD_HHMMSS) and load that instead.)"
                     ),
                     fix_kind="cross_param",
                 )
@@ -2036,13 +2062,13 @@ def collect_validation_errors(
                 )
             )
 
-        save_tag = _resolve(args, "save_tag", config.checkpoint.save_tag)
-        if save_tag is not None and not _TAG_PATTERN.match(save_tag):
+        save_tag = getattr(args, "save_tag", None)
+        if save_tag is not None and not _SAVE_TAG_PATTERN.match(save_tag):
             errors.append(
                 ValidationError(
                     field="checkpoint.save_tag",
                     current=save_tag,
-                    message=f"--save-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {save_tag!r}",
+                    message=f"--save-tag must be one of: test, train, inf, bench (the datetime is appended automatically); got {save_tag!r}",
                     fix_kind="format",
                 )
             )
@@ -2368,13 +2394,13 @@ def collect_validation_errors(
             )
 
         # -------------------------------------------------------------- Checkpoint
-        save_tag = _resolve(args, "save_tag", config.checkpoint.save_tag)
-        if save_tag is not None and not _TAG_PATTERN.match(save_tag):
+        save_tag = getattr(args, "save_tag", None)
+        if save_tag is not None and not _SAVE_TAG_PATTERN.match(save_tag):
             errors.append(
                 ValidationError(
                     field="checkpoint.save_tag",
                     current=save_tag,
-                    message=f"--save-tag must match one of: YYYYMMDD_HHMMSS, final_vX, round_XX, test_vX; got {save_tag!r}",
+                    message=f"--save-tag must be one of: test, train, inf, bench (the datetime is appended automatically); got {save_tag!r}",
                     fix_kind="format",
                 )
             )

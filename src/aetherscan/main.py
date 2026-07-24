@@ -24,6 +24,7 @@ from aetherscan.benchmark import stage_timer
 from aetherscan.cli import (
     apply_args_to_config,
     apply_saved_config,
+    resolve_save_tag,
     setup_argument_parser,
     validate_args,
 )
@@ -940,14 +941,23 @@ def main():
             parser.print_help()
         raise
 
-    # Initialize logger. Name the run's log file with its effective save_tag: the CLI --save-tag
-    # when provided (present on the train/inference subcommands as args.save_tag), else the config
-    # default timestamp tag. init_logger() runs before apply_args_to_config(), so the tag is
-    # resolved from args here rather than from the not-yet-updated config. Pass None straight
-    # through rather than pre-resolving the default here — Logger.__init__ already does the
-    # is-not-None fallback to config.checkpoint.save_tag internally.
+    # Resolve the run's save-tag ONCE, here, at runtime: a full {command}_{datetime} --load-tag
+    # resumes that run in place (its tag is adopted); otherwise {--save-tag prefix or subcommand}_
+    # {datetime}. Done before init_logger() (which names the log file by tag) and validate_args()
+    # so the log file, config, and every artifact share a single datetime. --save-tag stays a bare
+    # prefix on `args` for validate_args to check; only the resolved full tag lands on the config.
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+    config.checkpoint.save_tag = resolve_save_tag(
+        getattr(args, "command", None),
+        getattr(args, "save_tag", None),
+        getattr(args, "load_tag", None),
+    )
+
+    # Initialize logger, naming the run's log file with the resolved save_tag.
     try:
-        init_logger(save_tag=getattr(args, "save_tag", None))
+        init_logger(save_tag=config.checkpoint.save_tag)
         logger.info("Logger initialization successful, but not yet registered for cleanup.")
         logger.info("Awaiting resource manager initialization. Do not terminate the process!")
     except Exception as e:

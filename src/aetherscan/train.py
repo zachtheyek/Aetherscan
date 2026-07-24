@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import gc
-import glob
 import json
 import logging
 import os
@@ -216,91 +215,6 @@ def archive_directory(base_dir: str, target_dirs: list[str] | None = None, round
             logger.info(f"No files with round >= {round_num} found to delete")
 
 
-def get_latest_tag(checkpoints_dir: str) -> str:
-    """
-    Find the latest checkpoint tag (e.g. "round_05") in checkpoints_dir, choosing the most recent
-    tag whose encoder/decoder pair both exist on disk.
-
-    Tag families are ranked by priority: final_vX > round_XX > YYYYMMDD_HHMMSS > test_vX. The
-    highest-priority family present wins, then ties within that family are broken by version /
-    round number / timestamp. Raises FileNotFoundError if no valid pair is found.
-    """
-    if not os.path.exists(checkpoints_dir):
-        raise FileNotFoundError(f"Directory doesn't exist: {checkpoints_dir}")
-
-    # Find all encoder files
-    encoder_pattern = os.path.join(checkpoints_dir, "vae_encoder_*.keras")
-    encoder_files = glob.glob(encoder_pattern)
-
-    if not encoder_files:
-        raise FileNotFoundError(f"No encoder files found in {checkpoints_dir}")
-
-    # Extract tags and find complete pairs
-    valid_tags = []
-    for file in encoder_files:
-        basename = os.path.basename(file)
-        match = re.search(r"vae_encoder_(.+)\.keras", basename)
-        if match:
-            tag = match.group(1)
-            # Verify decoder exists
-            decoder_file = os.path.join(checkpoints_dir, f"vae_decoder_{tag}.keras")
-            if os.path.exists(decoder_file):
-                valid_tags.append(tag)
-
-    if not valid_tags:
-        raise FileNotFoundError(f"No valid model pairs found in {checkpoints_dir}")
-
-    # Sort tags to find the latest
-    def sort_key(tag_str):
-        # Handle final_vX format with highest priority
-        if tag_str.startswith("final_"):
-            try:
-                final_ver = int(tag_str.split("_v")[1])
-                return (0, final_ver)
-            except (ValueError, IndexError):
-                return (1, tag_str)
-        # Handle round_XX format with secondary priority
-        elif tag_str.startswith("round_"):
-            try:
-                round_num = int(tag_str.split("_")[1])
-                return (2, round_num)
-            except (ValueError, IndexError):
-                return (3, tag_str)
-        # Handle timestamp format YYYYMMDD_HHMMSS tertiary priority
-        elif re.match(r"\d{8}_\d{6}", tag_str):
-            try:
-                timestamp = datetime.strptime(tag_str, "%Y%m%d_%H%M%S")
-                return (4, timestamp)
-            except ValueError:
-                return (5, tag_str)
-        # Handle test_vX format with lowest priority
-        if tag_str.startswith("test_"):
-            try:
-                test_ver = int(tag_str.split("_v")[1])
-                return (6, test_ver)
-            except (ValueError, IndexError):
-                return (7, tag_str)
-        # Fallback for all other formats
-        else:
-            return (99, tag_str)
-
-    # Filter for the highest priority group
-    priorities = [sort_key(t)[0] for t in valid_tags]
-    highest_priority = min(priorities)  # smaller = higher priority
-
-    if highest_priority == 99:
-        raise FileNotFoundError(
-            "No valid model tags found (e.g. final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX)"
-        )
-
-    filtered_tags = [t for t in valid_tags if sort_key(t)[0] == highest_priority]
-
-    # Select the latest tag within highest priority group
-    filtered_tags.sort(key=sort_key)
-    tag = filtered_tags[-1]  # Get the latest
-    return tag
-
-
 def _model_pair_exists(base_dir: str, tag: str) -> bool:
     """True when the encoder/decoder pair for `tag` both exist in base_dir."""
     return os.path.exists(os.path.join(base_dir, f"vae_encoder_{tag}.keras")) and os.path.exists(
@@ -312,10 +226,9 @@ def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
     """
     Resolve the tag load_models() should load from base_dir.
 
-    An explicitly requested tag must exist: raising FileNotFoundError beats the old silent
-    get_latest_tag() fallback, which could resume training from a stale, unrelated model while
-    reporting success (issue #142). Only the tag=None default may fall back to the latest tag
-    present in base_dir.
+    An explicitly requested tag must exist on disk — we never fall back to "the latest" tag,
+    which could silently resume from a stale, unrelated model while reporting success (issue
+    #142). The tag=None default loads the conventional "final" model, or fails loudly.
     """
     if tag is not None:
         if _model_pair_exists(base_dir, tag):
@@ -325,30 +238,23 @@ def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
             f"for an explicitly requested tag."
         )
         # The per-round-checkpoint hint only helps for a round_XX tag; for any other explicit
-        # tag (e.g. a typo'd final_v2) it's a red herring, so only append it for round tags.
+        # tag (e.g. a typo'd full run tag) it's a red herring, so only append it for round tags.
         if re.fullmatch(r"round_\d+", tag):
             msg += (
                 " If you meant to resume from a per-round checkpoint, pass --load-dir checkpoints"
             )
         raise FileNotFoundError(msg)
 
-    # NOTE: use a more sensible default
+    # No explicit tag: only the conventional "final" model may be loaded implicitly. We do NOT
+    # scan for the "latest" tag in base_dir — that could silently load a stale, unrelated run's
+    # model (issue #142). If there's no "final" pair, fail loudly.
     logger.info("No tag specified. Defaulting to 'final'")
     if _model_pair_exists(base_dir, "final"):
         return "final"
-
-    logger.warning(f"No models tagged as 'final' in {base_dir}")
-    logger.warning(f"Looking for latest tag in {base_dir} instead")
-
-    latest = get_latest_tag(
-        base_dir
-    )  # get_latest_tag() will raise an error if no valid tags exist in base_dir
-    logger.info(f"Tag 'final' not found. Loading latest model with tag: '{latest}'")
-
-    # Sanity check: get_latest_tag() only returns tags whose pair existed at scan time
-    if not _model_pair_exists(base_dir, latest):
-        raise FileNotFoundError("Models not found")
-    return latest
+    raise FileNotFoundError(
+        f"No models tagged 'final' in {base_dir} and no explicit --load-tag given — refusing to "
+        f"guess a tag. Pass --load-tag (a full run tag, or --load-dir checkpoints --load-tag round_XX)."
+    )
 
 
 def compute_expected_std(layer):
@@ -1060,12 +966,35 @@ class TrainingPipeline:
 
         try:
             # Load models from checkpoints: explicit user flags win; otherwise a
-            # manifest-driven resume reloads the last completed round's checkpoint
-            if self.config.checkpoint.load_tag or self.config.checkpoint.load_dir:
+            # manifest-driven resume reloads the last completed round's checkpoint.
+            load_tag = self.config.checkpoint.load_tag
+            load_dir = self.config.checkpoint.load_dir
+            save_tag = self.config.checkpoint.save_tag
+            # Resume-in-place: a full-tag --load-tag that equals this run's save-tag (the tag was
+            # adopted by resolve_save_tag). If the run's final weights aren't on disk yet (the VAE
+            # didn't finish before the interruption), fall back to the manifest's last completed
+            # round for THIS tag — never to another run's checkpoints; fail loudly if neither.
+            resume_in_place = (
+                load_tag is not None
+                and load_tag == save_tag
+                and not re.fullmatch(r"round_\d+", load_tag)
+            )
+            if resume_in_place and not _model_pair_exists(self.config.model_path, load_tag):
+                if self._start_round > 1:
+                    resume_tag = f"round_{self._start_round - 1:02d}"
+                    logger.info(
+                        f"No final weights for run {load_tag!r} yet; resuming from {resume_tag} "
+                        f"(this run's last completed round, per manifest)"
+                    )
+                    self.load_models(tag=resume_tag, dir="checkpoints")
+                else:
+                    raise FileNotFoundError(
+                        f"Cannot resume run {load_tag!r}: no final weights on disk and no completed "
+                        f"rounds recorded in its manifest. Refusing to load another run's checkpoints."
+                    )
+            elif load_tag or load_dir:
                 logger.info("Resuming from checkpoint")
-                self.load_models(
-                    tag=self.config.checkpoint.load_tag, dir=self.config.checkpoint.load_dir
-                )
+                self.load_models(tag=load_tag, dir=load_dir)
             elif self._start_round > 1:
                 resume_tag = f"round_{self._start_round - 1:02d}"
                 logger.info(f"Resuming from checkpoint {resume_tag} (per run manifest)")

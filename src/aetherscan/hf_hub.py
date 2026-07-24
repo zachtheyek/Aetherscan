@@ -5,16 +5,17 @@ One public model repo (config.hf.repo_id, default zachtheyek/aetherscan) carries
 weights at stable filenames in the repo root — vae_encoder.keras, vae_decoder.keras,
 random_forest.joblib, config.json, plus an auto-generated model card README.md — with HF git
 tags carrying the versioning. Two tag families exist on the Hub: training tags (= a run's
-save_tag, e.g. final_v3, created by upload_run_to_hf after training) and release tags
-(vX.Y.Z, added by the release runbook pointing at the blessed weights commit).
+save_tag, e.g. train_20260101_120000, created by upload_run_to_hf after training) and release
+tags (vX.Y.Z, added by the release runbook pointing at the blessed weights commit).
 
 Upload (train, opt-in via --hf-upload) stages the four run artifacts under the stable names,
 commits them with the save_tag as the commit message, and tags the commit. Download
 (inference, the default when no local artifact paths are given) resolves a revision —
 explicit --hf-revision, else v{__version__} when running as an installed release (see
 version_default_revision — this is what makes `pip install aetherscan==1.0.0` + bare
-inference pull exactly the v1.0.0 weights), else the highest semver vX.Y.Z tag, else the
-highest final_vX tag — and pulls the artifact trio revision-pinned via hf_hub_download.
+inference pull exactly the v1.0.0 weights), else the highest semver vX.Y.Z release tag — and
+pulls the artifact trio revision-pinned via hf_hub_download. A no-artifact download requires a
+release tag; training tags never name the default revision.
 
 Auth: uploads require HF_TOKEN in the environment (loaded from the gitignored .env);
 huggingface_hub reads it implicitly. The repo is public, so downloads need no token. The
@@ -53,10 +54,10 @@ HF_CARD_FILENAME = "README.md"
 
 GITHUB_URL = "https://github.com/zachtheyek/Aetherscan"
 
-# Release tags (vX.Y.Z, from the release runbook) outrank training tags (final_vX) when
-# resolving the default download revision.
+# Release tags (vX.Y.Z, from the release runbook) name the default download revision. Training
+# tags (the {command}_{datetime} run tags) never name it — a no-artifact inference download
+# requires a blessed release tag.
 _SEMVER_TAG_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-_FINAL_TAG_PATTERN = re.compile(r"^final_v(\d+)$")
 
 
 def _hf_api():
@@ -118,17 +119,15 @@ def hf_tag_exists(repo_id: str, tag: str) -> bool:
 def select_default_revision(tags: list[str]) -> str | None:
     """
     Pick the default download revision from a repo's tag list: the highest semver vX.Y.Z
-    release tag; if none exist, the highest final_vX training tag; else None. Comparison is
-    numeric (v1.10.0 > v1.9.9), and tags in neither family (test_vX, timestamps) never win.
+    release tag, or None if the repo carries no release tag. Comparison is numeric
+    (v1.10.0 > v1.9.9); training tags (the {command}_{datetime} run tags) never win — a
+    no-artifact inference download requires a blessed release tag.
     """
     semver = [
         (tuple(int(g) for g in m.groups()), t) for t in tags if (m := _SEMVER_TAG_PATTERN.match(t))
     ]
     if semver:
         return max(semver)[1]
-    final = [(int(m.group(1)), t) for t in tags if (m := _FINAL_TAG_PATTERN.match(t))]
-    if final:
-        return max(final)[1]
     return None
 
 
@@ -186,7 +185,7 @@ def resolve_hf_revision(repo_id: str, revision: str | None) -> str:
     selected = select_default_revision(tags)
     if selected is None:
         raise RuntimeError(
-            f"No release tag (vX.Y.Z) or training tag (final_vX) found on HF repo "
+            f"No release tag (vX.Y.Z) found on HF repo "
             f"'{repo_id}' to download model artifacts from. Either pin a revision with "
             f"--hf-revision, point --hf-repo-id at a repo with released weights, or pass "
             f"all three local artifact paths (--encoder-path/--rf-path/--config-path)."
@@ -378,8 +377,8 @@ a 6-observation cadence (3 ON / 3 OFF, ABACAD) into an 8-dimensional latent, and
 Forest** classifies the cadence's concatenated latents as a technosignature candidate or not.
 
 This repository carries the released model weights at stable filenames, versioned via git
-tags: training tags match the pipeline run's save tag (e.g. `final_v3`), and release tags
-(`vX.Y.Z`) mark blessed weights.
+tags: training tags match the pipeline run's save tag (e.g. `train_20260101_120000`), and
+release tags (`vX.Y.Z`) mark blessed weights.
 
 **Training tag**: `{tag}`
 
