@@ -5,7 +5,7 @@ main.py auto-launches the dashboard alongside a run (dashboard_launcher.py); thi
 ad-hoc case — inspecting a saved DB after the fact — replacing the verbose manual incantation from
 dashboard.py's docstring with:
 
-    aetherscan-dashboard --db-path /path/to/aetherscan.db --tag final_v1
+    aetherscan-dashboard --db-path /path/to/aetherscan.db --tag train_20260101_120000
 
 Everything on the command line is forwarded verbatim to dashboard.py's argparse (--db-path, --tag,
 --plots-dir, --refresh). Streamlit must OWN the process (`streamlit run <file>`) for the `st.*`

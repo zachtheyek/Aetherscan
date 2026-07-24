@@ -18,7 +18,7 @@ opt out); to run it by hand against a saved DB, point streamlit at the installed
 
     streamlit run "$(python -c 'import aetherscan, os; \
         print(os.path.join(os.path.dirname(aetherscan.__file__), "dashboard.py"))')" \
-        -- --db-path /path/to/aetherscan.db --tag final_v1
+        -- --db-path /path/to/aetherscan.db --tag train_20260101_120000
 
 To watch a run on a cluster, SSH-forward the port:  ssh -L 8501:localhost:8501 blpc3
 

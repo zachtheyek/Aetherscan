@@ -232,7 +232,7 @@ reconstruct plus a PNG gallery.
 - **Manual runs against a saved DB.** The `aetherscan-dashboard` console script
   ([`src/aetherscan/dashboard_cli.py`](../src/aetherscan/dashboard_cli.py), registered under
   `[project.scripts]`) forwards its args verbatim to `dashboard.py`'s argparse:
-  `aetherscan-dashboard --db-path /path/to/aetherscan.db --tag final_v1`. In a source checkout /
+  `aetherscan-dashboard --db-path /path/to/aetherscan.db --tag train_20260101_120000`. In a source checkout /
   the container (no installed entry point), run the same shim as
   `PYTHONPATH=src python -m aetherscan.dashboard_cli <args>`. Either way it re-execs
   `python -m streamlit run <packaged dashboard.py> -- <args>` — Streamlit must own the process,

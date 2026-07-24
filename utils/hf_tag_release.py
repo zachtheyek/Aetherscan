@@ -3,7 +3,7 @@
 Bless trained weights as a release: create the HF release tag (vX.Y.Z) pointing at a
 training upload's commit (docs/RELEASE.md step 3).
 
-    python utils/hf_tag_release.py --save-tag final_v1 --release v1.0.0
+    python utils/hf_tag_release.py --save-tag train_20260101_120000 --release v1.0.0
 
 This is the human "these weights are the release" decision — the release CD workflow
 (.github/workflows/release.yml) verifies the tag exists but deliberately cannot create it.
@@ -44,7 +44,7 @@ def main() -> int:
     parser.add_argument(
         "--save-tag",
         required=True,
-        help="Training run tag whose uploaded weights are being blessed (e.g. final_v1); "
+        help="Training run tag whose uploaded weights are being blessed (e.g. train_20260101_120000); "
         "must already exist on the HF repo (created by `train --hf-upload`)",
     )
     parser.add_argument(

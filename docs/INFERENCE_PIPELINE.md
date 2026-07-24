@@ -86,8 +86,8 @@ after argument parsing). The trio is **all-or-none**
 
 When downloading, the **revision** is chosen by `resolve_hf_revision` in precedence order:
 
-1. **`--hf-revision <tag>`** — an explicit revision (a training tag `final_v1`, a release tag
-   `v1.0.0`, or a commit); returned as-is, existence checked by the download itself.
+1. **`--hf-revision <tag>`** — an explicit revision (a training tag `train_20260101_120000`, a
+   release tag `v1.0.0`, or a commit); returned as-is, existence checked by the download itself.
 2. **`v{__version__}`** — the version-coupled default. When the package is an **installed
    release**, `version_default_revision()` returns `f"v{__version__}"`, so
    `pip install aetherscan==1.0.0` + bare inference pulls exactly the `v1.0.0` weights. The
@@ -98,9 +98,9 @@ When downloading, the **revision** is chosen by `resolve_hf_revision` in precede
    fail the match — all fall through to step 3. This is deliberately **not** existence-checked:
    an installed release whose weights tag is missing must fail loudly (the release blessing
    step was skipped), never silently pull some other version.
-3. **Latest `vX.Y.Z` release tag**, else **latest `final_vX` training tag** on the repo
-   (`select_default_revision`; numeric comparison, so `v1.10.0 > v1.9.9`; tags in neither
-   family — `test_vX`, timestamps — never win). Raises `RuntimeError` with guidance when
+3. **Latest `vX.Y.Z` release tag** on the repo (`select_default_revision`; numeric comparison,
+   so `v1.10.0 > v1.9.9`). Training tags never name the default download — a no-artifact
+   inference download requires a blessed release tag. Raises `RuntimeError` with guidance when
    nothing resolves.
 
 Downloads go through `hf_hub_download` (revision-pinned, cached under `HF_HOME` /
