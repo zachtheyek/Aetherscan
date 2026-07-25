@@ -10,9 +10,9 @@ Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Bet
 
 ```bash
 # Canonical: NGC container (only option on Blackwell)
-./utils/run_container.sh python -m aetherscan.main {train|inference} --save-tag final_v1
+./utils/run_container.sh python -m aetherscan.main {train|inference} --save-tag train
 # Alternative: conda env (Ampere only) — prefix with PYTHONPATH=src
-PYTHONPATH=src python -m aetherscan.main {train|inference} --save-tag final_v1
+PYTHONPATH=src python -m aetherscan.main {train|inference} --save-tag train
 # Lint + format (also enforced via pre-commit)
 ruff check src/ && ruff format src/
 ```

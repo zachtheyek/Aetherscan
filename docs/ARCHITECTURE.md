@@ -140,8 +140,8 @@ The order is load-bearing — each step depends on the previous:
    name the per-tag log file `aetherscan_{tag}.log`. A pure CLI-syntax error therefore exits
    before any singleton or thread is created.
 4. `init_logger(save_tag=…)` — queue-based logging up before anything else wants to log; names
-   this run's log file from the save_tag resolved in step 3 (falls back to the config default
-   timestamp tag when `--save-tag` is omitted).
+   this run's log file from the tag `resolve_save_tag()` produced in step 3
+   (`{command}_{datetime}`, or the loaded tag when resuming in place via `--load-tag`).
 5. `init_manager()` — the ResourceManager registers its `atexit` + `SIGINT`/`SIGTERM` handlers.
 6. `register_logger()` — hands the logger to the manager so it is stopped **last** during
    cleanup (you can log during teardown of everything else).
@@ -190,21 +190,24 @@ spawn); they must never touch the DB singleton and must route logging through
 ## Tag conventions
 
 Every run is identified by `config.checkpoint.save_tag` — the **tag** — which stamps every
-artifact filename and every DB row. Accepted formats
-(`cli.py:_TAG_PATTERN`):
+artifact filename and every DB row. A tag is `{command}_{YYYYMMDD_HHMMSS}`, resolved once at
+startup by `cli.resolve_save_tag()` (before `init_logger`, so the log / config / artifacts all
+share one datetime):
 
-| Format            | Example           | Use                                                                                                                                                                               |
-| ----------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `YYYYMMDD_HHMMSS` | `20260712_143000` | Default (import-time timestamp) — every untagged run gets a unique one.                                                                                                           |
-| `final_vX`        | `final_v1`        | Release-grade training runs.                                                                                                                                                      |
-| `round_XX`        | `round_05`        | Per-round checkpoints (written by the pipeline; passed as `--load-tag` with `--load-dir checkpoints` to resume from a specific round — `CheckpointConfig.infer_start_round()` derives the start round from it). |
-| `test_vX`         | `test_v17`        | Smoke/test runs.                                                                                                                                                                  |
+| On the CLI | Resolves to | Use |
+| --- | --- | --- |
+| `--save-tag {test\|train\|inf\|bench}` | `{prefix}_{YYYYMMDD_HHMMSS}` | The user supplies only the prefix; the datetime is stamped at run time. |
+| `--save-tag` omitted | `{subcommand}_{YYYYMMDD_HHMMSS}` (`train`→`train_…`, `inference`→`inf_…`) | The default label per subcommand. |
+| `--load-tag {prefix}_{YYYYMMDD_HHMMSS}` | *(that tag is adopted)* | **Resume in place** — the run continues under the loaded tag (same `run_state` / DB rows / artifacts). |
+| `--load-tag round_XX` | *(a fresh save-tag)* | Load a per-round checkpoint (needs `--load-dir checkpoints`; `CheckpointConfig.infer_start_round()` sets the start round to `XX+1`) into a **new** run. |
 
-`train.py:get_latest_tag()` ranks the families `final_vX > round_XX > timestamp > test_vX`
-when hunting for the newest checkpoint pair. Same-tag **retries** are first-class: the
-run-state manifest (training) and the `inference_cadences` manifest (inference) make re-running
-the identical command resume rather than collide, with stale rows from dead attempts flagged
-`superseded` in the DB ([`DATABASE.md`](DATABASE.md)).
+`round_XX` is the intermediate per-round checkpoint tag and is **load-only** (rejected on
+`--save-tag`). There is no cross-run "latest tag" search: on resume, `_resolve_load_tag` loads
+the run's own final weights or, failing that, its last completed round (per the manifest) —
+never another run's model; it fails loudly instead. **Retries** are first-class: re-run with
+`--load-tag {full-tag}` and the run-state manifest (training) / `inference_cadences` manifest
+(inference) make it resume in place rather than collide, with stale rows from dead attempts
+flagged `superseded` in the DB ([`DATABASE.md`](DATABASE.md)).
 
 ## Directory layout & artifact map
 

@@ -45,7 +45,7 @@ tests/
 │   ├── test_round_data.py           # paths/manifest protocol, reuse/delete semantics, producer
 │   ├── test_seeding.py              # root-seed stream derivation (reproducible runs)
 │   ├── test_run_state.py            # manifest round-trip, stage machine transitions
-│   ├── test_train_utils.py          # get_latest_tag ladder, curriculum schedules, archiving
+│   ├── test_train_utils.py          # load-tag resolution, curriculum schedules, archiving
 │   ├── test_train_datasets.py       # batched generators: coverage, stratification, alignment
 │   ├── test_latent_traversal.py     # traversal grid math with a stub decoder
 │   ├── test_models.py               # feature layout, RF train/predict, encoder/decoder symmetry

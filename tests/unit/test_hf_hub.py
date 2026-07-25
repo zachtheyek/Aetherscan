@@ -123,7 +123,7 @@ class TestSanitizeConfigForUpload:
             "rf_path": "/datax/rf",
             "classification_threshold": 0.99,
         },
-        "checkpoint": {"load_dir": "/datax/ckpt", "save_tag": "final_v1"},
+        "checkpoint": {"load_dir": "/datax/ckpt", "save_tag": "train_20260101_120000"},
         "beta_vae": {"beta": 1.5, "latent_dim": 8},
     }
 
@@ -137,7 +137,7 @@ class TestSanitizeConfigForUpload:
         # Reproducibility-relevant fields survive.
         assert s["data"]["num_backgrounds"] == 45000
         assert s["inference"]["classification_threshold"] == 0.99
-        assert s["checkpoint"]["save_tag"] == "final_v1"
+        assert s["checkpoint"]["save_tag"] == "train_20260101_120000"
         assert s["beta_vae"] == {"beta": 1.5, "latent_dim": 8}
 
     def test_does_not_mutate_the_input(self):
@@ -146,21 +146,22 @@ class TestSanitizeConfigForUpload:
 
 
 class TestSelectDefaultRevision:
-    def test_semver_outranks_final(self):
-        assert select_default_revision(["final_v9", "v1.2.3", "v0.1.0"]) == "v1.2.3"
+    def test_semver_release_tag_wins_training_tags_ignored(self):
+        # Only vX.Y.Z release tags name the default download; training tags never do.
+        assert select_default_revision(["train_20260101_120000", "v1.2.3", "v0.1.0"]) == "v1.2.3"
 
     def test_semver_sorted_numerically_not_lexicographically(self):
         assert select_default_revision(["v1.9.9", "v1.10.0"]) == "v1.10.0"
         assert select_default_revision(["v2.0.0", "v10.0.0", "v9.9.9"]) == "v10.0.0"
 
-    def test_final_tags_sorted_numerically(self):
-        assert select_default_revision(["final_v2", "final_v12", "final_v3"]) == "final_v12"
-
-    def test_other_tag_families_never_win(self):
-        assert select_default_revision(["test_v17", "20260712_010203", "round_02"]) is None
-
-    def test_partial_semver_is_not_a_release_tag(self):
-        assert select_default_revision(["v1.2", "v1", "final_v1"]) == "final_v1"
+    def test_no_release_tag_returns_none(self):
+        # No vX.Y.Z release tag → None (a no-artifact download requires a blessed release tag).
+        # Training tags, timestamps, round tags, and partial semver never name the default.
+        assert (
+            select_default_revision(["train_20260101_120000", "20260712_010203", "round_02"])
+            is None
+        )
+        assert select_default_revision(["v1.2", "v1", "train_20260101_120000"]) is None
 
     def test_empty(self):
         assert select_default_revision([]) is None
@@ -201,7 +202,7 @@ class TestResolveHfRevision:
 
     def test_explicit_revision_outranks_installed_release(self, monkeypatch):
         _set_version(monkeypatch, "1.2.3")
-        assert resolve_hf_revision("ns/repo", "final_v9") == "final_v9"
+        assert resolve_hf_revision("ns/repo", "train_20260101_120000") == "train_20260101_120000"
 
     def test_installed_release_pins_own_version_without_listing(self, monkeypatch):
         # An installed release resolves v{__version__} directly — no tag listing, and no
@@ -216,12 +217,16 @@ class TestResolveHfRevision:
 
     def test_dev_version_falls_through_to_latest_release(self, monkeypatch):
         _set_version(monkeypatch, "0.9.0.dev0")
-        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["final_v1", "v0.2.0"])
+        monkeypatch.setattr(
+            hf_hub, "list_hf_tags", lambda repo_id: ["train_20260101_120000", "v0.2.0"]
+        )
         assert resolve_hf_revision("ns/repo", None) == "v0.2.0"
 
     def test_latest_release_selected(self, monkeypatch):
         _set_version(monkeypatch, "0.0.0.dev0")
-        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["final_v1", "v0.2.0"])
+        monkeypatch.setattr(
+            hf_hub, "list_hf_tags", lambda repo_id: ["train_20260101_120000", "v0.2.0"]
+        )
         assert resolve_hf_revision("ns/repo", None) == "v0.2.0"
 
     def test_no_resolvable_tag_raises_with_guidance(self, monkeypatch):
@@ -247,10 +252,10 @@ class TestListHfTags:
                 self.name = name
 
         class Refs:
-            tags = [Ref("v0.1.0"), Ref("final_v2")]
+            tags = [Ref("v0.1.0"), Ref("train_20260101_120000")]
 
         fake_api.list_repo_refs = lambda repo_id, repo_type=None: Refs()
-        assert hf_hub.list_hf_tags("ns/repo") == ["v0.1.0", "final_v2"]
+        assert hf_hub.list_hf_tags("ns/repo") == ["v0.1.0", "train_20260101_120000"]
 
     def test_missing_repo_yields_empty(self, monkeypatch, fake_api):
         import httpx  # noqa: PLC0415
@@ -348,7 +353,9 @@ class TestResolveInferenceArtifacts:
 
     def test_no_paths_no_revision_resolves_latest_and_records_provenance(self, monkeypatch):
         _set_version(monkeypatch, "0.0.0.dev0")
-        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["v0.1.0", "final_v3"])
+        monkeypatch.setattr(
+            hf_hub, "list_hf_tags", lambda repo_id: ["v0.1.0", "train_20260101_120000"]
+        )
         monkeypatch.setattr(hf_hub, "_hf_hub_download", lambda **kw: f"/cache/{kw['filename']}")
         args = self._args()
         resolve_inference_artifacts(args)
@@ -406,7 +413,7 @@ class TestResolveInferenceArtifacts:
             "_hf_hub_download",
             lambda **kw: (seen.append(kw["repo_id"]), f"/cache/{kw['filename']}")[1],
         )
-        args = self._args(hf_repo_id="other/repo", hf_revision="final_v1")
+        args = self._args(hf_repo_id="other/repo", hf_revision="train_20260101_120000")
         resolve_inference_artifacts(args)
         assert set(seen) == {"other/repo"}
 

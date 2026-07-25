@@ -122,9 +122,9 @@ imports), so it also runs against a database fetched from a cluster with
 
 ```bash
 # Default db path: {AETHERSCAN_OUTPUT_PATH}/db/aetherscan.db
-python utils/benchmark_report.py --save-tag final_v1
+python utils/benchmark_report.py --save-tag train
 # Explicit db (e.g. a copy pulled off the cluster)
-python utils/benchmark_report.py --save-tag test_v18 --db-path /path/to/aetherscan.db
+python utils/benchmark_report.py --save-tag test --db-path /path/to/aetherscan.db
 ```
 
 The same report is also generated **automatically at the tail of every `train`/`inference`

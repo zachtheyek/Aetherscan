@@ -15,8 +15,8 @@ Reads the SQLite file directly (stdlib sqlite3 + numpy + matplotlib only — no 
 imports), so it also runs against a database fetched from a cluster with
 utils/fetch_run_outputs.sh:
 
-    python utils/benchmark_report.py --save-tag final_v1
-    python utils/benchmark_report.py --save-tag test_v18 --db-path /path/to/aetherscan.db
+    python utils/benchmark_report.py --save-tag train_20260101_120000
+    python utils/benchmark_report.py --save-tag test_20260101_120000 --db-path /path/to/aetherscan.db
 """
 
 from __future__ import annotations

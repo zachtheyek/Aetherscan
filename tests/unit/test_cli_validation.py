@@ -12,13 +12,15 @@ import pytest
 
 from aetherscan import cli
 from aetherscan.cli import (
-    _TAG_PATTERN,
+    _LOAD_TAG_PATTERN,
+    _SAVE_TAG_PATTERN,
     _build_suggestion_block,
     _check_cross_constraints,
     _solve_cross_param_constraints,
     apply_args_to_config,
     apply_saved_config,
     collect_validation_errors,
+    resolve_save_tag,
     setup_argument_parser,
 )
 from aetherscan.config import get_config
@@ -62,32 +64,77 @@ def _ample_disk_space(monkeypatch):
 
 
 class TestTagPattern:
+    @pytest.mark.parametrize("tag", ["test", "train", "inf", "bench"])
+    def test_save_tag_accepted_prefixes(self, tag):
+        assert _SAVE_TAG_PATTERN.match(tag)
+
     @pytest.mark.parametrize(
         "tag",
-        ["20260712_123456", "final_v1", "final_v12", "round_01", "round_5", "test_v1", "test_v17"],
+        ["final_v1", "test_v1", "round_01", "train_20260101_000000", "TRAIN", " train", "", "prod"],
     )
-    def test_accepted_formats(self, tag):
-        assert _TAG_PATTERN.match(tag)
+    def test_save_tag_rejected(self, tag):
+        # --save-tag is a bare command prefix only; a full/round tag or old-scheme tag is rejected.
+        assert not _SAVE_TAG_PATTERN.match(tag)
 
     @pytest.mark.parametrize(
         "tag",
         [
-            "smoke_blackwell",  # free-form slug
-            "final_1",  # missing v
-            "final_v",  # missing version number
-            "test_17",  # missing v
-            "TEST_V1",  # wrong case
-            "2026_0712",  # malformed timestamp
+            "train_20260712_123456",
+            "test_20260101_000000",
+            "inf_20991231_235959",
+            "bench_20260712_123456",
+            "round_01",
+            "round_5",
+        ],
+    )
+    def test_load_tag_accepted(self, tag):
+        assert _LOAD_TAG_PATTERN.match(tag)
+
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            "final_v1",  # old scheme, retired
+            "test_v1",  # old scheme
+            "20260712_123456",  # bare datetime, retired
+            "train",  # a bare prefix isn't a full load tag
+            "train_2026",  # incomplete datetime
+            "TRAIN_20260101_000000",  # wrong case
             "20260712-123456",  # wrong separator
-            "20260712_12345",  # HHMMS (5 digits)
             "round_",  # missing round number
-            " test_v1",  # leading whitespace
-            "test_v1 ",  # trailing whitespace
+            " train_20260101_000000",  # leading whitespace
             "",
         ],
     )
-    def test_rejected_formats(self, tag):
-        assert not _TAG_PATTERN.match(tag)
+    def test_load_tag_rejected(self, tag):
+        assert not _LOAD_TAG_PATTERN.match(tag)
+
+
+class TestResolveSaveTag:
+    def test_prefix_gets_datetime_appended(self):
+        tag = resolve_save_tag("train", "test", None)
+        assert tag.startswith("test_") and _LOAD_TAG_PATTERN.match(tag)
+
+    def test_omitted_defaults_to_subcommand(self):
+        assert resolve_save_tag("train", None, None).startswith("train_")
+        assert resolve_save_tag("inference", None, None).startswith("inf_")
+
+    def test_full_load_tag_is_adopted_verbatim(self):
+        # A full {cmd}_{datetime} --load-tag resumes that run in place → its tag is adopted.
+        assert (
+            resolve_save_tag("train", "train", "train_20260101_120000") == "train_20260101_120000"
+        )
+
+    def test_round_load_tag_does_not_adopt(self):
+        # round_XX seeds a fresh run — the save-tag is freshly stamped, not adopted.
+        tag = resolve_save_tag("train", "train", "round_05")
+        assert tag.startswith("train_") and tag != "round_05"
+
+    @pytest.mark.parametrize("command", [None, "benchmark"])
+    def test_underivable_prefix_raises(self, command):
+        # No --save-tag and a command with no default prefix: refuse rather than emit an
+        # unloadable tag (main() guards the None case earlier via the required subparser).
+        with pytest.raises(ValueError, match="Cannot derive a save-tag prefix"):
+            resolve_save_tag(command, None, None)
 
 
 class TestCrossReplicaDivisibilityMatrix:
@@ -133,9 +180,11 @@ class TestSemanticChecks:
         )
         assert not any(e.field == "checkpoint.load_dir" for e in errors)
 
-    def test_final_load_tag_without_load_dir_passes(self):
-        # A final model legitimately lives in the models root — no load-dir required.
-        errors = collect_validation_errors(_parse(["train", "--load-tag", "final_v1"]), None)
+    def test_full_load_tag_without_load_dir_passes(self):
+        # A full run tag's final model legitimately lives in the models root — no load-dir required.
+        errors = collect_validation_errors(
+            _parse(["train", "--load-tag", "train_20260101_120000"]), None
+        )
         assert not any(e.field == "checkpoint.load_dir" for e in errors)
 
     def test_num_samples_divisible_by_4(self):

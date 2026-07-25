@@ -141,7 +141,7 @@ The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so the
 
 ```bash
 ./utils/run_container.sh python -m aetherscan.main {train|inference} \
-  --save-tag final_v1
+  --save-tag train
 ```
 
 The `utils/run_container.sh` wrapper auto-detects whether `apptainer` or `singularity` is on PATH (Apptainer wins when both are present), sets `--nv` for GPU passthrough, and binds the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 between host and container so absolute paths persisted in the DB stay valid across both. `PYTHONPATH` is set automatically inside the container — no inline prefix needed.
@@ -201,7 +201,7 @@ Multiprocess worker pools inherit the values via `os.environ` as usual.
 
 ```bash
 PYTHONPATH=src python -m aetherscan.main {train|inference} \
-  --save-tag final_v1
+  --save-tag train
 ```
 
 `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` step. No inline `KEY=VALUE` prefix is needed for Slack credentials — the `.env` auto-load runs before any worker process is spawned, so `os.environ` inheritance to multiprocess pools is automatic.
@@ -243,7 +243,7 @@ PYTHONPATH=src python -m aetherscan.main train
     --num-training-rounds 20 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
-    --save-tag test_v1
+    --save-tag test
 
 # Source
 PYTHONPATH=src python -m aetherscan.main train \
@@ -251,7 +251,7 @@ PYTHONPATH=src python -m aetherscan.main train \
     --num-training-rounds 20 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
-    --save-tag test_v1
+    --save-tag test
 ```
 
 **Resume from checkpoint**
@@ -261,13 +261,13 @@ PYTHONPATH=src python -m aetherscan.main train \
 ./utils/run_container.sh python -m aetherscan.main train \
     --load-dir checkpoints \
     --load-tag round_10 \
-    --save-tag test_v1
+    --save-tag test
 
 # Source
 PYTHONPATH=src python -m aetherscan.main train \
     --load-dir checkpoints \
     --load-tag round_10 \
-    --save-tag test_v1
+    --save-tag test
 ```
 
 > [!WARNING]
@@ -279,12 +279,12 @@ PYTHONPATH=src python -m aetherscan.main train \
 # Container
 ./utils/run_container.sh python -m aetherscan.main train \
     --gpu-memory-limit-mb 14000 \
-    --save-tag test_v1
+    --save-tag test
 
 # Source
 PYTHONPATH=src python -m aetherscan.main train \
     --gpu-memory-limit-mb 14000 \
-    --save-tag test_v1
+    --save-tag test
 ```
 
 **Watching the live dashboard from your local browser (SSH port forwarding)**
@@ -325,17 +325,17 @@ PYTHONPATH=src python -m aetherscan.main inference
 # Container
 ./utils/run_container.sh python -m aetherscan.main inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
-    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
-    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
-    --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_20260101_120000.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_20260101_120000.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_train_20260101_120000.json \
     --classification-threshold 0.99
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
-    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
-    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
-    --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json \
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_20260101_120000.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_20260101_120000.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_train_20260101_120000.json \
     --classification-threshold 0.99
 ```
 
@@ -349,7 +349,7 @@ AETHERSCAN_EXTRA_BINDS=/datag ./utils/run_container.sh python -m aetherscan.main
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json \
-    --save-tag run_v1
+    --save-tag inf
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
@@ -357,7 +357,7 @@ PYTHONPATH=src python -m aetherscan.main inference \
     --encoder-path /path/to/vae_encoder.keras \
     --rf-path /path/to/random_forest.joblib \
     --config-path /path/to/config.json \
-    --save-tag run_v1
+    --save-tag inf
 ```
 
 **Inference with async-allocator fallbacks (e.g. on a 5-GPU Blackwell topology)**
@@ -366,12 +366,12 @@ PYTHONPATH=src python -m aetherscan.main inference \
 # Container
 ./utils/run_container.sh python -m aetherscan.main inference \
     --no-async-allocator \
-    --save-tag run_v1
+    --save-tag inf
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
     --no-async-allocator \
-    --save-tag run_v1
+    --save-tag inf
 ```
 
 ---
@@ -730,16 +730,19 @@ options:
                         upload/download (default: zachtheyek/aetherscan)
   --load-dir LOAD_DIR   Subdirectory for checkpoint loading (relative to
                         --model-path)
-  --load-tag LOAD_TAG   Model tag for checkpoint loading. Accepted formats:
-                        final_vX, round_XX, YYYYMMDD_HHMMSS, test_vX. If
-                        round_XX format used, and --start-round not specified,
-                        training will resume from round following loaded
-                        checkpoint (i.e., XX + 1)
+  --load-tag LOAD_TAG   Checkpoint to load. A full run tag
+                        ({command}_YYYYMMDD_HHMMSS) resumes that run in place
+                        (its tag is adopted, so the resumed attempt writes
+                        under the same run). round_XX (requires --load-dir
+                        checkpoints) seeds a fresh run from that per-round
+                        checkpoint, resuming from round XX+1 unless --start-
+                        round is given.
   --start-round START_ROUND
                         Round to begin/resume training from
-  --save-tag SAVE_TAG   Tag for current pipeline run. Accepted formats:
-                        final_vX, round_XX, test_vX. Current timestamp used
-                        (YYYYMMDD_HHMMSS) if none specified
+  --save-tag SAVE_TAG   Run label prefix: one of test, train, inf, bench. The
+                        datetime is appended automatically at runtime (e.g.
+                        train_20260101_120000). Defaults to the subcommand
+                        (train->train, inference->inf) if omitted.
   --force-tag, --no-force-tag
                         Override the fail-early save-tag collision guard:
                         proceed even when an explicitly-provided --save-tag
@@ -956,10 +959,12 @@ options:
                         pin the model download to when no local artifact paths
                         are given (default: v{package version} when running as
                         an installed release, else the repo's latest release
-                        tag — highest semver vX.Y.Z tag, falling back to the
-                        highest final_vX training tag)
-  --save-tag SAVE_TAG   Tag for current pipeline run. Current timestamp used
-                        (YYYYMMDD_HHMMSS) if none specified
+                        tag — highest semver vX.Y.Z tag; a release tag is
+                        required for a no-artifact download)
+  --save-tag SAVE_TAG   Run label prefix: one of test, train, inf, bench. The
+                        datetime is appended automatically at runtime (e.g.
+                        inf_20260101_120000). Defaults to the subcommand
+                        (train->train, inference->inf) if omitted.
   --force-tag, --no-force-tag
                         Override the fail-early save-tag collision guard:
                         proceed even when an explicitly-provided --save-tag

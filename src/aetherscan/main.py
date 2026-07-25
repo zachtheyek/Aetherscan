@@ -24,6 +24,7 @@ from aetherscan.benchmark import stage_timer
 from aetherscan.cli import (
     apply_args_to_config,
     apply_saved_config,
+    resolve_save_tag,
     setup_argument_parser,
     validate_args,
 )
@@ -357,7 +358,9 @@ def train_command():
             # Reinitialize the training pipeline on each attempt so no corrupted state is
             # persisted. The persisted run manifest (run_state_{save_tag}.json) tells the new
             # pipeline which rounds/stages already completed, so the attempt resumes exactly
-            # where the previous one died (works identically for a full process relaunch)
+            # where the previous one died. The save_tag is fixed for the life of the process, so
+            # these in-process retries resume automatically; a full process relaunch mints a fresh
+            # datetime tag and only resumes when re-invoked with --load-tag {full-tag}.
             pipeline = run_training_pipeline(background_data=background_data, strategy=strategy)
 
             break  # If we get here, training succeeded
@@ -940,19 +943,39 @@ def main():
             parser.print_help()
         raise
 
-    # Initialize logger. Name the run's log file with its effective save_tag: the CLI --save-tag
-    # when provided (present on the train/inference subcommands as args.save_tag), else the config
-    # default timestamp tag. init_logger() runs before apply_args_to_config(), so the tag is
-    # resolved from args here rather than from the not-yet-updated config. Pass None straight
-    # through rather than pre-resolving the default here — Logger.__init__ already does the
-    # is-not-None fallback to config.checkpoint.save_tag internally.
+    # Resolve the run's save-tag ONCE, here, at runtime: a full {command}_{datetime} --load-tag
+    # resumes that run in place (its tag is adopted); otherwise {--save-tag prefix or subcommand}_
+    # {datetime}. Done before init_logger() (which names the log file by tag) and validate_args()
+    # so the log file, config, and every artifact share a single datetime. --save-tag stays a bare
+    # prefix on `args` for validate_args to check; only the resolved full tag lands on the config.
+    config = get_config()
+    if config is None:
+        raise ValueError("get_config() returned None")
+    config.checkpoint.save_tag = resolve_save_tag(
+        getattr(args, "command", None),
+        getattr(args, "save_tag", None),
+        getattr(args, "load_tag", None),
+    )
+
+    # Initialize logger, naming the run's log file with the resolved save_tag.
     try:
-        init_logger(save_tag=getattr(args, "save_tag", None))
+        init_logger(save_tag=config.checkpoint.save_tag)
         logger.info("Logger initialization successful, but not yet registered for cleanup.")
         logger.info("Awaiting resource manager initialization. Do not terminate the process!")
     except Exception as e:
         # Note, can't log if init_logger() fails
         sys.exit(1)
+
+    # A full --load-tag resumes that run in place (its tag is adopted as the save_tag). If the user
+    # ALSO passed an explicit --save-tag prefix, it was silently overridden — surface that so the
+    # save-tag not taking effect isn't a mystery.
+    if getattr(args, "save_tag", None) and config.checkpoint.save_tag == getattr(
+        args, "load_tag", None
+    ):
+        logger.info(
+            f"Resuming in place under --load-tag '{args.load_tag}' — the provided --save-tag "
+            f"'{args.save_tag}' was ignored (a full --load-tag adopts that run's tag)."
+        )
 
     # Initialize resource manager
     try:

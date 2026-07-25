@@ -2,10 +2,10 @@
 Fail-early save-tag dedup guards.
 
 Reusing a save_tag silently mixes a new run's artifacts, config JSON, and DB rows with a
-previous run's — the stale-artifact confusion the cluster runbook works around by manually
-incrementing test_vNN tags. These guards hard-stop a run at startup (before any expensive
-work or writes) when an explicitly-provided --save-tag collides with existing state, while
-staying out of the way of the two legitimate same-tag flows:
+previous run's — the stale-artifact confusion the cluster runbook used to work around by
+manually incrementing test_vNN tags. These guards hard-stop a run at startup (before any
+expensive work or writes) when its resolved save-tag collides with a completed run's state,
+while staying out of the way of the two legitimate same-tag flows:
 
 - Training retries/relaunches: a run-state manifest (run_state_{tag}.json) marks the tag as
   an in-progress resumable run, so the guard is skipped entirely (PR-04's supersede
@@ -14,9 +14,10 @@ staying out of the way of the two legitimate same-tag flows:
   streaming run. Only a completed run — evidenced by its saved config_{tag}.json, written at
   the very end of a successful pass — or stale legacy-path DB rows count as collisions.
 
-Default (datetime) save tags are immune by construction — a fresh second-resolution
-timestamp can't collide — so the local guards only fire for explicitly-provided tags.
---force-tag consciously overrides every guard.
+Because every resolved save-tag carries a fresh second-resolution {command}_{datetime} stamp,
+a fresh run can't collide by construction; the guards bite only if a completed run's tag is
+deliberately reused, and the resumable-run manifests above exempt the legitimate retry/resume
+flows. --force-tag consciously overrides every guard.
 
 enforce_tag_guards() is called from main() immediately before command dispatch
 (post-validation, post-DB-init, pre-any-work).

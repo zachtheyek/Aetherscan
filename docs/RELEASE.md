@@ -61,12 +61,13 @@ Inference resolves models in this precedence order:
 
 1. **Explicit local paths** (`--encoder-path` / `--rf-path` / `--config-path`) — always win;
    the offline/cluster path.
-2. **`--hf-revision <tag>`** — pin any HF revision (a training tag like `final_v1`, a
-   release tag like `v1.0.0`, or a commit).
+2. **`--hf-revision <tag>`** — pin any HF revision (a training tag like
+   `train_20260101_120000`, a release tag like `v1.0.0`, or a commit).
 3. **`v{__version__}`** — when running as an installed release, the package's own version is
    the default revision. This is the line that makes `pip install aetherscan==1.0.0` +
    bare inference pull exactly the `v1.0.0` weights.
-4. **Latest `v*` semver tag** on the HF repo, then **latest `final_vX`** training tag.
+4. **Latest `v*` semver tag** on the HF repo. Training tags never name the default download —
+   a no-artifact inference download requires a blessed release tag.
 5. Otherwise: error with guidance.
 
 Downloads happen **lazily at first inference**, never at import time (an import-time network
@@ -83,7 +84,7 @@ versioning**:
 
 | Tag family | Created by | Points at |
 | --- | --- | --- |
-| Training tags (`final_v1`, `test_v17`, ...) | Training runs with `--hf-upload` (tag = the run's `save_tag`) | The commit that upload produced |
+| Training tags (`train_20260101_120000`, ...) | Training runs with `--hf-upload` (tag = the run's `save_tag`) | The commit that upload produced |
 | Release tags (`v1.0.0`, ...) | The release runbook (step 3 below) | The blessed training upload's commit |
 
 Uploads need a write-scoped `HF_TOKEN` in the environment (`.env` on the clusters —
@@ -152,14 +153,15 @@ Steps for cutting `vX.Y.Z` (maintainer + agent together):
 1. **Prereqs** — one-time setup above is done; all intended PRs are merged; `master` is
    green.
 2. **Train the release model** — full-scale
-   `train --save-tag final_vN --hf-upload` on the chosen cluster. Weights land locally and
-   on HF tagged `final_vN`. **Review the training artifacts** — the loss curves, injection
+   `train --save-tag train --hf-upload` on the chosen cluster (the run tag resolves to
+   `train_{YYYYMMDD_HHMMSS}` — note it for the next step). Weights land locally and on HF tagged
+   with that run tag. **Review the training artifacts** — the loss curves, injection
    stats, latent diagnostics, and RF plots ([`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md))
    are the release-qualification evidence.
 3. **Bless the weights** — create the release tag on HF pointing at the training upload:
-   `utils/hf_tag_release.py --save-tag final_vN --release vX.Y.Z` (a thin wrapper over
-   `HfApi.create_tag`). This is the human "these weights are the release" decision — CD
-   deliberately cannot make it.
+   `utils/hf_tag_release.py --save-tag train_{YYYYMMDD_HHMMSS} --release vX.Y.Z` (the run tag from
+   step 2; a thin wrapper over `HfApi.create_tag`). This is the human "these weights are the
+   release" decision — CD deliberately cannot make it.
 4. **Release PR** — bump `version = "X.Y.Z"` in `pyproject.toml`, revisit the Development
    Status classifier, draft the release notes (curate the `claude-release-notes` comments),
    regenerate anything version-stamped. Merge through normal review.

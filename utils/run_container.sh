@@ -12,7 +12,7 @@
 # either cluster can build and run the image without code changes.
 #
 # Usage:
-#     ./utils/run_container.sh python -m aetherscan.main train --save-tag test_v1
+#     ./utils/run_container.sh python -m aetherscan.main train --save-tag test
 #     ./utils/run_container.sh python -m aetherscan.main inference --inference-files <csv>
 #
 # Override via env var:
@@ -45,7 +45,7 @@ set -euo pipefail
 
 if [[ $# -eq 0 ]]; then
     echo "Usage: $0 <command> [args...]" >&2
-    echo "  e.g. $0 python -m aetherscan.main train --save-tag test_v1" >&2
+    echo "  e.g. $0 python -m aetherscan.main train --save-tag test" >&2
     exit 1
 fi
 

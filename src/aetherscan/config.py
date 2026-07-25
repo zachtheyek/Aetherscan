@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
 from multiprocessing import cpu_count
 
 
@@ -426,7 +425,7 @@ class HFConfig:
     # (requires HF_TOKEN in the environment; default off = local-only).
     upload_after_training: bool = False
     # Inference pin: HF revision (tag/branch/commit) to download artifacts from. None
-    # resolves to the latest release tag (highest semver vX.Y.Z, else highest final_vX).
+    # resolves to the latest release tag (highest semver vX.Y.Z); a release tag is required.
     revision: str | None = None
 
 
@@ -437,7 +436,10 @@ class CheckpointConfig:
     load_dir: str | None = None
     load_tag: str | None = None
     start_round: int = 1
-    save_tag: str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Resolved once at runtime by cli.resolve_save_tag (in main(), before init_logger) to
+    # {command}_{YYYYMMDD_HHMMSS}. None until then — the pipeline always runs through the CLI,
+    # which sets it before any stage reads it.
+    save_tag: str | None = None
     # Override the fail-early save-tag dedup guards (local artifact/DB collisions and the
     # HF-side tag check) for an explicitly-provided save_tag.
     force_tag: bool = False

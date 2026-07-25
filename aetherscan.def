@@ -61,4 +61,4 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3@sha256:c83b37d26f19ab00d8a13cf974e
     forward compatibility) -- one recipe, both clusters.
 
     Use utils/run_container.sh from the repo root to launch commands, e.g.:
-        ./utils/run_container.sh python -m aetherscan.main train --save-tag test_v1
+        ./utils/run_container.sh python -m aetherscan.main train --save-tag test

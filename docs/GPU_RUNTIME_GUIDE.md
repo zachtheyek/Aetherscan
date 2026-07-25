@@ -129,13 +129,13 @@ The conda env was bumped to TF 2.17 / numpy 1.26 to match the container's API su
 # Blackwell — memory-growth only, full 96 GB per GPU
 ./utils/run_container.sh \
     python -m aetherscan.main train \
-    --save-tag final_v1
+    --save-tag train
 
 # Ampere — same wrapper, 14 GB cap to match the A4000s' prior behavior
 ./utils/run_container.sh \
     python -m aetherscan.main train \
     --gpu-memory-limit-mb 14000 \
-    --save-tag final_v1
+    --save-tag train
 ```
 
 The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv` for GPU passthrough, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB; on Ampere, pass `--gpu-memory-limit-mb 14000` to preserve the legacy A4000 cap.
@@ -145,7 +145,7 @@ The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHE
 ```bash
 PYTHONPATH=src python -m aetherscan.main train \
     --gpu-memory-limit-mb 14000 \
-    --save-tag final_v1
+    --save-tag train
 ```
 
 The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as the source of truth. Setting it preserves the original behavior on the A4000s.
@@ -156,9 +156,9 @@ The legacy hardcoded `memory_limit=14000` is now a CLI flag with `GPUConfig` as 
 ./utils/run_container.sh \
     python -m aetherscan.main inference \
     --inference-files complete_cadences_catalog.csv \
-    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_final_v1.keras \
-    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_final_v1.joblib \
-    --config-path /datax/scratch/zachy/models/aetherscan/config_final_v1.json
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_20260101_120000.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_20260101_120000.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_train_20260101_120000.json
 
 # Add --gpu-memory-limit-mb 14000 when running on Ampere (container or conda).
 # For the Ampere conda alternative, drop the run_container.sh wrapper and prepend PYTHONPATH=src.

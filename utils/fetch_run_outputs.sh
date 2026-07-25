@@ -18,15 +18,15 @@
 #   -h, --help      show this help.
 #
 # Examples:
-#   ./utils/fetch_run_outputs.sh train final_v1 blpc0
-#   ./utils/fetch_run_outputs.sh train final_v1 blpc0 blpc1   # same tag, several nodes
-#   ./utils/fetch_run_outputs.sh --all train final_v1 blpc0   # + checkpoints/archive
+#   ./utils/fetch_run_outputs.sh train train_20260101_120000 blpc0
+#   ./utils/fetch_run_outputs.sh train train_20260101_120000 blpc0 blpc1   # same tag, several nodes
+#   ./utils/fetch_run_outputs.sh --all train train_20260101_120000 blpc0   # + checkpoints/archive
 #   ./utils/fetch_run_outputs.sh --db inference run_2026 blpc0 # + the results DB
 #
 # Naming convention: a remote file BASENAME lands locally as
 # "<machine>_BASENAME". e.g. on machine blpc0,
-#   /datax/scratch/zachy/models/aetherscan/config_final_v1.json
-#     -> outputs/models/blpc0_config_final_v1.json
+#   /datax/scratch/zachy/models/aetherscan/config_train_20260101_120000.json
+#     -> outputs/models/blpc0_config_train_20260101_120000.json
 # Pulling the same tag from several machines is therefore collision-free, which
 # is the whole point of the machine prefix.
 #
