@@ -18,9 +18,22 @@ class DBConfig:
     get_connection_timeout: float = 60.0  # seconds
     stop_writer_timeout: float = 10.0  # seconds
     write_interval: float = 5.0  # seconds
-    write_buffer_max_size: int = 100  # records
+    # Rows per foreground transaction. 100 meant a commit (and fsync) every 100 rows — one of
+    # the drivers of the ~590 rows/s writer that let a multi-hour backlog build up (#277)
+    write_buffer_max_size: int = 5000  # records
     write_retry_delay: float = 1.0  # seconds
     flush_timeout: float = 10.0  # seconds
+    # Bulk lane (#277): high-volume injection stats ride a separate bounded queue so a plot
+    # flush only has to drain the (small) foreground lane, and queue growth is capped —
+    # backpressure blocks the background enqueuer (the round-data drainer thread), never the
+    # training path. bulk_chunk_rows is both the enqueue granularity and the bulk transaction
+    # size; the cap is bulk_queue_max_items * bulk_chunk_rows rows in memory (~1.6M at defaults).
+    bulk_chunk_rows: int = 50_000  # rows per bulk queue item / transaction
+    bulk_queue_max_items: int = 32  # bounded bulk-lane depth (items)
+    # Shutdown drain (#277): stop() drains BOTH lanes to disk before the writer exits (the old
+    # behavior silently dropped everything still queued — up to ~26M rows on the release run).
+    # If the drain exceeds this cap the remaining rows are dropped with an exact ERROR count.
+    stop_drain_timeout: float = 600.0  # seconds
 
 
 @dataclass
@@ -590,6 +603,9 @@ class Config:
                 "write_buffer_max_size": self.db.write_buffer_max_size,
                 "write_retry_delay": self.db.write_retry_delay,
                 "flush_timeout": self.db.flush_timeout,
+                "bulk_chunk_rows": self.db.bulk_chunk_rows,
+                "bulk_queue_max_items": self.db.bulk_queue_max_items,
+                "stop_drain_timeout": self.db.stop_drain_timeout,
             },
             "manager": {
                 "n_processes": self.manager.n_processes,

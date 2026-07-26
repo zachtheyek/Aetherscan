@@ -8,6 +8,7 @@ against a stub pipeline)."""
 from __future__ import annotations
 
 import logging
+import math
 import os
 import types
 
@@ -33,6 +34,7 @@ from aetherscan.train import (
     _execute_training_stages,
     _resolve_load_tag,
     archive_directory,
+    build_epoch_history,
     check_encoder_trained,
     check_val_auc_floor,
     compute_expected_std,
@@ -656,3 +658,97 @@ class TestExecuteTrainingStages:
         assert "_clear_stage_failure" in stub.calls
         assert state.stages_failed == []
         assert not state.is_stage_done(STAGE_HF_UPLOAD)
+
+
+class TestBuildEpochHistory:
+    """#277 problem 6: the real global-epoch axis — gaps stay gaps, no positional compression."""
+
+    def test_positions_use_real_epoch_numbers(self):
+        stats = [
+            {"stat_name": "total_loss", "round_number": 1, "epoch_number": 1, "value": 1.0},
+            {"stat_name": "total_loss", "round_number": 1, "epoch_number": 2, "value": 2.0},
+            {"stat_name": "total_loss", "round_number": 2, "epoch_number": 1, "value": 4.0},
+        ]
+        epochs, history = build_epoch_history(stats, epochs_per_round=3)
+        assert list(epochs) == [1, 2, 3, 4]
+        values = history["total_loss"]
+        assert values[0] == 1.0 and values[1] == 2.0 and values[3] == 4.0
+        # Round 1 epoch 3 never committed -> NaN gap, NOT round 2's value shifted left
+        assert math.isnan(values[2])
+
+    def test_gap_is_not_compressed(self):
+        stats = [
+            {"stat_name": "kl_loss", "round_number": 1, "epoch_number": 1, "value": 1.0},
+            {"stat_name": "kl_loss", "round_number": 1, "epoch_number": 5, "value": 5.0},
+        ]
+        epochs, history = build_epoch_history(stats, epochs_per_round=10)
+        assert list(epochs) == [1, 2, 3, 4, 5]
+        values = history["kl_loss"]
+        assert values[0] == 1.0 and values[4] == 5.0
+        assert all(math.isnan(v) for v in values[1:4])
+
+    def test_duplicate_rows_last_wins(self):
+        stats = [
+            {"stat_name": "lr", "round_number": 1, "epoch_number": 1, "value": 0.1},
+            {"stat_name": "lr", "round_number": 1, "epoch_number": 1, "value": 0.2},
+        ]
+        _, history = build_epoch_history(stats, epochs_per_round=2)
+        assert history["lr"] == [0.2]
+
+    def test_rows_without_round_or_epoch_are_skipped(self):
+        stats = [
+            {"stat_name": "scalar", "round_number": None, "epoch_number": None, "value": 9.0},
+            {"stat_name": "total_loss", "round_number": 1, "epoch_number": 1, "value": 1.0},
+        ]
+        epochs, history = build_epoch_history(stats, epochs_per_round=5)
+        assert list(epochs) == [1]
+        assert "scalar" not in history
+
+    def test_empty_input(self):
+        epochs, history = build_epoch_history([], epochs_per_round=5)
+        assert list(epochs) == []
+        assert history == {}
+
+
+class TestPlotFlushGates:
+    """#277 problem 5: a failed flush (or a pending bulk backlog) skips the plot — it never
+    renders a partial result set. Raising is the skip mechanism: per-round callers catch and
+    log; _run_plot_group records a non-critical failure."""
+
+    @staticmethod
+    def _pipeline_with_db(flush_ok: bool = True, backlog: int = 0):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        config = get_config()
+        config.checkpoint.save_tag = "test_20260101_000000"
+        pipeline.config = config
+
+        class _DBStub:
+            def flush(self, timeout=None):
+                return flush_ok
+
+            def injection_backlog_rows(self, max_round=None):
+                return backlog
+
+        pipeline.db = _DBStub()
+        pipeline.start_time = 0.0
+        return pipeline
+
+    def test_loss_curves_skip_on_flush_failure(self):
+        pipeline = self._pipeline_with_db(flush_ok=False)
+        with pytest.raises(RuntimeError, match="skipping the beta-VAE loss curves"):
+            pipeline.plot_beta_vae_loss_curves()
+
+    def test_stability_skip_on_flush_failure(self):
+        pipeline = self._pipeline_with_db(flush_ok=False)
+        with pytest.raises(RuntimeError, match="skipping the training stability plot"):
+            pipeline.plot_beta_vae_training_stability()
+
+    def test_injection_skip_on_bulk_backlog(self):
+        pipeline = self._pipeline_with_db(flush_ok=True, backlog=7)
+        with pytest.raises(RuntimeError, match="bulk lane"):
+            pipeline.plot_injection_stats(round_number=1)
+
+    def test_injection_skip_on_flush_failure(self):
+        pipeline = self._pipeline_with_db(flush_ok=False, backlog=0)
+        with pytest.raises(RuntimeError, match="skipping injection"):
+            pipeline.plot_injection_stats(round_number=1)

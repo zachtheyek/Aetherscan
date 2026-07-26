@@ -374,13 +374,19 @@ class TestComputeIntensityStats:
 
 
 class _RecordingDB:
-    """Minimal stand-in for the DB singleton: records write_injection_stat calls."""
+    """Minimal stand-in for the DB singleton: records injection-stat rows. Since #277
+    write_segment_stats batches everything through write_injection_stats_bulk; each row dict
+    is recorded individually so assertions read the same as for the old per-row API."""
 
     def __init__(self):
         self.calls = []
 
     def write_injection_stat(self, **kwargs):
         self.calls.append(kwargs)
+
+    def write_injection_stats_bulk(self, stats, tag=None):
+        for row in stats:
+            self.calls.append({**row, "tag": tag})
 
 
 class TestWriteSegmentStats:

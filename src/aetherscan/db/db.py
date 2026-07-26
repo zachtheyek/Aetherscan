@@ -56,11 +56,24 @@ _MARK_SUPERSEDED_SENTINEL = object()
 _SCHEMA_VERSION = 4
 
 
+# Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
+# is constant for the life of a process, and the uncached version opened a UDP socket per call
+# — a real cost on the injection-stat hot path, which calls this tens of millions of times per
+# round (#277). A spawned child process re-imports the module and rebuilds its own cache, so
+# the PID is always correct.
+_SYSTEM_METADATA_CACHE: str | None = None
+
+
 def get_system_metadata() -> str:
     """
     Collects system metadata (machine name, user name, IP address, process ID)
-    and returns it as a JSON string suitable for database storage.
+    and returns it as a JSON string suitable for database storage. Cached per process —
+    every field is process-constant.
     """
+    global _SYSTEM_METADATA_CACHE
+    if _SYSTEM_METADATA_CACHE is not None:
+        return _SYSTEM_METADATA_CACHE
+
     # Machine and user info
     machine_name = socket.gethostname()
     user_name = getpass.getuser()
@@ -92,7 +105,8 @@ def get_system_metadata() -> str:
     }
 
     # Use sorted keys for deterministic ordering (optional, good for diffs)
-    return json.dumps(metadata, sort_keys=True)
+    _SYSTEM_METADATA_CACHE = json.dumps(metadata, sort_keys=True)
+    return _SYSTEM_METADATA_CACHE
 
 
 class Database:
@@ -151,10 +165,24 @@ class Database:
         self.write_buffer_max_size = self.config.db.write_buffer_max_size
         self.write_retry_delay = self.config.db.write_retry_delay
         self.flush_timeout = self.config.db.flush_timeout
+        self.bulk_chunk_rows = self.config.db.bulk_chunk_rows
+        self.stop_drain_timeout = self.config.db.stop_drain_timeout
 
         self.write_queue = Queue()
+        # Bulk lane (#277): bounded queue for high-volume injection-stat chunks. The bound
+        # applies backpressure to the enqueuer (the round-data drainer / in-process data-gen
+        # stats callback — background work that can afford to wait), never the training path,
+        # and caps writer-side memory (the old single unbounded queue grew to ~35 GB of
+        # anonymous RSS on the release run). flush() only drains the foreground write_queue,
+        # so plot flushes no longer wait behind a round's worth of injection rows.
+        self.bulk_queue = Queue(maxsize=self.config.db.bulk_queue_max_items)
+        # Pending bulk rows per round_number (None keyed as -1), so plot code can verify that
+        # every injection row for rounds <= N is committed before rendering round N's figures
+        self._bulk_pending_lock = threading.Lock()
+        self._bulk_pending_by_round: dict[int, int] = {}
         self.writer_thread = None
         self.stop_event = threading.Event()  # Thread-safe flag for stopping
+        self.drain_event = threading.Event()  # Graceful-shutdown flag: drain both lanes first
 
         # Initialize database schema
         self._init_database()
@@ -460,6 +488,11 @@ class Database:
         """Context manager for database connections with proper cleanup"""
         conn = sqlite3.connect(self.db_path, timeout=self.get_connection_timeout)
         try:
+            # Under WAL, synchronous=NORMAL only skips the per-commit WAL fsync (the WAL is
+            # still synced at checkpoints) — a crash can lose the most recent commits but
+            # never corrupts the database. That durability is ample for diagnostic telemetry
+            # and removes the dominant per-transaction fsync stall (#277).
+            conn.execute("PRAGMA synchronous=NORMAL")
             yield conn
         finally:
             conn.close()
@@ -470,34 +503,75 @@ class Database:
             return
 
         self.stop_event.clear()
+        self.drain_event.clear()
         # NOTE: should db be daemon or non-daemon thread?
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=False)
         self.writer_thread.start()
         logger.info("Database writer thread started")
 
+    def _pending_row_counts(self) -> tuple[int, int]:
+        """Approximate (foreground items, bulk rows) still queued — for drain progress logs."""
+        with self._bulk_pending_lock:
+            bulk_rows = sum(self._bulk_pending_by_round.values())
+        return self.write_queue.qsize(), bulk_rows
+
     def stop(self):
-        """Stop the background writer thread and flush remaining data"""
+        """
+        Drain both write lanes to disk, then stop the background writer thread.
+
+        The writer first empties the foreground and bulk queues (with progress heartbeats —
+        the backlog can be large), bounded by stop_drain_timeout; only then does it exit. If
+        the drain cap is hit, the writer is force-stopped and the exact number of dropped
+        rows is logged at ERROR — never silently (#277: the old stop() discarded everything
+        still queued, losing the most recent rows first).
+        """
         if self.writer_thread is None:
             return
 
-        logger.info("Stopping database writer thread...")
-        self.stop_event.set()  # Signal thread to stop
+        fg_items, bulk_rows = self._pending_row_counts()
+        logger.info(
+            f"Stopping database writer thread (draining backlog: ~{fg_items} foreground "
+            f"item(s), ~{bulk_rows} bulk row(s))..."
+        )
+        self.drain_event.set()  # Ask the writer to drain both lanes, then exit
 
-        # Wait for writer thread to finish
-        self.writer_thread.join(timeout=self.stop_writer_timeout)
+        deadline = time.time() + self.stop_drain_timeout
+        while self.writer_thread.is_alive() and time.time() < deadline:
+            self.writer_thread.join(timeout=5.0)
+            if self.writer_thread.is_alive():
+                fg_items, bulk_rows = self._pending_row_counts()
+                logger.info(
+                    f"Draining DB backlog before shutdown: ~{fg_items} foreground item(s), "
+                    f"~{bulk_rows} bulk row(s) remaining"
+                )
 
         if self.writer_thread.is_alive():
-            logger.warning("Database writer thread did not stop cleanly")
+            # Drain cap hit — force the writer out and account for every dropped row
+            self.stop_event.set()
+            self.writer_thread.join(timeout=self.stop_writer_timeout)
+            fg_items, bulk_rows = self._pending_row_counts()
+            logger.error(
+                f"Database writer did not drain within {self.stop_drain_timeout}s; "
+                f"dropping ~{fg_items} foreground item(s) and ~{bulk_rows} bulk row(s) "
+                "still queued"
+            )
+            if self.writer_thread.is_alive():
+                logger.warning("Database writer thread did not stop cleanly")
         else:
-            logger.info("Database writer thread stopped")
+            self.stop_event.set()  # Writer already exited; keep post-stop flush()/writes short-circuiting
+            logger.info("Database writer thread stopped (backlog drained)")
 
     def flush(self, timeout: float | None = None) -> bool:
         """
-        Block until queued writes are drained to the database.
+        Block until queued FOREGROUND writes are drained to the database.
 
         Returns False on timeout or if shutdown is initiated mid-wait. A None timeout falls back
         to the configured flush_timeout. Call before any read that needs to observe writes still
         sitting in the queue.
+
+        The bulk injection-stat lane is deliberately NOT covered (#277): a flush must never
+        queue behind a round's worth of bulk rows. Readers of injection_stats should gate on
+        injection_backlog_rows() instead.
         """
         if timeout is None:
             timeout = self.flush_timeout
@@ -651,19 +725,61 @@ class Database:
             # kill the writer thread (stale rows would then merely reappear in plots)
             logger.error(f"Error marking rows superseded in {table}: {e}")
 
+    def _consume_bulk_item(self) -> bool:
+        """
+        Pull one bulk chunk (if any), commit it together with any buffered foreground rows in
+        a single transaction, and settle the pending-row accounting. Runs on the writer
+        thread. Returns True if a chunk was consumed.
+        """
+        try:
+            table, rows, round_counts = self.bulk_queue.get_nowait()
+        except Empty:
+            return False
+
+        self.buffer.extend((table, values) for values in rows)
+        self._flush_buffer()
+        self.buffer.clear()
+
+        # Settle the per-round pending accounting only after the commit attempt, so
+        # injection_backlog_rows() == 0 really means "every enqueued row reached the db
+        # engine" (_flush_buffer logs and drops a failed batch — those rows are gone either
+        # way, so they must not linger in the backlog count)
+        with self._bulk_pending_lock:
+            for round_key, count in round_counts.items():
+                remaining = self._bulk_pending_by_round.get(round_key, 0) - count
+                if remaining > 0:
+                    self._bulk_pending_by_round[round_key] = remaining
+                else:
+                    self._bulk_pending_by_round.pop(round_key, None)
+        return True
+
     def _writer_loop(self):
-        """Background loop that consumes data from queue and writes to database"""
+        """
+        Background loop that consumes data from both write lanes and writes to the database.
+
+        The foreground write_queue (training stats, latent snapshots, sentinels, ...) has
+        strict priority; the bounded bulk lane (injection-stat chunks) is serviced whenever
+        the foreground lane is idle. On graceful shutdown (drain_event) both lanes are fully
+        drained to disk before the thread exits (#277).
+        """
         self.buffer = []
         last_write_time = time.time()
 
-        # Keep looping until told to stop
-        while not self.stop_event.is_set():
+        # Keep looping until told to stop (hard) or drain (graceful)
+        while not self.stop_event.is_set() and not self.drain_event.is_set():
             try:
                 # Calculate how much time remains until the next scheduled write
                 # Don't wait longer than 1s so we check the stop flag regularly
                 # Don't wait more than 0.1s to avoid wasting CPU resources
                 # Retrive items from the queue one-by-one & append to local buffer
-                timeout = max(0.1, min(1.0, self.write_interval - (time.time() - last_write_time)))
+                # When bulk chunks are waiting, poll the foreground lane briefly instead so
+                # the bulk lane drains at full speed while foreground items still win ties
+                if self.bulk_queue.empty():
+                    timeout = max(
+                        0.1, min(1.0, self.write_interval - (time.time() - last_write_time))
+                    )
+                else:
+                    timeout = 0.01
                 metric = self.write_queue.get(timeout=timeout)
 
                 # Check for flush sentinel - signals immediate flush request
@@ -713,6 +829,11 @@ class Database:
                     last_write_time = current_time
 
             except Empty:
+                # Foreground lane idle — service one bulk chunk if available (commits the
+                # current buffer alongside it), else fall back to the interval flush check
+                if self._consume_bulk_item():
+                    last_write_time = time.time()
+                    continue
                 # If get() timesout (queue was empty) but interval elapsed, write buffered data anyway
                 current_time = time.time()
                 if self.buffer and (current_time - last_write_time) >= self.write_interval:
@@ -729,12 +850,64 @@ class Database:
                 # Sleep (interruptible for faster shutdown)
                 self.stop_event.wait(self.write_retry_delay)
 
+        # Graceful shutdown: drain BOTH lanes to disk before exiting (#277 — the old
+        # implementation dropped everything still queued, silently losing the most recent
+        # rows). A hard stop (stop_event without drain_event, or the drain cap escalation
+        # in stop()) skips this and only flushes the in-memory buffer below.
+        if self.drain_event.is_set() and not self.stop_event.is_set():
+            self._drain_queues()
+
         # Final flush on shutdown
         if self.buffer:
             flushed_count = len(self.buffer)
             self._flush_buffer()
             self.buffer.clear()
             logger.info(f"Flushed {flushed_count} remaining data on shutdown")
+
+    def _drain_queues(self) -> None:
+        """Empty both write lanes to disk (graceful-shutdown path; see stop())."""
+        drained_foreground = 0
+        drained_bulk_chunks = 0
+        while not self.stop_event.is_set():
+            progressed = False
+            try:
+                metric = self.write_queue.get_nowait()
+                progressed = True
+                if metric[0] is _FLUSH_SENTINEL:
+                    if self.buffer:
+                        self._flush_buffer()
+                        self.buffer.clear()
+                    metric[1].set()
+                elif metric[0] is _MARK_SUPERSEDED_SENTINEL:
+                    _, payload, mark_complete_event = metric
+                    try:
+                        if self.buffer:
+                            self._flush_buffer()
+                            self.buffer.clear()
+                        self._execute_mark_superseded(*payload)
+                    finally:
+                        mark_complete_event.set()
+                else:
+                    self.buffer.append(metric)
+                    drained_foreground += 1
+                    if len(self.buffer) >= self.write_buffer_max_size:
+                        self._flush_buffer()
+                        self.buffer.clear()
+            except Empty:
+                pass
+
+            if self._consume_bulk_item():
+                progressed = True
+                drained_bulk_chunks += 1
+
+            if not progressed:
+                break
+
+        if drained_foreground or drained_bulk_chunks:
+            logger.info(
+                f"Drained {drained_foreground} foreground row(s) and {drained_bulk_chunks} "
+                "bulk chunk(s) to the database at shutdown"
+            )
 
     # In commit 08fc37d, we switched from using sequential execute() to executemany()
     # The sequential approaches parses SQL statements N times & performs N round trips to the db
@@ -750,14 +923,18 @@ class Database:
     # in exchange for increased memory pressure is worth it
     # As well, since our db writes happen in a background thread & don't block the main process,
     # either approach should have minimal practical impact
-    def _flush_buffer(self):
+    def _flush_buffer(self, buffer: list | None = None):
         """
         Write buffered data to database in a single transaction using executemany().
 
         Groups records by table and uses executemany() for bulk inserts, which is more efficient
         than individual execute() calls because the SQL is parsed once and reused for all rows.
+        Defaults to the writer thread's buffer; an explicit `buffer` supports the inline
+        no-writer path of write_injection_stats_bulk.
         """
-        if not self.buffer:
+        if buffer is None:
+            buffer = self.buffer
+        if not buffer:
             return
 
         try:
@@ -773,7 +950,7 @@ class Database:
                 inference_cadences_records: list[tuple] = []
                 pipeline_stages_records: list[tuple] = []
 
-                for table, values in self.buffer:
+                for table, values in buffer:
                     if table == "system_resources":
                         system_resources_records.append(values)
                     elif table == "injection_stats":
@@ -973,6 +1150,98 @@ class Database:
                 ),
             )
         )
+
+    def write_injection_stats_bulk(self, stats: list[dict], tag: str | None = None) -> None:
+        """
+        Queue a batch of injection-stat rows on the bounded bulk lane (#277).
+
+        Each dict takes the same keys as write_injection_stat's parameters (stat_name and
+        value required; the rest optional). Semantics per row are identical — NaN/Inf
+        coercion with is_finite=0, slope_clamped bool -> int — but the batch shares ONE
+        system-metadata lookup and is enqueued in bulk_chunk_rows-sized chunks, so a
+        ~300K-row segment costs a handful of queue operations instead of ~300K (the per-row
+        Python overhead that capped the writer at ~590 rows/s). put() blocks when the bulk
+        lane is full — deliberate backpressure on the (background) enqueuer; never call this
+        from the training-critical path. With no writer thread running the rows are written
+        inline, mirroring mark_superseded's no-writer path.
+        """
+        metadata_json = get_system_metadata()
+        now = time.time()
+
+        rows: list[tuple] = []
+        round_counts: dict[int, int] = {}
+        non_finite = 0
+        for stat in stats:
+            value = stat["value"]
+            is_finite = 1 if np.isfinite(value) else 0
+            if not is_finite:
+                non_finite += 1
+            round_number = stat.get("round_number")
+            rows.append(
+                (
+                    stat.get("timestamp") or now,
+                    stat["stat_name"],
+                    float(value) if is_finite else 0.0,
+                    round_number,
+                    stat.get("chunk_number"),
+                    stat.get("sample_index"),
+                    stat.get("background_index"),
+                    stat.get("signal_class"),
+                    stat.get("signal_type"),
+                    stat.get("injection_stage"),
+                    is_finite,
+                    1 if stat.get("slope_clamped") else 0,
+                    tag,
+                    metadata_json,
+                )
+            )
+            # None rounds key as -1 so injection_backlog_rows() counts them conservatively
+            round_key = round_number if round_number is not None else -1
+            round_counts[round_key] = round_counts.get(round_key, 0) + 1
+
+        if non_finite:
+            logger.warning(
+                f"write_injection_stats_bulk: coerced {non_finite} non-finite value(s) to 0.0 "
+                "with is_finite=0"
+            )
+
+        if not rows:
+            return
+
+        # No writer thread -> no consumer for the bounded queue; write inline instead
+        if self.writer_thread is None or not self.writer_thread.is_alive():
+            self._flush_buffer([("injection_stats", values) for values in rows])
+            return
+
+        for start in range(0, len(rows), self.bulk_chunk_rows):
+            chunk = rows[start : start + self.bulk_chunk_rows]
+            chunk_counts: dict[int, int] = {}
+            for values in chunk:
+                round_key = values[3] if values[3] is not None else -1
+                chunk_counts[round_key] = chunk_counts.get(round_key, 0) + 1
+            with self._bulk_pending_lock:
+                for round_key, count in chunk_counts.items():
+                    self._bulk_pending_by_round[round_key] = (
+                        self._bulk_pending_by_round.get(round_key, 0) + count
+                    )
+            # Blocks when the lane is full (bounded queue) — the backpressure is the point
+            self.bulk_queue.put(("injection_stats", chunk, chunk_counts))
+
+    def injection_backlog_rows(self, max_round: int | None = None) -> int:
+        """
+        Bulk-lane injection rows enqueued but not yet committed for rounds <= max_round
+        (None = all rounds). Rows with round_number None are counted against every
+        max_round (conservative). Plot code uses this to verify a round's injection rows
+        are all committed before rendering its figures (#277).
+        """
+        with self._bulk_pending_lock:
+            if max_round is None:
+                return sum(self._bulk_pending_by_round.values())
+            return sum(
+                count
+                for round_key, count in self._bulk_pending_by_round.items()
+                if round_key == -1 or round_key <= max_round
+            )
 
     # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
     def write_training_stat(
@@ -1534,6 +1803,8 @@ class Database:
     def query_injection_stat_stability(
         self,
         stat_name: str | list[str] | None = None,
+        start_round_number: int | None = None,
+        end_round_number: int | None = None,
         injection_stage: str | list[str] | None = None,
         tag: str | list[str] | None = None,
         start_time: float | None = None,
@@ -1547,7 +1818,9 @@ class Database:
         can compute sanitization rate (non_finite_count / total_count) and clamping rate
         (clamped_count / total_count) without fetching every row. Preferred over
         query_injection_stat + Python-side aggregation: SQLite's native COUNT/SUM in C beats
-        materializing rows into Python dicts and iterating. String filters accept str or list[str].
+        materializing rows into Python dicts and iterating. String filters accept str or list[str];
+        start_round_number/end_round_number bound the rounds aggregated (#277 — callers scope to
+        the rounds being plotted so pre-generated later rounds don't show partial bars).
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1565,6 +1838,14 @@ class Database:
 
             if stat_name:
                 query = self._add_str_filter(query, params, "stat_name", stat_name)
+
+            if start_round_number is not None:
+                query += " AND round_number >= ?"
+                params.append(start_round_number)
+
+            if end_round_number is not None:
+                query += " AND round_number <= ?"
+                params.append(end_round_number)
 
             if injection_stage:
                 query = self._add_str_filter(query, params, "injection_stage", injection_stage)

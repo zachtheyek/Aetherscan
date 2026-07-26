@@ -736,3 +736,143 @@ class TestSchemaMigration:
         for table in self._MIGRATED_TABLES:
             assert "superseded" in self._column_names(db.db_path, table)
         assert self._user_version(db.db_path) == _SCHEMA_VERSION
+
+
+def _bulk_rows(n: int, round_number: int | None = 1, value: float = 1.0) -> list[dict]:
+    """Injection-stat row dicts for write_injection_stats_bulk (#277 tests)."""
+    return [
+        {
+            "stat_name": "global_mean",
+            "value": value,
+            "round_number": round_number,
+            "chunk_number": 0,
+            "sample_index": i,
+            "background_index": i,
+            "signal_class": "true",
+            "signal_type": "true_only_eti",
+            "injection_stage": "A",
+        }
+        for i in range(n)
+    ]
+
+
+def _wait_backlog_empty(database, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if database.injection_backlog_rows() == 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestBulkLane:
+    """#277: high-volume injection stats ride a bounded bulk lane separate from the
+    foreground queue, with per-round pending accounting."""
+
+    def test_bulk_rows_round_trip(self, db):
+        db.write_injection_stats_bulk(_bulk_rows(25), tag="bulk_v1")
+        assert _wait_backlog_empty(db)
+        rows = db.query_injection_stat(tag="bulk_v1", columns=["sample_index", "value"])
+        assert len(rows) == 25
+
+    def test_bulk_inline_when_writer_not_running(self):
+        database = Database()
+        # Writer never started: rows are written inline with zero backlog
+        database.write_injection_stats_bulk(_bulk_rows(7), tag="bulk_inline")
+        assert database.injection_backlog_rows() == 0
+        assert len(database.query_injection_stat(tag="bulk_inline")) == 7
+
+    def test_bulk_sanitizes_non_finite(self, db):
+        rows = _bulk_rows(2)
+        rows[0]["value"] = float("nan")
+        db.write_injection_stats_bulk(rows, tag="bulk_nan")
+        assert _wait_backlog_empty(db)
+        assert len(db.query_injection_stat(tag="bulk_nan", only_finite=True)) == 1
+        all_rows = db.query_injection_stat(
+            tag="bulk_nan", only_finite=False, columns=["value", "is_finite"]
+        )
+        assert len(all_rows) == 2
+        coerced = [r for r in all_rows if r["is_finite"] == 0]
+        assert len(coerced) == 1 and coerced[0]["value"] == 0.0
+
+    def test_bulk_chunking_and_backlog_accounting(self):
+        database = Database()
+        database.bulk_chunk_rows = 10
+
+        class _AliveStub:
+            def is_alive(self):
+                return True
+
+        # Stub writer: chunks are enqueued but never consumed, so the chunk/backlog math
+        # is directly observable
+        database.writer_thread = _AliveStub()
+        try:
+            database.write_injection_stats_bulk(_bulk_rows(25, round_number=2), tag="bulk_chunks")
+            assert database.bulk_queue.qsize() == 3  # 10 + 10 + 5
+            assert database.injection_backlog_rows() == 25
+            assert database.injection_backlog_rows(max_round=1) == 0
+            assert database.injection_backlog_rows(max_round=2) == 25
+            # None round_number counts against every max_round (conservative)
+            database.write_injection_stats_bulk(_bulk_rows(3, round_number=None), tag="bulk_chunks")
+            assert database.injection_backlog_rows(max_round=1) == 3
+        finally:
+            database.writer_thread = None
+
+    def test_flush_does_not_wait_for_bulk_lane(self, db, monkeypatch):
+        # Slow every commit so the bulk backlog outlives the foreground flush
+        real_flush = db._flush_buffer
+
+        def slow_flush(buffer=None):
+            time.sleep(0.3)
+            real_flush(buffer)
+
+        monkeypatch.setattr(db, "_flush_buffer", slow_flush)
+        db.bulk_chunk_rows = 50
+        for _ in range(6):
+            db.write_injection_stats_bulk(_bulk_rows(50), tag="bulk_load")
+        db.write_training_stat(model_name="m", stat_name="s", value=1.0, tag="bulk_load_fg")
+
+        assert db.flush(timeout=10.0) is True
+        # The foreground flush completed while bulk chunks were still queued — the whole
+        # point of the two-lane design (#277 problem 2)
+        assert db.injection_backlog_rows() > 0
+        assert _wait_backlog_empty(db)  # let the fixture teardown finish cleanly
+
+    def test_stability_query_round_bounds(self, db):
+        for round_number in (1, 2, 3):
+            db.write_injection_stats_bulk(_bulk_rows(4, round_number=round_number), tag="rb")
+        assert _wait_backlog_empty(db)
+        rows = db.query_injection_stat_stability(
+            stat_name="global_mean", start_round_number=1, end_round_number=2, tag="rb"
+        )
+        assert [r["round_number"] for r in rows] == [1, 2]
+        assert all(r["total_count"] == 4 for r in rows)
+
+
+class TestShutdownDrain:
+    """#277 problem 4: stop() must drain both lanes instead of silently dropping the queue."""
+
+    def test_stop_drains_foreground_backlog(self, db, monkeypatch):
+        # Slow, small-batch writer: most rows are still queue-resident when stop() is called
+        # (the old stop() dropped exactly those rows)
+        real_flush = db._flush_buffer
+
+        def slow_flush(buffer=None):
+            time.sleep(0.01)
+            real_flush(buffer)
+
+        monkeypatch.setattr(db, "_flush_buffer", slow_flush)
+        db.write_buffer_max_size = 100
+        n = 2000
+        for i in range(n):
+            db.write_training_stat(model_name="m", stat_name="s", value=float(i), tag="drain_fg")
+        db.stop()
+        assert len(db.query_training_stat(tag="drain_fg", columns=["value"])) == n
+
+    def test_stop_drains_bulk_backlog(self, db):
+        db.bulk_chunk_rows = 100
+        for _ in range(5):
+            db.write_injection_stats_bulk(_bulk_rows(100), tag="drain_bulk")
+        db.stop()
+        assert db.injection_backlog_rows() == 0
+        assert len(db.query_injection_stat(tag="drain_bulk")) == 500

@@ -357,6 +357,42 @@ def check_val_auc_floor(
     return val_auc
 
 
+def build_epoch_history(
+    all_stats: list[dict], epochs_per_round: int
+) -> tuple[range, dict[str, list[float]]]:
+    """
+    Arrange training-stat rows onto the REAL global-epoch axis for plotting (#277).
+
+    Each row's x position is (round_number - 1) * epochs_per_round + epoch_number, so a value
+    lands where the epoch actually happened; positions with no committed row hold NaN, which
+    matplotlib renders as a visible gap in the line. The previous positional 1..N axis
+    discarded epoch_number after sorting, so any missing rows silently re-registered later
+    epochs onto earlier x positions — a partially-drained write queue could mis-plot rather
+    than merely stop short. Duplicate (round, epoch) rows keep the last value seen; rows
+    without round/epoch numbers are skipped.
+
+    Returns (epochs, history): epochs = range(1, max_position + 1), and history maps
+    stat_name to a value list aligned with epochs.
+    """
+    per_stat: dict[str, dict[int, float]] = {}
+    max_position = 0
+    for stat in all_stats:
+        round_number = stat.get("round_number")
+        epoch_number = stat.get("epoch_number")
+        if round_number is None or epoch_number is None:
+            continue
+        position = (round_number - 1) * epochs_per_round + epoch_number
+        per_stat.setdefault(stat["stat_name"], {})[position] = stat["value"]
+        max_position = max(max_position, position)
+
+    epochs = range(1, max_position + 1)
+    history = {
+        stat_name: [values.get(position, float("nan")) for position in epochs]
+        for stat_name, values in per_stat.items()
+    }
+    return epochs, history
+
+
 def build_traversal_latents(
     z_base: np.ndarray, sigmas: np.ndarray, num_steps: int, max_sigma: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1679,19 +1715,40 @@ class TrainingPipeline:
 
             # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
             with stage_timer("plots"):
-                # Plot loss curves
-                self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
-
-                # Plot clipping rate
-                self.plot_beta_vae_training_stability(
-                    tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
-                )
-
-                # Plot injection stats
-                self.plot_injection_stats(
-                    tag=f"round_{round_idx + 1:02d}",
-                    dir="checkpoints",
-                )
+                # Per-round plots are best-effort (#277): a failed or skipped plot must never
+                # fail the round (a retry would regenerate the round data from scratch). The
+                # canonical full-run figures render again in the vae_plots stage, where
+                # _run_plot_group records failures as non-critical.
+                per_round_plots = [
+                    (
+                        "plot_beta_vae_loss_curves",
+                        lambda: self.plot_beta_vae_loss_curves(
+                            tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+                        ),
+                    ),
+                    (
+                        "plot_beta_vae_training_stability",
+                        lambda: self.plot_beta_vae_training_stability(
+                            tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+                        ),
+                    ),
+                    (
+                        "plot_injection_stats",
+                        lambda: self.plot_injection_stats(
+                            tag=f"round_{round_idx + 1:02d}",
+                            dir="checkpoints",
+                            round_number=round_idx + 1,
+                        ),
+                    ),
+                ]
+                for plot_name, plot_fn in per_round_plots:
+                    try:
+                        plot_fn()
+                    except Exception as e:
+                        logger.error(
+                            f"Skipped/failed {plot_name} for round {round_idx + 1} "
+                            f"(non-critical, round continues): {e}"
+                        )
 
                 # Optional per-round latent traversal (config-gated; the canonical set
                 # renders once at end of training in the vae_plots stage). Failures are
@@ -2380,9 +2437,11 @@ class TrainingPipeline:
             # resume_round (run_state.py) is max(completed_rounds) + 1, and completed_rounds only
             # ever holds values <= num_training_rounds, so _start_round <= num_training_rounds + 1
             # always — and rf_train only (re)starts once vae_rounds is fully done, i.e. exactly
-            # when _start_round == num_training_rounds + 1. round_number has no other consumer
-            # (plot_injection_stats/query_injection_stat don't filter or group by it), so this is
-            # safe to change without touching mark_superseded or the DB schema.
+            # when _start_round == num_training_rounds + 1. Since #277, plot_injection_stats
+            # scopes its queries to rounds 1..num_training_rounds, so this sentinel round is
+            # deliberately OUTSIDE every plotted range — RF-phase rows never appear in the
+            # injection figures. No other consumer filters or groups on round_number, so this
+            # is safe without touching mark_superseded or the DB schema.
             with stage_timer("data_generation", metadata={"source": "in-process"}):
                 self.data_generator.generate_round(
                     rf_paths,
@@ -2864,11 +2923,15 @@ class TrainingPipeline:
         # Flush database to ensure all training stats are written before plotting
         logger.info("Flushing database before plotting...")
         if not self.db.flush():
-            logger.warning(
-                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            # #277: never render a partial result set as if it were complete. The rows are
+            # still queued (nothing is lost) and the figure is regenerable once the writer
+            # catches up; callers treat plot failures as non-critical, so raising skips the
+            # figure without failing the run.
+            raise RuntimeError(
+                "Database flush timed out with training stats still queued - skipping the "
+                "beta-VAE loss curves plot rather than rendering an incomplete result set"
             )
-        else:
-            logger.info("Database flushed")
+        logger.info("Database flushed")
 
         # NOTE: how to handle retries under current implementation?
         # Query training stats from database
@@ -2884,29 +2947,11 @@ class TrainingPipeline:
             logger.warning("No training stats data to plot")
             return
 
-        # TODO: potential memory optimization here with array pre-allocation? is there a way to just use the all_stats dict directly? is the potential improvement worth the effort?
-        # Group query results by stat_name
-        raw_history = {}
-        for stat in all_stats:
-            key = stat["stat_name"]
-            if key not in raw_history:
-                raw_history[key] = []
-            # Store (round, epoch, value) tuple for later sorting
-            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+        # Arrange rows on the real global-epoch axis — missing epochs render as gaps (#277)
+        epochs, history = build_epoch_history(all_stats, self.config.training.epochs_per_round)
 
         del all_stats
         gc.collect()
-
-        # Sort by (round, epoch) and extract just the values
-        history = {}
-        for key, values in raw_history.items():
-            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))  # Sort by round, epoch
-            history[key] = [v[2] for v in sorted_values]  # Extract just the values
-
-        del raw_history
-        gc.collect()
-
-        epochs = range(1, len(history.get("total_loss", [])) + 1)
 
         # Add SNR range background shading to all axes
         snr_by_round = self._get_snr_by_round(current_time)
@@ -3065,11 +3110,12 @@ class TrainingPipeline:
         # Flush database to ensure all training stats are written before plotting
         logger.info("Flushing database before plotting...")
         if not self.db.flush():
-            logger.warning(
-                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            # #277: same skip-don't-render-partial contract as plot_beta_vae_loss_curves
+            raise RuntimeError(
+                "Database flush timed out with training stats still queued - skipping the "
+                "training stability plot rather than rendering an incomplete result set"
             )
-        else:
-            logger.info("Database flushed")
+        logger.info("Database flushed")
 
         # Query training stats from database
         all_stats = self.db.query_training_stat(
@@ -3084,27 +3130,11 @@ class TrainingPipeline:
             logger.warning("No training stats data to plot")
             return
 
-        # Group query results by stat_name
-        raw_history = {}
-        for stat in all_stats:
-            key = stat["stat_name"]
-            if key not in raw_history:
-                raw_history[key] = []
-            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+        # Arrange rows on the real global-epoch axis — missing epochs render as gaps (#277)
+        epochs, history = build_epoch_history(all_stats, self.config.training.epochs_per_round)
 
         del all_stats
         gc.collect()
-
-        # Sort by (round, epoch) and extract just the values
-        history = {}
-        for key, values in raw_history.items():
-            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))
-            history[key] = [v[2] for v in sorted_values]
-
-        del raw_history
-        gc.collect()
-
-        epochs = range(1, len(history.get("clipping_rate", [])) + 1)
 
         if not epochs:
             logger.warning("No clipping rate data to plot")
@@ -3389,14 +3419,20 @@ class TrainingPipeline:
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
     # TODO: move injection plots to data_generation.py & call at end of generate_round_to_memmap() (instead of at the end of train_round() & run_training_pipeline())
     # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
-    def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
+    def plot_injection_stats(
+        self, tag: str | None = None, dir: str | None = None, round_number: int | None = None
+    ):
         """
         Generate 8 figures for bias/leakage analysis of the injection pipeline: 1 injected signal
         characteristics, 1 injection stability, 4 global intensity distributions (one per
         signal_type), 1 A->B global intensity biases, and 1 final global intensity biases.
 
         tag defaults to config.checkpoint.save_tag and is used in filenames; dir is an optional
-        subdirectory under plots/ (e.g. "checkpoints" for per-round outputs).
+        subdirectory under plots/ (e.g. "checkpoints" for per-round outputs). round_number
+        scopes every query to that single round (the per-round call); None scopes to the full
+        beta-VAE round range 1..num_training_rounds (the end-of-run call) — either way the
+        pre-generated NEXT round's rows and the RF-phase sentinel round can no longer bleed
+        into the figures (#277).
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -3414,14 +3450,35 @@ class TrainingPipeline:
                 "No database instance detected - cannot generate injection stats plot"
             )
 
-        # Flush database to ensure all injection stats are written before plotting
+        # Round-scope every query below (#277): the background producer pre-generates round
+        # N+1's rows during round N, so an unscoped query silently blends them in
+        if round_number is not None:
+            start_round_number, end_round_number = round_number, round_number
+        else:
+            start_round_number = 1
+            end_round_number = self.config.training.num_training_rounds
+
+        # Injection rows ride the DB's bulk lane, which flush() deliberately does not cover.
+        # Gate on the bulk backlog instead: if any row for the rounds being plotted is still
+        # queued, the figures would be incomplete — skip (non-critical) rather than render a
+        # partial result set (#277). Rows for LATER rounds (the producer's pre-generation
+        # flood) don't block, since the round scoping excludes them from the queries anyway.
+        backlog = self.db.injection_backlog_rows(max_round=end_round_number)
+        if backlog:
+            raise RuntimeError(
+                f"{backlog} injection-stat row(s) for rounds <= {end_round_number} are still "
+                "queued in the DB bulk lane - skipping injection plots rather than rendering "
+                "an incomplete result set"
+            )
+
+        # Flush the foreground lane too (covers direct write_injection_stat callers)
         logger.info("Flushing database before plotting...")
         if not self.db.flush():
-            logger.warning(
-                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            raise RuntimeError(
+                "Database flush timed out with writes still queued - skipping injection "
+                "plots rather than rendering an incomplete result set"
             )
-        else:
-            logger.info("Database flushed")
+        logger.info("Database flushed")
 
         # Figure 1: Injected signal characteristics
         signal_stats = [
@@ -3440,6 +3497,8 @@ class TrainingPipeline:
             results = self.db.query_injection_stat(
                 stat_name=f"eti_{stat_name}",
                 signal_type=["true_only_eti", "true_eti_rfi"],
+                start_round_number=start_round_number,
+                end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -3452,6 +3511,8 @@ class TrainingPipeline:
             results = self.db.query_injection_stat(
                 stat_name=f"rfi_{stat_name}",
                 signal_type=["false_with_rfi", "true_eti_rfi"],
+                start_round_number=start_round_number,
+                end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -3465,6 +3526,8 @@ class TrainingPipeline:
             stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
             injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
             signal_type=["true_only_eti", "true_eti_rfi"],
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -3479,6 +3542,8 @@ class TrainingPipeline:
             stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
             injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
             signal_type=["false_with_rfi", "true_eti_rfi"],
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -3519,6 +3584,8 @@ class TrainingPipeline:
             agg_results = self.db.query_injection_stat_stability(
                 stat_name=stat_name,
                 injection_stage="A",  # NOTE: why are we only computing for A? only works if we assume sanitization happens evenly for all stages per cadence (is this always true?)
+                start_round_number=start_round_number,
+                end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -3538,6 +3605,8 @@ class TrainingPipeline:
         clamping_results = self.db.query_injection_stat_stability(
             stat_name="global_mean",  # Slope is the same for all stats. Use "global_mean" to reduce rows queried
             injection_stage="A",  # Slope is the same for all stages. Use "A" to reduce rows queried
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -3583,6 +3652,8 @@ class TrainingPipeline:
                         stat_name=stat_name,
                         injection_stage=stage,
                         signal_type=signal_type,
+                        start_round_number=start_round_number,
+                        end_round_number=end_round_number,
                         tag=self.config.checkpoint.save_tag,
                         start_time=self.start_time,
                         end_time=current_time,
@@ -3612,6 +3683,8 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="A",
                     signal_type=signal_type,
+                    start_round_number=start_round_number,
+                    end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
@@ -3625,6 +3698,8 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="B",
                     signal_type=signal_type,
+                    start_round_number=start_round_number,
+                    end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
@@ -3650,6 +3725,8 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="C",
                     signal_type=signal_type,
+                    start_round_number=start_round_number,
+                    end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
