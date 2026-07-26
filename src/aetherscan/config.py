@@ -132,6 +132,43 @@ class RandomForestConfig:
     # reproducibility.seed via STREAM_RF (#279); the deprecated --rf-seed flag sets this.
     seed: int | None = None
 
+    # Latent-representation variant the RF consumes (#282). Training sweeps every variant on
+    # one shared dataset/split and records the empirical winner here before final_save, so
+    # config_{tag}.json tells inference exactly how to rebuild features (never hardcoded).
+    # See aetherscan.latent_variants.VARIANTS for the catalogue; "z" is the legacy baseline.
+    latent_variant: str = "z"
+    # ACTIVE latent dims measured at training (Burda et al.; None until a sweep ran) —
+    # persisted so inference rebuilds the z_mean_logvar_active layout identically
+    active_dims: list[int] | None = None
+    # Extra sampled-z draws per cadence for the z_aug variant's training rows
+    z_aug_draws: int = 4
+    # Variance floor for a latent dim to count as ACTIVE (Burda et al. AU with z_mean
+    # variance); gates the active-dims variant + the posterior-collapse guard (#282)
+    active_units_threshold: float = 0.01
+    # Variant selection (#282): primary metric is recall at this false-positive rate on the
+    # selection split; the winner must beat every simpler (fewer-feature) variant by more
+    # than a bootstrap CI of the recall difference, else the simpler variant wins the tie
+    selection_max_fpr: float = 0.01
+    selection_bootstrap_rounds: int = 500
+    # Probability calibration (#282): auto-fit a calibrator on the held-out calibration
+    # split when the winner's measured ECE exceeds max_ece; isotonic when the calibration
+    # split has at least calibration_min_isotonic rows, else sigmoid/Platt (isotonic
+    # overfits small sets); kept only if it improves ECE (and does not worsen Brier) on the
+    # held-out test split. calibration_active/method are RECORDED BY TRAINING for the saved
+    # config — inference reads them to decide whether to load rf_calibrator_{tag}.joblib.
+    max_ece: float = 0.05
+    calibration_min_isotonic: int = 1000
+    calibration_active: bool = False
+    calibration_method: str | None = None
+    # Fractions of the val split carved out for selection / calibration (remainder = the
+    # held-out test split that release metrics are reported on — best-of-N on the selection
+    # split alone would be optimistically biased)
+    val_selection_fraction: float = 0.5
+    val_calibration_fraction: float = 0.25
+    # Screening-threshold validation (#282): warn if the two-pass cascade loses more than
+    # this much recall vs MC-scoring everything at the science threshold on the test split
+    screen_recall_tolerance: float = 0.0
+
 
 # NOTE: verify that our current GPU config gracefully handles cases where the node has a single GPU (vs multiple)
 # TODO: add a way to specify (either number or name) the specific GPUs on a system we wish to use (currently defaults to all available). extend to cli.py too
@@ -214,6 +251,14 @@ class TrainingConfig:
 
     num_training_rounds: int = 20
     epochs_per_round: int = 100
+
+    # Posterior-collapse guard (#282): a latent dim counts ACTIVE while its batch-mean KL
+    # exceeds kl_epsilon; a round alarms (advisory WARNING, never fatal) when the active
+    # fraction drops below min_active_units_fraction or any dim sits under epsilon for
+    # `patience` consecutive epochs
+    posterior_collapse_kl_epsilon: float = 0.01
+    min_active_units_fraction: float = 0.5
+    posterior_collapse_patience: int = 5
 
     num_samples_beta_vae: int = 499200
     num_samples_rf: int = 99840  # NOTE: come back to this later
@@ -371,6 +416,18 @@ class InferenceConfig:
     config_path: str = None
     per_replica_batch_size: int = 2048  # NOTE: come back to this later
     classification_threshold: float = 0.99
+    # Two-pass cascade (#282). Pass 1 scores EVERY snippet deterministically (z_mean-based
+    # features) against this permissive screening threshold, tuned for recall — its only job
+    # is "definitely not a candidate". Pass 2 re-scores the survivors with mc_draws seeded
+    # latent samples and carries the actual science threshold (classification_threshold
+    # above, applied to the MC mean). The two are a cascade, not two ANDed criteria.
+    screening_threshold: float = 0.5
+    mc_draws: int = 32
+    # Reference cloud (#282): pass 2 also MC-scores a seeded uniform reservoir subsample of
+    # the pass-1 REJECTS, persisted per run, so the candidate uncertainty plot compares each
+    # candidate against the survey population rather than against other candidates. 0
+    # disables the cloud (and the plot's background).
+    reference_cloud_size: int = 10000
 
     # NOTE: come back to this later (is this the optimal grouping?)
     # Energy detection preprocessing
@@ -683,6 +740,19 @@ class Config:
                 # The override field (None = derived from reproducibility.seed; see
                 # reproducibility.derived_rf_seed for the value actually used)
                 "seed": self.rf.seed,
+                "latent_variant": self.rf.latent_variant,
+                "active_dims": self.rf.active_dims,
+                "z_aug_draws": self.rf.z_aug_draws,
+                "active_units_threshold": self.rf.active_units_threshold,
+                "selection_max_fpr": self.rf.selection_max_fpr,
+                "selection_bootstrap_rounds": self.rf.selection_bootstrap_rounds,
+                "max_ece": self.rf.max_ece,
+                "calibration_min_isotonic": self.rf.calibration_min_isotonic,
+                "calibration_active": self.rf.calibration_active,
+                "calibration_method": self.rf.calibration_method,
+                "val_selection_fraction": self.rf.val_selection_fraction,
+                "val_calibration_fraction": self.rf.val_calibration_fraction,
+                "screen_recall_tolerance": self.rf.screen_recall_tolerance,
             },
             "gpu": {
                 "num_replicas": self.gpu.num_replicas,
@@ -708,6 +778,9 @@ class Config:
             "training": {
                 "num_training_rounds": self.training.num_training_rounds,
                 "epochs_per_round": self.training.epochs_per_round,
+                "posterior_collapse_kl_epsilon": self.training.posterior_collapse_kl_epsilon,
+                "min_active_units_fraction": self.training.min_active_units_fraction,
+                "posterior_collapse_patience": self.training.posterior_collapse_patience,
                 "num_samples_beta_vae": self.training.num_samples_beta_vae,
                 "num_samples_rf": self.training.num_samples_rf,
                 "train_val_split": self.training.train_val_split,
@@ -758,6 +831,9 @@ class Config:
                 "config_path": self.inference.config_path,
                 "per_replica_batch_size": self.inference.per_replica_batch_size,
                 "classification_threshold": self.inference.classification_threshold,
+                "screening_threshold": self.inference.screening_threshold,
+                "mc_draws": self.inference.mc_draws,
+                "reference_cloud_size": self.inference.reference_cloud_size,
                 "cadence_group_by_cols": self.inference.cadence_group_by_cols,
                 "cadence_h5_path_col": self.inference.cadence_h5_path_col,
                 "cadence_expected_obs": self.inference.cadence_expected_obs,

@@ -16,6 +16,7 @@ import aetherscan
 from aetherscan import hf_hub
 from aetherscan.config import get_config
 from aetherscan.hf_hub import (
+    HF_CALIBRATOR_FILENAME,
     HF_CARD_FILENAME,
     HF_CONFIG_FILENAME,
     HF_DECODER_FILENAME,
@@ -346,6 +347,8 @@ class TestResolveInferenceArtifacts:
             (repo_id, HF_ENCODER_FILENAME, "test_v17"),
             (repo_id, HF_RF_FILENAME, "test_v17"),
             (repo_id, HF_CONFIG_FILENAME, "test_v17"),
+            # Optional #282 calibrator: attempted last, tolerated when absent
+            (repo_id, HF_CALIBRATOR_FILENAME, "test_v17"),
         ]
         assert args.encoder_path == f"/cache/{HF_ENCODER_FILENAME}"
         assert args.rf_path == f"/cache/{HF_RF_FILENAME}"

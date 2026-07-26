@@ -732,6 +732,20 @@ def _run_streaming_csv_inference(
                 f"Inference stage failed for {len(failed_keys)} cadence(s): {failed_keys}"
             )
 
+        # Reference cloud (#282): MC-score the seeded reject reservoir once per successful
+        # pass. On a resumed run only the final attempt's cadences feed the reservoir
+        # (manifest-skipped cadences never re-offer their rejects) — the npz records the
+        # subsample size and rejects seen for provenance. Best-effort: the cloud degrades
+        # the uncertainty plot, never the science.
+        try:
+            with stage_timer("inference.reference_cloud"):
+                pipeline.finalize_reference_cloud()
+        except Exception as e:
+            logger.error(
+                f"Reference-cloud finalization failed ({e}); the candidate uncertainty "
+                f"plot will lack the survey background; run continues"
+            )
+
     if totals["n_cadences"] == 0:
         # Preserve the historical contract: preprocessing producing no stamp .npy at all is
         # an error (bad paths/catalog), not a legitimate empty result

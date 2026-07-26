@@ -32,6 +32,7 @@ import tensorflow as tf
 import umap
 from sklearn.calibration import calibration_curve
 from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     auc,
     average_precision_score,
@@ -41,6 +42,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from sklearn.utils import shuffle as sklearn_shuffle
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -50,6 +52,18 @@ from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
 from aetherscan.hf_hub import upload_run_to_hf
 from aetherscan.latent_gif import FrameCategory, render_latent_gif_frames
+from aetherscan.latent_variants import (
+    VARIANT_ORDER,
+    active_latent_dims,
+    apply_probability_calibrator,
+    build_variant_features,
+    build_z_aug_training_set,
+    expected_calibration_error,
+    fit_probability_calibrator,
+    recall_at_fpr,
+    sample_z_flat,
+    select_winner,
+)
 from aetherscan.logger import get_logger
 from aetherscan.models import (
     RandomForestModel,
@@ -82,6 +96,7 @@ from aetherscan.seeding import (
     STREAM_DATASET,
     STREAM_KMEANS,
     STREAM_PLOT,
+    STREAM_RF,
     STREAM_RF_PLOTS,
     STREAM_SHAP_SAMPLES,
     STREAM_UMAP,
@@ -403,6 +418,102 @@ def build_epoch_history(
         for stat_name, values in per_stat.items()
     }
     return epochs, history
+
+
+def check_posterior_collapse(
+    kl_per_dim: np.ndarray,
+    low_kl_streaks: np.ndarray,
+    kl_epsilon: float,
+    min_active_fraction: float,
+    patience: int,
+    tag: str,
+) -> bool:
+    """
+    Advisory posterior-collapse guard (#282), same idiom as check_val_auc_floor: never fails
+    the run, WARNs loudly (reaches Slack) when latent capacity is going dark.
+
+    A dim counts ACTIVE when its batch-mean KL exceeds kl_epsilon; the round alarms when the
+    active fraction drops below min_active_fraction OR any dim's KL has sat under epsilon
+    for `patience` consecutive epochs. With beta > 1 some pruning is expected and even
+    desirable — 6-8 active dims of 8 is healthy, 1-2 is pathological — so the caller-facing
+    remedy ladder (KL warm-up -> free bits -> lower beta -> shrink latent_dim) lives in
+    docs/TRAINING_PIPELINE.md, not in code. Returns True when collapse was flagged.
+    """
+    kl_per_dim = np.asarray(kl_per_dim, dtype=np.float64).ravel()
+    low_kl_streaks = np.asarray(low_kl_streaks).ravel()
+    latent_dim = len(kl_per_dim)
+    active = kl_per_dim > kl_epsilon
+    n_active = int(active.sum())
+    stuck_dims = [int(d) for d in np.nonzero(low_kl_streaks >= patience)[0]]
+
+    collapsed = (n_active < min_active_fraction * latent_dim) or bool(stuck_dims)
+    if collapsed:
+        logger.warning(
+            f"POSTERIOR COLLAPSE WARNING ({tag}): {n_active}/{latent_dim} latent dims active "
+            f"(KL > {kl_epsilon}); dims stuck below epsilon for >= {patience} consecutive "
+            f"epochs: {stuck_dims or 'none'}. Per-dim KL: "
+            f"{np.array2string(kl_per_dim, precision=4)}. See the posterior-collapse "
+            "playbook in docs/TRAINING_PIPELINE.md (KL warm-up, free bits, lower beta, or "
+            "shrink latent_dim)."
+        )
+    else:
+        logger.info(
+            f"Posterior-collapse check passed ({tag}): {n_active}/{latent_dim} latent dims "
+            f"active (KL > {kl_epsilon})"
+        )
+    return collapsed
+
+
+def check_screening_threshold(
+    test_labels: np.ndarray,
+    pass1_probas: np.ndarray,
+    mc_mean_probas: np.ndarray,
+    screening_threshold: float,
+    science_threshold: float,
+    recall_tolerance: float,
+    tag: str,
+) -> dict[str, float]:
+    """
+    Validate the two-pass cascade's screening threshold on labeled held-out data (#282):
+    anything pass 1 rejects never gets a second look, so the cascade must lose ~zero recall
+    versus MC-scoring EVERYTHING at the science threshold. Advisory (WARNs loudly, never
+    fails the run), same idiom as check_val_auc_floor. Returns the measured numbers,
+    including the largest screening threshold that would have lost nothing on this split.
+    """
+    test_labels = np.asarray(test_labels).astype(bool)
+    pass1_probas = np.asarray(pass1_probas)
+    mc_mean_probas = np.asarray(mc_mean_probas)
+
+    positives = test_labels
+    mc_pass = mc_mean_probas > science_threshold
+    n_positive_mc = int((mc_pass & positives).sum())
+    recall_full = float(mc_pass[positives].mean()) if positives.any() else float("nan")
+    cascade_pass = (pass1_probas > screening_threshold) & mc_pass
+    recall_cascade = float(cascade_pass[positives].mean()) if positives.any() else float("nan")
+    recall_loss = recall_full - recall_cascade
+    max_safe = float(pass1_probas[positives & mc_pass].min()) if n_positive_mc else float("nan")
+
+    stats = {
+        "screen_recall_mc_everything": recall_full,
+        "screen_recall_cascade": recall_cascade,
+        "screen_recall_loss": recall_loss,
+        "screen_max_safe_threshold": max_safe,
+    }
+    if recall_loss > recall_tolerance:
+        logger.warning(
+            f"SCREENING THRESHOLD UNSAFE ({tag}): the two-pass cascade at "
+            f"screening_threshold={screening_threshold} loses {recall_loss:.4f} recall vs "
+            f"MC-on-everything at the science threshold ({recall_full:.4f} -> "
+            f"{recall_cascade:.4f}); the largest zero-loss screen on this split is "
+            f"{max_safe:.4f}. Lower inference.screening_threshold before a science run."
+        )
+    else:
+        logger.info(
+            f"Screening threshold validated ({tag}): cascade recall {recall_cascade:.4f} vs "
+            f"MC-on-everything {recall_full:.4f} (loss {recall_loss:.4f} <= tolerance "
+            f"{recall_tolerance}); largest zero-loss screen on this split: {max_safe:.4f}"
+        )
+    return stats
 
 
 def build_traversal_latents(
@@ -1443,6 +1554,9 @@ class TrainingPipeline:
         # (root, round). deterministic_ops=False: already applied once in __init__
         seed_tensorflow(self.config.reproducibility.seed, False, 0, round_number)
 
+        # Fresh low-KL streak counters for this round's posterior-collapse guard (#282)
+        self._kl_low_streaks = np.zeros(self.config.beta_vae.latent_dim, dtype=np.int64)
+
         # Obtain this round's disk-backed data: reuse a validated on-disk dataset if one
         # exists, otherwise wait on the background producer (which was asked to generate it
         # while the previous round trained) or generate in-process (overlap disabled)
@@ -1588,6 +1702,26 @@ class TrainingPipeline:
                             timestamp=current_time,
                         )
 
+                    # Per-dimension KL (#282 posterior-collapse diagnostics): latent_dim
+                    # rows per epoch — negligible volume, powers the KL heatmap and the
+                    # active-units-vs-epoch curve
+                    kl_per_dim = np.asarray(epoch_losses["kl_per_dim"]).ravel()
+                    for dim_idx, dim_kl in enumerate(kl_per_dim):
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=f"kl_dim_{dim_idx:02d}",
+                            value=float(dim_kl),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+                    # Consecutive low-KL epoch streaks feed check_posterior_collapse at
+                    # round end (a dim parked under epsilon for `patience` epochs is
+                    # collapsing even if the batch-mean wobbles above zero)
+                    low = kl_per_dim < self.config.training.posterior_collapse_kl_epsilon
+                    self._kl_low_streaks = np.where(low, self._kl_low_streaks + 1, 0)
+
                     # Validation losses
                     for stat_name, key in [
                         ("val_total_loss", "total"),
@@ -1726,6 +1860,17 @@ class TrainingPipeline:
                     # Adaptive learning rate
                     self._update_learning_rate(val_losses)
 
+            # Posterior-collapse guard (#282): WARN loudly (reaches Slack) when latent dims
+            # are going dark — same non-fatal advisory idiom as check_val_auc_floor
+            check_posterior_collapse(
+                kl_per_dim=np.asarray(epoch_losses["kl_per_dim"]).ravel(),
+                low_kl_streaks=self._kl_low_streaks,
+                kl_epsilon=self.config.training.posterior_collapse_kl_epsilon,
+                min_active_fraction=self.config.training.min_active_units_fraction,
+                patience=self.config.training.posterior_collapse_patience,
+                tag=f"round_{round_idx + 1:02d}",
+            )
+
             # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
             with stage_timer("plots"):
                 # Per-round plots are best-effort (#277): a failed or skipped plot must never
@@ -1851,7 +1996,15 @@ class TrainingPipeline:
         if not start_time:
             start_time = time.time()
 
-        epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
+        epoch_losses = {
+            "total": 0.0,
+            "reconstruction": 0.0,
+            "kl": 0.0,
+            "true": 0.0,
+            "false": 0.0,
+            # Vector-valued (latent_dim,) — accumulates like the scalars (#282 diagnostics)
+            "kl_per_dim": np.zeros(self.config.beta_vae.latent_dim, dtype=np.float64),
+        }
         epoch_gradient_norms = []
         iterator = iter(dataset)
 
@@ -1863,6 +2016,7 @@ class TrainingPipeline:
                     "kl": 0.0,
                     "true": 0.0,
                     "false": 0.0,
+                    "kl_per_dim": np.zeros(self.config.beta_vae.latent_dim, dtype=np.float64),
                 }
 
                 # Initialize accumulated gradients
@@ -2074,6 +2228,10 @@ class TrainingPipeline:
             ),
             "false": self.strategy.reduce(
                 tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
+            ),
+            # (latent_dim,) vector — elementwise MEAN across replicas (#282 diagnostics)
+            "kl_per_dim": self.strategy.reduce(
+                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_per_dim"], axis=None
             ),
         }
 
@@ -2520,7 +2678,9 @@ class TrainingPipeline:
             f"using distributed inference"
         )
 
-        # Create distributed inference function
+        # Create distributed inference function. Since #282 it returns ALL THREE encoder
+        # outputs — z_mean and z_log_var used to be computed and thrown away here, which is
+        # exactly what makes the 8-variant representation sweep below free on the GPU side.
         @tf.function
         def rf_encode_fn(batch_data):
             """Encode batch data using distributed strategy"""
@@ -2533,15 +2693,14 @@ class TrainingPipeline:
                 concat_reshaped = tf.reshape(concat_data, [-1, time_bins, width_bin, 1])
 
                 # Encode (returns z_mean, z_log_var, z)
-                _, _, concat_z = self.vae.encoder(concat_reshaped, training=False)
+                z_mean, z_log_var, concat_z = self.vae.encoder(concat_reshaped, training=False)
 
-                return concat_z
+                return z_mean, z_log_var, concat_z
 
-            per_replica_concat = self.strategy.run(encode_fn, args=(batch_data,))
-            return per_replica_concat
+            return self.strategy.run(encode_fn, args=(batch_data,))
 
-        train_latents = None
-        val_latents = None
+        train_z_mean = train_z_log_var = train_latents = None
+        val_z_mean = val_z_log_var = val_latents = None
 
         try:
             # train_steps accounts for gradient accumulation (each "step" = accumulation_steps
@@ -2561,7 +2720,7 @@ class TrainingPipeline:
             train_encode_steps = train_steps * accumulation_steps
 
             with stage_timer("encode"):
-                [train_latents] = self._distributed_encode(
+                [train_z_mean, train_z_log_var, train_latents] = self._distributed_encode(
                     dataset=train_dataset,
                     n_steps=train_encode_steps,
                     encode_fn=rf_encode_fn,
@@ -2570,7 +2729,7 @@ class TrainingPipeline:
                     logging=True,
                 )
 
-                [val_latents] = self._distributed_encode(
+                [val_z_mean, val_z_log_var, val_latents] = self._distributed_encode(
                     dataset=val_dataset,
                     n_steps=val_steps,
                     encode_fn=rf_encode_fn,
@@ -2591,27 +2750,279 @@ class TrainingPipeline:
                 [s.startswith("true_") for s in val_subtype_labels], dtype=np.int64
             )
 
-            # Train Random Forest classifier (passes latent_vectors; model flattens internally)
-            with stage_timer("fit"):
-                self.rf_model.train(train_latents, train_binary_labels)
-            logger.info("Random Forest training complete")
+            # ---------------------------------------------------------------- #282 sweep
+            # Flatten every encoder output into per-cadence blocks once; every variant's
+            # features are hstack compositions of these (see aetherscan.latent_variants)
+            train_mean_flat = prepare_latent_features(train_z_mean, num_observations)
+            train_logvar_flat = prepare_latent_features(train_z_log_var, num_observations)
+            train_z_flat = prepare_latent_features(train_latents, num_observations)
+            val_mean_flat = prepare_latent_features(val_z_mean, num_observations)
+            val_logvar_flat = prepare_latent_features(val_z_log_var, num_observations)
 
-            # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for? why are we calling model.predict_proba directly? is it better to have a wrapper here? could we modify the return signature of predict_proba to return both features & probabilities?)
-            # Compute flattened features + val probas/preds for downstream plotting.
-            # val_preds is thresholded at inference.classification_threshold so the
-            # confusion matrix, SHAP correct/incorrect markers, and decision-boundary
-            # markers all reflect the model's deployment operating point — not
-            # sklearn's argmax default (implicitly 0.5 for the binary RF), which
-            # would understate FN / overstate TP relative to production behavior.
-            train_features = prepare_latent_features(train_latents, num_observations)
-            val_features = prepare_latent_features(val_latents, num_observations)
-            val_probas = self.rf_model.model.predict_proba(val_features)[:, 1].astype(np.float32)
+            root_seed = self.config.reproducibility.seed
+            rf_seed = self.config.resolved_rf_seed()
             classification_threshold = self.config.inference.classification_threshold
-            val_preds = (val_probas >= classification_threshold).astype(np.int64)
+            tag = self.config.checkpoint.save_tag
+
+            # Active Units (Burda et al.) on the train z_mean pool: sizes the collapse
+            # problem retroactively and gates the z_mean_logvar_active variant
+            active_dims = active_latent_dims(
+                train_mean_flat,
+                num_observations,
+                latent_dim,
+                self.config.rf.active_units_threshold,
+            )
+            logger.info(
+                f"Active latent dims (z_mean variance > "
+                f"{self.config.rf.active_units_threshold}): {len(active_dims)}/{latent_dim} "
+                f"-> {active_dims}"
+            )
+
+            # Partition the val split: selection (variant choice) / calibration (calibrator
+            # fit) / test (held-out release metrics — best-of-8 on the selection split alone
+            # would be optimistically biased). Seeded so the partition reproduces.
+            n_val_rows = len(val_binary_labels)
+            partition_rng = derive_rng(root_seed, STREAM_RF, 1)
+            permutation = partition_rng.permutation(n_val_rows)
+            n_selection = int(round(self.config.rf.val_selection_fraction * n_val_rows))
+            n_calibration = int(round(self.config.rf.val_calibration_fraction * n_val_rows))
+            selection_idx = permutation[:n_selection]
+            calibration_idx = permutation[n_selection : n_selection + n_calibration]
+            test_idx = permutation[n_selection + n_calibration :]
+
+            # Train EVERY variant on the same data and split; evaluate each under its
+            # DETERMINISTIC inference-time form (z_mean in the lead slot — for the z/z_aug
+            # variants that is deliberately the deployed configuration, not the training
+            # one). Cheap metrics for all; full diagnostics later for the winner only.
+            def _variant_train_matrix(variant):
+                if variant == "z":
+                    return train_z_flat, train_binary_labels
+                if variant == "z_aug":
+                    return build_z_aug_training_set(
+                        train_mean_flat,
+                        train_logvar_flat,
+                        train_binary_labels,
+                        self.config.rf.z_aug_draws,
+                        derive_rng(root_seed, STREAM_RF, 2),
+                    )
+                features = build_variant_features(
+                    variant,
+                    train_mean_flat,
+                    train_logvar_flat,
+                    num_observations,
+                    latent_dim,
+                    active_dims,
+                )
+                return features, train_binary_labels
+
+            variant_models: dict[str, RandomForestClassifier] = {}
+            variant_val_probas: dict[str, np.ndarray] = {}
+            variant_metrics: dict[str, dict[str, float]] = {}
+            with stage_timer("fit"):
+                for variant in VARIANT_ORDER:
+                    fit_features, fit_labels = _variant_train_matrix(variant)
+                    fit_features, fit_labels = sklearn_shuffle(
+                        fit_features, fit_labels, random_state=rf_seed
+                    )
+                    clf = RandomForestClassifier(
+                        n_estimators=self.config.rf.n_estimators,
+                        bootstrap=self.config.rf.bootstrap,
+                        max_features=self.config.rf.max_features,
+                        n_jobs=self.config.rf.n_jobs,
+                        random_state=rf_seed,
+                    )
+                    clf.fit(fit_features, fit_labels)
+                    variant_models[variant] = clf
+
+                    eval_features = build_variant_features(
+                        variant,
+                        val_mean_flat,
+                        val_logvar_flat,
+                        num_observations,
+                        latent_dim,
+                        active_dims,
+                    )
+                    probas = clf.predict_proba(eval_features)[:, 1].astype(np.float32)
+                    variant_val_probas[variant] = probas
+
+                    sel_labels = val_binary_labels[selection_idx]
+                    sel_probas = probas[selection_idx]
+                    metrics = {
+                        "recall_at_fpr": recall_at_fpr(
+                            sel_labels, sel_probas, self.config.rf.selection_max_fpr
+                        ),
+                        "roc_auc": float(roc_auc_score(sel_labels, sel_probas)),
+                        "brier": float(brier_score_loss(sel_labels, sel_probas)),
+                        "ece": expected_calibration_error(sel_labels, sel_probas),
+                        "n_features": int(fit_features.shape[1]),
+                    }
+                    variant_metrics[variant] = metrics
+                    logger.info(
+                        f"Variant '{variant}' (F={metrics['n_features']}): "
+                        f"recall@{self.config.rf.selection_max_fpr:g}FPR="
+                        f"{metrics['recall_at_fpr']:.4f}, AUC={metrics['roc_auc']:.4f}, "
+                        f"Brier={metrics['brier']:.4f}, ECE={metrics['ece']:.4f}"
+                    )
+                    variant_path = os.path.join(
+                        self.config.model_path, f"random_forest_{tag}_{variant}.joblib"
+                    )
+                    os.makedirs(os.path.dirname(variant_path), exist_ok=True)
+                    joblib.dump(clf, variant_path)
+                    del fit_features, fit_labels, eval_features
+                    gc.collect()
+
+            winner, selection_recalls = select_winner(
+                val_binary_labels[selection_idx],
+                {name: probas[selection_idx] for name, probas in variant_val_probas.items()},
+                self.config.rf.selection_max_fpr,
+                self.config.rf.selection_bootstrap_rounds,
+                derive_rng(root_seed, STREAM_RF, 3),
+            )
+            recall_summary = ", ".join(f"{k}={v:.4f}" for k, v in selection_recalls.items())
+            logger.info(f"LATENT VARIANT WINNER: '{winner}' (selection recalls: {recall_summary})")
+            # MC coherence note for the record (docs carry the full explanation): only a
+            # z-trained forest makes MC averaging a true posterior-predictive expectation
+            if winner in ("z",):
+                logger.info(
+                    "MC semantics: the winner trains on sampled z, so pass-2 MC averaging is "
+                    "a posterior-predictive expectation"
+                )
+            else:
+                logger.info(
+                    "MC semantics: the winner trains on deterministic features, so pass-2 MC "
+                    "is a sensitivity/robustness probe (documented in INFERENCE_PIPELINE.md)"
+                )
+
+            # The winning fitted forest becomes THE model: canonical filename, HF upload,
+            # and release tagging all pick it up unchanged
+            self.rf_model.model = variant_models[winner]
+            self.rf_model.is_trained = True
+            # Record the winner + calibration outcome on the config singleton so
+            # final_save's config_{tag}.json tells inference exactly how to rebuild
+            # features. Single-threaded orchestration point (same precedent as the
+            # startup-time save_tag resolution) — not a mid-flight mutation.
+            self.config.rf.latent_variant = winner
+            self.config.rf.active_dims = active_dims
+
+            val_probas = variant_val_probas[winner]
+            val_features = build_variant_features(
+                winner, val_mean_flat, val_logvar_flat, num_observations, latent_dim, active_dims
+            )
+            if winner == "z":
+                train_features = train_z_flat
+            elif winner == "z_aug":
+                train_features = train_mean_flat
+            else:
+                train_features = build_variant_features(
+                    winner,
+                    train_mean_flat,
+                    train_logvar_flat,
+                    num_observations,
+                    latent_dim,
+                    active_dims,
+                )
+
+            # -------------------------------------------------- #282 calibration (winner)
+            # Measure ECE on the held-out calibration split; auto-fit a calibrator only when
+            # the configured limit is exceeded, and KEEP it only if it demonstrably improves
+            # ECE (without worsening Brier) on the further held-out test split.
+            calibrator = None
+            cal_labels = val_binary_labels[calibration_idx]
+            cal_probas = val_probas[calibration_idx]
+            measured_ece = expected_calibration_error(cal_labels, cal_probas)
+            logger.info(
+                f"Winner ECE on the calibration split: {measured_ece:.4f} "
+                f"(rf.max_ece={self.config.rf.max_ece})"
+            )
+            if measured_ece > self.config.rf.max_ece:
+                candidate = fit_probability_calibrator(
+                    cal_probas, cal_labels, self.config.rf.calibration_min_isotonic
+                )
+                test_labels = val_binary_labels[test_idx]
+                raw_test = val_probas[test_idx]
+                calibrated_test = apply_probability_calibrator(candidate, raw_test)
+                ece_before = expected_calibration_error(test_labels, raw_test)
+                ece_after = expected_calibration_error(test_labels, calibrated_test)
+                brier_before = float(brier_score_loss(test_labels, raw_test))
+                brier_after = float(brier_score_loss(test_labels, calibrated_test))
+                if ece_after < ece_before and brier_after <= brier_before * 1.001:
+                    calibrator = candidate
+                    logger.info(
+                        f"Calibrator ({candidate['method']}) KEPT: test ECE "
+                        f"{ece_before:.4f} -> {ece_after:.4f}, Brier {brier_before:.4f} -> "
+                        f"{brier_after:.4f}"
+                    )
+                else:
+                    logger.warning(
+                        f"Calibrator ({candidate['method']}) DISCARDED — did not improve on "
+                        f"the held-out test split (ECE {ece_before:.4f} -> {ece_after:.4f}, "
+                        f"Brier {brier_before:.4f} -> {brier_after:.4f})"
+                    )
+            else:
+                logger.info("Calibration not applied: measured ECE within rf.max_ece")
+
+            self.config.rf.calibration_active = calibrator is not None
+            self.config.rf.calibration_method = calibrator["method"] if calibrator else None
+            if calibrator is not None:
+                calibrator_path = os.path.join(
+                    self.config.model_path, f"rf_calibrator_{tag}.joblib"
+                )
+                joblib.dump(calibrator, calibrator_path)
+                logger.info(f"Saved probability calibrator to {calibrator_path}")
+
+            # Deployment-scored probabilities/predictions for artifacts + plots: calibrated
+            # when a calibrator is active (inference applies it identically), raw otherwise
+            val_probas_deployed = apply_probability_calibrator(calibrator, val_probas).astype(
+                np.float32
+            )
+            val_preds = (val_probas_deployed >= classification_threshold).astype(np.int64)
+
+            # ------------------------------------------- #282 held-out test-split metrics
+            test_labels = val_binary_labels[test_idx]
+            test_deployed = val_probas_deployed[test_idx]
+            release_metrics = {
+                "test_recall_at_fpr": recall_at_fpr(
+                    test_labels, test_deployed, self.config.rf.selection_max_fpr
+                ),
+                "test_roc_auc": float(roc_auc_score(test_labels, test_deployed)),
+                "test_brier": float(brier_score_loss(test_labels, test_deployed)),
+                "test_ece": expected_calibration_error(test_labels, test_deployed),
+            }
+            release_summary = ", ".join(f"{k}={v:.4f}" for k, v in release_metrics.items())
+            logger.info(f"Held-out test metrics (deployment scoring): {release_summary}")
+
+            # -------------------------------- #282 screening-threshold validation (cascade)
+            # The two-pass cascade must lose ~zero recall vs MC-scoring EVERYTHING at the
+            # science threshold — anything pass 1 drops never gets a second look
+            mc_rng = derive_rng(root_seed, STREAM_RF, 4)
+            test_mean_flat = val_mean_flat[test_idx]
+            test_logvar_flat = val_logvar_flat[test_idx]
+            draw_probas = np.zeros((self.config.inference.mc_draws, len(test_idx)))
+            for draw_index in range(self.config.inference.mc_draws):
+                draw_flat = sample_z_flat(test_mean_flat, test_logvar_flat, mc_rng)
+                draw_features = build_variant_features(
+                    winner, draw_flat, test_logvar_flat, num_observations, latent_dim, active_dims
+                )
+                draw_probas[draw_index] = apply_probability_calibrator(
+                    calibrator, self.rf_model.model.predict_proba(draw_features)[:, 1]
+                )
+            mc_mean = draw_probas.mean(axis=0)
+            screen_stats = check_screening_threshold(
+                test_labels=test_labels,
+                pass1_probas=test_deployed,
+                mc_mean_probas=mc_mean,
+                screening_threshold=self.config.inference.screening_threshold,
+                science_threshold=classification_threshold,
+                recall_tolerance=self.config.rf.screen_recall_tolerance,
+                tag=tag,
+            )
+            del draw_probas, mc_mean, test_mean_flat, test_logvar_flat
 
             # NOTE: come back to this later (what is this artifact for? is it handled properly by archiving functions on startup?)
-            # Persist a single eval-artifact joblib that every RF plot function consumes
-            tag = self.config.checkpoint.save_tag
+            # Persist a single eval-artifact joblib that every RF plot function consumes.
+            # val_probas stays the winner's RAW deterministic-representation probabilities
+            # (rank plots are calibration-invariant); val_probas_deployed adds the calibrated
+            # view; val_preds reflects the deployment operating point.
             artifacts = {
                 "train_features": train_features,
                 "train_binary_labels": train_binary_labels,
@@ -2620,11 +3031,27 @@ class TrainingPipeline:
                 "val_binary_labels": val_binary_labels,
                 "val_subtype_labels": val_subtype_labels,
                 "val_probas": val_probas,
+                "val_probas_deployed": val_probas_deployed,
                 "val_preds": val_preds,
                 "classification_threshold": classification_threshold,
                 "snr_base": snr_base,
                 "snr_range": snr_range,
                 "tag": tag,
+                "latent_variant": winner,
+                "active_dims": active_dims,
+                "variant_metrics": variant_metrics,
+                "release_metrics": release_metrics,
+                "calibration": {
+                    "active": calibrator is not None,
+                    "method": calibrator["method"] if calibrator else None,
+                    "measured_ece": measured_ece,
+                    "max_ece": self.config.rf.max_ece,
+                },
+                "val_partition": {
+                    "selection_idx": selection_idx,
+                    "calibration_idx": calibration_idx,
+                    "test_idx": test_idx,
+                },
             }
             artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
             os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
@@ -2663,6 +3090,13 @@ class TrainingPipeline:
                     val_preds=val_preds,
                 )
                 rf_metrics["classification_threshold"] = float(classification_threshold)
+                rf_metrics["screening_threshold"] = float(self.config.inference.screening_threshold)
+                rf_metrics["active_units"] = float(len(active_dims))
+                rf_metrics.update({k: float(v) for k, v in release_metrics.items()})
+                rf_metrics.update({k: float(v) for k, v in screen_stats.items()})
+                for variant_name, metrics in variant_metrics.items():
+                    for metric_name, value in metrics.items():
+                        rf_metrics[f"variant_{variant_name}_{metric_name}"] = float(value)
                 metrics_timestamp = time.time()
                 for stat_name, value in rf_metrics.items():
                     self.db.write_training_stat(
@@ -2679,16 +3113,24 @@ class TrainingPipeline:
                 logger.warning(f"Failed to write RF eval metrics to db: {e}")
 
             # NOTE: come back to this later (are we dereferencing the correct things? can we instead write things to db instead of storing in memory?)
+            # train_binary_labels / train_*_flat are deliberately NOT del'd: the
+            # _variant_train_matrix closure references them and ruff flags closure names
+            # deleted by the enclosing scope (see the identical NOTE near plot_dual_axis);
+            # they are freed when the frame exits
             del (
                 artifacts,
                 train_features,
                 val_features,
                 train_subtype_labels,
                 val_subtype_labels,
-                train_binary_labels,
                 val_binary_labels,
                 val_probas,
+                val_probas_deployed,
                 val_preds,
+                variant_models,
+                variant_val_probas,
+                val_mean_flat,
+                val_logvar_flat,
             )
             gc.collect()
 
@@ -2747,6 +3189,21 @@ class TrainingPipeline:
             if self.rf_model is None:
                 self.rf_model = RandomForestModel()
             self.rf_model.load(rf_model_path)
+            # Restore the sweep outcome onto the config (#282): the resumed attempt skips
+            # train_random_forest's selection, but final_save still dumps the config, which
+            # must record the variant/calibration the persisted model was actually trained
+            # with — otherwise inference would rebuild the wrong features
+            artifacts = joblib.load(artifact_path)
+            self.config.rf.latent_variant = artifacts.get("latent_variant", "z")
+            self.config.rf.active_dims = artifacts.get("active_dims")
+            calibration = artifacts.get("calibration", {})
+            self.config.rf.calibration_active = bool(calibration.get("active", False))
+            self.config.rf.calibration_method = calibration.get("method")
+            logger.info(
+                f"Restored sweep outcome from artifacts: latent_variant="
+                f"'{self.config.rf.latent_variant}', calibration_active="
+                f"{self.config.rf.calibration_active}"
+            )
             return True
         except Exception as e:
             logger.warning(f"Failed to load persisted Random Forest from {rf_model_path}: {e}")
@@ -3436,6 +3893,98 @@ class TrainingPipeline:
                     rotation=rotation,
                     alpha=0.7,
                 )
+
+    def plot_posterior_collapse(self, tag: str | None = None, dir: str | None = None):
+        """
+        Posterior-collapse diagnostics (#282): a KL-per-dimension heatmap (dim x global
+        epoch — collapsing dims visibly go dark) plus the active-units count per epoch
+        (dims with KL > training.posterior_collapse_kl_epsilon), from the kl_dim_* rows
+        written each epoch. Follows the loss-curve plots' skip-don't-render-partial flush
+        contract (#277).
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        if self.db is None:
+            raise RuntimeError("No database instance detected - cannot plot posterior collapse")
+
+        logger.info("Flushing database before plotting...")
+        if not self.db.flush():
+            raise RuntimeError(
+                "Database flush timed out with training stats still queued - skipping the "
+                "posterior-collapse plot rather than rendering an incomplete result set"
+            )
+        logger.info("Database flushed")
+
+        latent_dim = self.config.beta_vae.latent_dim
+        current_time = time.time()
+        all_stats = self.db.query_training_stat(
+            model_name="beta_vae",
+            stat_name=[f"kl_dim_{d:02d}" for d in range(latent_dim)],
+            start_round_number=1,
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+        if not all_stats:
+            logger.warning("No per-dimension KL rows to plot (pre-#282 run?) — skipping")
+            return
+
+        epochs, history = build_epoch_history(all_stats, self.config.training.epochs_per_round)
+        n_epochs = len(epochs)
+        kl_matrix = np.full((latent_dim, n_epochs), np.nan)
+        for dim_idx in range(latent_dim):
+            values = history.get(f"kl_dim_{dim_idx:02d}")
+            if values is not None:
+                kl_matrix[dim_idx] = values
+
+        epsilon = self.config.training.posterior_collapse_kl_epsilon
+        active_counts = np.nansum(kl_matrix > epsilon, axis=0)
+
+        fig, (ax_heat, ax_active) = plt.subplots(
+            2, 1, figsize=(16, 9), height_ratios=[3, 1], sharex=True
+        )
+        image = ax_heat.imshow(
+            kl_matrix,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="viridis",
+            extent=(1, max(n_epochs, 2), latent_dim - 0.5, -0.5),
+        )
+        fig.colorbar(image, ax=ax_heat, label="mean KL per dim (nats)")
+        ax_heat.set_ylabel("latent dimension")
+        ax_heat.set_yticks(range(latent_dim))
+        ax_heat.set_title(
+            f"Per-dimension KL over training ({tag}) — dark rows = collapsing dims",
+            fontsize=13,
+            fontweight="bold",
+        )
+
+        ax_active.plot(list(epochs), active_counts, color="tab:red", linewidth=2)
+        ax_active.axhline(
+            self.config.training.min_active_units_fraction * latent_dim,
+            color="gray",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.8,
+        )
+        ax_active.set_ylim(0, latent_dim + 0.5)
+        ax_active.set_xlabel("Epoch (global)")
+        ax_active.set_ylabel(f"active dims\n(KL > {epsilon:g})")
+        ax_active.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path = os.path.join(self._training_plots_dir(dir), f"posterior_collapse_{tag}.png")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Posterior-collapse diagnostics saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path, title=f"Posterior Collapse Diagnostics - ({tag})"
+            )
 
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
     # TODO: move injection plots to data_generation.py & call at end of generate_round_to_memmap() (instead of at the end of train_round() & run_training_pipeline())
@@ -6326,7 +6875,11 @@ class TrainingPipeline:
                 logger.info(f"Rendering decision boundary for (nn={nn}, md={md})")
                 try:
                     umap_model = joblib.load(umap_path)
-                    embedding = umap_model.transform(pts_features)
+                    # The persisted cadence UMAP was fit on the num_obs*latent_dim z_mean
+                    # cadence space; wide #282 variants prepend that exact block, so
+                    # project the lead columns only
+                    lead_width = self.config.data.num_observations * self.config.beta_vae.latent_dim
+                    embedding = umap_model.transform(pts_features[:, :lead_width])
                 except Exception as e:
                     logger.warning(f"Failed to load/transform UMAP at {umap_path}: {e}")
                     continue
@@ -6352,7 +6905,19 @@ class TrainingPipeline:
                     )
                     continue
 
-                grid_probas = self.rf_model.model.predict_proba(grid_48d)[:, 1]
+                # #282: the cadence UMAP lives in the 48-dim z_mean space, but the winning
+                # variant may carry extra uncertainty features the inverse transform cannot
+                # reconstruct — hold those at their training-set means (a documented
+                # approximation: the boundary is then the slice through typical uncertainty)
+                n_rf_features = self.rf_model.model.n_features_in_
+                if n_rf_features > grid_48d.shape[1]:
+                    extras_mean = artifacts["train_features"][:, grid_48d.shape[1] :].mean(axis=0)
+                    grid_features = np.hstack(
+                        [grid_48d, np.tile(extras_mean, (grid_48d.shape[0], 1))]
+                    )
+                else:
+                    grid_features = grid_48d
+                grid_probas = self.rf_model.model.predict_proba(grid_features)[:, 1]
                 proba_grid = grid_probas.reshape(xx.shape)
 
                 fig, ax = plt.subplots(1, 1, figsize=(11, 9))
@@ -6730,6 +7295,7 @@ class TrainingPipeline:
             [
                 (self.plot_beta_vae_loss_curves, "plot_beta_vae_loss_curves"),
                 (self.plot_beta_vae_training_stability, "plot_beta_vae_training_stability"),
+                (self.plot_posterior_collapse, "plot_posterior_collapse"),
                 (self.plot_injection_stats, "plot_injection_stats"),
                 (self.plot_latent_space_gif, "plot_latent_space_gif"),
                 (self.plot_latent_traversal, "plot_latent_traversal"),

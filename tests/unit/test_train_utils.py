@@ -36,6 +36,8 @@ from aetherscan.train import (
     archive_directory,
     build_epoch_history,
     check_encoder_trained,
+    check_posterior_collapse,
+    check_screening_threshold,
     check_val_auc_floor,
     compute_expected_std,
 )
@@ -752,3 +754,87 @@ class TestPlotFlushGates:
         pipeline = self._pipeline_with_db(flush_ok=False, backlog=0)
         with pytest.raises(RuntimeError, match="skipping injection"):
             pipeline.plot_injection_stats(round_number=1)
+
+
+class TestCheckPosteriorCollapse:
+    """#282: advisory posterior-collapse guard (WARN, never fail)."""
+
+    def test_healthy_round_passes(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            flagged = check_posterior_collapse(
+                kl_per_dim=np.array([0.5, 0.8, 0.3, 0.6]),
+                low_kl_streaks=np.zeros(4),
+                kl_epsilon=0.01,
+                min_active_fraction=0.5,
+                patience=5,
+                tag="round_01",
+            )
+        assert flagged is False
+        assert not [r for r in caplog.records if "POSTERIOR COLLAPSE" in r.message]
+
+    def test_low_active_fraction_flags(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            flagged = check_posterior_collapse(
+                kl_per_dim=np.array([0.5, 0.001, 0.002, 0.003]),
+                low_kl_streaks=np.zeros(4),
+                kl_epsilon=0.01,
+                min_active_fraction=0.5,
+                patience=5,
+                tag="round_02",
+            )
+        assert flagged is True
+        assert any("POSTERIOR COLLAPSE" in r.message for r in caplog.records)
+
+    def test_stuck_streak_flags_even_with_enough_active(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            flagged = check_posterior_collapse(
+                kl_per_dim=np.array([0.5, 0.8, 0.3, 0.001]),
+                low_kl_streaks=np.array([0, 0, 0, 7]),
+                kl_epsilon=0.01,
+                min_active_fraction=0.5,
+                patience=5,
+                tag="round_03",
+            )
+        assert flagged is True
+        assert any("dims stuck below epsilon" in r.message for r in caplog.records)
+
+
+class TestCheckScreeningThreshold:
+    """#282: the cascade's screen must lose ~zero recall vs MC-on-everything."""
+
+    def test_safe_screen_passes(self, caplog):
+        labels = np.array([1, 1, 0, 0])
+        pass1 = np.array([0.9, 0.8, 0.2, 0.1])
+        mc = np.array([0.995, 0.992, 0.3, 0.2])
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            stats = check_screening_threshold(
+                test_labels=labels,
+                pass1_probas=pass1,
+                mc_mean_probas=mc,
+                screening_threshold=0.5,
+                science_threshold=0.99,
+                recall_tolerance=0.0,
+                tag="t",
+            )
+        assert stats["screen_recall_loss"] == pytest.approx(0.0)
+        assert stats["screen_max_safe_threshold"] == pytest.approx(0.8)
+        assert not [r for r in caplog.records if "UNSAFE" in r.message]
+
+    def test_lossy_screen_warns_with_numbers(self, caplog):
+        labels = np.array([1, 1, 0])
+        pass1 = np.array([0.9, 0.3, 0.1])  # second positive rejected by the screen
+        mc = np.array([0.995, 0.995, 0.2])  # ...but MC would have promoted it
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            stats = check_screening_threshold(
+                test_labels=labels,
+                pass1_probas=pass1,
+                mc_mean_probas=mc,
+                screening_threshold=0.5,
+                science_threshold=0.99,
+                recall_tolerance=0.0,
+                tag="t",
+            )
+        assert stats["screen_recall_mc_everything"] == pytest.approx(1.0)
+        assert stats["screen_recall_cascade"] == pytest.approx(0.5)
+        assert stats["screen_max_safe_threshold"] == pytest.approx(0.3)
+        assert any("SCREENING THRESHOLD UNSAFE" in r.message for r in caplog.records)

@@ -13,14 +13,25 @@ import os
 import threading
 import time
 
+import joblib
 import numpy as np
 import tensorflow as tf
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.db import get_db
-from aetherscan.models import RandomForestModel
-from aetherscan.seeding import seed_tensorflow
+from aetherscan.latent_variants import (
+    apply_probability_calibrator,
+    build_variant_features,
+    sample_z_flat,
+)
+from aetherscan.models import RandomForestModel, prepare_latent_features
+from aetherscan.seeding import (
+    STREAM_INFERENCE_MC,
+    STREAM_REFERENCE_CLOUD,
+    derive_rng,
+    seed_tensorflow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +202,52 @@ def prepare_distributed_inf_dataset(
     }
 
 
+class ReferenceCloudReservoir:
+    """
+    Seeded uniform reservoir (algorithm R) over the pass-1 rejects' posterior parameters
+    (#282): a fixed-size, catalog-representative sample — deliberately NOT near-threshold,
+    which would bias the reference cloud toward the boundary and make every candidate look
+    ordinary. offer() is O(1) per row; the MC scoring cost at finalize is fixed
+    (capacity x mc_draws) regardless of survey size.
+    """
+
+    def __init__(self, capacity: int, rng: np.random.Generator):
+        self.capacity = int(capacity)
+        self.rng = rng
+        self.seen = 0
+        self._mean_rows: list[np.ndarray] = []
+        self._log_var_rows: list[np.ndarray] = []
+        self._screening: list[float] = []
+
+    def offer(
+        self, mean_flat: np.ndarray, log_var_flat: np.ndarray, screening_probas: np.ndarray
+    ) -> None:
+        if self.capacity <= 0:
+            return
+        for row_index in range(len(mean_flat)):
+            self.seen += 1
+            if len(self._mean_rows) < self.capacity:
+                self._mean_rows.append(np.array(mean_flat[row_index]))
+                self._log_var_rows.append(np.array(log_var_flat[row_index]))
+                self._screening.append(float(screening_probas[row_index]))
+            else:
+                slot = int(self.rng.integers(0, self.seen))
+                if slot < self.capacity:
+                    self._mean_rows[slot] = np.array(mean_flat[row_index])
+                    self._log_var_rows[slot] = np.array(log_var_flat[row_index])
+                    self._screening[slot] = float(screening_probas[row_index])
+
+    def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self._mean_rows:
+            empty = np.empty((0, 0), dtype=np.float32)
+            return empty, empty, np.empty(0, dtype=np.float32)
+        return (
+            np.stack(self._mean_rows),
+            np.stack(self._log_var_rows),
+            np.asarray(self._screening, dtype=np.float32),
+        )
+
+
 class InferencePipeline:
     """Inference pipeline"""
 
@@ -238,6 +295,16 @@ class InferencePipeline:
 
         self.per_replica_inf_batch_size = self.config.inference.per_replica_batch_size
         self.threshold = self.config.inference.classification_threshold
+        self.screening_threshold = self.config.inference.screening_threshold
+        self.mc_draws = self.config.inference.mc_draws
+
+        # Reference cloud (#282): a seeded uniform reservoir over the pass-1 REJECTS across
+        # the whole run — MC-scored once at finalize so the candidate uncertainty plot
+        # compares candidates against the survey, not against other candidates
+        self._reference_reservoir = ReferenceCloudReservoir(
+            capacity=self.config.inference.reference_cloud_size,
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_REFERENCE_CLOUD),
+        )
 
         # Lazily-built tf.function for the distributed encode step, cached so repeated
         # run_inference calls (one per cadence in the streaming loop) reuse one trace
@@ -275,6 +342,31 @@ class InferencePipeline:
         except Exception as e:
             logger.error(f"Error loading Random Forest: {e}")
             raise  # Re-raise to propagate error
+
+        # Probability calibrator (#282): the saved training config records whether one is
+        # active; applying it identically at inference is mandatory (an unapplied calibrator
+        # is a silent train/serve mismatch), so a missing artifact is a hard error
+        self.calibrator = None
+        if self.config.rf.calibration_active:
+            calibrator_path = os.path.join(
+                os.path.dirname(rf_path),
+                os.path.basename(rf_path).replace("random_forest", "rf_calibrator"),
+            )
+            if not os.path.exists(calibrator_path):
+                raise FileNotFoundError(
+                    f"config records an active probability calibrator "
+                    f"({self.config.rf.calibration_method}) but {calibrator_path} does not "
+                    "exist — refusing to score uncalibrated (train/serve mismatch)"
+                )
+            self.calibrator = joblib.load(calibrator_path)
+            logger.info(
+                f"Loaded probability calibrator ({self.calibrator['method']}) from "
+                f"{calibrator_path}"
+            )
+        logger.info(
+            f"Inference feature layout: latent_variant='{self.config.rf.latent_variant}', "
+            f"active_dims={self.config.rf.active_dims}"
+        )
 
     def run_inference(
         self,
@@ -363,23 +455,86 @@ class InferencePipeline:
             )
 
             with stage_timer("encode"):
-                latents = self._distributed_encode(inf_dataset, n_padded, inf_steps)
+                z_mean, z_log_var = self._distributed_encode(inf_dataset, n_padded, inf_steps)
 
             # Drop the encoded padding rows: the first n_samples * num_observations latent
             # rows correspond exactly to the real snippets (row order is snippet-major)
-            latents = latents[: n_samples * self.num_observations]
+            z_mean = z_mean[: n_samples * self.num_observations]
+            z_log_var = z_log_var[: n_samples * self.num_observations]
 
-            # Run RF classification. One predict_proba pass (1000 trees per snippet) yields
-            # everything downstream: P(true) for the manifest confidence summary and the
-            # confidence-distribution figure, plus the same predictions / confidences
-            # predict_verbose would have derived from it (probability of the predicted
-            # class, so high for confident negatives too).
-            logger.info("Running Random Forest classification")
+            # Two-pass cascade (#282). Pass 1 scores EVERY snippet deterministically
+            # (features per the saved config's winning variant, z_mean in the lead slot)
+            # against the permissive screening threshold; pass 2 re-scores the survivors
+            # with mc_draws seeded reparameterized draws and REPLACES their score with the
+            # MC mean, which carries the science threshold. Not two ANDed criteria — pass 1
+            # only exists to say "definitely not a candidate" cheaply.
+            logger.info("Running Random Forest classification (two-pass cascade)")
             with stage_timer("rf"):
-                probas = self.rf_model.predict_proba(latents)
-                proba_true = probas[:, 1]
+                variant = self.config.rf.latent_variant
+                active_dims = self.config.rf.active_dims
+                latent_dim = self.latent_dim
+                num_observations = self.num_observations
+                mean_flat = prepare_latent_features(z_mean, num_observations)
+                logvar_flat = prepare_latent_features(z_log_var, num_observations)
+
+                pass1_features = build_variant_features(
+                    variant, mean_flat, logvar_flat, num_observations, latent_dim, active_dims
+                )
+                screening_probas = apply_probability_calibrator(
+                    self.calibrator, self.rf_model.model.predict_proba(pass1_features)[:, 1]
+                ).astype(np.float32)
+                survivors = screening_probas > self.screening_threshold
+
+                # Pass 2: seeded MC over the survivors. Draws are keyed on (root seed,
+                # cadence seed_key), so a cadence's MC statistics are independent of the
+                # rest of the catalog. Spread is computed on the SAME (calibrated when
+                # active) scale as the plotted probabilities — documented choice.
+                mc_mean = np.full(n_samples, np.nan, dtype=np.float32)
+                mc_std = np.full(n_samples, np.nan, dtype=np.float32)
+                survivor_idx = np.nonzero(survivors)[0]
+                if len(survivor_idx):
+                    mc_rng = derive_rng(
+                        self.config.reproducibility.seed, STREAM_INFERENCE_MC, seed_key or 0
+                    )
+                    draw_scores = np.empty((self.mc_draws, len(survivor_idx)))
+                    for draw_index in range(self.mc_draws):
+                        draw_flat = sample_z_flat(
+                            mean_flat[survivor_idx], logvar_flat[survivor_idx], mc_rng
+                        )
+                        draw_features = build_variant_features(
+                            variant,
+                            draw_flat,
+                            logvar_flat[survivor_idx],
+                            num_observations,
+                            latent_dim,
+                            active_dims,
+                        )
+                        draw_scores[draw_index] = apply_probability_calibrator(
+                            self.calibrator,
+                            self.rf_model.model.predict_proba(draw_features)[:, 1],
+                        )
+                    mc_mean[survivor_idx] = draw_scores.mean(axis=0)
+                    mc_std[survivor_idx] = draw_scores.std(axis=0)
+                    del draw_scores
+
+                # Final score: MC mean for survivors, the pass-1 score otherwise; the
+                # science threshold applies to the final score
+                proba_true = np.where(survivors, np.nan_to_num(mc_mean), screening_probas)
                 predictions = (proba_true > self.threshold).astype(int)
-                confidence_scores = np.where(predictions, proba_true, probas[:, 0])
+                confidence_scores = np.where(predictions, proba_true, 1.0 - proba_true)
+
+                # Reference cloud: feed the pass-1 rejects to the seeded uniform reservoir
+                reject_idx = np.nonzero(~survivors)[0]
+                if len(reject_idx):
+                    self._reference_reservoir.offer(
+                        mean_flat[reject_idx],
+                        logvar_flat[reject_idx],
+                        screening_probas[reject_idx],
+                    )
+
+                # The per-observation z_mean rows are the latents consumers see (candidate
+                # provenance vectors + the viz collector) — deterministic, reproducible
+                latents = z_mean
 
             # Write results to database
             with stage_timer("db_write"):
@@ -388,6 +543,9 @@ class InferencePipeline:
                     predictions=predictions,
                     confidence_scores=confidence_scores,
                     latents=latents,
+                    screening_probas=screening_probas,
+                    mc_mean=mc_mean,
+                    mc_std=mc_std,
                     target=target,
                     session=session,
                     cadence_id=cadence_id,
@@ -419,6 +577,9 @@ class InferencePipeline:
             "proba_true": proba_true,
             "predictions": predictions,
             "latents": latents,
+            "screening_probas": screening_probas,
+            "mc_mean": mc_mean,
+            "mc_std": mc_std,
         }
 
     def _distributed_encode(
@@ -428,14 +589,20 @@ class InferencePipeline:
         n_steps: int,
     ) -> np.ndarray:
         """
-        Encode `n_steps` worth of batches from a distributed `dataset` into a pre-allocated
-        latent array of shape (n_samples * num_observations, latent_dim). Per-replica results
-        are gathered via experimental_local_results + np.concatenate (faster than a strategy-level
-        gather over NCCL for the small latent payload).
+        Encode `n_steps` worth of batches from a distributed `dataset` into pre-allocated
+        (n_samples * num_observations, latent_dim) arrays of z_mean and z_log_var — the
+        DETERMINISTIC posterior parameters (#282: pass 1 scores on z_mean-based features;
+        pass-2 MC draws are reparameterized in numpy from these, seeded per cadence, so no
+        stochastic z ever crosses the GPU boundary). Per-replica results are gathered via
+        experimental_local_results + np.concatenate (faster than a strategy-level gather
+        over NCCL for the small latent payload).
         """
-        # Pre-allocate latent array
+        # Pre-allocate output arrays
         # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
-        latents = np.empty((n_samples * self.num_observations, self.latent_dim), dtype=np.float32)
+        z_mean_out = np.empty(
+            (n_samples * self.num_observations, self.latent_dim), dtype=np.float32
+        )
+        z_log_var_out = np.empty_like(z_mean_out)
 
         if self._encode_step is None:
             # Cache dimensions for tf.function
@@ -448,13 +615,12 @@ class InferencePipeline:
                     """Per-replica encoding step"""
                     # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
                     reshaped = tf.reshape(data, [-1, time_bins, width_bin, 1])
-                    # Encode (returns mean, log_var, z)
-                    _, _, z = self.encoder(reshaped, training=False)
-                    return z
+                    # Encode (returns mean, log_var, z) — keep the posterior parameters
+                    z_mean, z_log_var, _ = self.encoder(reshaped, training=False)
+                    return z_mean, z_log_var
 
                 # Run encoding on all replicas
-                per_replica_z = self.strategy.run(encode_fn, args=(batch_data,))
-                return per_replica_z
+                return self.strategy.run(encode_fn, args=(batch_data,))
 
             self._encode_step = encode_step
 
@@ -468,18 +634,26 @@ class InferencePipeline:
             for step in range(n_steps):
                 batch = next(iterator)
 
-                # Get per-replica latents for this batch
-                per_replica_z = encode_step(batch)
+                # Get per-replica posterior parameters for this batch
+                per_replica_mean, per_replica_log_var = encode_step(batch)
 
                 # Extract results from each replica and concatenate
                 # This avoids the inefficient gather operation with NCCL
-                results = self.strategy.experimental_local_results(per_replica_z)
+                batch_mean = np.concatenate(
+                    [r.numpy() for r in self.strategy.experimental_local_results(per_replica_mean)],
+                    axis=0,
+                )
+                batch_log_var = np.concatenate(
+                    [
+                        r.numpy()
+                        for r in self.strategy.experimental_local_results(per_replica_log_var)
+                    ],
+                    axis=0,
+                )
 
-                # Concatenate results from all replicas
-                batch_z = np.concatenate([r.numpy() for r in results], axis=0)
-
-                batch_size = batch_z.shape[0]
-                latents[current_idx : current_idx + batch_size] = batch_z
+                batch_size = batch_mean.shape[0]
+                z_mean_out[current_idx : current_idx + batch_size] = batch_mean
+                z_log_var_out[current_idx : current_idx + batch_size] = batch_log_var
 
                 current_idx += batch_size
 
@@ -487,7 +661,7 @@ class InferencePipeline:
                 if (step + 1) % 10 == 0 or (step + 1) == n_steps:
                     logger.info(f"Encoded step {step + 1}/{n_steps}")
 
-                del per_replica_z, results, batch_z
+                del per_replica_mean, per_replica_log_var, batch_mean, batch_log_var
                 gc.collect()
 
         except Exception as e:
@@ -498,8 +672,7 @@ class InferencePipeline:
             # NOTE: should check to make sure iterator exist first
             del iterator
 
-        # NOTE: is this the right location for return statement?
-        return latents
+        return z_mean_out, z_log_var_out
 
     def _write_inference_results(
         self,
@@ -507,6 +680,9 @@ class InferencePipeline:
         predictions: np.ndarray,
         confidence_scores: np.ndarray,
         latents: np.ndarray,
+        screening_probas: np.ndarray | None = None,
+        mc_mean: np.ndarray | None = None,
+        mc_std: np.ndarray | None = None,
         target: str | None = None,
         session: str | None = None,
         cadence_id: int | None = None,
@@ -551,6 +727,12 @@ class InferencePipeline:
                     idx * self.num_observations : (idx + 1) * self.num_observations
                 ]
 
+                def _optional_float(values, index):
+                    if values is None:
+                        return None
+                    value = float(values[index])
+                    return None if np.isnan(value) else value
+
                 self.db.write_inference_result(
                     npy_path=npy_path,
                     snippet_index=idx,
@@ -565,10 +747,70 @@ class InferencePipeline:
                     timestamp_observed=timestamp_observed,
                     h5_path=h5_path,
                     tag=tag,
+                    screening_proba=_optional_float(screening_probas, idx),
+                    mc_mean=_optional_float(mc_mean, idx),
+                    mc_std=_optional_float(mc_std, idx),
                 )
 
         logger.info(f"Wrote {n_candidates} candidates to database")
         return n_candidates
+
+    def finalize_reference_cloud(self) -> str | None:
+        """
+        MC-score the reject reservoir and persist the reference cloud (#282): the
+        (screening_proba, mc_mean, mc_std) triples for a seeded uniform subsample of the
+        survey's pass-1 rejects, written to
+        {output_path}/inference_reference_cloud_{tag}.npz together with the subsample
+        size, total rejects seen, root seed, and draw count — so the candidate uncertainty
+        plot can be regenerated later without re-running inference. Call once, after the
+        last run_inference of the run. Returns the npz path (None when the cloud is
+        disabled or no rejects were seen).
+        """
+        mean_flat, logvar_flat, screening = self._reference_reservoir.arrays()
+        if len(screening) == 0:
+            logger.info("Reference cloud: no pass-1 rejects collected — nothing to persist")
+            return None
+
+        logger.info(
+            f"MC-scoring the reference cloud: {len(screening)} reject rows "
+            f"(uniform reservoir over {self._reference_reservoir.seen} rejects) x "
+            f"{self.mc_draws} draws"
+        )
+        variant = self.config.rf.latent_variant
+        active_dims = self.config.rf.active_dims
+        cloud_rng = derive_rng(self.config.reproducibility.seed, STREAM_REFERENCE_CLOUD, 1)
+        draw_scores = np.empty((self.mc_draws, len(screening)))
+        for draw_index in range(self.mc_draws):
+            draw_flat = sample_z_flat(mean_flat, logvar_flat, cloud_rng)
+            draw_features = build_variant_features(
+                variant,
+                draw_flat,
+                logvar_flat,
+                self.num_observations,
+                self.latent_dim,
+                active_dims,
+            )
+            draw_scores[draw_index] = apply_probability_calibrator(
+                self.calibrator, self.rf_model.model.predict_proba(draw_features)[:, 1]
+            )
+
+        tag = self.config.checkpoint.save_tag
+        cloud_path = os.path.join(self.config.output_path, f"inference_reference_cloud_{tag}.npz")
+        os.makedirs(os.path.dirname(cloud_path), exist_ok=True)
+        np.savez_compressed(
+            cloud_path,
+            screening_proba=screening,
+            mc_mean=draw_scores.mean(axis=0).astype(np.float32),
+            mc_std=draw_scores.std(axis=0).astype(np.float32),
+            subsample_size=np.int64(len(screening)),
+            rejects_seen=np.int64(self._reference_reservoir.seen),
+            mc_draws=np.int64(self.mc_draws),
+            root_seed=np.int64(
+                -1 if self.config.reproducibility.seed is None else self.config.reproducibility.seed
+            ),
+        )
+        logger.info(f"Reference cloud persisted to {cloud_path}")
+        return cloud_path
 
     # NOTE: candidate plotting lives in aetherscan.inference_viz (plot_candidate /
     # plot_candidate_gallery), rendered at end of run from the inference_results rows +
@@ -621,6 +863,12 @@ def run_inference_pipeline(
                 timestamp_observed=timestamp_observed,
                 h5_path=h5_path,
             )
+        # Reference cloud (#282), best-effort — the legacy single-shot path builds a fresh
+        # pipeline per call, so the cloud covers this one cadence's rejects only
+        try:
+            pipeline.finalize_reference_cloud()
+        except Exception as e:
+            logger.error(f"Reference-cloud finalization failed ({e}); continuing")
     finally:
         # Force TensorFlow to release internal references to datasets/iterators. Runs once
         # per pipeline lifetime (after the loaded models are no longer needed) rather than

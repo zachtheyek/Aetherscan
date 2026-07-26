@@ -53,7 +53,10 @@ _MARK_SUPERSEDED_SENTINEL = object()
 # v4: added the `pipeline_stages` table (always-on stage timing spans from
 #     aetherscan.benchmark, consumed by utils/benchmark_report.py and the monitor's
 #     stage-band overlay). New table -> no ALTER step, same as v2.
-_SCHEMA_VERSION = 4
+# v5: added `inference_results.screening_proba` / `mc_mean` / `mc_std` (#282 two-pass
+#     inference: the deterministic pass-1 score plus the seeded MC mean/spread that carries
+#     the science threshold for survivors).
+_SCHEMA_VERSION = 5
 
 
 # Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
@@ -355,7 +358,10 @@ class Database:
                     h5_path TEXT,
                     tag TEXT,
                     metadata TEXT,
-                    superseded INTEGER DEFAULT 0
+                    superseded INTEGER DEFAULT 0,
+                    screening_proba REAL,
+                    mc_mean REAL,
+                    mc_std REAL
                 )
             """)
 
@@ -477,6 +483,16 @@ class Database:
         # v4 (pipeline_stages table) needs no migration step here either: like v2, the table is
         # created for old and new databases alike by the CREATE TABLE IF NOT EXISTS statement in
         # _init_database(). Only the version stamp below advances.
+
+        if version < 5:
+            # v5: two-pass inference columns (#282). A fresh db already has them from the
+            # CREATE TABLE above; the ALTERs patch a pre-v5 db. Column-existence checks keep
+            # each step idempotent.
+            columns = {row[1] for row in cursor.execute("PRAGMA table_info(inference_results)")}
+            for column in ("screening_proba", "mc_mean", "mc_std"):
+                if column not in columns:
+                    cursor.execute(f"ALTER TABLE inference_results ADD COLUMN {column} REAL")
+                    logger.info(f"Schema migration: added inference_results.{column}")
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -1018,8 +1034,8 @@ class Database:
                         INSERT INTO inference_results
                         (timestamp, npy_path, snippet_index, prediction, confidence, latent_vector,
                          target, session, cadence_id, band, frequency_mhz, timestamp_observed,
-                         h5_path, tag, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         h5_path, tag, metadata, screening_proba, mc_mean, mc_std)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_results_records,
                     )
@@ -1341,6 +1357,9 @@ class Database:
         h5_path: str | None = None,
         tag: str | None = None,
         timestamp: float | None = None,
+        screening_proba: float | None = None,
+        mc_mean: float | None = None,
+        mc_std: float | None = None,
     ):
         """
         Queue a non-blocking write to inference_results.
@@ -1350,7 +1369,9 @@ class Database:
         target, session, cadence_id, band, frequency_mhz, timestamp_observed, and h5_path carry
         the observational provenance (e.g. target='DDO210', session='AGBT18A_999_103', band='L').
         Timestamp defaults to current wall time (distinct from timestamp_observed, which is the
-        original observation time).
+        original observation time). screening_proba / mc_mean / mc_std carry the #282 two-pass
+        scores: the deterministic pass-1 probability and the seeded MC mean/spread for
+        pass-2 survivors.
         """
         metadata_json = get_system_metadata()
 
@@ -1378,6 +1399,9 @@ class Database:
                     h5_path,
                     tag,
                     metadata_json,
+                    screening_proba,
+                    mc_mean,
+                    mc_std,
                 ),
             )
         )
@@ -1542,6 +1566,9 @@ class Database:
         "tag",
         "metadata",
         "superseded",
+        "screening_proba",
+        "mc_mean",
+        "mc_std",
     }
     _INFERENCE_CADENCES_COLUMNS = {
         "id",

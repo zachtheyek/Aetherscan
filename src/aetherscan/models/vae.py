@@ -254,9 +254,12 @@ class BetaVAE(keras.Model):
             )
         )
 
-        # Compute KL loss
-        kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1))
+        # Compute KL loss. The per-(batch, dim) matrix is kept one step longer so the
+        # posterior-collapse diagnostics (#282) get the batch-mean KL of EACH latent dim
+        # (a collapsing dim's KL goes to ~0) — the scalar loss term is unchanged.
+        kl_matrix = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+        kl_per_dim = tf.reduce_mean(kl_matrix, axis=0)
+        kl_loss = tf.reduce_mean(tf.reduce_sum(kl_matrix, axis=1))
 
         # Compute clustering losses
         false_loss = self.compute_clustering_loss_false(false_data)
@@ -271,6 +274,7 @@ class BetaVAE(keras.Model):
             "total_loss": total_loss,
             "reconstruction_loss": reconstruction_loss,
             "kl_loss": kl_loss,
+            "kl_per_dim": kl_per_dim,
             "true_loss": true_loss,
             "false_loss": false_loss,
         }

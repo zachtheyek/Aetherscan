@@ -50,6 +50,7 @@ HF_ENCODER_FILENAME = "vae_encoder.keras"
 HF_DECODER_FILENAME = "vae_decoder.keras"
 HF_RF_FILENAME = "random_forest.joblib"
 HF_CONFIG_FILENAME = "config.json"
+HF_CALIBRATOR_FILENAME = "rf_calibrator.joblib"  # optional: only calibrated runs (#282)
 HF_CARD_FILENAME = "README.md"
 
 GITHUB_URL = "https://github.com/zachtheyek/Aetherscan"
@@ -206,6 +207,17 @@ def download_inference_artifacts(repo_id: str, revision: str) -> tuple[str, str,
             _hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
             for filename in (HF_ENCODER_FILENAME, HF_RF_FILENAME, HF_CONFIG_FILENAME)
         )
+        # Optional calibrator (#282): lands in the same snapshot dir as the RF, where
+        # InferencePipeline.init_models derives its path from rf_path. Absent for
+        # uncalibrated runs and pre-#282 uploads — the downloaded config's
+        # rf.calibration_active decides whether inference requires it.
+        try:
+            _hf_hub_download(repo_id=repo_id, filename=HF_CALIBRATOR_FILENAME, revision=revision)
+        except Exception:
+            logger.info(
+                f"No {HF_CALIBRATOR_FILENAME} at {repo_id}@{revision} (expected for "
+                "uncalibrated or pre-#282 runs)"
+            )
     except Exception as e:
         # Wrap raw huggingface_hub errors (404s, network failures, auth) with operator
         # guidance — this surfaces via main.py's resolution path at startup.
@@ -473,6 +485,12 @@ def upload_run_to_hf(
         raise FileNotFoundError(
             f"Cannot upload run '{tag}' to HF: missing artifact(s): {', '.join(missing)}"
         )
+
+    # Optional fifth artifact (#282): the probability calibrator, present only when training
+    # fitted-and-kept one (config.json's rf.calibration_active records which)
+    calibrator_source = os.path.join(model_path, f"rf_calibrator_{tag}.joblib")
+    if os.path.exists(calibrator_source):
+        sources[HF_CALIBRATOR_FILENAME] = calibrator_source
 
     with open(sources[HF_CONFIG_FILENAME]) as f:
         config_dict = json.load(f)

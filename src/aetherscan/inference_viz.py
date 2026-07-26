@@ -787,6 +787,100 @@ def plot_candidate_gallery() -> str | None:
     return _save_and_upload(fig, f"candidate_gallery_{tag}.png", "Candidate Gallery")
 
 
+def plot_candidate_uncertainty() -> str | None:
+    """
+    Candidate uncertainty view (#282): x = final RF probability (MC mean), y = MC spread,
+    each candidate bold red over a hexbin density background of the survey's reference
+    cloud (the seeded uniform subsample of pass-1 rejects persisted by
+    finalize_reference_cloud). Population context is the whole point: "p=0.97,
+    spread=0.05" is only interpretable against where the survey sits — and the dangerous
+    quadrant (high p, high spread: a mean that looks confident while draws swing) is
+    exactly what p alone cannot flag. The science threshold is drawn as a vertical line.
+    """
+    config = get_config()
+    tag = config.checkpoint.save_tag
+
+    db = get_db()
+    if db is None:
+        logger.info("Viz: no database instance; skipping candidate uncertainty plot")
+        return None
+    db.flush()
+    rows = db.query_inference_result(
+        tag=tag, prediction=1, columns=["mc_mean", "mc_std", "target", "frequency_mhz"]
+    )
+    rows = [r for r in rows if r.get("mc_mean") is not None and r.get("mc_std") is not None]
+
+    cloud_path = os.path.join(config.output_path, f"inference_reference_cloud_{tag}.npz")
+    cloud = None
+    if os.path.exists(cloud_path):
+        cloud = np.load(cloud_path)
+    elif config.inference.reference_cloud_size > 0:
+        logger.warning(
+            f"Viz: reference cloud {cloud_path} not found — the candidate uncertainty plot "
+            "will lack the survey background (candidates would only be compared against "
+            "each other)"
+        )
+
+    if not rows and cloud is None:
+        logger.info("Viz: no MC-scored candidates and no reference cloud; skipping plot")
+        return None
+
+    fig = Figure(figsize=(9, 7))
+    ax = fig.subplots(1, 1)
+
+    if cloud is not None and len(cloud["mc_mean"]) > 0:
+        hb = ax.hexbin(
+            cloud["mc_mean"],
+            cloud["mc_std"],
+            gridsize=60,
+            bins="log",
+            cmap="Greys",
+            mincnt=1,
+        )
+        fig.colorbar(hb, ax=ax, label="survey reference density (log count)")
+
+    if rows:
+        ax.scatter(
+            [r["mc_mean"] for r in rows],
+            [r["mc_std"] for r in rows],
+            c="red",
+            s=60,
+            marker="*",
+            zorder=5,
+            label=f"candidates ({len(rows)})",
+        )
+
+    threshold = config.inference.classification_threshold
+    ax.axvline(threshold, color="tab:blue", linestyle="--", linewidth=1.2, alpha=0.8)
+    ax.text(
+        threshold,
+        ax.get_ylim()[1],
+        f"  science threshold = {threshold}",
+        color="tab:blue",
+        fontsize=8,
+        va="top",
+    )
+
+    ax.set_xlabel(
+        "RF probability (MC mean"
+        + (", calibrated)" if config.rf.calibration_active else ", uncalibrated)")
+    )
+    ax.set_ylabel("MC spread (std of draw probabilities)")
+    cloud_note = ""
+    if cloud is not None:
+        cloud_note = (
+            f" — cloud: {int(cloud['subsample_size'])} of {int(cloud['rejects_seen'])} "
+            f"rejects, {int(cloud['mc_draws'])} draws"
+        )
+    ax.set_title(f"Candidate uncertainty vs survey population ({tag}){cloud_note}", fontsize=11)
+    if rows:
+        ax.legend(loc="upper left", fontsize=8)
+
+    return _save_and_upload(
+        fig, f"candidate_uncertainty_{tag}.png", "Candidate Uncertainty vs Survey"
+    )
+
+
 def plot_inference_latent_projection(collector: InferenceVizCollector) -> str | None:
     """Project this run's cadence-level latent features through the persisted cadence-level
     UMAP from the training run (located via the training config JSON's model_path +
@@ -1019,6 +1113,7 @@ def render_inference_visualizations(
     _viz_safe("preproc_funnel", plot_preproc_funnel, records, metadatas)
     _viz_safe("confidence_distribution", plot_confidence_distribution, records)
     _viz_safe("candidate_gallery", plot_candidate_gallery)
+    _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
     _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
     _viz_safe("inference_summary", plot_inference_summary, records, metadatas, totals)
 

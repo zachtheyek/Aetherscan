@@ -43,6 +43,8 @@ STREAM_TF = 7  # tf.random.set_seed roots — sub-keyed 0=training (then per rou
 STREAM_INFERENCE_VIZ = 8  # inference_viz latent budget-fill subsample
 STREAM_SHAP_SAMPLES = 9  # SHAP summary/interaction row subsampling (feeds cached artifacts)
 STREAM_RF_PLOTS = 10  # RF plot subsamples (sub-keyed: 0=learning curve, 1=decision boundary)
+STREAM_INFERENCE_MC = 11  # pass-2 MC latent draws (sub-keyed by the cadence's catalog index)
+STREAM_REFERENCE_CLOUD = 12  # reservoir subsample of pass-1 rejects for the reference cloud
 
 # One-shot flag so an unseeded run warns exactly once instead of per derived stream
 _UNSEEDED_WARNED = False

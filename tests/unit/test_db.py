@@ -876,3 +876,34 @@ class TestShutdownDrain:
         db.stop()
         assert db.injection_backlog_rows() == 0
         assert len(db.query_injection_stat(tag="drain_bulk")) == 500
+
+
+class TestTwoPassColumns:
+    """#282: schema v5 — inference_results carries the two-pass scores."""
+
+    def test_write_and_query_two_pass_scores(self, db):
+        db.write_inference_result(
+            npy_path="/x/a.npy",
+            snippet_index=3,
+            prediction=1,
+            confidence=0.97,
+            tag="tp_v1",
+            screening_proba=0.91,
+            mc_mean=0.97,
+            mc_std=0.03,
+        )
+        assert db.flush()
+        [row] = db.query_inference_result(
+            tag="tp_v1", columns=["screening_proba", "mc_mean", "mc_std"]
+        )
+        assert row["screening_proba"] == pytest.approx(0.91)
+        assert row["mc_mean"] == pytest.approx(0.97)
+        assert row["mc_std"] == pytest.approx(0.03)
+
+    def test_two_pass_columns_default_null(self, db):
+        db.write_inference_result(
+            npy_path="/x/b.npy", snippet_index=0, prediction=1, confidence=0.99, tag="tp_v2"
+        )
+        assert db.flush()
+        [row] = db.query_inference_result(tag="tp_v2", columns=["mc_mean", "mc_std"])
+        assert row["mc_mean"] is None and row["mc_std"] is None

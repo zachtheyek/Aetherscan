@@ -858,7 +858,25 @@ def _add_inference_flags_to(parser):
         "--classification-threshold",
         type=float,
         default=None,
-        help="Classification threshold for candidate detection",
+        help="Science threshold for candidate detection, applied to the pass-2 MC mean probability (the two-pass cascade's final score)",
+    )
+    parser.add_argument(
+        "--screening-threshold",
+        type=float,
+        default=None,
+        help="Permissive pass-1 screening threshold of the two-pass cascade (tuned for recall; must not exceed --classification-threshold). Snippets below it are rejected without MC scoring",
+    )
+    parser.add_argument(
+        "--mc-draws",
+        type=int,
+        default=None,
+        help="Seeded Monte-Carlo latent draws per pass-2 survivor (mean carries the science threshold; std is the reported uncertainty spread)",
+    )
+    parser.add_argument(
+        "--reference-cloud-size",
+        type=int,
+        default=None,
+        help="Size of the seeded uniform reservoir of pass-1 rejects MC-scored as the candidate uncertainty plot's survey background (0 disables)",
     )
 
     # Energy detection preprocessing
@@ -1340,6 +1358,12 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.config_path = args.config_path
     if hasattr(args, "classification_threshold") and args.classification_threshold is not None:
         config.inference.classification_threshold = args.classification_threshold
+    if hasattr(args, "screening_threshold") and args.screening_threshold is not None:
+        config.inference.screening_threshold = args.screening_threshold
+    if hasattr(args, "mc_draws") and args.mc_draws is not None:
+        config.inference.mc_draws = args.mc_draws
+    if hasattr(args, "reference_cloud_size") and args.reference_cloud_size is not None:
+        config.inference.reference_cloud_size = args.reference_cloud_size
     if (
         hasattr(args, "per_replica_batch_size")
         and args.per_replica_batch_size is not None
@@ -2198,6 +2222,58 @@ def collect_validation_errors(
                     fix_kind="range",
                     min_val=0.0,
                     max_val=1.0,
+                )
+            )
+
+        # Two-pass cascade (#282): the screen must be MORE permissive than the science
+        # threshold — pass 1 only exists to reject cheap certain-negatives
+        st = _resolve(args, "screening_threshold", config.inference.screening_threshold)
+        if st is not None and not (0 <= st <= 1):
+            errors.append(
+                ValidationError(
+                    field="inference.screening_threshold",
+                    current=st,
+                    message=f"--screening-threshold must satisfy 0 <= threshold <= 1, got {st}",
+                    fix_kind="range",
+                    min_val=0.0,
+                    max_val=1.0,
+                )
+            )
+        elif st is not None and ct is not None and st > ct:
+            errors.append(
+                ValidationError(
+                    field="inference.screening_threshold",
+                    current=st,
+                    message=(
+                        f"--screening-threshold ({st}) must not exceed "
+                        f"--classification-threshold ({ct}): the pass-1 screen must be the "
+                        "more permissive of the two (it can only ever REMOVE candidates)"
+                    ),
+                    fix_kind="cross_param",
+                )
+            )
+
+        mc_draws = _resolve(args, "mc_draws", config.inference.mc_draws)
+        if mc_draws is not None and mc_draws < 1:
+            errors.append(
+                ValidationError(
+                    field="inference.mc_draws",
+                    current=mc_draws,
+                    message=f"--mc-draws must be a positive integer, got {mc_draws}",
+                    fix_kind="clamp_low",
+                    min_val=1,
+                )
+            )
+
+        cloud_size = _resolve(args, "reference_cloud_size", config.inference.reference_cloud_size)
+        if cloud_size is not None and cloud_size < 0:
+            errors.append(
+                ValidationError(
+                    field="inference.reference_cloud_size",
+                    current=cloud_size,
+                    message=f"--reference-cloud-size must be >= 0, got {cloud_size}",
+                    fix_kind="clamp_low",
+                    min_val=0,
                 )
             )
 

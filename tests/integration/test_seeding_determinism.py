@@ -102,3 +102,40 @@ def test_seeding_yields_byte_identical_encoder_weights():
     assert len(weights_first) == len(weights_second)
     for w_first, w_second in zip(weights_first, weights_second, strict=True):
         np.testing.assert_array_equal(w_first, w_second)
+
+
+def test_multi_gpu_sampling_reproduces_with_seed_tensorflow():
+    """#279 acceptance: the VAE Sampling layer's draws are reproducible under
+    MirroredStrategy across multiple GPUs when seeded via seeding.seed_tensorflow — the
+    stream inference relies on for repeatable candidate sets (single-GPU coverage lives in
+    tests/unit/test_models.py; this pins the multi-replica path, which had none)."""
+    if shutil.which("nvidia-smi") is None:
+        pytest.skip("requires a GPU host (nvidia-smi not found)")
+
+    import tensorflow as tf  # noqa: PLC0415
+
+    from aetherscan.models.vae import Sampling  # noqa: PLC0415
+    from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if len(gpus) < 2:
+        pytest.skip("requires >= 2 GPUs for a multi-replica MirroredStrategy")
+
+    strategy = tf.distribute.MirroredStrategy(devices=["/GPU:0", "/GPU:1"])
+    layer = Sampling()
+    z_mean = tf.zeros((8, 4))
+    z_log_var = tf.zeros((8, 4))
+
+    def _sample_once() -> np.ndarray:
+        seed_tensorflow(_SEED, False, 1, 3)
+
+        def replica_fn():
+            return layer([z_mean, z_log_var])
+
+        per_replica = strategy.run(replica_fn)
+        local = strategy.experimental_local_results(per_replica)
+        return np.concatenate([r.numpy() for r in local], axis=0)
+
+    first = _sample_once()
+    second = _sample_once()
+    np.testing.assert_array_equal(first, second)

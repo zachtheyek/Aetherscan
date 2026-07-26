@@ -412,7 +412,9 @@ options:
 The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py train` (container) or `PYTHONPATH=src python utils/print_cli_help.py train` (source).
 
 ```
-usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+usage: train [-h] [--seed SEED]
+             [--tf-deterministic-ops | --no-tf-deterministic-ops]
+             [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
              [--dashboard-port DASHBOARD_PORT]
              [--benchmark-report | --no-benchmark-report]
@@ -433,8 +435,7 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--num-target-backgrounds NUM_TARGET_BACKGROUNDS]
              [--background-load-chunk-size BACKGROUND_LOAD_CHUNK_SIZE]
              [--max-chunks-per-file MAX_CHUNKS_PER_FILE]
-             [--train-files TRAIN_FILES [TRAIN_FILES ...]] [--seed SEED]
-             [--tf-deterministic-ops | --no-tf-deterministic-ops]
+             [--train-files TRAIN_FILES [TRAIN_FILES ...]]
              [--num-training-rounds NUM_TRAINING_ROUNDS]
              [--epochs-per-round EPOCHS_PER_ROUND]
              [--num-samples-beta-vae NUM_SAMPLES_BETA_VAE]
@@ -479,6 +480,19 @@ usage: train [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
 
 options:
   -h, --help            show this help message and exit
+  --seed SEED           Root random seed for reproducible runs: every random
+                        stream derives from it — data generation, dataset
+                        split/shuffles, TF weight init, the VAE sampling layer
+                        (training AND inference), the random forest,
+                        UMAP/KMeans plot fits, and plot subsampling. Defaults
+                        to a concrete value (reproducible out of the box);
+                        must be >= 0.
+  --tf-deterministic-ops, --no-tf-deterministic-ops
+                        Force deterministic TensorFlow/cuDNN op
+                        implementations
+                        (tf.config.experimental.enable_op_determinism) for
+                        bit-exact GPU reproducibility at some speed cost. Only
+                        meaningful together with a seed (default: disabled)
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -524,7 +538,10 @@ options:
   --rf-n-jobs RF_N_JOBS
                         Number of parallel jobs for random forest training (-1
                         uses all CPU cores)
-  --rf-seed RF_SEED     Random seed for random forest reproducibility
+  --rf-seed RF_SEED     DEPRECATED: explicit random forest seed override. The
+                        RF seed now derives from the root --seed (#279); this
+                        alias remains for existing scripts and logs a
+                        deprecation warning when used.
   --num-replicas NUM_REPLICAS
                         Number of GPUs to use for the distributed strategy. If
                         omitted, the strategy uses every GPU visible to TF;
@@ -573,18 +590,6 @@ options:
   --train-files TRAIN_FILES [TRAIN_FILES ...]
                         Space-separated list of training data file names
                         (e.g., real_filtered_LARGE_HIP110750.npy)
-  --seed SEED           Root random seed for reproducible runs: seeds data
-                        generation, dataset split/shuffles, TF weight init,
-                        and the VAE sampling layer (the random forest is
-                        seeded separately via --rf-seed). Omit for OS-entropy
-                        (non-reproducible) behavior. Must be >= 0.
-  --tf-deterministic-ops, --no-tf-deterministic-ops
-                        Force deterministic TensorFlow/cuDNN op
-                        implementations
-                        (tf.config.experimental.enable_op_determinism) for
-                        bit-exact GPU reproducibility at some training-speed
-                        cost. Only meaningful together with --seed (default:
-                        disabled)
   --num-training-rounds NUM_TRAINING_ROUNDS
                         Total number of training rounds in curriculum learning
                         schedule
@@ -756,7 +761,9 @@ options:
 The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py inference` (container) or `PYTHONPATH=src python utils/print_cli_help.py inference` (source).
 
 ```
-usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
+usage: inference [-h] [--seed SEED]
+                 [--tf-deterministic-ops | --no-tf-deterministic-ops]
+                 [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
                  [--dashboard-port DASHBOARD_PORT]
                  [--benchmark-report | --no-benchmark-report]
@@ -769,6 +776,9 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--config-path CONFIG_PATH]
                  [--per-replica-batch-size PER_REPLICA_BATCH_SIZE]
                  [--classification-threshold CLASSIFICATION_THRESHOLD]
+                 [--screening-threshold SCREENING_THRESHOLD]
+                 [--mc-draws MC_DRAWS]
+                 [--reference-cloud-size REFERENCE_CLOUD_SIZE]
                  [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
@@ -794,6 +804,19 @@ usage: inference [-h] [--data-path DATA_PATH] [--model-path MODEL_PATH]
 
 options:
   -h, --help            show this help message and exit
+  --seed SEED           Root random seed for reproducible runs: every random
+                        stream derives from it — data generation, dataset
+                        split/shuffles, TF weight init, the VAE sampling layer
+                        (training AND inference), the random forest,
+                        UMAP/KMeans plot fits, and plot subsampling. Defaults
+                        to a concrete value (reproducible out of the box);
+                        must be >= 0.
+  --tf-deterministic-ops, --no-tf-deterministic-ops
+                        Force deterministic TensorFlow/cuDNN op
+                        implementations
+                        (tf.config.experimental.enable_op_determinism) for
+                        bit-exact GPU reproducibility at some speed cost. Only
+                        meaningful together with a seed (default: disabled)
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -856,7 +879,21 @@ options:
   --per-replica-batch-size PER_REPLICA_BATCH_SIZE
                         Batch size per GPU/device replica during inference
   --classification-threshold CLASSIFICATION_THRESHOLD
-                        Classification threshold for candidate detection
+                        Science threshold for candidate detection, applied to
+                        the pass-2 MC mean probability (the two-pass cascade's
+                        final score)
+  --screening-threshold SCREENING_THRESHOLD
+                        Permissive pass-1 screening threshold of the two-pass
+                        cascade (tuned for recall; must not exceed
+                        --classification-threshold). Snippets below it are
+                        rejected without MC scoring
+  --mc-draws MC_DRAWS   Seeded Monte-Carlo latent draws per pass-2 survivor
+                        (mean carries the science threshold; std is the
+                        reported uncertainty spread)
+  --reference-cloud-size REFERENCE_CLOUD_SIZE
+                        Size of the seeded uniform reservoir of pass-1 rejects
+                        MC-scored as the candidate uncertainty plot's survey
+                        background (0 disables)
   --cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]
                         Space-separated list of CSV column names whose joint
                         value defines cadence membership (e.g., Target Session
