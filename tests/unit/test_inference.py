@@ -293,3 +293,21 @@ class TestReferenceCloudReservoir:
         reservoir.offer(*self._rows(6))
         _, _, screening = reservoir.arrays()
         assert len(screening) == 0
+
+    def test_rng_consumption_pattern_is_frozen(self):
+        # GOLDEN test: pins the exact rng-consumption pattern of offer()'s vectorized
+        # replacement phase (one rng.random(batch) acceptance draw, then one
+        # rng.integers(batch) slot draw, ALWAYS both, regardless of acceptance count).
+        # A same-seed-twice comparison cannot catch a refactor that reorders these calls —
+        # both sides would drift together — so the surviving items are frozen here.
+        # Regenerate the goldens ONLY for a deliberate, documented stream change.
+        reservoir = ReferenceCloudReservoir(capacity=3, rng=np.random.default_rng(123))
+        for chunk in range(4):
+            mean = (np.arange(5, dtype=np.float32) + 10 * chunk).reshape(5, 1)
+            log_var = np.full((5, 1), -2.0, dtype=np.float32)
+            screening = (np.arange(5, dtype=np.float32) + 10 * chunk) / 100.0
+            reservoir.offer(mean, log_var, screening.astype(np.float32))
+        mean_rows, _, screening_vals = reservoir.arrays()
+        assert reservoir.seen == 20
+        np.testing.assert_array_equal(mean_rows[:, 0], [14.0, 20.0, 22.0])
+        np.testing.assert_allclose(screening_vals, [0.14, 0.20, 0.22], atol=1e-6)
