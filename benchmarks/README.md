@@ -17,6 +17,9 @@ python benchmarks/bench_pfb_vs_spline.py        # PFB static equalization vs per
 python benchmarks/bench_rf.py                    # Random Forest stage: latent prep + fit + predict
 # On the clusters, run through the container:
 ./utils/run_container.sh python benchmarks/bench_normality.py
+# Container-only (need the full TF/umap stack; bench_input_pipeline's step mode needs GPUs):
+./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode iterate --variant current
+./utils/run_container.sh python benchmarks/bench_latent_gif.py --mode all
 ```
 
 `bench_gpu.py` is a different animal — it profiles the Beta-VAE on a real GPU (throughput +
@@ -38,6 +41,8 @@ comparing against the baselines.
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` (static response divide) vs `preprocessing._spline_flatten_bandpass` (order-16 fit) on one 1M-bin coarse channel | Bandpass flattening inside energy detection |
 | `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one or more GPUs | VAE training (`train.round_XX`) and encoder inference — **GPU-only, see below** |
 | `bench_rf.py` | `RandomForestClassifier` fit + `predict_proba` and the `prepare_latent_features` reshape (sklearn, CPU) | Second-stage RF training + inference (`train.train_random_forest`) |
+| `bench_input_pipeline.py` | The REAL memmap → tf.data → distribute → train-step input path (gather / iterate / step modes; legacy vs current builder; `--gil-load` contention knob) — **container-only; step mode needs GPUs** | The training input pipeline `bench_gpu.py` deliberately excludes (`train.prepare_distributed_train_dataset`) — see [#276 audit](#input-pipeline-audit-276) |
+| `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / frame render / GIF assembly) with output-equality checks on every candidate optimization — **container-only** | The `vae_plots` latent-GIF tail (`train.plot_latent_space_gif`) — see [#278 audit](#latent-gif-audit-278) |
 
 ## Baseline numbers
 
@@ -177,3 +182,59 @@ replicas (all-reduce overhead eats the rest). `--accumulation-steps 4` raises th
 all-reduce — per 4 micro-batches instead of every step, amortizing that fixed per-apply overhead over
 4× as many cadences; the cost is the persistent gradient accumulator's VRAM (3.21 → 9.91 GB/GPU). At
 the default batch 128, training uses ~2.8 GB/GPU — comfortably within the 16 GB budget.
+
+
+## Input-pipeline audit (#276)
+
+`bench_input_pipeline.py` closes the gap `bench_gpu.py` documents (synthetic in-memory tensors,
+no input path): it synthesizes an on-disk round of the production layout and measures the real
+memmap → tf.data → distribute → train-step path, with a verbatim replica of the pre-#276
+single-generator builder (`--variant legacy`) for before/after. Numbers below from blpc3
+(5× RTX PRO 6000, 32 cores, NGC 25.02, July 2026; 20k-sample synthetic round, page-cache
+resident — the same regime the live-run audit measured).
+
+| measurement | legacy | current (#276) |
+|---|---|---|
+| raw numpy gather (single thread, no tf.data) | 11,815 samples/s (~7.0 GB/s) | — |
+| iterate, 1 replica, batch 128, idle host | 4,790 samples/s | 3,031 samples/s |
+| iterate + 1 GIL-load thread (DB-drainer-shaped work) | 1,708 samples/s (−64%) | 1,478 samples/s |
+| **step: real VAE train step, 5 GPUs, accum 12** | **1,043 cad/s** | **1,407 cad/s (+35%)** |
+| step, current + `--tf-deterministic-ops` | — | 1,307 cad/s (−7% vs current) |
+
+Audit conclusions (the #276 "name the bottleneck first" deliverable):
+
+1. **The host copy is not the bottleneck** — a single thread gathers ~7 GB/s from the
+   page-cache-resident memmaps, ~2.5× the volume the 5-GPU consumer needs.
+2. **GIL contention is the dominant mechanism**: one background thread doing
+   `write_injection_stat`-shaped pure-Python work (the #277 drainer flood, ~300K calls per
+   producer message) costs the single-threaded legacy producer **64%** of its throughput.
+   This is the measured #276 × #277 interaction — #277's bulk write API removes ~all of that
+   Python-call volume, and the parallel gather spreads what remains across tf.data workers.
+3. **End to end, the #276 index-generator + parallel-gather builder is worth +35%** on the
+   real 5-GPU train step. In the *uncontended single-replica iterate* microbenchmark the
+   parallel map is actually slower than the plain generator (per-batch `tf.numpy_function`
+   overhead with no overlap to hide it) — the win comes from overlapping gathers with GPU
+   compute at real global batch sizes, which is the regime that matters.
+4. `--tf-deterministic-ops` costs ~7% end-to-end on this path (deterministic kernels + ordered
+   tf.data) — the price of bit-exact reproducibility, now quantified.
+
+## Latent-GIF audit (#278)
+
+`bench_latent_gif.py` decomposes the ~24–29 h `vae_plots` GIF tail and gates every candidate
+optimization on output equality (issue #278 requires the produced GIFs unchanged). blpc3
+numbers (48 frames × 23,040 obs-level points, fit pool 100k, n_neighbors 15):
+
+| phase | baseline | optimized | output identical? |
+|---|---|---|---|
+| render (pre-#278 per-frame figure loop) | 7.25 s (0.15 s/frame) | pool 1 worker: 4.81 s; **32 workers: 1.01 s (7.2×)** | **yes — byte-identical PNGs** |
+| UMAP fit (direct) | 62.6 s | precomputed-knn reuse: 3.3 + 38.6 s | **NO** (max abs diff 13.8) |
+| transforms (500-call serial) | 213 s | one batched call: 193 s (−9%) | **NO** (max abs diff 11.6) |
+| GIF assembly (imageio) | 1.6 s | — | — |
+
+Only the render parallelization shipped (`aetherscan.latent_gif`, byte-identical by
+construction and pinned by test). Precomputed-knn reuse and batched transforms are **rejected
+with numbers**: both change how UMAP consumes its `random_state` stream, so they produce a
+*different* (equally deterministic) embedding — a violation of #278's output-identity
+constraint for a ~9% / ~24 s-per-fit saving. The two other UMAP sites #278 flags land at
+benchmark scale: decision-boundary fit 10.2 s + inverse-transform grid 29.4 s per combo, and
+SHAP-space UMAP 9.4 s + KMeans 4.1 s — minutes per run, not hours; deferred.

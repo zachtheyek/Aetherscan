@@ -332,6 +332,10 @@ def _run_step(data, args, variant) -> dict:
     strategy = tf.distribute.MirroredStrategy(devices=[f"/GPU:{i}" for i in range(args.num_gpus)])
     with strategy.scope():
         model = create_beta_vae_model()
+        # Build the Adam slot variables NOW, inside scope, so they mirror across replicas —
+        # lazy slot creation at the first eager apply_gradients would place them on GPU:0
+        # only and the multi-replica update then fails with a cross-device resource error
+        model.optimizer.build(model.trainable_variables)
 
     built = _build_datasets(variant, data, args, strategy, num_replicas=args.num_gpus)
     iterator = iter(built["train_dataset"])
@@ -353,9 +357,17 @@ def _run_step(data, args, variant) -> dict:
         grads = [strategy.reduce(tf.distribute.ReduceOp.MEAN, g, axis=None) for g in per_grads]
         return loss, grads
 
+    @tf.function
+    def apply_gradients_fn(gradients):
+        # Mirrors train.py's _apply_gradients exactly: a tf.function that clips by global
+        # norm and applies — inside tf.function the optimizer update routes through the
+        # captured distribution strategy correctly (an eager apply hits merge_call errors)
+        clipped, _ = tf.clip_by_global_norm(gradients, _CLIP_NORM)
+        model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
+
     def optimizer_step():
         # Mirrors _train_epoch: sum reduced grads over accumulation sub-steps in Python,
-        # average, clip by global norm, apply once
+        # average, clip + apply once via the tf.function above
         accumulated = None
         for _ in range(accumulation_steps):
             _, grads = micro_step(next(iterator))
@@ -364,8 +376,7 @@ def _run_step(data, args, variant) -> dict:
             else:
                 accumulated = [a + g for a, g in zip(accumulated, grads, strict=False)]
         averaged = [a / accumulation_steps for a in accumulated]
-        clipped, _ = tf.clip_by_global_norm(averaged, _CLIP_NORM)
-        model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
+        apply_gradients_fn(averaged)
 
     for _ in range(args.warmup):
         optimizer_step()
@@ -453,6 +464,9 @@ def main() -> None:
         init_config()
         if args.deterministic_ops:
             tf.config.experimental.enable_op_determinism()
+            # Deterministic ops REQUIRE seeded random ops (the VAE Sampling layer draws
+            # tf.random.normal); the production pipeline is likewise always seeded (#279)
+            tf.random.set_seed(0)
 
     stop_event = threading.Event()
     hogs = [
