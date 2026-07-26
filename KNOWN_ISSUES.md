@@ -633,3 +633,13 @@ No action required. The alert is not exploitable in this project's usage.
 ### Related Code
 
 `pyproject.toml` / `requirements-container.txt` / `environment.yml` (the `setuptools>=78.1.1,<81` pin and its rationale comment), issue #4 (the `pkg_resources`/`blimpy` coupling that fixes the `<81` ceiling).
+
+## Pre-#283 saved configs: `training.seed` / `training.tf_deterministic_ops` are silently skipped on restore
+
+PR #283 (issue #279) moved the root seed to `reproducibility.seed` (new default **11**) and
+`tf_deterministic_ops` alongside it. `apply_saved_config` skips unknown keys by design, so
+reloading a `config_{tag}.json` written **before** #283 silently ignores the old
+`training.seed` / `training.tf_deterministic_ops` values and the run uses the new defaults
+instead. **Workaround:** pass the old value explicitly (`--seed N` / `--tf-deterministic-ops`
+— both flags now exist on `train` *and* `inference`). Same clean-break precedent as the #272
+tag-scheme change.

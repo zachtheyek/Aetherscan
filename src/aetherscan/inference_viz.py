@@ -813,7 +813,10 @@ def plot_candidate_uncertainty() -> str | None:
     cloud_path = os.path.join(config.output_path, f"inference_reference_cloud_{tag}.npz")
     cloud = None
     if os.path.exists(cloud_path):
-        cloud = np.load(cloud_path)
+        # Materialize the arrays and close the archive immediately — an NpzFile keeps its
+        # file handle open until GC, which would leak on this function's early returns
+        with np.load(cloud_path) as cloud_npz:
+            cloud = {key: cloud_npz[key] for key in cloud_npz.files}
     elif config.inference.reference_cloud_size > 0:
         logger.warning(
             f"Viz: reference cloud {cloud_path} not found — the candidate uncertainty plot "

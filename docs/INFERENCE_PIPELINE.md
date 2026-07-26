@@ -251,7 +251,11 @@ For one cadence's snippet array `(n, 6, 16, 512)`:
    positives are expected to be vanishingly rare), where `proba_true` is the MC mean for
    pass-2 survivors and the pass-1 score for rejects. The stored `confidence` is the
    probability of the **predicted** class — `proba_true` for candidates, `1 − proba_true`
-   for rejections — so a confident rejection also reads as ~1.0.
+   for rejections — so a confident rejection also reads as ~1.0. Note the semantic shift
+   from pre-#282 rows: under an active calibrator the negative-class confidence is the
+   complement of the *calibrated* positive score, not the raw RF's class-0 probability
+   (`1 − cal(p₁) ≠ cal(p₀)` in general) — every persisted probability now lives on the one
+   deployed scale.
 5. `_write_inference_results()` writes **positives only** to `inference_results` (a deliberate
    size trade — see [`DATABASE.md`](DATABASE.md)), each row carrying: snippet index (== row
    in the `.npy`), confidence, the flattened 48-dim latent vector (the deterministic `z_mean`

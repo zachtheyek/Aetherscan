@@ -2882,7 +2882,7 @@ class TrainingPipeline:
             logger.info(f"LATENT VARIANT WINNER: '{winner}' (selection recalls: {recall_summary})")
             # MC coherence note for the record (docs carry the full explanation): only a
             # z-trained forest makes MC averaging a true posterior-predictive expectation
-            if winner in ("z",):
+            if winner == "z":
                 logger.info(
                     "MC semantics: the winner trains on sampled z, so pass-2 MC averaging is "
                     "a posterior-predictive expectation"

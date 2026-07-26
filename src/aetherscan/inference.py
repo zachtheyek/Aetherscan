@@ -224,18 +224,33 @@ class ReferenceCloudReservoir:
     ) -> None:
         if self.capacity <= 0:
             return
-        for row_index in range(len(mean_flat)):
+        n_rows = len(mean_flat)
+        start = 0
+        # Fill phase (rare: only until the reservoir reaches capacity)
+        while start < n_rows and len(self._mean_rows) < self.capacity:
+            self._mean_rows.append(np.array(mean_flat[start]))
+            self._log_var_rows.append(np.array(log_var_flat[start]))
+            self._screening.append(float(screening_probas[start]))
             self.seen += 1
-            if len(self._mean_rows) < self.capacity:
-                self._mean_rows.append(np.array(mean_flat[row_index]))
-                self._log_var_rows.append(np.array(log_var_flat[row_index]))
-                self._screening.append(float(screening_probas[row_index]))
-            else:
-                slot = int(self.rng.integers(0, self.seen))
-                if slot < self.capacity:
-                    self._mean_rows[slot] = np.array(mean_flat[row_index])
-                    self._log_var_rows[slot] = np.array(log_var_flat[row_index])
-                    self._screening[slot] = float(screening_probas[row_index])
+            start += 1
+        if start >= n_rows:
+            return
+
+        # Replacement phase, vectorized (this runs for every reject batch of the survey, so
+        # the per-row Python loop it replaces was a real cost): item t (1-indexed global
+        # count) is accepted with probability capacity/t and lands in a uniform slot —
+        # textbook algorithm R, with one rng call per batch instead of one per row
+        remaining = n_rows - start
+        t_values = self.seen + 1 + np.arange(remaining)
+        accepted = self.rng.random(remaining) < (self.capacity / t_values)
+        slots = self.rng.integers(0, self.capacity, size=remaining)
+        self.seen += remaining
+        for offset in np.nonzero(accepted)[0]:
+            row_index = start + int(offset)
+            slot = int(slots[offset])
+            self._mean_rows[slot] = np.array(mean_flat[row_index])
+            self._log_var_rows[slot] = np.array(log_var_flat[row_index])
+            self._screening[slot] = float(screening_probas[row_index])
 
     def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not self._mean_rows:
@@ -493,9 +508,15 @@ class InferencePipeline:
                 mc_std = np.full(n_samples, np.nan, dtype=np.float32)
                 survivor_idx = np.nonzero(survivors)[0]
                 if len(survivor_idx):
-                    mc_rng = derive_rng(
-                        self.config.reproducibility.seed, STREAM_INFERENCE_MC, seed_key or 0
+                    # None gets the BARE stream key, a real cadence index its own sub-key:
+                    # SeedSequence([root, id]) and SeedSequence([root, id, 0]) are distinct,
+                    # so a keyless legacy call can never collide with catalog cadence 0
+                    mc_key = (
+                        (STREAM_INFERENCE_MC,)
+                        if seed_key is None
+                        else (STREAM_INFERENCE_MC, seed_key)
                     )
+                    mc_rng = derive_rng(self.config.reproducibility.seed, *mc_key)
                     draw_scores = np.empty((self.mc_draws, len(survivor_idx)))
                     for draw_index in range(self.mc_draws):
                         draw_flat = sample_z_flat(
@@ -518,7 +539,12 @@ class InferencePipeline:
                     del draw_scores
 
                 # Final score: MC mean for survivors, the pass-1 score otherwise; the
-                # science threshold applies to the final score
+                # science threshold applies to the final score. Confidence of a NEGATIVE is
+                # 1 - final score on the DEPLOYED (calibrated when active) scale — a
+                # deliberate semantic choice: the old probas[:, 0] equalled 1 - p only on
+                # the raw scale, and a calibrator fit on the positive marginal does not
+                # commute with the complement (1 - cal(p1) != cal(p0) in general). All
+                # persisted/reported probabilities live on one scale this way.
                 proba_true = np.where(survivors, np.nan_to_num(mc_mean), screening_probas)
                 predictions = (proba_true > self.threshold).astype(int)
                 confidence_scores = np.where(predictions, proba_true, 1.0 - proba_true)
@@ -587,7 +613,7 @@ class InferencePipeline:
         dataset: tf.distribute.DistributedDataset,
         n_samples: int,
         n_steps: int,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Encode `n_steps` worth of batches from a distributed `dataset` into pre-allocated
         (n_samples * num_observations, latent_dim) arrays of z_mean and z_log_var — the
@@ -708,6 +734,12 @@ class InferencePipeline:
         tag = self.config.checkpoint.save_tag
         n_candidates = 0
 
+        def _optional_float(values, index):
+            if values is None:
+                return None
+            value = float(values[index])
+            return None if np.isnan(value) else value
+
         for idx in range(len(confidence_scores)):
             confidence = float(confidence_scores[idx])
             prediction = int(predictions[idx])
@@ -726,12 +758,6 @@ class InferencePipeline:
                 latent_rows = latents[
                     idx * self.num_observations : (idx + 1) * self.num_observations
                 ]
-
-                def _optional_float(values, index):
-                    if values is None:
-                        return None
-                    value = float(values[index])
-                    return None if np.isnan(value) else value
 
                 self.db.write_inference_result(
                     npy_path=npy_path,
@@ -808,6 +834,12 @@ class InferencePipeline:
             root_seed=np.int64(
                 -1 if self.config.reproducibility.seed is None else self.config.reproducibility.seed
             ),
+            # Explicit stream provenance so a reader can reproduce the cloud without
+            # reverse-engineering the derivation: the reservoir consumes
+            # derive_rng(root, STREAM_REFERENCE_CLOUD) and the MC scoring
+            # derive_rng(root, STREAM_REFERENCE_CLOUD, 1)
+            reservoir_stream_id=np.int64(STREAM_REFERENCE_CLOUD),
+            mc_stream_key=np.array([STREAM_REFERENCE_CLOUD, 1], dtype=np.int64),
         )
         logger.info(f"Reference cloud persisted to {cloud_path}")
         return cloud_path

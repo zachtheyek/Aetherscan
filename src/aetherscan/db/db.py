@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 import numpy as np
@@ -1240,8 +1240,30 @@ class Database:
                     self._bulk_pending_by_round[round_key] = (
                         self._bulk_pending_by_round.get(round_key, 0) + count
                     )
-            # Blocks when the lane is full (bounded queue) — the backpressure is the point
-            self.bulk_queue.put(("injection_stats", chunk, chunk_counts))
+            # Blocks when the lane is full (bounded queue) — the backpressure is the point.
+            # But never blocks FOREVER: a bounded put with no consumer would deadlock the
+            # enqueuer if the writer died after the liveness check above, so re-check
+            # liveness on every timeout and fall back to an inline write if it's gone
+            while True:
+                if self.writer_thread is None or not self.writer_thread.is_alive():
+                    logger.warning(
+                        "DB writer thread died while the bulk lane was full - writing "
+                        f"{len(chunk)} injection row(s) inline"
+                    )
+                    self._flush_buffer([("injection_stats", values) for values in chunk])
+                    with self._bulk_pending_lock:
+                        for round_key, count in chunk_counts.items():
+                            remaining = self._bulk_pending_by_round.get(round_key, 0) - count
+                            if remaining > 0:
+                                self._bulk_pending_by_round[round_key] = remaining
+                            else:
+                                self._bulk_pending_by_round.pop(round_key, None)
+                    break
+                try:
+                    self.bulk_queue.put(("injection_stats", chunk, chunk_counts), timeout=5.0)
+                    break
+                except Full:
+                    continue
 
     def injection_backlog_rows(self, max_round: int | None = None) -> int:
         """

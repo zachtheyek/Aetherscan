@@ -201,3 +201,11 @@ class TestCalibrator:
     def test_identity_when_none(self):
         raw = np.linspace(0, 1, 11)
         np.testing.assert_array_equal(apply_probability_calibrator(None, raw), raw)
+
+    def test_ece_hand_computed_quantile_bins(self):
+        # 4 probabilities, 2 quantile bins of 2: bin1 = {0.1, 0.2} (mean 0.15, frac pos 0.5),
+        # bin2 = {0.8, 0.9} (mean 0.85, frac pos 0.5) ->
+        # ECE = 0.5*|0.5-0.15| + 0.5*|0.5-0.85| = 0.35
+        labels = np.array([0, 1, 0, 1])
+        probas = np.array([0.1, 0.2, 0.8, 0.9])
+        assert expected_calibration_error(labels, probas, n_bins=2) == pytest.approx(0.35)

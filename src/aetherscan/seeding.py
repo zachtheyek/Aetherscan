@@ -46,7 +46,10 @@ STREAM_RF_PLOTS = 10  # RF plot subsamples (sub-keyed: 0=learning curve, 1=decis
 STREAM_INFERENCE_MC = 11  # pass-2 MC latent draws (sub-keyed by the cadence's catalog index)
 STREAM_REFERENCE_CLOUD = 12  # reservoir subsample of pass-1 rejects for the reference cloud
 
-# One-shot flag so an unseeded run warns exactly once instead of per derived stream
+# One-shot flag so an unseeded run warns exactly once instead of per derived stream.
+# Module-level, so the "once" is PER PROCESS: forkserver/spawn workers each carry their own
+# copy and may repeat the warning in their own logs — intentional (each worker's log is
+# self-contained), not a bug.
 _UNSEEDED_WARNED = False
 
 
