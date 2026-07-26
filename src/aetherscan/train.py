@@ -518,12 +518,15 @@ def prepare_distributed_train_dataset(
     true_only_eti, true_eti_rfi) — generation lays labels out sequentially within chunks, so a
     naive positional split would over-represent later signal types in val.
 
-    The generators yield whole GLOBAL batches (leading batch dim in the output signature; no
-    .batch() call downstream): each batch gathers sorted fancy indices from the memmaps, cutting
-    the per-sample Python/tf.data boundary crossings by a factor of the global batch size — the
-    per-sample yields were the main source of the 0-14 % GPU utilization. Randomness lives at
-    the epoch level (train_indices are reshuffled each pass); sorting *within* a batch only
-    improves memmap read locality and the model is order-invariant within a batch.
+    The datasets are built as cheap index generators (whole GLOBAL batches of row indices;
+    leading batch dim in the output signature, no .batch() call downstream) followed by a
+    parallel, deterministic .map() that performs the sorted fancy-index gathers from the
+    memmaps on tf.data worker threads (#276: a single generator thread doing the gathers
+    starved the GPUs; batching the yields had earlier fixed the per-sample-yield version of
+    the same problem). deterministic=True preserves the exact batch order of the index stream,
+    so parallelism changes throughput only, never epoch composition or ordering. Randomness
+    lives at the epoch level (train_indices are reshuffled each pass); sorting *within* a batch
+    only improves memmap read locality and the model is order-invariant within a batch.
 
     Page-cache framing: gathering from the memmaps pulls pages through the OS page cache, so
     after the first epoch a round's ~294 GB (at full-scale defaults) is served at RAM speed from
@@ -612,21 +615,18 @@ def prepare_distributed_train_dataset(
     # only one global batch is materialized at a time.
     train_holder = TrainDataHolder(data["concatenated"], data["true"], data["false"])
 
-    # Create generator functions yielding whole global batches gathered from the (memmap)
-    # arrays — see the docstring for the batching/locality/page-cache rationale
-    def train_generator():
+    # Create index-generator functions yielding whole GLOBAL batches of row indices. The
+    # (expensive) memmap gathers happen in a parallel, deterministic .map() below, OFF the
+    # single generator thread (#276: the one-thread from_generator producer starved the GPUs).
+    # All randomness stays in the generators, so the epoch-level rng consumption order — and
+    # therefore the #49 reproducibility contract (same seed => same split AND same per-epoch
+    # batch order) — is byte-identical to the previous single-generator implementation.
+    def train_index_generator():
         while True:  # Make generators infinite to reset state between epochs
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
             with train_holder._lock:
                 if train_holder._cleared:
                     return  # Exit if data already cleared
-                # Cache references while holding lock
-                concat = train_holder.concat
-                true = train_holder.true
-                false = train_holder.false
 
-            # Work with local references (safe from clearing, no per-batch lock needed)
             # Copy train_indices because rng.shuffle mutates in-place
             indices = train_indices.copy()
             if shuffle:
@@ -638,59 +638,85 @@ def prepare_distributed_train_dataset(
                     # Within-batch sorted order improves memmap read locality; random batch
                     # membership is already guaranteed by the epoch-level shuffle above
                     batch_indices = np.sort(batch_indices)
-                concat_batch = concat[batch_indices]
-                yield (concat_batch, true[batch_indices], false[batch_indices]), concat_batch
+                yield batch_indices.astype(np.int64, copy=False)
 
-            # Remove cache references to ensure garbage collection in future
-            del concat, true, false
-
-    def val_generator():
+    def val_index_generator():
         while True:  # Make generators infinite to reset state between epochs
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
             with train_holder._lock:
                 if train_holder._cleared:
                     return  # Exit if data already cleared
-                # Cache references while holding lock
-                concat = train_holder.concat
-                true = train_holder.true
-                false = train_holder.false
 
             # Maintain val_indices order on each epoch (already sorted above): no gradients are
             # calculated during validation, and train_random_forest relies on the i-th encoded
             # val cadence corresponding to val_indices[i]
             for start in range(0, len(val_indices), global_val_batch_size):
-                batch_indices = val_indices[start : start + global_val_batch_size]
-                concat_batch = concat[batch_indices]
-                yield (concat_batch, true[batch_indices], false[batch_indices]), concat_batch
+                yield val_indices[start : start + global_val_batch_size].astype(
+                    np.int64, copy=False
+                )
 
-            # Remove cache references to ensure garbage collection in future
-            del concat, true, false
-
-    # Determine dataset output signature: the generators yield whole global batches, so the
-    # specs carry a leading (None) batch dimension and no .batch() call is applied downstream
+    # Determine the gathered-batch shape: the map below emits whole global batches, so the
+    # tensors carry a leading (None) batch dimension and no .batch() call is applied downstream
     sample_shape = data["concatenated"].shape[1:]
-    batch_spec = tf.TensorSpec(shape=(None, *sample_shape), dtype=tf.float32)
-    output_signature = ((batch_spec, batch_spec, batch_spec), batch_spec)
 
-    # Create datasets using generators to reduce GPU memory pressure
-    # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the generators yield data in global batches before being sharded (distributed)
-    # across replicas, ensuring per replica batch sizes match expectations
+    def gather_batch(batch_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Gather one global batch from the shared holder arrays. Runs on tf.data's map worker
+        threads — numpy releases the GIL during the (large, contiguous-dtype) fancy-index
+        copies, so several gathers genuinely proceed in parallel.
+        """
+        with train_holder._lock:
+            if train_holder._cleared:
+                # In-flight map calls can land after clear(); the step-counted consumers never
+                # read past their epoch budgets, so these placeholder batches are never consumed.
+                empty = np.empty((0, *sample_shape), dtype=np.float32)
+                return empty, empty, empty
+            concat = train_holder.concat
+            true = train_holder.true
+            false = train_holder.false
+
+        return (
+            concat[batch_indices].astype(np.float32, copy=False),
+            true[batch_indices].astype(np.float32, copy=False),
+            false[batch_indices].astype(np.float32, copy=False),
+        )
+
+    index_spec = tf.TensorSpec(shape=(None,), dtype=tf.int64)
+
+    def map_gather(batch_indices):
+        concat_batch, true_batch, false_batch = tf.numpy_function(
+            gather_batch,
+            [batch_indices],
+            [tf.float32, tf.float32, tf.float32],
+            stateful=False,
+        )
+        # numpy_function erases static shape info; restore it so the strategy can split the
+        # leading batch dimension across replicas
+        for tensor in (concat_batch, true_batch, false_batch):
+            tensor.set_shape((None, *sample_shape))
+        return (concat_batch, true_batch, false_batch), concat_batch
+
+    # Create datasets from the index generators + parallel gather map. Data is kept on CPU &
+    # transferred to GPU in batches on-demand; the map emits whole global batches which are
+    # then sharded (distributed) across replicas, so per-replica batch sizes match expectations.
+    # deterministic=True keeps the emitted batch ORDER identical to the index stream even with
+    # parallel in-flight gathers (and matches --tf-deterministic-ops semantics, which would
+    # force it anyway).
     logger.info(
-        f"Creating infinite batched datasets from generators with global batch size - "
+        f"Creating infinite batched datasets from index generators with global batch size - "
         f"Train: {global_train_batch_size}, Val: {global_val_batch_size}"
     )
 
     train_dataset = (
-        tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
+        tf.data.Dataset.from_generator(train_index_generator, output_signature=index_spec)
+        .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
 
     val_dataset = (
-        tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
+        tf.data.Dataset.from_generator(val_index_generator, output_signature=index_spec)
         # NOTE: do we need repeat for val dataset? run test without repeat & see if anything breaks?
+        .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)
     )
