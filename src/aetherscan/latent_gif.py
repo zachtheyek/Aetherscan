@@ -50,9 +50,13 @@ class FrameCategory:
 def batched_umap_transform(model, coords_list: list[np.ndarray]) -> list[np.ndarray]:
     """
     Project every snapshot's coords through `model` in ONE stacked .transform() call instead
-    of len(coords_list) serial calls (#278): the per-call overhead (input validation, kNN
-    query setup) is amortized across the whole pool. Returns the per-snapshot list split
-    back out, order preserved.
+    of len(coords_list) serial calls. Returns the per-snapshot list split back out, order
+    preserved.
+
+    NOT used by the pipeline: the #278 benchmark measured it ~9% faster but NOT
+    output-identical to per-snapshot transforms (UMAP consumes its random_state stream
+    differently for the joint batch), which violates #278's outputs-unchanged constraint.
+    Kept as benchmark-support so bench_latent_gif.py can keep re-measuring the trade.
     """
     if not coords_list:
         return []

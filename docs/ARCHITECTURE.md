@@ -52,11 +52,13 @@ Physical constants ride along in `DataConfig`: `freq_resolution` ≈ 2.79 Hz/bin
 | [`round_data.py`](../src/aetherscan/round_data.py)                                                                         | Disk-backed (memmap) per-round datasets: `RoundDataPaths`, the atomic `.done` manifest protocol, and the `RoundDataProducer` background-generation process.                                                                          |
 | [`run_state.py`](../src/aetherscan/run_state.py)                                                                           | Persisted `TrainingRunState` manifest (`run_state_{tag}.json`) that drives stage-aware training resume.                                                                                                                              |
 | [`data_generation.py`](../src/aetherscan/data_generation.py)                                                               | setigen signal injection: `create_false` / `create_true_single` / `create_true_double`, batched memmap generation (`generate_round_to_memmap`), injection statistics. See [`PREPROCESSING.md`](PREPROCESSING.md).                    |
-| [`seeding.py`](../src/aetherscan/seeding.py)                                                                               | Root-seed stream derivation (`derive_rng(root_seed, *stream_key)` + per-consumer stream ids) making training runs reproducible when `config.training.seed` is set. See [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md).               |
+| [`seeding.py`](../src/aetherscan/seeding.py)                                                                               | Root-seed stream derivation (`derive_rng`/`derive_seed`/`seed_tensorflow` + per-consumer stream ids) making **both** pipelines reproducible from `config.reproducibility.seed` (default 11). See [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md).               |
 | [`preprocessing.py`](../src/aetherscan/preprocessing.py)                                                                   | Training background loading; inference energy detection (fused per-coarse-channel workers, vectorized D'Agostino-Pearson test, spline/PFB bandpass flattening, stamp extraction). See [`PREPROCESSING.md`](PREPROCESSING.md).        |
 | [`pfb.py`](../src/aetherscan/pfb.py)                                                                                       | Polyphase-filterbank static passband response (native NumPy port of the bliss reference) used by the default bandpass-flattening method.                                                                                             |
-| [`inference.py`](../src/aetherscan/inference.py)                                                                           | `InferencePipeline`: distributed encoding of snippets, RF classification, positives-only result writes. See [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).                                                                        |
-| [`inference_viz.py`](../src/aetherscan/inference_viz.py)                                                                   | End-of-run inference visualization suite (ED distributions, galleries, latent projection, summary card).                                                                                                                             |
+| [`inference.py`](../src/aetherscan/inference.py)                                                                           | `InferencePipeline`: distributed encoding of snippets, two-pass RF classification (deterministic screen → seeded MC scoring), the reference-cloud reservoir, positives-only result writes. See [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).                                                                        |
+| [`inference_viz.py`](../src/aetherscan/inference_viz.py)                                                                   | End-of-run inference visualization suite (ED distributions, galleries, candidate uncertainty, latent projection, summary card).                                                                                                                             |
+| [`latent_variants.py`](../src/aetherscan/latent_variants.py)                                                               | TF-free latent-representation catalogue (#282): the 8-variant feature builders shared by training's RF sweep and inference's feature rebuild, selection metrics (recall@FPR, ECE, bootstrap minimum-margin winner), and the probability calibrator. See [`MODELS.md`](MODELS.md).                                     |
+| [`latent_gif.py`](../src/aetherscan/latent_gif.py)                                                                         | TF-free process-parallel latent-GIF frame renderer (#278): forkserver pool with per-worker figure/artist reuse, byte-identical PNGs across worker counts. Called by `train.py`'s `plot_latent_space_gif`.                             |
 | [`models/vae.py`](../src/aetherscan/models/vae.py), [`models/random_forest.py`](../src/aetherscan/models/random_forest.py) | Model definitions. See [`MODELS.md`](MODELS.md).                                                                                                                                                                                     |
 | [`rf_metrics.py`](../src/aetherscan/rf_metrics.py)                                                                         | Pure (TF-free) helper `compute_rf_eval_metrics()` — sklearn.metrics-based scalar RF eval metrics that `train.py` persists to `training_stats` (`model_name='rf'`) for the dashboard's RF tab.                                        |
 | [`shap_parallel.py`](../src/aetherscan/shap_parallel.py)                                                                   | TF-free process-pool wrapper (`parallel_shap`) chunking the RF SHAP passes across worker processes, each rebuilding a stock `TreeExplainer`. Called by `train.py`. See [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md).               |
@@ -224,7 +226,9 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 {model_path}/
 ├── vae_encoder_{tag}.keras            # final encoder (the inference model)
 ├── vae_decoder_{tag}.keras            # final decoder (needed for latent traversal)
-├── random_forest_{tag}.joblib         # final RF classifier
+├── random_forest_{tag}.joblib         # final RF classifier (the winning latent variant)
+├── random_forest_{tag}_{variant}.joblib   # every variant of the #282 sweep (post-hoc comparison)
+├── rf_calibrator_{tag}.joblib         # kept probability calibrator (only calibrated runs)
 ├── rf_eval_artifacts_{tag}.joblib     # val features/labels/probas consumed by all RF plots
 ├── rf_shap_values_{tag}.joblib        # cached SHAP values (summary/interaction/log-loss)
 ├── umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib   # persisted UMAP projections
@@ -234,6 +238,7 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 {output_path}/
 ├── config_{tag}.json                  # resolved config snapshot (written by final_save / inference)
 ├── run_state_{tag}.json               # training run manifest (stage machine + completed rounds)
+├── inference_reference_cloud_{tag}.npz # MC-scored survey reference cloud (candidate uncertainty plot)
 ├── db/aetherscan.db                   # SQLite (WAL) — all stats/results tables
 ├── logs/aetherscan_{tag}.log          # this run's log (mode="w": overwrites the same tag's log on rerun)
 ├── cache/pfb/pfb_response_*.npy       # content-addressed PFB passband responses (tag-independent)
@@ -242,9 +247,9 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 └── plots/
     ├── resource_utilization_{tag}.png # monitor resource plot (mode-agnostic)
     ├── benchmark_report_{tag}.png      # end-of-run resource report (mode-agnostic)
-    ├── training/{tag}/*.png            # end-of-training diagnostics
+    ├── training/{tag}/*.png            # end-of-training diagnostics (incl. posterior_collapse_{tag}.png)
     │   └── checkpoints/*_round_XX.png  #   per-round diagnostics (archived like model checkpoints)
-    └── inference/{tag}/*.png           # inference visualization suite
+    └── inference/{tag}/*.png           # inference viz suite (incl. candidate_uncertainty_{tag}.png)
 ```
 
 Startup hygiene: `train.py:archive_directory()` moves (fresh run) or copies (resume) existing

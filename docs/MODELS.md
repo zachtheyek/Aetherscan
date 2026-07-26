@@ -19,14 +19,17 @@ The division of labor:
   it processes observations independently — but the *clustering loss* (below) shapes the
   latent space so that ON/OFF structure becomes linearly visible in it.
 - The **Random Forest** sees a whole cadence as the concatenation of its six latents
-  (48 features) and decides true (ETI-like: present in ONs, absent in OFFs) vs false
-  (noise/RFI). Trees over a 48-dim space are cheap, interpretable (SHAP), and robust at the
-  extreme class-imbalance operating point inference runs at.
+  (48 base features, optionally extended with encoder-uncertainty features — the
+  [latent-representation variants](#latent-representation-variants-282) below) and decides
+  true (ETI-like: present in ONs, absent in OFFs) vs false (noise/RFI). Trees over a
+  ~48-dim space are cheap, interpretable (SHAP), and robust at the extreme class-imbalance
+  operating point inference runs at.
 
 Hyperparameters live on `BetaVAEConfig` / `RandomForestConfig`
 ([`config.py`](../src/aetherscan/config.py)): `latent_dim` 8, `dense_layer_size` 512,
 `kernel_size` (3, 3), `beta` 1.5, `alpha` 10.0; RF: 1000 trees, bootstrap, `max_features`
-"sqrt", seeded (11).
+"sqrt", `random_state` derived from the pipeline root seed (`Config.resolved_rf_seed()`;
+see [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md#reproducibility)).
 
 ## Beta-VAE
 
@@ -149,28 +152,74 @@ The caller must keep rows `i·6 .. i·6+5` grouped as cadence *i* — both train
 `.npy` order preserved through padding/truncation) uphold this contract. Features are indexed
 `obs{i}_z{d}` in the SHAP plots; even-numbered observations are ON-source.
 
-Note the two models consume **different latent tensors**: the RF trains and infers on the
-sampled `z`, while the latent-space visualizations use the deterministic `z_mean` — one is
-the representation under the model's own noise, the other the noise-free embedding.
+### Latent-representation variants (#282)
+
+The encoder emits **three** tensors per observation — `z_mean`, `z_log_var`, and the sampled
+`z = z_mean + exp(z_log_var/2)·ε`. `z` is a *lossy, stochastic* collapse of the two posterior
+parameters into one number per dimension: training on it gives the forest a dataset-level
+noise regularization (each cadence lands somewhere in its posterior cloud — sampling as
+augmentation) but discards the per-sample uncertainty, while training on `z_mean` (+
+`z_log_var`-derived features) is noise-free and lets the forest reason *conditionally* on
+each cadence's own uncertainty. The two carry complementary information — which is why the
+choice is made empirically: `rf_train` sweeps the full catalogue in
+[`latent_variants.py`](../src/aetherscan/latent_variants.py) on one shared dataset/split and
+records the winner in the saved config (`rf.latent_variant`), which inference reads to
+rebuild features identically (see [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md) for the
+selection protocol). Feature layout is always `[lead block | extras]`, obs-major within
+blocks; feature counts below assume the defaults (6 obs × 8 dims = 48).
+
+| Variant (`VARIANT_ORDER`, simple → complex) | Lead block | Extras | F |
+| --- | --- | --- | --- |
+| `z_mean` | per-obs posterior means | — | 48 |
+| `z` | one stochastic sample (the legacy baseline) | — | 48 |
+| `z_aug` | trained on `z_mean` + `rf.z_aug_draws` sampled draws as extra *rows*; evaluated on plain `z_mean` | — | 48 |
+| `z_mean_total_kl` | `z_mean` | total KL per cadence | 49 |
+| `z_mean_obs_logvar` | `z_mean` | per-observation mean `log_var` | 54 |
+| `z_mean_dim_logvar` | `z_mean` | per-dim mean `log_var` over obs | 56 |
+| `z_mean_logvar_active` | `z_mean` | `log_var` restricted to ACTIVE dims (Burda et al. active units, `rf.active_units_threshold`; recorded as `rf.active_dims`) | 48–96 |
+| `z_mean_logvar` | `z_mean` | full per-dimension `log_var` | 96 |
+
+The ordering is a tie-break contract: selection walks it simple → complex, so a variant only
+loses to a *more* complex one that beats it beyond bootstrap noise. Variant names are
+persisted in `config_{tag}.json` and artifact filenames — treat them as stable. The
+latent-space *visualizations* always use the deterministic `z_mean` regardless of variant.
 
 ### Classifier and thresholds
 
 `RandomForestClassifier(n_estimators=1000, bootstrap=True, max_features="sqrt",
-random_state=11, n_jobs=-1)`, fit on binary labels (`true_*` subtypes = 1). Prediction
-surfaces:
+random_state=<derived from the root seed>, n_jobs=-1)`, fit on binary labels (`true_*`
+subtypes = 1). Prediction surfaces:
 
 - `predict_proba` → `(n, 2)` columns `[P(false), P(true)]`. With 1000 bootstrap trees the
   probability resolution is fine enough for a 0.99 operating point to be meaningful.
 - `predict(threshold=0.5)` / `predict_verbose(threshold=0.5)` — generic helpers; the
   **pipeline never uses 0.5**. Inference thresholds at
-  `config.inference.classification_threshold` (default **0.99**): a snippet is a candidate iff
-  `P(true) > 0.99`. The RF diagnostics evaluate at this same deployment threshold so the
-  confusion matrix and error markers reflect production behavior, not sklearn's argmax.
+  `config.inference.classification_threshold` (default **0.99**), applied since #282 to the
+  final score of the two-pass cascade (the seeded MC mean for snippets that survive the
+  permissive `screening_threshold` pass — see
+  [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)). The RF diagnostics evaluate at this same
+  deployment threshold so the confusion matrix and error markers reflect production behavior,
+  not sklearn's argmax.
 - **Confidence semantics**: the `confidence` stored in `inference_results` is the probability
-  of the **predicted** class — `P(true)` for candidates, `P(false)` for rejections — so a
+  of the **predicted** class — `P(true)` for candidates, `1 − P(true)` for rejections — so a
   confident rejection also scores ~1.0. The full `P(true)` vector per cadence is summarized
   (quantiles, above-threshold counts) into the `inference_cadences` manifest
   ([`DATABASE.md`](DATABASE.md)); don't confuse the two columns.
+
+### Probability calibration
+
+A forest's probabilities are rank-informative but not necessarily *calibrated* — "P = 0.99"
+need not mean 99 % empirical frequency, which matters when the operating point lives in the
+top percentile. Training therefore measures the winner's ECE on a held-out calibration split
+and, only when it exceeds `rf.max_ece`, fits a calibrator (isotonic on large splits, else
+sigmoid/Platt) that is **kept only if** it improves ECE without worsening Brier on a further
+held-out test split ([`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)). Calibration is
+**monotonic**: rank metrics (AUC, recall@FPR) are unchanged — only probability *values*
+move. A kept calibrator (`rf_calibrator_{tag}.joblib`, recorded as
+`rf.calibration_active`/`rf.calibration_method`) is applied identically to every probability
+at inference — pass 1, the MC draws, and the reference cloud — because an unapplied
+calibrator would be a silent train/serve mismatch (inference hard-errors if the artifact is
+missing).
 
 Why 0.99: candidates are forwarded to human review, real positives are expected to be
 vanishingly rare, and the synthetic training distribution is easier than the real sky — the
@@ -184,8 +233,10 @@ tell you what it costs in recall.
 | --- | --- | --- |
 | `vae_encoder_{tag}.keras` | `save_models` | The inference feature extractor (outputs `z_mean, z_log_var, z`). |
 | `vae_decoder_{tag}.keras` | `save_models` | Mirror decoder; needed only for latent traversal / reconstruction diagnostics. |
-| `random_forest_{tag}.joblib` | `train_random_forest` / `save_models` | The fitted sklearn classifier (joblib of the bare `RandomForestClassifier`). |
-| `rf_eval_artifacts_{tag}.joblib` | `train_random_forest` | Dict of train/val features, binary + subtype labels, val probabilities and threshold-consistent predictions, the threshold and SNR range used — the single source every RF plot consumes (and what lets a resumed run skip RF retraining). |
+| `random_forest_{tag}.joblib` | `train_random_forest` / `save_models` | The fitted sklearn classifier (joblib of the bare `RandomForestClassifier`) — the *winning* variant of the #282 sweep, under the canonical name. |
+| `random_forest_{tag}_{variant}.joblib` (×8) | `train_random_forest` | Every variant's fitted forest from the sweep, kept for post-hoc comparison; only the winner is deployed. |
+| `rf_calibrator_{tag}.joblib` | `train_random_forest` | The kept probability calibrator (`{method, model}` dict); exists only when calibration was fit *and* survived the test-split gate. Required by inference when `rf.calibration_active`. |
+| `rf_eval_artifacts_{tag}.joblib` | `train_random_forest` | Dict of train/val features (winning variant), binary + subtype labels, raw + deployment-scored val probabilities and threshold-consistent predictions, the threshold and SNR range used, plus the sweep record (winner, active dims, per-variant metrics, calibration outcome, val partition) — the single source every RF plot consumes (and what lets a resumed run skip RF retraining and restore the sweep outcome). |
 | `rf_shap_values_{tag}.joblib` | `_compute_or_load_shap_values` | Cached SHAP outputs: positive-class summary values (+ the val row indices they correspond to), pairwise interaction values, and a log-loss decomposition (`model_output="log_loss"`), normalized across shap versions by `_select_positive_class_shap`. Computing these is minutes of work; every SHAP figure reuses the cache. |
 | `umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib` | `plot_latent_space_gif` | Fitted UMAP reducers per (n_neighbors, min_dist): obs-level (8-dim inputs) and cadence-level (48-dim). Reused by the RF decision-boundary plot and by inference's latent-projection figure — which is why deleting them breaks those two figures but nothing else. |
 

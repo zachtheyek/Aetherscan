@@ -48,7 +48,11 @@ tests/
 │   ├── test_train_utils.py          # load-tag resolution, curriculum schedules, archiving
 │   ├── test_train_datasets.py       # batched generators: coverage, stratification, alignment
 │   ├── test_latent_traversal.py     # traversal grid math with a stub decoder
+│   ├── test_latent_gif.py           # parallel GIF frame renderer: byte-identity across worker
+│   │                                #   counts, batched-transform split preservation
 │   ├── test_models.py               # feature layout, RF train/predict, encoder/decoder symmetry
+│   ├── test_latent_variants.py      # variant feature builders, active-unit detection, recall@FPR/
+│   │                                #   ECE/min-margin selection, probability calibrator (TF-free)
 │   ├── test_rf_metrics.py           # pure RF eval-metric helper: AUC/AP/Brier/confusion/quantile hand-computed cases, degenerate single-class split
 │   ├── test_shap_parallel.py        # positive-class shape normalization + MP-vs-single-process byte-identity (all three passes)
 │   ├── test_preprocessing.py        # k² equivalence gates, dedup, grouping, DC spike, spline

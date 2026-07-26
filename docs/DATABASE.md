@@ -8,11 +8,13 @@ mechanism, the query API, and how big to expect the database to get.
 ## TL;DR
 
 One SQLite file — `{output_path}/db/aetherscan.db`, WAL mode — behind a thread-safe
-`Database` singleton (`get_db()` accessor). All writes go through an in-process
-`queue.Queue` drained by **one background writer thread** that batches rows and commits with
-`executemany()`; reads open short-lived connections directly. Failed-attempt rows are never
-deleted — they're flagged `superseded = 1`, and every query filters them out by default.
-Schema evolution is a minimal `PRAGMA user_version` gate (currently version 4).
+`Database` singleton (`get_db()` accessor). All writes go through in-process
+`queue.Queue`s — a foreground lane for everything, plus a bounded **bulk lane** for
+high-volume injection-stat chunks (#277) — drained by **one background writer thread** that
+batches rows and commits with `executemany()`; reads open short-lived connections directly.
+Failed-attempt rows are never deleted — they're flagged `superseded = 1`, and every query
+filters them out by default. Schema evolution is a minimal `PRAGMA user_version` gate
+(currently version 5).
 
 > [!IMPORTANT]
 > The write queue is a **thread** queue, not process-safe. Worker *processes* must never call
@@ -30,16 +32,41 @@ guarantees possible.
 `write_*` methods are non-blocking: they validate/sanitize their arguments and `put()` a
 `(table, values_tuple)` record on the queue. The writer loop (`_writer_loop`) accumulates
 records into a buffer and flushes when either the buffer reaches
-`db.write_buffer_max_size` (100 records) or `db.write_interval` (5 s) elapses. A flush
+`db.write_buffer_max_size` (5000 records — raised from 100 in #277: a commit-and-fsync every
+100 rows was one driver of the ~590 rows/s writer that let multi-hour backlogs build) or
+`db.write_interval` (5 s) elapses. A flush
 (`_flush_buffer`) groups the buffer by table and bulk-inserts each group with a single
 `executemany()` per table — SQL parsed once, one commit per flush; the batch is
 all-or-nothing (errors are logged and the loop continues; a failed write never kills the
-thread). On shutdown (`stop()`), the loop drains and performs a final flush.
+thread). Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
+per-commit WAL fsync (the WAL is still synced at checkpoints) — a crash can lose the newest
+commits but never corrupts the database, ample durability for diagnostic telemetry and the
+removal of the dominant per-transaction fsync stall.
+
+### The bulk lane (#277)
+
+High-volume injection stats ride a separate, **bounded** queue: `write_injection_stats_bulk`
+takes a whole batch of rows (per-row semantics identical to `write_injection_stat` —
+NaN/Inf coercion with `is_finite=0`, one shared system-metadata lookup, which is also cached
+per process now) and enqueues it in `db.bulk_chunk_rows`-sized chunks (50 000, also the bulk
+transaction size), so a ~300 K-row segment costs a handful of queue operations instead of
+~300 K. The lane is capped at `db.bulk_queue_max_items` chunks (32 — ~1.6 M rows in memory
+at defaults; the old single unbounded queue grew to ~35 GB of RSS on a release run):
+a full lane **blocks the enqueuer**, which is deliberately the round-data drainer thread
+(background work that can afford to wait), never the training path. The writer services the
+foreground lane with strict priority and consumes bulk chunks whenever it is idle.
+`data_generation.write_segment_stats` batches each generated class-segment's rows into one
+bulk call. With no writer thread running, bulk rows are written inline (mirroring
+`mark_superseded`'s no-writer path).
 
 Lifecycle: `init_db()` constructs the singleton (schema init + migration) and `start()`s the
 writer thread; the ResourceManager stops it during `cleanup_all()` — after the monitor (which
 still writes samples) and before the logger (see
-[`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md)).
+[`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md)). `stop()` **drains both lanes to disk** before
+the writer exits (the old behavior silently dropped everything still queued — up to tens of
+millions of rows on a release run), with progress heartbeats and a `db.stop_drain_timeout`
+cap (600 s); if the cap is hit the writer is force-stopped and the exact number of dropped
+rows is logged at ERROR — never silently.
 
 ### Flush protocol
 
@@ -47,8 +74,16 @@ Reads that must observe queued-but-unwritten rows (every plot function does this
 `db.flush(timeout=...)`: a `(_FLUSH_SENTINEL, event)` tuple is queued; when the writer
 dequeues it, it flushes the buffer immediately and sets the event. Queue FIFO ordering makes
 the semantics exact: everything queued *before* the sentinel is on disk when `flush()`
-returns True. Returns False on timeout or if shutdown began mid-wait — callers treat that as
-"plot may be missing the newest rows", not as fatal.
+returns True. Returns False on timeout or if shutdown began mid-wait; since #277 the
+training plot functions treat a False return by **skipping the figure** (a non-critical
+failure) rather than rendering a partial result set.
+
+`flush()` covers the **foreground lane only** — it must never queue behind a round's worth
+of bulk injection rows. Readers of `injection_stats` gate on
+`db.injection_backlog_rows(max_round=...)` instead: the count of bulk-lane rows enqueued but
+not yet committed for rounds ≤ `max_round` (rows with `round_number=NULL` count against
+every round, conservatively). `plot_injection_stats` skips its figures while the backlog for
+the rounds being plotted is nonzero.
 
 ### Mark-superseded protocol
 
@@ -97,7 +132,7 @@ span bounds instead.
 | `injection_stats` | per generated cadence | yes | v0 (+ column v1) |
 | `training_stats` | per training epoch | yes | v0 (+ column v1) |
 | `latent_snapshots` | per viz cadence per capture | yes | v0 (+ column v1) |
-| `inference_results` | positives only | yes | v0 (+ column v1) |
+| `inference_results` | positives only | yes | v0 (+ column v1, + columns v5) |
 | `inference_cadences` | per-cadence run manifest | yes | v2 |
 | `pipeline_stages` | per timed stage span | no (attempt-agnostic history) | v4 |
 
@@ -121,7 +156,8 @@ history.
 ### `injection_stats`
 
 Signal-injection provenance, written per generated cadence by the round-data drainer
-(`data_generation.write_segment_stats`).
+(`data_generation.write_segment_stats` — one `write_injection_stats_bulk` batch per
+class-segment, on the bounded bulk lane).
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -140,7 +176,8 @@ Index: `(tag, timestamp, stat_name, signal_type, injection_stage)`.
 Per-epoch beta-VAE training telemetry (~21 rows per epoch): losses (`total_loss`,
 `reconstruction_loss`, `kl_loss`, `true_loss`, `false_loss` + `val_` variants), gradient
 statistics (`gradient_norm_{mean,max,std}`, `clipping_rate`), `learning_rate`, durations,
-step counts, and the round's SNR floor/ceiling. The RF stage also writes here: at the tail
+step counts, and the round's SNR floor/ceiling — plus, since #282, `latent_dim` per-dimension
+KL rows per epoch (`kl_dim_00` … `kl_dim_NN`, feeding the posterior-collapse diagnostics). The RF stage also writes here: at the tail
 of `rf_train`, `train_random_forest()` persists ~25 scalar eval metrics (accuracy, ROC-AUC,
 average precision, Brier score, per-sub-type accuracies, binary + sub-type × prediction
 confusion cell counts, val P(true) quantiles) plus a `classification_threshold` row; the
@@ -190,6 +227,8 @@ per-cadence aggregates that summaries need live in the manifest table instead.
 | `timestamp_observed` | REAL | The `.h5` header's `tstart` (MJD) |
 | `h5_path` | TEXT | First observation of the cadence |
 | `superseded` | INTEGER | Default 0 |
+| `screening_proba` | REAL | Deterministic pass-1 score of the #282 two-pass cascade (v5) |
+| `mc_mean`, `mc_std` | REAL | Seeded MC mean/spread for pass-2 survivors — the mean carries the science threshold; NULL for snippets that never reached pass 2 (v5) |
 
 Index: `(tag, timestamp, confidence, prediction)`.
 
@@ -233,7 +272,7 @@ attempt, each with its own span.
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 4`). The stamp maps to schema features as:
+(`_SCHEMA_VERSION = 5`). The stamp maps to schema features as:
 
 | `user_version` | What it added | Migration work |
 | --- | --- | --- |
@@ -242,6 +281,7 @@ attempt, each with its own span.
 | v2 | the `inference_cadences` run-manifest table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
 | v3 | `config_fingerprint TEXT` on `inference_cadences` | additive `ALTER TABLE ... ADD COLUMN` |
 | v4 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
+| v5 | `screening_proba` / `mc_mean` / `mc_std` on `inference_results` (#282 two-pass inference) | additive `ALTER TABLE ... ADD COLUMN` |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -256,6 +296,9 @@ attempt, each with its own span.
   same `PRAGMA table_info` column-existence check as the v0 → v1 step (a fresh db already has
   the column from `CREATE TABLE`, so the ALTER only patches a db that created the v2 table
   before the column existed).
+- **v4 → v5** (`inference_results.{screening_proba,mc_mean,mc_std}`): additive
+  `ALTER TABLE ... ADD COLUMN ... REAL` per column, idempotent via the same
+  `PRAGMA table_info` existence check.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped.
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
@@ -298,12 +341,15 @@ Rules of thumb at full-scale defaults (dominant terms only):
   **~24.5 rows per cadence** (18 + 6.5). A training round generates `3 × num_samples_beta_vae`
   cadences (main + true + false), so at defaults:
   `3 × 499 200 × ~24.5 ≈ 37 M rows per round`, times 20 rounds plus the RF dataset. This is
-  why writes are batched, why the drainer runs off the training critical
+  why these rows ride the bounded bulk lane in per-segment batches (#277), why the drainer
+  runs off the training critical
   path, and why the injection plots subsample (`plot_injection_subsampling_count`). If the
   database size becomes a problem, this table is where the budget goes — smoke-scale runs
   (`--num-samples-beta-vae 3072`) keep it trivial.
-- **`training_stats`**: ~21 rows/epoch → ~42 k rows for 20 × 100 epochs; the RF stage adds
-  a negligible tail (~25 scalars + `classification_threshold` + the per-tree
+- **`training_stats`**: ~21 + `latent_dim` rows/epoch → ~58 k rows for 20 × 100 epochs at
+  the default `latent_dim` 8; the RF stage adds
+  a negligible tail (~25 scalars + `classification_threshold` + the #282 sweep/test/screen
+  metrics + the per-tree
   `ensemble_val_accuracy` series ≈ `rf.n_estimators` rows). Still negligible.
 - **`latent_snapshots`**: one row per viz cadence per capture — 3840 cadences
   (`latent_viz_num_cadences_per_type=960` × 4 signal types) × one capture every

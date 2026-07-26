@@ -135,7 +135,7 @@ class RandomForestConfig:
     # Latent-representation variant the RF consumes (#282). Training sweeps every variant on
     # one shared dataset/split and records the empirical winner here before final_save, so
     # config_{tag}.json tells inference exactly how to rebuild features (never hardcoded).
-    # See aetherscan.latent_variants.VARIANTS for the catalogue; "z" is the legacy baseline.
+    # See aetherscan.latent_variants.VARIANT_ORDER for the catalogue; "z" is the legacy baseline.
     latent_variant: str = "z"
     # ACTIVE latent dims measured at training (Burda et al.; None until a sweep ran) —
     # persisted so inference rebuilds the z_mean_logvar_active layout identically

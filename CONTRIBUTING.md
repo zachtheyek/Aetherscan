@@ -176,7 +176,7 @@ Aetherscan/
 │   ├── preprocessing.py        # Data preprocessing + energy detection
 │   ├── pfb.py                  # PFB static passband equalization
 │   ├── data_generation.py      # Synthetic signal injection
-│   ├── seeding.py              # Root-seed stream derivation (reproducible training runs)
+│   ├── seeding.py              # Root-seed stream derivation (reproducible train + inference runs)
 │   ├── benchmark.py            # Always-on stage timing → pipeline_stages table
 │   ├── dashboard.py            # Streamlit live-monitoring dashboard (DB-driven)
 │   ├── dashboard_launcher.py   # Spawns the headless dashboard subprocess (guarded)
@@ -185,6 +185,8 @@ Aetherscan/
 │   ├── tag_guards.py           # Fail-early --save-tag dedup guards
 │   ├── rf_metrics.py           # Pure RF eval-metric helper (persisted to training_stats via train.py)
 │   ├── shap_parallel.py        # RF SHAP process-pool wrapper (TF-free; called by train.py)
+│   ├── latent_variants.py      # Latent-representation variant catalogue + selection/calibration (TF-free)
+│   ├── latent_gif.py           # Process-parallel latent-GIF frame renderer (TF-free; called by train.py)
 │   ├── models/
 │   │   ├── __init__.py         # Model exports
 │   │   ├── vae.py              # Beta-VAE architecture
@@ -257,7 +259,7 @@ Aetherscan/
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `pfb.py`                  | Polyphase-filterbank static passband response (bandpass flattening)    |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
-| `seeding.py`              | Root-seed stream derivation (reproducible training runs)               |
+| `seeding.py`              | Root-seed stream derivation (reproducible train + inference runs)      |
 | `benchmark.py`            | Always-on stage timing (`stage_timer`/`record_stage`) to `pipeline_stages` |
 | `dashboard.py`            | Streamlit live-monitoring dashboard read from the run SQLite DB        |
 | `dashboard_launcher.py`   | `launch_dashboard()` spawns/reaps the headless dashboard subprocess    |
@@ -266,6 +268,8 @@ Aetherscan/
 | `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
 | `rf_metrics.py`           | Pure RF eval-metric helper written to `training_stats` (`model_name='rf'`) |
 | `shap_parallel.py`        | Process-pool wrapper for RF SHAP passes (TF-free; forkserver + empty preload; called by `train.py`) |
+| `latent_variants.py`      | Latent-representation variant catalogue, selection metrics, probability calibrator (TF-free; shared by `train.py` and `inference.py`) |
+| `latent_gif.py`           | Process-parallel latent-GIF frame rendering (TF-free; forkserver + empty preload; called by `train.py`) |
 | `models/vae.py`           | Beta-VAE architecture with composite clustering loss                   |
 | `models/random_forest.py` | Scikit-learn RF wrapper                                                |
 | `db/db.py`                | Thread-safe SQLite with async queue-based writes                       |

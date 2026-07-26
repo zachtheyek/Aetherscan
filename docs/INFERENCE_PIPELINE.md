@@ -69,7 +69,10 @@ CSV so basenames are distinct.
 ### Artifact resolution: local paths or the HuggingFace Hub
 
 Inference needs three artifacts — the encoder, the Random Forest, and the training run's
-`config.json`. They come from local disk **or** the HuggingFace Hub, resolved *before*
+`config.json` — plus an optional fourth, the probability calibrator
+`rf_calibrator.joblib`, present only for runs whose training kept one (the downloaded
+config's `rf.calibration_active` records which; a Hub download fetches it best-effort
+alongside the RF). They come from local disk **or** the HuggingFace Hub, resolved *before*
 validation by `hf_hub.resolve_inference_artifacts(args)` (called from `main()` immediately
 after argument parsing). The trio is **all-or-none**
 ([`src/aetherscan/hf_hub.py`](../src/aetherscan/hf_hub.py)):
@@ -116,7 +119,12 @@ paths:
 - `--encoder-path` → `tf.keras.models.load_model` **inside `strategy.scope()`** (the hard
   rule: all TF model creation/loading happens in scope so variables are mirrored across
   replicas). The `Sampling` layer is registered serializable, so no `custom_objects` needed.
-- `--rf-path` → `RandomForestModel.load()` (joblib).
+- `--rf-path` → `RandomForestModel.load()` (joblib). When the saved config records an active
+  calibrator (`rf.calibration_active`), `rf_calibrator_{tag}.joblib` is loaded from the same
+  directory — and a **missing calibrator artifact is a hard error**: scoring uncalibrated
+  when training calibrated would be a silent train/serve mismatch. The saved
+  `rf.latent_variant` / `rf.active_dims` drive how features are rebuilt from the encoder
+  outputs (never hardcoded — see the two-pass cascade below).
 - `--config-path` → the training run's `config_{tag}.json`, layered onto the singleton by
   `cli.apply_saved_config()` **before validation** so shape-critical fields
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
@@ -195,9 +203,10 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
    manifest skip means **only the failed cadences re-run**. Permanent conditions (no work
    units from the CSVs, no cadence produced stamps) raise `NonRetryableInferenceError`, which
    fails fast instead of burning retries.
-7. **Visualization.** On a fully successful pass (and `inference.inference_viz_enabled`),
-   `render_inference_visualizations()` draws the whole suite, every figure individually
-   exception-guarded.
+7. **Finalization.** On a fully successful pass, the reference cloud is MC-scored and
+   persisted (`finalize_reference_cloud()`, best-effort — see below), then (with
+   `inference.inference_viz_enabled`) `render_inference_visualizations()` draws the whole
+   suite, every figure individually exception-guarded.
 
 The retry loop wraps all of it: transient failures (I/O hiccups, GPU errors) retry up to
 `inference.max_retries` with `inference.retry_delay` between passes; `KeyboardInterrupt`
@@ -217,23 +226,86 @@ For one cadence's snippet array `(n, 6, 16, 512)`:
    otherwise process nothing at all. Order is preserved (no shuffle).
 2. `_distributed_encode()` runs the cached encode step over the distributed dataset; each
    snippet's 6 observations go through the encoder as independent `(16, 512, 1)` inputs and
-   come back as sampled latents `z`. Per-replica results are gathered with
+   come back as the **deterministic posterior parameters** `z_mean` / `z_log_var` (#282 —
+   no stochastic `z` ever crosses the GPU boundary; the MC draws below are reparameterized
+   in NumPy from these, seeded per cadence). Per-replica results are gathered with
    `experimental_local_results` + `np.concatenate` (cheaper than an NCCL gather for the tiny
    latent payload), then truncated back to `n × 6` rows to drop the padding.
-3. `RandomForestModel.predict_proba()` over the cadence-level 48-feature vectors yields
-   `proba_true = P(true)` per snippet.
+3. **Two-pass cascade** (#282). Features are rebuilt per the saved config's winning
+   representation (`rf.latent_variant` / `rf.active_dims` — see [`MODELS.md`](MODELS.md)),
+   and the calibrator is applied to every probability when active:
+   - **Pass 1** scores *every* snippet deterministically (`z_mean` in the lead feature slot)
+     against the permissive `inference.screening_threshold` (default 0.5, tuned for recall;
+     validated `<= classification_threshold` at startup). Its only job is to say "definitely
+     not a candidate" cheaply — snippets below it are rejected without MC scoring.
+   - **Pass 2** re-scores the survivors with `inference.mc_draws` (default 32) seeded
+     reparameterized latent samples; the **MC mean replaces their score** and carries the
+     science threshold, while the MC std is the reported uncertainty spread. Draws are keyed
+     on (root seed, cadence), so a cadence's MC statistics are independent of the rest of
+     the catalog.
+   The two passes are a **cascade, not two ANDed criteria**: pass 1 can only ever *remove*
+   candidates (training's `check_screening_threshold` verifies it loses ~zero recall vs
+   MC-scoring everything — see [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)).
 4. Threshold semantics: `predictions = proba_true > classification_threshold` (default
    **0.99** — deliberately conservative: at BL scale, false positives are expensive and true
-   positives are expected to be vanishingly rare). The stored `confidence` is the
-   probability of the **predicted** class — `proba_true` for candidates, `proba_false` for
-   rejections — so a confident rejection also reads as ~1.0.
+   positives are expected to be vanishingly rare), where `proba_true` is the MC mean for
+   pass-2 survivors and the pass-1 score for rejects. The stored `confidence` is the
+   probability of the **predicted** class — `proba_true` for candidates, `1 − proba_true`
+   for rejections — so a confident rejection also reads as ~1.0.
 5. `_write_inference_results()` writes **positives only** to `inference_results` (a deliberate
    size trade — see [`DATABASE.md`](DATABASE.md)), each row carrying: snippet index (== row
-   in the `.npy`), confidence, the flattened 48-dim latent vector, and full provenance
-   (target/session/band/cadence id/per-stamp frequency/observation timestamp/`h5` path/tag).
-   Aggregates for *all* snippets (count, threshold, above-threshold count, mean/min/max,
-   quantiles p01–p99 via `summarize_confidences`) go into the cadence's manifest row, so
-   run-level summaries never depend on the positives-only table.
+   in the `.npy`), confidence, the flattened 48-dim latent vector (the deterministic `z_mean`
+   rows), the schema-v5 score columns (`screening_proba`, `mc_mean`, `mc_std`), and full
+   provenance (target/session/band/cadence id/per-stamp frequency/observation
+   timestamp/`h5` path/tag). Aggregates for *all* snippets (count, threshold, above-threshold
+   count, mean/min/max, quantiles p01–p99 via `summarize_confidences`) go into the cadence's
+   manifest row, so run-level summaries never depend on the positives-only table.
+
+### Interpreting the MC mean and spread
+
+What the MC average *means* depends on the representation the RF was trained on (recorded in
+`rf.latent_variant`): trained on sampled `z`, the MC mean is a true **posterior-predictive
+expectation** (averaging the classifier over the encoder's posterior); trained on `z_mean`
+(+ uncertainty aggregates), MC scoring is a **sensitivity/robustness probe** — how stable the
+verdict is under the encoder's own uncertainty. Either way the (mean, spread) pair reads the
+same:
+
+| MC mean (p) | MC spread | Reading |
+| --- | --- | --- |
+| high | low | Strong candidate — confident and stable under posterior perturbation. |
+| high | high | The dangerous false positive `p` alone cannot flag: the mean looks confident while individual draws swing wildly. Inspect these first. |
+| ~0.5 | low | Irreducibly ambiguous — the model is *certain* it can't tell. |
+| ~0.5 | high | Lowest confidence — ambiguous *and* unstable. |
+
+Note that tree disagreement adds no independent signal here — for a forest of binary votes
+the vote variance is `p(1 − p)`, a deterministic function of the probability itself; the MC
+spread over latent draws is the informative axis.
+
+### The reference cloud
+
+A `(p, spread)` pair is only interpretable against where the *survey* sits, so pass 1 also
+feeds a seeded uniform reservoir (algorithm R, `inference.reference_cloud_size`, default
+10 000; `0` disables) over the **rejects'** posterior parameters — deliberately uniform, not
+near-threshold, which would bias the cloud toward the boundary and make every candidate look
+ordinary. After the last cadence, `finalize_reference_cloud()` MC-scores the reservoir once
+and persists `{output_path}/inference_reference_cloud_{tag}.npz` (screening/mc_mean/mc_std
+arrays plus subsample size, rejects seen, root seed, and draw count), so the candidate
+uncertainty figure can be regenerated without re-running inference. Best-effort: a failure
+degrades the plot, never the science. On a resumed run only the final attempt's cadences
+feed the reservoir (manifest-skipped cadences never re-offer their rejects).
+
+## Reproducibility
+
+Inference used to be entirely unseeded: the encoder's `Sampling` layer drew fresh entropy
+every run, so the same encoder + RF + stamps could yield a different candidate set each time.
+Since #279 the `InferencePipeline` constructor seeds TF's global RNG from the shared root
+seed (`config.reproducibility.seed`, default 11; `--seed` and `--tf-deterministic-ops` are on
+the inference subparser too), and `run_inference` re-seeds per cadence keyed on the stable
+catalog index — so a cadence's results depend only on (root seed, cadence), reproducible even
+when the catalog is subset or a run resumes partway. The pass-2 MC draws and the
+reference-cloud reservoir derive their own NumPy streams from the same root (see
+[`seeding.py`](../src/aetherscan/seeding.py) and the Reproducibility section of
+[`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)).
 
 ## The run manifest: `inference_cadences`
 
@@ -255,8 +327,9 @@ flagged while later writes stay live (`Database.mark_superseded`).
 | Artifact | Where | Notes |
 | --- | --- | --- |
 | Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_<tag>/*.npy` + `.json` | The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, raw/merged hit lists, the `.h5` header. |
-| Candidate rows | `inference_results` table | Positives only, with latents + provenance. |
+| Candidate rows | `inference_results` table | Positives only, with latents + provenance + the two-pass scores (`screening_proba`/`mc_mean`/`mc_std`, schema v5). |
 | Run manifest | `inference_cadences` table | Per-cadence stages, aggregates, durations. |
+| Reference cloud | `{output_path}/inference_reference_cloud_{tag}.npz` | MC scores for the seeded uniform reservoir of pass-1 rejects — the survey background of the candidate uncertainty figure (regenerable without re-running inference). |
 | Config snapshot | `{output_path}/config_{tag}.json` | The resolved (saved-config + CLI) view this run actually used. |
 | Figures | `{output_path}/plots/inference/{tag}/` | The visualization suite below; also uploaded to the run's Slack thread. |
 | Resource plot | `{output_path}/plots/resource_utilization_{tag}.png` | Written by the monitor at shutdown. |
@@ -306,6 +379,7 @@ can never kill a science run.
 | `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
 | `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
+| `candidate_uncertainty_{tag}.png` | Each candidate (red star) at x = final RF probability (MC mean), y = MC spread, over a hexbin density background of the reference cloud (the survey's pass-1 rejects), with the science threshold as a vertical line. | Population context is the whole point: "p = 0.97, spread = 0.05" is only interpretable against where the survey sits. The dangerous quadrant is **high p + high spread** — a mean that looks confident while draws swing — exactly what `p` alone cannot flag (see the interpretation table above). Candidates hugging the survey cloud are threshold noise. |
 | `inference_latent_projection_{tag}.png` | This run's cadence-level latents projected through the **training run's persisted UMAP** (`umap_cadence_nn*_md*_*.joblib`, located via the training config JSON's `model_path` + tag), over the training embedding as backdrop; candidates highlighted. Skips gracefully if the UMAP is absent. | "Where does real data live relative to the synthetic classes?" Real snippets clustering onto the training false-class region = healthy. Candidates far from *any* training class are the interesting anomalies; candidates inside the false-class cloud are threshold noise. |
 | `inference_summary_{tag}.png` | Table-style run card: cadence/snippet/candidate counts, per-stage durations and throughput from the manifest, per-target/band candidate counts. | The one-glance run report — read it before opening anything else. |
 
@@ -326,7 +400,7 @@ Inference-specific fields live on `InferenceConfig`
 | Group | Fields |
 | --- | --- |
 | Models | `encoder_path`, `rf_path`, `config_path` |
-| Classification | `per_replica_batch_size`, `classification_threshold` |
+| Classification | `per_replica_batch_size`, `classification_threshold`, `screening_threshold`, `mc_draws`, `reference_cloud_size` |
 | Cadence grouping | `cadence_group_by_cols`, `cadence_h5_path_col`, `cadence_expected_obs` |
 | Energy detection | `coarse_channel_width`, `coarse_channel_log_interval`, `bandpass_method`, `pfb_taps_per_channel`, `bandpass_debug_plot`, `spline_order`, `detection_window_size`, `detection_step_size`, `stat_threshold` |
 | Stamps | `stamp_width`, `store_downsampled_stamps`, `overlap_search`, `overlap_fraction`, `preprocess_output_dir` |

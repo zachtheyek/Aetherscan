@@ -74,8 +74,9 @@ subcommand uses it:
 | `ManagerConfig`      | Multiprocessing pool sizing                                                                                                        |
 | `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle, live-dashboard enable (`dashboard_enabled`) and port (`dashboard_port`) |
 | `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
+| `ReproducibilityConfig` | The pipeline root seed (`seed`, default 11 — every random stream in **both** modes derives from it; see `seeding.py`) and `tf_deterministic_ops` |
 | `BetaVAEConfig`      | Beta-VAE model hyperparameters                                                                                                     |
-| `RandomForestConfig` | RF classifier hyperparameters                                                                                                      |
+| `RandomForestConfig` | RF classifier hyperparameters, the #282 latent-variant sweep/selection/calibration knobs, and the override-only `seed` (default `None` = derived from the root seed) |
 | `GPUConfig`          | TF strategy: replica count, memory growth, NCCL packs, allocator toggles                                                           |
 | `DataConfig`         | Data shape, file lists, chunk sizes                                                                                                |
 | `TrainingConfig`     | Anything specific to the `train` command — sample counts, batch sizes, LR schedule, curriculum, latent-viz, retries                |
@@ -130,7 +131,10 @@ def _add_inference_flags_to(parser):
 The `_add_*_flags_to(parser)` indirection exists so utility scripts (e.g.
 `utils/find_optimal_configs.py`) can expose the exact same flag surface against an
 arbitrary parser — they import the helper and call it on their own parser without
-re-declaring every argument.
+re-declaring every argument. Both helpers additionally call
+`_add_reproducibility_flags_to(parser)` first, registering the shared `--seed` /
+`--tf-deterministic-ops` flags (#279) through one function so the train and inference
+surfaces cannot drift.
 
 ### Flag categories
 
@@ -151,9 +155,14 @@ if hasattr(args, "num_samples_beta_vae") and args.num_samples_beta_vae is not No
 ```
 
 Examples: most flags (`--num-samples-beta-vae`, `--curriculum-schedule`,
-`--encoder-path`, `--overlap-fraction`, ...). The `hasattr` check is what gives the
+`--encoder-path`, `--screening-threshold`, `--mc-draws`, `--overlap-fraction`, ...). The
+`hasattr` check is what gives the
 guarantee — argparse simply doesn't add inference-only attributes to a train namespace
 (and vice versa), so `hasattr` is False for any other mode.
+
+One Pattern A flag is a **deprecated alias**: `--rf-seed` (train-only) still routes to
+`config.rf.seed` as an explicit override, but the RF seed normally derives from the shared
+root `--seed` (#279) — using the alias logs a deprecation warning.
 
 #### Pattern B — shared flag, identical destination
 
@@ -179,6 +188,9 @@ Current Pattern B flags:
 - `--force-tag` → `config.checkpoint.force_tag`
 - `--dashboard` / `--no-dashboard` (`BooleanOptionalAction`) → `config.monitor.dashboard_enabled`
 - `--dashboard-port` → `config.monitor.dashboard_port`
+- `--benchmark-report` / `--no-benchmark-report` (`BooleanOptionalAction`) → `config.monitor.benchmark_report_enabled`
+- `--seed` → `config.reproducibility.seed` (registered via `_add_reproducibility_flags_to`)
+- `--tf-deterministic-ops` (`BooleanOptionalAction`) → `config.reproducibility.tf_deterministic_ops` (same helper)
 
 #### Pattern C — shared flag, divergent destination
 
@@ -303,7 +315,9 @@ When adding `--my-new-flag`:
 2. **Register the flag** on the right helper(s) in `cli.py`:
    - Used only by training → `_add_train_flags_to` (Pattern A)
    - Used only by inference → `_add_inference_flags_to` (Pattern A)
-   - Used by both, same destination → both helpers (Pattern B)
+   - Used by both, same destination → both helpers (Pattern B); if the two registrations
+     must stay word-for-word identical, register once in a shared helper called by both —
+     the `_add_reproducibility_flags_to` precedent
    - Used by both, different destinations → both helpers (Pattern C)
 3. **Wire `apply_args_to_config`** using the correct pattern:
    - Pattern A or B: one `hasattr + None` block
@@ -388,5 +402,8 @@ mode && /^ *"--/{
 
 The second command lists every shared flag (those appearing in both subparsers); each
 should match either a single Pattern B `apply_args` block or a pair of Pattern C blocks
-with a `command` discriminator. As of this writing it yields 14 shared flags —
-11 Pattern B + 3 Pattern C — matching the tables above.
+with a `command` discriminator. Note the awk only sees flags registered lexically inside
+the two `_add_*_flags_to` bodies — `--seed` / `--tf-deterministic-ops` live in the shared
+`_add_reproducibility_flags_to` helper (called by both) and must be counted by hand. As of
+this writing the command yields 15 flags; with the two helper-registered ones the shared
+surface is 17 — 14 Pattern B + 3 Pattern C.
