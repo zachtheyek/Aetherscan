@@ -78,7 +78,18 @@ from aetherscan.run_state import (
     run_state_path,
     save_run_state,
 )
-from aetherscan.seeding import STREAM_DATASET, STREAM_PLOT, STREAM_VIZ, derive_rng
+from aetherscan.seeding import (
+    STREAM_DATASET,
+    STREAM_KMEANS,
+    STREAM_PLOT,
+    STREAM_RF_PLOTS,
+    STREAM_SHAP_SAMPLES,
+    STREAM_UMAP,
+    STREAM_VIZ,
+    derive_rng,
+    derive_seed,
+    seed_tensorflow,
+)
 from aetherscan.shap_parallel import parallel_shap
 
 logger = logging.getLogger(__name__)
@@ -951,27 +962,21 @@ class TrainingPipeline:
         if self.db is None:
             raise ValueError("get_db() returned None")
 
-        # Reproducibility: seed TF's global RNG before any model/variable creation so weight
-        # initialization (HeNormal/GlorotNormal) and the VAE Sampling layer draw
-        # deterministic streams. numpy/python randomness is NOT globally seeded here — each
-        # consumer derives its own independent stream from the same root seed (see
-        # aetherscan.seeding.derive_rng and its call sites). No-op when seed is None
-        if self.config.training.seed is not None:
-            tf.random.set_seed(self.config.training.seed)
-            logger.info(f"Seeded TF global RNG from root seed {self.config.training.seed}")
-        if self.config.training.tf_deterministic_ops:
-            # Deterministic cuDNN/reduction kernels for bit-exact GPU reproducibility, at
-            # some training-speed cost. Only useful alongside a root seed
-            tf.config.experimental.enable_op_determinism()
-            logger.info("TF op determinism enabled (deterministic GPU kernels)")
-            if self.config.training.seed is None:
-                # Without a seed the deterministic kernels cost speed but buy no
-                # reproducibility (TF's global RNG stays unseeded) — warn so it isn't silent.
-                logger.warning(
-                    "tf_deterministic_ops is enabled but --seed is not set: deterministic "
-                    "kernels incur a speed cost without making the run reproducible. Pass "
-                    "--seed to seed the RNG streams."
-                )
+        # Reproducibility (#279): seed TF's global RNG before any model/variable creation so
+        # weight initialization (HeNormal/GlorotNormal) draws a deterministic stream. The
+        # shared seeding helper is used by BOTH pipeline constructors so training and
+        # inference can't drift; train_round re-seeds per round (sub-key = round number) so a
+        # resumed run reproduces an uninterrupted one. numpy/python randomness is NOT
+        # globally seeded here — each consumer derives its own independent stream from the
+        # same root (see aetherscan.seeding). No-op when the root seed is None
+        applied_tf_seed = seed_tensorflow(
+            self.config.reproducibility.seed, self.config.reproducibility.tf_deterministic_ops, 0
+        )
+        if applied_tf_seed is not None:
+            logger.info(
+                f"Seeded TF global RNG from root seed {self.config.reproducibility.seed} "
+                f"(derived training stream seed {applied_tf_seed})"
+            )
 
         # Load (or create) the persisted run manifest for this tag. This resolves
         # self.start_time (wall clock of attempt 1 — used by every DB query/plot, so retries
@@ -1363,7 +1368,7 @@ class TrainingPipeline:
                     time_resolution=self.data_generator.time_resolution,
                     db=self.db,
                     tag=self.config.checkpoint.save_tag,
-                    seed=self.config.training.seed,
+                    seed=self.config.reproducibility.seed,
                 )
                 self._round_producer.start()
                 # Kick off the first round's data right away (nothing to overlap with yet —
@@ -1431,6 +1436,13 @@ class TrainingPipeline:
         paths = RoundDataPaths.for_round(self._round_data_base_dir, round_number)
         round_trained = False  # Set True once the round fully completes (drives dir deletion)
 
+        # Re-seed TF's global RNG per round, sub-keyed by round number (#279): a resumed run
+        # skips completed rounds, which would otherwise leave the single __init__-time stream
+        # at a different position than an uninterrupted run — with per-round keys, round k's
+        # TF draws (VAE sampling, dropout-free here but future-proof) depend only on
+        # (root, round). deterministic_ops=False: already applied once in __init__
+        seed_tensorflow(self.config.reproducibility.seed, False, 0, round_number)
+
         # Obtain this round's disk-backed data: reuse a validated on-disk dataset if one
         # exists, otherwise wait on the background producer (which was asked to generate it
         # while the previous round trained) or generate in-process (overlap disabled)
@@ -1482,7 +1494,7 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=True,
-            rng=derive_rng(self.config.training.seed, STREAM_DATASET, round_number),
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_DATASET, round_number),
         )
 
         # Free the dict shell (original arrays stay alive via the shared train_holder)
@@ -2351,6 +2363,13 @@ class TrainingPipeline:
             )
             return
 
+        # Re-seed TF for the RF stage, sub-keyed by the same num_training_rounds+1 sentinel
+        # as its data generation (#279): the sampled-z encodes below then reproduce whether
+        # the stage runs after 20 in-process rounds or first thing on a resumed attempt
+        seed_tensorflow(
+            self.config.reproducibility.seed, False, 0, self.config.training.num_training_rounds + 1
+        )
+
         # Initialize RF model
         if self.rf_model is None:
             self.rf_model = RandomForestModel()
@@ -2468,9 +2487,11 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=False,
-            # RF dataset uses the round-0 stream key, mirroring its data generation
-            # (beta-VAE rounds are 1-based, so no collision)
-            rng=derive_rng(self.config.training.seed, STREAM_DATASET, 0),
+            # RF dataset uses the round-0 STREAM_DATASET key (beta-VAE rounds are 1-based,
+            # so no collision). Its DATA GENERATION uses the num_training_rounds+1 sentinel
+            # on STREAM_DATA_GEN (see the round_num comment above) — different stream ids,
+            # so the keys need not (and do not) match.
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_DATASET, 0),
         )
 
         # NOTE: come back to this later
@@ -2800,8 +2821,7 @@ class TrainingPipeline:
         n_summary = min(self.config.training.shap_max_samples_summary, n_val)
         n_interact = min(self.config.training.shap_max_samples_interaction, n_val)
 
-        # NOTE: use a global config seed instead of hard-coding
-        rng = np.random.default_rng(self.config.rf.seed)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_SHAP_SAMPLES)
         summary_indices = np.sort(rng.choice(n_val, size=n_summary, replace=False))
         interaction_indices = np.sort(rng.choice(n_val, size=n_interact, replace=False))
 
@@ -4197,7 +4217,7 @@ class TrainingPipeline:
 
         max_points = self.config.training.plot_injection_subsampling_count
         outlier_pct = self.config.training.plot_injection_outlier_percentile
-        rng = derive_rng(self.config.training.seed, STREAM_PLOT)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_PLOT)
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
@@ -4583,8 +4603,12 @@ class TrainingPipeline:
 
             strata = np.concatenate([np.array(s, dtype="U") for s in strata_list])
 
-            # NOTE: use a global config seed instead of hard-coding
-            rng = np.random.default_rng(11)
+            # Sub-key 10 (obs) / 11 (cadence): distinct from the UMAP-fit sub-keys below
+            rng = derive_rng(
+                self.config.reproducibility.seed,
+                STREAM_UMAP,
+                10 if mode_label.startswith("obs") else 11,
+            )
             unique_classes = np.unique(strata)
             per_class = umap_fit_max // len(unique_classes)
             fit_indices = []
@@ -4815,13 +4839,16 @@ class TrainingPipeline:
             for md in min_dist_values:
                 # Obs-level UMAP
                 logger.info(f"Fitting obs-level UMAP with n_neighbors={nn}, min_dist={md}")
-                # NOTE: use a global config seed instead of hard-coding
                 # Note that by setting random_state, we get a deterministic UMAP fit, at the
                 # expense of single-thread performance (n_jobs=1). This is a hard constraint of
                 # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
+                # random_state derives from the root seed, sub-keyed (level, nn, md) so every
+                # fit gets its own reproducible stream (#279; md keyed at 1e-3 resolution)
                 umap_obs = umap.UMAP(
                     n_components=2,
-                    random_state=11,
+                    random_state=derive_seed(
+                        self.config.reproducibility.seed, STREAM_UMAP, 0, nn, round(md * 1000)
+                    ),
                     n_neighbors=nn,
                     min_dist=md,
                 ).fit(fit_pool_obs)
@@ -4861,13 +4888,14 @@ class TrainingPipeline:
 
                 # Cadence-level UMAP
                 logger.info(f"Fitting cadence-level UMAP with n_neighbors={nn}, min_dist={md}")
-                # NOTE: use a global config seed instead of hard-coding
                 # Note that by setting random_state, we get a deterministic UMAP fit, at the
                 # expense of single-thread performance (n_jobs=1). This is a hard constraint of
                 # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
                 umap_cadence = umap.UMAP(
                     n_components=2,
-                    random_state=11,
+                    random_state=derive_seed(
+                        self.config.reproducibility.seed, STREAM_UMAP, 1, nn, round(md * 1000)
+                    ),
                     n_neighbors=nn,
                     min_dist=md,
                 ).fit(fit_pool_cadence)
@@ -5878,14 +5906,19 @@ class TrainingPipeline:
         else:
             logger.info("Fitting SHAP-space UMAP + KMeans on summary SHAP values")
             # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
-            # NOTE: use a global config seed instead of hard-coding
             umap_model = umap.UMAP(
-                n_components=2, random_state=11, n_neighbors=15, min_dist=0.1
+                n_components=2,
+                random_state=derive_seed(self.config.reproducibility.seed, STREAM_UMAP, 2),
+                n_neighbors=15,
+                min_dist=0.1,
             ).fit(shap_values)
             embedding = umap_model.transform(shap_values)
             # NOTE: come back to this later (are these values of n_clusters & n_init appropriate always?)
-            # NOTE: use a global config seed instead of hard-coding
-            kmeans = KMeans(n_clusters=4, random_state=11, n_init=10)
+            kmeans = KMeans(
+                n_clusters=4,
+                random_state=derive_seed(self.config.reproducibility.seed, STREAM_KMEANS),
+                n_init=10,
+            )
             cluster_labels = kmeans.fit_predict(shap_values)
             os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
             joblib.dump(
@@ -6120,8 +6153,7 @@ class TrainingPipeline:
         val_features = artifacts["val_features"]
         val_binary = artifacts["val_binary_labels"]
 
-        # NOTE: use a global config seed instead of hard-coding
-        rng = np.random.default_rng(self.config.rf.seed)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_RF_PLOTS, 0)
         # NOTE: come back to this later (parametrize 10% hold-out in config.py)
         n_train_sample = max(1, int(0.1 * train_features.shape[0]))
         train_sample_idx = rng.choice(train_features.shape[0], size=n_train_sample, replace=False)
@@ -6252,8 +6284,7 @@ class TrainingPipeline:
         grid_size = self.config.training.rf_decision_boundary_grid_size
 
         if val_features.shape[0] > max_points:
-            # NOTE: use a global config seed instead of hard-coding
-            rng = np.random.default_rng(self.config.rf.seed)
+            rng = derive_rng(self.config.reproducibility.seed, STREAM_RF_PLOTS, 1)
             point_idx = rng.choice(val_features.shape[0], size=max_points, replace=False)
             pts_features = val_features[point_idx]
             pts_subtype = val_subtype[point_idx]
@@ -6435,7 +6466,7 @@ class TrainingPipeline:
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
-        rng = derive_rng(self.config.training.seed, STREAM_VIZ, 0)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_VIZ, 0)
 
         # Restrict to candidate subset if provided (avoids copying the entire partition)
         if candidate_indices is not None:
@@ -6501,7 +6532,7 @@ class TrainingPipeline:
             per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
-            rng=derive_rng(self.config.training.seed, STREAM_VIZ, 1),
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_VIZ, 1),
         )
 
         self._latent_viz_dataset = viz_results["viz_dataset"]

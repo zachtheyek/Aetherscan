@@ -230,12 +230,33 @@ def _add_train_arguments(subparsers):
 
 
 # TODO: improve flag help descriptions
+def _add_reproducibility_flags_to(parser):
+    """
+    Add the shared reproducibility flags (#279) — registered on BOTH subparsers via one
+    helper so the train and inference surfaces cannot drift.
+    """
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Root random seed for reproducible runs: every random stream derives from it — data generation, dataset split/shuffles, TF weight init, the VAE sampling layer (training AND inference), the random forest, UMAP/KMeans plot fits, and plot subsampling. Defaults to a concrete value (reproducible out of the box); must be >= 0.",
+    )
+    parser.add_argument(
+        "--tf-deterministic-ops",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some speed cost. Only meaningful together with a seed (default: disabled)",
+    )
+
+
 def _add_train_flags_to(parser):
     """
     Add all training-mode CLI flags to `parser`. Defined separately from the subparser wrapper
     so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
     surface without re-declaring every argument.
     """
+    # Shared reproducibility flags (#279) — one helper, both subparsers
+    _add_reproducibility_flags_to(parser)
 
     # Path arguments (overrides environment variables)
     parser.add_argument(
@@ -337,7 +358,7 @@ def _add_train_flags_to(parser):
         "--rf-seed",
         type=int,
         default=None,
-        help="Random seed for random forest reproducibility",
+        help="DEPRECATED: explicit random forest seed override. The RF seed now derives from the root --seed (#279); this alias remains for existing scripts and logs a deprecation warning when used.",
     )
 
     # GPU configuration
@@ -430,18 +451,6 @@ def _add_train_flags_to(parser):
     )
 
     # Training configuration
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Root random seed for reproducible runs: seeds data generation, dataset split/shuffles, TF weight init, and the VAE sampling layer (the random forest is seeded separately via --rf-seed). Omit for OS-entropy (non-reproducible) behavior. Must be >= 0.",
-    )
-    parser.add_argument(
-        "--tf-deterministic-ops",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some training-speed cost. Only meaningful together with --seed (default: disabled)",
-    )
     parser.add_argument(
         "--num-training-rounds",
         type=int,
@@ -743,6 +752,8 @@ def _add_inference_flags_to(parser):
     so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
     surface without re-declaring every argument.
     """
+    # Shared reproducibility flags (#279) — one helper, both subparsers
+    _add_reproducibility_flags_to(parser)
 
     # Path arguments
     parser.add_argument(
@@ -1117,6 +1128,12 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     if hasattr(args, "rf_n_jobs") and args.rf_n_jobs is not None:
         config.rf.n_jobs = args.rf_n_jobs
     if hasattr(args, "rf_seed") and args.rf_seed is not None:
+        # Deprecated alias (#279): the RF seed normally derives from the root --seed via
+        # STREAM_RF; an explicit override still works but is discouraged
+        logger.warning(
+            "--rf-seed is DEPRECATED: the random forest seed now derives from the root "
+            "--seed. The explicit override will be honored this run."
+        )
         config.rf.seed = args.rf_seed
 
     # GPU configuration
@@ -1159,14 +1176,16 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     if hasattr(args, "inference_files") and args.inference_files is not None:
         config.data.inference_files = args.inference_files
 
-    # Training configuration
+    # Reproducibility (#279): shared by both subparsers
     if hasattr(args, "seed") and args.seed is not None:
-        config.training.seed = args.seed
+        config.reproducibility.seed = args.seed
     # tf_deterministic_ops uses argparse.BooleanOptionalAction with default=None so the CLI
     # can express "leave the config default" (omit), "force on", and "force off" — same
     # pattern as async_allocator above
     if hasattr(args, "tf_deterministic_ops") and args.tf_deterministic_ops is not None:
-        config.training.tf_deterministic_ops = args.tf_deterministic_ops
+        config.reproducibility.tf_deterministic_ops = args.tf_deterministic_ops
+
+    # Training configuration
     if hasattr(args, "num_training_rounds") and args.num_training_rounds is not None:
         config.training.num_training_rounds = args.num_training_rounds
     if hasattr(args, "epochs_per_round") and args.epochs_per_round is not None:
@@ -1446,6 +1465,34 @@ def collect_validation_errors(
             )
         )
 
+    # Reproducibility (#279, shared flags): the root seed must be non-negative
+    # (np.random.SeedSequence and tf.random.set_seed both reject negatives at runtime)
+    seed = _resolve(args, "seed", config.reproducibility.seed)
+    if seed is not None and seed < 0:
+        errors.append(
+            ValidationError(
+                field="reproducibility.seed",
+                current=seed,
+                message=f"--seed must be a non-negative integer, got {seed}",
+                fix_kind="clamp_low",
+                min_val=0,
+            )
+        )
+
+    # Same bound for the deprecated explicit RF override (train-only flag; _resolve falls
+    # back to the config default on the inference namespace)
+    rf_seed = _resolve(args, "rf_seed", config.rf.seed)
+    if rf_seed is not None and rf_seed < 0:
+        errors.append(
+            ValidationError(
+                field="rf.seed",
+                current=rf_seed,
+                message=f"--rf-seed must be a non-negative integer, got {rf_seed}",
+                fix_kind="clamp_low",
+                min_val=0,
+            )
+        )
+
     # ============================================================================
     # TRAINING-MODE CHECKS — match _add_train_flags_to layout
     # ============================================================================
@@ -1541,20 +1588,6 @@ def collect_validation_errors(
             config.training.latent_viz_num_cadences_per_type,
         )
         cs = _resolve(args, "curriculum_schedule", config.training.curriculum_schedule)
-
-        # Root seed must be non-negative (np.random.SeedSequence and tf.random.set_seed both
-        # reject negatives at runtime)
-        seed = _resolve(args, "seed", config.training.seed)
-        if seed is not None and seed < 0:
-            errors.append(
-                ValidationError(
-                    field="training.seed",
-                    current=seed,
-                    message=f"--seed must be a non-negative integer, got {seed}",
-                    fix_kind="clamp_low",
-                    min_val=0,
-                )
-            )
 
         # NOTE: come back to this later (should we parametrize num_signal_types = 4 in config.py?)
         # num_samples_beta_vae divisible by 4 (balanced class generation)

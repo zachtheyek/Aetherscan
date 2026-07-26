@@ -20,6 +20,7 @@ from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.db import get_db
 from aetherscan.models import RandomForestModel
+from aetherscan.seeding import seed_tensorflow
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,22 @@ class InferencePipeline:
             raise ValueError("get_db() returned None")
         self.start_time = time.time()
 
+        # Reproducibility (#279): inference used to be entirely unseeded — the encoder's
+        # Sampling layer drew fresh entropy every run, so the same encoder + RF + stamps
+        # could yield a different candidate set on every run. Seed TF's global RNG from the
+        # shared root seed (sub-key 1 = the inference stream; training uses 0) and honor
+        # tf_deterministic_ops on this path too. run_inference re-seeds per cadence.
+        applied_tf_seed = seed_tensorflow(
+            self.config.reproducibility.seed,
+            self.config.reproducibility.tf_deterministic_ops,
+            1,
+        )
+        if applied_tf_seed is not None:
+            logger.info(
+                f"Seeded TF global RNG from root seed {self.config.reproducibility.seed} "
+                f"(derived inference stream seed {applied_tf_seed})"
+            )
+
         # Set distributed strategy
         self.strategy = strategy or tf.distribute.get_strategy()
         self.num_replicas = self.strategy.num_replicas_in_sync
@@ -271,6 +288,7 @@ class InferencePipeline:
         stamp_frequencies_mhz: list[float] | None = None,
         timestamp_observed: float | None = None,
         h5_path: str | None = None,
+        seed_key: int | None = None,
     ) -> dict:
         """
         Run inference on preprocessed cadence snippets (shape (n, 6, 16, 512)) sourced from
@@ -297,6 +315,13 @@ class InferencePipeline:
         # Sanity check
         if not self.encoder or not self.rf_model:
             raise RuntimeError("Encoder and/or Random Forest not initialized")
+
+        # Reproducibility (#279): re-seed TF per cadence when the caller provides a stable
+        # key (the streaming loop passes the catalog cadence index), so a cadence's sampled
+        # latents depend only on (root seed, cadence) — reproducible even when the catalog
+        # is subset or a run resumes partway
+        if seed_key is not None:
+            seed_tensorflow(self.config.reproducibility.seed, False, 1, seed_key)
 
         inf_holder = None
         inf_dataset = None

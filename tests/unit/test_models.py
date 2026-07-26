@@ -179,3 +179,44 @@ class TestEncoderDecoderSymmetry:
         recon = reconstruction.numpy()
         assert recon.min() >= 0.0
         assert recon.max() <= 1.0
+
+
+class TestSeededSamplingReproducibility:
+    """#279: seed_tensorflow makes the Sampling layer's draws reproducible — the mechanism
+    that makes inference candidate sets repeatable (the layer used to be entirely unseeded
+    on the inference path)."""
+
+    def test_same_stream_key_reproduces_sampled_z(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+        layer = Sampling()
+        z_mean = tf.zeros((4, 8))
+        z_log_var = tf.zeros((4, 8))
+
+        seed_tensorflow(207, False, 1, 5)
+        first = layer([z_mean, z_log_var]).numpy()
+        seed_tensorflow(207, False, 1, 5)
+        second = layer([z_mean, z_log_var]).numpy()
+        np.testing.assert_array_equal(first, second)
+
+        # A different sub-key (e.g. another cadence) yields a different, but equally
+        # reproducible, draw
+        seed_tensorflow(207, False, 1, 6)
+        third = layer([z_mean, z_log_var]).numpy()
+        assert not np.array_equal(first, third)
+
+    def test_unseeded_root_returns_none_and_leaves_entropy(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+        layer = Sampling()
+        z_mean = tf.zeros((4, 8))
+        z_log_var = tf.zeros((4, 8))
+        assert seed_tensorflow(None, False, 1) is None
+        first = layer([z_mean, z_log_var]).numpy()
+        assert seed_tensorflow(None, False, 1) is None
+        second = layer([z_mean, z_log_var]).numpy()
+        assert not np.array_equal(first, second)

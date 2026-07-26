@@ -102,6 +102,23 @@ class BetaVAEConfig:
 
 
 @dataclass
+class ReproducibilityConfig:
+    """Random-state configuration (#279): ONE root seed for the whole pipeline"""
+
+    # Root seed for every random stream in BOTH pipelines: synthetic data generation, dataset
+    # split/shuffles, TF weight init, the VAE sampling layer (training AND inference), the
+    # Random Forest, UMAP/KMeans plot fits, and plot subsampling — each consumer derives an
+    # independent stream (see aetherscan.seeding). Defaults to a concrete value so runs are
+    # reproducible out of the box (#279 flipped this from the historical None); None restores
+    # OS entropy (non-reproducible, warned once). Bit-exact GPU reproducibility additionally
+    # needs tf_deterministic_ops and identical hardware/software (GPU count, TF version).
+    seed: int | None = 11
+    # Force deterministic TF/cuDNN op implementations (tf.config.experimental
+    # .enable_op_determinism) at some speed cost. Only meaningful alongside `seed`.
+    tf_deterministic_ops: bool = False
+
+
+@dataclass
 class RandomForestConfig:
     """Random Forest configuration"""
 
@@ -111,7 +128,9 @@ class RandomForestConfig:
     )
     max_features: str = "sqrt"  # Random feature selection (sqrt, log2, float)
     n_jobs: int = -1  # Number of parallel jobs to run (-1 = use all available CPU cores)
-    seed: int = 11
+    # Explicit override for the RF random_state. None (the default) derives the seed from
+    # reproducibility.seed via STREAM_RF (#279); the deprecated --rf-seed flag sets this.
+    seed: int | None = None
 
 
 # NOTE: verify that our current GPU config gracefully handles cases where the node has a single GPU (vs multiple)
@@ -190,17 +209,8 @@ class DataConfig:
 
 @dataclass
 class TrainingConfig:
-    # Reproducibility params
-    # Root seed for the pipeline's random streams: synthetic data generation, dataset
-    # split/shuffles, TF weight init, and the VAE sampling layer (each consumer derives an
-    # independent stream — see aetherscan.seeding). None = OS entropy, i.e. non-reproducible
-    # runs (the historical behavior). The Random Forest stage is seeded independently via
-    # rf.seed. Bit-exact GPU reproducibility additionally needs tf_deterministic_ops and
-    # identical hardware/software (GPU count, TF version).
-    seed: int | None = None
-    # Force deterministic TF/cuDNN op implementations (tf.config.experimental
-    # .enable_op_determinism) at some training-speed cost. Only meaningful alongside `seed`.
-    tf_deterministic_ops: bool = False
+    # Reproducibility now lives in ReproducibilityConfig (#279): one root seed shared by both
+    # pipelines instead of a training-only seed plus an independent rf.seed.
 
     num_training_rounds: int = 20
     epochs_per_round: int = 100
@@ -506,6 +516,7 @@ class Config:
         self.manager = ManagerConfig()
         self.monitor = MonitorConfig()
         self.logger = LoggerConfig()
+        self.reproducibility = ReproducibilityConfig()
         self.beta_vae = BetaVAEConfig()
         self.rf = RandomForestConfig()
         self.gpu = GPUConfig()
@@ -538,6 +549,20 @@ class Config:
                 f"({self.inference.stamp_width}) must equal data.width_bin "
                 f"({self.data.width_bin})"
             )
+
+    def resolved_rf_seed(self) -> int:
+        """
+        The Random Forest random_state actually used this run (#279): rf.seed when explicitly
+        overridden (deprecated --rf-seed), else derived from the root seed via STREAM_RF.
+        Always a concrete int — with an unseeded root the derived value is OS entropy, so the
+        RF still gets a set random_state (the #279 constraint: never drop one that exists).
+        """
+        # Deferred import: config must stay importable before/without the rest of the package
+        from aetherscan.seeding import STREAM_RF, derive_seed  # noqa: PLC0415
+
+        if self.rf.seed is not None:
+            return self.rf.seed
+        return derive_seed(self.reproducibility.seed, STREAM_RF)
 
     @classmethod
     def _reset(cls):
@@ -642,11 +667,21 @@ class Config:
                 "beta": self.beta_vae.beta,
                 "alpha": self.beta_vae.alpha,
             },
+            "reproducibility": {
+                "seed": self.reproducibility.seed,
+                "tf_deterministic_ops": self.reproducibility.tf_deterministic_ops,
+                # Provenance only (#279): the concrete values derived from the root this run.
+                # Not a settable field — apply_saved_config skips unknown sub-keys, so a
+                # restored config re-derives from the root instead of pinning these.
+                "derived_rf_seed": self.resolved_rf_seed(),
+            },
             "rf": {
                 "n_estimators": self.rf.n_estimators,
                 "bootstrap": self.rf.bootstrap,
                 "max_features": self.rf.max_features,
                 "n_jobs": self.rf.n_jobs,
+                # The override field (None = derived from reproducibility.seed; see
+                # reproducibility.derived_rf_seed for the value actually used)
                 "seed": self.rf.seed,
             },
             "gpu": {
@@ -671,8 +706,6 @@ class Config:
                 "inference_files": self.data.inference_files,
             },
             "training": {
-                "seed": self.training.seed,
-                "tf_deterministic_ops": self.training.tf_deterministic_ops,
                 "num_training_rounds": self.training.num_training_rounds,
                 "epochs_per_round": self.training.epochs_per_round,
                 "num_samples_beta_vae": self.training.num_samples_beta_vae,

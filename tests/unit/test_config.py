@@ -73,6 +73,12 @@ class TestSingletonSemantics:
         )
 
 
+# Provenance-only keys (#279): emitted by to_dict() for the saved-config record but NOT
+# settable dataclass fields (apply_saved_config skips them on restore). Any addition here
+# must be deliberate — everything else stays strictly field-synced.
+_PROVENANCE_ONLY_KEYS = {"reproducibility": {"derived_rf_seed"}}
+
+
 class TestToDict:
     def test_sections_cover_every_dataclass_field(self):
         """to_dict() must be updated by hand for every new config section/field — catch drift."""
@@ -88,10 +94,11 @@ class TestToDict:
             f"missing={sections - serialized_sections}, extra={serialized_sections - sections}"
         )
 
-        # A forgotten field within a section: each section's keys must equal its dataclass fields.
+        # A forgotten field within a section: each section's keys must equal its dataclass
+        # fields (plus any documented provenance-only extras).
         for section in sections:
             expected = {f.name for f in dataclasses.fields(type(getattr(config, section)))}
-            actual = set(serialized[section].keys())
+            actual = set(serialized[section].keys()) - _PROVENANCE_ONLY_KEYS.get(section, set())
             assert actual == expected, (
                 f"Config.to_dict()['{section}'] is out of sync with "
                 f"{type(getattr(config, section)).__name__}: "
@@ -108,6 +115,8 @@ class TestToDict:
         assert serialized["paths"]["data_path"] == config.data_path
         for section in _config_sections(config):
             for field_name, value in serialized[section].items():
+                if field_name in _PROVENANCE_ONLY_KEYS.get(section, set()):
+                    continue  # derived, not a stored field
                 stored = getattr(getattr(config, section), field_name)
                 if isinstance(stored, tuple):
                     # json-level equality: tuples serialize as lists downstream

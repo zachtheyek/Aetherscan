@@ -789,7 +789,7 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     # dataset, which runs after the training datasets/iterators are torn down (train_round's
     # finally: holder.clear() -> del datasets -> clear_session -> gc), so no tf.data generator
     # thread is alive mutating global RNG state during it. Per-task seeds are drawn from the
-    # per-round seed_rng in generate_round_to_memmap — derived from config.training.seed
+    # per-round seed_rng in generate_round_to_memmap — derived from config.reproducibility.seed
     # when set (making generation reproducible across runs), OS entropy otherwise; either
     # way this reseed keeps results independent of worker scheduling within a run.
     random.seed(seed)
@@ -1000,7 +1000,7 @@ def generate_round_to_memmap(
     stats_cb(segment_dict) fires once per class-segment per chunk; progress_cb(chunk,
     n_chunks) once per chunk. Returns the manifest dict.
 
-    `seed` is the pipeline root seed (config.training.seed): when set, per-task seeds derive
+    `seed` is the pipeline root seed (config.reproducibility.seed): when set, per-task seeds derive
     deterministically from (seed, round_num) and the same call regenerates byte-identical
     data; None keeps the OS-entropy behavior.
     """
@@ -1040,8 +1040,9 @@ def generate_round_to_memmap(
     # Per-task seeds are drawn from this stream. With a root `seed` it derives
     # deterministically from (seed, round), so the same seed regenerates identical data;
     # with seed=None it falls back to OS entropy (non-reproducible, the historical
-    # behavior). The RF dataset passes round_num=None and maps onto the round-0 key —
-    # beta-VAE rounds are 1-based, so the streams never collide.
+    # behavior). The RF dataset passes round_num=num_training_rounds+1 (the supersede
+    # sentinel — see train.train_random_forest); beta-VAE rounds are 1-based, so the
+    # streams never collide. The None->0 fallback below is only a signature default.
     seed_rng = derive_rng(seed, STREAM_DATA_GEN, round_num if round_num is not None else 0)
 
     logger.info(
@@ -1328,6 +1329,6 @@ class DataGenerator:
             pool=self.pool,
             backgrounds=self.backgrounds if self.pool is None else None,
             round_num=round_num,
-            seed=self.config.training.seed,
+            seed=self.config.reproducibility.seed,
             stats_cb=_stats_cb,
         )

@@ -44,6 +44,7 @@ from aetherscan.db import get_db
 from aetherscan.logger import get_logger
 from aetherscan.models import prepare_latent_features
 from aetherscan.pfb import gen_coarse_channel_response
+from aetherscan.seeding import STREAM_INFERENCE_VIZ, derive_rng
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,9 @@ class InferenceVizCollector:
         self._latent_chunks: list[np.ndarray] = []  # (k, num_obs * latent_dim) each
         self._candidate_chunks: list[np.ndarray] = []  # bool masks aligned with chunks
         self._latent_count = 0
-        self._rng = np.random.default_rng(11)
+        config = get_config()
+        root_seed = config.reproducibility.seed if config is not None else None
+        self._rng = derive_rng(root_seed, STREAM_INFERENCE_VIZ)
 
     def record_skipped(
         self, key: tuple, npy_path: str, metadata_path: str, manifest_row: dict

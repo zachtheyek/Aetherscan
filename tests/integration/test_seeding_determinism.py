@@ -58,8 +58,8 @@ def test_seeding_yields_byte_identical_encoder_weights():
     # -threaded test, so the mutate-config-post-init caveat does not apply.
     if get_config() is None:
         init_config()
-    get_config().training.seed = _SEED
-    seed = get_config().training.seed
+    get_config().reproducibility.seed = _SEED
+    seed = get_config().reproducibility.seed
 
     # Deterministic cuDNN/reduction kernels (the --tf-deterministic-ops promise). Process-global
     # and only meaningful on a real GPU, hence the gpu/cluster markers + nvidia-smi guard above.

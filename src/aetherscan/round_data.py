@@ -615,7 +615,7 @@ class RoundDataProducer:
             "task_size": task_size,
             "freq_resolution": freq_resolution,
             "time_resolution": time_resolution,
-            # Pipeline root seed (config.training.seed) — crosses the spawn boundary with the
+            # Pipeline root seed (config.reproducibility.seed) — crosses the spawn boundary with the
             # rest of the params so producer-generated rounds derive the same per-round
             # streams as in-process generation. None = OS entropy
             "seed": seed,

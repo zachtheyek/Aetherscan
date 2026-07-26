@@ -477,6 +477,8 @@ def _infer_cadence(
         results = pipeline.run_inference(
             data=cadence_data,
             npy_path=cadence_result.npy_path,
+            # Stable per-catalog cadence index -> reproducible per-cadence TF stream (#279)
+            seed_key=unit.index,
             **provenance,
         )
         del cadence_data
