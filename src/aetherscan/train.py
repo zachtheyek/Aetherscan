@@ -49,6 +49,7 @@ from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
 from aetherscan.hf_hub import upload_run_to_hf
+from aetherscan.latent_gif import FrameCategory, render_latent_gif_frames
 from aetherscan.logger import get_logger
 from aetherscan.models import (
     RandomForestModel,
@@ -4692,66 +4693,50 @@ class TrainingPipeline:
             mode,
         ):
             """
-            Render one scatter frame per snapshot and assemble them into a GIF.
+            Render one scatter frame per snapshot (across a process pool — see
+            aetherscan.latent_gif, #278) and assemble them into a GIF.
 
             mode="obs"     → 8-category (signal_type × ON/OFF) scatter with triangle/x markers
             mode="cadence" → 4-category (signal_type) scatter with single-marker style
             """
-            frame_paths = []
+            if mode == "obs":
+                categories = [
+                    FrameCategory(
+                        signal_type=stype,
+                        onoff=status,
+                        color=color,
+                        marker=obs_markers[status],
+                        display_name=obs_display_names[(stype, status)],
+                    )
+                    for (stype, status), color in obs_colors.items()
+                ]
+                legend_kwargs = {
+                    "loc": "upper right",
+                    "fontsize": 8,
+                    "markerscale": 2,
+                    "ncol": 2,
+                    "framealpha": 0.8,
+                }
+            else:  # cadence
+                categories = [
+                    FrameCategory(
+                        signal_type=stype,
+                        onoff=None,
+                        color=color,
+                        marker="o",
+                        display_name=cadence_display_names[stype],
+                    )
+                    for stype, color in cadence_colors.items()
+                ]
+                legend_kwargs = {
+                    "loc": "upper right",
+                    "fontsize": 8,
+                    "markerscale": 2,
+                    "framealpha": 0.8,
+                }
+
+            frames = []
             for frame_idx, meta in enumerate(snapshot_metadata):
-                coords_2d = transformed_list[frame_idx]
-                fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-
-                if mode == "obs":
-                    labels_arr = np.array(all_snapshot_labels_obs[frame_idx])
-                    onoff_arr = np.array(all_snapshot_onoff_obs[frame_idx])
-                    for (stype, status), color in obs_colors.items():
-                        mask = (labels_arr == stype) & (onoff_arr == status)
-                        if mask.any():
-                            ax.scatter(
-                                coords_2d[mask, 0],
-                                coords_2d[mask, 1],
-                                c=color,
-                                marker=obs_markers[status],
-                                s=10,
-                                alpha=0.75,
-                                label=obs_display_names[(stype, status)],
-                                rasterized=True,
-                            )
-                    del labels_arr, onoff_arr
-                    legend_kwargs = {
-                        "loc": "upper right",
-                        "fontsize": 8,
-                        "markerscale": 2,
-                        "ncol": 2,
-                        "framealpha": 0.8,
-                    }
-                else:  # cadence
-                    labels_arr = np.array(all_snapshot_labels_cadence[frame_idx])
-                    for stype, color in cadence_colors.items():
-                        mask = labels_arr == stype
-                        if mask.any():
-                            ax.scatter(
-                                coords_2d[mask, 0],
-                                coords_2d[mask, 1],
-                                c=color,
-                                marker="o",
-                                s=10,
-                                alpha=0.75,
-                                label=cadence_display_names[stype],
-                                rasterized=True,
-                            )
-                    del labels_arr
-                    legend_kwargs = {
-                        "loc": "upper right",
-                        "fontsize": 8,
-                        "markerscale": 2,
-                        "framealpha": 0.8,
-                    }
-
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
-
                 meta_snr_base = meta["snr_base"]
                 meta_snr_range = meta["snr_range"]
                 meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
@@ -4760,22 +4745,37 @@ class TrainingPipeline:
                     if meta_snr_base is not None and meta_snr_range is not None
                     else "?"
                 )
-                ax.set_title(
-                    f"Beta-VAE Latent Space: {display_method} — "
-                    f"Round {meta['round_number']}, "
-                    f"Epoch {meta['epoch_number']}, "
-                    f"Step {meta['step_number']} "
-                    f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
-                    fontsize=11,
+                frames.append(
+                    {
+                        "coords": transformed_list[frame_idx],
+                        "labels": (
+                            all_snapshot_labels_obs[frame_idx]
+                            if mode == "obs"
+                            else all_snapshot_labels_cadence[frame_idx]
+                        ),
+                        "onoff": all_snapshot_onoff_obs[frame_idx] if mode == "obs" else None,
+                        "title": (
+                            f"Beta-VAE Latent Space: {display_method} — "
+                            f"Round {meta['round_number']}, "
+                            f"Epoch {meta['epoch_number']}, "
+                            f"Step {meta['step_number']} "
+                            f"(SNR: {meta_snr_floor}–{meta_snr_ceil})"
+                        ),
+                    }
                 )
-                ax.legend(**legend_kwargs)
 
-                plt.tight_layout()
-
-                frame_path = os.path.join(temp_dir, f"{method_name}_frame_{frame_idx:05d}.png")
-                fig.savefig(frame_path, dpi=100)
-                plt.close(fig)
-                frame_paths.append(frame_path)
+            frame_paths = render_latent_gif_frames(
+                frames,
+                categories=categories,
+                xlim=xlim,
+                ylim=ylim,
+                legend_kwargs=legend_kwargs,
+                out_dir=temp_dir,
+                method_name=method_name,
+                n_workers=self.config.manager.n_processes,
+            )
+            del frames
+            gc.collect()
 
             # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
             gif_filename = f"latent_space_{method_name}_{tag}.gif"
