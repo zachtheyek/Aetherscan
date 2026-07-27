@@ -52,6 +52,7 @@ def test_seeding_yields_byte_identical_encoder_weights():
 
     from aetherscan.config import get_config, init_config  # noqa: PLC0415
     from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+    from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
 
     # Integration tests skip the autouse config-init fixture, so bootstrap the singleton here,
     # then pin the seed the construction path reads (create_beta_vae_model -> get_config). Single
@@ -77,10 +78,13 @@ def test_seeding_yields_byte_identical_encoder_weights():
     strategy = tf.distribute.get_strategy()
 
     def _build_and_train_once() -> list[np.ndarray]:
-        # Seed the TF global RNG before any variable creation so weight init and the Sampling
-        # layer's epsilon draw the same stream each run — exactly the ordering TrainingPipeline
-        # uses (tf.random.set_seed before create_beta_vae_model, inside strategy.scope()).
-        tf.random.set_seed(seed)
+        # Seed through the PIPELINE'S OWN helper before any variable creation, exactly as
+        # TrainingPipeline.__init__ does. Calling tf.random.set_seed directly (as this test
+        # used to) is what let the #279 weight-init hole hide: tf_keras initializers seed
+        # from Python's global `random`, not from TF's global seed, so a test that bypasses
+        # seed_tensorflow tests something the pipeline never does — and this test failed on
+        # master for exactly that reason.
+        seed_tensorflow(seed, False, 0)
         with strategy.scope():
             vae = create_beta_vae_model()
             # One real train step: mirrors _distributed_train_step's per-replica body and

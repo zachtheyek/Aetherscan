@@ -24,6 +24,7 @@ overwritten by the per-task root-derived reseed before any draw).
 from __future__ import annotations
 
 import logging
+import random
 
 import numpy as np
 
@@ -45,6 +46,7 @@ STREAM_SHAP_SAMPLES = 9  # SHAP summary/interaction row subsampling (feeds cache
 STREAM_RF_PLOTS = 10  # RF plot subsamples (sub-keyed: 0=learning curve, 1=decision boundary)
 STREAM_INFERENCE_MC = 11  # pass-2 MC latent draws (sub-keyed by the cadence's catalog index)
 STREAM_REFERENCE_CLOUD = 12  # reservoir subsample of pass-1 rejects for the reference cloud
+STREAM_KERAS_INIT = 13  # Python's global random, which tf_keras initializers seed from (see below)
 
 # One-shot flag so an unseeded run warns exactly once instead of per derived stream.
 # Module-level, so the "once" is PER PROCESS: forkserver/spawn workers each carry their own
@@ -104,6 +106,24 @@ def seed_tensorflow(root_seed: int | None, deterministic_ops: bool, *stream_key:
     partially-rerun pipeline reproduces an uninterrupted one (#279: a single __init__-time
     set_seed is not resume-safe, because skipping rounds shifts the stream position).
 
+    ALSO seeds Python's global `random` module, which is NOT incidental: tf_keras's weight
+    initializers (HeNormal/GlorotNormal in models/vae.py) build a
+    `backend.RandomGenerator(seed=None, rng_type="stateless")`, whose `_create_seed()` falls
+    back to `random.randint(1, int(1e9))` when no Keras seed generator is set. So
+    `tf.random.set_seed()` alone does NOT pin weight initialization — measured on the NGC
+    2.17 image: two same-`tf.random.set_seed` builds gave 100% different weights. Seeding
+    Python's `random` closes that hole (verified: identical weights same seed, different
+    weights different seed).
+
+    Do NOT "simplify" this to `tf_keras.utils.set_random_seed()`, the canonical Keras API:
+    it populates the thread-local `_SEED_GENERATOR`, after which `_create_seed()` calls
+    `generator.randint(1, 1e9)` with a FLOAT bound, which Python 3.12's `random.randint`
+    rejects — every subsequent initializer raises `TypeError: 'float' object cannot be
+    interpreted as an integer`. That path is broken on this stack; this one is not.
+
+    The VAE `Sampling` layer calls `tf.random.normal` directly and IS covered by
+    `tf.random.set_seed` alone — only the initializers needed the extra seeding.
+
     Returns the seed applied, or None when root_seed is None (TF keeps its own entropy;
     warned once). TF is imported lazily so this module stays importable without the
     scientific stack.
@@ -115,6 +135,7 @@ def seed_tensorflow(root_seed: int | None, deterministic_ops: bool, *stream_key:
     if root_seed is not None:
         applied = derive_seed(root_seed, STREAM_TF, *stream_key)
         tf.random.set_seed(applied)
+        random.seed(derive_seed(root_seed, STREAM_KERAS_INIT, *stream_key))
 
     if deterministic_ops:
         # Deterministic kernels only pin op results; without a seed the draws still differ
