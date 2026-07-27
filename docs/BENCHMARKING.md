@@ -204,7 +204,7 @@ the maintained per-host baseline tables.
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` vs `_spline_flatten_bandpass` on one 1M-bin coarse channel | bandpass flattening inside ED |
 | `bench_rf.py` | `RandomForestClassifier.fit` + `predict_proba` and the `prepare_latent_features` reshape (sklearn, CPU) | Second-stage RF training + inference (`train.train_random_forest`) |
 | `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one or more GPUs | VAE training (`train.round_XX`) and encoder inference — **GPU-only, container required** |
-| `bench_input_pipeline.py` | The real memmap → tf.data → distribute → train-step input path, legacy vs current builder, with a `--gil-load` contention knob and `--profile` TF-profiler hook | The training input pipeline `bench_gpu.py` deliberately excludes — the #276 audit harness (numbers + conclusions in `benchmarks/README.md`) |
+| `bench_input_pipeline.py` | The real memmap → tf.data → distribute → train-step input path, legacy vs current builder, with a `--gil-load` contention knob and `--profile` TF-profiler hook | The training input pipeline `bench_gpu.py` deliberately excludes — the #276 audit harness. Its profiler traces are what established that the GPUs sit idle >90% of the wall clock while doing exactly the kernel work `bench_gpu` predicts (numbers + conclusions in `benchmarks/README.md`) |
 | `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / render / assemble) with output-equality gates on every candidate optimization | The `vae_plots` latent-GIF tail — the #278 audit harness (numbers in `benchmarks/README.md`) |
 
 Only the four CPU micro-benchmarks (`bench_normality`, `bench_injection`,

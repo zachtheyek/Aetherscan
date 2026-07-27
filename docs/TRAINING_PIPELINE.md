@@ -245,6 +245,18 @@ warned once per process).
   the RF stage, so a resumed run reproduces an uninterrupted one (a single `__init__`-time
   `set_seed` is not resume-safe: skipping rounds shifts the stream position). Inference
   additionally re-seeds per cadence — see [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).
+
+  > **Why `seed_tensorflow` also seeds Python's `random`.** `tf.random.set_seed()` alone does
+  > **not** pin weight initialization on this stack: tf_keras's initializers build a
+  > `backend.RandomGenerator(seed=None, rng_type="stateless")` whose `_create_seed()` falls
+  > back to `random.randint(...)` on Python's *global* `random` module. Before this was fixed,
+  > every VAE initialized from OS entropy regardless of `--seed`. The `Sampling` layer calls
+  > `tf.random.normal` directly and was always covered — only initialization was affected.
+  > **Do not replace this with `tf_keras.utils.set_random_seed()`**, the canonical Keras API:
+  > it populates the thread-local `_SEED_GENERATOR`, after which `_create_seed()` calls
+  > `randint(1, 1e9)` with a *float* bound that Python 3.12 rejects, and every subsequent
+  > initializer raises `TypeError`. Verified on the NGC 2.17 image; guarded by a regression
+  > test in `tests/unit/test_models.py`.
 - **The Random Forest seed derives from the root** (`STREAM_RF`). `config.rf.seed` is now an
   explicit-override-only field (default `None`); the **deprecated** `--rf-seed` alias still
   sets it for existing scripts but logs a deprecation warning.

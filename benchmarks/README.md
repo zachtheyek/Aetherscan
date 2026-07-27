@@ -188,35 +188,89 @@ the default batch 128, training uses ~2.8 GB/GPU — comfortably within the 16 G
 
 `bench_input_pipeline.py` closes the gap `bench_gpu.py` documents (synthetic in-memory tensors,
 no input path): it synthesizes an on-disk round of the production layout and measures the real
-memmap → tf.data → distribute → train-step path, with a verbatim replica of the pre-#276
-single-generator builder (`--variant legacy`) for before/after. Numbers below from blpc3
-(5× RTX PRO 6000, 32 cores, NGC 25.02, July 2026; 20k-sample synthetic round, page-cache
-resident — the same regime the live-run audit measured).
+memmap -> tf.data -> distribute -> train-step path, with a verbatim replica of the pre-#276
+single-generator builder (`--variant legacy`) for before/after, a `--gil-load N` knob running N
+background threads doing `write_injection_stat`-shaped pure-Python work (the #277 drainer flood,
+in proxy form), and a `--profile` TF-profiler hook. Numbers below from blpc3 (5x RTX PRO 6000,
+32 cores, NGC 25.02, July 2026; 20k-sample synthetic round, page-cache resident -- the same
+regime the live-run audit measured: `wa=0`, `bi=0`, round resident in RAM).
+
+### Throughput ladder (idle host)
 
 | measurement | legacy | current (#276) |
 |---|---|---|
-| raw numpy gather (single thread, no tf.data) | 11,815 samples/s (~7.0 GB/s) | — |
-| iterate, 1 replica, batch 128, idle host | 4,790 samples/s | 3,031 samples/s |
-| iterate + 1 GIL-load thread (DB-drainer-shaped work) | 1,708 samples/s (−64%) | 1,478 samples/s |
-| **step: real VAE train step, 5 GPUs, accum 12** | **1,043 cad/s** | **1,407 cad/s (+35%)** |
-| step, current + `--tf-deterministic-ops` | — | 1,307 cad/s (−7% vs current) |
+| raw numpy gather (single thread, no tf.data) | 11,815 cad/s (**6.97 GB/s**) | — |
+| iterate, 1 replica, batch 128 (tf.data only, no GPU) | 4,790 cad/s | 3,031 cad/s |
+| **step: real VAE train step, 5 GPUs, accum 12** | **1,022 cad/s** | **1,409 cad/s (+38%)** |
+| step, current + `--tf-deterministic-ops` | — | 1,307 cad/s (−7%) |
 
-Audit conclusions (the #276 "name the bottleneck first" deliverable):
+### TF profiler: the GPUs are idle >90% of the time
 
-1. **The host copy is not the bottleneck** — a single thread gathers ~7 GB/s from the
-   page-cache-resident memmaps, ~2.5× the volume the 5-GPU consumer needs.
-2. **GIL contention is the dominant mechanism**: one background thread doing
-   `write_injection_stat`-shaped pure-Python work (the #277 drainer flood, ~300K calls per
-   producer message) costs the single-threaded legacy producer **64%** of its throughput.
-   This is the measured #276 × #277 interaction — #277's bulk write API removes ~all of that
-   Python-call volume, and the parallel gather spreads what remains across tf.data workers.
-3. **End to end, the #276 index-generator + parallel-gather builder is worth +35%** on the
-   real 5-GPU train step. In the *uncontended single-replica iterate* microbenchmark the
-   parallel map is actually slower than the plain generator (per-batch `tf.numpy_function`
-   overhead with no overlap to hide it) — the win comes from overlapping gathers with GPU
-   compute at real global batch sizes, which is the regime that matters.
-4. `--tf-deterministic-ops` costs ~7% end-to-end on this path (deterministic kernels + ordered
-   tf.data) — the price of bit-exact reproducibility, now quantified.
+XPlane compute-stream occupancy over the timed steps (the authoritative host-vs-device
+measurement issue #276 asked for):
+
+| | legacy | current (#276) |
+|---|---|---|
+| wall window for identical GPU work | 75.66 s | **57.25 s (−24%)** |
+| GPU compute time (mean per GPU) | 4.72 s | 4.72 s |
+| **mean GPU compute occupancy** | **6.3%** | **8.3%** |
+| GPUs idle | 93.7% | 91.7% |
+
+Two things fall out. First, **the per-GPU kernel time is identical between variants** (4.72 s for
+the same 120 micro-batches) — the fix changes only how long the GPUs wait, not the work they do.
+Second, that kernel time implies **3,253 cad/s per GPU** of pure compute, within 9% of
+`bench_gpu`'s independently measured 2,986 cad/s synthetic figure. The GPUs are doing exactly the
+work the synthetic benchmark predicts; they simply sit idle for >90% of the wall clock waiting on
+the host. (Live-run `nvidia-smi` sampling reported 20–25% "utilization"; that counter registers a
+sample as busy if *any* kernel ran during it, so it reads high against true kernel occupancy —
+the two observations agree.)
+
+### GIL dose-response (end-to-end 5-GPU step throughput)
+
+| background Python threads | legacy | current (#276) | current advantage |
+|---|---|---|---|
+| 0 | 1,022 cad/s | 1,409 cad/s | **+38%** |
+| 1 | 468 cad/s (−54%) | 526 cad/s (−63%) | +12% |
+| 2 | 92 cad/s (−91%) | 82 cad/s (−94%) | **−11% (crossover)** |
+
+### Conclusions
+
+Graded by what the data actually supports.
+
+1. **GIL contention is the dominant mechanism — measured end-to-end, not inferred.** One
+   background thread doing drainer-shaped Python work costs **54%** of legacy end-to-end training
+   throughput; two threads cost **91%** (an 11x collapse). This is the #276 x #277 interaction,
+   and it is the strongest signal in the audit. *Caveat, stated plainly:* the hog's intensity is
+   synthetic and was not calibrated against the real drainer's burst rate, so this establishes
+   the mechanism and the pipeline's sensitivity to it — not the exact magnitude attributable to
+   the live run. #277's bulk write API removes ~all of that per-row Python call volume, which is
+   why the two fixes belong together.
+2. **The single-threaded memmap copy is CO-LIMITING, not a non-factor.** Raw gather sustains
+   6.97 GB/s. The trace's own kernel timings put a fully fed 5-GPU consumer at 16,265 cad/s =
+   **9.59 GB/s** of gather demand, so one thread supplies **0.73x** of what saturated GPUs would
+   draw. It is not the dominant term at the throughputs actually observed (8% of ceiling, for the
+   GIL reasons above), but it cannot be dismissed: remove every other bottleneck and the copy
+   becomes the next wall.
+   > **Correction.** An earlier revision of this section claimed the copy had "~2.5x the volume
+   > the 5-GPU consumer needs" and was therefore "not the bottleneck". That figure divided the
+   > raw gather rate by the *legacy pipeline's own delivered rate* — circular, since that rate is
+   > the thing under evaluation — and the conclusion did not follow. Corrected above against the
+   > profiler-derived ceiling.
+3. **The #276 fix's benefit is contention-dependent, and it inverts under heavy load.** +38% on
+   an idle host, +12% with one competing Python thread, and **−11% with two** — because
+   `tf.numpy_function` re-enters the interpreter, so the parallel-map workers contend for the very
+   GIL they are meant to route around. It is still the right change to land: with #277 in the same
+   PR the drainer flood is gone, which puts production near the 0–1 thread regime where the fix
+   wins. But the durable lever is removing Python from the hot path, and a future gather that
+   never returns to Python (pure `tf.data` ops or a C-level reader) would be immune to this
+   entirely. **Do not port the parallel map into a Python-heavy process without re-measuring.**
+4. **`--tf-deterministic-ops` costs ~7%** end-to-end (deterministic kernels + ordered `tf.data`)
+   — the price of bit-exact reproducibility, now quantified.
+
+**Not measured** (honest gaps, for whoever picks this up): `py-spy` attribution on a live training
+process, and the ~700k context-switches/s the issue reported — the proxy hog reproduces the
+*effect*, but neither was attributed on the real process. Both want a real (small) training run on
+an otherwise idle cluster.
 
 ## Latent-GIF audit (#278)
 

@@ -860,6 +860,14 @@ def prepare_distributed_train_dataset(
     # deterministic=True keeps the emitted batch ORDER identical to the index stream even with
     # parallel in-flight gathers (and matches --tf-deterministic-ops semantics, which would
     # force it anyway).
+    #
+    # ⚠ MEASURED CAVEAT (#276 audit, benchmarks/README.md): tf.numpy_function re-enters the
+    # Python interpreter, so these map workers contend for the SAME GIL they exist to route
+    # around. End-to-end on 5 GPUs this is +38% on an idle host, +12% with one competing
+    # Python thread, and −11% with two — it inverts under heavy Python load. That is fine here
+    # because #277 removed the per-row injection-stat call volume that used to saturate the
+    # GIL, but re-measure before assuming it helps in a Python-heavier process. The durable
+    # fix would be a gather that never returns to Python (pure tf.data ops / a C-level reader).
     logger.info(
         f"Creating infinite batched datasets from index generators with global batch size - "
         f"Train: {global_train_batch_size}, Val: {global_val_batch_size}"
