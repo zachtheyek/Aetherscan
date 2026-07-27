@@ -135,6 +135,16 @@ def seed_tensorflow(root_seed: int | None, deterministic_ops: bool, *stream_key:
     if root_seed is not None:
         applied = derive_seed(root_seed, STREAM_TF, *stream_key)
         tf.random.set_seed(applied)
+        # NOTE: random.seed() is PROCESS-WIDE, with two consequences worth knowing:
+        # (1) it pins any transitive consumer of Python's `random` in the imported dependency
+        #     tree, not just tf_keras — a feature for a reproducibility fix, but it means a
+        #     library whose behavior varies with RNG state now behaves differently than it did
+        #     before this call existed. Nothing in the current dep set is known to care.
+        # (2) it is not thread-local. data_generation reseeds per task before every draw
+        #     (data_generation.py:795), so today's single-threaded-per-task usage is safe; but
+        #     if a CONCURRENT main-process consumer of `random` is ever added (a monitor
+        #     thread, a plot renderer, a callback), the seed pins the aggregate stream while
+        #     the per-thread interleaving stays nondeterministic.
         random.seed(derive_seed(root_seed, STREAM_KERAS_INIT, *stream_key))
 
     if deterministic_ops:

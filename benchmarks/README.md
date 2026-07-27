@@ -199,10 +199,16 @@ regime the live-run audit measured: `wa=0`, `bi=0`, round resident in RAM).
 
 | measurement | legacy | current (#276) |
 |---|---|---|
-| raw numpy gather (single thread, no tf.data) | 11,815 cad/s (**6.97 GB/s**) | — |
+| raw numpy gather (single thread, no tf.data) | 11,815 cad/s (**6.97 GB/s**)¹ | — |
 | iterate, 1 replica, batch 128 (tf.data only, no GPU) | 4,790 cad/s | 3,031 cad/s |
 | **step: real VAE train step, 5 GPUs, accum 12** | **1,022 cad/s** | **1,409 cad/s (+38%)** |
 | step, current + `--tf-deterministic-ops` | — | 1,307 cad/s (−7%) |
+
+¹ **Per-cadence gather volume is 3× the memmap element**: every training sample pulls one
+`main` + one `true` + one `false` cadence out of the three round memmaps, so one cadence costs
+`3 × 6 × 16 × 512 × 4 B = 590 KB`, not 197 KB. Every GB/s figure in this section uses the 3×
+volume — miss it and the throughput numbers come out 3× low (this is easy to do; a reviewer of
+this very section did it one paragraph after flagging the risk).
 
 ### TF profiler: the GPUs are idle >90% of the time
 
@@ -245,12 +251,14 @@ Graded by what the data actually supports.
    the mechanism and the pipeline's sensitivity to it — not the exact magnitude attributable to
    the live run. #277's bulk write API removes ~all of that per-row Python call volume, which is
    why the two fixes belong together.
-2. **The single-threaded memmap copy is CO-LIMITING, not a non-factor.** Raw gather sustains
-   6.97 GB/s. The trace's own kernel timings put a fully fed 5-GPU consumer at 16,265 cad/s =
-   **9.59 GB/s** of gather demand, so one thread supplies **0.73x** of what saturated GPUs would
-   draw. It is not the dominant term at the throughputs actually observed (8% of ceiling, for the
-   GIL reasons above), but it cannot be dismissed: remove every other bottleneck and the copy
-   becomes the next wall.
+2. **The single-threaded memmap copy is the NEXT wall, not the current one.** To be precise
+   about the order of limits: at the throughput actually observed (1,409 cad/s = 0.83 GB/s of
+   gather) the copy is running **8.4x under** its own 6.97 GB/s capability — it is emphatically
+   *not* what limits the pipeline today; the GIL is. But the trace's own kernel timings put a
+   *fully fed* 5-GPU consumer at 16,265 cad/s = **9.59 GB/s** of demand, and one thread supplies
+   only **0.73x** of that. So the copy is co-limiting **at saturation**: it is what you hit after
+   removing the GIL ceiling, not before. Both statements matter — the first says don't optimize
+   the copy now, the second says don't assume it will scale when you do.
    > **Correction.** An earlier revision of this section claimed the copy had "~2.5x the volume
    > the 5-GPU consumer needs" and was therefore "not the bottleneck". That figure divided the
    > raw gather rate by the *legacy pipeline's own delivered rate* — circular, since that rate is
