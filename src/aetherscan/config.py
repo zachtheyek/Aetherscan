@@ -364,9 +364,10 @@ class TrainingConfig:
         # whereas larger values yield better global structure
         # - 5: fine-grained local structure
         # - 15: UMAP default, good baseline
-        # - 30: balanced local/global
         # - 50: global topology emphasis
-        default_factory=lambda: [5, 15, 30, 50]
+        # (30 was dropped from the default sweep 2026-07: it sat between 15 and 50 without
+        # adding a distinct view, and each nn value costs 3 min_dist x 2 level combos)
+        default_factory=lambda: [5, 15, 50]
     )
     latent_viz_umap_min_dist: list[float] = field(
         # UMAP min_dist values to sweep

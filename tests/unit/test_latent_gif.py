@@ -168,7 +168,7 @@ class TestBatchedUmapTransform:
 class TestRunUmapGifSweep:
     """The whole-combo sweep (fit + persist + transform + render + GIF) must be
     byte-identical between serial and pooled execution — the #278-follow-up contract that
-    lets the 24-combo sweep parallelize without changing any output."""
+    lets the multi-combo sweep parallelize without changing any output."""
 
     def _bundle(self, tmp_path):
         rng = np.random.default_rng(11)

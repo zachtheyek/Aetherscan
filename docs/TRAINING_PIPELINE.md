@@ -608,10 +608,12 @@ late rounds mean the faint-SNR curriculum is destroying earlier structure. The f
 models are persisted (`umap_*.joblib`) and reused by the RF decision-boundary plot and by
 inference's latent-projection figure.
 
-The sweep is combo-parallel (the #278 follow-up): each of the 24 (n_neighbors × min_dist ×
-obs/cadence) combos is an independent UMAP fit with its own derived `random_state` (sub-keyed
-`(level, nn, md)`, #279), reads the shared inputs read-only (shipped to workers through one
-on-disk joblib bundle), and writes distinct files — so
+The sweep is combo-parallel (the #278 follow-up): each (n_neighbors × min_dist ×
+obs/cadence) combo — 18 at the current defaults (3 × 3 × 2; the sweep was 24 until
+`n_neighbors=30` was dropped as redundant between 15 and 50) — is an independent UMAP fit
+with its own derived `random_state` (sub-keyed `(level, nn, md)`, #279), reads the shared
+inputs read-only (shipped to workers through one on-disk joblib bundle), and writes
+distinct files — so
 [`latent_gif.py`](../src/aetherscan/latent_gif.py)`:run_umap_gif_sweep` farms WHOLE combos
 (fit + joblib persist + per-snapshot transforms + frame render + GIF assembly) to forkserver
 workers (empty preload; BLAS-family thread pools pinned per the `shap_parallel.py` isolation
