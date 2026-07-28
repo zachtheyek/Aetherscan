@@ -109,6 +109,13 @@ from aetherscan.shap_parallel import parallel_shap
 
 logger = logging.getLogger(__name__)
 
+# TEST: is clipping still needed? currently every step seems to be getting clipped. what
+# happens if we just don't?
+# Global L2-norm gradient-clip threshold (see _build_accumulated_train_step for rationale):
+# aggressive enough to catch exploding gradients, permissive enough not to dampen learning —
+# aim for no more than ~1-5% of steps triggering the clip
+_GRADIENT_CLIP_NORM = 1.0
+
 
 # NOTE: Removing TensorBoard support
 # archive_directory() includes (incomplete) functionality for setting up & handling
@@ -651,6 +658,44 @@ class VizDataHolder:
             self.concat = None
 
 
+# Eigen's EIGEN_MAX_ALIGN_BYTES: TF CHECK-fails — an uncatchable SIGABRT, not an exception
+# — when a CPU kernel touches a tensor whose buffer is less aligned than this, so zero-copy
+# wrapping is gated on the source pointer's alignment below
+_TF_CPU_TENSOR_ALIGN = 64
+
+
+def _as_cpu_tensor(array: np.ndarray) -> tf.Tensor:
+    """
+    Wrap `array` as a CPU tensor for graph-side gathers, zero-copy when possible.
+
+    from_dlpack on a writable, 64-byte-aligned ndarray — which the mmap_mode="c"
+    copy-on-write memmaps load_round_arrays returns always are (page-aligned mapping + the
+    npy format's 64-byte header padding) — aliases the existing buffer (no allocation, no
+    copy), so a ~98 GB round array becomes a TF tensor in microseconds and gathers stream
+    through the OS page cache exactly like numpy fancy-indexing did.
+
+    Everything else falls back to tf.convert_to_tensor, which copies — fine for small
+    in-RAM test arrays, loudly logged for anything big enough to matter. The fallback
+    covers: read-only arrays (numpy refuses to export them over dlpack) and buffers below
+    Eigen alignment (plain numpy allocations are typically 16-byte aligned; TF would abort
+    the process at kernel time, not raise, so this is checked proactively).
+    """
+    with tf.device("/CPU:0"):
+        if array.ctypes.data % _TF_CPU_TENSOR_ALIGN == 0:
+            try:
+                return tf.experimental.dlpack.from_dlpack(array.__dlpack__())
+            except (AttributeError, BufferError, TypeError, RuntimeError, ValueError):
+                pass
+        if array.nbytes > 1 << 30:
+            logger.warning(
+                f"Zero-copy dlpack wrap unavailable for a {array.nbytes / 1e9:.1f} GB array "
+                f"(read-only, misaligned, or non-exportable); falling back to an in-RAM "
+                f"copy. If this is round data, check that load_round_arrays uses "
+                f"mmap_mode='c'."
+            )
+        return tf.convert_to_tensor(array)
+
+
 def prepare_distributed_train_dataset(
     data: dict,
     train_val_split: float,
@@ -671,32 +716,43 @@ def prepare_distributed_train_dataset(
     callers pass a Generator derived from the pipeline root seed for reproducible runs (see
     aetherscan.seeding.derive_rng); None falls back to OS entropy (the historical behavior).
 
-    `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the read-only
-    memmaps returned by round_data.load_round_arrays(), though plain in-RAM ndarrays work too.
-    The split is stratified across the 4 signal types (false_no_signal, false_with_rfi,
-    true_only_eti, true_eti_rfi) — generation lays labels out sequentially within chunks, so a
-    naive positional split would over-represent later signal types in val.
+    `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the
+    copy-on-write memmaps returned by round_data.load_round_arrays(), though plain in-RAM
+    ndarrays work too. The split is stratified across the 4 signal types (false_no_signal,
+    false_with_rfi, true_only_eti, true_eti_rfi) — generation lays labels out sequentially
+    within chunks, so a naive positional split would over-represent later signal types in val.
 
-    The datasets are built as cheap index generators (whole GLOBAL batches of row indices;
-    leading batch dim in the output signature, no .batch() call downstream) followed by a
-    parallel, deterministic .map() that performs the sorted fancy-index gathers from the
-    memmaps on tf.data worker threads (#276: a single generator thread doing the gathers
-    starved the GPUs; batching the yields had earlier fixed the per-sample-yield version of
-    the same problem). deterministic=True preserves the exact batch order of the index stream,
-    so parallelism changes throughput only, never epoch composition or ordering. Randomness
-    lives at the epoch level (train_indices are reshuffled each pass); sorting *within* a batch
-    only improves memmap read locality and the model is order-invariant within a batch.
+    The datasets are built as cheap index generators followed by a parallel, deterministic
+    .map() of pure tf.gather ops over zero-copy tensor views of the backing arrays
+    (_as_cpu_tensor), so the entire steady-state gather path runs in tf.data's C++ threadpool
+    with no Python — and therefore no GIL — involvement. This is the durable #276 fix: the
+    previous tf.numpy_function gather re-entered the interpreter from every map worker, which
+    made its +38% idle-host win invert to a loss whenever any other Python thread (the #277
+    DB drainer, the producer relay) competed for the GIL. deterministic=True preserves the
+    exact batch order of the index stream, so parallelism changes throughput only, never
+    epoch composition or ordering. Randomness lives at the epoch level (train_indices are
+    reshuffled each pass); sorting *within* a batch only improves read locality and the model
+    is order-invariant within a batch.
 
-    Page-cache framing: gathering from the memmaps pulls pages through the OS page cache, so
-    after the first epoch a round's ~294 GB (at full-scale defaults) is served at RAM speed from
-    otherwise-free memory on the 503 GB training nodes — but under memory pressure the kernel
-    evicts pages instead of OOM-killing the process, which is exactly the failure mode the old
-    in-RAM arrays hit.
+    Each index-stream element is one PER-REPLICA batch (replica r of global batch g is
+    element g*num_replicas + r): strategy.distribute_datasets_from_function hands consecutive
+    elements to consecutive replicas, reproducing exactly the contiguous split that
+    experimental_distribute_dataset used to apply to whole global batches, while skipping the
+    split op and letting InputOptions prefetch each replica's batches straight to its GPU
+    (the host→device copy overlaps compute instead of serializing in the step). Consumers see
+    the same distributed-dataset interface as before; with one replica the elements are
+    byte-identical to the old whole-global-batch stream.
 
-    Each generated batch has the signature ((concat, true, false), concat). Sample counts are
-    trimmed to the global / effective batch size to keep all replicas evenly fed (so every epoch
-    pass yields whole batches exactly); the holder is shared by both generators so neither pays
-    a memory cost beyond index subsets.
+    Page-cache framing: gathers pull pages of the mmap_mode="c" arrays through the OS page
+    cache, so after the first epoch a round's ~294 GB (at full-scale defaults) is served at
+    RAM speed from otherwise-free memory on the 503 GB training nodes — but under memory
+    pressure the kernel evicts pages instead of OOM-killing the process, which is exactly the
+    failure mode the old in-RAM arrays hit.
+
+    Each logical global batch has the signature ((concat, true, false), concat). Sample
+    counts are trimmed to the global / effective batch size to keep all replicas evenly fed
+    (so every epoch pass yields whole batches exactly); the holder is shared by both index
+    generators so neither pays a memory cost beyond index subsets.
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -769,17 +825,33 @@ def prepare_distributed_train_dataset(
 
     # Share the original arrays between train and val generators via a single data holder.
     # The stratified split requires non-contiguous indices, which would force numpy to create
-    # full copies via fancy indexing (~2x peak memory). Instead, both generators gather
+    # full copies via fancy indexing (~2x peak memory). Instead, both datasets gather
     # per-batch slices from the same original arrays using their respective index subsets —
-    # only one global batch is materialized at a time.
+    # only the in-flight batches are materialized.
     train_holder = TrainDataHolder(data["concatenated"], data["true"], data["false"])
 
-    # Create index-generator functions yielding whole GLOBAL batches of row indices. The
-    # (expensive) memmap gathers happen in a parallel, deterministic .map() below, OFF the
-    # single generator thread (#276: the one-thread from_generator producer starved the GPUs).
+    # Zero-copy CPU tensor views of the backing arrays for the graph-side gather map below.
+    # The map functions capture these by reference; they keep the underlying mappings alive
+    # until the datasets are dropped, which is why train_round's teardown deletes the
+    # datasets before removing the round directory (deletion is safe even with a lingering
+    # mapping — POSIX inode semantics — the pages just stay reclaimable until the drop).
+    concat_t = _as_cpu_tensor(data["concatenated"])
+    true_t = _as_cpu_tensor(data["true"])
+    false_t = _as_cpu_tensor(data["false"])
+
+    # Create index-generator functions yielding ONE EPOCH of per-replica index batches per
+    # yield, as a (batches_per_epoch * num_replicas, per_replica_batch) int64 array — row
+    # g*num_replicas + r is replica r's slice of global batch g (with one replica, the old
+    # whole-global-batch stream unchanged). A pure-TF .unbatch() downstream streams the rows
+    # out one per-replica batch at a time, so the interpreter is touched ONCE per epoch: at
+    # heavy GIL contention (the #277 drainer flood regime), a per-micro-batch Python yield
+    # measured a further 35% off end-to-end throughput; the per-epoch yield is immune. The
+    # gathers happen in a parallel, deterministic .map() of pure TF ops below — never in
+    # Python (#276: first the one-thread gather starved the GPUs, then the numpy_function
+    # gather contended for the GIL under load).
     # All randomness stays in the generators, so the epoch-level rng consumption order — and
     # therefore the #49 reproducibility contract (same seed => same split AND same per-epoch
-    # batch order) — is byte-identical to the previous single-generator implementation.
+    # batch order) — is byte-identical to the previous implementations.
     def train_index_generator():
         while True:  # Make generators infinite to reset state between epochs
             with train_holder._lock:
@@ -791,13 +863,12 @@ def prepare_distributed_train_dataset(
             if shuffle:
                 # Perform global shuffle on each epoch so each pass through the data is unique
                 rng.shuffle(indices)
-            for start in range(0, len(indices), global_train_batch_size):
-                batch_indices = indices[start : start + global_train_batch_size]
-                if shuffle:
-                    # Within-batch sorted order improves memmap read locality; random batch
-                    # membership is already guaranteed by the epoch-level shuffle above
-                    batch_indices = np.sort(batch_indices)
-                yield batch_indices.astype(np.int64, copy=False)
+            epoch = indices.astype(np.int64, copy=False).reshape(-1, global_train_batch_size)
+            if shuffle:
+                # Within-batch sorted order improves memmap read locality; random batch
+                # membership is already guaranteed by the epoch-level shuffle above
+                epoch = np.sort(epoch, axis=1)
+            yield epoch.reshape(-1, per_replica_batch_size)
 
     def val_index_generator():
         while True:  # Make generators infinite to reset state between epochs
@@ -808,91 +879,54 @@ def prepare_distributed_train_dataset(
             # Maintain val_indices order on each epoch (already sorted above): no gradients are
             # calculated during validation, and train_random_forest relies on the i-th encoded
             # val cadence corresponding to val_indices[i]
-            for start in range(0, len(val_indices), global_val_batch_size):
-                yield val_indices[start : start + global_val_batch_size].astype(
-                    np.int64, copy=False
-                )
-
-    # Determine the gathered-batch shape: the map below emits whole global batches, so the
-    # tensors carry a leading (None) batch dimension and no .batch() call is applied downstream
-    sample_shape = data["concatenated"].shape[1:]
-
-    def gather_batch(batch_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Gather one global batch from the shared holder arrays. Runs on tf.data's map worker
-        threads — numpy releases the GIL during the (large, contiguous-dtype) fancy-index
-        copies, so several gathers genuinely proceed in parallel.
-        """
-        with train_holder._lock:
-            if train_holder._cleared:
-                # In-flight map calls can land after clear(); the step-counted consumers never
-                # read past their epoch budgets, so these placeholder batches are never consumed.
-                empty = np.empty((0, *sample_shape), dtype=np.float32)
-                return empty, empty, empty
-            concat = train_holder.concat
-            true = train_holder.true
-            false = train_holder.false
-
-        return (
-            concat[batch_indices].astype(np.float32, copy=False),
-            true[batch_indices].astype(np.float32, copy=False),
-            false[batch_indices].astype(np.float32, copy=False),
-        )
-
-    index_spec = tf.TensorSpec(shape=(None,), dtype=tf.int64)
+            yield val_indices.astype(np.int64, copy=False).reshape(-1, per_replica_val_batch_size)
 
     def map_gather(batch_indices):
-        concat_batch, true_batch, false_batch = tf.numpy_function(
-            gather_batch,
-            [batch_indices],
-            [tf.float32, tf.float32, tf.float32],
-            stateful=False,
-        )
-        # numpy_function erases static shape info; restore it so the strategy can split the
-        # leading batch dimension across replicas
-        for tensor in (concat_batch, true_batch, false_batch):
-            tensor.set_shape((None, *sample_shape))
+        # Pure tf.data ops on CPU: the gather runs in TF's C++ threadpool, releases nothing
+        # to Python, and parallel map workers scale with cores instead of convoying on the
+        # GIL. tf.cast is a no-op passthrough for the production float32 arrays.
+        with tf.device("/CPU:0"):
+            concat_batch = tf.cast(tf.gather(concat_t, batch_indices), tf.float32)
+            true_batch = tf.cast(tf.gather(true_t, batch_indices), tf.float32)
+            false_batch = tf.cast(tf.gather(false_t, batch_indices), tf.float32)
         return (concat_batch, true_batch, false_batch), concat_batch
 
-    # Create datasets from the index generators + parallel gather map. Data is kept on CPU &
-    # transferred to GPU in batches on-demand; the map emits whole global batches which are
-    # then sharded (distributed) across replicas, so per-replica batch sizes match expectations.
-    # deterministic=True keeps the emitted batch ORDER identical to the index stream even with
-    # parallel in-flight gathers (and matches --tf-deterministic-ops semantics, which would
-    # force it anyway).
-    #
-    # ⚠ MEASURED CAVEAT (#276 audit, benchmarks/README.md): tf.numpy_function re-enters the
-    # Python interpreter, so these map workers contend for the SAME GIL they exist to route
-    # around. End-to-end on 5 GPUs this is +38% on an idle host, +12% with one competing
-    # Python thread, and −11% with two — it inverts under heavy Python load. That is fine here
-    # because #277 removed the per-row injection-stat call volume that used to saturate the
-    # GIL, but re-measure before assuming it helps in a Python-heavier process. The durable
-    # fix would be a gather that never returns to Python (pure tf.data ops / a C-level reader).
+    # deterministic=True keeps the emitted batch ORDER identical to the index stream even
+    # with parallel in-flight gathers (and matches --tf-deterministic-ops semantics, which
+    # would force it anyway).
+    def _distributed_from_index_generator(generator_fn, per_replica_rows):
+        index_spec = tf.TensorSpec(shape=(None, per_replica_rows), dtype=tf.int64)
+
+        def dataset_fn(_input_context):
+            return (
+                tf.data.Dataset.from_generator(generator_fn, output_signature=index_spec)
+                .unbatch()  # epoch table -> per-replica index batches, in pure TF
+                .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
+                .repeat()
+                .prefetch(tf.data.AUTOTUNE)
+            )
+
+        # fetch_to_device prefetches each replica's next batches into device memory, so the
+        # host→device copy overlaps compute instead of serializing inside the step. The
+        # buffer costs per_replica_buffer_size * ~76 MB of VRAM per GPU at production shapes.
+        input_options = tf.distribute.InputOptions(
+            experimental_fetch_to_device=True,
+            experimental_per_replica_buffer_size=2,
+        )
+        return strategy.distribute_datasets_from_function(dataset_fn, input_options)
+
     logger.info(
-        f"Creating infinite batched datasets from index generators with global batch size - "
-        f"Train: {global_train_batch_size}, Val: {global_val_batch_size}"
+        f"Creating infinite per-replica datasets from index generators with global batch size - "
+        f"Train: {global_train_batch_size}, Val: {global_val_batch_size} "
+        f"(distributed across {num_replicas} GPUs)"
     )
 
-    train_dataset = (
-        tf.data.Dataset.from_generator(train_index_generator, output_signature=index_spec)
-        .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
+    train_dataset_distributed = _distributed_from_index_generator(
+        train_index_generator, per_replica_batch_size
     )
-
-    val_dataset = (
-        tf.data.Dataset.from_generator(val_index_generator, output_signature=index_spec)
-        # NOTE: do we need repeat for val dataset? run test without repeat & see if anything breaks?
-        .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
+    val_dataset_distributed = _distributed_from_index_generator(
+        val_index_generator, per_replica_val_batch_size
     )
-
-    # Distribute datasets across GPUs
-    logger.info(f"Distributing datasets across {num_replicas} GPUs")
-
-    train_dataset_distributed = strategy.experimental_distribute_dataset(train_dataset)
-    val_dataset_distributed = strategy.experimental_distribute_dataset(val_dataset)
 
     # Calculate steps
     train_steps = n_train_trimmed // effective_batch_size
@@ -970,52 +1004,54 @@ def prepare_distributed_viz_dataset(
 
     viz_holder = VizDataHolder(padded_data)
 
-    # Create generator function yielding whole global batches — this feeds
-    # _capture_latent_snapshot every latent_viz_step_interval training steps, so per-sample
-    # yields here used to tax every capture during the epoch loop
-    def viz_generator():
+    # Zero-copy CPU tensor view for the graph-side gather (same machinery as the train
+    # datasets — see prepare_distributed_train_dataset / _as_cpu_tensor). This feeds
+    # _capture_latent_snapshot every latent_viz_step_interval training steps, so Python in
+    # this path used to tax every capture during the epoch loop.
+    viz_t = _as_cpu_tensor(padded_data)
+
+    # Index generator yielding one full pass of PER-REPLICA contiguous index slices per
+    # yield (row g*num_replicas + r is replica r's slice of global batch g — the same
+    # consecutive-element convention as the train datasets, reproducing the old contiguous
+    # global-batch split exactly); a pure-TF .unbatch() streams the rows out, so Python is
+    # touched once per pass rather than once per batch.
+    # WARN: DO NOT SHUFFLE viz indices, OR ELSE YOU'LL BREAK plot_latent_space_gif() —
+    # contiguous in-order slices preserve the original cadence order on every pass
+    # (n_padded is an exact multiple of the global batch size, so slices are whole)
+    def viz_index_generator():
         while True:  # Make generator infinite to reset state between passes
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
             with viz_holder._lock:
                 if viz_holder._cleared:
                     return  # Exit if data already cleared
-                # Cache references while holding lock
-                concat = viz_holder.concat
 
-            # WARN: DO NOT SHUFFLE viz_generator(), OR ELSE YOU'LL BREAK plot_latent_space_gif()
-            # Contiguous in-order slices preserve the original cadence order on every pass
-            # (n_padded is an exact multiple of the global batch size, so slices are whole)
-            for start in range(0, len(concat), global_viz_batch_size):
-                yield concat[start : start + global_viz_batch_size]
+            yield np.arange(n_padded, dtype=np.int64).reshape(-1, per_replica_inf_batch_size)
 
-            # Remove cache references for future garbage collection
-            del concat
+    index_spec = tf.TensorSpec(shape=(None, per_replica_inf_batch_size), dtype=tf.int64)
 
-    # Determine dataset output signature: the generator yields whole global batches, so the
-    # spec carries a leading (None) batch dimension and no .batch() call is applied downstream
-    sample_shape = padded_data.shape[1:]
-    output_signature = tf.TensorSpec(shape=(None, *sample_shape), dtype=tf.float32)
+    def map_gather(batch_indices):
+        with tf.device("/CPU:0"):
+            return tf.cast(tf.gather(viz_t, batch_indices), tf.float32)
 
-    # Create dataset using generator to reduce GPU memory pressure
-    # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the generator yields data in global batches before being sharded (distributed)
-    # across replicas, ensuring per replica batch sizes match expectations
     logger.info(
-        f"Creating infinite batched dataset from generator with global batch size: {global_viz_batch_size}"
+        f"Creating infinite per-replica viz dataset with global batch size: "
+        f"{global_viz_batch_size} (distributed across {num_replicas} GPUs)"
     )
 
-    viz_dataset = (
-        tf.data.Dataset.from_generator(viz_generator, output_signature=output_signature)
-        # NOTE: do we need repeat for viz dataset? run test without repeat & see if anything breaks?
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
+    def dataset_fn(_input_context):
+        return (
+            tf.data.Dataset.from_generator(viz_index_generator, output_signature=index_spec)
+            .unbatch()  # pass table -> per-replica index batches, in pure TF
+            .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
+            # NOTE: do we need repeat for viz dataset? run test without repeat & see if anything breaks?
+            .repeat()
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
+    input_options = tf.distribute.InputOptions(
+        experimental_fetch_to_device=True,
+        experimental_per_replica_buffer_size=2,
     )
-
-    # Distribute dataset across GPUs
-    logger.info(f"Distributing dataset across {num_replicas} GPUs")
-
-    viz_dataset_distributed = strategy.experimental_distribute_dataset(viz_dataset)
+    viz_dataset_distributed = strategy.distribute_datasets_from_function(dataset_fn, input_options)
 
     # Calculate steps
     viz_steps = n_padded // global_viz_batch_size
@@ -1127,6 +1163,19 @@ class TrainingPipeline:
         self._latent_viz_steps = None
         self._latent_viz_holder = None
         self._viz_encode_fn = None
+
+        # Graph-side accumulation state (built lazily by _ensure_accumulation_state on the
+        # first epoch: the accumulator variables must be created inside strategy.scope, and
+        # doing it here would pay the allocation even for resume paths that never train).
+        # _accumulated_train_step_fns / _val_loop_fns cache one traced tf.function per
+        # (accumulation_steps,) / (val_steps,) value so a config change can never silently
+        # reuse a graph built for a different K.
+        self._grad_accumulators: list[tf.Variable] | None = None
+        self._train_loss_accumulators: dict[str, tf.Variable] | None = None
+        self._val_loss_accumulator: tf.Variable | None = None
+        self._unconnected_grad_indices: set[int] = set()
+        self._accumulated_train_step_fns: dict[int, Callable] = {}
+        self._val_loop_fns: dict[int, Callable] = {}
 
         # Initialize RF model as None
         self.rf_model = None
@@ -1662,7 +1711,19 @@ class TrainingPipeline:
         )
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
 
+        train_iterator = None
+        val_iterator = None
         try:
+            # ONE distributed iterator per dataset for the WHOLE round, not one per epoch:
+            # the datasets are infinite (the index generators reshuffle at every wrap, so
+            # epoch boundaries are purely step-counted), and a fresh per-epoch iterator both
+            # discards whatever the pipeline had prefetched across the boundary and hands
+            # the traced step functions a new iterator object every epoch — under
+            # MirroredStrategy that meant a retrace of the accumulated-step and val-loop
+            # graphs per epoch, which dominated the epoch wall at production step counts.
+            train_iterator = iter(train_dataset)
+            val_iterator = iter(val_dataset)
+
             # Round-level epoch span (per-epoch durations already live in training_stats).
             # stage_timer records the span even on a mid-loop exception (status=failed).
             with stage_timer("epochs"):
@@ -1673,7 +1734,7 @@ class TrainingPipeline:
                         epoch,
                         snr_base,
                         snr_range,
-                        train_dataset,
+                        train_iterator,
                         steps_per_epoch,
                         accumulation_steps,
                         time.time(),
@@ -1681,7 +1742,7 @@ class TrainingPipeline:
 
                     # Validation
                     val_losses, val_duration = self._validate_epoch(
-                        val_dataset, val_steps, time.time()
+                        val_iterator, val_steps, time.time()
                     )
 
                     # Queue db writes (non-blocking) & log results
@@ -1951,7 +2012,9 @@ class TrainingPipeline:
         # Run cleanup regardless if round finishes successfully or not
         finally:
             # NOTE: should check to make sure train_holder & datasets exist first
-            # Clear intermediate data
+            # Iterators first (bench_input_pipeline teardown order: iterator -> dataset ->
+            # clear), then clear intermediate data
+            del train_iterator, val_iterator
             train_holder.clear()
             del train_dataset, val_dataset
 
@@ -1987,22 +2050,244 @@ class TrainingPipeline:
                 shutil.rmtree(paths.round_dir, ignore_errors=True)
                 logger.info(f"Deleted round {round_number} data directory: {paths.round_dir}")
 
+    # Maps epoch-loss dict keys to the keys compute_total_loss returns; "kl_per_dim" is the
+    # vector-valued (latent_dim,) #282 diagnostic and accumulates like the scalars
+    _LOSS_KEY_MAP = (
+        ("total", "total_loss"),
+        ("reconstruction", "reconstruction_loss"),
+        ("kl", "kl_loss"),
+        ("true", "true_loss"),
+        ("false", "false_loss"),
+        ("kl_per_dim", "kl_per_dim"),
+    )
+
+    def _ensure_accumulation_state(self):
+        """
+        Lazily create the graph-side accumulation state: one gradient accumulator per
+        trainable variable, the train loss accumulators (5 scalars + the (latent_dim,)
+        per-dim KL vector), and the (5,) val loss accumulator.
+
+        ON_READ synchronization makes assign_add inside strategy.run a replica-LOCAL update
+        (no communication per micro-batch); reading the variable back in cross-replica
+        context performs a single aggregation — SUM across replicas for gradients, MEAN for
+        losses. One optimizer step therefore costs exactly one cross-replica reduction per
+        variable, instead of one per variable per micro-batch as the pre-#276-follow-up
+        implementation did. Created inside strategy.scope() per the repo hard rule.
+        """
+        if self._grad_accumulators is not None:
+            return
+
+        with self.strategy.scope():
+            self._grad_accumulators = [
+                tf.Variable(
+                    tf.zeros_like(v),
+                    trainable=False,
+                    synchronization=tf.VariableSynchronization.ON_READ,
+                    aggregation=tf.VariableAggregation.SUM,
+                )
+                for v in self.vae.trainable_variables
+            ]
+
+            def _loss_accumulator(shape):
+                return tf.Variable(
+                    tf.zeros(shape, dtype=tf.float32),
+                    trainable=False,
+                    synchronization=tf.VariableSynchronization.ON_READ,
+                    aggregation=tf.VariableAggregation.MEAN,
+                )
+
+            self._train_loss_accumulators = {
+                name: _loss_accumulator(
+                    [self.config.beta_vae.latent_dim] if name == "kl_per_dim" else []
+                )
+                for name, _ in self._LOSS_KEY_MAP
+            }
+            # One (5,) vector for the val losses, ordered as _LOSS_KEY_MAP minus kl_per_dim
+            self._val_loss_accumulator = _loss_accumulator([5])
+
+    def _accumulate_micro_batch(self, batch_data):
+        """
+        Per-replica micro-batch: forward + backward, accumulating gradients and losses into
+        the replica-local ON_READ accumulators. Runs under strategy.run inside the
+        accumulated-train-step graph — there is no cross-replica communication here.
+        """
+        x, y = batch_data
+        main_data = x[0]
+        true_data = x[1]
+        false_data = x[2]
+
+        with tf.GradientTape() as tape:
+            losses = self.vae.compute_total_loss(main_data, true_data, false_data, y, training=True)
+
+        gradients = tape.gradient(losses["total_loss"], self.vae.trainable_variables)
+
+        for idx, (accumulator, grad) in enumerate(
+            zip(self._grad_accumulators, gradients, strict=False)
+        ):
+            if grad is None:
+                # Trace-time bookkeeping (this branch never becomes graph ops): the variable
+                # is structurally disconnected from the loss, so the apply step must skip it
+                # — exactly what apply_gradients did with the None entries the previous
+                # Python-side accumulation forwarded. Expected empty for the beta-VAE.
+                self._unconnected_grad_indices.add(idx)
+            else:
+                accumulator.assign_add(grad)
+
+        for name, loss_key in self._LOSS_KEY_MAP:
+            self._train_loss_accumulators[name].assign_add(losses[loss_key])
+
+    def _accumulate_val_micro_batch(self, batch_data):
+        """Per-replica val micro-batch: forward only, losses into the (5,) accumulator."""
+        x, y = batch_data
+        losses = self.vae.compute_total_loss(x[0], x[1], x[2], y, training=False)
+        self._val_loss_accumulator.assign_add(
+            tf.stack([losses[key] for _, key in self._LOSS_KEY_MAP[:5]])
+        )
+
+    def _get_accumulated_train_step(self, accumulation_steps: int) -> Callable:
+        """Traced accumulated-train-step for this K, built once and cached."""
+        fn = self._accumulated_train_step_fns.get(accumulation_steps)
+        if fn is None:
+            fn = self._build_accumulated_train_step(accumulation_steps)
+            self._accumulated_train_step_fns[accumulation_steps] = fn
+        return fn
+
+    def _build_accumulated_train_step(self, accumulation_steps: int) -> Callable:
+        """
+        Build the tf.function that performs ONE full optimizer step: K micro-batches
+        accumulated per replica, one cross-replica reduction per variable, NaN/Inf guard,
+        global-norm clip, apply, reset. The interpreter is re-entered once per optimizer
+        step instead of once per micro-batch (plus per-variable eager ops), which removes
+        the Python/GIL cost that dominated the #276 audit's host-side wall — and makes the
+        steady-state loop immune to GIL competition from the DB writer / producer threads.
+
+        tf.range (not python range) keeps the K micro-batches as a sequential graph loop:
+        one traced body instead of K unrolled copies, and — critically for the 16 GB
+        A4000 release host — at most one micro-batch's activations in flight per replica,
+        so peak VRAM stays at the K=1 level (an unrolled loop measured 23.4 GB/GPU at
+        K=12 on blpc3 from overlapped activations).
+
+        Gradient semantics match the previous implementation exactly (up to float summation
+        order): per-replica sums over K micro-batches, MEAN across replicas, averaged over
+        K, then clipped by global L2 norm at 1.0 and applied once. Clipping rationale
+        (unchanged): the global-norm form preserves the gradient direction while bounding
+        magnitude — appropriate for this beta-VAE's heterogeneous gradient scales
+        (reconstruction + KL components); per-tensor clipping would distort direction.
+        Healthy training keeps global_norm below clip_norm with only occasional clips; if
+        clipping becomes frequent, raise clip_norm rather than dampening learning.
+        """
+        strategy = self.strategy
+
+        @tf.function
+        def accumulated_train_step(iterator):
+            for _ in tf.range(accumulation_steps):
+                strategy.run(self._accumulate_micro_batch, args=(next(iterator),))
+
+            # Reading the ON_READ accumulators in cross-replica context SUMs across
+            # replicas; scale to the mean-over-replicas, mean-over-micro-batches gradient
+            scale = tf.cast(accumulation_steps * strategy.num_replicas_in_sync, tf.float32)
+            gradients = [acc.read_value() / scale for acc in self._grad_accumulators]
+
+            trainable = self.vae.trainable_variables
+            included = [
+                (grad, var)
+                for idx, (grad, var) in enumerate(zip(gradients, trainable, strict=False))
+                if idx not in self._unconnected_grad_indices
+            ]
+            included_grads = [grad for grad, _ in included]
+
+            # NaN/Inf guard on the averaged pre-clip gradients (same point the previous
+            # implementation checked); the apply is skipped on a bad step so the weights
+            # are never corrupted — the Python caller then raises, matching the old
+            # behavior observable to everything downstream
+            all_finite = tf.reduce_all(
+                tf.stack([tf.reduce_all(tf.math.is_finite(g)) for g in included_grads])
+            )
+            global_norm = tf.linalg.global_norm(included_grads)
+
+            def _clip_and_apply():
+                clipped, _ = tf.clip_by_global_norm(
+                    included_grads, _GRADIENT_CLIP_NORM, use_norm=global_norm
+                )
+                self.vae.optimizer.apply_gradients(
+                    zip(clipped, [var for _, var in included], strict=False)
+                )
+                return tf.constant(True)
+
+            applied = tf.cond(all_finite, _clip_and_apply, lambda: tf.constant(False))
+
+            # Aggregated (MEAN across replicas) losses, averaged over the K micro-batches.
+            # Auto control dependencies order these reads after the accumulation loop and
+            # the resets below after the reads — resource ops on one variable never reorder
+            losses = {
+                name: self._train_loss_accumulators[name].read_value()
+                / tf.cast(accumulation_steps, tf.float32)
+                for name, _ in self._LOSS_KEY_MAP
+            }
+
+            for acc in self._grad_accumulators:
+                acc.assign(tf.zeros_like(acc))
+            for var in self._train_loss_accumulators.values():
+                var.assign(tf.zeros_like(var))
+
+            return losses, global_norm, applied
+
+        return accumulated_train_step
+
+    def _get_val_loop(self, val_steps: int) -> Callable:
+        """Traced whole-epoch val loop for this step count, built once and cached."""
+        fn = self._val_loop_fns.get(val_steps)
+        if fn is None:
+            fn = self._build_val_loop(val_steps)
+            self._val_loop_fns[val_steps] = fn
+        return fn
+
+    def _build_val_loop(self, val_steps: int) -> Callable:
+        """One tf.function for the whole validation epoch: val_steps forward micro-batches
+        accumulated per replica, one MEAN aggregation at the end — a single interpreter
+        re-entry per val epoch instead of one (plus five strategy.reduce calls) per batch."""
+        strategy = self.strategy
+
+        @tf.function
+        def val_loop(iterator):
+            for _ in tf.range(val_steps):
+                strategy.run(self._accumulate_val_micro_batch, args=(next(iterator),))
+            totals = self._val_loss_accumulator.read_value() / tf.cast(val_steps, tf.float32)
+            self._val_loss_accumulator.assign(tf.zeros_like(self._val_loss_accumulator))
+            return totals
+
+        return val_loop
+
     def _train_epoch(
         self,
         round_idx,
         epoch_idx,
         snr_base,
         snr_range,
-        dataset,
+        iterator,
         steps_per_epoch,
         accumulation_steps=1,
         start_time=None,
     ):
         """
-        Perform a single training epoch with gradient accumulation
+        Perform a single training epoch with gradient accumulation.
+
+        `iterator` is the round-scoped distributed iterator train_round creates once and
+        passes to every epoch (the datasets are infinite; epoch boundaries are step-counted,
+        and the underlying index generators reshuffle at each wrap). Handing the SAME
+        iterator object to the traced step function every epoch is what keeps it from
+        retracing — a fresh per-epoch iterator forced a per-epoch retrace of the
+        accumulated-step graph under MirroredStrategy.
+
+        Each optimizer step is one call into the traced accumulated-train-step graph (see
+        _build_accumulated_train_step); Python-side work per step is a handful of scalar
+        fetches and dict updates, plus the periodic latent snapshot.
         """
         if not start_time:
             start_time = time.time()
+
+        self._ensure_accumulation_state()
+        train_step_fn = self._get_accumulated_train_step(accumulation_steps)
 
         epoch_losses = {
             "total": 0.0,
@@ -2014,95 +2299,24 @@ class TrainingPipeline:
             "kl_per_dim": np.zeros(self.config.beta_vae.latent_dim, dtype=np.float64),
         }
         epoch_gradient_norms = []
-        iterator = iter(dataset)
 
         try:
             for step in range(steps_per_epoch):
-                step_losses = {
-                    "total": 0.0,
-                    "reconstruction": 0.0,
-                    "kl": 0.0,
-                    "true": 0.0,
-                    "false": 0.0,
-                    "kl_per_dim": np.zeros(self.config.beta_vae.latent_dim, dtype=np.float64),
-                }
+                step_losses, global_norm, applied = train_step_fn(iterator)
 
-                # Initialize accumulated gradients
-                accumulated_gradients = None
-                successful_accumulations = 0
-
-                # Process sub-steps for gradient accumulation
-                for sub_step in range(accumulation_steps):
-                    try:
-                        micro_batch = next(iterator)
-
-                        # Compute gradients & losses
-                        micro_grads, micro_losses = self._distributed_train_step(micro_batch)
-
-                        # NOTE: come back to this later (any or all?)
-                        # Sanity check: verify gradients are valid before accumulating
-                        if micro_grads is None or all(g is None for g in micro_grads):
-                            logger.warning(
-                                f"Step {step + 1}, sub-step {sub_step + 1}: "
-                                f"All gradients are None, skipping this micro-batch"
-                            )
-                            continue
-
-                        # Accumulate gradients over sub-steps
-                        if accumulated_gradients is None:
-                            accumulated_gradients = micro_grads
-                        else:
-                            accumulated_gradients = [
-                                # NOTE: come back to this later (what if ag and g are both None)
-                                ag + g if ag is not None and g is not None else ag or g
-                                for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
-                            ]
-
-                        successful_accumulations += 1
-
-                        # Accumulate losses over sub-steps
-                        for key in step_losses:
-                            step_losses[key] += micro_losses[key]
-
-                    except StopIteration:  # Empty dataset
-                        logger.error(
-                            f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}"
-                        )
-                        raise  # Re-raise to propagate error
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
-                        )
-                        raise  # Re-raise to propagate error
-
-                # Sanity check: verify that gradient accumulation was successful
-                if accumulated_gradients is None or successful_accumulations == 0:
-                    logger.error(f"Step {step + 1}: No valid gradients accumulated!")
-                    raise RuntimeError(f"Failed to accumulate gradients at step {step + 1}")
-
-                # Average accumulated gradients over sub-steps
-                accumulated_gradients = [
-                    g / successful_accumulations if g is not None else None
-                    for g in accumulated_gradients
-                ]
-
-                # Sanity check: verify no NaN/Inf in gradients
-                has_nan_or_inf = False
-                for g in accumulated_gradients:
-                    if g is not None and (
-                        tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
-                    ):
-                        has_nan_or_inf = True
-                        break
-
-                if has_nan_or_inf:
+                if not bool(applied.numpy()):
                     logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
                     raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
-                # Apply accumulated gradients
-                global_norm = self._apply_gradients(accumulated_gradients)
-                epoch_gradient_norms.append(float(global_norm))
+                epoch_gradient_norms.append(float(global_norm.numpy()))
+
+                # Accumulate epoch losses over training steps (already averaged over
+                # micro-batches and replicas in-graph)
+                for key, value in step_losses.items():
+                    if key == "kl_per_dim":
+                        epoch_losses[key] += value.numpy().astype(np.float64)
+                    else:
+                        epoch_losses[key] += float(value.numpy())
 
                 # Capture latent snapshot every N steps, and on the final step
                 is_interval_step = (step + 1) % self.config.training.latent_viz_step_interval == 0
@@ -2115,13 +2329,6 @@ class TrainingPipeline:
                         snr_base,
                         snr_range,
                     )
-
-                for key, loss in step_losses.items():
-                    # Average step losses over sub-steps
-                    avg_loss = loss / successful_accumulations
-                    step_losses[key] = avg_loss
-                    # Accumulate epoch losses over training steps
-                    epoch_losses[key] += avg_loss
 
             # Average epoch losses over training steps
             for key in epoch_losses:
@@ -2136,36 +2343,28 @@ class TrainingPipeline:
             logger.error(f"Error in _train_epoch(): {e}")
             raise  # Re-raise to propagate error
 
-        # Run cleanup regardless if epoch finishes successfully or not
+        # Run cleanup regardless if epoch finishes successfully or not (the round-scoped
+        # iterator is train_round's to tear down)
         finally:
-            # NOTE: should check to make sure iterator exists first
-            del iterator
             gc.collect()
 
-    def _validate_epoch(self, dataset, steps, start_time=None):
+    def _validate_epoch(self, iterator, steps, start_time=None):
         """
-        Perform a single validation epoch
+        Perform a single validation epoch (one traced graph call — see _build_val_loop).
+        `iterator` is round-scoped, like _train_epoch's — same retrace rationale.
         """
         if not start_time:
             start_time = time.time()
 
-        val_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
-        iterator = iter(dataset)
+        self._ensure_accumulation_state()
+        val_loop_fn = self._get_val_loop(steps)
 
         try:
-            for _step in range(steps):
-                batch = next(iterator)
-
-                # Compute losses
-                step_losses = self._distributed_val_step(batch)
-
-                # Accumulate validation losses over validation steps
-                for key in val_losses:
-                    val_losses[key] += step_losses[key]
-
-            # Average validation losses over validation steps
-            for key in val_losses:
-                val_losses[key] /= steps
+            totals = val_loop_fn(iterator).numpy()
+            val_losses = {
+                name: float(value)
+                for (name, _), value in zip(self._LOSS_KEY_MAP[:5], totals, strict=False)
+            }
 
             # Calculate val epoch duration
             val_duration = time.time() - start_time
@@ -2176,155 +2375,10 @@ class TrainingPipeline:
             logger.error(f"Error in _validate_epoch(): {e}")
             raise  # Re-raise to propagate error
 
-        # Run cleanup regardless if epoch finishes successfully or not
+        # Run cleanup regardless if epoch finishes successfully or not (the round-scoped
+        # iterator is train_round's to tear down)
         finally:
-            # NOTE: should check to make sure iterator exists first
-            del iterator
             gc.collect()
-
-    @tf.function
-    def _distributed_train_step(self, batch_data):
-        """
-        Perform a single distributed training step
-        Returns reduced gradients & losses
-        """
-        num_replicas = self.strategy.num_replicas_in_sync
-
-        def step_fn(data):
-            """Per-replica training step"""
-            x, y = data
-            main_data = x[0]
-            true_data = x[1]
-            false_data = x[2]
-
-            with tf.GradientTape() as tape:
-                # Compute losses
-                losses = self.vae.compute_total_loss(
-                    main_data, true_data, false_data, y, training=True
-                )
-
-            # Compute gradients
-            gradients = tape.gradient(losses["total_loss"], self.vae.trainable_variables)
-
-            return gradients, losses
-
-        # Run training step on all replicas
-        per_replica_grads, per_replica_losses = self.strategy.run(step_fn, args=(batch_data,))
-
-        # Reduce gradients across replicas
-        reduced_grads = []
-        for grad in per_replica_grads:
-            if grad is not None:
-                reduced_grad = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, grad, axis=None)
-                reduced_grads.append(reduced_grad)
-            else:
-                reduced_grads.append(None)
-
-        # Reduce losses across replicas
-        reduced_losses = {
-            "total": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["total_loss"], axis=None
-            ),
-            "reconstruction": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["reconstruction_loss"], axis=None
-            ),
-            "kl": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_loss"], axis=None
-            ),
-            "true": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["true_loss"], axis=None
-            ),
-            "false": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
-            ),
-            # (latent_dim,) vector — elementwise MEAN across replicas (#282 diagnostics)
-            "kl_per_dim": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_per_dim"], axis=None
-            ),
-        }
-
-        return reduced_grads, reduced_losses
-
-    @tf.function
-    def _apply_gradients(self, gradients):
-        """
-        Apply gradients after gradient clipping by global L2 norm
-        """
-        # TEST: is this still needed? currently every step seems to be getting clipped. what happens if we just don't?
-        # Clip gradients for additional stability
-        # Note, this step is optional but recommended given our beta-VAE architecture's
-        # heterogeneous gradient scale (reconstruction + KL loss components)
-        # Gradient clipping computes the global L2 norm across all gradient tensors, then rescales
-        # them proportionally if that norm exceeds some clip_norm threshold. This preserves the
-        # relative direction of the gradient vector in parameter space while simultaneously bounding
-        # its magnitude, maintaining the optimization trajectory's direction, which is critical for
-        # training stability
-        # Alternatively, per-tensor clipping (with tf.clip_by_norm() on each gradient independently)
-        # could also work, but may distort the gradient direction (parameters with smaller gradients
-        # get disproportionately boosted relative to those with larger gradients). Only use if you
-        # need layer-specific interventions (e.g. lower LR for encoder, or gradient clipping
-        # per-component, etc.)
-        # The 1.0 threshold was chosen to be aggressive enough to prevent exploding gradients, while
-        # permissive enough to not overly dampen learning. Healthy training should progress with
-        # global_norm consistently below clip_norm, with the occasional instability (e.g. due to bad
-        # batches, or KL spikes) getting caught & dampened. If you notice global_norm consistently
-        # exceeding clip_norm, even with adaptive LR in place, consider increasing clip_norm to
-        # allow more of the true gradients to pass through. A general heuristic for clip_norm is to
-        # have no more than 1-5% of steps trigger gradient clipping
-        clipped_gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
-
-        # Apply gradients
-        self.vae.optimizer.apply_gradients(
-            zip(clipped_gradients, self.vae.trainable_variables, strict=False)
-        )
-
-        # Return pre-clipping global norm (for monitoring)
-        return global_norm
-
-    @tf.function
-    def _distributed_val_step(self, batch_data):
-        """
-        Perform a single distributed validation step
-        Returns reduced losses
-        """
-
-        def step_fn(data):
-            """Per-replica validation step"""
-            x, y = data
-            main_data = x[0]
-            true_data = x[1]
-            false_data = x[2]
-
-            # Compute losses
-            losses = self.vae.compute_total_loss(
-                main_data, true_data, false_data, y, training=False
-            )
-
-            return losses
-
-        # Run validation step on all replicas
-        per_replica_losses = self.strategy.run(step_fn, args=(batch_data,))
-
-        # Reduce losses across replicas
-        reduced_losses = {
-            "total": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["total_loss"], axis=None
-            ),
-            "reconstruction": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["reconstruction_loss"], axis=None
-            ),
-            "kl": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_loss"], axis=None
-            ),
-            "true": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["true_loss"], axis=None
-            ),
-            "false": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
-            ),
-        }
-
-        return reduced_losses
 
     def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
         """
@@ -2483,7 +2537,6 @@ class TrainingPipeline:
                 current_idx += batch_size
 
                 del results
-                gc.collect()
 
             # Drift guard: the train/val datasets returned by
             # prepare_distributed_train_dataset() are .repeat()-ed, so the iterator
@@ -2507,6 +2560,9 @@ class TrainingPipeline:
         finally:
             # NOTE: should check to make sure iterator exists first
             del iterator
+            # One collection per encode pass — a per-batch gc.collect() here used to burn
+            # GIL-holding milliseconds hundreds of times per pass (incl. inside the epoch
+            # loop via _capture_latent_snapshot)
             gc.collect()
 
         return outputs

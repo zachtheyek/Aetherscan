@@ -10,6 +10,7 @@ import tensorflow as tf
 
 from aetherscan.train import (
     TrainDataHolder,
+    _as_cpu_tensor,
     prepare_distributed_train_dataset,
     prepare_distributed_viz_dataset,
 )
@@ -164,20 +165,56 @@ class TestPrepareDistributedTrainDataset:
         # Epoch-level randomness survives seeding: epoch 2's batch membership differs
         assert first[2][0] != first[2][1]
 
-    def test_memmap_inputs_supported(self, tmp_path):
-        """Round data arrives as np.load(mmap_mode='r') memmaps — gathers must produce plain
-        in-RAM batches from them."""
+    @pytest.mark.parametrize("mmap_mode", ["c", "r"])
+    def test_memmap_inputs_supported(self, tmp_path, mmap_mode):
+        """Round data arrives as np.load(mmap_mode='c') memmaps (the zero-copy dlpack path);
+        read-only 'r' memmaps must also still work via the copying fallback."""
         data = _make_data()
         mmap_data = {"labels": data["labels"]}
         for key in ("concatenated", "true", "false"):
             path = tmp_path / f"{key}.npy"
             np.save(path, data[key])
-            mmap_data[key] = np.load(path, mmap_mode="r")
+            mmap_data[key] = np.load(path, mmap_mode=mmap_mode)
         results = _build(mmap_data, shuffle=False)
         iterator = iter(results["train_dataset"])
         batch_ids = _batch_row_ids(next(iterator))
         assert batch_ids.tolist() == results["train_indices"][:4].tolist()
         results["_train_holder"].clear()
+
+    def test_as_cpu_tensor_zero_copy_for_aligned_memmap(self, tmp_path):
+        """_as_cpu_tensor must alias (not copy) a writable 64-byte-aligned buffer — the
+        property that makes a ~98 GB round array wrappable. The production source
+        (np.load(mmap_mode='c') of a .npy) is guaranteed aligned: page-aligned mapping plus
+        the npy format's 64-byte header padding. A post-wrap write to the numpy buffer must
+        be visible through the tensor."""
+        path = tmp_path / "aligned.npy"
+        np.save(path, np.arange(32, dtype=np.float32).reshape(8, 4))
+        mapped = np.load(path, mmap_mode="c")
+        assert mapped.ctypes.data % 64 == 0  # the alignment premise the gate relies on
+        tensor = _as_cpu_tensor(mapped)
+        mapped[1, 2] = 777.0  # mode "c": private page, the file itself stays clean
+        assert float(tensor.numpy()[1, 2]) == 777.0  # zero-copy: same buffer
+
+    def test_as_cpu_tensor_falls_back_for_unaligned_and_readonly(self):
+        """Buffers TF would abort on (sub-64-byte alignment) and buffers dlpack refuses
+        (read-only) must take the copying fallback and still gather correctly — a misaligned
+        zero-copy tensor is an uncatchable SIGABRT at kernel time, not an exception."""
+        # Deliberately misaligned view into an aligned backing buffer (offset 4 bytes)
+        backing = np.zeros(36, dtype=np.float32)
+        offset = 1 if backing.ctypes.data % 64 == 0 else 0
+        unaligned = backing[offset : offset + 32].reshape(8, 4)
+        unaligned[:] = np.arange(32, dtype=np.float32).reshape(8, 4)
+        if unaligned.ctypes.data % 64 != 0:
+            tensor = _as_cpu_tensor(unaligned)
+            np.testing.assert_array_equal(tensor.numpy(), unaligned)
+            # A copy, not an alias: post-wrap writes are not reflected
+            unaligned[0, 0] = 555.0
+            assert float(tensor.numpy()[0, 0]) == 0.0
+
+        readonly = np.arange(12, dtype=np.float32).reshape(3, 4)
+        readonly.setflags(write=False)
+        tensor_ro = _as_cpu_tensor(readonly)
+        np.testing.assert_array_equal(tensor_ro.numpy(), readonly)
 
     def test_holder_clear_drops_references(self):
         holder = TrainDataHolder(np.zeros(2), np.zeros(2), np.zeros(2))

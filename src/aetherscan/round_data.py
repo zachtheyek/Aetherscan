@@ -264,17 +264,21 @@ def validate_done_manifest(
 
 def load_round_arrays(paths: RoundDataPaths) -> dict[str, np.ndarray]:
     """
-    Open one round's arrays for training. The three cadence arrays come back as read-only
-    memmaps (np.load(mmap_mode="r")) so nothing is pulled into RAM until batches gather it —
-    the OS page cache keeps hot pages resident and evicts them under memory pressure instead
-    of OOM-killing the process. Labels and the main array's log-norm parameters ("lognorm",
-    consumed by the latent-traversal plot) are small (~24 MB for the main array at full scale)
-    and loaded eagerly.
+    Open one round's arrays for training. The three cadence arrays come back as
+    copy-on-write memmaps (np.load(mmap_mode="c")) so nothing is pulled into RAM until
+    batches gather it — the OS page cache keeps hot pages resident and evicts them under
+    memory pressure instead of OOM-killing the process. mmap_mode="c" (MAP_PRIVATE) rather
+    than "r": reads behave identically and the on-disk files stay write-protected, but the
+    mapping is writable from numpy's point of view, which lets train._as_cpu_tensor export
+    it zero-copy over dlpack for the graph-side gather (numpy refuses dlpack export of
+    read-only arrays; nothing ever writes, so no private pages are materialized). Labels and
+    the main array's log-norm parameters ("lognorm", consumed by the latent-traversal plot)
+    are small (~24 MB for the main array at full scale) and loaded eagerly.
     """
     return {
-        "concatenated": np.load(paths.main_path, mmap_mode="r"),
-        "true": np.load(paths.true_path, mmap_mode="r"),
-        "false": np.load(paths.false_path, mmap_mode="r"),
+        "concatenated": np.load(paths.main_path, mmap_mode="c"),
+        "true": np.load(paths.true_path, mmap_mode="c"),
+        "false": np.load(paths.false_path, mmap_mode="c"),
         "labels": np.load(paths.labels_path),
         "lognorm": np.load(paths.lognorm_paths["main"]),
     }
