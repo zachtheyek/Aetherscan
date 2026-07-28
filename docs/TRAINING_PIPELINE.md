@@ -48,7 +48,7 @@ fresh datetime tag and starts a new run).
 4. **Prepare the latent-viz batch** (first round only) — 960 held-out val cadences per signal
    type, persisted across rounds so latent-space snapshots aren't confounded by curriculum
    distribution shift.
-5. **Epoch loop** — `_train_epoch()` + `_validate_epoch()`, ~21 `training_stats` rows per
+5. **Epoch loop** — `_train_epoch()` + `_validate_epoch()`, ~23 `training_stats` rows per
    epoch (losses, gradient norms, LR, durations, SNR range) plus `latent_dim` per-dimension
    KL rows (`kl_dim_NN`), adaptive LR update. At round end `check_posterior_collapse()`
    WARNs loudly (never fails) when latent dims are going dark — see
@@ -512,7 +512,9 @@ out.
 ### `beta_vae_loss_curves_{tag}.png`
 
 Total loss (full-width top panel) plus reconstruction / KL / true-clustering /
-false-clustering components (bottom row), train and val overlaid, epochs on the x-axis with
+false-clustering / regularization components (bottom row; the regularization panel is empty
+for runs predating the 2026-07 L1/L2 activation — see MODELS.md), train and val overlaid,
+epochs on the x-axis with
 per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
 global-epoch position (`(round − 1) · epochs_per_round + epoch`, via `build_epoch_history`):
 epochs with no committed row render as visible NaN gaps instead of silently shifting later

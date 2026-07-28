@@ -140,6 +140,7 @@ _SCRIPT = textwrap.dedent(
                 "kl_loss": total,
                 "true_loss": total,
                 "false_loss": total,
+                "reg_loss": total,
                 "kl_per_dim": tf.fill([2], total),
             }
 

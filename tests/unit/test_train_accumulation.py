@@ -41,6 +41,7 @@ class _StubModel(tf.Module):
             "kl_loss": 0.25 * total,
             "true_loss": 0.15 * total,
             "false_loss": 0.1 * total,
+            "reg_loss": 0.05 * total,
             "kl_per_dim": tf.fill([_LATENT_DIM], 0.01 * total),
         }
 

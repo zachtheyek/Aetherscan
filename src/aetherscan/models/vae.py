@@ -230,11 +230,20 @@ class BetaVAE(keras.Model):
         """
         Forward-pass main_data through the VAE and return a dict with reconstruction, KL, and
         per-class clustering losses plus their weighted sum:
-            total = reconstruction + beta * kl + alpha * (true_loss + false_loss)
+            total = reconstruction + beta * kl + alpha * (true_loss + false_loss) + reg
 
         Reconstruction uses binary cross-entropy on the [0, 1]-bounded decoder output (sigmoid).
         true_data and false_data are separate cadences fed through the clustering-loss heads —
         they don't share gradients with reconstruction.
+
+        `reg` is the sum of the layer-declared regularization penalties (activated 2026-07 by
+        maintainer decision — the L1/L2 declarations existed since inception but a custom
+        training loop only applies them if it adds model.losses to the objective, so every
+        model trained before this change was effectively unregularized). Stock keras
+        semantics: kernel/bias L2 penalties appear once each; activity-L1 penalties accrue
+        once per regularized-layer forward performed inside this function (the reconstruction
+        pass AND both clustering branches), and keras batch-SUM-scales them, so the effective
+        activity coefficient scales with the per-replica batch size (128 at defaults).
         """
         # Perform forward pass through Beta-VAE
         reconstruction, z_mean, z_log_var, z = self.call(main_data, training=training)
@@ -265,9 +274,20 @@ class BetaVAE(keras.Model):
         false_loss = self.compute_clustering_loss_false(false_data)
         true_loss = self.compute_clustering_loss_true(true_data)
 
+        # Layer-declared regularization penalties (see docstring). Cast fp32 so the sum is
+        # exact under mixed_bfloat16 (activity penalties on bf16 activations); the islands
+        # keep the rest of the loss math fp32 already.
+        if self.losses:
+            reg_loss = tf.add_n([tf.cast(loss, tf.float32) for loss in self.losses])
+        else:
+            reg_loss = tf.constant(0.0, dtype=tf.float32)
+
         # Compute total loss
         total_loss = (
-            reconstruction_loss + self.beta * kl_loss + self.alpha * (true_loss + false_loss)
+            reconstruction_loss
+            + self.beta * kl_loss
+            + self.alpha * (true_loss + false_loss)
+            + reg_loss
         )
 
         return {
@@ -277,6 +297,7 @@ class BetaVAE(keras.Model):
             "kl_per_dim": kl_per_dim,
             "true_loss": true_loss,
             "false_loss": false_loss,
+            "reg_loss": reg_loss,
         }
 
 

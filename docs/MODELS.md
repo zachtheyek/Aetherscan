@@ -93,9 +93,18 @@ Each training batch is a triplet `(main, true, false)` of cadence batches
 arrays are generated):
 
 ```
-total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(false))
+total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(false)) + reg
 ```
 
+- **Regularization** (`reg`, activated 2026-07 by maintainer decision): the sum of the
+  layer-declared penalties — L2(0.01) on every conv kernel and bias plus L1(0.001) on conv
+  activations. These declarations existed since inception but were never consumed: a custom
+  training loop only applies them if it adds `model.losses` to the objective, so **every
+  model trained before the activation was effectively unregularized** (the docstrings'
+  claims notwithstanding). Stock keras semantics apply: weight penalties count once;
+  activity penalties are batch-SUM-scaled and accrue once per regularized-layer forward
+  inside the loss (the reconstruction pass and both clustering branches), so the effective
+  activity coefficient scales with the per-replica batch size (128 at defaults).
 - **Reconstruction**: `main` is reshaped to `(B·6, 16, 512, 1)`, encoded, decoded, and scored
   with binary cross-entropy summed over the spectrogram and averaged over the batch
   (`from_logits=False`; the decoder output is already sigmoid-bounded).

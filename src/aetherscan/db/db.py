@@ -60,7 +60,9 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     the NOT NULL constraint, and the failed executemany silently dropped the whole flush
 #     batch. Non-finite values now store as 0.0 with is_finite=0 (the injection_stats
 #     semantics), and query_training_stat filters them by default.
-_SCHEMA_VERSION = 6
+# v7: idx_injection_stats_by_stat — the end-of-run plot pass scanned the whole tag
+#     partition ~165x, ~6 h projected at release scale
+_SCHEMA_VERSION = 7
 
 
 # Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
@@ -288,6 +290,18 @@ class Database:
                 ON injection_stats(tag, timestamp, stat_name, signal_type, injection_stage)
             """)
 
+            # Secondary composite index for the stat-scoped query shape (schema v7): the
+            # end-of-run plot pass filters on (tag, stat_name, signal_type, injection_stage)
+            # with run-wide timestamp bounds, which the (tag, timestamp, ...) index above can
+            # only answer by scanning the tag's whole timestamp range — ~165 times per call.
+            # Leading with the equality columns turns each of those into a seek; round_number
+            # trails so round-scoped queries seek too. No query changes needed — SQLite's
+            # planner picks the better index per query.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_injection_stats_by_stat
+                ON injection_stats(tag, stat_name, signal_type, injection_stage, round_number)
+            """)
+
             # Training statistics table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS training_stats (
@@ -507,6 +521,17 @@ class Database:
             if "is_finite" not in columns:
                 cursor.execute("ALTER TABLE training_stats ADD COLUMN is_finite INTEGER DEFAULT 1")
                 logger.info("Schema migration: added training_stats.is_finite")
+
+        if version < 7:
+            # v7: idx_injection_stats_by_stat. Like the v2/v4 no-ALTER steps, the real work
+            # happens in _init_database() — its CREATE INDEX IF NOT EXISTS runs before this
+            # method for old and new databases alike, and the statement is itself idempotent,
+            # so re-executing it here is a safe no-op that records the step explicitly.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_injection_stats_by_stat
+                ON injection_stats(tag, stat_name, signal_type, injection_stage, round_number)
+            """)
+            logger.info("Schema migration: ensured injection_stats.idx_injection_stats_by_stat")
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")

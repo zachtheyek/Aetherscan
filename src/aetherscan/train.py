@@ -1787,6 +1787,7 @@ class TrainingPipeline:
                         ("kl_loss", "kl"),
                         ("true_loss", "true"),
                         ("false_loss", "false"),
+                        ("reg_loss", "reg"),
                     ]:
                         self.db.write_training_stat(
                             model_name="beta_vae",
@@ -1825,6 +1826,7 @@ class TrainingPipeline:
                         ("val_kl_loss", "kl"),
                         ("val_true_loss", "true"),
                         ("val_false_loss", "false"),
+                        ("val_reg_loss", "reg"),
                     ]:
                         self.db.write_training_stat(
                             model_name="beta_vae",
@@ -1936,6 +1938,7 @@ class TrainingPipeline:
                         f"KL: {epoch_losses['kl']:.4f}, "
                         f"True: {epoch_losses['true']:.4f}, "
                         f"False: {epoch_losses['false']:.4f}, "
+                        f"Reg: {epoch_losses['reg']:.4f}, "
                         f"Duration: {train_duration:.2f} "
                     )
                     logger.info(
@@ -1950,6 +1953,7 @@ class TrainingPipeline:
                         f"KL: {val_losses['kl']:.4f}, "
                         f"True: {val_losses['true']:.4f}, "
                         f"False: {val_losses['false']:.4f}, "
+                        f"Reg: {val_losses['reg']:.4f}, "
                         f"Duration: {val_duration:.2f} "
                     )
 
@@ -2087,14 +2091,15 @@ class TrainingPipeline:
         ("kl", "kl_loss"),
         ("true", "true_loss"),
         ("false", "false_loss"),
+        ("reg", "reg_loss"),
         ("kl_per_dim", "kl_per_dim"),
     )
 
     def _ensure_accumulation_state(self):
         """
         Lazily create the graph-side accumulation state: one gradient accumulator per
-        trainable variable, the train loss accumulators (5 scalars + the (latent_dim,)
-        per-dim KL vector), and the (5,) val loss accumulator.
+        trainable variable, the train loss accumulators (the _LOSS_KEY_MAP scalars + the
+        (latent_dim,) per-dim KL vector), and the scalar-count-sized val loss accumulator.
 
         ON_READ synchronization makes assign_add inside strategy.run a replica-LOCAL update
         (no communication per micro-batch); reading the variable back in cross-replica
@@ -2131,8 +2136,8 @@ class TrainingPipeline:
                 )
                 for name, _ in self._LOSS_KEY_MAP
             }
-            # One (5,) vector for the val losses, ordered as _LOSS_KEY_MAP minus kl_per_dim
-            self._val_loss_accumulator = _loss_accumulator([5])
+            # One vector for the val losses, ordered as _LOSS_KEY_MAP minus kl_per_dim
+            self._val_loss_accumulator = _loss_accumulator([len(self._LOSS_KEY_MAP) - 1])
 
     def _accumulate_micro_batch(self, batch_data):
         """
@@ -2170,11 +2175,11 @@ class TrainingPipeline:
             self._train_loss_accumulators[name].assign_add(losses[loss_key])
 
     def _accumulate_val_micro_batch(self, batch_data):
-        """Per-replica val micro-batch: forward only, losses into the (5,) accumulator."""
+        """Per-replica val micro-batch: forward only, losses into the scalar accumulator."""
         x, y = batch_data
         losses = self.vae.compute_total_loss(x[0], x[1], x[2], y, training=False)
         self._val_loss_accumulator.assign_add(
-            tf.stack([losses[key] for _, key in self._LOSS_KEY_MAP[:5]])
+            tf.stack([losses[key] for _, key in self._LOSS_KEY_MAP[:-1]])
         )
 
     def _get_accumulated_train_step(self, accumulation_steps: int) -> Callable:
@@ -2328,6 +2333,7 @@ class TrainingPipeline:
             "kl": 0.0,
             "true": 0.0,
             "false": 0.0,
+            "reg": 0.0,
             # Vector-valued (latent_dim,) — accumulates like the scalars (#282 diagnostics)
             "kl_per_dim": np.zeros(self.config.beta_vae.latent_dim, dtype=np.float64),
         }
@@ -2396,7 +2402,7 @@ class TrainingPipeline:
             totals = val_loop_fn(iterator).numpy()
             val_losses = {
                 name: float(value)
-                for (name, _), value in zip(self._LOSS_KEY_MAP[:5], totals, strict=False)
+                for (name, _), value in zip(self._LOSS_KEY_MAP[:-1], totals, strict=False)
             }
 
             # Calculate val epoch duration
@@ -3559,7 +3565,7 @@ class TrainingPipeline:
 
         # Create figure & setup gridspec
         fig = plt.figure(figsize=(fig_width, 12))
-        gs = fig.add_gridspec(2, 4, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
+        gs = fig.add_gridspec(2, 5, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
 
         # Top subplot spanning full width - Total Loss
         ax_top = fig.add_subplot(gs[0, :])
@@ -3569,6 +3575,7 @@ class TrainingPipeline:
         ax_kl = fig.add_subplot(gs[1, 1])
         ax_true = fig.add_subplot(gs[1, 2])
         ax_false = fig.add_subplot(gs[1, 3])
+        ax_reg = fig.add_subplot(gs[1, 4])
 
         fig.suptitle(
             f"Beta-VAE Loss Curves ({tag}, {machine_name})", fontsize=18, fontweight="bold"
@@ -3578,7 +3585,7 @@ class TrainingPipeline:
         self._add_snr_range_shading(
             ax_top, snr_by_round, epochs_per_round, use_rounds=False, show_text_annotations=True
         )
-        for ax in [ax_recon, ax_kl, ax_true, ax_false]:
+        for ax in [ax_recon, ax_kl, ax_true, ax_false, ax_reg]:
             self._add_snr_range_shading(
                 ax, snr_by_round, epochs_per_round, use_rounds=False, show_text_annotations=False
             )
@@ -3623,6 +3630,8 @@ class TrainingPipeline:
         plot_dual_axis(ax_kl, "KL Divergence", "kl_loss", "val_kl_loss")
         plot_dual_axis(ax_true, "True Loss", "true_loss", "val_true_loss")
         plot_dual_axis(ax_false, "False Loss", "false_loss", "val_false_loss")
+        # L1/L2 regularization penalties (activated 2026-07; absent for runs predating it)
+        plot_dual_axis(ax_reg, "Regularization", "reg_loss", "val_reg_loss")
 
         # Create shared legend at top right of figure
         train_line = mlines.Line2D([], [], color="blue", linewidth=2, label="Train")

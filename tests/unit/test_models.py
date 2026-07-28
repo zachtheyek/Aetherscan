@@ -146,6 +146,60 @@ class TestSamplingLayer:
 
 
 @pytest.mark.slow
+class TestRegularizationActivation:
+    """The layer-declared L1/L2 penalties reach the training objective (activated 2026-07 —
+    before this, a custom loop that never added model.losses left every trained model
+    effectively unregularized)."""
+
+    def test_reg_loss_present_positive_and_in_total(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+
+        vae = create_beta_vae_model()
+        config = get_config()
+        dense_size = config.beta_vae.dense_layer_size
+        tf.random.set_seed(11)
+        main = tf.random.uniform((2, 6, 16, dense_size))
+        true = tf.random.uniform((2, 6, 16, dense_size))
+        false = tf.random.uniform((2, 6, 16, dense_size))
+
+        losses = vae.compute_total_loss(main, true, false, main, training=False)
+        assert "reg_loss" in losses
+        reg = float(losses["reg_loss"])
+        # Freshly initialized weights + nonzero activations => strictly positive penalties
+        assert reg > 0.0
+        assert losses["reg_loss"].dtype == tf.float32
+        # reg is a real component of the objective, with the documented composition
+        expected_total = (
+            float(losses["reconstruction_loss"])
+            + vae.beta * float(losses["kl_loss"])
+            + vae.alpha * (float(losses["true_loss"]) + float(losses["false_loss"]))
+            + reg
+        )
+        np.testing.assert_allclose(float(losses["total_loss"]), expected_total, rtol=1e-5)
+
+    def test_reg_loss_deterministic_across_calls(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+
+        vae = create_beta_vae_model()
+        config = get_config()
+        dense_size = config.beta_vae.dense_layer_size
+        tf.random.set_seed(11)
+        batch = tf.random.uniform((2, 6, 16, dense_size))
+        first = float(
+            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+        )
+        second = float(
+            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+        )
+        # Same weights + same activations => identical penalties (no RNG in regularizers)
+        assert first == second
+
+
+@pytest.mark.slow
 class TestEncoderDecoderSymmetry:
     """Builds the full Beta-VAE graph on CPU — slow but CI-safe."""
 
