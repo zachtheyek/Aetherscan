@@ -65,7 +65,7 @@ from _common import machine_info, write_result
 _CADENCE_SHAPE = (6, 16, 512)
 _SAMPLE_BYTES = int(np.prod(_CADENCE_SHAPE)) * 4  # float32
 _SIGNAL_TYPES = ("false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi")
-_CLIP_NORM = 1.0  # matches train.py `_apply_gradients`
+_CLIP_NORM = 1.0  # matches train.py `_GRADIENT_CLIP_NORM` (used in `_build_accumulated_train_step`)
 
 
 def _positive_int(value: str) -> int:

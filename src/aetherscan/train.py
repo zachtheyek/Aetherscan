@@ -2132,6 +2132,10 @@ class TrainingPipeline:
                 # is structurally disconnected from the loss, so the apply step must skip it
                 # — exactly what apply_gradients did with the None entries the previous
                 # Python-side accumulation forwarded. Expected empty for the beta-VAE.
+                # The set is instance-scoped and shared across every traced K: that is safe
+                # only because loss↔variable connectivity is a property of the model graph,
+                # independent of accumulation depth — if compute_total_loss ever grows
+                # K-dependent branches, give each traced K its own set.
                 self._unconnected_grad_indices.add(idx)
             else:
                 accumulator.assign_add(grad)
@@ -2308,7 +2312,7 @@ class TrainingPipeline:
                 step_losses, global_norm, applied = train_step_fn(iterator)
 
                 if not bool(applied.numpy()):
-                    logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
+                    logger.error(f"Step {step + 1}: NaN/Inf detected in averaged gradients!")
                     raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
                 epoch_gradient_norms.append(float(global_norm.numpy()))
