@@ -1769,6 +1769,38 @@ class Database:
             # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
+    def query_injection_stat_time_span(
+        self,
+        tag: str,
+        start_round_number: int | None = None,
+        end_round_number: int | None = None,
+    ) -> tuple[float, float] | None:
+        """
+        MIN/MAX timestamp over a tag's injection_stats rows, optionally bounded to a round
+        range. One deliberate full-partition aggregate (no timestamp filter; superseded and
+        non-finite rows included) that lets callers tighten the (tag, timestamp) index window
+        for the many row-level queries that follow — idx_injection_stats_filter leads with
+        (tag, timestamp) and round_number is not in it, so a run-wide window makes every
+        round-scoped query re-scan the tag's whole history. The span covers every row a
+        filtered query could return for those rounds, so intersecting a query window with it
+        never changes that query's result set. Returns None when no rows match.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT MIN(timestamp), MAX(timestamp) FROM injection_stats WHERE tag = ?"
+            params: list = [tag]
+            if start_round_number is not None:
+                query += " AND round_number >= ?"
+                params.append(start_round_number)
+            if end_round_number is not None:
+                query += " AND round_number <= ?"
+                params.append(end_round_number)
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0]), float(row[1])
+
     # NOTE: how to additionally filter by metadata (e.g. machine_name)?
     # NOTE: should we also let user filter by value (e.g. >= or <= some value)?
     def query_injection_stat(

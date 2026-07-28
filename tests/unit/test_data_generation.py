@@ -20,10 +20,12 @@ from aetherscan.data_generation import (
     create_false,
     create_true_double,
     create_true_single,
+    generate_round_to_memmap,
     log_norm,
     new_cadence,
     write_segment_stats,
 )
+from aetherscan.round_data import RoundDataPaths, validate_done_manifest
 
 # Keep injection fast: small frequency axis, real-ish resolutions.
 _WIDTH_BIN = 128
@@ -308,23 +310,29 @@ class TestCreateCadences:
         assert sample_info["intersection_retry_capped"] is False
 
     def _stub_injections(self, monkeypatch):
-        # Replace the expensive setigen injection with a shape-preserving stub whose slope
-        # differs on every call, so the slope_1 != slope_2 guard never causes a retry and
-        # the retry count is driven purely by the (patched) intersection check.
+        # Replace the expensive draw+materialize pair with shape-preserving stubs whose slope
+        # differs on every draw, so the slope_1 != slope_2 guard never causes a retry and
+        # the retry count is driven purely by the (patched) intersection check. Since the
+        # draw-first split, create_true_double calls _draw_signal_params per attempt and
+        # _inject_drawn_signal only for the final pair — patch both.
         calls = itertools.count(1)
 
-        def fake_new_cadence(data, snr, width_bin, freq_resolution, time_resolution):
-            signal_info = {
-                "snr": float(snr),
+        def fake_draw_signal_params(total_time, width_bin, freq_resolution, time_resolution):
+            params = {
                 "drift_rate": 1.0,
                 "signal_width": 1.0,
                 "starting_bin": 1.0,
                 "slope_pixel": float(next(calls)),
                 "y_intercept": 0.0,
             }
-            return data, signal_info, False
+            return params, False
 
-        monkeypatch.setattr(data_generation, "new_cadence", fake_new_cadence)
+        monkeypatch.setattr(data_generation, "_draw_signal_params", fake_draw_signal_params)
+        monkeypatch.setattr(
+            data_generation,
+            "_inject_drawn_signal",
+            lambda data, snr, params, freq_resolution, time_resolution: data,
+        )
 
     def test_true_double_retry_cap_clamps_and_flags(self, plate, monkeypatch):
         # Always-rejecting geometry must terminate at the cap, keep the last drawn pair,
@@ -342,6 +350,183 @@ class TestCreateCadences:
         _, sample_info = create_true_double(plate, **self._kwargs())
         assert sample_info["intersection_retries"] == 1
         assert sample_info["intersection_retry_capped"] is False
+
+
+class TestFloat16RoundArrays:
+    """round_array_dtype="float16" (A/B-gated): same seeded generation, on-disk quantization
+    only — the manifest records and gates the dtype."""
+
+    def _generate(self, plate, tmp_path, subdir, array_dtype):
+        paths = RoundDataPaths.for_round(str(tmp_path / subdir), 1)
+        generate_round_to_memmap(
+            paths,
+            8,
+            10.0,
+            5.0,
+            width_bin=_WIDTH_BIN,
+            num_observations=6,
+            time_bins=16,
+            chunk_size=8,
+            task_size=4,
+            freq_resolution=_FREQ_RES,
+            time_resolution=_TIME_RES,
+            backgrounds=plate,
+            round_num=1,
+            seed=11,
+            array_dtype=array_dtype,
+        )
+        return paths
+
+    def test_float16_generation_is_quantization_only(self, plate, tmp_path):
+        paths32 = self._generate(plate, tmp_path, "f32", "float32")
+        paths16 = self._generate(plate, tmp_path, "f16", "float16")
+        a32 = np.load(paths32.main_path)
+        a16 = np.load(paths16.main_path)
+        assert a32.dtype == np.float32
+        assert a16.dtype == np.float16
+        # Same seed => identical generated values; the only difference is the on-disk
+        # downcast, bounded by half-precision resolution on the [0, 1] log-normed data
+        np.testing.assert_allclose(a16.astype(np.float32), a32, atol=2**-11)
+        # Sidecars stay float32; labels identical
+        assert np.load(paths16.lognorm_paths["main"]).dtype == np.float32
+        np.testing.assert_array_equal(np.load(paths16.labels_path), np.load(paths32.labels_path))
+        # Manifest gates reuse by dtype
+        assert validate_done_manifest(paths16, expected_array_dtype="float16") is not None
+        assert validate_done_manifest(paths16, expected_array_dtype="float32") is None
+
+    def test_unknown_dtype_rejected(self, plate, tmp_path):
+        with pytest.raises(ValueError, match="array_dtype"):
+            self._generate(plate, tmp_path, "bad", "float64")
+
+
+class TestDrawFirstEquivalence:
+    """Byte-compatibility pins for the draw-first split of new_cadence (#TBD).
+
+    The split moved setigen materialization out of create_true_double's retry loop; these
+    tests pin the two contracts that make that byte-identical: materialization consumes no
+    RNG, and create_true_double's draw order matches the pre-split inject-then-test loop
+    exactly.
+    """
+
+    def test_inject_drawn_signal_consumes_no_rng(self):
+        data = np.abs(np.random.randn(96, _WIDTH_BIN)) + 1.0
+        params, _ = data_generation._draw_signal_params(96, _WIDTH_BIN, _FREQ_RES, _TIME_RES)
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        data_generation._inject_drawn_signal(data, 20.0, params, _FREQ_RES, _TIME_RES)
+        assert random.getstate() == py_state
+        np_state_after = np.random.get_state()
+        assert np_state[0] == np_state_after[0]
+        np.testing.assert_array_equal(np_state[1], np_state_after[1])
+        assert np_state[2:] == np_state_after[2:]
+
+    def test_new_cadence_is_draw_then_inject_composition(self):
+        data = np.abs(np.random.randn(96, _WIDTH_BIN)) + 1.0
+        state_py = random.getstate()
+        state_np = np.random.get_state()
+        modified, signal_info, clamped = new_cadence(data, 20.0, _WIDTH_BIN, _FREQ_RES, _TIME_RES)
+        random.setstate(state_py)
+        np.random.set_state(state_np)
+        params, clamped_ref = data_generation._draw_signal_params(
+            data.shape[0], _WIDTH_BIN, _FREQ_RES, _TIME_RES
+        )
+        modified_ref = data_generation._inject_drawn_signal(
+            data, 20.0, params, _FREQ_RES, _TIME_RES
+        )
+        np.testing.assert_array_equal(modified, modified_ref)
+        assert signal_info == data_generation._signal_info_from_params(20.0, params)
+        assert clamped == clamped_ref
+
+    @staticmethod
+    def _pre_split_true_double_reference(
+        plate, snr_base, snr_range, width_bin, freq_resolution, time_resolution, dynamic_range=1.0
+    ):
+        """The pre-split create_true_double loop (inject both, then test), reproduced verbatim
+        via the public new_cadence so the equivalence test compares against the exact legacy
+        RNG-consumption and materialization order."""
+        background_index = int(plate.shape[0] * random.random())
+        base = plate[background_index, :, :, :]
+        n_obs = plate.shape[1]
+        n_time = plate.shape[2]
+        final = np.zeros((n_obs, n_time, width_bin))
+        stats_a = _compute_intensity_stats(base)
+        data = np.zeros((n_obs * n_time, width_bin))
+        for i in range(n_obs):
+            data[i * n_time : (i + 1) * n_time, :] = base[i, :, :]
+        snr = random.random() * snr_range + snr_base
+        intersection_retries = 0
+        intersection_retry_capped = False
+        while True:
+            intersection_retries += 1
+            cadence_1, rfi_signal_info, rfi_slope_clamped = new_cadence(
+                data, snr, width_bin, freq_resolution, time_resolution
+            )
+            cadence_2, eti_signal_info, eti_slope_clamped = new_cadence(
+                cadence_1, snr * dynamic_range, width_bin, freq_resolution, time_resolution
+            )
+            slope_1 = rfi_signal_info["slope_pixel"]
+            intercept_1 = rfi_signal_info["y_intercept"]
+            slope_2 = eti_signal_info["slope_pixel"]
+            intercept_2 = eti_signal_info["y_intercept"]
+            if slope_1 != slope_2 and check_valid_intersection(
+                slope_1, slope_2, intercept_1, intercept_2
+            ):
+                break
+            if intersection_retries >= MAX_INTERSECTION_RETRIES:
+                intersection_retry_capped = True
+                break
+        slope_was_clamped = rfi_slope_clamped or eti_slope_clamped
+        signal_info = {
+            **{f"rfi_{k}": v for k, v in rfi_signal_info.items()},
+            **{f"eti_{k}": v for k, v in eti_signal_info.items()},
+        }
+        stats_b = _compute_intensity_stats(cadence_2)
+        lognorm_params = np.zeros((n_obs, 2), dtype=np.float32)
+        for i in range(n_obs):
+            source = cadence_2 if i % 2 == 0 else cadence_1
+            final[i, :, :], lognorm_params[i] = log_norm(
+                source[i * n_time : (i + 1) * n_time, :], return_params=True
+            )
+        stats_c = _compute_intensity_stats(final)
+        return final, {
+            "background_index": background_index,
+            "intensity_stats": {"A": stats_a, "B": stats_b, "C": stats_c},
+            "signal_info": signal_info,
+            "slope_was_clamped": slope_was_clamped,
+            "intersection_retries": intersection_retries,
+            "intersection_retry_capped": intersection_retry_capped,
+            "lognorm_params": lognorm_params,
+        }
+
+    @pytest.mark.parametrize("seed", [11, 12, 13, 14])
+    def test_true_double_matches_pre_split_reference(self, plate, seed):
+        kwargs = {
+            "snr_base": 10.0,
+            "snr_range": 5.0,
+            "width_bin": _WIDTH_BIN,
+            "freq_resolution": _FREQ_RES,
+            "time_resolution": _TIME_RES,
+        }
+        random.seed(seed)
+        np.random.seed(seed)
+        final_ref, info_ref = self._pre_split_true_double_reference(plate, **kwargs)
+        state_py_ref = random.getstate()
+        state_np_ref = np.random.get_state()
+        random.seed(seed)
+        np.random.seed(seed)
+        final_new, info_new = create_true_double(plate, **kwargs)
+        np.testing.assert_array_equal(final_new, final_ref)
+        np.testing.assert_array_equal(
+            info_new.pop("lognorm_params"), info_ref.pop("lognorm_params")
+        )
+        assert info_new == info_ref
+        # Both arms must also leave the global RNG streams in the same state (no extra or
+        # missing draws) — the property the per-task seeding contract depends on.
+        assert random.getstate() == state_py_ref
+        state_np_new = np.random.get_state()
+        assert state_np_new[0] == state_np_ref[0]
+        np.testing.assert_array_equal(state_np_new[1], state_np_ref[1])
+        assert state_np_new[2:] == state_np_ref[2:]
 
 
 class TestComputeIntensityStats:

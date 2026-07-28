@@ -21,7 +21,6 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 
-import imageio.v3 as iio
 import joblib
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
@@ -51,7 +50,7 @@ from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
 from aetherscan.hf_hub import upload_run_to_hf
-from aetherscan.latent_gif import FrameCategory, render_latent_gif_frames
+from aetherscan.latent_gif import run_umap_gif_sweep
 from aetherscan.latent_variants import (
     VARIANT_ORDER,
     active_latent_dims,
@@ -884,7 +883,9 @@ def prepare_distributed_train_dataset(
     def map_gather(batch_indices):
         # Pure tf.data ops on CPU: the gather runs in TF's C++ threadpool, releases nothing
         # to Python, and parallel map workers scale with cores instead of convoying on the
-        # GIL. tf.cast is a no-op passthrough for the production float32 arrays.
+        # GIL. tf.cast is a no-op passthrough for float32 round arrays and the host-side
+        # upcast under round_array_dtype="float16" (the gather itself moves half the bytes;
+        # the training graph sees float32 either way).
         with tf.device("/CPU:0"):
             concat_batch = tf.cast(tf.gather(concat_t, batch_indices), tf.float32)
             true_batch = tf.cast(tf.gather(true_t, batch_indices), tf.float32)
@@ -1144,6 +1145,18 @@ class TrainingPipeline:
 
         # Set distributed strategy
         self.strategy = strategy or tf.distribute.get_strategy()
+
+        # Opt-in bf16 mixed precision (A/B-gated; see BetaVAEConfig.mixed_precision): the
+        # global policy must be set BEFORE the models are built so every layer picks it up.
+        # bf16 needs no loss scaling, and keras keeps variables/optimizer state — and hence
+        # the gradients reaching the fp32 accumulators and NaN guard — in fp32. Flag off =>
+        # no policy call at all, preserving the fp32 pipeline's numerics byte-for-byte.
+        if self.config.beta_vae.mixed_precision:
+            tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
+            logger.info(
+                "Mixed precision enabled: keras global policy set to mixed_bfloat16 "
+                "(fp32 islands: z_mean/z_log_var/Sampling, decoder output, loss math)"
+            )
 
         # Create VAE model & optimizer inside distributed context
         with self.strategy.scope():
@@ -1461,7 +1474,11 @@ class TrainingPipeline:
             "round_data"
         )
         self._round_data_base_dir = os.path.join(round_data_root, self.config.checkpoint.save_tag)
-        prepare_round_data_dir(self._round_data_base_dir, start_round)
+        prepare_round_data_dir(
+            self._round_data_base_dir,
+            start_round,
+            expected_array_dtype=self.config.training.round_array_dtype,
+        )
 
         logger.info("Setup directories complete")
 
@@ -1538,6 +1555,7 @@ class TrainingPipeline:
                     db=self.db,
                     tag=self.config.checkpoint.save_tag,
                     seed=self.config.reproducibility.seed,
+                    array_dtype=self.config.training.round_array_dtype,
                 )
                 self._round_producer.start()
                 # Kick off the first round's data right away (nothing to overlap with yet —
@@ -1618,7 +1636,14 @@ class TrainingPipeline:
         # Obtain this round's disk-backed data: reuse a validated on-disk dataset if one
         # exists, otherwise wait on the background producer (which was asked to generate it
         # while the previous round trained) or generate in-process (overlap disabled)
-        if validate_done_manifest(paths, expected_n_samples=n_samples) is not None:
+        if (
+            validate_done_manifest(
+                paths,
+                expected_n_samples=n_samples,
+                expected_array_dtype=self.config.training.round_array_dtype,
+            )
+            is not None
+        ):
             logger.info(f"Reusing validated round {round_number} data at {paths.round_dir}")
         elif self._round_producer is not None:
             logger.info(f"Waiting for round {round_number} data from the background producer")
@@ -2680,7 +2705,14 @@ class TrainingPipeline:
             round_dir=os.path.join(self._round_data_base_dir, "rf"), round_idx=0
         )
         rf_trained = False  # Set True once RF training fully completes (drives dir deletion)
-        if validate_done_manifest(rf_paths, expected_n_samples=n_samples) is not None:
+        if (
+            validate_done_manifest(
+                rf_paths,
+                expected_n_samples=n_samples,
+                expected_array_dtype=self.config.training.round_array_dtype,
+            )
+            is not None
+        ):
             logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
         else:
             # RF data is always generated in-process (no background producer for the RF phase);
@@ -4130,6 +4162,23 @@ class TrainingPipeline:
             )
         logger.info("Database flushed")
 
+        # Tighten the timestamp window to the queried rounds' actual row span:
+        # idx_injection_stats_filter leads with (tag, timestamp) and round_number is not in
+        # it, so with the run-wide window every query below re-scans the tag's entire row
+        # history (measured 10.5x slower at 12M rows) — and this function issues ~165 such
+        # queries per call. The span is MIN/MAX over ALL rows for these rounds (superseded
+        # included), so intersecting it with the existing [run-start, now] window can only
+        # narrow each scan — never change a result set.
+        window_start, window_end = self.start_time, current_time
+        span = self.db.query_injection_stat_time_span(
+            tag=self.config.checkpoint.save_tag,
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
+        )
+        if span is not None:
+            window_start = max(window_start, span[0] - 1.0)
+            window_end = min(window_end, span[1] + 1.0)
+
         # Figure 1: Injected signal characteristics
         signal_stats = [
             "snr",
@@ -4150,8 +4199,8 @@ class TrainingPipeline:
                 start_round_number=start_round_number,
                 end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
+                start_time=window_start,
+                end_time=window_end,
                 columns=["value"],
             )
             eti_stats[stat_name] = [r["value"] for r in results]
@@ -4164,8 +4213,8 @@ class TrainingPipeline:
                 start_round_number=start_round_number,
                 end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
+                start_time=window_start,
+                end_time=window_end,
                 columns=["value"],
             )
             rfi_stats[stat_name] = [r["value"] for r in results]
@@ -4179,8 +4228,8 @@ class TrainingPipeline:
             start_round_number=start_round_number,
             end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
+            start_time=window_start,
+            end_time=window_end,
             columns=["background_index"],
         )
         eti_background_indices = [
@@ -4195,8 +4244,8 @@ class TrainingPipeline:
             start_round_number=start_round_number,
             end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
+            start_time=window_start,
+            end_time=window_end,
             columns=["background_index"],
         )
         rfi_background_indices = [
@@ -4237,8 +4286,8 @@ class TrainingPipeline:
                 start_round_number=start_round_number,
                 end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
+                start_time=window_start,
+                end_time=window_end,
             )
             for row in agg_results:
                 round_num = row["round_number"]
@@ -4258,8 +4307,8 @@ class TrainingPipeline:
             start_round_number=start_round_number,
             end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
+            start_time=window_start,
+            end_time=window_end,
         )
         for row in clamping_results:
             round_num = row["round_number"]
@@ -4305,8 +4354,8 @@ class TrainingPipeline:
                         start_round_number=start_round_number,
                         end_round_number=end_round_number,
                         tag=self.config.checkpoint.save_tag,
-                        start_time=self.start_time,
-                        end_time=current_time,
+                        start_time=window_start,
+                        end_time=window_end,
                         columns=["value"],
                     )
                     stats_by_stage[stage][stat_name] = [r["value"] for r in results]
@@ -4336,8 +4385,8 @@ class TrainingPipeline:
                     start_round_number=start_round_number,
                     end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
+                    start_time=window_start,
+                    end_time=window_end,
                     columns=["value"],
                 )
                 values_a = [r["value"] for r in results_a]
@@ -4351,8 +4400,8 @@ class TrainingPipeline:
                     start_round_number=start_round_number,
                     end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
+                    start_time=window_start,
+                    end_time=window_end,
                     columns=["value"],
                 )
                 values_b = [r["value"] for r in results_b]
@@ -4378,8 +4427,8 @@ class TrainingPipeline:
                     start_round_number=start_round_number,
                     end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
+                    start_time=window_start,
+                    end_time=window_end,
                     columns=["value"],
                 )
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
@@ -5279,55 +5328,6 @@ class TrainingPipeline:
         )
 
         # Compute consistent axis limits with 5% padding (streaming min/max to avoid concat)
-        def _compute_limits(transformed_list):
-            x_min = min(t[:, 0].min() for t in transformed_list)
-            x_max = max(t[:, 0].max() for t in transformed_list)
-            y_min = min(t[:, 1].min() for t in transformed_list)
-            y_max = max(t[:, 1].max() for t in transformed_list)
-            x_pad = (x_max - x_min) * 0.05
-            y_pad = (y_max - y_min) * 0.05
-            return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
-
-        # NOTE: come back to this later
-        # Obs-level palette: 8 categories (signal_type × ON/OFF) with ON/OFF as triangle/x
-        obs_colors = {
-            ("false_no_signal", "ON"): "#1565C0",
-            ("false_no_signal", "OFF"): "#64B5F6",
-            ("false_with_rfi", "ON"): "#F9A825",
-            ("false_with_rfi", "OFF"): "#FFF176",
-            ("true_only_eti", "ON"): "#2E7D32",
-            ("true_only_eti", "OFF"): "#81C784",
-            ("true_eti_rfi", "ON"): "#C62828",
-            ("true_eti_rfi", "OFF"): "#EF5350",
-        }
-        obs_markers = {"ON": "^", "OFF": "x"}
-        obs_display_names = {
-            ("false_no_signal", "ON"): "No Signal (ON)",
-            ("false_no_signal", "OFF"): "No Signal (OFF)",
-            ("false_with_rfi", "ON"): "RFI Only (ON)",
-            ("false_with_rfi", "OFF"): "RFI Only (OFF)",
-            ("true_only_eti", "ON"): "ETI Only (ON)",
-            ("true_only_eti", "OFF"): "ETI Only (OFF)",
-            ("true_eti_rfi", "ON"): "ETI+RFI (ON)",
-            ("true_eti_rfi", "OFF"): "ETI+RFI (OFF)",
-        }
-
-        # NOTE: come back to this later (change colors, add markers. potentially need to change _render_frames_and_write_gif: docstring & collapse mode arg?)
-        # Cadence-level palette: 4 categories, kept distinct from the obs palette on
-        # purpose so downstream RF plots can reuse the same colors
-        cadence_colors = {
-            "false_no_signal": "tab:blue",
-            "false_with_rfi": "tab:green",
-            "true_only_eti": "tab:red",
-            "true_eti_rfi": "tab:orange",
-        }
-        cadence_display_names = {
-            "false_no_signal": "No Signal",
-            "false_with_rfi": "RFI Only",
-            "true_only_eti": "ETI Only",
-            "true_eti_rfi": "ETI+RFI",
-        }
-
         # NOTE: instead of temp_dir, save frames in persistent dir. update dir archiving to handle
         temp_dir = tempfile.mkdtemp(prefix="latent_gif_")
 
@@ -5337,234 +5337,103 @@ class TrainingPipeline:
         n_neighbors_values = self.config.training.latent_viz_umap_n_neighbors
         min_dist_values = self.config.training.latent_viz_umap_min_dist
 
-        def _render_frames_and_write_gif(
-            transformed_list,
-            method_name,
-            display_method,
-            xlim,
-            ylim,
-            mode,
-        ):
-            """
-            Render one scatter frame per snapshot (across a process pool — see
-            aetherscan.latent_gif, #278) and assemble them into a GIF.
+        # Bundle the shared inputs once for the combo workers: every (mode, nn, md) combo
+        # reads the same fit pools / snapshot coords / labels read-only, so they ship to the
+        # forkserver workers through one on-disk joblib bundle instead of a per-task pickle.
+        bundle_path = os.path.join(temp_dir, "sweep_inputs.joblib")
+        joblib.dump(
+            {
+                "fit_pool_obs": fit_pool_obs,
+                "fit_pool_cadence": fit_pool_cadence,
+                "coords_obs": all_coords_obs,
+                "coords_cadence": all_coords_cadence,
+                "labels_obs": all_snapshot_labels_obs,
+                "labels_cadence": all_snapshot_labels_cadence,
+                "onoff_obs": all_snapshot_onoff_obs,
+                "snapshot_metadata": snapshot_metadata,
+            },
+            bundle_path,
+        )
 
-            mode="obs"     → 8-category (signal_type × ON/OFF) scatter with triangle/x markers
-            mode="cadence" → 4-category (signal_type) scatter with single-marker style
-            """
-            if mode == "obs":
-                categories = [
-                    FrameCategory(
-                        signal_type=stype,
-                        onoff=status,
-                        color=color,
-                        marker=obs_markers[status],
-                        display_name=obs_display_names[(stype, status)],
+        # One task per (nn, md, level): the whole combo pipeline (UMAP fit + persist +
+        # per-snapshot transforms + frame render + GIF assembly) runs in a forkserver worker
+        # (aetherscan.latent_gif.run_umap_gif_sweep). The sweep was strictly serial here at
+        # ~95% single-core (~1.7-1.9 h per run) even after #278 parallelized frame
+        # rendering; combos are independent fits with their own derived random_state, so
+        # process isolation preserves every output byte — unlike the rejected within-fit
+        # ideas (batched transforms / precomputed-knn reuse, see latent_gif.py).
+        sweep_tasks = []
+        for nn in n_neighbors_values:
+            for md in min_dist_values:
+                for level_idx, mode in ((0, "obs"), (1, "cadence")):
+                    method_name = f"{mode}_umap_nn{nn}_md{md}"
+                    level_display = "Obs-level" if mode == "obs" else "Cadence-level"
+                    sweep_tasks.append(
+                        {
+                            "mode": mode,
+                            "nn": nn,
+                            "md": md,
+                            # random_state derives from the root seed, sub-keyed (level, nn,
+                            # md) so every fit gets its own reproducible stream (#279; md
+                            # keyed at 1e-3 resolution) — the same derivation the serial
+                            # loop used
+                            "seed": derive_seed(
+                                self.config.reproducibility.seed,
+                                STREAM_UMAP,
+                                level_idx,
+                                nn,
+                                round(md * 1000),
+                            ),
+                            "method_name": method_name,
+                            "display_method": (
+                                f"{level_display} UMAP (n_neighbors: {nn}, min_dist: {md})"
+                            ),
+                            "bundle_path": bundle_path,
+                            "frames_dir": temp_dir,
+                            "gif_path": os.path.join(
+                                save_dir, f"latent_space_{method_name}_{tag}.gif"
+                            ),
+                            "umap_path": os.path.join(
+                                self.config.model_path,
+                                f"umap_{mode}_nn{nn}_md{md}_{tag}.joblib",
+                            ),
+                            "duration_ms": duration_ms,
+                        }
                     )
-                    for (stype, status), color in obs_colors.items()
-                ]
-                legend_kwargs = {
-                    "loc": "upper right",
-                    "fontsize": 8,
-                    "markerscale": 2,
-                    "ncol": 2,
-                    "framealpha": 0.8,
-                }
-            else:  # cadence
-                categories = [
-                    FrameCategory(
-                        signal_type=stype,
-                        onoff=None,
-                        color=color,
-                        marker="o",
-                        display_name=cadence_display_names[stype],
-                    )
-                    for stype, color in cadence_colors.items()
-                ]
-                legend_kwargs = {
-                    "loc": "upper right",
-                    "fontsize": 8,
-                    "markerscale": 2,
-                    "framealpha": 0.8,
-                }
 
-            frames = []
-            for frame_idx, meta in enumerate(snapshot_metadata):
-                meta_snr_base = meta["snr_base"]
-                meta_snr_range = meta["snr_range"]
-                meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
-                meta_snr_ceil = (
-                    meta_snr_base + meta_snr_range
-                    if meta_snr_base is not None and meta_snr_range is not None
-                    else "?"
-                )
-                frames.append(
-                    {
-                        "coords": transformed_list[frame_idx],
-                        "labels": (
-                            all_snapshot_labels_obs[frame_idx]
-                            if mode == "obs"
-                            else all_snapshot_labels_cadence[frame_idx]
-                        ),
-                        "onoff": all_snapshot_onoff_obs[frame_idx] if mode == "obs" else None,
-                        "title": (
-                            f"Beta-VAE Latent Space: {display_method} — "
-                            f"Round {meta['round_number']}, "
-                            f"Epoch {meta['epoch_number']}, "
-                            f"Step {meta['step_number']} "
-                            f"(SNR: {meta_snr_floor}–{meta_snr_ceil})"
-                        ),
-                    }
-                )
+        # The parent's copies of the bundled inputs are dead weight during the sweep
+        del fit_pool_obs, fit_pool_cadence
+        del all_coords_obs, all_coords_cadence
+        del all_snapshot_labels_obs, all_snapshot_labels_cadence, all_snapshot_onoff_obs
+        gc.collect()
 
-            frame_paths = render_latent_gif_frames(
-                frames,
-                categories=categories,
-                xlim=xlim,
-                ylim=ylim,
-                legend_kwargs=legend_kwargs,
-                out_dir=temp_dir,
-                method_name=method_name,
-                n_workers=self.config.manager.n_processes,
-            )
-            del frames
-            gc.collect()
+        n_sweep_workers = min(len(sweep_tasks), self.config.manager.n_processes)
+        logger.info(
+            f"Running {len(sweep_tasks)} UMAP GIF combos across {n_sweep_workers} worker(s)"
+        )
+        sweep_results = run_umap_gif_sweep(sweep_tasks, n_workers=n_sweep_workers)
 
-            # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
-            gif_filename = f"latent_space_{method_name}_{tag}.gif"
-            gif_path = os.path.join(save_dir, gif_filename)
-
-            n_frames = len(frame_paths)
-            if n_frames > 0:
-                with iio.imopen(gif_path, "w", plugin="pillow") as gif_writer:
-                    for frame_path in frame_paths:
-                        frame = iio.imread(frame_path)
-                        gif_writer.write(
-                            frame,
-                            duration=duration_ms,
-                            loop=0,
-                            is_batch=False,
-                        )
-                        del frame
-
+        # Logging, bookkeeping and Slack uploads stay parental (forkserver workers have no
+        # log handler and no Slack client), in task order — the serial loop's output order
+        for result in sweep_results:
+            for warning in result["warnings"]:
+                logger.warning(warning)
+            if os.path.exists(result["umap_path"]):
+                logger.info(f"Saved UMAP model: {result['umap_path']}")
+            gif_paths[result["method_name"]] = result["gif_path"]
+            if result["n_frames"] > 0:
                 logger.info(
-                    f"Latent space {method_name.upper()} GIF saved: {gif_path} ({n_frames} frames)"
+                    f"Latent space {result['method_name'].upper()} GIF saved: "
+                    f"{result['gif_path']} ({result['n_frames']} frames)"
                 )
-
-                # Upload to Slack
                 logger_instance = get_logger()
                 if logger_instance:
                     logger_instance.upload_image_to_slack(
-                        gif_path,
-                        title=f"Latent Space {display_method} - ({tag})",
+                        result["gif_path"],
+                        title=f"Latent Space {result['display_method']} - ({tag})",
                     )
 
-            del frame_paths
-            gc.collect()
-
-            return gif_path
-
-        for nn in n_neighbors_values:
-            for md in min_dist_values:
-                # Obs-level UMAP
-                logger.info(f"Fitting obs-level UMAP with n_neighbors={nn}, min_dist={md}")
-                # Note that by setting random_state, we get a deterministic UMAP fit, at the
-                # expense of single-thread performance (n_jobs=1). This is a hard constraint of
-                # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
-                # random_state derives from the root seed, sub-keyed (level, nn, md) so every
-                # fit gets its own reproducible stream (#279; md keyed at 1e-3 resolution)
-                umap_obs = umap.UMAP(
-                    n_components=2,
-                    random_state=derive_seed(
-                        self.config.reproducibility.seed, STREAM_UMAP, 0, nn, round(md * 1000)
-                    ),
-                    n_neighbors=nn,
-                    min_dist=md,
-                ).fit(fit_pool_obs)
-
-                obs_umap_path = os.path.join(
-                    self.config.model_path, f"umap_obs_nn{nn}_md{md}_{tag}.joblib"
-                )
-                try:
-                    os.makedirs(self.config.model_path, exist_ok=True)
-                    joblib.dump(umap_obs, obs_umap_path)
-                    logger.info(f"Saved obs-level UMAP model: {obs_umap_path}")
-                except Exception as exc:
-                    logger.warning(
-                        f"Failed to persist obs-level UMAP model ({obs_umap_path}): {exc}"
-                    )
-
-                transformed_obs = [umap_obs.transform(c) for c in all_coords_obs]
-                del umap_obs
-                gc.collect()
-
-                xlim_obs, ylim_obs = _compute_limits(transformed_obs)
-                method_name_obs = f"obs_umap_nn{nn}_md{md}"
-                display_method_obs = f"Obs-level UMAP (n_neighbors: {nn}, min_dist: {md})"
-
-                gif_path_obs = _render_frames_and_write_gif(
-                    transformed_obs,
-                    method_name_obs,
-                    display_method_obs,
-                    xlim_obs,
-                    ylim_obs,
-                    mode="obs",
-                )
-                gif_paths[method_name_obs] = gif_path_obs
-
-                del transformed_obs
-                gc.collect()
-
-                # Cadence-level UMAP
-                logger.info(f"Fitting cadence-level UMAP with n_neighbors={nn}, min_dist={md}")
-                # Note that by setting random_state, we get a deterministic UMAP fit, at the
-                # expense of single-thread performance (n_jobs=1). This is a hard constraint of
-                # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
-                umap_cadence = umap.UMAP(
-                    n_components=2,
-                    random_state=derive_seed(
-                        self.config.reproducibility.seed, STREAM_UMAP, 1, nn, round(md * 1000)
-                    ),
-                    n_neighbors=nn,
-                    min_dist=md,
-                ).fit(fit_pool_cadence)
-
-                cadence_umap_path = os.path.join(
-                    self.config.model_path, f"umap_cadence_nn{nn}_md{md}_{tag}.joblib"
-                )
-                try:
-                    os.makedirs(self.config.model_path, exist_ok=True)
-                    joblib.dump(umap_cadence, cadence_umap_path)
-                    logger.info(f"Saved cadence-level UMAP model: {cadence_umap_path}")
-                except Exception as exc:
-                    logger.warning(
-                        f"Failed to persist cadence-level UMAP model ({cadence_umap_path}): {exc}"
-                    )
-
-                transformed_cadence = [umap_cadence.transform(c) for c in all_coords_cadence]
-                del umap_cadence
-                gc.collect()
-
-                xlim_cad, ylim_cad = _compute_limits(transformed_cadence)
-                method_name_cad = f"cadence_umap_nn{nn}_md{md}"
-                display_method_cad = f"Cadence-level UMAP (n_neighbors: {nn}, min_dist: {md})"
-
-                gif_path_cad = _render_frames_and_write_gif(
-                    transformed_cadence,
-                    method_name_cad,
-                    display_method_cad,
-                    xlim_cad,
-                    ylim_cad,
-                    mode="cadence",
-                )
-                gif_paths[method_name_cad] = gif_path_cad
-
-                del transformed_cadence
-                gc.collect()
-
-        # Cleanup — leave closure-captured variables for Python's scope teardown rather
-        # than `del`ing them here (ruff F821 flags closure refs when the enclosing
-        # scope explicitly deletes the name, even if the closure already ran).
+        # Cleanup (frame PNGs + the sweep input bundle)
         # NOTE: temp_dir isn't cleaned on exception (should use try/finally or tempfile.TemporaryDirectory() with context manager)
         shutil.rmtree(temp_dir, ignore_errors=True)
         gc.collect()
@@ -7147,9 +7016,11 @@ class TrainingPipeline:
             self._latent_viz_lognorm_params = None
             return
 
-        # Fancy indexing already creates a new independent array (no .copy() needed)
+        # Fancy indexing already creates a new independent array (no .copy() needed); the
+        # astype is a no-op for float32 rounds and upcasts float16 rounds so traversal math
+        # and plain-model encodes always see float32 (mirrors map_gather's cast)
         all_indices = np.concatenate(selected_indices)
-        self._latent_viz_batch = concat_data[all_indices]
+        self._latent_viz_batch = concat_data[all_indices].astype(np.float32, copy=False)
         self._latent_viz_labels = np.array(selected_labels, dtype="U20")
         self._latent_viz_lognorm_params = (
             lognorm_params[all_indices] if lognorm_params is not None else None

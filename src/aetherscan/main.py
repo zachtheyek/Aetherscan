@@ -90,6 +90,22 @@ def setup_gpu_strategy():
     # Enable aggressive cleanup of intermediate tensors
     os.environ["TF_ENABLE_GPU_GARBAGE_COLLECTION"] = "true"
 
+    # Dedicated per-GPU kernel-launch threads (see GPUConfig.gpu_thread_mode). Read lazily by
+    # TF at GPU-runtime init like the allocator var above.
+    valid_thread_modes = {"global", "gpu_private", "gpu_shared"}
+    if config.gpu.gpu_thread_mode not in valid_thread_modes:
+        raise ValueError(
+            f"gpu.gpu_thread_mode must be one of {sorted(valid_thread_modes)}, "
+            f"got {config.gpu.gpu_thread_mode!r}"
+        )
+    if config.gpu.gpu_thread_mode == "global":
+        # Explicitly clear so a previous run's env doesn't leak in.
+        os.environ.pop("TF_GPU_THREAD_MODE", None)
+        os.environ.pop("TF_GPU_THREAD_COUNT", None)
+    else:
+        os.environ["TF_GPU_THREAD_MODE"] = config.gpu.gpu_thread_mode
+        os.environ["TF_GPU_THREAD_COUNT"] = str(config.gpu.gpu_thread_count)
+
     gpus = tf.config.list_physical_devices("GPU")
     if not gpus:
         logger.warning("No GPUs detected")

@@ -48,13 +48,15 @@ def _seed_rngs():
     np.random.seed(11)
 
 
-def _write_small_round(paths: RoundDataPaths, n_samples=8, width_bin=16, snr_base=10.0):
+def _write_small_round(
+    paths: RoundDataPaths, n_samples=8, width_bin=16, snr_base=10.0, dtype=np.float32
+):
     """Write a tiny but structurally-complete round dataset + validated manifest."""
     os.makedirs(paths.round_dir, exist_ok=True)
     rng = np.random.default_rng(paths.round_idx + 1)
     shape = (n_samples, 6, 4, width_bin)
     for path in paths.array_paths.values():
-        arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+        arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.dtype(dtype), shape=shape)
         arr[:] = rng.random(shape, dtype=np.float32)
         del arr
     lognorm_shape = (n_samples, 6, 2)
@@ -74,6 +76,7 @@ def _write_small_round(paths: RoundDataPaths, n_samples=8, width_bin=16, snr_bas
         snr_range=40.0,
         wall_time_s=1.0,
         chunk_count=1,
+        array_dtype=str(np.dtype(dtype)),
     )
     write_done_manifest(paths, manifest)
     return manifest
@@ -120,6 +123,37 @@ class TestManifest:
         _write_small_round(paths)
         os.remove(paths.done_path)
         assert validate_done_manifest(paths) is None
+
+    def test_array_dtype_gate(self, tmp_path):
+        # A float32 round validates against a float32 expectation but must not be silently
+        # reused when the config now wants float16 (and vice versa) — mid-run input-numerics
+        # switches are a resume hazard, not a reuse opportunity.
+        paths = RoundDataPaths.for_round(str(tmp_path), 1)
+        _write_small_round(paths)
+        assert validate_done_manifest(paths, expected_array_dtype="float32") is not None
+        assert validate_done_manifest(paths, expected_array_dtype="float16") is None
+
+    def test_float16_round_validates_and_gates(self, tmp_path):
+        paths = RoundDataPaths.for_round(str(tmp_path), 1)
+        _write_small_round(paths, dtype=np.float16)
+        manifest = validate_done_manifest(paths, expected_array_dtype="float16")
+        assert manifest is not None
+        assert manifest["array_dtype"] == "float16"
+        assert manifest["dtypes"]["main"] == "float16"
+        # Sidecars stay float32 regardless of the cadence-array dtype
+        assert manifest["dtypes"]["main_lognorm"] == "float32"
+        assert validate_done_manifest(paths, expected_array_dtype="float32") is None
+
+    def test_legacy_manifest_without_dtype_keys_validates_as_float32(self, tmp_path):
+        # Manifests written before the dtype keys existed are all float32 rounds: they must
+        # keep validating under a float32 expectation and be rejected under float16.
+        paths = RoundDataPaths.for_round(str(tmp_path), 1)
+        manifest = _write_small_round(paths)
+        manifest.pop("dtypes")
+        manifest.pop("array_dtype")
+        write_done_manifest(paths, manifest)
+        assert validate_done_manifest(paths, expected_array_dtype="float32") is not None
+        assert validate_done_manifest(paths, expected_array_dtype="float16") is None
 
     def test_expected_n_samples_mismatch_invalid(self, tmp_path):
         paths = RoundDataPaths.for_round(str(tmp_path), 1)

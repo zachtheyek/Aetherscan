@@ -75,11 +75,11 @@ subcommand uses it:
 | `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle, live-dashboard enable (`dashboard_enabled`) and port (`dashboard_port`) |
 | `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
 | `ReproducibilityConfig` | The pipeline root seed (`seed`, default 11 — every random stream in **both** modes derives from it; see `seeding.py`) and `tf_deterministic_ops` |
-| `BetaVAEConfig`      | Beta-VAE model hyperparameters                                                                                                     |
+| `BetaVAEConfig`      | Beta-VAE model hyperparameters, plus the A/B-gated `mixed_precision` (bf16) opt-in (default off)                                   |
 | `RandomForestConfig` | RF classifier hyperparameters, the #282 latent-variant sweep/selection/calibration knobs, and the override-only `seed` (default `None` = derived from the root seed) |
-| `GPUConfig`          | TF strategy: replica count, memory growth, NCCL packs, allocator toggles                                                           |
+| `GPUConfig`          | TF strategy: replica count, memory growth, NCCL packs, allocator toggles, GPU thread mode (`gpu_thread_mode` / `gpu_thread_count`) |
 | `DataConfig`         | Data shape, file lists, chunk sizes                                                                                                |
-| `TrainingConfig`     | Anything specific to the `train` command — sample counts, batch sizes, LR schedule, curriculum, latent-viz, retries                |
+| `TrainingConfig`     | Anything specific to the `train` command — sample counts, batch sizes, LR schedule, curriculum, round-data layout/dtype, latent-viz, retries |
 | `InferenceConfig`    | Anything specific to the `inference` command — encoder/RF paths, classification threshold, energy-detection preprocessing, retries |
 | `HFConfig`           | HuggingFace Hub integration — target repo id, opt-in post-training upload, inference revision pin                                  |
 | `CheckpointConfig`   | Load/save tags, start round, tag-collision-guard override                                                                          |
@@ -100,6 +100,18 @@ are changed by editing their default in `config.py`. One worth knowing:
 Random Forest's validation ROC-AUC. When set and unmet after the RF fit, training logs a
 loud WARNING (which reaches the Slack summary) rather than failing the run, so a run
 that "completes" but learned nothing is caught before its model is promoted.
+
+Four config-only fields from the 2026-07 training-performance pass follow the same
+pattern (no CLI flags): `gpu.gpu_thread_mode` (default `"gpu_private"`; also
+`"global"`/`"gpu_shared"`) and `gpu.gpu_thread_count` (default 2) set
+`TF_GPU_THREAD_MODE`/`TF_GPU_THREAD_COUNT` in `setup_gpu_strategy` before the GPU
+runtime initializes; `training.round_array_dtype` (default `"float32"`; `"float16"`
+halves the on-disk round footprint and gather volume) and `beta_vae.mixed_precision`
+(default `False`; `True` = keras `mixed_bfloat16` with fp32 islands) are **A/B-gated
+numerics levers — leave both at their defaults until the val-metric A/B documented in
+[`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md#performance-engineering-the-276-follow-up-july-2026)
+passes on the target host.** All four are emitted by `Config.to_dict()` and so are part
+of the persisted config snapshot.
 
 ## The CLI surface
 

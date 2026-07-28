@@ -143,16 +143,19 @@ def log_norm(
 
 
 # NOTE: not 100% sure how this function works. ported from Peter's code. comments added by Claude. assuming it works as intended?
-def new_cadence(
-    data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
-) -> tuple[np.ndarray, dict[str, float], bool]:
+def _draw_signal_params(
+    total_time: int, width_bin: int, freq_resolution: float, time_resolution: float
+) -> tuple[dict[str, float], bool]:
     """
-    Inject a single drifting narrowband signal into a stacked cadence array.
+    Consume the RNG draws for one signal injection and return the realized geometry
+    {drift_rate, signal_width, starting_bin, slope_pixel, y_intercept} plus
+    slope_was_clamped — WITHOUT materializing anything.
 
-    Returns (modified_data, signal_info, slope_was_clamped). signal_info carries the realized
-    parameters {snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept};
-    slope_was_clamped is True if the drift slope was forced away from ~0 to avoid a degenerate
-    near-vertical injection (downstream queries can filter on this).
+    The draw order — random.random (starting_bin), np.random.choice (drift direction),
+    random.random (slope noise), random.random (signal width) — is the byte-compatibility
+    contract with the pre-split new_cadence: create_true_double replays this exact sequence
+    per retry attempt and materializes only the accepted pair, so reordering, adding, or
+    removing a draw changes every seeded round (pinned by tests).
     """
     # NOTE: should noise = 3 parametrized?
     # Set noise parameter (for simulating randomness in drift rate calculation)
@@ -161,9 +164,6 @@ def new_cadence(
     # Randomly select a starting frequency bin (channel) to start the signal injection
     # Avoids edges (bin 0)
     starting_bin = int(random.random() * (width_bin - 1)) + 1
-
-    # Get the total number of time samples in stacked array (typically 96 for 6 obs x 16 time bins)
-    total_time = data.shape[0]
 
     # Randomly select a positive or negative drift direction
     if np.random.choice([-1, 1]) > 0:
@@ -213,6 +213,43 @@ def new_cadence(
     # Calculate y-intercept for linear signal trajectory
     y_intercept = total_time - slope_pixel * (starting_bin)
 
+    params = {
+        "drift_rate": drift_rate,
+        "signal_width": signal_width,
+        "starting_bin": starting_bin,
+        "slope_pixel": slope_pixel,
+        "y_intercept": y_intercept,
+    }
+    return params, slope_was_clamped
+
+
+def _signal_info_from_params(snr: float, params: dict[str, float]) -> dict[str, float]:
+    """Build the signal_info dict from drawn geometry. Key order is the DB row-order contract
+    (write_segment_stats iterates signal_info.items()) — keep it stable."""
+    return {
+        "snr": float(snr),
+        "drift_rate": float(params["drift_rate"]),
+        "signal_width": float(params["signal_width"]),
+        "starting_bin": float(params["starting_bin"]),
+        "slope_pixel": float(params["slope_pixel"]),
+        "y_intercept": float(params["y_intercept"]),
+    }
+
+
+def _inject_drawn_signal(
+    data: np.ndarray,
+    snr: float,
+    params: dict[str, float],
+    freq_resolution: float,
+    time_resolution: float,
+) -> np.ndarray:
+    """
+    Materialize one drawn signal into `data` and return the modified array.
+
+    Contract: consumes NO RNG (pinned by test) — create_true_double relies on this to defer
+    materialization until after the intersection-acceptance test without shifting the seeded
+    per-task stream.
+    """
     # Create setigen Frame
     frame = stg.Frame.from_data(
         df=freq_resolution * u.Hz,
@@ -226,12 +263,13 @@ def new_cadence(
     signal = frame.add_signal(
         # Use linear drift trajectory starting at starting_bin & with the calculated drift rate
         stg.constant_path(
-            f_start=frame.get_frequency(index=starting_bin), drift_rate=drift_rate * u.Hz / u.s
+            f_start=frame.get_frequency(index=int(params["starting_bin"])),
+            drift_rate=params["drift_rate"] * u.Hz / u.s,
         ),
         # Constant intensity over time, calibrated to achieve target snr
         stg.constant_t_profile(level=frame.get_intensity(snr=snr)),
         # Gaussian shape in frequency domain with calculated signal width
-        stg.gaussian_f_profile(width=signal_width * u.Hz),
+        stg.gaussian_f_profile(width=params["signal_width"] * u.Hz),
         # Constant bandpass profile (no frequency-dependent scaling)
         stg.constant_bp_profile(level=1),
     )
@@ -239,22 +277,33 @@ def new_cadence(
     # Extract the modified data (with signal injection) from the setigen Frame
     modified_data = frame.data.copy()
 
-    # Cleanup intermediate data
+    # Cleanup intermediate data. Refcounting frees the Frame's arrays immediately — do NOT
+    # add a gc.collect() here: this function runs once per injection (~2.5M times per
+    # production round), and a full collection per call cost ~23 ms against ~4.5 ms for
+    # everything else in this function (~5x the total generation wall). The per-chunk
+    # collect in generate_round_to_memmap covers cycle cleanup.
     del frame, signal
-    gc.collect()
 
-    # Build signal info dictionary
-    signal_info = {
-        "snr": float(snr),
-        "drift_rate": float(drift_rate),
-        "signal_width": float(signal_width),
-        "starting_bin": float(starting_bin),
-        "slope_pixel": float(slope_pixel),
-        "y_intercept": float(y_intercept),
-    }
+    return modified_data
 
-    # Return the modified data array, signal info, and clamping flag
-    return modified_data, signal_info, slope_was_clamped
+
+def new_cadence(
+    data: np.ndarray, snr: float, width_bin: int, freq_resolution: float, time_resolution: float
+) -> tuple[np.ndarray, dict[str, float], bool]:
+    """
+    Inject a single drifting narrowband signal into a stacked cadence array.
+
+    Returns (modified_data, signal_info, slope_was_clamped). signal_info carries the realized
+    parameters {snr, drift_rate, signal_width, starting_bin, slope_pixel, y_intercept};
+    slope_was_clamped is True if the drift slope was forced away from ~0 to avoid a degenerate
+    near-vertical injection (downstream queries can filter on this). Composition of
+    _draw_signal_params + _inject_drawn_signal; byte-identical to the pre-split function.
+    """
+    params, slope_was_clamped = _draw_signal_params(
+        data.shape[0], width_bin, freq_resolution, time_resolution
+    )
+    modified_data = _inject_drawn_signal(data, snr, params, freq_resolution, time_resolution)
+    return modified_data, _signal_info_from_params(snr, params), slope_was_clamped
 
 
 # Float-rounding pad for the ON-band boundary comparison in check_valid_intersection (#118).
@@ -543,30 +592,35 @@ def create_true_double(
     snr = random.random() * snr_range + snr_base
 
     # NOTE: quantified in #118 — acceptance is i.i.d. geometric with p~=0.42, so the worst
-    # sample over a full 499200-round is ~25 retries (~3s); a >100-retry sample is effectively
-    # impossible (P~1e-24). This loop is therefore NOT the ~10-min single-worker stall seen in
-    # the #117 smoke (that is gc/IO/scheduling, see #118). MAX_INTERSECTION_RETRIES is the
+    # sample over a full 499200-round is ~25 retries; a >100-retry sample is effectively
+    # impossible (P~1e-24). Since the draw-first split, a retry costs only the ~microsecond
+    # parameter draws — the two setigen injections are materialized once, after acceptance —
+    # so the loop is timing-noise regardless of draw luck. MAX_INTERSECTION_RETRIES is the
     # defensive cap #118 called for: on exhaustion keep the last drawn pair and flag the sample
     # (clamp-and-flag, mirroring slope_was_clamped) rather than raise and kill a whole round.
-    # Retry signal injection until we get valid non-intersecting signals (or the cap is hit)
+    # Retry the geometry draws until they are valid non-intersecting (or the cap is hit)
+    total_time = data.shape[0]
     intersection_retries = 0
     intersection_retry_capped = False
     while True:
         intersection_retries += 1
-        # Inject RFI
-        cadence_1, rfi_signal_info, rfi_slope_clamped = new_cadence(
-            data, snr, width_bin, freq_resolution, time_resolution
+        # Draw both signals' geometry, consuming the exact per-attempt RNG sequence the
+        # pre-split inject-then-test loop consumed (RFI draws, then ETI draws) — but
+        # materialize nothing: the acceptance test below is a pure function of the drawn
+        # slopes/intercepts, and at p~=0.42 acceptance, injecting before testing wasted
+        # ~41% of all setigen injections in a production round.
+        rfi_params, rfi_slope_clamped = _draw_signal_params(
+            total_time, width_bin, freq_resolution, time_resolution
         )
-        # Inject ETI
-        cadence_2, eti_signal_info, eti_slope_clamped = new_cadence(
-            cadence_1, snr * dynamic_range, width_bin, freq_resolution, time_resolution
+        eti_params, eti_slope_clamped = _draw_signal_params(
+            total_time, width_bin, freq_resolution, time_resolution
         )
 
         # Extract slope and intercept for intersection check
-        slope_1 = rfi_signal_info["slope_pixel"]
-        intercept_1 = rfi_signal_info["y_intercept"]
-        slope_2 = eti_signal_info["slope_pixel"]
-        intercept_2 = eti_signal_info["y_intercept"]
+        slope_1 = rfi_params["slope_pixel"]
+        intercept_1 = rfi_params["y_intercept"]
+        slope_2 = eti_params["slope_pixel"]
+        intercept_2 = eti_params["y_intercept"]
 
         if slope_1 != slope_2 and check_valid_intersection(
             slope_1, slope_2, intercept_1, intercept_2
@@ -585,6 +639,16 @@ def create_true_double(
                 f"exhausted; keeping last drawn (rejected) signal pair and flagging the sample"
             )
             break
+
+    # Materialize only the accepted (or cap-flagged last-drawn) pair: RFI into the stacked
+    # background, then ETI on top of the RFI-injected cadence — same order, same arrays,
+    # same values as the pre-split inject-then-test loop.
+    cadence_1 = _inject_drawn_signal(data, snr, rfi_params, freq_resolution, time_resolution)
+    cadence_2 = _inject_drawn_signal(
+        cadence_1, snr * dynamic_range, eti_params, freq_resolution, time_resolution
+    )
+    rfi_signal_info = _signal_info_from_params(snr, rfi_params)
+    eti_signal_info = _signal_info_from_params(snr * dynamic_range, eti_params)
 
     # Track if any slope was clamped (either RFI or ETI)
     slope_was_clamped = rfi_slope_clamped or eti_slope_clamped
@@ -822,13 +886,14 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
                 lognorm_out[start_idx + i] = lognorm_params
             all_sample_info.append(sample_info)
     finally:
-        # Flush in the finally so rows written before a mid-task exception still reach disk
-        # deterministically (a failed round has no .done manifest and reads as garbage either
-        # way, but not all filesystems are guaranteed to write back dirty pages on munmap)
-        out.flush()
+        # No per-task flush: memmap.flush() is an msync over the task's whole mapping, and at
+        # ~23,400 tasks per production round the concurrent full-mapping msyncs stack into the
+        # chunk-tail stragglers (#117/#118). Durability is unchanged: written pages live in the
+        # shared page cache regardless, and generate_round_to_memmap msyncs every array once,
+        # before the .done manifest is written — a crash before that leaves no manifest, so the
+        # dir reads as garbage either way.
         del out
         if lognorm_out is not None:
-            lognorm_out.flush()
             del lognorm_out
 
     return time.time() - task_start, all_sample_info
@@ -980,6 +1045,7 @@ def generate_round_to_memmap(
     seed: int | None = None,
     stats_cb=None,
     progress_cb=None,
+    array_dtype: str = "float32",
 ) -> dict:
     """
     Generate one round's triplet dataset straight into disk-backed .npy memmaps.
@@ -1010,6 +1076,8 @@ def generate_round_to_memmap(
         raise ValueError(f"chunk_size must be divisible by 4, got {chunk_size}")
     if pool is None and backgrounds is None:
         raise ValueError("backgrounds must be provided when no pool is given")
+    if array_dtype not in ("float32", "float16"):
+        raise ValueError(f"array_dtype must be 'float32' or 'float16', got {array_dtype!r}")
 
     wall_start = time.time()
 
@@ -1018,11 +1086,13 @@ def generate_round_to_memmap(
     shutil.rmtree(paths.round_dir, ignore_errors=True)
     os.makedirs(paths.round_dir, exist_ok=True)
 
-    # Pre-create the three destination memmaps; workers reopen them r+ per task
+    # Pre-create the three destination memmaps; workers reopen them r+ per task and numpy
+    # downcasts on row assignment, so array_dtype="float16" needs no worker-side changes
+    # (the config.py field documents the quantization bound and the A/B gate)
     shape = (n_samples, num_observations, time_bins, width_bin)
     array_paths = paths.array_paths
     for path in array_paths.values():
-        mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+        mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.dtype(array_dtype), shape=shape)
         del mm  # Close immediately: creation only reserves the file; workers do the writing
 
     # Sibling per-observation log-norm parameter arrays ((min_log, range_log) per obs —
@@ -1137,6 +1207,15 @@ def generate_round_to_memmap(
 
     np.save(paths.labels_path, labels)
 
+    # One msync per array replaces the per-task flushes that used to live in
+    # _run_memmap_task's finally: everything the workers wrote must reach disk before the
+    # .done manifest can exist (the same durability contract, without ~23,400 concurrent
+    # full-mapping msyncs per production round).
+    for path in (*array_paths.values(), *lognorm_paths.values()):
+        arr = np.lib.format.open_memmap(path, mode="r+")
+        arr.flush()
+        del arr
+
     # The .done manifest is only written after every chunk has finished — the same atomicity
     # idea as preprocessing's .tmp -> os.replace stamp extraction
     manifest = build_manifest(
@@ -1146,6 +1225,7 @@ def generate_round_to_memmap(
         snr_range=snr_range,
         wall_time_s=time.time() - wall_start,
         chunk_count=n_chunks,
+        array_dtype=array_dtype,
     )
     write_done_manifest(paths, manifest)
 
@@ -1331,4 +1411,5 @@ class DataGenerator:
             round_num=round_num,
             seed=self.config.reproducibility.seed,
             stats_cb=_stats_cb,
+            array_dtype=self.config.training.round_array_dtype,
         )

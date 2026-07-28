@@ -88,13 +88,16 @@ and `injection_stats` and shows up as background shading on the training plots.
 ## Round data: memmaps + background producer
 
 A full-scale round is three arrays (`main`, `true`, `false`) of shape
-`(499200, 6, 16, 512)` float32 ≈ 98 GB each — ~294 GB per round. Holding that in RAM is what
-used to OOM-kill 503 GB training nodes; instead each round lives on disk under
-`{round_data_dir}/{save_tag}/round_{k:02d}/` (default root `{data_path}/training/round_data`):
+`(499200, 6, 16, 512)` — float32 at the `training.round_array_dtype` default ≈ 98 GB each,
+~294 GB per round (the A/B-gated `"float16"` setting halves all of that; see the
+[performance-engineering section](#performance-engineering-the-276-follow-up-july-2026)).
+Holding that in RAM is what used to OOM-kill 503 GB training nodes; instead each round lives
+on disk under `{round_data_dir}/{save_tag}/round_{k:02d}/` (default root
+`{data_path}/training/round_data`):
 
 ```
 round_02/
-├── main.npy  true.npy  false.npy        # (n, 6, 16, 512) float32 memmaps
+├── main.npy  true.npy  false.npy        # (n, 6, 16, 512) round_array_dtype memmaps
 ├── main_lognorm.npy  true_lognorm.npy  false_lognorm.npy   # (n, 6, 2) log-norm params
 ├── labels.npy                            # (n,) signal-type strings
 └── round_02.done                         # atomic JSON manifest
@@ -109,9 +112,14 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
   returns only small stats dicts. No per-sample IPC pickling, one `pool.map` barrier per
   chunk.
 - **The `.done` manifest is the completion contract.** Written atomically
-  (`.tmp` → `os.replace`) only after every chunk finishes; it records shapes, SNR params, and
-  cheap sampled checksums. `validate_done_manifest()` re-checks all of it — a directory
-  without a valid manifest is garbage and gets regenerated.
+  (`.tmp` → `os.replace`) only after every chunk finishes and every array is msync'd; it
+  records shapes, per-array dtypes (plus the requested `array_dtype`), SNR params, and cheap
+  sampled checksums. `validate_done_manifest()` re-checks all of it — a directory without a
+  valid manifest is garbage and gets regenerated, and every reuse/resume path (producer
+  short-circuit, round reuse, RF-dataset reuse, `prepare_round_data_dir`) also gates on the
+  dtype, so a round generated under a different `round_array_dtype` is regenerated rather than
+  silently changing input numerics mid-run (manifests predating the dtype keys validate as
+  float32).
 - **Page-cache-backed reads.** Training opens the arrays with `np.load(mmap_mode="r")`;
   after the first epoch the OS caches the round in otherwise-free RAM, so steady-state reads
   run at RAM speed — but under memory pressure the kernel evicts pages instead of OOM-killing
@@ -296,6 +304,74 @@ End-to-end effect (5 GPUs, accumulation 12): optimizer-step throughput 1,453 →
 writer at full flood (−0.3%), and real-run training epochs went 48.5 → 5.8 s quiet /
 56.5 → 10.9 s with generation overlapped (8.4× / 5.2×), validation 16.7 → 1.7 s. The full
 A/B and the measured ladder live in `benchmarks/README.md`.
+
+**The second pass (late July 2026)** attacked the walls left standing once training epochs got
+fast, with the same byte-identity discipline:
+
+1. **Data generation** — with training 8.5× faster, generation became the run's dominant wall
+   (a killed production-scale blpc3 run measured ~6.2 h/round, GPUs at 0%, 32 workers at
+   ~94.5% CPU / ~97% user-mode). Three producer-path fixes, all byte-identical and gated by
+   `benchmarks/bench_datagen.py`'s per-array sha256 A/B: the per-injection `gc.collect()` in
+   `new_cadence` is gone (~2.5M calls per round in TF-laden pool workers; measured ~23 ms per
+   call against ~4.5 ms for the entire rest of the function), `create_true_double` draws both
+   signals' geometry first and materializes setigen injections only for the accepted pair (at
+   the measured p≈0.42 acceptance, ~41% of injections were computed and discarded), and the
+   per-task memmap msync is one flush per array before the `.done` manifest (same durability
+   contract). Measured on blpc3 (8192 samples × 3 arrays, 32 workers, TF preloaded):
+   282.0 → 13.1 s (**21.5×**), checksums identical — projecting a production round from
+   ~6.2 h to ~20 min on the same 32-core host (a projection, not a measured production
+   round). Ladder + mechanisms in `benchmarks/README.md`.
+2. **Injection-plot query windows** — `plot_injection_stats` issues ~165 round-scoped queries
+   per call, but `idx_injection_stats_filter` leads with `(tag, timestamp)` and
+   `round_number` is not in it, so the run-wide `[run-start, now]` window re-scanned the
+   tag's entire row history per query (measured 10.5× slower at 12M rows).
+   `Database.query_injection_stat_time_span` — one whole-partition MIN/MAX aggregate, a
+   deliberate superset bound — now tightens the window to the plotted rounds' actual row
+   span (±1 s); intersection can only narrow scans, never change a result set (see
+   [`DATABASE.md`](DATABASE.md#query-api)).
+3. **The UMAP GIF sweep** — the 24-combo sweep in `plot_latent_space_gif` ran strictly
+   serially at ~95% single-core (~1.7–1.9 h per run) even after #278 parallelized frame
+   rendering; whole combos now run across forkserver workers. First parallel measurement
+   (reduced 60-frame shape, 24 workers on blpc3): ~93 min — 24 concurrent single-threaded
+   UMAP fits/transforms contend for memory bandwidth, so the wall is well below the naive
+   per-combo × 24 serial bound but far from core-count scaling; the production-scale number
+   and the fit-vs-transform-vs-JIT attribution (plus whether a smaller worker cap beats 24
+   under contention) are open follow-ups. Byte-identity pinned by test. Details in
+   [the latent-GIF plot section](#latent_space_obscadence_nnn_mdm_taggif) below.
+4. **GPU thread mode** — `gpu.gpu_thread_mode` (default `"gpu_private"`, also
+   `"global"`/`"gpu_shared"`) and `gpu.gpu_thread_count` (default 2) set
+   `TF_GPU_THREAD_MODE`/`TF_GPU_THREAD_COUNT` in `setup_gpu_strategy` before the GPU runtime
+   initializes: dedicated per-GPU kernel-launch threads that tf.data host work cannot steal,
+   aimed at the measured ~7.6% input h2d/scheduling interference (the one residual with no
+   pinned null result). The flipped default is provisional pending the bench A/B on blpc3
+   (validation in flight) — flip back to `"global"` if the step ladder regresses.
+
+Two further levers landed **default-off behind an A/B gate**, because flipping either changes
+numerics. The gate is a val-metric A/B (3 seeds × 2 arms): val AUC within max(2σ, 0.002),
+losses and recalls within 2σ, the same active-dimension count, and zero NaN-guard trips.
+Until it passes on the target host, both flags stay at their defaults — which reproduce the
+pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off):
+
+- **`training.round_array_dtype`** (`"float32"` default). `"float16"` halves the ~294.5 GB
+  round footprint to ~147 GB — and with it the gather volume and the page-cache working set,
+  the lever that keeps overlapped epochs at page-cache speed once two rounds no longer fit in
+  RAM at full scale. Quantization is ≤ 2⁻¹² on the [0, 1] log-normed inputs; the gather map's
+  existing `tf.cast` becomes the host-side upcast (the viz fancy-index path upcasts
+  identically), so the training graph and loss math see float32 unchanged either way. Labels
+  and lognorm sidecars stay float32; `.done` manifests record the dtypes and every
+  reuse/resume path gates on them (legacy manifests read as float32).
+- **`beta_vae.mixed_precision`** (`False` default). `True` sets the keras `mixed_bfloat16`
+  global policy before the model build, with fp32 islands pinned in `models/vae.py` — the
+  z_mean/z_log_var heads, `Sampling`, and the decoder's sigmoid output — so everything
+  reaching `compute_total_loss` stays fp32. bf16 needs no loss scaling; variables, Adam
+  state, and the step's gradient/loss accumulators stay fp32. Saved `.keras` files carry the
+  per-layer dtypes, so inference follows automatically. `bench_gpu.py --mixed-precision` is
+  the Phase-0 throughput A/B.
+
+Deferred with rationale (recorded in `benchmarks/README.md` so they are not blindly retried):
+RF-dataset pre-generation on the producer, a direct-numpy injection bundle, SHAP-stage
+overlap, pool thread-pinning, and fused moments — the 21.5× generation result collapsed their
+absolute value.
 
 ### Adaptive learning rate
 
@@ -532,15 +608,25 @@ late rounds mean the faint-SNR curriculum is destroying earlier structure. The f
 models are persisted (`umap_*.joblib`) and reused by the RF decision-boundary plot and by
 inference's latent-projection figure.
 
-Frame rendering is process-parallel (#278): frames are independent, so
-[`latent_gif.py`](../src/aetherscan/latent_gif.py) renders the PNGs across a forkserver
-process pool (`n_workers = manager.n_processes`, mirroring `shap_parallel.py`'s isolation
-pattern — empty preload, so workers never import the parent's TF stack), with the figure and
-scatter artists built once per worker and updated per frame; output PNGs are byte-identical
-regardless of worker count. The UMAP fits/transforms, GIF assembly, and Slack upload are
-unchanged — batching the per-snapshot `.transform()` calls and reusing a precomputed kNN
-graph across the sweep were both measured and **rejected** because they change UMAP outputs
-(the library consumes its `random_state` stream differently), which #278 forbids.
+The sweep is combo-parallel (the #278 follow-up): each of the 24 (n_neighbors × min_dist ×
+obs/cadence) combos is an independent UMAP fit with its own derived `random_state` (sub-keyed
+`(level, nn, md)`, #279), reads the shared inputs read-only (shipped to workers through one
+on-disk joblib bundle), and writes distinct files — so
+[`latent_gif.py`](../src/aetherscan/latent_gif.py)`:run_umap_gif_sweep` farms WHOLE combos
+(fit + joblib persist + per-snapshot transforms + frame render + GIF assembly) to forkserver
+workers (empty preload; BLAS-family thread pools pinned per the `shap_parallel.py` isolation
+pattern — but deliberately NOT numba's or OMP's: UMAP grows numba's pool itself on large-N
+paths and numba hard-errors past a capped launch, see `_sweep_worker_init`). At production
+shape the serial tail is ~1.7–1.9 h (~95% single-core, even after #278 parallelized frame
+rendering); the first parallel measurement, at a reduced 60-frame shape with 24 workers on
+blpc3, is ~93 min (memory-bandwidth contention between concurrent single-threaded fits), so
+no production-shape speedup can be quoted yet. Logging and Slack uploads stay in the parent
+process, in the serial loop's order; byte-identity of the GIFs is pinned by a slow-marked unit test
+comparing serial vs pooled output. This is disjoint from the #278-**rejected** within-fit
+ideas: batching the per-snapshot `.transform()` calls and reusing a precomputed kNN graph
+across the sweep remain rejected because they change how UMAP consumes its `random_state`
+stream (per-snapshot transforms stay serial *within* each combo) — process isolation between
+combos changes no stream at all.
 
 ### `latent_traversal_{signal_type}_{tag}.png` + `latent_traversal_spectra_{signal_type}_{tag}.png`
 
@@ -733,7 +819,7 @@ Training-specific fields live on `TrainingConfig`
 | Scale | `num_training_rounds`, `epochs_per_round`, `num_samples_beta_vae`, `num_samples_rf`, `train_val_split` |
 | Posterior-collapse guard | `posterior_collapse_kl_epsilon`, `min_active_units_fraction`, `posterior_collapse_patience` |
 | Batching | `per_replica_batch_size`, `effective_batch_size`, `per_replica_val_batch_size` |
-| Round data | `round_data_dir`, `overlap_data_generation`, `keep_round_data`, `signal_injection_chunk_size`, `data_gen_task_size` |
+| Round data | `round_data_dir`, `overlap_data_generation`, `keep_round_data`, `signal_injection_chunk_size`, `data_gen_task_size`, `round_array_dtype` (A/B-gated) |
 | Curriculum | `snr_base`, `initial_snr_range`, `final_snr_range`, `curriculum_schedule`, `exponential_decay_rate`, `step_easy_rounds`, `step_hard_rounds` |
 | Adaptive LR | `base_learning_rate`, `min_learning_rate`, `min_pct_improvement`, `patience_threshold`, `reduction_factor` |
 | Latent viz / traversal | `latent_viz_*`, `latent_traversal_every_round`, `latent_traversal_num_steps`, `latent_traversal_max_sigma` |
