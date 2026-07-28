@@ -17,8 +17,9 @@ train_command() (main.py)
 └── retry loop (training.max_retries, training.retry_delay)
     └── run_training_pipeline() → _execute_training_stages():
         1. vae_rounds   — for each round: get data → epochs → per-round plots → checkpoint
-        2. vae_plots    — final loss/stability/injection plots, latent GIF, latent traversal
-        3. rf_train     — generate RF data → encode latents → fit RF → persist model+artifacts
+        2. vae_plots    — final loss/stability/collapse/injection plots, latent GIF, latent traversal
+        3. rf_train     — generate RF data → encode latents → 8-variant RF sweep → calibrate →
+                          persist winner+artifacts
         4. rf_plots     — the ten RF diagnostics
         5. final_save   — final models + config_{tag}.json
         6. hf_upload    — publish artifacts + model card to the HuggingFace Hub (opt-in)
@@ -48,10 +49,16 @@ fresh datetime tag and starts a new run).
    type, persisted across rounds so latent-space snapshots aren't confounded by curriculum
    distribution shift.
 5. **Epoch loop** — `_train_epoch()` + `_validate_epoch()`, ~21 `training_stats` rows per
-   epoch (losses, gradient norms, LR, durations, SNR range), adaptive LR update.
+   epoch (losses, gradient norms, LR, durations, SNR range) plus `latent_dim` per-dimension
+   KL rows (`kl_dim_NN`), adaptive LR update. At round end `check_posterior_collapse()`
+   WARNs loudly (never fails) when latent dims are going dark — see
+   [the playbook](#posterior_collapse_tagpng--the-collapse-playbook).
 6. **Per-round plots** — loss curves, training stability, injection stats (tagged
-   `round_XX`, saved under `plots/training/{save_tag}/checkpoints/`), plus the latent traversal when
-   `--latent-traversal-every-round` is set.
+   `round_XX`, saved under `plots/training/{save_tag}/checkpoints/`; the injection queries
+   are scoped to this round only), plus the latent traversal when
+   `--latent-traversal-every-round` is set. Each per-round plot is best-effort: a failure
+   (including a skipped plot whose DB flush timed out) logs an error and the round
+   continues — a retry here would cost a full data regeneration.
 7. **Checkpoint** — `save_models(tag="round_XX", dir="checkpoints")`, then the round is
    recorded in the run manifest (`completed_rounds`).
 8. **Cleanup** — holders cleared, `tf.keras.backend.clear_session()`, pools reset, and the
@@ -168,13 +175,28 @@ path, also used automatically when `manager.n_processes == 1`).
 
 ### Datasets
 
-`prepare_distributed_train_dataset()` builds infinite generator-backed `tf.data` datasets that
-yield **whole global batches** (`per_replica_batch_size × num_replicas` rows gathered from the
-memmaps by fancy indexing), with a leading batch dimension in the output signature and no
-`.batch()` call — cutting per-sample Python boundary crossings by the global batch size,
-which is what fixed the historical 0–14 % GPU utilization. Randomness lives at the epoch
-level (train indices reshuffled per pass); within a batch, indices are sorted for memmap read
-locality (the model is order-invariant within a batch).
+`prepare_distributed_train_dataset()` builds infinite `tf.data` datasets from cheap
+**index generators** followed by a parallel, deterministic `.map()` of **pure `tf.gather`
+ops** over zero-copy tensor views of the round memmaps (`_as_cpu_tensor`: dlpack export of
+the `mmap_mode="c"` arrays — no allocation, no copy, and gathers stream through the OS page
+cache exactly as before, but inside tf.data's C++ threadpool with no Python and no GIL in
+the hot path). This is the durable #276 fix: the historical single generator starved the
+GPUs on per-sample Python crossings, and the interim `tf.numpy_function` gather re-entered
+the interpreter from every map worker, so its benefit inverted whenever another Python
+thread (DB writer, producer relay) competed for the GIL — see the follow-up section of
+[`benchmarks/README.md`](../benchmarks/README.md) for the measured ladder.
+
+Each index-stream element is one **per-replica batch** (replica *r* of global batch *g* is
+element `g·R + r`), distributed via `strategy.distribute_datasets_from_function`, which
+hands consecutive elements to consecutive replicas — reproducing exactly the contiguous
+split `experimental_distribute_dataset` used to apply to whole global batches, while
+skipping the split op and prefetching each replica's batches straight to its GPU
+(`InputOptions(experimental_fetch_to_device=True)`), so host→device copies overlap compute.
+`deterministic=True` preserves the exact batch order of the index stream, so parallelism
+changes throughput only — epoch composition and ordering (and therefore the seeding
+contract below) are byte-identical to the previous implementations. Randomness lives at the
+epoch level (train indices reshuffled per pass); within a batch, indices are sorted for
+memmap read locality (the model is order-invariant within a batch).
 
 The train/val split is **stratified** over the four signal types (generation lays labels out
 contiguously per chunk, so a positional split would skew val), then trimmed to exact multiples
@@ -185,21 +207,95 @@ of `effective_batch_size` (train) and the global val batch size. With `shuffle=F
 ### Gradient accumulation
 
 Each training step accumulates `accumulation_steps = effective_batch_size /
-(per_replica_batch_size × num_replicas)` micro-batch gradients before applying
-(`_train_epoch()` → `_distributed_train_step()` → `_apply_gradients()`), giving an effective
-batch of 7680 at defaults (chosen so it divides evenly on 4-, 5-, or 6-GPU hosts) regardless of
-per-GPU memory. **Note:** 7680 is ~2.5× the previous 3072, so there are ~2.5× fewer optimizer
-updates per epoch; LR-schedule behavior calibrated to the old cadence may differ. On a fixed 4- or
-6-GPU host you can pass `--effective-batch-size 3072` to restore the old cadence (it stays valid
-there). Guards along the way: all-None
-gradient micro-batches are skipped, accumulated gradients are averaged over successful
-micro-steps, NaN/Inf gradients raise immediately, and the global gradient norm is clipped at
-1.0 with the pre-clip norm recorded per step (that's the `clipping_rate` statistic).
+(per_replica_batch_size × num_replicas)` micro-batch gradients before applying, giving an
+effective batch of 7680 at defaults (chosen so it divides evenly on 4-, 5-, or 6-GPU hosts)
+regardless of per-GPU memory. **Note:** 7680 is ~2.5× the previous 3072, so there are ~2.5×
+fewer optimizer updates per epoch; LR-schedule behavior calibrated to the old cadence may
+differ. On a fixed 4- or 6-GPU host you can pass `--effective-batch-size 3072` to restore the
+old cadence (it stays valid there).
+
+The whole optimizer step runs inside **one `tf.function`**
+(`_train_epoch()` → `_build_accumulated_train_step()`): the K micro-batches accumulate into
+per-replica `ON_READ` accumulator variables inside a `tf.range` loop (sequential graph loop —
+bounded activation memory, which is what keeps peak VRAM at ~8.4 GB/GPU instead of the
+~23 GB/GPU an unrolled K=12 loop measures, and what lets the 16 GB A4000 release host run it),
+then ONE cross-replica reduction per variable, an in-graph NaN/Inf guard (a bad step skips the
+apply so weights are never corrupted, then the Python caller raises exactly as before), a
+global-norm clip at 1.0 with the pre-clip norm recorded per step (the `clipping_rate`
+statistic), and one apply. The interpreter is re-entered once per optimizer step — the
+previous loop re-entered per micro-batch and additionally ran one `strategy.reduce` per
+variable per micro-batch plus per-variable eager NaN checks, which the #276 profiler traces
+showed dominated the host-side wall. Validation is likewise one traced graph call per epoch
+(`_build_val_loop`).
 
 The divisibility preconditions (`effective_batch_size % (per_replica × replicas) == 0`, sample
 counts divisible by batch sizes, etc.) are validated up front by
 `cli.py:collect_validation_errors` — see [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md) for the
 cross-replica constraint system and the fix proposer.
+
+### Performance engineering (the #276 follow-up, July 2026)
+
+The 2026-07 release-rehearsal runs showed the GPUs idle >90% of every epoch (profiler-verified;
+`nvidia-smi`'s sampled "utilization" reads higher — see `benchmarks/parse_xplane_occupancy.py`).
+Three successive host-side walls were identified and removed; the full measured evidence chain
+lives in the follow-up section of [`benchmarks/README.md`](../benchmarks/README.md), and every
+number below is from blpc3 (5× RTX PRO 6000, NGC 25.02).
+
+1. **Python in the gather** — first a single generator thread doing the memmap gathers, then
+   (post-#283) a `tf.numpy_function` gather whose map workers re-entered the interpreter and
+   convoyed on the GIL with the DB writer / producer-relay threads (+38% idle turned into
+   −11% under two competing Python threads). *Fix:* pure `tf.gather` over zero-copy dlpack
+   tensor views of the `mmap_mode="c"` round arrays; index generators yield one epoch table
+   per epoch, streamed by `.unbatch()`. Python touches the input path once per epoch.
+2. **Python in the training loop** — per micro-batch: one interpreter re-entry, one
+   `strategy.reduce` per variable (an all-reduce launch per variable per micro-batch), eager
+   gradient sums, and per-variable NaN checks that forced device syncs. *Fix:* the
+   accumulated-step graph described above (one re-entry and one reduction per variable per
+   optimizer step).
+3. **Per-epoch iterator lifecycle** — `iter(distributed_dataset)` costs ~9 s per call on a
+   5-GPU MirroredStrategy (measured; stable across calls, it is construction cost, not
+   tracing — trace counts were probed and stay flat), and the old loop paid it twice per
+   epoch (train + val) while also discarding whatever the pipeline had prefetched across the
+   boundary. *Fix:* iterators are created once per round in `train_round` and passed to every
+   epoch; the infinite datasets make epoch boundaries purely step-counted, so batch
+   composition is unchanged. A fresh-eyes audit then found the SAME disease in the
+   latent-snapshot path (a fresh viz-dataset iterator plus a gc pass per capture: ~1.2 s of
+   the ~1.5 s per-snapshot cost, at up to 6 captures per epoch at full scale) — fixed the
+   same way (round-scoped viz iterator, `_distributed_encode(iterator=...)`), alongside
+   batching the snapshot's ~3,840 per-row DB writes into one bulk call.
+
+Design decisions worth knowing before touching this code:
+
+- **`tf.range`, not an unrolled micro-batch loop.** Unrolling K=12 overlaps enough in-flight
+  activations to peak at 23–26 GB/GPU — it does not fit the 16 GB A4000 release host. The
+  `tf.while_loop` form peaks at ~8.4 GB and still pipelines (autograph's default
+  `parallel_iterations=10`); at the step level it costs nothing (a fresh-eyes audit measured
+  the production tf.range step FASTER than the unrolled single-GPU benchmark, 3,015 vs
+  2,907 cad/s — the shipped configuration sits at ~85% of the measured 15,112 cad/s
+  zero-communication bound, with the residual split ~7.4% MirroredStrategy lockstep +
+  ~7.6% input h2d interference, both probed for further levers with null results; see
+  `benchmarks/README.md`, "Corrected ceiling decomposition").
+- **Zero-copy has an alignment gate.** TF CHECK-aborts (uncatchable SIGABRT, not an
+  exception) on CPU tensors whose buffers are under 64-byte aligned; `_as_cpu_tensor` only
+  dlpack-wraps 64-aligned writable arrays (`.npy` memmaps always qualify) and falls back to a
+  copying `tf.convert_to_tensor` otherwise.
+- **Avoid replica-context collective ops on blpc3.** `CollectiveReduceV2` (e.g. a
+  replica-context `all_reduce`, or tf_keras' own aggregation when `apply_gradients` runs in
+  replica context) aborts with an NCCL "unhandled cuda error" on the 5-GPU Blackwell host;
+  the pipeline keeps all cross-replica communication on the `strategy.reduce` /
+  cross-replica-apply path, which is proven there.
+- **Same-seed results are deterministic but not bit-compatible** with the pre-follow-up
+  implementation (gather backend and float summation order changed). The #49 contract —
+  same seed ⇒ same split, same per-epoch batch order, byte-identical reruns — is preserved
+  and pinned by `test_train_datasets.py` / `test_train_accumulation.py` /
+  `test_train_distribution.py` (the last one pins the cross-replica accumulator semantics at
+  2 CPU replicas, where a silent gradient mis-scale would otherwise hide).
+
+End-to-end effect (5 GPUs, accumulation 12): optimizer-step throughput 1,453 → 12,317 cad/s
+(8.5×), GPU occupancy 8.3% → 73.7%, the step loop is insensitive to the production DB
+writer at full flood (−0.3%), and real-run training epochs went 48.5 → 5.8 s quiet /
+56.5 → 10.9 s with generation overlapped (8.4× / 5.2×), validation 16.7 → 1.7 s. The full
+A/B and the measured ladder live in `benchmarks/README.md`.
 
 ### Adaptive learning rate
 
@@ -213,39 +309,65 @@ reaches `min_learning_rate`.
 
 ## Reproducibility
 
-Training randomness is reproducible only behind an opt-in root seed; with no seed the pipeline
-draws from OS entropy and runs are non-reproducible (the historical default).
+Runs are reproducible **out of the box**: one root seed — `config.reproducibility.seed`,
+default **11** (#279 flipped this from the historical `None`) — drives every random stream in
+*both* pipelines. Setting it to `None` restores the OS-entropy behavior (non-reproducible,
+warned once per process).
 
-- **`--seed`** (mirrors `config.training.seed`; `int | None`, default `None`, must be `>= 0`).
-  When set it seeds every training-side source of randomness: synthetic data generation
-  (per-round worker-task seeds derived from `(seed, round_number)`, identical on the
+- **`--seed`** (mirrors `config.reproducibility.seed`; `int | None`, must be `>= 0`; on
+  **both** subcommands). Every consumer derives an independent stream from it: synthetic data
+  generation (per-round worker-task seeds derived from `(seed, round_number)`, identical on the
   background-producer and the sequential in-process paths), the dataset split/trim/per-epoch
-  train shuffles (`prepare_distributed_train_dataset`, one stream per round), latent-visualization
-  batch selection and padding, injection-bias plot subsampling, and the TensorFlow global RNG via
-  `tf.random.set_seed` (fixing `HeNormal`/`GlorotNormal` weight init and the VAE `Sampling`
-  layer). `tf.random.set_seed` runs in `TrainingPipeline.__init__`, before any model is built.
-- **Independently seeded surfaces** are unaffected by `--seed`: the Random Forest keeps its own
-  `config.rf.seed` / `--rf-seed`, and the latent-viz UMAP/KMeans fits use fixed `random_state`s.
-  The RF dataset borrows the round-`0` stream key while curriculum (beta-VAE) rounds are 1-based,
-  so their streams never collide.
-- **`--tf-deterministic-ops`** (`config.training.tf_deterministic_ops`, off by default) forces
-  deterministic TF/cuDNN kernels via `tf.config.experimental.enable_op_determinism()`. It costs
-  some training speed and is only meaningful alongside `--seed` — enabling it without a seed logs
-  a warning and buys nothing.
+  train shuffles (`prepare_distributed_train_dataset`, one stream per round),
+  latent-visualization batch selection and padding, plot subsampling (injection-bias figures,
+  SHAP sample selection, RF learning-curve/decision-boundary points), every UMAP/KMeans
+  `random_state`, the Random Forest (below), and the TensorFlow global RNG (fixing
+  `HeNormal`/`GlorotNormal` weight init and the VAE `Sampling` layer) via
+  `seeding.seed_tensorflow` — called by **both** pipeline constructors so training and
+  inference can't drift, and again at each round boundary (sub-keyed by round number) and at
+  the RF stage, so a resumed run reproduces an uninterrupted one (a single `__init__`-time
+  `set_seed` is not resume-safe: skipping rounds shifts the stream position). Inference
+  additionally re-seeds per cadence — see [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).
+
+  > **Why `seed_tensorflow` also seeds Python's `random`.** `tf.random.set_seed()` alone does
+  > **not** pin weight initialization on this stack: tf_keras's initializers build a
+  > `backend.RandomGenerator(seed=None, rng_type="stateless")` whose `_create_seed()` falls
+  > back to `random.randint(...)` on Python's *global* `random` module. Before this was fixed,
+  > every VAE initialized from OS entropy regardless of `--seed`. The `Sampling` layer calls
+  > `tf.random.normal` directly and was always covered — only initialization was affected.
+  > **Do not replace this with `tf_keras.utils.set_random_seed()`**, the canonical Keras API:
+  > it populates the thread-local `_SEED_GENERATOR`, after which `_create_seed()` calls
+  > `randint(1, 1e9)` with a *float* bound that Python 3.12 rejects, and every subsequent
+  > initializer raises `TypeError`. Verified on the NGC 2.17 image; guarded by a regression
+  > test in `tests/unit/test_models.py`.
+- **The Random Forest seed derives from the root** (`STREAM_RF`). `config.rf.seed` is now an
+  explicit-override-only field (default `None`); the **deprecated** `--rf-seed` alias still
+  sets it for existing scripts but logs a deprecation warning.
+  `Config.resolved_rf_seed()` reports the value actually used. The RF *dataset* borrows the
+  round-`0` `STREAM_DATASET` key while curriculum (beta-VAE) rounds are 1-based, so their
+  streams never collide.
+- **`--tf-deterministic-ops`** (`config.reproducibility.tf_deterministic_ops`, off by default;
+  on both subcommands) forces deterministic TF/cuDNN kernels via
+  `tf.config.experimental.enable_op_determinism()`. It costs some speed and is only meaningful
+  alongside a seed — enabling it without one logs a warning and buys nothing.
 - **Approximate vs. bit-exact.** Seeding alone gives *approximate* run-to-run reproducibility;
   *bit-exact* GPU reproducibility additionally requires `--tf-deterministic-ops` plus identical
   hardware and software.
 
 Stream derivation lives in [`seeding.py`](../src/aetherscan/seeding.py): `derive_rng(root_seed,
 *stream_key)` builds an independent NumPy `Generator` per consumer from
-`SeedSequence([root_seed, *stream_key])`, so distinct keys are statistically independent and each
-consumer's stream is stable regardless of what the others draw.
+`SeedSequence([root_seed, *stream_key])` — `derive_seed` is its int-valued sibling for APIs
+that take an integer `random_state` (sklearn, umap, `tf.random.set_seed`) — so distinct keys
+are statistically independent and each consumer's stream is stable regardless of what the
+others draw. The deliberately *unseeded* sites (uuid4 temp names, content-keyed checksums,
+per-PID worker init) are catalogued in the module docstring; don't "fix" them.
 
-Both `seed` and `tf_deterministic_ops` are emitted by `Config.to_dict()["training"]`, so they are
-part of the run-manifest config fingerprint: a tag started before these fields existed — or under
-a different seed — cannot resume across the change under the same `--save-tag`; the guard
-downgrades to a fresh run with a loud warning. See [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md) for the
-config/CLI plumbing and the [CLI Reference](../README.md#cli-reference) for the exact flag help.
+Both `seed` and `tf_deterministic_ops` are emitted by `Config.to_dict()["reproducibility"]`
+(alongside a provenance-only `derived_rf_seed`), so they are part of the run-manifest config
+fingerprint: a tag started before these fields existed — or under a different seed — cannot
+resume across the change under the same `--save-tag`; the guard downgrades to a fresh run with
+a loud warning. See [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md) for the config/CLI plumbing and
+the [CLI Reference](../README.md#cli-reference) for the exact flag help.
 
 ## Checkpointing, the run manifest, and retries
 
@@ -254,7 +376,7 @@ config/CLI plumbing and the [CLI Reference](../README.md#cli-reference) for the 
 | Artifact | When | Where |
 | --- | --- | --- |
 | `vae_{encoder,decoder}_round_XX.keras` | End of every round | `{model_path}/checkpoints/` |
-| `random_forest_{tag}.joblib` + `rf_eval_artifacts_{tag}.joblib` | End of `rf_train` | `{model_path}/` |
+| `random_forest_{tag}.joblib` (the winning variant) + `random_forest_{tag}_{variant}.joblib` (all 8 variants) + `rf_calibrator_{tag}.joblib` (only when calibration is kept) + `rf_eval_artifacts_{tag}.joblib` | End of `rf_train` | `{model_path}/` |
 | `vae_{encoder,decoder}_{tag}.keras`, `random_forest_{tag}.joblib` | `final_save` stage | `{model_path}/` |
 | `config_{tag}.json` (resolved config snapshot) | `final_save` stage | `{output_path}/` |
 | `run_state_{tag}.json` | Updated after every stage/round transition | `{output_path}/` |
@@ -315,7 +437,12 @@ out.
 
 Total loss (full-width top panel) plus reconstruction / KL / true-clustering /
 false-clustering components (bottom row), train and val overlaid, epochs on the x-axis with
-per-round SNR-range shading in the background. What to look for:
+per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
+global-epoch position (`(round − 1) · epochs_per_round + epoch`, via `build_epoch_history`):
+epochs with no committed row render as visible NaN gaps instead of silently shifting later
+epochs left, and a failed pre-plot DB flush now **skips the figure** (raised as a
+non-critical plot failure) rather than rendering a partial result set as if it were
+complete. What to look for:
 
 - Both curves trending down within each round; **val tracking train** (a widening gap =
   overfitting the current curriculum stage).
@@ -323,8 +450,9 @@ per-round SNR-range shading in the background. What to look for:
   sustained jump means the curriculum narrowed too fast (`exponential_decay_rate` too
   negative).
 - KL should settle to a moderate plateau: collapsing toward 0 means the posterior ignores the
-  input (posterior collapse — consider lowering `beta`); growing without bound means the
-  latent space isn't regularizing.
+  input (posterior collapse — see the [per-dimension diagnostics and
+  playbook](#posterior_collapse_tagpng--the-collapse-playbook)); growing without bound means
+  the latent space isn't regularizing.
 - True/false clustering losses should decay and stay low; if `true_loss` dominates late
   rounds, the ON/OFF separation is failing on faint signals.
 - Doubled/serrated series are the signature of stale rows from a failed attempt leaking in —
@@ -334,17 +462,48 @@ per-round SNR-range shading in the background. What to look for:
 ### `beta_vae_training_stability_{tag}.png`
 
 2×3 grid: gradient **clipping rate** across the top, gradient-norm mean/std/max across the
-bottom, same SNR shading. What to look for: clipping rate near zero after the first epochs
+bottom, same SNR shading; same real-epoch axis / NaN-gap / skip-on-failed-flush contract as
+the loss curves. What to look for: clipping rate near zero after the first epochs
 (sustained clipping = LR too high for the stage); norm mean smooth and slowly decaying;
 isolated max spikes are fine, but spikes that coincide with loss cliffs point at bad batches
 or an injection bug. NaN/Inf gradients abort the epoch outright, so anything you see here was
 at least finite.
 
+### `posterior_collapse_{tag}.png` + the collapse playbook
+
+Per-dimension KL diagnostics (#282), from the `kl_dim_NN` `training_stats` rows written each
+epoch: a `latent_dim × global-epoch` **KL heatmap** (collapsing dims visibly go dark) over an
+**active-units curve** (dims with KL > `training.posterior_collapse_kl_epsilon` per epoch,
+with the `min_active_units_fraction` alarm line). Same flush-skip contract as the loss
+curves. The plot is the offline view of the per-round `check_posterior_collapse()` guard,
+which WARNs (reaching Slack, never failing the run) when the active fraction drops below
+`training.min_active_units_fraction` or any dim's KL sits under epsilon for
+`training.posterior_collapse_patience` consecutive epochs.
+
+What to look for — and what to do about it:
+
+- With `beta > 1` some pruning is **expected and even desirable**: 6–8 active dims of 8 is
+  healthy; 1–2 is pathological (the VAE is ignoring its latent capacity and the RF has almost
+  nothing to work with).
+- Remedies, least → most intrusive: **KL warm-up** (anneal `beta` in from 0 over early
+  epochs), **free bits** (exempt a per-dim KL floor from the loss), **lower `vae_beta`**,
+  **shrink `latent_dim`** (if dims stay dead across remedies, the capacity was never needed).
+- If the check *passes*, read it as evidence the `log_var`-carrying RF variants (below)
+  deserve their weight — and confirm the active dims are actually discriminative via the
+  SHAP summary plot (active-but-uninformative dims are possible).
+
 ### Injection-stats figures (from `plot_injection_stats`, 8 PNGs)
 
 Bias/leakage analysis of the synthetic data itself, sourced from the `injection_stats` table
 (intensity statistics captured at stage **A** = raw background, **B** = post-injection,
-**C** = post-normalization; see [`PREPROCESSING.md`](PREPROCESSING.md)):
+**C** = post-normalization; see [`PREPROCESSING.md`](PREPROCESSING.md)). Since #277 every
+query is **round-scoped**: the per-round call passes its own `round_number`, and the
+end-of-run call spans rounds `1..num_training_rounds` — so the background producer's
+pre-generated next-round rows and the RF stage's sentinel round
+(`num_training_rounds + 1`) can no longer bleed into the figures. Injection rows ride the
+DB's bulk lane (which `flush()` deliberately does not cover), so before rendering the
+function gates on `db.injection_backlog_rows(max_round=...)` and skips (non-critically)
+while any row for the plotted rounds is still queued — never a partial result set:
 
 | File | Contents | What to look for |
 | --- | --- | --- |
@@ -372,6 +531,16 @@ show 4 separable — not necessarily linearly — clusters. Classes collapsing b
 late rounds mean the faint-SNR curriculum is destroying earlier structure. The fitted UMAP
 models are persisted (`umap_*.joblib`) and reused by the RF decision-boundary plot and by
 inference's latent-projection figure.
+
+Frame rendering is process-parallel (#278): frames are independent, so
+[`latent_gif.py`](../src/aetherscan/latent_gif.py) renders the PNGs across a forkserver
+process pool (`n_workers = manager.n_processes`, mirroring `shap_parallel.py`'s isolation
+pattern — empty preload, so workers never import the parent's TF stack), with the figure and
+scatter artists built once per worker and updated per frame; output PNGs are byte-identical
+regardless of worker count. The UMAP fits/transforms, GIF assembly, and Slack upload are
+unchanged — batching the per-snapshot `.transform()` calls and reusing a precomputed kNN
+graph across the sweep were both measured and **rejected** because they change UMAP outputs
+(the library consumes its `random_state` stream differently), which #278 forbids.
 
 ### `latent_traversal_{signal_type}_{tag}.png` + `latent_traversal_spectra_{signal_type}_{tag}.png`
 
@@ -401,7 +570,11 @@ in-memory viz batch never existed, so the plot skips with a warning.
 
 All consume `rf_eval_artifacts_{tag}.joblib` (val features/labels/probas thresholded at the
 **deployment** `classification_threshold`, not sklearn's 0.5 default); the five SHAP figures
-share `rf_shap_values_{tag}.joblib` (computed once, cached).
+share `rf_shap_values_{tag}.joblib` (computed once, cached). Since #282 the artifacts carry
+the *winning variant's* features, both raw (`val_probas` — rank plots are
+calibration-invariant) and deployment-scored (`val_probas_deployed`, calibrated when a
+calibrator is active) probabilities, plus the sweep record (variant metrics, calibration
+outcome, val partition indices).
 
 | File | Contents | What to look for |
 | --- | --- | --- |
@@ -414,7 +587,7 @@ share `rf_shap_values_{tag}.joblib` (computed once, cached).
 | `rf_shap_explanation_clustering_{tag}.png` | UMAP of SHAP explanation vectors, colored by subtype, markers for correct/incorrect. | Errors concentrated in one explanation cluster = a single confusable mode (fixable with targeted data); errors scattered everywhere = noise-floor performance. |
 | `rf_calibration_curve_{tag}.png` | Reliability diagram (quantile-binned) + Brier/ECE + probability histogram. | With a 0.99 threshold, calibration in the top bins is what matters: if the top-bin empirical frequency is well below its predicted probability, the threshold is less conservative than it looks. |
 | `rf_oob_accuracy_curve_{tag}.png` (from `plot_rf_ensemble_accuracy_curve`) | Cumulative accuracy vs number of trees (val + train-subsample baseline), elbow annotated. Also persists the per-tree `ensemble_val_accuracy` series to `training_stats` (`model_name='rf'`, `epoch_number` = tree count) for the dashboard RF tab — so the DB series only lands when `rf_plots` succeeds. | Should saturate well before 1000 trees; if it's still climbing at the end, raise `rf.n_estimators`. |
-| `rf_latent_decision_boundary_nn{n}_md{m}_{tag}.png` | RF P(true) contour over each persisted cadence-level UMAP plane, val points + 0.5 contour. | A coherent boundary separating the true classes; ragged islands = the forest partitioning noise. Depends on the UMAPs from `plot_latent_space_gif`, so `vae_plots` must have succeeded. |
+| `rf_latent_decision_boundary_nn{n}_md{m}_{tag}.png` | RF P(true) contour over each persisted cadence-level UMAP plane, val points + 0.5 contour. The UMAP lives in the 48-dim `z_mean` space; wide #282 variants project their lead columns only, and grid features the inverse transform can't reconstruct (the uncertainty extras) are held at their training-set means — the boundary is then the slice through typical uncertainty (a stated approximation). | A coherent boundary separating the true classes; ragged islands = the forest partitioning noise. Depends on the UMAPs from `plot_latent_space_gif`, so `vae_plots` must have succeeded. |
 
 ### SHAP explainability performance (CPU multiprocessing; GPU is a documented alternative)
 
@@ -480,13 +653,58 @@ overlap enabled) the two should visibly coincide from round 2 onward.
 `train_random_forest()` generates a fresh dataset (`num_samples_rf`, default 99 840; SNR range
 = `initial_snr_range` — the wide range, so the RF sees the full difficulty spectrum) into
 `round_data/{tag}/rf/` using the same memmap machinery (in-process; the producer has already
-shut down). It reuses `prepare_distributed_train_dataset(shuffle=False)`, encodes train and
+shut down). It reuses `prepare_distributed_train_dataset(shuffle=False)` and encodes train and
 val cadences through the (frozen) encoder with `_distributed_encode` — note the
-`train_steps × accumulation_steps` step-count correction, guarded by an exact-count assertion
-— fits the RF on binary labels (`true_*` vs `false_*`), and persists the model plus the eval
-artifacts immediately so a retry can skip straight to plots. A `check_encoder_trained()`
+`train_steps × accumulation_steps` step-count correction, guarded by an exact-count assertion.
+Since #282 the encode keeps **all three** encoder outputs (`z_mean`, `z_log_var`, `z` — the
+posterior parameters used to be computed and thrown away here), which makes the
+representation sweep below free on the GPU side. A `check_encoder_trained()`
 heuristic (weight-std deviation from initializer expectations) guards against accidentally
 encoding with untrained weights and falls back to loading the newest checkpoint.
+
+### The latent-representation sweep (#282)
+
+The RF historically consumed the stochastic sampled `z`; nobody had ever tested whether that
+is the best representation. `train_random_forest()` now trains **all 8 variants** of the
+catalogue in [`latent_variants.py`](../src/aetherscan/latent_variants.py) (see
+[`MODELS.md`](MODELS.md) for the table) on the same generated data and split, and picks the
+winner empirically:
+
+1. **Active units** are measured first (Burda et al.: dims whose `z_mean` variance exceeds
+   `rf.active_units_threshold`) — they gate the `z_mean_logvar_active` variant and size any
+   collapse problem retroactively.
+2. **The val split is partitioned** (seeded) into *selection* / *calibration* / *test* via
+   `rf.val_selection_fraction` / `rf.val_calibration_fraction` (remainder = test). Release
+   metrics are reported on the held-out test split — best-of-8 on the selection split alone
+   would be optimistically biased.
+3. **Every variant is fit and evaluated under its deterministic inference-time form**
+   (`z_mean` in the lead feature slot — for the `z`/`z_aug` variants that is deliberately the
+   deployed configuration, not the training one) and saved as
+   `random_forest_{tag}_{variant}.joblib`.
+4. **Selection**: the primary metric is recall at `rf.selection_max_fpr` on the selection
+   split (AUC averages over operating points the pipeline never uses). The best variant must
+   beat every *simpler* (fewer-feature) variant by more than a bootstrap CI of the recall
+   difference (`rf.selection_bootstrap_rounds`), else the simpler variant wins the tie —
+   `select_winner()`'s minimum-margin rule.
+5. **The winner becomes THE model** — canonical `random_forest_{tag}.joblib` filename, HF
+   upload, and release tagging all pick it up unchanged — and the sweep outcome is recorded
+   on the config (`rf.latent_variant`, `rf.active_dims`) so `config_{tag}.json` tells
+   inference exactly how to rebuild features (never hardcoded). A resumed attempt restores
+   these fields from the eval artifacts instead of re-sweeping.
+6. **ECE-gated calibration**: the winner's ECE is measured on the calibration split; only
+   when it exceeds `rf.max_ece` is a calibrator fit (isotonic with ≥
+   `rf.calibration_min_isotonic` rows, else sigmoid/Platt — isotonic overfits small sets),
+   and it is **kept only if** it improves ECE without worsening Brier on the held-out test
+   split. A kept calibrator is persisted as `rf_calibrator_{tag}.joblib` and recorded as
+   `rf.calibration_active` / `rf.calibration_method`; inference applies it identically
+   (an unapplied calibrator would be a silent train/serve mismatch).
+7. **Screening-threshold validation**: `check_screening_threshold()` replays the two-pass
+   inference cascade on the test split and WARNs (advisory, like `check_val_auc_floor`) if it
+   loses more than `rf.screen_recall_tolerance` recall versus MC-scoring *everything* at the
+   science threshold — anything pass 1 rejects never gets a second look, so the screen must
+   be demonstrably safe before a science run. The log also reports the largest zero-loss
+   screening threshold on that split. See [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)
+   for the cascade itself.
 
 At the tail of the stage, `train_random_forest()` also persists scalar RF eval metrics
 (accuracy, ROC-AUC, average precision, Brier score, per-sub-type accuracies, binary +
@@ -494,7 +712,9 @@ sub-type × prediction confusion cell counts, val P(true) quantiles) to `trainin
 under `model_name='rf'` via the pure (TF-free) helper
 [`compute_rf_eval_metrics()`](../src/aetherscan/rf_metrics.py); the deployment
 `inference.classification_threshold` used to derive `val_accuracy` is written alongside as
-its own `classification_threshold` row. `plot_rf_ensemble_accuracy_curve()` (in the
+its own `classification_threshold` row, and since #282 so are the held-out test metrics
+(`test_*`), the screening-validation numbers (`screen_*`), the active-unit count, and the
+per-variant selection metrics (`variant_{name}_{metric}`). `plot_rf_ensemble_accuracy_curve()` (in the
 downstream `rf_plots` stage) then writes the per-tree `ensemble_val_accuracy` series
 (`epoch_number` = tree count) so the dashboard's RF tab is live end-to-end. The ensemble
 curve keeps its pre-existing hard-coded 0.5 threshold (the dashboard shows a caption to
@@ -511,6 +731,7 @@ Training-specific fields live on `TrainingConfig`
 | Group | Fields |
 | --- | --- |
 | Scale | `num_training_rounds`, `epochs_per_round`, `num_samples_beta_vae`, `num_samples_rf`, `train_val_split` |
+| Posterior-collapse guard | `posterior_collapse_kl_epsilon`, `min_active_units_fraction`, `posterior_collapse_patience` |
 | Batching | `per_replica_batch_size`, `effective_batch_size`, `per_replica_val_batch_size` |
 | Round data | `round_data_dir`, `overlap_data_generation`, `keep_round_data`, `signal_injection_chunk_size`, `data_gen_task_size` |
 | Curriculum | `snr_base`, `initial_snr_range`, `final_snr_range`, `curriculum_schedule`, `exponential_decay_rate`, `step_easy_rounds`, `step_hard_rounds` |

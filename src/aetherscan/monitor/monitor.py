@@ -24,6 +24,7 @@ import numpy as np
 import psutil
 import tensorflow as tf
 from matplotlib.lines import Line2D
+from matplotlib.patches import ConnectionPatch
 
 matplotlib.use("Agg")  # Non-interactive backend for headless environments
 
@@ -167,19 +168,38 @@ def _draw_stage_boundaries(
     axes: list, spans: list[dict], start_time: float, current_time: float
 ) -> None:
     """
-    Draw the pipeline-stage overlay: one solid `dimgray` vertical line at each span's right
-    edge (its end time, in minutes since `start_time`) on EVERY axis in `axes` (the panels
-    share an x-axis), and label each stage once — anchored just left of its line and rotated
-    30 deg from horizontal, sitting just BELOW the x-axis of `axes[0]` (in the inter-panel band,
-    not inside the plot). Pure drawing helper (no DB or instance state) so it's exercisable with
-    synthetic spans in tests and the render harness. `axes` must be non-empty; `axes[0]` is the
-    top (CPU) panel whose x-axis the labels hang under.
+    Draw the pipeline-stage overlay: ONE dashed, semi-transparent `dimgray` vertical line at
+    each span's right edge (its end time, in minutes since `start_time`), spanning
+    continuously from the top of `axes[0]` to the bottom of `axes[-1]` — crossing the
+    inter-panel gaps instead of rendering as three clipped per-panel segments (#280) — and
+    label each stage once, anchored just left of its line and rotated 30 deg from horizontal,
+    sitting just BELOW the x-axis of `axes[0]` (in the inter-panel band, not inside the
+    plot). Pure drawing helper (no DB or instance state) so it's exercisable with synthetic
+    spans in tests and the render harness. `axes` must be non-empty; `axes[0]` is the top
+    (CPU) panel whose x-axis the labels hang under.
     """
     label_ax = axes[0]
+    figure = label_ax.get_figure()
     for span in spans:
         end_min = (min(span["end_time"], current_time) - start_time) / 60
-        for ax in axes:
-            ax.axvline(end_min, color=_ANNOTATION_COLOR, linewidth=1.0, alpha=0.7, zorder=2)
+        # ConnectionPatch with get_xaxis_transform() endpoints: x in data coords (the shared
+        # x-axis makes one value valid for both panels), y in axes fraction — (end_min, 1.0)
+        # is the top of the first panel, (end_min, 0.0) the bottom of the last, independent
+        # of y-limits. Figure-level artists draw over panel contents, so the line is dashed
+        # and lighter (alpha 0.4) than the old per-panel alpha 0.7 to keep titles, tick
+        # labels, and the rotated stage annotations readable underneath it.
+        boundary = ConnectionPatch(
+            xyA=(end_min, 1.0),
+            coordsA=axes[0].get_xaxis_transform(),
+            xyB=(end_min, 0.0),
+            coordsB=axes[-1].get_xaxis_transform(),
+            color=_ANNOTATION_COLOR,
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.4,
+            zorder=2,
+        )
+        figure.add_artist(boundary)
         # Leaf name only ("round_03", not "train.round_03"), anchored just left of the line and
         # angled so long names stay legible without overrunning into the neighbouring stage
         label = str(span["stage"]).split(".")[-1]

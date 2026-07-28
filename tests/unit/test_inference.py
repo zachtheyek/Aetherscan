@@ -13,6 +13,7 @@ from aetherscan.config import get_config
 from aetherscan.inference import (
     InfDataHolder,
     InferencePipeline,
+    ReferenceCloudReservoir,
     prepare_distributed_inf_dataset,
     summarize_confidences,
 )
@@ -149,14 +150,17 @@ class _StubEncoder:
 
 
 class _RecordingRF:
-    """predict_proba stub recording how many latent rows reached the classifier."""
+    """predict_proba stub recording how many feature rows reached the classifier. Since
+    #282 the pipeline calls rf_model.model.predict_proba with CADENCE-level variant
+    features, so the stub exposes itself as its own .model."""
 
     def __init__(self):
         self.n_rows_seen: int | None = None
+        self.model = self
 
-    def predict_proba(self, latents):
-        self.n_rows_seen = latents.shape[0]
-        return np.full((latents.shape[0], 2), [0.7, 0.3])  # P(true)=0.3: never a candidate
+    def predict_proba(self, features):
+        self.n_rows_seen = features.shape[0]
+        return np.full((features.shape[0], 2), [0.7, 0.3])  # P(true)=0.3: never a candidate
 
 
 class TestLatentPaddingRowTruncation:
@@ -181,6 +185,12 @@ class TestLatentPaddingRowTruncation:
         pipeline.num_observations = 6
         pipeline.per_replica_inf_batch_size = 2  # global batch 2: n=5 pads to 6
         pipeline.threshold = 0.99
+        pipeline.screening_threshold = 0.5
+        pipeline.mc_draws = 2
+        pipeline.calibrator = None
+        pipeline._reference_reservoir = ReferenceCloudReservoir(
+            capacity=0, rng=np.random.default_rng(0)
+        )
         pipeline._encode_step = None
         # DB writes are covered elsewhere; keep this test on the truncation seam.
         pipeline._write_inference_results = lambda **kwargs: 0
@@ -188,8 +198,9 @@ class TestLatentPaddingRowTruncation:
         data = _make_data(5)
         results = pipeline.run_inference(data=data, npy_path="/fake/cadence.npy")
 
-        # 5 samples pad to 6 -> 36 latent rows encoded; only the 30 real ones may survive.
-        assert pipeline.rf_model.n_rows_seen == 5 * 6
+        # 5 samples pad to 6 -> 36 latent rows encoded; only the 30 real ones survive, and
+        # since #282 the RF consumes CADENCE-level variant features: one row per snippet.
+        assert pipeline.rf_model.n_rows_seen == 5
         assert results["latents"].shape == (5 * 6, 1)
         assert results["n_cadence_snippets"] == 5
         assert results["n_processed"] == 5
@@ -246,3 +257,57 @@ class TestSummarizeConfidences:
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="at least one confidence"):
             summarize_confidences(np.array([]), threshold=0.5)
+
+
+class TestReferenceCloudReservoir:
+    """#282: seeded uniform reservoir over pass-1 rejects."""
+
+    def _rows(self, n, offset=0):
+        mean = np.arange(n * 4, dtype=np.float32).reshape(n, 4) + offset
+        log_var = np.full((n, 4), -2.0, dtype=np.float32)
+        screening = np.linspace(0, 0.4, n).astype(np.float32)
+        return mean, log_var, screening
+
+    def test_fills_to_capacity_then_stays_bounded(self):
+        reservoir = ReferenceCloudReservoir(capacity=5, rng=np.random.default_rng(0))
+        reservoir.offer(*self._rows(3))
+        reservoir.offer(*self._rows(10, offset=100))
+        mean, log_var, screening = reservoir.arrays()
+        assert mean.shape == (5, 4) and log_var.shape == (5, 4) and screening.shape == (5,)
+        assert reservoir.seen == 13
+
+    def test_seeded_reservoir_is_reproducible(self):
+        def build():
+            reservoir = ReferenceCloudReservoir(capacity=4, rng=np.random.default_rng(42))
+            for chunk in range(5):
+                reservoir.offer(*self._rows(7, offset=chunk * 10))
+            return reservoir.arrays()
+
+        first_mean, _, first_screening = build()
+        second_mean, _, second_screening = build()
+        np.testing.assert_array_equal(first_mean, second_mean)
+        np.testing.assert_array_equal(first_screening, second_screening)
+
+    def test_zero_capacity_collects_nothing(self):
+        reservoir = ReferenceCloudReservoir(capacity=0, rng=np.random.default_rng(0))
+        reservoir.offer(*self._rows(6))
+        _, _, screening = reservoir.arrays()
+        assert len(screening) == 0
+
+    def test_rng_consumption_pattern_is_frozen(self):
+        # GOLDEN test: pins the exact rng-consumption pattern of offer()'s vectorized
+        # replacement phase (one rng.random(batch) acceptance draw, then one
+        # rng.integers(batch) slot draw, ALWAYS both, regardless of acceptance count).
+        # A same-seed-twice comparison cannot catch a refactor that reorders these calls —
+        # both sides would drift together — so the surviving items are frozen here.
+        # Regenerate the goldens ONLY for a deliberate, documented stream change.
+        reservoir = ReferenceCloudReservoir(capacity=3, rng=np.random.default_rng(123))
+        for chunk in range(4):
+            mean = (np.arange(5, dtype=np.float32) + 10 * chunk).reshape(5, 1)
+            log_var = np.full((5, 1), -2.0, dtype=np.float32)
+            screening = (np.arange(5, dtype=np.float32) + 10 * chunk) / 100.0
+            reservoir.offer(mean, log_var, screening.astype(np.float32))
+        mean_rows, _, screening_vals = reservoir.arrays()
+        assert reservoir.seen == 20
+        np.testing.assert_array_equal(mean_rows[:, 0], [14.0, 20.0, 22.0])
+        np.testing.assert_allclose(screening_vals, [0.14, 0.20, 0.22], atol=1e-6)

@@ -11,11 +11,18 @@ import contextlib
 import io
 import logging
 import os
+import sys
 from unittest.mock import patch
 
 import pytest
 
-from aetherscan.logger.logger import Logger, StreamToLogger, log_path_for_tag, shutdown_logger
+from aetherscan.logger.logger import (
+    Logger,
+    ShutdownSafeQueueHandler,
+    StreamToLogger,
+    log_path_for_tag,
+    shutdown_logger,
+)
 
 
 class _CaptureHandler(logging.Handler):
@@ -163,3 +170,79 @@ class TestLoggerStop:
                 instance.log_queue.close()
                 instance.log_queue.cancel_join_thread()
             Logger._reset()
+
+
+class TestTeardownRecursionFix:
+    """#281: Logger.stop() must restore the real streams and disarm the logging error path,
+    so teardown-time output can never recurse through a redirected stderr."""
+
+    def _build_logger(self):
+        return Logger(save_tag="test_v281")
+
+    def test_stop_restores_real_streams(self):
+        instance = self._build_logger()
+        try:
+            assert isinstance(sys.stdout, StreamToLogger)
+            assert isinstance(sys.stderr, StreamToLogger)
+            instance.stop()
+            assert sys.stdout is sys.__stdout__
+            assert sys.stderr is sys.__stderr__
+        finally:
+            Logger._reset()
+
+    def test_stop_leaves_foreign_redirect_alone(self):
+        instance = self._build_logger()
+        foreign = io.StringIO()
+        try:
+            sys.stderr = foreign  # someone else redirected after us (e.g. pytest capture)
+            instance.stop()
+            assert sys.stderr is foreign  # not clobbered
+            assert sys.stdout is sys.__stdout__  # ours was restored
+        finally:
+            Logger._reset()
+
+    def test_logging_after_stop_is_a_silent_noop(self):
+        instance = self._build_logger()
+        try:
+            instance.stop()
+            # The root logger still carries the (shutdown-safe) queue handler; emitting must
+            # neither raise nor recurse now that the queue is closed
+            logging.getLogger("post_stop_probe").error("logged after Logger.stop()")
+            sys.stderr.write("written after Logger.stop()\n")
+        finally:
+            Logger._reset()
+
+    def test_stop_is_idempotent(self):
+        instance = self._build_logger()
+        try:
+            instance.stop()
+            instance.stop()  # QueueListener.stop() would raise without the guard
+        finally:
+            Logger._reset()
+
+    def test_shutdown_safe_handler_drops_on_closed_queue(self):
+        from multiprocessing import Queue as MpQueue  # noqa: PLC0415
+
+        queue = MpQueue(-1)
+        handler = ShutdownSafeQueueHandler(queue)
+        record = logging.LogRecord("probe", logging.INFO, __file__, 1, "msg", None, None)
+        queue.close()
+        queue.cancel_join_thread()
+        handler.emit(record)  # must not raise (vanilla QueueHandler would ValueError)
+
+    def test_stream_to_logger_write_is_reentrancy_guarded(self, capture_logger):
+        log, handler = capture_logger
+        stream = StreamToLogger(log, logging.INFO)
+
+        class _Recurser(logging.Handler):
+            def emit(self, record):
+                stream.write("recursed")  # second entry must be dropped, not recurse
+
+        recurser = _Recurser()
+        log.addHandler(recurser)
+        try:
+            stream.write("outer")
+        finally:
+            log.removeHandler(recurser)
+        # Only the outer write landed; the re-entrant one was dropped instead of recursing
+        assert [r.getMessage() for r in handler.records] == ["outer"]

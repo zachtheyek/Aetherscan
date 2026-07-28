@@ -60,6 +60,26 @@ one at **ERROR**. That means:
    propagate; they don't travel through the stream). Wrap any new dependency that draws
    progress bars the same way, or configure the bar off.
 
+### Shutdown safety (#281)
+
+Teardown used to be able to arm a recursion loop: after `stop()` disposed the queue, any
+late log record made the vanilla `QueueHandler.emit()` raise on the closed queue, logging's
+`handleError()` printed that traceback to `sys.stderr` — still a `StreamToLogger` redirect —
+which logged again, raised again, and recursed without bound (the observed `RecursionError`
++ "lost sys.stderr" at teardown). Three guards make the loop structurally impossible:
+
+- **`Logger.stop()` is idempotent** (a second call is a no-op — `QueueListener.stop()`
+  raises if called twice, and cleanup paths can legitimately overlap) and its *first* act is
+  restoring `sys.stdout`/`sys.stderr` to the real streams — guarded with `isinstance`
+  checks, so a foreign redirect installed on top of ours (e.g. pytest's capture) is left
+  alone. Anything printed during or after shutdown reaches the real console.
+- **`ShutdownSafeQueueHandler`** (used for the main-process root handler *and* by
+  `init_worker_logging`) silently drops records once its queue is closed or its pipe broken
+  — the only sane destination for late shutdown-time records.
+- **`StreamToLogger` has a thread-local re-entrancy guard**: if anything downstream of
+  `logger.log` ever writes back into the stream, the second entry is dropped instead of
+  recursing.
+
 ### Slack integration
 
 When `SLACK_BOT_TOKEN` (and a channel via `SLACK_CHANNEL` or `logger.slack_channel`) is set,
@@ -180,8 +200,13 @@ Missing stretches in the panels are a known symptom
 ### Stage annotations
 
 When `monitor.annotate_stages` is enabled (config default `True`), `_save_plot()` overlays the
-run's pipeline-stage spans as solid `dimgray` vertical boundary lines at each span's right edge
-on **every panel** (CPU, RAM, GPU — they share an x-axis) via `_annotate_stage_spans`; the leaf
+run's pipeline-stage spans via `_annotate_stage_spans`: **one** dashed, semi-transparent
+`dimgray` vertical line per span end (a figure-level `ConnectionPatch`, #280) spanning
+continuously from the top of the CPU panel to the bottom of the GPU panel — crossing the
+inter-panel gaps instead of rendering as three clipped per-panel segments (the panels share
+an x-axis, so one data-coordinate x value is valid for all of them). Figure-level artists
+draw over panel contents, hence dashed and lighter (alpha 0.4) than the old per-panel solid
+lines so titles and tick labels stay readable underneath. The leaf
 stage name is labeled once, just left of each line and angled 30° from horizontal, on the
 **CPU (top) panel only** so the other panels stay uncluttered. This turns the utilization curves
 into a self-explaining timeline: the region ending at a `round_03` line is round 3 data

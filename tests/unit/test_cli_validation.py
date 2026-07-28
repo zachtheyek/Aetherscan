@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 
 import pytest
 
@@ -193,12 +194,21 @@ class TestSemanticChecks:
 
     def test_negative_seed_rejected(self):
         errors = collect_validation_errors(_parse(["train", "--seed", "-1"]), None)
-        assert any(e.field == "training.seed" and e.fix_kind == "clamp_low" for e in errors)
+        assert any(e.field == "reproducibility.seed" and e.fix_kind == "clamp_low" for e in errors)
+
+    def test_negative_seed_rejected_on_inference_too(self):
+        # #279: --seed is a shared flag; the bound applies on the inference subparser as well
+        errors = collect_validation_errors(_parse(["inference", "--seed", "-1"]), None)
+        assert any(e.field == "reproducibility.seed" and e.fix_kind == "clamp_low" for e in errors)
 
     @pytest.mark.parametrize("seed", ["0", "42"])
     def test_non_negative_seed_passes(self, seed):
         errors = collect_validation_errors(_parse(["train", "--seed", seed]), None)
-        assert not any(e.field == "training.seed" for e in errors)
+        assert not any(e.field == "reproducibility.seed" for e in errors)
+
+    def test_negative_rf_seed_rejected(self):
+        errors = collect_validation_errors(_parse(["train", "--rf-seed", "-1"]), None)
+        assert any(e.field == "rf.seed" and e.fix_kind == "clamp_low" for e in errors)
 
     def test_curriculum_schedule_enum(self):
         errors = collect_validation_errors(
@@ -589,19 +599,43 @@ class TestApplyArgsToConfig:
         apply_args_to_config(_parse(["train", "--load-tag", "round_03"]))
         assert config.checkpoint.start_round == 4
 
-    def test_seed_flags_apply_to_training_config(self):
+    def test_seed_flags_apply_to_reproducibility_config(self):
         config = get_config()
-        assert config.training.seed is None  # default: OS entropy
-        assert config.training.tf_deterministic_ops is False
+        assert config.reproducibility.seed == 11  # #279: reproducible out of the box
+        assert config.reproducibility.tf_deterministic_ops is False
         apply_args_to_config(_parse(["train", "--seed", "123", "--tf-deterministic-ops"]))
-        assert config.training.seed == 123
-        assert config.training.tf_deterministic_ops is True
+        assert config.reproducibility.seed == 123
+        assert config.reproducibility.tf_deterministic_ops is True
         # Omitting both flags leaves the applied values untouched (None-guarded application)
         apply_args_to_config(_parse(["train"]))
-        assert config.training.seed == 123
-        assert config.training.tf_deterministic_ops is True
+        assert config.reproducibility.seed == 123
+        assert config.reproducibility.tf_deterministic_ops is True
         apply_args_to_config(_parse(["train", "--no-tf-deterministic-ops"]))
-        assert config.training.tf_deterministic_ops is False
+        assert config.reproducibility.tf_deterministic_ops is False
+
+    def test_seed_flags_apply_from_inference_subparser(self):
+        # #279: inference is seedable/pinnable from the CLI (the original gap)
+        config = get_config()
+        apply_args_to_config(_parse(["inference", "--seed", "321", "--tf-deterministic-ops"]))
+        assert config.reproducibility.seed == 321
+        assert config.reproducibility.tf_deterministic_ops is True
+
+    def test_rf_seed_override_applies_with_deprecation(self, caplog):
+        config = get_config()
+        assert config.rf.seed is None  # derived from the root by default
+        with caplog.at_level(logging.WARNING, logger="aetherscan.cli"):
+            apply_args_to_config(_parse(["train", "--rf-seed", "77"]))
+        assert config.rf.seed == 77
+        assert any("DEPRECATED" in r.message for r in caplog.records)
+        assert config.resolved_rf_seed() == 77
+
+    def test_rf_seed_derives_from_root_when_not_overridden(self):
+        from aetherscan.seeding import STREAM_RF, derive_seed  # noqa: PLC0415
+
+        config = get_config()
+        apply_args_to_config(_parse(["train", "--seed", "123"]))
+        assert config.rf.seed is None
+        assert config.resolved_rf_seed() == derive_seed(123, STREAM_RF)
 
     def test_bandpass_flags_apply_to_inference_config(self):
         config = get_config()

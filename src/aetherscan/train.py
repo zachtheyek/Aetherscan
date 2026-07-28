@@ -32,6 +32,7 @@ import tensorflow as tf
 import umap
 from sklearn.calibration import calibration_curve
 from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     auc,
     average_precision_score,
@@ -41,6 +42,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from sklearn.utils import shuffle as sklearn_shuffle
 from tensorflow.keras.initializers import GlorotNormal, HeNormal
 from tensorflow.keras.layers import Conv2D, Dense
 
@@ -49,6 +51,19 @@ from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
 from aetherscan.db import get_db, get_system_metadata
 from aetherscan.hf_hub import upload_run_to_hf
+from aetherscan.latent_gif import FrameCategory, render_latent_gif_frames
+from aetherscan.latent_variants import (
+    VARIANT_ORDER,
+    active_latent_dims,
+    apply_probability_calibrator,
+    build_variant_features,
+    build_z_aug_training_set,
+    expected_calibration_error,
+    fit_probability_calibrator,
+    recall_at_fpr,
+    sample_z_flat,
+    select_winner,
+)
 from aetherscan.logger import get_logger
 from aetherscan.models import (
     RandomForestModel,
@@ -77,10 +92,29 @@ from aetherscan.run_state import (
     run_state_path,
     save_run_state,
 )
-from aetherscan.seeding import STREAM_DATASET, STREAM_PLOT, STREAM_VIZ, derive_rng
+from aetherscan.seeding import (
+    STREAM_DATASET,
+    STREAM_KMEANS,
+    STREAM_PLOT,
+    STREAM_RF,
+    STREAM_RF_PLOTS,
+    STREAM_SHAP_SAMPLES,
+    STREAM_UMAP,
+    STREAM_VIZ,
+    derive_rng,
+    derive_seed,
+    seed_tensorflow,
+)
 from aetherscan.shap_parallel import parallel_shap
 
 logger = logging.getLogger(__name__)
+
+# TEST: is clipping still needed? currently every step seems to be getting clipped. what
+# happens if we just don't?
+# Global L2-norm gradient-clip threshold (see _build_accumulated_train_step for rationale):
+# aggressive enough to catch exploding gradients, permissive enough not to dampen learning —
+# aim for no more than ~1-5% of steps triggering the clip
+_GRADIENT_CLIP_NORM = 1.0
 
 
 # NOTE: Removing TensorBoard support
@@ -357,6 +391,138 @@ def check_val_auc_floor(
     return val_auc
 
 
+def build_epoch_history(
+    all_stats: list[dict], epochs_per_round: int
+) -> tuple[range, dict[str, list[float]]]:
+    """
+    Arrange training-stat rows onto the REAL global-epoch axis for plotting (#277).
+
+    Each row's x position is (round_number - 1) * epochs_per_round + epoch_number, so a value
+    lands where the epoch actually happened; positions with no committed row hold NaN, which
+    matplotlib renders as a visible gap in the line. The previous positional 1..N axis
+    discarded epoch_number after sorting, so any missing rows silently re-registered later
+    epochs onto earlier x positions — a partially-drained write queue could mis-plot rather
+    than merely stop short. Duplicate (round, epoch) rows keep the last value seen; rows
+    without round/epoch numbers are skipped.
+
+    Returns (epochs, history): epochs = range(1, max_position + 1), and history maps
+    stat_name to a value list aligned with epochs.
+    """
+    per_stat: dict[str, dict[int, float]] = {}
+    max_position = 0
+    for stat in all_stats:
+        round_number = stat.get("round_number")
+        epoch_number = stat.get("epoch_number")
+        if round_number is None or epoch_number is None:
+            continue
+        position = (round_number - 1) * epochs_per_round + epoch_number
+        per_stat.setdefault(stat["stat_name"], {})[position] = stat["value"]
+        max_position = max(max_position, position)
+
+    epochs = range(1, max_position + 1)
+    history = {
+        stat_name: [values.get(position, float("nan")) for position in epochs]
+        for stat_name, values in per_stat.items()
+    }
+    return epochs, history
+
+
+def check_posterior_collapse(
+    kl_per_dim: np.ndarray,
+    low_kl_streaks: np.ndarray,
+    kl_epsilon: float,
+    min_active_fraction: float,
+    patience: int,
+    tag: str,
+) -> bool:
+    """
+    Advisory posterior-collapse guard (#282), same idiom as check_val_auc_floor: never fails
+    the run, WARNs loudly (reaches Slack) when latent capacity is going dark.
+
+    A dim counts ACTIVE when its batch-mean KL exceeds kl_epsilon; the round alarms when the
+    active fraction drops below min_active_fraction OR any dim's KL has sat under epsilon
+    for `patience` consecutive epochs. With beta > 1 some pruning is expected and even
+    desirable — 6-8 active dims of 8 is healthy, 1-2 is pathological — so the caller-facing
+    remedy ladder (KL warm-up -> free bits -> lower beta -> shrink latent_dim) lives in
+    docs/TRAINING_PIPELINE.md, not in code. Returns True when collapse was flagged.
+    """
+    kl_per_dim = np.asarray(kl_per_dim, dtype=np.float64).ravel()
+    low_kl_streaks = np.asarray(low_kl_streaks).ravel()
+    latent_dim = len(kl_per_dim)
+    active = kl_per_dim > kl_epsilon
+    n_active = int(active.sum())
+    stuck_dims = [int(d) for d in np.nonzero(low_kl_streaks >= patience)[0]]
+
+    collapsed = (n_active < min_active_fraction * latent_dim) or bool(stuck_dims)
+    if collapsed:
+        logger.warning(
+            f"POSTERIOR COLLAPSE WARNING ({tag}): {n_active}/{latent_dim} latent dims active "
+            f"(KL > {kl_epsilon}); dims stuck below epsilon for >= {patience} consecutive "
+            f"epochs: {stuck_dims or 'none'}. Per-dim KL: "
+            f"{np.array2string(kl_per_dim, precision=4)}. See the posterior-collapse "
+            "playbook in docs/TRAINING_PIPELINE.md (KL warm-up, free bits, lower beta, or "
+            "shrink latent_dim)."
+        )
+    else:
+        logger.info(
+            f"Posterior-collapse check passed ({tag}): {n_active}/{latent_dim} latent dims "
+            f"active (KL > {kl_epsilon})"
+        )
+    return collapsed
+
+
+def check_screening_threshold(
+    test_labels: np.ndarray,
+    pass1_probas: np.ndarray,
+    mc_mean_probas: np.ndarray,
+    screening_threshold: float,
+    science_threshold: float,
+    recall_tolerance: float,
+    tag: str,
+) -> dict[str, float]:
+    """
+    Validate the two-pass cascade's screening threshold on labeled held-out data (#282):
+    anything pass 1 rejects never gets a second look, so the cascade must lose ~zero recall
+    versus MC-scoring EVERYTHING at the science threshold. Advisory (WARNs loudly, never
+    fails the run), same idiom as check_val_auc_floor. Returns the measured numbers,
+    including the largest screening threshold that would have lost nothing on this split.
+    """
+    test_labels = np.asarray(test_labels).astype(bool)
+    pass1_probas = np.asarray(pass1_probas)
+    mc_mean_probas = np.asarray(mc_mean_probas)
+
+    positives = test_labels
+    mc_pass = mc_mean_probas > science_threshold
+    n_positive_mc = int((mc_pass & positives).sum())
+    recall_full = float(mc_pass[positives].mean()) if positives.any() else float("nan")
+    cascade_pass = (pass1_probas > screening_threshold) & mc_pass
+    recall_cascade = float(cascade_pass[positives].mean()) if positives.any() else float("nan")
+    recall_loss = recall_full - recall_cascade
+    max_safe = float(pass1_probas[positives & mc_pass].min()) if n_positive_mc else float("nan")
+
+    stats = {
+        "screen_recall_mc_everything": recall_full,
+        "screen_recall_cascade": recall_cascade,
+        "screen_recall_loss": recall_loss,
+        "screen_max_safe_threshold": max_safe,
+    }
+    if recall_loss > recall_tolerance:
+        logger.warning(
+            f"SCREENING THRESHOLD UNSAFE ({tag}): the two-pass cascade at "
+            f"screening_threshold={screening_threshold} loses {recall_loss:.4f} recall vs "
+            f"MC-on-everything at the science threshold ({recall_full:.4f} -> "
+            f"{recall_cascade:.4f}); the largest zero-loss screen on this split is "
+            f"{max_safe:.4f}. Lower inference.screening_threshold before a science run."
+        )
+    else:
+        logger.info(
+            f"Screening threshold validated ({tag}): cascade recall {recall_cascade:.4f} vs "
+            f"MC-on-everything {recall_full:.4f} (loss {recall_loss:.4f} <= tolerance "
+            f"{recall_tolerance}); largest zero-loss screen on this split: {max_safe:.4f}"
+        )
+    return stats
+
+
 def build_traversal_latents(
     z_base: np.ndarray, sigmas: np.ndarray, num_steps: int, max_sigma: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -492,6 +658,44 @@ class VizDataHolder:
             self.concat = None
 
 
+# Eigen's EIGEN_MAX_ALIGN_BYTES: TF CHECK-fails — an uncatchable SIGABRT, not an exception
+# — when a CPU kernel touches a tensor whose buffer is less aligned than this, so zero-copy
+# wrapping is gated on the source pointer's alignment below
+_TF_CPU_TENSOR_ALIGN = 64
+
+
+def _as_cpu_tensor(array: np.ndarray) -> tf.Tensor:
+    """
+    Wrap `array` as a CPU tensor for graph-side gathers, zero-copy when possible.
+
+    from_dlpack on a writable, 64-byte-aligned ndarray — which the mmap_mode="c"
+    copy-on-write memmaps load_round_arrays returns always are (page-aligned mapping + the
+    npy format's 64-byte header padding) — aliases the existing buffer (no allocation, no
+    copy), so a ~98 GB round array becomes a TF tensor in microseconds and gathers stream
+    through the OS page cache exactly like numpy fancy-indexing did.
+
+    Everything else falls back to tf.convert_to_tensor, which copies — fine for small
+    in-RAM test arrays, loudly logged for anything big enough to matter. The fallback
+    covers: read-only arrays (numpy refuses to export them over dlpack) and buffers below
+    Eigen alignment (plain numpy allocations are typically 16-byte aligned; TF would abort
+    the process at kernel time, not raise, so this is checked proactively).
+    """
+    with tf.device("/CPU:0"):
+        if array.ctypes.data % _TF_CPU_TENSOR_ALIGN == 0:
+            try:
+                return tf.experimental.dlpack.from_dlpack(array.__dlpack__())
+            except (AttributeError, BufferError, TypeError, RuntimeError, ValueError):
+                pass
+        if array.nbytes > 1 << 30:
+            logger.warning(
+                f"Zero-copy dlpack wrap unavailable for a {array.nbytes / 1e9:.1f} GB array "
+                f"(read-only, misaligned, or non-exportable); falling back to an in-RAM "
+                f"copy. If this is round data, check that load_round_arrays uses "
+                f"mmap_mode='c'."
+            )
+        return tf.convert_to_tensor(array)
+
+
 def prepare_distributed_train_dataset(
     data: dict,
     train_val_split: float,
@@ -512,29 +716,43 @@ def prepare_distributed_train_dataset(
     callers pass a Generator derived from the pipeline root seed for reproducible runs (see
     aetherscan.seeding.derive_rng); None falls back to OS entropy (the historical behavior).
 
-    `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the read-only
-    memmaps returned by round_data.load_round_arrays(), though plain in-RAM ndarrays work too.
-    The split is stratified across the 4 signal types (false_no_signal, false_with_rfi,
-    true_only_eti, true_eti_rfi) — generation lays labels out sequentially within chunks, so a
-    naive positional split would over-represent later signal types in val.
+    `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the
+    copy-on-write memmaps returned by round_data.load_round_arrays(), though plain in-RAM
+    ndarrays work too. The split is stratified across the 4 signal types (false_no_signal,
+    false_with_rfi, true_only_eti, true_eti_rfi) — generation lays labels out sequentially
+    within chunks, so a naive positional split would over-represent later signal types in val.
 
-    The generators yield whole GLOBAL batches (leading batch dim in the output signature; no
-    .batch() call downstream): each batch gathers sorted fancy indices from the memmaps, cutting
-    the per-sample Python/tf.data boundary crossings by a factor of the global batch size — the
-    per-sample yields were the main source of the 0-14 % GPU utilization. Randomness lives at
-    the epoch level (train_indices are reshuffled each pass); sorting *within* a batch only
-    improves memmap read locality and the model is order-invariant within a batch.
+    The datasets are built as cheap index generators followed by a parallel, deterministic
+    .map() of pure tf.gather ops over zero-copy tensor views of the backing arrays
+    (_as_cpu_tensor), so the entire steady-state gather path runs in tf.data's C++ threadpool
+    with no Python — and therefore no GIL — involvement. This is the durable #276 fix: the
+    previous tf.numpy_function gather re-entered the interpreter from every map worker, which
+    made its +38% idle-host win invert to a loss whenever any other Python thread (the #277
+    DB drainer, the producer relay) competed for the GIL. deterministic=True preserves the
+    exact batch order of the index stream, so parallelism changes throughput only, never
+    epoch composition or ordering. Randomness lives at the epoch level (train_indices are
+    reshuffled each pass); sorting *within* a batch only improves read locality and the model
+    is order-invariant within a batch.
 
-    Page-cache framing: gathering from the memmaps pulls pages through the OS page cache, so
-    after the first epoch a round's ~294 GB (at full-scale defaults) is served at RAM speed from
-    otherwise-free memory on the 503 GB training nodes — but under memory pressure the kernel
-    evicts pages instead of OOM-killing the process, which is exactly the failure mode the old
-    in-RAM arrays hit.
+    Each index-stream element is one PER-REPLICA batch (replica r of global batch g is
+    element g*num_replicas + r): strategy.distribute_datasets_from_function hands consecutive
+    elements to consecutive replicas, reproducing exactly the contiguous split that
+    experimental_distribute_dataset used to apply to whole global batches, while skipping the
+    split op and letting InputOptions prefetch each replica's batches straight to its GPU
+    (the host→device copy overlaps compute instead of serializing in the step). Consumers see
+    the same distributed-dataset interface as before; with one replica the elements are
+    byte-identical to the old whole-global-batch stream.
 
-    Each generated batch has the signature ((concat, true, false), concat). Sample counts are
-    trimmed to the global / effective batch size to keep all replicas evenly fed (so every epoch
-    pass yields whole batches exactly); the holder is shared by both generators so neither pays
-    a memory cost beyond index subsets.
+    Page-cache framing: gathers pull pages of the mmap_mode="c" arrays through the OS page
+    cache, so after the first epoch a round's ~294 GB (at full-scale defaults) is served at
+    RAM speed from otherwise-free memory on the 503 GB training nodes — but under memory
+    pressure the kernel evicts pages instead of OOM-killing the process, which is exactly the
+    failure mode the old in-RAM arrays hit.
+
+    Each logical global batch has the signature ((concat, true, false), concat). Sample
+    counts are trimmed to the global / effective batch size to keep all replicas evenly fed
+    (so every epoch pass yields whole batches exactly); the holder is shared by both index
+    generators so neither pays a memory cost beyond index subsets.
     """
     global_train_batch_size = per_replica_batch_size * num_replicas
     global_val_batch_size = per_replica_val_batch_size * num_replicas
@@ -607,99 +825,108 @@ def prepare_distributed_train_dataset(
 
     # Share the original arrays between train and val generators via a single data holder.
     # The stratified split requires non-contiguous indices, which would force numpy to create
-    # full copies via fancy indexing (~2x peak memory). Instead, both generators gather
+    # full copies via fancy indexing (~2x peak memory). Instead, both datasets gather
     # per-batch slices from the same original arrays using their respective index subsets —
-    # only one global batch is materialized at a time.
+    # only the in-flight batches are materialized.
     train_holder = TrainDataHolder(data["concatenated"], data["true"], data["false"])
 
-    # Create generator functions yielding whole global batches gathered from the (memmap)
-    # arrays — see the docstring for the batching/locality/page-cache rationale
-    def train_generator():
+    # Zero-copy CPU tensor views of the backing arrays for the graph-side gather map below.
+    # The map functions capture these by reference; they keep the underlying mappings alive
+    # until the datasets are dropped, which is why train_round's teardown deletes the
+    # datasets before removing the round directory (deletion is safe even with a lingering
+    # mapping — POSIX inode semantics — the pages just stay reclaimable until the drop).
+    concat_t = _as_cpu_tensor(data["concatenated"])
+    true_t = _as_cpu_tensor(data["true"])
+    false_t = _as_cpu_tensor(data["false"])
+
+    # Create index-generator functions yielding ONE EPOCH of per-replica index batches per
+    # yield, as a (batches_per_epoch * num_replicas, per_replica_batch) int64 array — row
+    # g*num_replicas + r is replica r's slice of global batch g (with one replica, the old
+    # whole-global-batch stream unchanged). A pure-TF .unbatch() downstream streams the rows
+    # out one per-replica batch at a time, so the interpreter is touched ONCE per epoch: at
+    # heavy GIL contention (the #277 drainer flood regime), a per-micro-batch Python yield
+    # measured a further 35% off end-to-end throughput; the per-epoch yield is immune. The
+    # gathers happen in a parallel, deterministic .map() of pure TF ops below — never in
+    # Python (#276: first the one-thread gather starved the GPUs, then the numpy_function
+    # gather contended for the GIL under load).
+    # All randomness stays in the generators, so the epoch-level rng consumption order — and
+    # therefore the #49 reproducibility contract (same seed => same split AND same per-epoch
+    # batch order) — is byte-identical to the previous implementations.
+    def train_index_generator():
         while True:  # Make generators infinite to reset state between epochs
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
             with train_holder._lock:
                 if train_holder._cleared:
                     return  # Exit if data already cleared
-                # Cache references while holding lock
-                concat = train_holder.concat
-                true = train_holder.true
-                false = train_holder.false
 
-            # Work with local references (safe from clearing, no per-batch lock needed)
             # Copy train_indices because rng.shuffle mutates in-place
             indices = train_indices.copy()
             if shuffle:
                 # Perform global shuffle on each epoch so each pass through the data is unique
                 rng.shuffle(indices)
-            for start in range(0, len(indices), global_train_batch_size):
-                batch_indices = indices[start : start + global_train_batch_size]
-                if shuffle:
-                    # Within-batch sorted order improves memmap read locality; random batch
-                    # membership is already guaranteed by the epoch-level shuffle above
-                    batch_indices = np.sort(batch_indices)
-                concat_batch = concat[batch_indices]
-                yield (concat_batch, true[batch_indices], false[batch_indices]), concat_batch
+            epoch = indices.astype(np.int64, copy=False).reshape(-1, global_train_batch_size)
+            if shuffle:
+                # Within-batch sorted order improves memmap read locality; random batch
+                # membership is already guaranteed by the epoch-level shuffle above
+                epoch = np.sort(epoch, axis=1)
+            yield epoch.reshape(-1, per_replica_batch_size)
 
-            # Remove cache references to ensure garbage collection in future
-            del concat, true, false
-
-    def val_generator():
+    def val_index_generator():
         while True:  # Make generators infinite to reset state between epochs
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
             with train_holder._lock:
                 if train_holder._cleared:
                     return  # Exit if data already cleared
-                # Cache references while holding lock
-                concat = train_holder.concat
-                true = train_holder.true
-                false = train_holder.false
 
             # Maintain val_indices order on each epoch (already sorted above): no gradients are
             # calculated during validation, and train_random_forest relies on the i-th encoded
             # val cadence corresponding to val_indices[i]
-            for start in range(0, len(val_indices), global_val_batch_size):
-                batch_indices = val_indices[start : start + global_val_batch_size]
-                concat_batch = concat[batch_indices]
-                yield (concat_batch, true[batch_indices], false[batch_indices]), concat_batch
+            yield val_indices.astype(np.int64, copy=False).reshape(-1, per_replica_val_batch_size)
 
-            # Remove cache references to ensure garbage collection in future
-            del concat, true, false
+    def map_gather(batch_indices):
+        # Pure tf.data ops on CPU: the gather runs in TF's C++ threadpool, releases nothing
+        # to Python, and parallel map workers scale with cores instead of convoying on the
+        # GIL. tf.cast is a no-op passthrough for the production float32 arrays.
+        with tf.device("/CPU:0"):
+            concat_batch = tf.cast(tf.gather(concat_t, batch_indices), tf.float32)
+            true_batch = tf.cast(tf.gather(true_t, batch_indices), tf.float32)
+            false_batch = tf.cast(tf.gather(false_t, batch_indices), tf.float32)
+        return (concat_batch, true_batch, false_batch), concat_batch
 
-    # Determine dataset output signature: the generators yield whole global batches, so the
-    # specs carry a leading (None) batch dimension and no .batch() call is applied downstream
-    sample_shape = data["concatenated"].shape[1:]
-    batch_spec = tf.TensorSpec(shape=(None, *sample_shape), dtype=tf.float32)
-    output_signature = ((batch_spec, batch_spec, batch_spec), batch_spec)
+    # deterministic=True keeps the emitted batch ORDER identical to the index stream even
+    # with parallel in-flight gathers (and matches --tf-deterministic-ops semantics, which
+    # would force it anyway).
+    def _distributed_from_index_generator(generator_fn, per_replica_rows):
+        index_spec = tf.TensorSpec(shape=(None, per_replica_rows), dtype=tf.int64)
 
-    # Create datasets using generators to reduce GPU memory pressure
-    # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the generators yield data in global batches before being sharded (distributed)
-    # across replicas, ensuring per replica batch sizes match expectations
+        def dataset_fn(_input_context):
+            return (
+                tf.data.Dataset.from_generator(generator_fn, output_signature=index_spec)
+                .unbatch()  # epoch table -> per-replica index batches, in pure TF
+                .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
+                .repeat()
+                .prefetch(tf.data.AUTOTUNE)
+            )
+
+        # fetch_to_device prefetches each replica's next batches into device memory, so the
+        # host→device copy overlaps compute instead of serializing inside the step. The
+        # buffer costs per_replica_buffer_size * ~76 MB of VRAM per GPU at production shapes.
+        input_options = tf.distribute.InputOptions(
+            experimental_fetch_to_device=True,
+            experimental_per_replica_buffer_size=2,
+        )
+        return strategy.distribute_datasets_from_function(dataset_fn, input_options)
+
     logger.info(
-        f"Creating infinite batched datasets from generators with global batch size - "
-        f"Train: {global_train_batch_size}, Val: {global_val_batch_size}"
+        f"Creating infinite per-replica datasets from index generators with global batch size - "
+        f"Train: {global_train_batch_size}, Val: {global_val_batch_size} "
+        f"(distributed across {num_replicas} GPUs)"
     )
 
-    train_dataset = (
-        tf.data.Dataset.from_generator(train_generator, output_signature=output_signature)
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
+    train_dataset_distributed = _distributed_from_index_generator(
+        train_index_generator, per_replica_batch_size
     )
-
-    val_dataset = (
-        tf.data.Dataset.from_generator(val_generator, output_signature=output_signature)
-        # NOTE: do we need repeat for val dataset? run test without repeat & see if anything breaks?
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
+    val_dataset_distributed = _distributed_from_index_generator(
+        val_index_generator, per_replica_val_batch_size
     )
-
-    # Distribute datasets across GPUs
-    logger.info(f"Distributing datasets across {num_replicas} GPUs")
-
-    train_dataset_distributed = strategy.experimental_distribute_dataset(train_dataset)
-    val_dataset_distributed = strategy.experimental_distribute_dataset(val_dataset)
 
     # Calculate steps
     train_steps = n_train_trimmed // effective_batch_size
@@ -777,52 +1004,54 @@ def prepare_distributed_viz_dataset(
 
     viz_holder = VizDataHolder(padded_data)
 
-    # Create generator function yielding whole global batches — this feeds
-    # _capture_latent_snapshot every latent_viz_step_interval training steps, so per-sample
-    # yields here used to tax every capture during the epoch loop
-    def viz_generator():
+    # Zero-copy CPU tensor view for the graph-side gather (same machinery as the train
+    # datasets — see prepare_distributed_train_dataset / _as_cpu_tensor). This feeds
+    # _capture_latent_snapshot every latent_viz_step_interval training steps, so Python in
+    # this path used to tax every capture during the epoch loop.
+    viz_t = _as_cpu_tensor(padded_data)
+
+    # Index generator yielding one full pass of PER-REPLICA contiguous index slices per
+    # yield (row g*num_replicas + r is replica r's slice of global batch g — the same
+    # consecutive-element convention as the train datasets, reproducing the old contiguous
+    # global-batch split exactly); a pure-TF .unbatch() streams the rows out, so Python is
+    # touched once per pass rather than once per batch.
+    # WARN: DO NOT SHUFFLE viz indices, OR ELSE YOU'LL BREAK plot_latent_space_gif() —
+    # contiguous in-order slices preserve the original cadence order on every pass
+    # (n_padded is an exact multiple of the global batch size, so slices are whole)
+    def viz_index_generator():
         while True:  # Make generator infinite to reset state between passes
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
             with viz_holder._lock:
                 if viz_holder._cleared:
                     return  # Exit if data already cleared
-                # Cache references while holding lock
-                concat = viz_holder.concat
 
-            # WARN: DO NOT SHUFFLE viz_generator(), OR ELSE YOU'LL BREAK plot_latent_space_gif()
-            # Contiguous in-order slices preserve the original cadence order on every pass
-            # (n_padded is an exact multiple of the global batch size, so slices are whole)
-            for start in range(0, len(concat), global_viz_batch_size):
-                yield concat[start : start + global_viz_batch_size]
+            yield np.arange(n_padded, dtype=np.int64).reshape(-1, per_replica_inf_batch_size)
 
-            # Remove cache references for future garbage collection
-            del concat
+    index_spec = tf.TensorSpec(shape=(None, per_replica_inf_batch_size), dtype=tf.int64)
 
-    # Determine dataset output signature: the generator yields whole global batches, so the
-    # spec carries a leading (None) batch dimension and no .batch() call is applied downstream
-    sample_shape = padded_data.shape[1:]
-    output_signature = tf.TensorSpec(shape=(None, *sample_shape), dtype=tf.float32)
+    def map_gather(batch_indices):
+        with tf.device("/CPU:0"):
+            return tf.cast(tf.gather(viz_t, batch_indices), tf.float32)
 
-    # Create dataset using generator to reduce GPU memory pressure
-    # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the generator yields data in global batches before being sharded (distributed)
-    # across replicas, ensuring per replica batch sizes match expectations
     logger.info(
-        f"Creating infinite batched dataset from generator with global batch size: {global_viz_batch_size}"
+        f"Creating infinite per-replica viz dataset with global batch size: "
+        f"{global_viz_batch_size} (distributed across {num_replicas} GPUs)"
     )
 
-    viz_dataset = (
-        tf.data.Dataset.from_generator(viz_generator, output_signature=output_signature)
-        # NOTE: do we need repeat for viz dataset? run test without repeat & see if anything breaks?
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
+    def dataset_fn(_input_context):
+        return (
+            tf.data.Dataset.from_generator(viz_index_generator, output_signature=index_spec)
+            .unbatch()  # pass table -> per-replica index batches, in pure TF
+            .map(map_gather, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
+            # NOTE: do we need repeat for viz dataset? run test without repeat & see if anything breaks?
+            .repeat()
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
+    input_options = tf.distribute.InputOptions(
+        experimental_fetch_to_device=True,
+        experimental_per_replica_buffer_size=2,
     )
-
-    # Distribute dataset across GPUs
-    logger.info(f"Distributing dataset across {num_replicas} GPUs")
-
-    viz_dataset_distributed = strategy.experimental_distribute_dataset(viz_dataset)
+    viz_dataset_distributed = strategy.distribute_datasets_from_function(dataset_fn, input_options)
 
     # Calculate steps
     viz_steps = n_padded // global_viz_batch_size
@@ -888,27 +1117,21 @@ class TrainingPipeline:
         if self.db is None:
             raise ValueError("get_db() returned None")
 
-        # Reproducibility: seed TF's global RNG before any model/variable creation so weight
-        # initialization (HeNormal/GlorotNormal) and the VAE Sampling layer draw
-        # deterministic streams. numpy/python randomness is NOT globally seeded here — each
-        # consumer derives its own independent stream from the same root seed (see
-        # aetherscan.seeding.derive_rng and its call sites). No-op when seed is None
-        if self.config.training.seed is not None:
-            tf.random.set_seed(self.config.training.seed)
-            logger.info(f"Seeded TF global RNG from root seed {self.config.training.seed}")
-        if self.config.training.tf_deterministic_ops:
-            # Deterministic cuDNN/reduction kernels for bit-exact GPU reproducibility, at
-            # some training-speed cost. Only useful alongside a root seed
-            tf.config.experimental.enable_op_determinism()
-            logger.info("TF op determinism enabled (deterministic GPU kernels)")
-            if self.config.training.seed is None:
-                # Without a seed the deterministic kernels cost speed but buy no
-                # reproducibility (TF's global RNG stays unseeded) — warn so it isn't silent.
-                logger.warning(
-                    "tf_deterministic_ops is enabled but --seed is not set: deterministic "
-                    "kernels incur a speed cost without making the run reproducible. Pass "
-                    "--seed to seed the RNG streams."
-                )
+        # Reproducibility (#279): seed TF's global RNG before any model/variable creation so
+        # weight initialization (HeNormal/GlorotNormal) draws a deterministic stream. The
+        # shared seeding helper is used by BOTH pipeline constructors so training and
+        # inference can't drift; train_round re-seeds per round (sub-key = round number) so a
+        # resumed run reproduces an uninterrupted one. numpy/python randomness is NOT
+        # globally seeded here — each consumer derives its own independent stream from the
+        # same root (see aetherscan.seeding). No-op when the root seed is None
+        applied_tf_seed = seed_tensorflow(
+            self.config.reproducibility.seed, self.config.reproducibility.tf_deterministic_ops, 0
+        )
+        if applied_tf_seed is not None:
+            logger.info(
+                f"Seeded TF global RNG from root seed {self.config.reproducibility.seed} "
+                f"(derived training stream seed {applied_tf_seed})"
+            )
 
         # Load (or create) the persisted run manifest for this tag. This resolves
         # self.start_time (wall clock of attempt 1 — used by every DB query/plot, so retries
@@ -935,11 +1158,25 @@ class TrainingPipeline:
         self._latent_viz_labels = None
         self._latent_viz_lognorm_params = None
         self._latent_viz_dataset = None
+        self._latent_viz_iterator = None
         self._latent_viz_n_padded = None
         self._latent_viz_n_samples = None
         self._latent_viz_steps = None
         self._latent_viz_holder = None
         self._viz_encode_fn = None
+
+        # Graph-side accumulation state (built lazily by _ensure_accumulation_state on the
+        # first epoch: the accumulator variables must be created inside strategy.scope, and
+        # doing it here would pay the allocation even for resume paths that never train).
+        # _accumulated_train_step_fns / _val_loop_fns cache one traced tf.function per
+        # (accumulation_steps,) / (val_steps,) value so a config change can never silently
+        # reuse a graph built for a different K.
+        self._grad_accumulators: list[tf.Variable] | None = None
+        self._train_loss_accumulators: dict[str, tf.Variable] | None = None
+        self._val_loss_accumulator: tf.Variable | None = None
+        self._unconnected_grad_indices: set[int] = set()
+        self._accumulated_train_step_fns: dict[int, Callable] = {}
+        self._val_loop_fns: dict[int, Callable] = {}
 
         # Initialize RF model as None
         self.rf_model = None
@@ -1300,7 +1537,7 @@ class TrainingPipeline:
                     time_resolution=self.data_generator.time_resolution,
                     db=self.db,
                     tag=self.config.checkpoint.save_tag,
-                    seed=self.config.training.seed,
+                    seed=self.config.reproducibility.seed,
                 )
                 self._round_producer.start()
                 # Kick off the first round's data right away (nothing to overlap with yet —
@@ -1368,6 +1605,16 @@ class TrainingPipeline:
         paths = RoundDataPaths.for_round(self._round_data_base_dir, round_number)
         round_trained = False  # Set True once the round fully completes (drives dir deletion)
 
+        # Re-seed TF's global RNG per round, sub-keyed by round number (#279): a resumed run
+        # skips completed rounds, which would otherwise leave the single __init__-time stream
+        # at a different position than an uninterrupted run — with per-round keys, round k's
+        # TF draws (VAE sampling, dropout-free here but future-proof) depend only on
+        # (root, round). deterministic_ops=False: already applied once in __init__
+        seed_tensorflow(self.config.reproducibility.seed, False, 0, round_number)
+
+        # Fresh low-KL streak counters for this round's posterior-collapse guard (#282)
+        self._kl_low_streaks = np.zeros(self.config.beta_vae.latent_dim, dtype=np.int64)
+
         # Obtain this round's disk-backed data: reuse a validated on-disk dataset if one
         # exists, otherwise wait on the background producer (which was asked to generate it
         # while the previous round trained) or generate in-process (overlap disabled)
@@ -1419,7 +1666,7 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=True,
-            rng=derive_rng(self.config.training.seed, STREAM_DATASET, round_number),
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_DATASET, round_number),
         )
 
         # Free the dict shell (original arrays stay alive via the shared train_holder)
@@ -1465,7 +1712,19 @@ class TrainingPipeline:
         )
         logger.info(f"Gradients accumulated every {accumulation_steps} sub-steps")
 
+        train_iterator = None
+        val_iterator = None
         try:
+            # ONE distributed iterator per dataset for the WHOLE round, not one per epoch:
+            # the datasets are infinite (the index generators reshuffle at every wrap, so
+            # epoch boundaries are purely step-counted), and a fresh per-epoch iterator both
+            # discards whatever the pipeline had prefetched across the boundary and hands
+            # the traced step functions a new iterator object every epoch — under
+            # MirroredStrategy that meant a retrace of the accumulated-step and val-loop
+            # graphs per epoch, which dominated the epoch wall at production step counts.
+            train_iterator = iter(train_dataset)
+            val_iterator = iter(val_dataset)
+
             # Round-level epoch span (per-epoch durations already live in training_stats).
             # stage_timer records the span even on a mid-loop exception (status=failed).
             with stage_timer("epochs"):
@@ -1476,7 +1735,7 @@ class TrainingPipeline:
                         epoch,
                         snr_base,
                         snr_range,
-                        train_dataset,
+                        train_iterator,
                         steps_per_epoch,
                         accumulation_steps,
                         time.time(),
@@ -1484,7 +1743,7 @@ class TrainingPipeline:
 
                     # Validation
                     val_losses, val_duration = self._validate_epoch(
-                        val_dataset, val_steps, time.time()
+                        val_iterator, val_steps, time.time()
                     )
 
                     # Queue db writes (non-blocking) & log results
@@ -1512,6 +1771,26 @@ class TrainingPipeline:
                             tag=self.config.checkpoint.save_tag,
                             timestamp=current_time,
                         )
+
+                    # Per-dimension KL (#282 posterior-collapse diagnostics): latent_dim
+                    # rows per epoch — negligible volume, powers the KL heatmap and the
+                    # active-units-vs-epoch curve
+                    kl_per_dim = np.asarray(epoch_losses["kl_per_dim"]).ravel()
+                    for dim_idx, dim_kl in enumerate(kl_per_dim):
+                        self.db.write_training_stat(
+                            model_name="beta_vae",
+                            stat_name=f"kl_dim_{dim_idx:02d}",
+                            value=float(dim_kl),
+                            round_number=round_idx + 1,
+                            epoch_number=epoch + 1,
+                            tag=self.config.checkpoint.save_tag,
+                            timestamp=current_time,
+                        )
+                    # Consecutive low-KL epoch streaks feed check_posterior_collapse at
+                    # round end (a dim parked under epsilon for `patience` epochs is
+                    # collapsing even if the batch-mean wobbles above zero)
+                    low = kl_per_dim < self.config.training.posterior_collapse_kl_epsilon
+                    self._kl_low_streaks = np.where(low, self._kl_low_streaks + 1, 0)
 
                     # Validation losses
                     for stat_name, key in [
@@ -1651,21 +1930,53 @@ class TrainingPipeline:
                     # Adaptive learning rate
                     self._update_learning_rate(val_losses)
 
+            # Posterior-collapse guard (#282): WARN loudly (reaches Slack) when latent dims
+            # are going dark — same non-fatal advisory idiom as check_val_auc_floor
+            check_posterior_collapse(
+                kl_per_dim=np.asarray(epoch_losses["kl_per_dim"]).ravel(),
+                low_kl_streaks=self._kl_low_streaks,
+                kl_epsilon=self.config.training.posterior_collapse_kl_epsilon,
+                min_active_fraction=self.config.training.min_active_units_fraction,
+                patience=self.config.training.posterior_collapse_patience,
+                tag=f"round_{round_idx + 1:02d}",
+            )
+
             # NOTE: combine plot_beta_vae_loss_curves(), plot_beta_vae_training_stability(), and plot_latent_space_gif() into plot_training_progress()?
             with stage_timer("plots"):
-                # Plot loss curves
-                self.plot_beta_vae_loss_curves(tag=f"round_{round_idx + 1:02d}", dir="checkpoints")
-
-                # Plot clipping rate
-                self.plot_beta_vae_training_stability(
-                    tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
-                )
-
-                # Plot injection stats
-                self.plot_injection_stats(
-                    tag=f"round_{round_idx + 1:02d}",
-                    dir="checkpoints",
-                )
+                # Per-round plots are best-effort (#277): a failed or skipped plot must never
+                # fail the round (a retry would regenerate the round data from scratch). The
+                # canonical full-run figures render again in the vae_plots stage, where
+                # _run_plot_group records failures as non-critical.
+                per_round_plots = [
+                    (
+                        "plot_beta_vae_loss_curves",
+                        lambda: self.plot_beta_vae_loss_curves(
+                            tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+                        ),
+                    ),
+                    (
+                        "plot_beta_vae_training_stability",
+                        lambda: self.plot_beta_vae_training_stability(
+                            tag=f"round_{round_idx + 1:02d}", dir="checkpoints"
+                        ),
+                    ),
+                    (
+                        "plot_injection_stats",
+                        lambda: self.plot_injection_stats(
+                            tag=f"round_{round_idx + 1:02d}",
+                            dir="checkpoints",
+                            round_number=round_idx + 1,
+                        ),
+                    ),
+                ]
+                for plot_name, plot_fn in per_round_plots:
+                    try:
+                        plot_fn()
+                    except Exception as e:
+                        logger.error(
+                            f"Skipped/failed {plot_name} for round {round_idx + 1} "
+                            f"(non-critical, round continues): {e}"
+                        )
 
                 # Optional per-round latent traversal (config-gated; the canonical set
                 # renders once at end of training in the vae_plots stage). Failures are
@@ -1702,11 +2013,15 @@ class TrainingPipeline:
         # Run cleanup regardless if round finishes successfully or not
         finally:
             # NOTE: should check to make sure train_holder & datasets exist first
-            # Clear intermediate data
+            # Iterators first (bench_input_pipeline teardown order: iterator -> dataset ->
+            # clear), then clear intermediate data
+            del train_iterator, val_iterator
             train_holder.clear()
             del train_dataset, val_dataset
 
-            # Clear latent viz distributed dataset (rebuilt each round)
+            # Clear latent viz distributed dataset (rebuilt each round); iterator dropped
+            # BEFORE the holder clear, same teardown order as the train/val iterators
+            self._latent_viz_iterator = None
             if self._latent_viz_holder is not None:
                 self._latent_viz_holder.clear()
             self._latent_viz_dataset = None
@@ -1738,113 +2053,277 @@ class TrainingPipeline:
                 shutil.rmtree(paths.round_dir, ignore_errors=True)
                 logger.info(f"Deleted round {round_number} data directory: {paths.round_dir}")
 
+    # Maps epoch-loss dict keys to the keys compute_total_loss returns; "kl_per_dim" is the
+    # vector-valued (latent_dim,) #282 diagnostic and accumulates like the scalars
+    _LOSS_KEY_MAP = (
+        ("total", "total_loss"),
+        ("reconstruction", "reconstruction_loss"),
+        ("kl", "kl_loss"),
+        ("true", "true_loss"),
+        ("false", "false_loss"),
+        ("kl_per_dim", "kl_per_dim"),
+    )
+
+    def _ensure_accumulation_state(self):
+        """
+        Lazily create the graph-side accumulation state: one gradient accumulator per
+        trainable variable, the train loss accumulators (5 scalars + the (latent_dim,)
+        per-dim KL vector), and the (5,) val loss accumulator.
+
+        ON_READ synchronization makes assign_add inside strategy.run a replica-LOCAL update
+        (no communication per micro-batch); reading the variable back in cross-replica
+        context performs a single aggregation — SUM across replicas for gradients, MEAN for
+        losses. One optimizer step therefore costs exactly one cross-replica reduction per
+        variable, instead of one per variable per micro-batch as the pre-#276-follow-up
+        implementation did. Created inside strategy.scope() per the repo hard rule.
+        """
+        if self._grad_accumulators is not None:
+            return
+
+        with self.strategy.scope():
+            self._grad_accumulators = [
+                tf.Variable(
+                    tf.zeros_like(v),
+                    trainable=False,
+                    synchronization=tf.VariableSynchronization.ON_READ,
+                    aggregation=tf.VariableAggregation.SUM,
+                )
+                for v in self.vae.trainable_variables
+            ]
+
+            def _loss_accumulator(shape):
+                return tf.Variable(
+                    tf.zeros(shape, dtype=tf.float32),
+                    trainable=False,
+                    synchronization=tf.VariableSynchronization.ON_READ,
+                    aggregation=tf.VariableAggregation.MEAN,
+                )
+
+            self._train_loss_accumulators = {
+                name: _loss_accumulator(
+                    [self.config.beta_vae.latent_dim] if name == "kl_per_dim" else []
+                )
+                for name, _ in self._LOSS_KEY_MAP
+            }
+            # One (5,) vector for the val losses, ordered as _LOSS_KEY_MAP minus kl_per_dim
+            self._val_loss_accumulator = _loss_accumulator([5])
+
+    def _accumulate_micro_batch(self, batch_data):
+        """
+        Per-replica micro-batch: forward + backward, accumulating gradients and losses into
+        the replica-local ON_READ accumulators. Runs under strategy.run inside the
+        accumulated-train-step graph — there is no cross-replica communication here.
+        """
+        x, y = batch_data
+        main_data = x[0]
+        true_data = x[1]
+        false_data = x[2]
+
+        with tf.GradientTape() as tape:
+            losses = self.vae.compute_total_loss(main_data, true_data, false_data, y, training=True)
+
+        gradients = tape.gradient(losses["total_loss"], self.vae.trainable_variables)
+
+        for idx, (accumulator, grad) in enumerate(
+            zip(self._grad_accumulators, gradients, strict=False)
+        ):
+            if grad is None:
+                # Trace-time bookkeeping (this branch never becomes graph ops): the variable
+                # is structurally disconnected from the loss, so the apply step must skip it
+                # — exactly what apply_gradients did with the None entries the previous
+                # Python-side accumulation forwarded. Expected empty for the beta-VAE.
+                # The set is instance-scoped and shared across every traced K: that is safe
+                # only because loss↔variable connectivity is a property of the model graph,
+                # independent of accumulation depth — if compute_total_loss ever grows
+                # K-dependent branches, give each traced K its own set.
+                self._unconnected_grad_indices.add(idx)
+            else:
+                accumulator.assign_add(grad)
+
+        for name, loss_key in self._LOSS_KEY_MAP:
+            self._train_loss_accumulators[name].assign_add(losses[loss_key])
+
+    def _accumulate_val_micro_batch(self, batch_data):
+        """Per-replica val micro-batch: forward only, losses into the (5,) accumulator."""
+        x, y = batch_data
+        losses = self.vae.compute_total_loss(x[0], x[1], x[2], y, training=False)
+        self._val_loss_accumulator.assign_add(
+            tf.stack([losses[key] for _, key in self._LOSS_KEY_MAP[:5]])
+        )
+
+    def _get_accumulated_train_step(self, accumulation_steps: int) -> Callable:
+        """Traced accumulated-train-step for this K, built once and cached."""
+        fn = self._accumulated_train_step_fns.get(accumulation_steps)
+        if fn is None:
+            fn = self._build_accumulated_train_step(accumulation_steps)
+            self._accumulated_train_step_fns[accumulation_steps] = fn
+        return fn
+
+    def _build_accumulated_train_step(self, accumulation_steps: int) -> Callable:
+        """
+        Build the tf.function that performs ONE full optimizer step: K micro-batches
+        accumulated per replica, one cross-replica reduction per variable, NaN/Inf guard,
+        global-norm clip, apply, reset. The interpreter is re-entered once per optimizer
+        step instead of once per micro-batch (plus per-variable eager ops), which removes
+        the Python/GIL cost that dominated the #276 audit's host-side wall — and makes the
+        steady-state loop immune to GIL competition from the DB writer / producer threads.
+
+        tf.range (not python range) keeps the K micro-batches as a sequential graph loop:
+        one traced body instead of K unrolled copies, and — critically for the 16 GB
+        A4000 release host — at most one micro-batch's activations in flight per replica,
+        so peak VRAM stays at the K=1 level (an unrolled loop measured 23.4 GB/GPU at
+        K=12 on blpc3 from overlapped activations).
+
+        Gradient semantics match the previous implementation exactly (up to float summation
+        order): per-replica sums over K micro-batches, MEAN across replicas, averaged over
+        K, then clipped by global L2 norm at 1.0 and applied once. Clipping rationale
+        (unchanged): the global-norm form preserves the gradient direction while bounding
+        magnitude — appropriate for this beta-VAE's heterogeneous gradient scales
+        (reconstruction + KL components); per-tensor clipping would distort direction.
+        Healthy training keeps global_norm below clip_norm with only occasional clips; if
+        clipping becomes frequent, raise clip_norm rather than dampening learning.
+        """
+        strategy = self.strategy
+
+        @tf.function
+        def accumulated_train_step(iterator):
+            for _ in tf.range(accumulation_steps):
+                strategy.run(self._accumulate_micro_batch, args=(next(iterator),))
+
+            # Reading the ON_READ accumulators in cross-replica context SUMs across
+            # replicas; scale to the mean-over-replicas, mean-over-micro-batches gradient
+            scale = tf.cast(accumulation_steps * strategy.num_replicas_in_sync, tf.float32)
+            gradients = [acc.read_value() / scale for acc in self._grad_accumulators]
+
+            trainable = self.vae.trainable_variables
+            included = [
+                (grad, var)
+                for idx, (grad, var) in enumerate(zip(gradients, trainable, strict=False))
+                if idx not in self._unconnected_grad_indices
+            ]
+            included_grads = [grad for grad, _ in included]
+
+            # NaN/Inf guard on the averaged pre-clip gradients (same point the previous
+            # implementation checked); the apply is skipped on a bad step so the weights
+            # are never corrupted — the Python caller then raises, matching the old
+            # behavior observable to everything downstream
+            all_finite = tf.reduce_all(
+                tf.stack([tf.reduce_all(tf.math.is_finite(g)) for g in included_grads])
+            )
+            global_norm = tf.linalg.global_norm(included_grads)
+
+            def _clip_and_apply():
+                clipped, _ = tf.clip_by_global_norm(
+                    included_grads, _GRADIENT_CLIP_NORM, use_norm=global_norm
+                )
+                self.vae.optimizer.apply_gradients(
+                    zip(clipped, [var for _, var in included], strict=False)
+                )
+                return tf.constant(True)
+
+            applied = tf.cond(all_finite, _clip_and_apply, lambda: tf.constant(False))
+
+            # Aggregated (MEAN across replicas) losses, averaged over the K micro-batches.
+            # Auto control dependencies order these reads after the accumulation loop and
+            # the resets below after the reads — resource ops on one variable never reorder
+            losses = {
+                name: self._train_loss_accumulators[name].read_value()
+                / tf.cast(accumulation_steps, tf.float32)
+                for name, _ in self._LOSS_KEY_MAP
+            }
+
+            for acc in self._grad_accumulators:
+                acc.assign(tf.zeros_like(acc))
+            for var in self._train_loss_accumulators.values():
+                var.assign(tf.zeros_like(var))
+
+            return losses, global_norm, applied
+
+        return accumulated_train_step
+
+    def _get_val_loop(self, val_steps: int) -> Callable:
+        """Traced whole-epoch val loop for this step count, built once and cached."""
+        fn = self._val_loop_fns.get(val_steps)
+        if fn is None:
+            fn = self._build_val_loop(val_steps)
+            self._val_loop_fns[val_steps] = fn
+        return fn
+
+    def _build_val_loop(self, val_steps: int) -> Callable:
+        """One tf.function for the whole validation epoch: val_steps forward micro-batches
+        accumulated per replica, one MEAN aggregation at the end — a single interpreter
+        re-entry per val epoch instead of one (plus five strategy.reduce calls) per batch."""
+        strategy = self.strategy
+
+        @tf.function
+        def val_loop(iterator):
+            for _ in tf.range(val_steps):
+                strategy.run(self._accumulate_val_micro_batch, args=(next(iterator),))
+            totals = self._val_loss_accumulator.read_value() / tf.cast(val_steps, tf.float32)
+            self._val_loss_accumulator.assign(tf.zeros_like(self._val_loss_accumulator))
+            return totals
+
+        return val_loop
+
     def _train_epoch(
         self,
         round_idx,
         epoch_idx,
         snr_base,
         snr_range,
-        dataset,
+        iterator,
         steps_per_epoch,
         accumulation_steps=1,
         start_time=None,
     ):
         """
-        Perform a single training epoch with gradient accumulation
+        Perform a single training epoch with gradient accumulation.
+
+        `iterator` is the round-scoped distributed iterator train_round creates once and
+        passes to every epoch (the datasets are infinite; epoch boundaries are step-counted,
+        and the underlying index generators reshuffle at each wrap). Handing the SAME
+        iterator object to the traced step function every epoch is what keeps it from
+        retracing — a fresh per-epoch iterator forced a per-epoch retrace of the
+        accumulated-step graph under MirroredStrategy.
+
+        Each optimizer step is one call into the traced accumulated-train-step graph (see
+        _build_accumulated_train_step); Python-side work per step is a handful of scalar
+        fetches and dict updates, plus the periodic latent snapshot.
         """
         if not start_time:
             start_time = time.time()
 
-        epoch_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
+        self._ensure_accumulation_state()
+        train_step_fn = self._get_accumulated_train_step(accumulation_steps)
+
+        epoch_losses = {
+            "total": 0.0,
+            "reconstruction": 0.0,
+            "kl": 0.0,
+            "true": 0.0,
+            "false": 0.0,
+            # Vector-valued (latent_dim,) — accumulates like the scalars (#282 diagnostics)
+            "kl_per_dim": np.zeros(self.config.beta_vae.latent_dim, dtype=np.float64),
+        }
         epoch_gradient_norms = []
-        iterator = iter(dataset)
 
         try:
             for step in range(steps_per_epoch):
-                step_losses = {
-                    "total": 0.0,
-                    "reconstruction": 0.0,
-                    "kl": 0.0,
-                    "true": 0.0,
-                    "false": 0.0,
-                }
+                step_losses, global_norm, applied = train_step_fn(iterator)
 
-                # Initialize accumulated gradients
-                accumulated_gradients = None
-                successful_accumulations = 0
-
-                # Process sub-steps for gradient accumulation
-                for sub_step in range(accumulation_steps):
-                    try:
-                        micro_batch = next(iterator)
-
-                        # Compute gradients & losses
-                        micro_grads, micro_losses = self._distributed_train_step(micro_batch)
-
-                        # NOTE: come back to this later (any or all?)
-                        # Sanity check: verify gradients are valid before accumulating
-                        if micro_grads is None or all(g is None for g in micro_grads):
-                            logger.warning(
-                                f"Step {step + 1}, sub-step {sub_step + 1}: "
-                                f"All gradients are None, skipping this micro-batch"
-                            )
-                            continue
-
-                        # Accumulate gradients over sub-steps
-                        if accumulated_gradients is None:
-                            accumulated_gradients = micro_grads
-                        else:
-                            accumulated_gradients = [
-                                # NOTE: come back to this later (what if ag and g are both None)
-                                ag + g if ag is not None and g is not None else ag or g
-                                for ag, g in zip(accumulated_gradients, micro_grads, strict=False)
-                            ]
-
-                        successful_accumulations += 1
-
-                        # Accumulate losses over sub-steps
-                        for key in step_losses:
-                            step_losses[key] += micro_losses[key]
-
-                    except StopIteration:  # Empty dataset
-                        logger.error(
-                            f"Dataset exhausted at step {step + 1}, sub-step {sub_step + 1}"
-                        )
-                        raise  # Re-raise to propagate error
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error during gradient computation at step {step + 1}, sub-step {sub_step + 1}: {e}"
-                        )
-                        raise  # Re-raise to propagate error
-
-                # Sanity check: verify that gradient accumulation was successful
-                if accumulated_gradients is None or successful_accumulations == 0:
-                    logger.error(f"Step {step + 1}: No valid gradients accumulated!")
-                    raise RuntimeError(f"Failed to accumulate gradients at step {step + 1}")
-
-                # Average accumulated gradients over sub-steps
-                accumulated_gradients = [
-                    g / successful_accumulations if g is not None else None
-                    for g in accumulated_gradients
-                ]
-
-                # Sanity check: verify no NaN/Inf in gradients
-                has_nan_or_inf = False
-                for g in accumulated_gradients:
-                    if g is not None and (
-                        tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g))
-                    ):
-                        has_nan_or_inf = True
-                        break
-
-                if has_nan_or_inf:
-                    logger.error(f"Step {step + 1}: NaN or Inf detected in gradients!")
+                if not bool(applied.numpy()):
+                    logger.error(f"Step {step + 1}: NaN/Inf detected in averaged gradients!")
                     raise RuntimeError(f"NaN/Inf gradients at step {step + 1}")
 
-                # Apply accumulated gradients
-                global_norm = self._apply_gradients(accumulated_gradients)
-                epoch_gradient_norms.append(float(global_norm))
+                epoch_gradient_norms.append(float(global_norm.numpy()))
+
+                # Accumulate epoch losses over training steps (already averaged over
+                # micro-batches and replicas in-graph)
+                for key, value in step_losses.items():
+                    if key == "kl_per_dim":
+                        epoch_losses[key] += value.numpy().astype(np.float64)
+                    else:
+                        epoch_losses[key] += float(value.numpy())
 
                 # Capture latent snapshot every N steps, and on the final step
                 is_interval_step = (step + 1) % self.config.training.latent_viz_step_interval == 0
@@ -1857,13 +2336,6 @@ class TrainingPipeline:
                         snr_base,
                         snr_range,
                     )
-
-                for key, loss in step_losses.items():
-                    # Average step losses over sub-steps
-                    avg_loss = loss / successful_accumulations
-                    step_losses[key] = avg_loss
-                    # Accumulate epoch losses over training steps
-                    epoch_losses[key] += avg_loss
 
             # Average epoch losses over training steps
             for key in epoch_losses:
@@ -1878,36 +2350,28 @@ class TrainingPipeline:
             logger.error(f"Error in _train_epoch(): {e}")
             raise  # Re-raise to propagate error
 
-        # Run cleanup regardless if epoch finishes successfully or not
+        # Run cleanup regardless if epoch finishes successfully or not (the round-scoped
+        # iterator is train_round's to tear down)
         finally:
-            # NOTE: should check to make sure iterator exists first
-            del iterator
             gc.collect()
 
-    def _validate_epoch(self, dataset, steps, start_time=None):
+    def _validate_epoch(self, iterator, steps, start_time=None):
         """
-        Perform a single validation epoch
+        Perform a single validation epoch (one traced graph call — see _build_val_loop).
+        `iterator` is round-scoped, like _train_epoch's — same retrace rationale.
         """
         if not start_time:
             start_time = time.time()
 
-        val_losses = {"total": 0.0, "reconstruction": 0.0, "kl": 0.0, "true": 0.0, "false": 0.0}
-        iterator = iter(dataset)
+        self._ensure_accumulation_state()
+        val_loop_fn = self._get_val_loop(steps)
 
         try:
-            for _step in range(steps):
-                batch = next(iterator)
-
-                # Compute losses
-                step_losses = self._distributed_val_step(batch)
-
-                # Accumulate validation losses over validation steps
-                for key in val_losses:
-                    val_losses[key] += step_losses[key]
-
-            # Average validation losses over validation steps
-            for key in val_losses:
-                val_losses[key] /= steps
+            totals = val_loop_fn(iterator).numpy()
+            val_losses = {
+                name: float(value)
+                for (name, _), value in zip(self._LOSS_KEY_MAP[:5], totals, strict=False)
+            }
 
             # Calculate val epoch duration
             val_duration = time.time() - start_time
@@ -1918,151 +2382,10 @@ class TrainingPipeline:
             logger.error(f"Error in _validate_epoch(): {e}")
             raise  # Re-raise to propagate error
 
-        # Run cleanup regardless if epoch finishes successfully or not
+        # Run cleanup regardless if epoch finishes successfully or not (the round-scoped
+        # iterator is train_round's to tear down)
         finally:
-            # NOTE: should check to make sure iterator exists first
-            del iterator
             gc.collect()
-
-    @tf.function
-    def _distributed_train_step(self, batch_data):
-        """
-        Perform a single distributed training step
-        Returns reduced gradients & losses
-        """
-        num_replicas = self.strategy.num_replicas_in_sync
-
-        def step_fn(data):
-            """Per-replica training step"""
-            x, y = data
-            main_data = x[0]
-            true_data = x[1]
-            false_data = x[2]
-
-            with tf.GradientTape() as tape:
-                # Compute losses
-                losses = self.vae.compute_total_loss(
-                    main_data, true_data, false_data, y, training=True
-                )
-
-            # Compute gradients
-            gradients = tape.gradient(losses["total_loss"], self.vae.trainable_variables)
-
-            return gradients, losses
-
-        # Run training step on all replicas
-        per_replica_grads, per_replica_losses = self.strategy.run(step_fn, args=(batch_data,))
-
-        # Reduce gradients across replicas
-        reduced_grads = []
-        for grad in per_replica_grads:
-            if grad is not None:
-                reduced_grad = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, grad, axis=None)
-                reduced_grads.append(reduced_grad)
-            else:
-                reduced_grads.append(None)
-
-        # Reduce losses across replicas
-        reduced_losses = {
-            "total": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["total_loss"], axis=None
-            ),
-            "reconstruction": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["reconstruction_loss"], axis=None
-            ),
-            "kl": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_loss"], axis=None
-            ),
-            "true": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["true_loss"], axis=None
-            ),
-            "false": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
-            ),
-        }
-
-        return reduced_grads, reduced_losses
-
-    @tf.function
-    def _apply_gradients(self, gradients):
-        """
-        Apply gradients after gradient clipping by global L2 norm
-        """
-        # TEST: is this still needed? currently every step seems to be getting clipped. what happens if we just don't?
-        # Clip gradients for additional stability
-        # Note, this step is optional but recommended given our beta-VAE architecture's
-        # heterogeneous gradient scale (reconstruction + KL loss components)
-        # Gradient clipping computes the global L2 norm across all gradient tensors, then rescales
-        # them proportionally if that norm exceeds some clip_norm threshold. This preserves the
-        # relative direction of the gradient vector in parameter space while simultaneously bounding
-        # its magnitude, maintaining the optimization trajectory's direction, which is critical for
-        # training stability
-        # Alternatively, per-tensor clipping (with tf.clip_by_norm() on each gradient independently)
-        # could also work, but may distort the gradient direction (parameters with smaller gradients
-        # get disproportionately boosted relative to those with larger gradients). Only use if you
-        # need layer-specific interventions (e.g. lower LR for encoder, or gradient clipping
-        # per-component, etc.)
-        # The 1.0 threshold was chosen to be aggressive enough to prevent exploding gradients, while
-        # permissive enough to not overly dampen learning. Healthy training should progress with
-        # global_norm consistently below clip_norm, with the occasional instability (e.g. due to bad
-        # batches, or KL spikes) getting caught & dampened. If you notice global_norm consistently
-        # exceeding clip_norm, even with adaptive LR in place, consider increasing clip_norm to
-        # allow more of the true gradients to pass through. A general heuristic for clip_norm is to
-        # have no more than 1-5% of steps trigger gradient clipping
-        clipped_gradients, global_norm = tf.clip_by_global_norm(gradients, 1.0)
-
-        # Apply gradients
-        self.vae.optimizer.apply_gradients(
-            zip(clipped_gradients, self.vae.trainable_variables, strict=False)
-        )
-
-        # Return pre-clipping global norm (for monitoring)
-        return global_norm
-
-    @tf.function
-    def _distributed_val_step(self, batch_data):
-        """
-        Perform a single distributed validation step
-        Returns reduced losses
-        """
-
-        def step_fn(data):
-            """Per-replica validation step"""
-            x, y = data
-            main_data = x[0]
-            true_data = x[1]
-            false_data = x[2]
-
-            # Compute losses
-            losses = self.vae.compute_total_loss(
-                main_data, true_data, false_data, y, training=False
-            )
-
-            return losses
-
-        # Run validation step on all replicas
-        per_replica_losses = self.strategy.run(step_fn, args=(batch_data,))
-
-        # Reduce losses across replicas
-        reduced_losses = {
-            "total": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["total_loss"], axis=None
-            ),
-            "reconstruction": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["reconstruction_loss"], axis=None
-            ),
-            "kl": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["kl_loss"], axis=None
-            ),
-            "true": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["true_loss"], axis=None
-            ),
-            "false": self.strategy.reduce(
-                tf.distribute.ReduceOp.MEAN, per_replica_losses["false_loss"], axis=None
-            ),
-        }
-
-        return reduced_losses
 
     def _calculate_curriculum_snr(self, round_idx: int) -> tuple[int, int]:
         """
@@ -2174,7 +2497,7 @@ class TrainingPipeline:
         return current_lr
 
     def _distributed_encode(
-        self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False
+        self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False, iterator=None
     ):
         """
         Run a provided @tf.function (`encode_fn`) over `n_steps` of a distributed `dataset` and
@@ -2184,9 +2507,17 @@ class TrainingPipeline:
         PerReplica tensor yields 1 output, a tuple of PerReplica tensors yields N. Per-replica
         results are gathered via experimental_local_results + np.concatenate, which is faster than
         a strategy-level gather over NCCL for the small latent payload.
+
+        `iterator` lets a caller that encodes REPEATEDLY from the same in-order infinite
+        dataset (the per-snapshot viz encode) supply a persistent iterator instead of paying
+        iter() + a gc pass per call (~1.2 s of the ~1.5 s per-snapshot cost, measured); the
+        caller then owns the iterator's lifecycle. One-shot callers (the RF stage) omit it
+        and keep the original create/teardown behavior.
         """
         # Process all batches
-        iterator = iter(dataset)
+        owns_iterator = iterator is None
+        if owns_iterator:
+            iterator = iter(dataset)
         current_idx = 0
         outputs = None
 
@@ -2221,7 +2552,6 @@ class TrainingPipeline:
                 current_idx += batch_size
 
                 del results
-                gc.collect()
 
             # Drift guard: the train/val datasets returned by
             # prepare_distributed_train_dataset() are .repeat()-ed, so the iterator
@@ -2243,9 +2573,13 @@ class TrainingPipeline:
             if logging:
                 logger.info(f"Finished encoding {n_steps} steps")
         finally:
-            # NOTE: should check to make sure iterator exists first
-            del iterator
-            gc.collect()
+            if owns_iterator:
+                del iterator
+                # One collection per encode pass — a per-batch gc.collect() here used to
+                # burn GIL-holding milliseconds hundreds of times per pass; callers with a
+                # persistent iterator skip even this (0.33 s/call measured, and the epoch
+                # loop's snapshot path is exactly that caller)
+                gc.collect()
 
         return outputs
 
@@ -2266,6 +2600,13 @@ class TrainingPipeline:
                 "skipping RF data generation and retraining"
             )
             return
+
+        # Re-seed TF for the RF stage, sub-keyed by the same num_training_rounds+1 sentinel
+        # as its data generation (#279): the sampled-z encodes below then reproduce whether
+        # the stage runs after 20 in-process rounds or first thing on a resumed attempt
+        seed_tensorflow(
+            self.config.reproducibility.seed, False, 0, self.config.training.num_training_rounds + 1
+        )
 
         # Initialize RF model
         if self.rf_model is None:
@@ -2354,9 +2695,11 @@ class TrainingPipeline:
             # resume_round (run_state.py) is max(completed_rounds) + 1, and completed_rounds only
             # ever holds values <= num_training_rounds, so _start_round <= num_training_rounds + 1
             # always — and rf_train only (re)starts once vae_rounds is fully done, i.e. exactly
-            # when _start_round == num_training_rounds + 1. round_number has no other consumer
-            # (plot_injection_stats/query_injection_stat don't filter or group by it), so this is
-            # safe to change without touching mark_superseded or the DB schema.
+            # when _start_round == num_training_rounds + 1. Since #277, plot_injection_stats
+            # scopes its queries to rounds 1..num_training_rounds, so this sentinel round is
+            # deliberately OUTSIDE every plotted range — RF-phase rows never appear in the
+            # injection figures. No other consumer filters or groups on round_number, so this
+            # is safe without touching mark_superseded or the DB schema.
             with stage_timer("data_generation", metadata={"source": "in-process"}):
                 self.data_generator.generate_round(
                     rf_paths,
@@ -2382,9 +2725,11 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=False,
-            # RF dataset uses the round-0 stream key, mirroring its data generation
-            # (beta-VAE rounds are 1-based, so no collision)
-            rng=derive_rng(self.config.training.seed, STREAM_DATASET, 0),
+            # RF dataset uses the round-0 STREAM_DATASET key (beta-VAE rounds are 1-based,
+            # so no collision). Its DATA GENERATION uses the num_training_rounds+1 sentinel
+            # on STREAM_DATA_GEN (see the round_num comment above) — different stream ids,
+            # so the keys need not (and do not) match.
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_DATASET, 0),
         )
 
         # NOTE: come back to this later
@@ -2413,7 +2758,9 @@ class TrainingPipeline:
             f"using distributed inference"
         )
 
-        # Create distributed inference function
+        # Create distributed inference function. Since #282 it returns ALL THREE encoder
+        # outputs — z_mean and z_log_var used to be computed and thrown away here, which is
+        # exactly what makes the 8-variant representation sweep below free on the GPU side.
         @tf.function
         def rf_encode_fn(batch_data):
             """Encode batch data using distributed strategy"""
@@ -2426,15 +2773,14 @@ class TrainingPipeline:
                 concat_reshaped = tf.reshape(concat_data, [-1, time_bins, width_bin, 1])
 
                 # Encode (returns z_mean, z_log_var, z)
-                _, _, concat_z = self.vae.encoder(concat_reshaped, training=False)
+                z_mean, z_log_var, concat_z = self.vae.encoder(concat_reshaped, training=False)
 
-                return concat_z
+                return z_mean, z_log_var, concat_z
 
-            per_replica_concat = self.strategy.run(encode_fn, args=(batch_data,))
-            return per_replica_concat
+            return self.strategy.run(encode_fn, args=(batch_data,))
 
-        train_latents = None
-        val_latents = None
+        train_z_mean = train_z_log_var = train_latents = None
+        val_z_mean = val_z_log_var = val_latents = None
 
         try:
             # train_steps accounts for gradient accumulation (each "step" = accumulation_steps
@@ -2454,7 +2800,7 @@ class TrainingPipeline:
             train_encode_steps = train_steps * accumulation_steps
 
             with stage_timer("encode"):
-                [train_latents] = self._distributed_encode(
+                [train_z_mean, train_z_log_var, train_latents] = self._distributed_encode(
                     dataset=train_dataset,
                     n_steps=train_encode_steps,
                     encode_fn=rf_encode_fn,
@@ -2463,7 +2809,7 @@ class TrainingPipeline:
                     logging=True,
                 )
 
-                [val_latents] = self._distributed_encode(
+                [val_z_mean, val_z_log_var, val_latents] = self._distributed_encode(
                     dataset=val_dataset,
                     n_steps=val_steps,
                     encode_fn=rf_encode_fn,
@@ -2484,27 +2830,279 @@ class TrainingPipeline:
                 [s.startswith("true_") for s in val_subtype_labels], dtype=np.int64
             )
 
-            # Train Random Forest classifier (passes latent_vectors; model flattens internally)
-            with stage_timer("fit"):
-                self.rf_model.train(train_latents, train_binary_labels)
-            logger.info("Random Forest training complete")
+            # ---------------------------------------------------------------- #282 sweep
+            # Flatten every encoder output into per-cadence blocks once; every variant's
+            # features are hstack compositions of these (see aetherscan.latent_variants)
+            train_mean_flat = prepare_latent_features(train_z_mean, num_observations)
+            train_logvar_flat = prepare_latent_features(train_z_log_var, num_observations)
+            train_z_flat = prepare_latent_features(train_latents, num_observations)
+            val_mean_flat = prepare_latent_features(val_z_mean, num_observations)
+            val_logvar_flat = prepare_latent_features(val_z_log_var, num_observations)
 
-            # NOTE: come back to this later (is it correct to call prepare_latent_features directly? this impacts the __init__.py in models/. what do we need features & probas for? why are we calling model.predict_proba directly? is it better to have a wrapper here? could we modify the return signature of predict_proba to return both features & probabilities?)
-            # Compute flattened features + val probas/preds for downstream plotting.
-            # val_preds is thresholded at inference.classification_threshold so the
-            # confusion matrix, SHAP correct/incorrect markers, and decision-boundary
-            # markers all reflect the model's deployment operating point — not
-            # sklearn's argmax default (implicitly 0.5 for the binary RF), which
-            # would understate FN / overstate TP relative to production behavior.
-            train_features = prepare_latent_features(train_latents, num_observations)
-            val_features = prepare_latent_features(val_latents, num_observations)
-            val_probas = self.rf_model.model.predict_proba(val_features)[:, 1].astype(np.float32)
+            root_seed = self.config.reproducibility.seed
+            rf_seed = self.config.resolved_rf_seed()
             classification_threshold = self.config.inference.classification_threshold
-            val_preds = (val_probas >= classification_threshold).astype(np.int64)
+            tag = self.config.checkpoint.save_tag
+
+            # Active Units (Burda et al.) on the train z_mean pool: sizes the collapse
+            # problem retroactively and gates the z_mean_logvar_active variant
+            active_dims = active_latent_dims(
+                train_mean_flat,
+                num_observations,
+                latent_dim,
+                self.config.rf.active_units_threshold,
+            )
+            logger.info(
+                f"Active latent dims (z_mean variance > "
+                f"{self.config.rf.active_units_threshold}): {len(active_dims)}/{latent_dim} "
+                f"-> {active_dims}"
+            )
+
+            # Partition the val split: selection (variant choice) / calibration (calibrator
+            # fit) / test (held-out release metrics — best-of-8 on the selection split alone
+            # would be optimistically biased). Seeded so the partition reproduces.
+            n_val_rows = len(val_binary_labels)
+            partition_rng = derive_rng(root_seed, STREAM_RF, 1)
+            permutation = partition_rng.permutation(n_val_rows)
+            n_selection = int(round(self.config.rf.val_selection_fraction * n_val_rows))
+            n_calibration = int(round(self.config.rf.val_calibration_fraction * n_val_rows))
+            selection_idx = permutation[:n_selection]
+            calibration_idx = permutation[n_selection : n_selection + n_calibration]
+            test_idx = permutation[n_selection + n_calibration :]
+
+            # Train EVERY variant on the same data and split; evaluate each under its
+            # DETERMINISTIC inference-time form (z_mean in the lead slot — for the z/z_aug
+            # variants that is deliberately the deployed configuration, not the training
+            # one). Cheap metrics for all; full diagnostics later for the winner only.
+            def _variant_train_matrix(variant):
+                if variant == "z":
+                    return train_z_flat, train_binary_labels
+                if variant == "z_aug":
+                    return build_z_aug_training_set(
+                        train_mean_flat,
+                        train_logvar_flat,
+                        train_binary_labels,
+                        self.config.rf.z_aug_draws,
+                        derive_rng(root_seed, STREAM_RF, 2),
+                    )
+                features = build_variant_features(
+                    variant,
+                    train_mean_flat,
+                    train_logvar_flat,
+                    num_observations,
+                    latent_dim,
+                    active_dims,
+                )
+                return features, train_binary_labels
+
+            variant_models: dict[str, RandomForestClassifier] = {}
+            variant_val_probas: dict[str, np.ndarray] = {}
+            variant_metrics: dict[str, dict[str, float]] = {}
+            with stage_timer("fit"):
+                for variant in VARIANT_ORDER:
+                    fit_features, fit_labels = _variant_train_matrix(variant)
+                    fit_features, fit_labels = sklearn_shuffle(
+                        fit_features, fit_labels, random_state=rf_seed
+                    )
+                    clf = RandomForestClassifier(
+                        n_estimators=self.config.rf.n_estimators,
+                        bootstrap=self.config.rf.bootstrap,
+                        max_features=self.config.rf.max_features,
+                        n_jobs=self.config.rf.n_jobs,
+                        random_state=rf_seed,
+                    )
+                    clf.fit(fit_features, fit_labels)
+                    variant_models[variant] = clf
+
+                    eval_features = build_variant_features(
+                        variant,
+                        val_mean_flat,
+                        val_logvar_flat,
+                        num_observations,
+                        latent_dim,
+                        active_dims,
+                    )
+                    probas = clf.predict_proba(eval_features)[:, 1].astype(np.float32)
+                    variant_val_probas[variant] = probas
+
+                    sel_labels = val_binary_labels[selection_idx]
+                    sel_probas = probas[selection_idx]
+                    metrics = {
+                        "recall_at_fpr": recall_at_fpr(
+                            sel_labels, sel_probas, self.config.rf.selection_max_fpr
+                        ),
+                        "roc_auc": float(roc_auc_score(sel_labels, sel_probas)),
+                        "brier": float(brier_score_loss(sel_labels, sel_probas)),
+                        "ece": expected_calibration_error(sel_labels, sel_probas),
+                        "n_features": int(fit_features.shape[1]),
+                    }
+                    variant_metrics[variant] = metrics
+                    logger.info(
+                        f"Variant '{variant}' (F={metrics['n_features']}): "
+                        f"recall@{self.config.rf.selection_max_fpr:g}FPR="
+                        f"{metrics['recall_at_fpr']:.4f}, AUC={metrics['roc_auc']:.4f}, "
+                        f"Brier={metrics['brier']:.4f}, ECE={metrics['ece']:.4f}"
+                    )
+                    variant_path = os.path.join(
+                        self.config.model_path, f"random_forest_{tag}_{variant}.joblib"
+                    )
+                    os.makedirs(os.path.dirname(variant_path), exist_ok=True)
+                    joblib.dump(clf, variant_path)
+                    del fit_features, fit_labels, eval_features
+                    gc.collect()
+
+            winner, selection_recalls = select_winner(
+                val_binary_labels[selection_idx],
+                {name: probas[selection_idx] for name, probas in variant_val_probas.items()},
+                self.config.rf.selection_max_fpr,
+                self.config.rf.selection_bootstrap_rounds,
+                derive_rng(root_seed, STREAM_RF, 3),
+            )
+            recall_summary = ", ".join(f"{k}={v:.4f}" for k, v in selection_recalls.items())
+            logger.info(f"LATENT VARIANT WINNER: '{winner}' (selection recalls: {recall_summary})")
+            # MC coherence note for the record (docs carry the full explanation): only a
+            # z-trained forest makes MC averaging a true posterior-predictive expectation
+            if winner == "z":
+                logger.info(
+                    "MC semantics: the winner trains on sampled z, so pass-2 MC averaging is "
+                    "a posterior-predictive expectation"
+                )
+            else:
+                logger.info(
+                    "MC semantics: the winner trains on deterministic features, so pass-2 MC "
+                    "is a sensitivity/robustness probe (documented in INFERENCE_PIPELINE.md)"
+                )
+
+            # The winning fitted forest becomes THE model: canonical filename, HF upload,
+            # and release tagging all pick it up unchanged
+            self.rf_model.model = variant_models[winner]
+            self.rf_model.is_trained = True
+            # Record the winner + calibration outcome on the config singleton so
+            # final_save's config_{tag}.json tells inference exactly how to rebuild
+            # features. Single-threaded orchestration point (same precedent as the
+            # startup-time save_tag resolution) — not a mid-flight mutation.
+            self.config.rf.latent_variant = winner
+            self.config.rf.active_dims = active_dims
+
+            val_probas = variant_val_probas[winner]
+            val_features = build_variant_features(
+                winner, val_mean_flat, val_logvar_flat, num_observations, latent_dim, active_dims
+            )
+            if winner == "z":
+                train_features = train_z_flat
+            elif winner == "z_aug":
+                train_features = train_mean_flat
+            else:
+                train_features = build_variant_features(
+                    winner,
+                    train_mean_flat,
+                    train_logvar_flat,
+                    num_observations,
+                    latent_dim,
+                    active_dims,
+                )
+
+            # -------------------------------------------------- #282 calibration (winner)
+            # Measure ECE on the held-out calibration split; auto-fit a calibrator only when
+            # the configured limit is exceeded, and KEEP it only if it demonstrably improves
+            # ECE (without worsening Brier) on the further held-out test split.
+            calibrator = None
+            cal_labels = val_binary_labels[calibration_idx]
+            cal_probas = val_probas[calibration_idx]
+            measured_ece = expected_calibration_error(cal_labels, cal_probas)
+            logger.info(
+                f"Winner ECE on the calibration split: {measured_ece:.4f} "
+                f"(rf.max_ece={self.config.rf.max_ece})"
+            )
+            if measured_ece > self.config.rf.max_ece:
+                candidate = fit_probability_calibrator(
+                    cal_probas, cal_labels, self.config.rf.calibration_min_isotonic
+                )
+                test_labels = val_binary_labels[test_idx]
+                raw_test = val_probas[test_idx]
+                calibrated_test = apply_probability_calibrator(candidate, raw_test)
+                ece_before = expected_calibration_error(test_labels, raw_test)
+                ece_after = expected_calibration_error(test_labels, calibrated_test)
+                brier_before = float(brier_score_loss(test_labels, raw_test))
+                brier_after = float(brier_score_loss(test_labels, calibrated_test))
+                if ece_after < ece_before and brier_after <= brier_before * 1.001:
+                    calibrator = candidate
+                    logger.info(
+                        f"Calibrator ({candidate['method']}) KEPT: test ECE "
+                        f"{ece_before:.4f} -> {ece_after:.4f}, Brier {brier_before:.4f} -> "
+                        f"{brier_after:.4f}"
+                    )
+                else:
+                    logger.warning(
+                        f"Calibrator ({candidate['method']}) DISCARDED — did not improve on "
+                        f"the held-out test split (ECE {ece_before:.4f} -> {ece_after:.4f}, "
+                        f"Brier {brier_before:.4f} -> {brier_after:.4f})"
+                    )
+            else:
+                logger.info("Calibration not applied: measured ECE within rf.max_ece")
+
+            self.config.rf.calibration_active = calibrator is not None
+            self.config.rf.calibration_method = calibrator["method"] if calibrator else None
+            if calibrator is not None:
+                calibrator_path = os.path.join(
+                    self.config.model_path, f"rf_calibrator_{tag}.joblib"
+                )
+                joblib.dump(calibrator, calibrator_path)
+                logger.info(f"Saved probability calibrator to {calibrator_path}")
+
+            # Deployment-scored probabilities/predictions for artifacts + plots: calibrated
+            # when a calibrator is active (inference applies it identically), raw otherwise
+            val_probas_deployed = apply_probability_calibrator(calibrator, val_probas).astype(
+                np.float32
+            )
+            val_preds = (val_probas_deployed >= classification_threshold).astype(np.int64)
+
+            # ------------------------------------------- #282 held-out test-split metrics
+            test_labels = val_binary_labels[test_idx]
+            test_deployed = val_probas_deployed[test_idx]
+            release_metrics = {
+                "test_recall_at_fpr": recall_at_fpr(
+                    test_labels, test_deployed, self.config.rf.selection_max_fpr
+                ),
+                "test_roc_auc": float(roc_auc_score(test_labels, test_deployed)),
+                "test_brier": float(brier_score_loss(test_labels, test_deployed)),
+                "test_ece": expected_calibration_error(test_labels, test_deployed),
+            }
+            release_summary = ", ".join(f"{k}={v:.4f}" for k, v in release_metrics.items())
+            logger.info(f"Held-out test metrics (deployment scoring): {release_summary}")
+
+            # -------------------------------- #282 screening-threshold validation (cascade)
+            # The two-pass cascade must lose ~zero recall vs MC-scoring EVERYTHING at the
+            # science threshold — anything pass 1 drops never gets a second look
+            mc_rng = derive_rng(root_seed, STREAM_RF, 4)
+            test_mean_flat = val_mean_flat[test_idx]
+            test_logvar_flat = val_logvar_flat[test_idx]
+            draw_probas = np.zeros((self.config.inference.mc_draws, len(test_idx)))
+            for draw_index in range(self.config.inference.mc_draws):
+                draw_flat = sample_z_flat(test_mean_flat, test_logvar_flat, mc_rng)
+                draw_features = build_variant_features(
+                    winner, draw_flat, test_logvar_flat, num_observations, latent_dim, active_dims
+                )
+                draw_probas[draw_index] = apply_probability_calibrator(
+                    calibrator, self.rf_model.model.predict_proba(draw_features)[:, 1]
+                )
+            mc_mean = draw_probas.mean(axis=0)
+            screen_stats = check_screening_threshold(
+                test_labels=test_labels,
+                pass1_probas=test_deployed,
+                mc_mean_probas=mc_mean,
+                screening_threshold=self.config.inference.screening_threshold,
+                science_threshold=classification_threshold,
+                recall_tolerance=self.config.rf.screen_recall_tolerance,
+                tag=tag,
+            )
+            del draw_probas, mc_mean, test_mean_flat, test_logvar_flat
 
             # NOTE: come back to this later (what is this artifact for? is it handled properly by archiving functions on startup?)
-            # Persist a single eval-artifact joblib that every RF plot function consumes
-            tag = self.config.checkpoint.save_tag
+            # Persist a single eval-artifact joblib that every RF plot function consumes.
+            # val_probas stays the winner's RAW deterministic-representation probabilities
+            # (rank plots are calibration-invariant); val_probas_deployed adds the calibrated
+            # view; val_preds reflects the deployment operating point.
             artifacts = {
                 "train_features": train_features,
                 "train_binary_labels": train_binary_labels,
@@ -2513,11 +3111,27 @@ class TrainingPipeline:
                 "val_binary_labels": val_binary_labels,
                 "val_subtype_labels": val_subtype_labels,
                 "val_probas": val_probas,
+                "val_probas_deployed": val_probas_deployed,
                 "val_preds": val_preds,
                 "classification_threshold": classification_threshold,
                 "snr_base": snr_base,
                 "snr_range": snr_range,
                 "tag": tag,
+                "latent_variant": winner,
+                "active_dims": active_dims,
+                "variant_metrics": variant_metrics,
+                "release_metrics": release_metrics,
+                "calibration": {
+                    "active": calibrator is not None,
+                    "method": calibrator["method"] if calibrator else None,
+                    "measured_ece": measured_ece,
+                    "max_ece": self.config.rf.max_ece,
+                },
+                "val_partition": {
+                    "selection_idx": selection_idx,
+                    "calibration_idx": calibration_idx,
+                    "test_idx": test_idx,
+                },
             }
             artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
             os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
@@ -2556,6 +3170,13 @@ class TrainingPipeline:
                     val_preds=val_preds,
                 )
                 rf_metrics["classification_threshold"] = float(classification_threshold)
+                rf_metrics["screening_threshold"] = float(self.config.inference.screening_threshold)
+                rf_metrics["active_units"] = float(len(active_dims))
+                rf_metrics.update({k: float(v) for k, v in release_metrics.items()})
+                rf_metrics.update({k: float(v) for k, v in screen_stats.items()})
+                for variant_name, metrics in variant_metrics.items():
+                    for metric_name, value in metrics.items():
+                        rf_metrics[f"variant_{variant_name}_{metric_name}"] = float(value)
                 metrics_timestamp = time.time()
                 for stat_name, value in rf_metrics.items():
                     self.db.write_training_stat(
@@ -2572,16 +3193,24 @@ class TrainingPipeline:
                 logger.warning(f"Failed to write RF eval metrics to db: {e}")
 
             # NOTE: come back to this later (are we dereferencing the correct things? can we instead write things to db instead of storing in memory?)
+            # train_binary_labels / train_*_flat are deliberately NOT del'd: the
+            # _variant_train_matrix closure references them and ruff flags closure names
+            # deleted by the enclosing scope (see the identical NOTE near plot_dual_axis);
+            # they are freed when the frame exits
             del (
                 artifacts,
                 train_features,
                 val_features,
                 train_subtype_labels,
                 val_subtype_labels,
-                train_binary_labels,
                 val_binary_labels,
                 val_probas,
+                val_probas_deployed,
                 val_preds,
+                variant_models,
+                variant_val_probas,
+                val_mean_flat,
+                val_logvar_flat,
             )
             gc.collect()
 
@@ -2640,6 +3269,21 @@ class TrainingPipeline:
             if self.rf_model is None:
                 self.rf_model = RandomForestModel()
             self.rf_model.load(rf_model_path)
+            # Restore the sweep outcome onto the config (#282): the resumed attempt skips
+            # train_random_forest's selection, but final_save still dumps the config, which
+            # must record the variant/calibration the persisted model was actually trained
+            # with — otherwise inference would rebuild the wrong features
+            artifacts = joblib.load(artifact_path)
+            self.config.rf.latent_variant = artifacts.get("latent_variant", "z")
+            self.config.rf.active_dims = artifacts.get("active_dims")
+            calibration = artifacts.get("calibration", {})
+            self.config.rf.calibration_active = bool(calibration.get("active", False))
+            self.config.rf.calibration_method = calibration.get("method")
+            logger.info(
+                f"Restored sweep outcome from artifacts: latent_variant="
+                f"'{self.config.rf.latent_variant}', calibration_active="
+                f"{self.config.rf.calibration_active}"
+            )
             return True
         except Exception as e:
             logger.warning(f"Failed to load persisted Random Forest from {rf_model_path}: {e}")
@@ -2714,8 +3358,7 @@ class TrainingPipeline:
         n_summary = min(self.config.training.shap_max_samples_summary, n_val)
         n_interact = min(self.config.training.shap_max_samples_interaction, n_val)
 
-        # NOTE: use a global config seed instead of hard-coding
-        rng = np.random.default_rng(self.config.rf.seed)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_SHAP_SAMPLES)
         summary_indices = np.sort(rng.choice(n_val, size=n_summary, replace=False))
         interaction_indices = np.sort(rng.choice(n_val, size=n_interact, replace=False))
 
@@ -2838,11 +3481,15 @@ class TrainingPipeline:
         # Flush database to ensure all training stats are written before plotting
         logger.info("Flushing database before plotting...")
         if not self.db.flush():
-            logger.warning(
-                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            # #277: never render a partial result set as if it were complete. The rows are
+            # still queued (nothing is lost) and the figure is regenerable once the writer
+            # catches up; callers treat plot failures as non-critical, so raising skips the
+            # figure without failing the run.
+            raise RuntimeError(
+                "Database flush timed out with training stats still queued - skipping the "
+                "beta-VAE loss curves plot rather than rendering an incomplete result set"
             )
-        else:
-            logger.info("Database flushed")
+        logger.info("Database flushed")
 
         # NOTE: how to handle retries under current implementation?
         # Query training stats from database
@@ -2858,29 +3505,11 @@ class TrainingPipeline:
             logger.warning("No training stats data to plot")
             return
 
-        # TODO: potential memory optimization here with array pre-allocation? is there a way to just use the all_stats dict directly? is the potential improvement worth the effort?
-        # Group query results by stat_name
-        raw_history = {}
-        for stat in all_stats:
-            key = stat["stat_name"]
-            if key not in raw_history:
-                raw_history[key] = []
-            # Store (round, epoch, value) tuple for later sorting
-            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+        # Arrange rows on the real global-epoch axis — missing epochs render as gaps (#277)
+        epochs, history = build_epoch_history(all_stats, self.config.training.epochs_per_round)
 
         del all_stats
         gc.collect()
-
-        # Sort by (round, epoch) and extract just the values
-        history = {}
-        for key, values in raw_history.items():
-            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))  # Sort by round, epoch
-            history[key] = [v[2] for v in sorted_values]  # Extract just the values
-
-        del raw_history
-        gc.collect()
-
-        epochs = range(1, len(history.get("total_loss", [])) + 1)
 
         # Add SNR range background shading to all axes
         snr_by_round = self._get_snr_by_round(current_time)
@@ -3039,11 +3668,12 @@ class TrainingPipeline:
         # Flush database to ensure all training stats are written before plotting
         logger.info("Flushing database before plotting...")
         if not self.db.flush():
-            logger.warning(
-                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            # #277: same skip-don't-render-partial contract as plot_beta_vae_loss_curves
+            raise RuntimeError(
+                "Database flush timed out with training stats still queued - skipping the "
+                "training stability plot rather than rendering an incomplete result set"
             )
-        else:
-            logger.info("Database flushed")
+        logger.info("Database flushed")
 
         # Query training stats from database
         all_stats = self.db.query_training_stat(
@@ -3058,27 +3688,11 @@ class TrainingPipeline:
             logger.warning("No training stats data to plot")
             return
 
-        # Group query results by stat_name
-        raw_history = {}
-        for stat in all_stats:
-            key = stat["stat_name"]
-            if key not in raw_history:
-                raw_history[key] = []
-            raw_history[key].append((stat["round_number"], stat["epoch_number"], stat["value"]))
+        # Arrange rows on the real global-epoch axis — missing epochs render as gaps (#277)
+        epochs, history = build_epoch_history(all_stats, self.config.training.epochs_per_round)
 
         del all_stats
         gc.collect()
-
-        # Sort by (round, epoch) and extract just the values
-        history = {}
-        for key, values in raw_history.items():
-            sorted_values = sorted(values, key=lambda x: (x[0], x[1]))
-            history[key] = [v[2] for v in sorted_values]
-
-        del raw_history
-        gc.collect()
-
-        epochs = range(1, len(history.get("clipping_rate", [])) + 1)
 
         if not epochs:
             logger.warning("No clipping rate data to plot")
@@ -3360,17 +3974,115 @@ class TrainingPipeline:
                     alpha=0.7,
                 )
 
+    def plot_posterior_collapse(self, tag: str | None = None, dir: str | None = None):
+        """
+        Posterior-collapse diagnostics (#282): a KL-per-dimension heatmap (dim x global
+        epoch — collapsing dims visibly go dark) plus the active-units count per epoch
+        (dims with KL > training.posterior_collapse_kl_epsilon), from the kl_dim_* rows
+        written each epoch. Follows the loss-curve plots' skip-don't-render-partial flush
+        contract (#277).
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        if self.db is None:
+            raise RuntimeError("No database instance detected - cannot plot posterior collapse")
+
+        logger.info("Flushing database before plotting...")
+        if not self.db.flush():
+            raise RuntimeError(
+                "Database flush timed out with training stats still queued - skipping the "
+                "posterior-collapse plot rather than rendering an incomplete result set"
+            )
+        logger.info("Database flushed")
+
+        latent_dim = self.config.beta_vae.latent_dim
+        current_time = time.time()
+        all_stats = self.db.query_training_stat(
+            model_name="beta_vae",
+            stat_name=[f"kl_dim_{d:02d}" for d in range(latent_dim)],
+            start_round_number=1,
+            tag=self.config.checkpoint.save_tag,
+            start_time=self.start_time,
+            end_time=current_time,
+        )
+        if not all_stats:
+            logger.warning("No per-dimension KL rows to plot (pre-#282 run?) — skipping")
+            return
+
+        epochs, history = build_epoch_history(all_stats, self.config.training.epochs_per_round)
+        n_epochs = len(epochs)
+        kl_matrix = np.full((latent_dim, n_epochs), np.nan)
+        for dim_idx in range(latent_dim):
+            values = history.get(f"kl_dim_{dim_idx:02d}")
+            if values is not None:
+                kl_matrix[dim_idx] = values
+
+        epsilon = self.config.training.posterior_collapse_kl_epsilon
+        active_counts = np.nansum(kl_matrix > epsilon, axis=0)
+
+        fig, (ax_heat, ax_active) = plt.subplots(
+            2, 1, figsize=(16, 9), height_ratios=[3, 1], sharex=True
+        )
+        image = ax_heat.imshow(
+            kl_matrix,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="viridis",
+            extent=(1, max(n_epochs, 2), latent_dim - 0.5, -0.5),
+        )
+        fig.colorbar(image, ax=ax_heat, label="mean KL per dim (nats)")
+        ax_heat.set_ylabel("latent dimension")
+        ax_heat.set_yticks(range(latent_dim))
+        ax_heat.set_title(
+            f"Per-dimension KL over training ({tag}) — dark rows = collapsing dims",
+            fontsize=13,
+            fontweight="bold",
+        )
+
+        ax_active.plot(list(epochs), active_counts, color="tab:red", linewidth=2)
+        ax_active.axhline(
+            self.config.training.min_active_units_fraction * latent_dim,
+            color="gray",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.8,
+        )
+        ax_active.set_ylim(0, latent_dim + 0.5)
+        ax_active.set_xlabel("Epoch (global)")
+        ax_active.set_ylabel(f"active dims\n(KL > {epsilon:g})")
+        ax_active.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path = os.path.join(self._training_plots_dir(dir), f"posterior_collapse_{tag}.png")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Posterior-collapse diagnostics saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path, title=f"Posterior Collapse Diagnostics - ({tag})"
+            )
+
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
     # TODO: move injection plots to data_generation.py & call at end of generate_round_to_memmap() (instead of at the end of train_round() & run_training_pipeline())
     # NOTE: there's a ton of improvements we could make to this function (and subsequent _plot functions), but i just care that it works well enough for now
-    def plot_injection_stats(self, tag: str | None = None, dir: str | None = None):
+    def plot_injection_stats(
+        self, tag: str | None = None, dir: str | None = None, round_number: int | None = None
+    ):
         """
         Generate 8 figures for bias/leakage analysis of the injection pipeline: 1 injected signal
         characteristics, 1 injection stability, 4 global intensity distributions (one per
         signal_type), 1 A->B global intensity biases, and 1 final global intensity biases.
 
         tag defaults to config.checkpoint.save_tag and is used in filenames; dir is an optional
-        subdirectory under plots/ (e.g. "checkpoints" for per-round outputs).
+        subdirectory under plots/ (e.g. "checkpoints" for per-round outputs). round_number
+        scopes every query to that single round (the per-round call); None scopes to the full
+        beta-VAE round range 1..num_training_rounds (the end-of-run call) — either way the
+        pre-generated NEXT round's rows and the RF-phase sentinel round can no longer bleed
+        into the figures (#277).
         """
         if tag is None:
             tag = self.config.checkpoint.save_tag
@@ -3388,14 +4100,35 @@ class TrainingPipeline:
                 "No database instance detected - cannot generate injection stats plot"
             )
 
-        # Flush database to ensure all injection stats are written before plotting
+        # Round-scope every query below (#277): the background producer pre-generates round
+        # N+1's rows during round N, so an unscoped query silently blends them in
+        if round_number is not None:
+            start_round_number, end_round_number = round_number, round_number
+        else:
+            start_round_number = 1
+            end_round_number = self.config.training.num_training_rounds
+
+        # Injection rows ride the DB's bulk lane, which flush() deliberately does not cover.
+        # Gate on the bulk backlog instead: if any row for the rounds being plotted is still
+        # queued, the figures would be incomplete — skip (non-critical) rather than render a
+        # partial result set (#277). Rows for LATER rounds (the producer's pre-generation
+        # flood) don't block, since the round scoping excludes them from the queries anyway.
+        backlog = self.db.injection_backlog_rows(max_round=end_round_number)
+        if backlog:
+            raise RuntimeError(
+                f"{backlog} injection-stat row(s) for rounds <= {end_round_number} are still "
+                "queued in the DB bulk lane - skipping injection plots rather than rendering "
+                "an incomplete result set"
+            )
+
+        # Flush the foreground lane too (covers direct write_injection_stat callers)
         logger.info("Flushing database before plotting...")
         if not self.db.flush():
-            logger.warning(
-                "Database flush failed. Plotting may encounter issues. Proceeding anyways..."
+            raise RuntimeError(
+                "Database flush timed out with writes still queued - skipping injection "
+                "plots rather than rendering an incomplete result set"
             )
-        else:
-            logger.info("Database flushed")
+        logger.info("Database flushed")
 
         # Figure 1: Injected signal characteristics
         signal_stats = [
@@ -3414,6 +4147,8 @@ class TrainingPipeline:
             results = self.db.query_injection_stat(
                 stat_name=f"eti_{stat_name}",
                 signal_type=["true_only_eti", "true_eti_rfi"],
+                start_round_number=start_round_number,
+                end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -3426,6 +4161,8 @@ class TrainingPipeline:
             results = self.db.query_injection_stat(
                 stat_name=f"rfi_{stat_name}",
                 signal_type=["false_with_rfi", "true_eti_rfi"],
+                start_round_number=start_round_number,
+                end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -3439,6 +4176,8 @@ class TrainingPipeline:
             stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
             injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
             signal_type=["true_only_eti", "true_eti_rfi"],
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -3453,6 +4192,8 @@ class TrainingPipeline:
             stat_name="global_mean",  # Any stat works here. Select "mean" to reduce rows queried
             injection_stage="A",  # Any stage works here. Select "A" to reduce rows queried
             signal_type=["false_with_rfi", "true_eti_rfi"],
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -3493,6 +4234,8 @@ class TrainingPipeline:
             agg_results = self.db.query_injection_stat_stability(
                 stat_name=stat_name,
                 injection_stage="A",  # NOTE: why are we only computing for A? only works if we assume sanitization happens evenly for all stages per cadence (is this always true?)
+                start_round_number=start_round_number,
+                end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
                 start_time=self.start_time,
                 end_time=current_time,
@@ -3512,6 +4255,8 @@ class TrainingPipeline:
         clamping_results = self.db.query_injection_stat_stability(
             stat_name="global_mean",  # Slope is the same for all stats. Use "global_mean" to reduce rows queried
             injection_stage="A",  # Slope is the same for all stages. Use "A" to reduce rows queried
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
             start_time=self.start_time,
             end_time=current_time,
@@ -3557,6 +4302,8 @@ class TrainingPipeline:
                         stat_name=stat_name,
                         injection_stage=stage,
                         signal_type=signal_type,
+                        start_round_number=start_round_number,
+                        end_round_number=end_round_number,
                         tag=self.config.checkpoint.save_tag,
                         start_time=self.start_time,
                         end_time=current_time,
@@ -3586,6 +4333,8 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="A",
                     signal_type=signal_type,
+                    start_round_number=start_round_number,
+                    end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
@@ -3599,6 +4348,8 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="B",
                     signal_type=signal_type,
+                    start_round_number=start_round_number,
+                    end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
@@ -3624,6 +4375,8 @@ class TrainingPipeline:
                     stat_name=stat_name,
                     injection_stage="C",
                     signal_type=signal_type,
+                    start_round_number=start_round_number,
+                    end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
                     start_time=self.start_time,
                     end_time=current_time,
@@ -4093,7 +4846,7 @@ class TrainingPipeline:
 
         max_points = self.config.training.plot_injection_subsampling_count
         outlier_pct = self.config.training.plot_injection_outlier_percentile
-        rng = derive_rng(self.config.training.seed, STREAM_PLOT)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_PLOT)
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
@@ -4479,8 +5232,12 @@ class TrainingPipeline:
 
             strata = np.concatenate([np.array(s, dtype="U") for s in strata_list])
 
-            # NOTE: use a global config seed instead of hard-coding
-            rng = np.random.default_rng(11)
+            # Sub-key 10 (obs) / 11 (cadence): distinct from the UMAP-fit sub-keys below
+            rng = derive_rng(
+                self.config.reproducibility.seed,
+                STREAM_UMAP,
+                10 if mode_label.startswith("obs") else 11,
+            )
             unique_classes = np.unique(strata)
             per_class = umap_fit_max // len(unique_classes)
             fit_indices = []
@@ -4589,66 +5346,50 @@ class TrainingPipeline:
             mode,
         ):
             """
-            Render one scatter frame per snapshot and assemble them into a GIF.
+            Render one scatter frame per snapshot (across a process pool — see
+            aetherscan.latent_gif, #278) and assemble them into a GIF.
 
             mode="obs"     → 8-category (signal_type × ON/OFF) scatter with triangle/x markers
             mode="cadence" → 4-category (signal_type) scatter with single-marker style
             """
-            frame_paths = []
+            if mode == "obs":
+                categories = [
+                    FrameCategory(
+                        signal_type=stype,
+                        onoff=status,
+                        color=color,
+                        marker=obs_markers[status],
+                        display_name=obs_display_names[(stype, status)],
+                    )
+                    for (stype, status), color in obs_colors.items()
+                ]
+                legend_kwargs = {
+                    "loc": "upper right",
+                    "fontsize": 8,
+                    "markerscale": 2,
+                    "ncol": 2,
+                    "framealpha": 0.8,
+                }
+            else:  # cadence
+                categories = [
+                    FrameCategory(
+                        signal_type=stype,
+                        onoff=None,
+                        color=color,
+                        marker="o",
+                        display_name=cadence_display_names[stype],
+                    )
+                    for stype, color in cadence_colors.items()
+                ]
+                legend_kwargs = {
+                    "loc": "upper right",
+                    "fontsize": 8,
+                    "markerscale": 2,
+                    "framealpha": 0.8,
+                }
+
+            frames = []
             for frame_idx, meta in enumerate(snapshot_metadata):
-                coords_2d = transformed_list[frame_idx]
-                fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-
-                if mode == "obs":
-                    labels_arr = np.array(all_snapshot_labels_obs[frame_idx])
-                    onoff_arr = np.array(all_snapshot_onoff_obs[frame_idx])
-                    for (stype, status), color in obs_colors.items():
-                        mask = (labels_arr == stype) & (onoff_arr == status)
-                        if mask.any():
-                            ax.scatter(
-                                coords_2d[mask, 0],
-                                coords_2d[mask, 1],
-                                c=color,
-                                marker=obs_markers[status],
-                                s=10,
-                                alpha=0.75,
-                                label=obs_display_names[(stype, status)],
-                                rasterized=True,
-                            )
-                    del labels_arr, onoff_arr
-                    legend_kwargs = {
-                        "loc": "upper right",
-                        "fontsize": 8,
-                        "markerscale": 2,
-                        "ncol": 2,
-                        "framealpha": 0.8,
-                    }
-                else:  # cadence
-                    labels_arr = np.array(all_snapshot_labels_cadence[frame_idx])
-                    for stype, color in cadence_colors.items():
-                        mask = labels_arr == stype
-                        if mask.any():
-                            ax.scatter(
-                                coords_2d[mask, 0],
-                                coords_2d[mask, 1],
-                                c=color,
-                                marker="o",
-                                s=10,
-                                alpha=0.75,
-                                label=cadence_display_names[stype],
-                                rasterized=True,
-                            )
-                    del labels_arr
-                    legend_kwargs = {
-                        "loc": "upper right",
-                        "fontsize": 8,
-                        "markerscale": 2,
-                        "framealpha": 0.8,
-                    }
-
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
-
                 meta_snr_base = meta["snr_base"]
                 meta_snr_range = meta["snr_range"]
                 meta_snr_floor = meta_snr_base if meta_snr_base is not None else "?"
@@ -4657,22 +5398,37 @@ class TrainingPipeline:
                     if meta_snr_base is not None and meta_snr_range is not None
                     else "?"
                 )
-                ax.set_title(
-                    f"Beta-VAE Latent Space: {display_method} — "
-                    f"Round {meta['round_number']}, "
-                    f"Epoch {meta['epoch_number']}, "
-                    f"Step {meta['step_number']} "
-                    f"(SNR: {meta_snr_floor}–{meta_snr_ceil})",
-                    fontsize=11,
+                frames.append(
+                    {
+                        "coords": transformed_list[frame_idx],
+                        "labels": (
+                            all_snapshot_labels_obs[frame_idx]
+                            if mode == "obs"
+                            else all_snapshot_labels_cadence[frame_idx]
+                        ),
+                        "onoff": all_snapshot_onoff_obs[frame_idx] if mode == "obs" else None,
+                        "title": (
+                            f"Beta-VAE Latent Space: {display_method} — "
+                            f"Round {meta['round_number']}, "
+                            f"Epoch {meta['epoch_number']}, "
+                            f"Step {meta['step_number']} "
+                            f"(SNR: {meta_snr_floor}–{meta_snr_ceil})"
+                        ),
+                    }
                 )
-                ax.legend(**legend_kwargs)
 
-                plt.tight_layout()
-
-                frame_path = os.path.join(temp_dir, f"{method_name}_frame_{frame_idx:05d}.png")
-                fig.savefig(frame_path, dpi=100)
-                plt.close(fig)
-                frame_paths.append(frame_path)
+            frame_paths = render_latent_gif_frames(
+                frames,
+                categories=categories,
+                xlim=xlim,
+                ylim=ylim,
+                legend_kwargs=legend_kwargs,
+                out_dir=temp_dir,
+                method_name=method_name,
+                n_workers=self.config.manager.n_processes,
+            )
+            del frames
+            gc.collect()
 
             # Assemble GIF by streaming one frame at a time via imageio (reduces memory pressure)
             gif_filename = f"latent_space_{method_name}_{tag}.gif"
@@ -4712,13 +5468,16 @@ class TrainingPipeline:
             for md in min_dist_values:
                 # Obs-level UMAP
                 logger.info(f"Fitting obs-level UMAP with n_neighbors={nn}, min_dist={md}")
-                # NOTE: use a global config seed instead of hard-coding
                 # Note that by setting random_state, we get a deterministic UMAP fit, at the
                 # expense of single-thread performance (n_jobs=1). This is a hard constraint of
                 # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
+                # random_state derives from the root seed, sub-keyed (level, nn, md) so every
+                # fit gets its own reproducible stream (#279; md keyed at 1e-3 resolution)
                 umap_obs = umap.UMAP(
                     n_components=2,
-                    random_state=11,
+                    random_state=derive_seed(
+                        self.config.reproducibility.seed, STREAM_UMAP, 0, nn, round(md * 1000)
+                    ),
                     n_neighbors=nn,
                     min_dist=md,
                 ).fit(fit_pool_obs)
@@ -4758,13 +5517,14 @@ class TrainingPipeline:
 
                 # Cadence-level UMAP
                 logger.info(f"Fitting cadence-level UMAP with n_neighbors={nn}, min_dist={md}")
-                # NOTE: use a global config seed instead of hard-coding
                 # Note that by setting random_state, we get a deterministic UMAP fit, at the
                 # expense of single-thread performance (n_jobs=1). This is a hard constraint of
                 # the UMAP library. We compensate by fitting UMAP on a stratified subsample.
                 umap_cadence = umap.UMAP(
                     n_components=2,
-                    random_state=11,
+                    random_state=derive_seed(
+                        self.config.reproducibility.seed, STREAM_UMAP, 1, nn, round(md * 1000)
+                    ),
                     n_neighbors=nn,
                     min_dist=md,
                 ).fit(fit_pool_cadence)
@@ -5775,14 +6535,19 @@ class TrainingPipeline:
         else:
             logger.info("Fitting SHAP-space UMAP + KMeans on summary SHAP values")
             # NOTE: come back to this later (are these values of n_neighbors & min_dist appropriate always?)
-            # NOTE: use a global config seed instead of hard-coding
             umap_model = umap.UMAP(
-                n_components=2, random_state=11, n_neighbors=15, min_dist=0.1
+                n_components=2,
+                random_state=derive_seed(self.config.reproducibility.seed, STREAM_UMAP, 2),
+                n_neighbors=15,
+                min_dist=0.1,
             ).fit(shap_values)
             embedding = umap_model.transform(shap_values)
             # NOTE: come back to this later (are these values of n_clusters & n_init appropriate always?)
-            # NOTE: use a global config seed instead of hard-coding
-            kmeans = KMeans(n_clusters=4, random_state=11, n_init=10)
+            kmeans = KMeans(
+                n_clusters=4,
+                random_state=derive_seed(self.config.reproducibility.seed, STREAM_KMEANS),
+                n_init=10,
+            )
             cluster_labels = kmeans.fit_predict(shap_values)
             os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
             joblib.dump(
@@ -6017,8 +6782,7 @@ class TrainingPipeline:
         val_features = artifacts["val_features"]
         val_binary = artifacts["val_binary_labels"]
 
-        # NOTE: use a global config seed instead of hard-coding
-        rng = np.random.default_rng(self.config.rf.seed)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_RF_PLOTS, 0)
         # NOTE: come back to this later (parametrize 10% hold-out in config.py)
         n_train_sample = max(1, int(0.1 * train_features.shape[0]))
         train_sample_idx = rng.choice(train_features.shape[0], size=n_train_sample, replace=False)
@@ -6149,8 +6913,7 @@ class TrainingPipeline:
         grid_size = self.config.training.rf_decision_boundary_grid_size
 
         if val_features.shape[0] > max_points:
-            # NOTE: use a global config seed instead of hard-coding
-            rng = np.random.default_rng(self.config.rf.seed)
+            rng = derive_rng(self.config.reproducibility.seed, STREAM_RF_PLOTS, 1)
             point_idx = rng.choice(val_features.shape[0], size=max_points, replace=False)
             pts_features = val_features[point_idx]
             pts_subtype = val_subtype[point_idx]
@@ -6192,7 +6955,11 @@ class TrainingPipeline:
                 logger.info(f"Rendering decision boundary for (nn={nn}, md={md})")
                 try:
                     umap_model = joblib.load(umap_path)
-                    embedding = umap_model.transform(pts_features)
+                    # The persisted cadence UMAP was fit on the num_obs*latent_dim z_mean
+                    # cadence space; wide #282 variants prepend that exact block, so
+                    # project the lead columns only
+                    lead_width = self.config.data.num_observations * self.config.beta_vae.latent_dim
+                    embedding = umap_model.transform(pts_features[:, :lead_width])
                 except Exception as e:
                     logger.warning(f"Failed to load/transform UMAP at {umap_path}: {e}")
                     continue
@@ -6218,7 +6985,19 @@ class TrainingPipeline:
                     )
                     continue
 
-                grid_probas = self.rf_model.model.predict_proba(grid_48d)[:, 1]
+                # #282: the cadence UMAP lives in the 48-dim z_mean space, but the winning
+                # variant may carry extra uncertainty features the inverse transform cannot
+                # reconstruct — hold those at their training-set means (a documented
+                # approximation: the boundary is then the slice through typical uncertainty)
+                n_rf_features = self.rf_model.model.n_features_in_
+                if n_rf_features > grid_48d.shape[1]:
+                    extras_mean = artifacts["train_features"][:, grid_48d.shape[1] :].mean(axis=0)
+                    grid_features = np.hstack(
+                        [grid_48d, np.tile(extras_mean, (grid_48d.shape[0], 1))]
+                    )
+                else:
+                    grid_features = grid_48d
+                grid_probas = self.rf_model.model.predict_proba(grid_features)[:, 1]
                 proba_grid = grid_probas.reshape(xx.shape)
 
                 fig, ax = plt.subplots(1, 1, figsize=(11, 9))
@@ -6332,7 +7111,7 @@ class TrainingPipeline:
         """
         n_per_type = self.config.training.latent_viz_num_cadences_per_type
         signal_types = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
-        rng = derive_rng(self.config.training.seed, STREAM_VIZ, 0)
+        rng = derive_rng(self.config.reproducibility.seed, STREAM_VIZ, 0)
 
         # Restrict to candidate subset if provided (avoids copying the entire partition)
         if candidate_indices is not None:
@@ -6398,7 +7177,7 @@ class TrainingPipeline:
             per_replica_inf_batch_size=self.config.training.per_replica_val_batch_size,
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
-            rng=derive_rng(self.config.training.seed, STREAM_VIZ, 1),
+            rng=derive_rng(self.config.reproducibility.seed, STREAM_VIZ, 1),
         )
 
         self._latent_viz_dataset = viz_results["viz_dataset"]
@@ -6406,6 +7185,12 @@ class TrainingPipeline:
         self._latent_viz_n_samples = viz_results["n_samples"]
         self._latent_viz_steps = viz_results["viz_steps"]
         self._latent_viz_holder = viz_results["_viz_holder"]
+        # ONE iterator for the round, shared by every snapshot: iter() on a distributed
+        # dataset costs ~0.9 s on a 5-GPU strategy, and each capture consumes exactly one
+        # in-order pass of the infinite dataset, so a persistent iterator reproduces the
+        # per-capture encode order byte-for-byte (fresh-eyes audit: the fresh per-capture
+        # iterator was ~60% of the snapshot's measured cost)
+        self._latent_viz_iterator = iter(self._latent_viz_dataset)
         del viz_results
 
         time_bins = self.config.data.time_bins
@@ -6449,7 +7234,10 @@ class TrainingPipeline:
         latent_dim = self.config.beta_vae.latent_dim
 
         # TEST: make sure this works as expected
-        # Encode all cadences using distributed inference
+        # Encode all cadences using distributed inference. The persistent round-scoped
+        # iterator (each capture consumes exactly one in-order pass of the infinite viz
+        # dataset) skips the ~0.9 s iter() + ~0.3 s gc that a fresh per-capture iterator
+        # measured — this runs INSIDE the epoch loop, up to 6x per epoch at full scale
         [all_z_mean] = self._distributed_encode(
             dataset=self._latent_viz_dataset,
             n_steps=self._latent_viz_steps,
@@ -6457,6 +7245,7 @@ class TrainingPipeline:
             n_samples=n_padded * num_obs,
             latent_dim=latent_dim,
             logging=False,
+            iterator=self._latent_viz_iterator,
         )
 
         # Truncate padding and reshape to per-cadence: (n_samples, 6, latent_dim)
@@ -6464,27 +7253,25 @@ class TrainingPipeline:
         z_mean_per_cadence = all_z_mean.reshape(n_samples, num_obs, latent_dim)
         del all_z_mean
 
-        # Write to DB
-        timestamp = time.time()
-        tag = self.config.checkpoint.save_tag
-        for cadence_idx in range(n_samples):
-            # NOTE: 8 decimal precison for stored latents
-            latent_vector_list = np.round(z_mean_per_cadence[cadence_idx], 8).tolist()
-            self.db.write_latent_snapshot(
-                model_name="beta_vae",
-                round_number=round_idx + 1,
-                epoch_number=epoch + 1,
-                step_number=step + 1,
-                cadence_index=cadence_idx,
-                signal_type=str(self._latent_viz_labels[cadence_idx]),
-                latent_vector=latent_vector_list,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                tag=tag,
-                timestamp=timestamp,
-            )
+        # Write to DB in one batched call: one metadata lookup and one array-wide round
+        # instead of per-cadence Python (NOTE: 8 decimal precision for stored latents)
+        rounded = np.round(z_mean_per_cadence, 8)
+        self.db.write_latent_snapshots_bulk(
+            model_name="beta_vae",
+            round_number=round_idx + 1,
+            epoch_number=epoch + 1,
+            step_number=step + 1,
+            snr_base=snr_base,
+            snr_range=snr_range,
+            tag=self.config.checkpoint.save_tag,
+            timestamp=time.time(),
+            snapshots=[
+                (cadence_idx, str(self._latent_viz_labels[cadence_idx]), rounded[cadence_idx])
+                for cadence_idx in range(n_samples)
+            ],
+        )
 
-        del z_mean_per_cadence
+        del z_mean_per_cadence, rounded
 
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""
@@ -6596,6 +7383,7 @@ class TrainingPipeline:
             [
                 (self.plot_beta_vae_loss_curves, "plot_beta_vae_loss_curves"),
                 (self.plot_beta_vae_training_stability, "plot_beta_vae_training_stability"),
+                (self.plot_posterior_collapse, "plot_posterior_collapse"),
                 (self.plot_injection_stats, "plot_injection_stats"),
                 (self.plot_latent_space_gif, "plot_latent_space_gif"),
                 (self.plot_latent_traversal, "plot_latent_traversal"),

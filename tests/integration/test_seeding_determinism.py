@@ -52,14 +52,15 @@ def test_seeding_yields_byte_identical_encoder_weights():
 
     from aetherscan.config import get_config, init_config  # noqa: PLC0415
     from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+    from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
 
     # Integration tests skip the autouse config-init fixture, so bootstrap the singleton here,
     # then pin the seed the construction path reads (create_beta_vae_model -> get_config). Single
     # -threaded test, so the mutate-config-post-init caveat does not apply.
     if get_config() is None:
         init_config()
-    get_config().training.seed = _SEED
-    seed = get_config().training.seed
+    get_config().reproducibility.seed = _SEED
+    seed = get_config().reproducibility.seed
 
     # Deterministic cuDNN/reduction kernels (the --tf-deterministic-ops promise). Process-global
     # and only meaningful on a real GPU, hence the gpu/cluster markers + nvidia-smi guard above.
@@ -77,10 +78,13 @@ def test_seeding_yields_byte_identical_encoder_weights():
     strategy = tf.distribute.get_strategy()
 
     def _build_and_train_once() -> list[np.ndarray]:
-        # Seed the TF global RNG before any variable creation so weight init and the Sampling
-        # layer's epsilon draw the same stream each run — exactly the ordering TrainingPipeline
-        # uses (tf.random.set_seed before create_beta_vae_model, inside strategy.scope()).
-        tf.random.set_seed(seed)
+        # Seed through the PIPELINE'S OWN helper before any variable creation, exactly as
+        # TrainingPipeline.__init__ does. Calling tf.random.set_seed directly (as this test
+        # used to) is what let the #279 weight-init hole hide: tf_keras initializers seed
+        # from Python's global `random`, not from TF's global seed, so a test that bypasses
+        # seed_tensorflow tests something the pipeline never does — and this test failed on
+        # master for exactly that reason.
+        seed_tensorflow(seed, False, 0)
         with strategy.scope():
             vae = create_beta_vae_model()
             # One real train step: mirrors _distributed_train_step's per-replica body and
@@ -102,3 +106,40 @@ def test_seeding_yields_byte_identical_encoder_weights():
     assert len(weights_first) == len(weights_second)
     for w_first, w_second in zip(weights_first, weights_second, strict=True):
         np.testing.assert_array_equal(w_first, w_second)
+
+
+def test_multi_gpu_sampling_reproduces_with_seed_tensorflow():
+    """#279 acceptance: the VAE Sampling layer's draws are reproducible under
+    MirroredStrategy across multiple GPUs when seeded via seeding.seed_tensorflow — the
+    stream inference relies on for repeatable candidate sets (single-GPU coverage lives in
+    tests/unit/test_models.py; this pins the multi-replica path, which had none)."""
+    if shutil.which("nvidia-smi") is None:
+        pytest.skip("requires a GPU host (nvidia-smi not found)")
+
+    import tensorflow as tf  # noqa: PLC0415
+
+    from aetherscan.models.vae import Sampling  # noqa: PLC0415
+    from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if len(gpus) < 2:
+        pytest.skip("requires >= 2 GPUs for a multi-replica MirroredStrategy")
+
+    strategy = tf.distribute.MirroredStrategy(devices=["/GPU:0", "/GPU:1"])
+    layer = Sampling()
+    z_mean = tf.zeros((8, 4))
+    z_log_var = tf.zeros((8, 4))
+
+    def _sample_once() -> np.ndarray:
+        seed_tensorflow(_SEED, False, 1, 3)
+
+        def replica_fn():
+            return layer([z_mean, z_log_var])
+
+        per_replica = strategy.run(replica_fn)
+        local = strategy.experimental_local_results(per_replica)
+        return np.concatenate([r.numpy() for r in local], axis=0)
+
+    first = _sample_once()
+    second = _sample_once()
+    np.testing.assert_array_equal(first, second)

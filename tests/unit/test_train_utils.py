@@ -8,6 +8,7 @@ against a stub pipeline)."""
 from __future__ import annotations
 
 import logging
+import math
 import os
 import types
 
@@ -33,7 +34,10 @@ from aetherscan.train import (
     _execute_training_stages,
     _resolve_load_tag,
     archive_directory,
+    build_epoch_history,
     check_encoder_trained,
+    check_posterior_collapse,
+    check_screening_threshold,
     check_val_auc_floor,
     compute_expected_std,
 )
@@ -656,3 +660,181 @@ class TestExecuteTrainingStages:
         assert "_clear_stage_failure" in stub.calls
         assert state.stages_failed == []
         assert not state.is_stage_done(STAGE_HF_UPLOAD)
+
+
+class TestBuildEpochHistory:
+    """#277 problem 6: the real global-epoch axis — gaps stay gaps, no positional compression."""
+
+    def test_positions_use_real_epoch_numbers(self):
+        stats = [
+            {"stat_name": "total_loss", "round_number": 1, "epoch_number": 1, "value": 1.0},
+            {"stat_name": "total_loss", "round_number": 1, "epoch_number": 2, "value": 2.0},
+            {"stat_name": "total_loss", "round_number": 2, "epoch_number": 1, "value": 4.0},
+        ]
+        epochs, history = build_epoch_history(stats, epochs_per_round=3)
+        assert list(epochs) == [1, 2, 3, 4]
+        values = history["total_loss"]
+        assert values[0] == 1.0 and values[1] == 2.0 and values[3] == 4.0
+        # Round 1 epoch 3 never committed -> NaN gap, NOT round 2's value shifted left
+        assert math.isnan(values[2])
+
+    def test_gap_is_not_compressed(self):
+        stats = [
+            {"stat_name": "kl_loss", "round_number": 1, "epoch_number": 1, "value": 1.0},
+            {"stat_name": "kl_loss", "round_number": 1, "epoch_number": 5, "value": 5.0},
+        ]
+        epochs, history = build_epoch_history(stats, epochs_per_round=10)
+        assert list(epochs) == [1, 2, 3, 4, 5]
+        values = history["kl_loss"]
+        assert values[0] == 1.0 and values[4] == 5.0
+        assert all(math.isnan(v) for v in values[1:4])
+
+    def test_duplicate_rows_last_wins(self):
+        stats = [
+            {"stat_name": "lr", "round_number": 1, "epoch_number": 1, "value": 0.1},
+            {"stat_name": "lr", "round_number": 1, "epoch_number": 1, "value": 0.2},
+        ]
+        _, history = build_epoch_history(stats, epochs_per_round=2)
+        assert history["lr"] == [0.2]
+
+    def test_rows_without_round_or_epoch_are_skipped(self):
+        stats = [
+            {"stat_name": "scalar", "round_number": None, "epoch_number": None, "value": 9.0},
+            {"stat_name": "total_loss", "round_number": 1, "epoch_number": 1, "value": 1.0},
+        ]
+        epochs, history = build_epoch_history(stats, epochs_per_round=5)
+        assert list(epochs) == [1]
+        assert "scalar" not in history
+
+    def test_empty_input(self):
+        epochs, history = build_epoch_history([], epochs_per_round=5)
+        assert list(epochs) == []
+        assert history == {}
+
+
+class TestPlotFlushGates:
+    """#277 problem 5: a failed flush (or a pending bulk backlog) skips the plot — it never
+    renders a partial result set. Raising is the skip mechanism: per-round callers catch and
+    log; _run_plot_group records a non-critical failure."""
+
+    @staticmethod
+    def _pipeline_with_db(flush_ok: bool = True, backlog: int = 0):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        config = get_config()
+        config.checkpoint.save_tag = "test_20260101_000000"
+        pipeline.config = config
+
+        class _DBStub:
+            def flush(self, timeout=None):
+                return flush_ok
+
+            def injection_backlog_rows(self, max_round=None):
+                return backlog
+
+        pipeline.db = _DBStub()
+        pipeline.start_time = 0.0
+        return pipeline
+
+    def test_loss_curves_skip_on_flush_failure(self):
+        pipeline = self._pipeline_with_db(flush_ok=False)
+        with pytest.raises(RuntimeError, match="skipping the beta-VAE loss curves"):
+            pipeline.plot_beta_vae_loss_curves()
+
+    def test_stability_skip_on_flush_failure(self):
+        pipeline = self._pipeline_with_db(flush_ok=False)
+        with pytest.raises(RuntimeError, match="skipping the training stability plot"):
+            pipeline.plot_beta_vae_training_stability()
+
+    def test_injection_skip_on_bulk_backlog(self):
+        pipeline = self._pipeline_with_db(flush_ok=True, backlog=7)
+        with pytest.raises(RuntimeError, match="bulk lane"):
+            pipeline.plot_injection_stats(round_number=1)
+
+    def test_injection_skip_on_flush_failure(self):
+        pipeline = self._pipeline_with_db(flush_ok=False, backlog=0)
+        with pytest.raises(RuntimeError, match="skipping injection"):
+            pipeline.plot_injection_stats(round_number=1)
+
+
+class TestCheckPosteriorCollapse:
+    """#282: advisory posterior-collapse guard (WARN, never fail)."""
+
+    def test_healthy_round_passes(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            flagged = check_posterior_collapse(
+                kl_per_dim=np.array([0.5, 0.8, 0.3, 0.6]),
+                low_kl_streaks=np.zeros(4),
+                kl_epsilon=0.01,
+                min_active_fraction=0.5,
+                patience=5,
+                tag="round_01",
+            )
+        assert flagged is False
+        assert not [r for r in caplog.records if "POSTERIOR COLLAPSE" in r.message]
+
+    def test_low_active_fraction_flags(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            flagged = check_posterior_collapse(
+                kl_per_dim=np.array([0.5, 0.001, 0.002, 0.003]),
+                low_kl_streaks=np.zeros(4),
+                kl_epsilon=0.01,
+                min_active_fraction=0.5,
+                patience=5,
+                tag="round_02",
+            )
+        assert flagged is True
+        assert any("POSTERIOR COLLAPSE" in r.message for r in caplog.records)
+
+    def test_stuck_streak_flags_even_with_enough_active(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            flagged = check_posterior_collapse(
+                kl_per_dim=np.array([0.5, 0.8, 0.3, 0.001]),
+                low_kl_streaks=np.array([0, 0, 0, 7]),
+                kl_epsilon=0.01,
+                min_active_fraction=0.5,
+                patience=5,
+                tag="round_03",
+            )
+        assert flagged is True
+        assert any("dims stuck below epsilon" in r.message for r in caplog.records)
+
+
+class TestCheckScreeningThreshold:
+    """#282: the cascade's screen must lose ~zero recall vs MC-on-everything."""
+
+    def test_safe_screen_passes(self, caplog):
+        labels = np.array([1, 1, 0, 0])
+        pass1 = np.array([0.9, 0.8, 0.2, 0.1])
+        mc = np.array([0.995, 0.992, 0.3, 0.2])
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            stats = check_screening_threshold(
+                test_labels=labels,
+                pass1_probas=pass1,
+                mc_mean_probas=mc,
+                screening_threshold=0.5,
+                science_threshold=0.99,
+                recall_tolerance=0.0,
+                tag="t",
+            )
+        assert stats["screen_recall_loss"] == pytest.approx(0.0)
+        assert stats["screen_max_safe_threshold"] == pytest.approx(0.8)
+        assert not [r for r in caplog.records if "UNSAFE" in r.message]
+
+    def test_lossy_screen_warns_with_numbers(self, caplog):
+        labels = np.array([1, 1, 0])
+        pass1 = np.array([0.9, 0.3, 0.1])  # second positive rejected by the screen
+        mc = np.array([0.995, 0.995, 0.2])  # ...but MC would have promoted it
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            stats = check_screening_threshold(
+                test_labels=labels,
+                pass1_probas=pass1,
+                mc_mean_probas=mc,
+                screening_threshold=0.5,
+                science_threshold=0.99,
+                recall_tolerance=0.0,
+                tag="t",
+            )
+        assert stats["screen_recall_mc_everything"] == pytest.approx(1.0)
+        assert stats["screen_recall_cascade"] == pytest.approx(0.5)
+        assert stats["screen_max_safe_threshold"] == pytest.approx(0.3)
+        assert any("SCREENING THRESHOLD UNSAFE" in r.message for r in caplog.records)

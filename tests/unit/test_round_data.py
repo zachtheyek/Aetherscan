@@ -759,6 +759,10 @@ class _FakeDB:
     def write_injection_stat(self, **kwargs):
         self.writes.append(kwargs)
 
+    def write_injection_stats_bulk(self, stats, tag=None):
+        for row in stats:
+            self.writes.append({**row, "tag": tag})
+
 
 def _minimal_sample_info():
     stage = dict.fromkeys(

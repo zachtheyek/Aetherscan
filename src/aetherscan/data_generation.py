@@ -789,7 +789,7 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
     # dataset, which runs after the training datasets/iterators are torn down (train_round's
     # finally: holder.clear() -> del datasets -> clear_session -> gc), so no tf.data generator
     # thread is alive mutating global RNG state during it. Per-task seeds are drawn from the
-    # per-round seed_rng in generate_round_to_memmap — derived from config.training.seed
+    # per-round seed_rng in generate_round_to_memmap — derived from config.reproducibility.seed
     # when set (making generation reproducible across runs), OS entropy otherwise; either
     # way this reseed keeps results independent of worker scheduling within a run.
     random.seed(seed)
@@ -845,9 +845,13 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
     a thread queue.Queue, not process-safe). `segment` is the dict emitted by
     generate_round_to_memmap's stats_cb.
 
-    Per-sample writes: 6 intensity stats x 3 stages = 18 rows, plus 0-12 signal-characteristic
+    Per-sample rows: 6 intensity stats x 3 stages = 18 rows, plus 0-12 signal-characteristic
     rows depending on signal_type, plus 2 intersection-retry rows for true-double samples
-    (#118). Segment-level writes: 4 metadata rows.
+    (#118). Segment-level rows: 4 metadata rows. The rows (identical in content to the old
+    per-row write_injection_stat calls) are batched into one write_injection_stats_bulk call
+    on the DB's bounded bulk lane (#277): a segment costs a handful of queue operations
+    instead of ~300K, and the enqueue blocks THIS (background) thread when the writer is
+    behind rather than growing an unbounded queue.
     """
     if db is None:
         raise RuntimeError("No database instance detected - cannot write injection stats")
@@ -858,6 +862,15 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
     signal_type = segment["signal_type"]
     timestamp = segment["timestamp"]
 
+    common = {
+        "round_number": round_number,
+        "chunk_number": chunk_number,
+        "signal_class": signal_class,
+        "signal_type": signal_type,
+        "timestamp": timestamp,
+    }
+
+    rows: list[dict] = []
     for sample_idx, sample_info in enumerate(segment["stats_list"]):
         background_index = sample_info["background_index"]
         intensity_stats = sample_info["intensity_stats"]
@@ -876,38 +889,32 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
                 "global_skew",
                 "global_kurtosis",
             ]:
-                db.write_injection_stat(
-                    stat_name=stat_name,
-                    value=stage_stats[stat_name],
-                    round_number=round_number,
-                    chunk_number=chunk_number,
-                    sample_index=sample_idx,
-                    background_index=background_index,
-                    signal_class=signal_class,
-                    signal_type=signal_type,
-                    injection_stage=stage,
-                    slope_clamped=slope_was_clamped,
-                    tag=tag,
-                    timestamp=timestamp,
+                rows.append(
+                    {
+                        **common,
+                        "stat_name": stat_name,
+                        "value": stage_stats[stat_name],
+                        "sample_index": sample_idx,
+                        "background_index": background_index,
+                        "injection_stage": stage,
+                        "slope_clamped": slope_was_clamped,
+                    }
                 )
 
         # NOTE: what happens when signal_info is empty for false_no_rfi signal types?
         # Signal characteristics (eti_snr, rfi_drift_rate, etc.)
         # injection_stage=None since these describe the injection itself
         for stat_name, value in signal_info.items():
-            db.write_injection_stat(
-                stat_name=stat_name,
-                value=float(value),
-                round_number=round_number,
-                chunk_number=chunk_number,
-                sample_index=sample_idx,
-                background_index=background_index,
-                signal_class=signal_class,
-                signal_type=signal_type,
-                injection_stage=None,
-                slope_clamped=slope_was_clamped,
-                tag=tag,
-                timestamp=timestamp,
+            rows.append(
+                {
+                    **common,
+                    "stat_name": stat_name,
+                    "value": float(value),
+                    "sample_index": sample_idx,
+                    "background_index": background_index,
+                    "injection_stage": None,
+                    "slope_clamped": slope_was_clamped,
+                }
             )
 
         # Straggler observability (#118): true-double samples record how many injection
@@ -919,19 +926,16 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
                 ("intersection_retry_capped", float(sample_info["intersection_retry_capped"])),
             ]
             for stat_name, value in retry_stats:
-                db.write_injection_stat(
-                    stat_name=stat_name,
-                    value=value,
-                    round_number=round_number,
-                    chunk_number=chunk_number,
-                    sample_index=sample_idx,
-                    background_index=background_index,
-                    signal_class=signal_class,
-                    signal_type=signal_type,
-                    injection_stage=None,
-                    slope_clamped=slope_was_clamped,
-                    tag=tag,
-                    timestamp=timestamp,
+                rows.append(
+                    {
+                        **common,
+                        "stat_name": stat_name,
+                        "value": value,
+                        "sample_index": sample_idx,
+                        "background_index": background_index,
+                        "injection_stage": None,
+                        "slope_clamped": slope_was_clamped,
+                    }
                 )
 
     # Segment-level metadata stats (once per segment, not per sample)
@@ -943,19 +947,18 @@ def write_segment_stats(db, tag: str, segment: dict) -> None:
     ]
 
     for stat_name, value in metadata_stats:
-        db.write_injection_stat(
-            stat_name=stat_name,
-            value=value,
-            round_number=round_number,
-            chunk_number=chunk_number,
-            sample_index=None,
-            background_index=None,
-            signal_class=signal_class,
-            signal_type=signal_type,
-            injection_stage=None,
-            tag=tag,
-            timestamp=timestamp,
+        rows.append(
+            {
+                **common,
+                "stat_name": stat_name,
+                "value": value,
+                "sample_index": None,
+                "background_index": None,
+                "injection_stage": None,
+            }
         )
+
+    db.write_injection_stats_bulk(rows, tag=tag)
 
 
 def generate_round_to_memmap(
@@ -997,7 +1000,7 @@ def generate_round_to_memmap(
     stats_cb(segment_dict) fires once per class-segment per chunk; progress_cb(chunk,
     n_chunks) once per chunk. Returns the manifest dict.
 
-    `seed` is the pipeline root seed (config.training.seed): when set, per-task seeds derive
+    `seed` is the pipeline root seed (config.reproducibility.seed): when set, per-task seeds derive
     deterministically from (seed, round_num) and the same call regenerates byte-identical
     data; None keeps the OS-entropy behavior.
     """
@@ -1037,8 +1040,9 @@ def generate_round_to_memmap(
     # Per-task seeds are drawn from this stream. With a root `seed` it derives
     # deterministically from (seed, round), so the same seed regenerates identical data;
     # with seed=None it falls back to OS entropy (non-reproducible, the historical
-    # behavior). The RF dataset passes round_num=None and maps onto the round-0 key —
-    # beta-VAE rounds are 1-based, so the streams never collide.
+    # behavior). The RF dataset passes round_num=num_training_rounds+1 (the supersede
+    # sentinel — see train.train_random_forest); beta-VAE rounds are 1-based, so the
+    # streams never collide. The None->0 fallback below is only a signature default.
     seed_rng = derive_rng(seed, STREAM_DATA_GEN, round_num if round_num is not None else 0)
 
     logger.info(
@@ -1325,6 +1329,6 @@ class DataGenerator:
             pool=self.pool,
             backgrounds=self.backgrounds if self.pool is None else None,
             round_num=round_num,
-            seed=self.config.training.seed,
+            seed=self.config.reproducibility.seed,
             stats_cb=_stats_cb,
         )

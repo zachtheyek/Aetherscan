@@ -65,7 +65,8 @@ class RandomForestModel:
             bootstrap=self.config.rf.bootstrap,
             max_features=self.config.rf.max_features,
             n_jobs=self.config.rf.n_jobs,
-            random_state=self.config.rf.seed,
+            # Derived from the pipeline root seed unless --rf-seed overrides (#279)
+            random_state=self.config.resolved_rf_seed(),
         )
 
         self.is_trained = False
@@ -88,7 +89,9 @@ class RandomForestModel:
             )
 
         # Shuffle data
-        features, binary_labels = shuffle(features, binary_labels, random_state=self.config.rf.seed)
+        features, binary_labels = shuffle(
+            features, binary_labels, random_state=self.config.resolved_rf_seed()
+        )
         logger.info(f"Prepared {features.shape[0]} training samples")
 
         # Start training

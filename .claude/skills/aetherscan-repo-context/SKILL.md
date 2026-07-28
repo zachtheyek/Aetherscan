@@ -115,7 +115,7 @@ src/aetherscan/
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
 ├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection — batched memmap workers + background producer
-├── seeding.py           # Root-seed stream derivation (reproducible training runs)
+├── seeding.py           # Root-seed stream derivation (reproducible train + inference runs)
 ├── benchmark.py         # Always-on stage timing to the pipeline_stages table
 ├── dashboard.py         # Streamlit live-monitoring dashboard (DB-driven)
 ├── dashboard_launcher.py # Spawns the headless dashboard subprocess (guarded)
@@ -124,6 +124,8 @@ src/aetherscan/
 ├── tag_guards.py        # Fail-early --save-tag dedup guards
 ├── rf_metrics.py        # Pure RF eval-metric helper (persisted to training_stats by train.py)
 ├── shap_parallel.py     # RF SHAP process-pool wrapper (TF-free; called by train.py)
+├── latent_variants.py   # Latent-representation variant catalogue + selection/calibration (TF-free; shared by train.py + inference.py)
+├── latent_gif.py        # Process-parallel latent-GIF frame renderer (TF-free; called by train.py)
 ├── models/{vae,random_forest}.py
 ├── db/db.py             # Thread-safe SQLite, async queue-based writes, schema migration, supersede semantics
 ├── logger/              # Multi-handler logging + Slack integration

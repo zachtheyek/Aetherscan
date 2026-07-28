@@ -179,3 +179,95 @@ class TestEncoderDecoderSymmetry:
         recon = reconstruction.numpy()
         assert recon.min() >= 0.0
         assert recon.max() <= 1.0
+
+
+class TestSeededSamplingReproducibility:
+    """#279: seed_tensorflow makes the Sampling layer's draws reproducible — the mechanism
+    that makes inference candidate sets repeatable (the layer used to be entirely unseeded
+    on the inference path)."""
+
+    def test_same_stream_key_reproduces_sampled_z(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+        layer = Sampling()
+        z_mean = tf.zeros((4, 8))
+        z_log_var = tf.zeros((4, 8))
+
+        seed_tensorflow(207, False, 1, 5)
+        first = layer([z_mean, z_log_var]).numpy()
+        seed_tensorflow(207, False, 1, 5)
+        second = layer([z_mean, z_log_var]).numpy()
+        np.testing.assert_array_equal(first, second)
+
+        # A different sub-key (e.g. another cadence) yields a different, but equally
+        # reproducible, draw
+        seed_tensorflow(207, False, 1, 6)
+        third = layer([z_mean, z_log_var]).numpy()
+        assert not np.array_equal(first, third)
+
+    def test_unseeded_root_returns_none_and_leaves_entropy(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+        layer = Sampling()
+        z_mean = tf.zeros((4, 8))
+        z_log_var = tf.zeros((4, 8))
+        assert seed_tensorflow(None, False, 1) is None
+        first = layer([z_mean, z_log_var]).numpy()
+        assert seed_tensorflow(None, False, 1) is None
+        second = layer([z_mean, z_log_var]).numpy()
+        assert not np.array_equal(first, second)
+
+
+class TestWeightInitReproducibility:
+    """#279 acceptance ("same seed => byte-identical VAE weights") — the criterion that was
+    NOT actually met before: tf_keras initializers seed from Python's global `random`, not
+    from tf.random.set_seed, so weight init drifted run-to-run even with --seed pinned."""
+
+    @staticmethod
+    def _build_kernel():
+        import tensorflow as tf  # noqa: PLC0415
+        from tensorflow import keras  # noqa: PLC0415
+
+        del tf  # imported for parity with the production build path
+        inputs = keras.Input(shape=(8,))
+        outputs = keras.layers.Dense(16, kernel_initializer=keras.initializers.HeNormal())(inputs)
+        return keras.Model(inputs, outputs).get_weights()[0]
+
+    def test_same_root_seed_reproduces_initial_weights(self):
+        from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+        seed_tensorflow(207, False, 0)
+        first = self._build_kernel()
+        seed_tensorflow(207, False, 0)
+        second = self._build_kernel()
+        np.testing.assert_array_equal(first, second)
+
+    def test_different_root_seed_changes_initial_weights(self):
+        from aetherscan.seeding import seed_tensorflow  # noqa: PLC0415
+
+        seed_tensorflow(207, False, 0)
+        first = self._build_kernel()
+        seed_tensorflow(208, False, 0)
+        second = self._build_kernel()
+        assert not np.array_equal(first, second)
+
+    def test_tf_set_seed_alone_is_insufficient(self):
+        # Regression guard on the ROOT CAUSE: if a future refactor drops the Python-random
+        # seeding from seed_tensorflow (e.g. "tf.random.set_seed is enough"), this test
+        # documents why that is wrong on the tf_keras stack. Two builds under only
+        # tf.random.set_seed must differ — if they ever stop differing, tf_keras changed its
+        # initializer seeding and seed_tensorflow's workaround can be revisited.
+        import random  # noqa: PLC0415
+
+        import tensorflow as tf  # noqa: PLC0415
+
+        random.seed(1234)  # fixed start so the assertion below is deterministic
+        tf.random.set_seed(207)
+        first = self._build_kernel()
+        tf.random.set_seed(207)
+        second = self._build_kernel()
+        assert not np.array_equal(first, second)

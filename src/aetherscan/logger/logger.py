@@ -38,6 +38,25 @@ def _parse_level(level_str: str) -> int:
     return level_map.get(level_str.upper(), logging.INFO)
 
 
+class ShutdownSafeQueueHandler(QueueHandler):
+    """
+    QueueHandler that silently drops records once its multiprocessing queue is closed (#281).
+
+    After Logger.stop() disposes the queue, a vanilla emit() raises ValueError("Queue ... is
+    closed"); logging's handleError() then prints the traceback to sys.stderr — and if stderr
+    is (or becomes) a StreamToLogger redirect, that print logs again, raises again, and
+    recurses without bound (the observed RecursionError + "lost sys.stderr" at teardown).
+    Swallowing the closed-queue error here makes that loop structurally impossible no matter
+    what the streams point at; late shutdown-time records are dropped, which is the only
+    sane destination for them anyway.
+    """
+
+    def enqueue(self, record):
+        # Queue closed (or its pipe broken) during teardown — drop the record
+        with contextlib.suppress(ValueError, OSError):
+            super().enqueue(record)
+
+
 def log_path_for_tag(output_path: str, tag: str) -> str:
     """Return this run's log-file path: ``{output_path}/logs/aetherscan_{tag}.log``.
 
@@ -56,10 +75,21 @@ class StreamToLogger:
         self.logger = logger
         self.level = level
         self.linebuf = ""
+        # Re-entrancy guard (#281): if anything downstream of logger.log ever writes back to
+        # this stream (e.g. logging's handleError printing to a redirected stderr), the
+        # second entry is dropped instead of recursing without bound. Thread-local so
+        # concurrent writers on other threads are unaffected.
+        self._reentrancy = threading.local()
 
     def write(self, buf):
-        for line in buf.rstrip().splitlines():
-            self.logger.log(self.level, line.rstrip())
+        if getattr(self._reentrancy, "writing", False):
+            return
+        self._reentrancy.writing = True
+        try:
+            for line in buf.rstrip().splitlines():
+                self.logger.log(self.level, line.rstrip())
+        finally:
+            self._reentrancy.writing = False
 
     def flush(self):
         # Flush any remaining content in linebuf if needed
@@ -229,8 +259,9 @@ class Logger:
         self.log_listener = QueueListener(self.log_queue, *handlers, respect_handler_level=True)
         self.log_listener.start()
 
-        # Add queue handler to root logger (both main and workers use this)
-        queue_handler = QueueHandler(self.log_queue)
+        # Add queue handler to root logger (both main and workers use this); shutdown-safe
+        # so post-stop() records are dropped instead of raising through handleError (#281)
+        queue_handler = ShutdownSafeQueueHandler(self.log_queue)
         root_logger.addHandler(queue_handler)
 
         # Start the Slack run thread FIRST (posts run summary, all logs become replies)
@@ -283,7 +314,28 @@ class Logger:
             # Note, can't log here after tear down
 
     def stop(self):
-        """Stop the queue listener thread and flush Slack messages"""
+        """
+        Stop the queue listener thread and flush Slack messages.
+
+        Idempotent (#281): a second call is a no-op — QueueListener.stop() raises if called
+        twice, and cleanup paths can legitimately overlap (conftest teardown + explicit
+        stops). Restores sys.stdout/sys.stderr BEFORE the listener/queue teardown, so any
+        output produced during or after shutdown (including logging's own handleError)
+        reaches the real console instead of recursing through the redirect — the
+        RecursionError / "lost sys.stderr" loop this method used to leave armed.
+        """
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
+
+        # Root fix (#281): put the real streams back first — same idiom the worker path
+        # already uses in init_worker_logging. Guarded so a foreign redirect installed on
+        # top of ours (e.g. pytest's capture) is left alone.
+        if isinstance(sys.stdout, StreamToLogger):
+            sys.stdout = sys.__stdout__
+        if isinstance(sys.stderr, StreamToLogger):
+            sys.stderr = sys.__stderr__
+
         # Flush and close Slack handler first (while listener is still running)
         if self.slack_handler is not None:
             self.slack_handler.close()
@@ -389,7 +441,7 @@ def init_worker_logging(log_queue=None):
     # Configure process-local logging to use queue
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    root_logger.addHandler(QueueHandler(log_queue))
+    root_logger.addHandler(ShutdownSafeQueueHandler(log_queue))
     root_logger.setLevel(logging.INFO)
 
 

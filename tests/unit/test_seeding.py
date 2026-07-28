@@ -1,16 +1,45 @@
-"""Unit tests for aetherscan.seeding: root-seed stream derivation (issue #49)."""
+"""Unit tests for aetherscan.seeding: root-seed stream derivation (issues #49, #279)."""
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
+from aetherscan import seeding
 from aetherscan.seeding import (
     STREAM_DATA_GEN,
     STREAM_DATASET,
+    STREAM_INFERENCE_MC,
+    STREAM_INFERENCE_VIZ,
+    STREAM_KMEANS,
     STREAM_PLOT,
+    STREAM_REFERENCE_CLOUD,
+    STREAM_RF,
+    STREAM_RF_PLOTS,
+    STREAM_SHAP_SAMPLES,
+    STREAM_TF,
+    STREAM_UMAP,
     STREAM_VIZ,
     derive_rng,
+    derive_seed,
 )
+
+_ALL_STREAM_IDS = [
+    STREAM_DATA_GEN,
+    STREAM_DATASET,
+    STREAM_VIZ,
+    STREAM_PLOT,
+    STREAM_RF,
+    STREAM_UMAP,
+    STREAM_KMEANS,
+    STREAM_TF,
+    STREAM_INFERENCE_VIZ,
+    STREAM_SHAP_SAMPLES,
+    STREAM_RF_PLOTS,
+    STREAM_INFERENCE_MC,
+    STREAM_REFERENCE_CLOUD,
+]
 
 
 def _draws(rng: np.random.Generator, n: int = 16) -> list[int]:
@@ -34,9 +63,8 @@ class TestDeriveRng:
         )
 
     def test_stream_ids_are_distinct_and_independent(self):
-        ids = [STREAM_DATA_GEN, STREAM_DATASET, STREAM_VIZ, STREAM_PLOT]
-        assert len(set(ids)) == len(ids)
-        streams = [tuple(_draws(derive_rng(42, stream_id, 1))) for stream_id in ids]
+        assert len(set(_ALL_STREAM_IDS)) == len(_ALL_STREAM_IDS)
+        streams = [tuple(_draws(derive_rng(42, stream_id, 1))) for stream_id in _ALL_STREAM_IDS]
         assert len(set(streams)) == len(streams)
 
     def test_none_root_seed_falls_back_to_entropy(self):
@@ -45,3 +73,48 @@ class TestDeriveRng:
         rng = derive_rng(None, STREAM_DATA_GEN, 1)
         assert isinstance(rng, np.random.Generator)
         assert _draws(rng) != _draws(derive_rng(None, STREAM_DATA_GEN, 1))
+
+
+class TestDeriveSeed:
+    """#279: the int-valued sibling for APIs that take an integer random_state."""
+
+    def test_deterministic_and_in_range(self):
+        first = derive_seed(42, STREAM_RF)
+        assert first == derive_seed(42, STREAM_RF)
+        assert 0 <= first < 2**32
+
+    def test_key_and_root_change_value(self):
+        base = derive_seed(42, STREAM_UMAP, 0, 15, 100)
+        assert base != derive_seed(42, STREAM_UMAP, 1, 15, 100)
+        assert base != derive_seed(42, STREAM_UMAP, 0, 30, 100)
+        assert base != derive_seed(43, STREAM_UMAP, 0, 15, 100)
+
+    def test_none_root_still_returns_concrete_int(self):
+        # The #279 constraint: sites that set a random_state today keep setting one — an
+        # unseeded root yields entropy, never None
+        first = derive_seed(None, STREAM_RF)
+        assert isinstance(first, int) and 0 <= first < 2**32
+        assert first != derive_seed(None, STREAM_RF)  # overwhelmingly likely
+
+
+class TestUnseededWarning:
+    """#279: an unseeded run warns exactly once instead of failing silently."""
+
+    def _reset_flag(self):
+        seeding._UNSEEDED_WARNED = False
+
+    def test_warns_once_for_none_root(self, caplog):
+        self._reset_flag()
+        with caplog.at_level(logging.WARNING, logger="aetherscan.seeding"):
+            derive_rng(None, STREAM_DATA_GEN, 1)
+            derive_seed(None, STREAM_RF)
+        warnings = [r for r in caplog.records if "NOT reproducible" in r.message]
+        assert len(warnings) == 1
+        self._reset_flag()
+
+    def test_no_warning_with_concrete_root(self, caplog):
+        self._reset_flag()
+        with caplog.at_level(logging.WARNING, logger="aetherscan.seeding"):
+            derive_rng(11, STREAM_DATA_GEN, 1)
+            derive_seed(11, STREAM_RF)
+        assert not [r for r in caplog.records if "NOT reproducible" in r.message]

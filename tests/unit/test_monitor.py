@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import psutil
 import pytest
 from matplotlib.lines import Line2D
+from matplotlib.patches import ConnectionPatch
 
 from aetherscan.monitor import get_process_tree_stats
 from aetherscan.monitor.monitor import (
@@ -232,7 +234,12 @@ class TestDrawStageBoundaries:
     """The boundary-line/label overlay (issue #214): a divider line on every panel at each
     span's right edge, with the leaf stage name labelled once on the CPU (first) panel."""
 
-    def test_lines_on_all_panels_labels_on_cpu_only(self):
+    @staticmethod
+    def _boundary_patches(fig):
+        """The figure-level ConnectionPatch artists _draw_stage_boundaries adds (#280)."""
+        return [artist for artist in fig.artists if isinstance(artist, ConnectionPatch)]
+
+    def test_one_figure_line_per_span_labels_on_cpu_only(self):
         fig, axes = plt.subplots(3, 1)
         try:
             spans = [
@@ -242,9 +249,11 @@ class TestDrawStageBoundaries:
             ]
             _draw_stage_boundaries(list(axes), spans, start_time=0, current_time=1800)
 
-            # One axvline per span on every panel (no data plotted -> ax.lines are the lines)
+            # ONE figure-level line per span (#280) — the panels themselves stay untouched
+            boundaries = self._boundary_patches(fig)
+            assert len(boundaries) == len(spans)
             for ax in axes:
-                assert len(ax.lines) == len(spans)
+                assert len(ax.lines) == 0
 
             # Labels only on the CPU (first) panel, one per span, leaf name only
             assert [t.get_text() for t in axes[0].texts] == [
@@ -256,12 +265,32 @@ class TestDrawStageBoundaries:
             assert len(axes[2].texts) == 0
 
             # Boundaries sit at each span's end time in minutes since start (600s -> 10min, ...)
-            xs = [line.get_xdata()[0] for line in axes[0].lines]
+            xs = [patch.xy1[0] for patch in boundaries]
             assert xs == pytest.approx([10.0, 20.0, 30.0])
 
-            # Labels are dimgray and angled 30 deg from horizontal
+            # Labels are dimgray and angled 30 deg from horizontal — byte-identical to the
+            # pre-#280 annotations (only the lines changed)
             assert axes[0].texts[0].get_color() == "dimgray"
             assert axes[0].texts[0].get_rotation() == pytest.approx(30.0)
+        finally:
+            plt.close(fig)
+
+    def test_boundary_line_style_and_span(self):
+        # #280 acceptance: dashed, semi-transparent, dimgray, spanning from the top of the
+        # first panel (y=1 in axes fraction) to the bottom of the last (y=0)
+        fig, axes = plt.subplots(3, 1)
+        try:
+            spans = [{"stage": "round_01", "start_time": 0, "end_time": 600}]
+            _draw_stage_boundaries(list(axes), spans, start_time=0, current_time=1800)
+            [boundary] = self._boundary_patches(fig)
+            assert boundary.get_linestyle() == "--"
+            assert boundary.get_alpha() is not None and boundary.get_alpha() < 1.0
+            assert boundary.get_edgecolor()[:3] == mcolors.to_rgb("dimgray")
+            assert boundary.xy1 == (10.0, 1.0)
+            assert boundary.xy2 == (10.0, 0.0)
+            # Endpoint transforms anchor to the FIRST and LAST axes respectively
+            assert boundary.coords1 is axes[0].get_xaxis_transform()
+            assert boundary.coords2 is axes[-1].get_xaxis_transform()
         finally:
             plt.close(fig)
 
@@ -272,7 +301,8 @@ class TestDrawStageBoundaries:
             spans = [{"stage": "final_save", "start_time": 0, "end_time": 9_999}]
             _draw_stage_boundaries(list(axes), spans, start_time=0, current_time=1800)
             # min(9999, 1800) = 1800s -> 30 min
-            assert axes[0].lines[0].get_xdata()[0] == pytest.approx(30.0)
+            [boundary] = self._boundary_patches(fig)
+            assert boundary.xy1[0] == pytest.approx(30.0)
         finally:
             plt.close(fig)
 
