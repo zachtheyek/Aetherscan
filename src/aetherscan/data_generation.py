@@ -239,9 +239,12 @@ def new_cadence(
     # Extract the modified data (with signal injection) from the setigen Frame
     modified_data = frame.data.copy()
 
-    # Cleanup intermediate data
+    # Cleanup intermediate data. Refcounting frees the Frame's arrays immediately — do NOT
+    # add a gc.collect() here: this function runs once per injection (~2.5M times per
+    # production round), and a full collection per call cost ~23 ms against ~4.5 ms for
+    # everything else in this function (~5x the total generation wall). The per-chunk
+    # collect in generate_round_to_memmap covers cycle cleanup.
     del frame, signal
-    gc.collect()
 
     # Build signal info dictionary
     signal_info = {
