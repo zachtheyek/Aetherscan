@@ -616,11 +616,12 @@ on-disk joblib bundle), and writes distinct files — so
 (fit + joblib persist + per-snapshot transforms + frame render + GIF assembly) to forkserver
 workers (empty preload; BLAS-family thread pools pinned per the `shap_parallel.py` isolation
 pattern — but deliberately NOT numba's or OMP's: UMAP grows numba's pool itself on large-N
-paths and numba hard-errors past a capped launch, see `_sweep_worker_init`). The ~1.7–1.9 h
-serial tail (~95% single-core, even after #278 parallelized frame rendering) drops to ~93 min
-at a reduced 60-frame shape with 24 workers (first measurement; memory-bandwidth contention
-between concurrent single-threaded fits — the production-scale number is pending). Logging and Slack uploads stay in the parent process, in
-the serial loop's order; byte-identity of the GIFs is pinned by a slow-marked unit test
+paths and numba hard-errors past a capped launch, see `_sweep_worker_init`). At production
+shape the serial tail is ~1.7–1.9 h (~95% single-core, even after #278 parallelized frame
+rendering); the first parallel measurement, at a reduced 60-frame shape with 24 workers on
+blpc3, is ~93 min (memory-bandwidth contention between concurrent single-threaded fits), so
+no production-shape speedup can be quoted yet. Logging and Slack uploads stay in the parent
+process, in the serial loop's order; byte-identity of the GIFs is pinned by a slow-marked unit test
 comparing serial vs pooled output. This is disjoint from the #278-**rejected** within-fit
 ideas: batching the per-snapshot `.transform()` calls and reusing a precomputed kNN graph
 across the sweep remain rejected because they change how UMAP consumes its `random_state`
