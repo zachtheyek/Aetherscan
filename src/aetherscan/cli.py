@@ -102,15 +102,21 @@ def _resolve(args: argparse.Namespace, arg_name: str, default: Any) -> Any:
 
 
 def _estimate_round_data_nbytes(
-    n_samples: int, num_observations: int, time_bins: int, width_bin_downsampled: int
+    n_samples: int,
+    num_observations: int,
+    time_bins: int,
+    width_bin_downsampled: int,
+    bytes_per_element: int = 4,
 ) -> int:
     """
     Estimate the on-disk size of one round's disk-backed dataset (see round_data.py): three
-    float32 arrays of shape (n_samples, num_observations, time_bins, width_bin_downsampled)
-    plus a tiny U20 labels array. Kept stdlib-only (no numpy) so utils/print_cli_help.py can
-    keep importing cli.py without the scientific stack.
+    cadence arrays of shape (n_samples, num_observations, time_bins, width_bin_downsampled)
+    at `bytes_per_element` (4 for the float32 default, 2 under
+    training.round_array_dtype="float16") plus a tiny U20 labels array. Kept stdlib-only
+    (no numpy) so utils/print_cli_help.py can keep importing cli.py without the scientific
+    stack.
     """
-    per_sample_bytes = num_observations * time_bins * width_bin_downsampled * 4  # float32
+    per_sample_bytes = num_observations * time_bins * width_bin_downsampled * bytes_per_element
     labels_bytes = n_samples * 20 * 4  # numpy "U20" = 20 UCS-4 code points per label
     return 3 * n_samples * per_sample_bytes + labels_bytes
 
@@ -1723,7 +1729,7 @@ def collect_validation_errors(
         # two rounds coexist on disk (round k trains while round k+1 generates), so require
         # 2.2x one round's estimated size free; 1.1x when overlap is disabled. Estimated from
         # sample counts only — actual usage tracks the estimate closely since the arrays are
-        # fixed-shape float32.
+        # fixed-shape (float32; halved under training.round_array_dtype="float16").
         nob = _resolve(args, "num_observations", config.data.num_observations)
         tb = _resolve(args, "time_bins", config.data.time_bins)
         overlap = _resolve(args, "overlap_data_generation", config.training.overlap_data_generation)
@@ -1733,7 +1739,10 @@ def collect_validation_errors(
             # training data, so they live under the training-data root
             round_data_dir = config.get_training_file_path("round_data", data_path)
         if all(v is not None for v in (nsb, nob, tb, wb)) and df:
-            round_nbytes = _estimate_round_data_nbytes(nsb, nob, tb, wb // df)
+            element_bytes = 2 if config.training.round_array_dtype == "float16" else 4
+            round_nbytes = _estimate_round_data_nbytes(
+                nsb, nob, tb, wb // df, bytes_per_element=element_bytes
+            )
             required_factor = 2.2 if overlap else 1.1
             required_bytes = required_factor * round_nbytes
             try:
