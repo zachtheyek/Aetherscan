@@ -360,16 +360,25 @@ def build_snapshot_frames(
 
 
 def _sweep_worker_init() -> None:
-    """Pin native thread pools before numpy/umap/numba initialize in the fresh forkserver
-    interpreter (same pattern as shap_parallel; numba added for UMAP's kernels)."""
+    """Pin BLAS-family thread pools before numpy/umap initialize in the fresh forkserver
+    interpreter (the shap_parallel pattern) — but deliberately NOT numba's.
+
+    UMAP calls numba.set_num_threads(cpu_count) on its large-N paths, and numba hard-errors
+    when asked to grow past the pool it launched ("Cannot set NUMBA_NUM_THREADS to a
+    different value once the threads have been launched") — so capping NUMBA_NUM_THREADS at
+    1 breaks production-scale fits outright (found by the first full-scale run; the small-N
+    unit fits take the brute-force path and never touch the thread API). OMP_NUM_THREADS is
+    left unpinned for the same reason: numba's threading layer may be OpenMP-backed, in
+    which case the OMP cap is the same trap under a different name. Shrinking is always
+    legal, so an unpinned launch matches the pre-parallel serial behavior exactly (the old
+    in-process sweep also ran with an unpinned numba pool); the seeded fits force their
+    single-threaded deterministic paths regardless."""
     for var in (
-        "OMP_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
         "MKL_NUM_THREADS",
         "NUMEXPR_NUM_THREADS",
         "VECLIB_MAXIMUM_THREADS",
         "BLIS_NUM_THREADS",
-        "NUMBA_NUM_THREADS",
     ):
         os.environ.setdefault(var, "1")
 
