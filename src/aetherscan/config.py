@@ -199,7 +199,10 @@ class GPUConfig:
     # interference (measured at ~7.6% of step throughput on blpc3, benchmarks/README.md
     # "Corrected ceiling decomposition"). "global" restores TF's default shared pool;
     # "gpu_shared" is the third TF-supported value. Applied in setup_gpu_strategy before the
-    # GPU runtime initializes; inert in the producer tree (CUDA-blanked).
+    # GPU runtime initializes; inert in the producer tree (CUDA-blanked). NOTE: this config is
+    # the source of truth — "global" actively CLEARS any shell-set TF_GPU_THREAD_MODE/COUNT
+    # (same semantics as use_async_allocator vs TF_GPU_ALLOCATOR above), so an env-only
+    # override will not survive; set the config field instead.
     gpu_thread_mode: str = "gpu_private"
     # TF_GPU_THREAD_COUNT: threads per GPU when gpu_thread_mode="gpu_private" (TF default 2)
     gpu_thread_count: int = 2

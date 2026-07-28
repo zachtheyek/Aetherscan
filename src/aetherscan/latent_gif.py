@@ -484,7 +484,16 @@ def run_umap_gif_sweep(tasks: list[dict], n_workers: int) -> list[dict]:
 
     n_workers = max(1, min(n_workers, len(tasks)))
     if n_workers == 1:
-        return [run_umap_gif_combo(task) for task in tasks]
+        # In-process combos cache the shared bundle in THIS process's module globals — clear
+        # them afterwards so the caller's pre-sweep memory cleanup (train.py dels its copies
+        # of the bundled inputs) isn't quietly undone by a lingering multi-hundred-MB cache.
+        # The pooled arm needs no equivalent: its cache lives in short-lived workers.
+        global _SWEEP_BUNDLE, _SWEEP_BUNDLE_PATH
+        try:
+            return [run_umap_gif_combo(task) for task in tasks]
+        finally:
+            _SWEEP_BUNDLE = None
+            _SWEEP_BUNDLE_PATH = None
 
     ctx = mp.get_context("forkserver")
     ctx.set_forkserver_preload([])
