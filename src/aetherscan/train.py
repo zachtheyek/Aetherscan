@@ -4130,6 +4130,23 @@ class TrainingPipeline:
             )
         logger.info("Database flushed")
 
+        # Tighten the timestamp window to the queried rounds' actual row span:
+        # idx_injection_stats_filter leads with (tag, timestamp) and round_number is not in
+        # it, so with the run-wide window every query below re-scans the tag's entire row
+        # history (measured 10.5x slower at 12M rows) — and this function issues ~165 such
+        # queries per call. The span is MIN/MAX over ALL rows for these rounds (superseded
+        # included), so intersecting it with the existing [run-start, now] window can only
+        # narrow each scan — never change a result set.
+        window_start, window_end = self.start_time, current_time
+        span = self.db.query_injection_stat_time_span(
+            tag=self.config.checkpoint.save_tag,
+            start_round_number=start_round_number,
+            end_round_number=end_round_number,
+        )
+        if span is not None:
+            window_start = max(window_start, span[0] - 1.0)
+            window_end = min(window_end, span[1] + 1.0)
+
         # Figure 1: Injected signal characteristics
         signal_stats = [
             "snr",
@@ -4150,8 +4167,8 @@ class TrainingPipeline:
                 start_round_number=start_round_number,
                 end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
+                start_time=window_start,
+                end_time=window_end,
                 columns=["value"],
             )
             eti_stats[stat_name] = [r["value"] for r in results]
@@ -4164,8 +4181,8 @@ class TrainingPipeline:
                 start_round_number=start_round_number,
                 end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
+                start_time=window_start,
+                end_time=window_end,
                 columns=["value"],
             )
             rfi_stats[stat_name] = [r["value"] for r in results]
@@ -4179,8 +4196,8 @@ class TrainingPipeline:
             start_round_number=start_round_number,
             end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
+            start_time=window_start,
+            end_time=window_end,
             columns=["background_index"],
         )
         eti_background_indices = [
@@ -4195,8 +4212,8 @@ class TrainingPipeline:
             start_round_number=start_round_number,
             end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
+            start_time=window_start,
+            end_time=window_end,
             columns=["background_index"],
         )
         rfi_background_indices = [
@@ -4237,8 +4254,8 @@ class TrainingPipeline:
                 start_round_number=start_round_number,
                 end_round_number=end_round_number,
                 tag=self.config.checkpoint.save_tag,
-                start_time=self.start_time,
-                end_time=current_time,
+                start_time=window_start,
+                end_time=window_end,
             )
             for row in agg_results:
                 round_num = row["round_number"]
@@ -4258,8 +4275,8 @@ class TrainingPipeline:
             start_round_number=start_round_number,
             end_round_number=end_round_number,
             tag=self.config.checkpoint.save_tag,
-            start_time=self.start_time,
-            end_time=current_time,
+            start_time=window_start,
+            end_time=window_end,
         )
         for row in clamping_results:
             round_num = row["round_number"]
@@ -4305,8 +4322,8 @@ class TrainingPipeline:
                         start_round_number=start_round_number,
                         end_round_number=end_round_number,
                         tag=self.config.checkpoint.save_tag,
-                        start_time=self.start_time,
-                        end_time=current_time,
+                        start_time=window_start,
+                        end_time=window_end,
                         columns=["value"],
                     )
                     stats_by_stage[stage][stat_name] = [r["value"] for r in results]
@@ -4336,8 +4353,8 @@ class TrainingPipeline:
                     start_round_number=start_round_number,
                     end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
+                    start_time=window_start,
+                    end_time=window_end,
                     columns=["value"],
                 )
                 values_a = [r["value"] for r in results_a]
@@ -4351,8 +4368,8 @@ class TrainingPipeline:
                     start_round_number=start_round_number,
                     end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
+                    start_time=window_start,
+                    end_time=window_end,
                     columns=["value"],
                 )
                 values_b = [r["value"] for r in results_b]
@@ -4378,8 +4395,8 @@ class TrainingPipeline:
                     start_round_number=start_round_number,
                     end_round_number=end_round_number,
                     tag=self.config.checkpoint.save_tag,
-                    start_time=self.start_time,
-                    end_time=current_time,
+                    start_time=window_start,
+                    end_time=window_end,
                     columns=["value"],
                 )
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]

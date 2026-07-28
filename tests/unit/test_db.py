@@ -790,6 +790,42 @@ def _wait_backlog_empty(database, timeout: float = 15.0) -> bool:
     return False
 
 
+class TestInjectionStatTimeSpan:
+    """query_injection_stat_time_span: the whole-partition MIN/MAX aggregate that callers use
+    to tighten (tag, timestamp) index windows for round-scoped queries."""
+
+    def test_span_by_round_and_missing_tag(self, db):
+        rows = _bulk_rows(3, round_number=1) + _bulk_rows(3, round_number=2)
+        for i, r in enumerate(rows[:3]):
+            r["timestamp"] = 100.0 + i  # round 1: 100..102
+        for i, r in enumerate(rows[3:]):
+            r["timestamp"] = 200.0 + i  # round 2: 200..202
+        db.write_injection_stats_bulk(rows, tag="span_v1")
+        assert _wait_backlog_empty(db)
+        assert db.query_injection_stat_time_span(tag="span_v1") == (100.0, 202.0)
+        assert db.query_injection_stat_time_span(tag="span_v1", start_round_number=2) == (
+            200.0,
+            202.0,
+        )
+        assert db.query_injection_stat_time_span(
+            tag="span_v1", start_round_number=1, end_round_number=1
+        ) == (100.0, 102.0)
+        assert db.query_injection_stat_time_span(tag="no_such_tag") is None
+
+    def test_span_includes_superseded_and_non_finite_rows(self, db):
+        # The span deliberately ignores the is_finite / superseded filters row-level queries
+        # apply: it must be a SUPERSET bound, so intersecting a query window with it can
+        # never drop a row that query would have returned.
+        rows = _bulk_rows(2, round_number=1)
+        rows[0]["timestamp"] = 50.0
+        rows[0]["value"] = float("nan")  # sanitized to is_finite=0 at write time
+        rows[1]["timestamp"] = 60.0
+        db.write_injection_stats_bulk(rows, tag="span_v2")
+        assert _wait_backlog_empty(db)
+        db.mark_superseded("injection_stats", tag="span_v2", round_ge=1)
+        assert db.query_injection_stat_time_span(tag="span_v2") == (50.0, 60.0)
+
+
 class TestBulkLane:
     """#277: high-volume injection stats ride a bounded bulk lane separate from the
     foreground queue, with per-round pending accounting."""
