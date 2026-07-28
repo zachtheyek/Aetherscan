@@ -886,13 +886,14 @@ def _run_memmap_task(args: tuple, backgrounds: np.ndarray) -> tuple[float, list[
                 lognorm_out[start_idx + i] = lognorm_params
             all_sample_info.append(sample_info)
     finally:
-        # Flush in the finally so rows written before a mid-task exception still reach disk
-        # deterministically (a failed round has no .done manifest and reads as garbage either
-        # way, but not all filesystems are guaranteed to write back dirty pages on munmap)
-        out.flush()
+        # No per-task flush: memmap.flush() is an msync over the task's whole mapping, and at
+        # ~23,400 tasks per production round the concurrent full-mapping msyncs stack into the
+        # chunk-tail stragglers (#117/#118). Durability is unchanged: written pages live in the
+        # shared page cache regardless, and generate_round_to_memmap msyncs every array once,
+        # before the .done manifest is written — a crash before that leaves no manifest, so the
+        # dir reads as garbage either way.
         del out
         if lognorm_out is not None:
-            lognorm_out.flush()
             del lognorm_out
 
     return time.time() - task_start, all_sample_info
@@ -1200,6 +1201,15 @@ def generate_round_to_memmap(
         logger.info(f"Chunk {chunk_idx + 1}/{n_chunks} complete")
 
     np.save(paths.labels_path, labels)
+
+    # One msync per array replaces the per-task flushes that used to live in
+    # _run_memmap_task's finally: everything the workers wrote must reach disk before the
+    # .done manifest can exist (the same durability contract, without ~23,400 concurrent
+    # full-mapping msyncs per production round).
+    for path in (*array_paths.values(), *lognorm_paths.values()):
+        arr = np.lib.format.open_memmap(path, mode="r+")
+        arr.flush()
+        del arr
 
     # The .done manifest is only written after every chunk has finished — the same atomicity
     # idea as preprocessing's .tmp -> os.replace stamp extraction
