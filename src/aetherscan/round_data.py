@@ -170,19 +170,26 @@ def build_manifest(
     snr_range: float,
     wall_time_s: float,
     chunk_count: int,
+    array_dtype: str = "float32",
 ) -> dict:
-    """Assemble the .done manifest dict by re-opening the finished arrays read-only."""
+    """Assemble the .done manifest dict by re-opening the finished arrays read-only.
+    `array_dtype` is the requested cadence-array dtype; the per-array `dtypes` map records
+    what is actually on disk (labels/lognorm sidecars stay float32/U regardless)."""
     shapes: dict[str, list[int]] = {}
+    dtypes: dict[str, str] = {}
     checksums: dict[str, dict] = {}
     for name, path in _manifest_paths(paths).items():
         arr = np.load(path, mmap_mode="r")
         shapes[name] = list(arr.shape)
+        dtypes[name] = str(arr.dtype)
         checksums[name] = _array_checksum(arr)
         del arr
     return {
         "round_idx": paths.round_idx,
         "n_samples": int(n_samples),
         "shapes": shapes,
+        "dtypes": dtypes,
+        "array_dtype": str(array_dtype),
         "snr_base": float(snr_base),
         "snr_range": float(snr_range),
         "checksums": checksums,
@@ -203,7 +210,9 @@ def write_done_manifest(paths: RoundDataPaths, manifest: dict) -> None:
 
 
 def validate_done_manifest(
-    paths: RoundDataPaths, expected_n_samples: int | None = None
+    paths: RoundDataPaths,
+    expected_n_samples: int | None = None,
+    expected_array_dtype: str | None = None,
 ) -> dict | None:
     """
     Validate a round dir's .done manifest against the arrays on disk. Returns the manifest
@@ -234,7 +243,20 @@ def validate_done_manifest(
                 f"({expected_n_samples}) in {paths.done_path}"
             )
             return None
+        # Cadence-array dtype gate: a dir generated under a different round_array_dtype must
+        # not be silently reused (a float16 round fed to a float32-config resume — or vice
+        # versa — changes input numerics mid-run). Manifests predating the dtypes key are all
+        # float32 rounds.
+        if expected_array_dtype is not None:
+            manifest_dtype = manifest.get("array_dtype", "float32")
+            if manifest_dtype != expected_array_dtype:
+                logger.warning(
+                    f"Manifest array_dtype ({manifest_dtype}) != expected "
+                    f"({expected_array_dtype}) in {paths.done_path}"
+                )
+                return None
 
+        manifest_dtypes = manifest.get("dtypes")
         for name, path in _manifest_paths(paths).items():
             if not os.path.isfile(path):
                 logger.warning(f"Manifest array missing on disk: {path}")
@@ -243,6 +265,9 @@ def validate_done_manifest(
             try:
                 if list(arr.shape) != manifest["shapes"][name]:
                     logger.warning(f"Shape mismatch for {path}")
+                    return None
+                if manifest_dtypes is not None and str(arr.dtype) != manifest_dtypes[name]:
+                    logger.warning(f"Dtype mismatch for {path}")
                     return None
                 checksum = manifest["checksums"][name]
                 if int(arr.size) != checksum["elements"]:
@@ -332,7 +357,9 @@ def _reap_stale_producer(base_dir: str, term_timeout: float = 5.0) -> None:
         os.remove(pidfile)
 
 
-def prepare_round_data_dir(base_dir: str, start_round: int) -> None:
+def prepare_round_data_dir(
+    base_dir: str, start_round: int, expected_array_dtype: str = "float32"
+) -> None:
     """
     Startup cleanup of a tag's round-data directory, mirroring checkpoint-archiving semantics
     (train.archive_directory) for resumable runs — except entries are deleted rather than
@@ -361,7 +388,12 @@ def prepare_round_data_dir(base_dir: str, start_round: int) -> None:
         if round_idx >= start_round:
             logger.info(f"Deleting round-data dir for round >= {start_round}: {entry_path}")
             shutil.rmtree(entry_path, ignore_errors=True)
-        elif validate_done_manifest(RoundDataPaths(entry_path, round_idx)) is None:
+        elif (
+            validate_done_manifest(
+                RoundDataPaths(entry_path, round_idx), expected_array_dtype=expected_array_dtype
+            )
+            is None
+        ):
             logger.info(f"Deleting round-data dir with missing/invalid manifest: {entry_path}")
             shutil.rmtree(entry_path, ignore_errors=True)
         else:
@@ -400,6 +432,7 @@ def _default_generate(paths, round_idx, snr_base, snr_range, pool, params, stats
         seed=params["seed"],
         stats_cb=stats_cb,
         progress_cb=progress_cb,
+        array_dtype=params.get("array_dtype", "float32"),
     )
 
 
@@ -535,7 +568,11 @@ def _producer_main(
             _, round_idx, snr_base, snr_range = message
             paths = RoundDataPaths.for_round(params["base_dir"], round_idx)
 
-            existing = validate_done_manifest(paths, expected_n_samples=params["n_samples"])
+            existing = validate_done_manifest(
+                paths,
+                expected_n_samples=params["n_samples"],
+                expected_array_dtype=params.get("array_dtype", "float32"),
+            )
             if existing is not None:
                 logger.info(f"RoundDataProducer: reusing validated round {round_idx} data")
                 result_queue.put(("done", round_idx, existing))
@@ -604,6 +641,7 @@ class RoundDataProducer:
         db,
         tag: str,
         seed: int | None = None,
+        array_dtype: str = "float32",
     ):
         self._params = {
             "base_dir": base_dir,
@@ -623,6 +661,8 @@ class RoundDataProducer:
             # rest of the params so producer-generated rounds derive the same per-round
             # streams as in-process generation. None = OS entropy
             "seed": seed,
+            # On-disk dtype for the cadence arrays (config.training.round_array_dtype)
+            "array_dtype": str(array_dtype),
         }
         self._db = db
         self._tag = tag

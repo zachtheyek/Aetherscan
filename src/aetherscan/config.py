@@ -99,6 +99,13 @@ class BetaVAEConfig:
     kernel_size: tuple[int, int] = (3, 3)  # For Conv2D & Conv2DTranspose layers
     beta: float = 1.5  # KL divergence weight
     alpha: float = 10.0  # Clustering loss weight
+    # Opt-in keras mixed_bfloat16 policy for the Beta-VAE (train.py sets the global policy
+    # before model build). A/B-gated: changes training numerics — bf16 needs no loss scaling,
+    # variables/optimizer state stay fp32 under keras mixed precision, and the numerically
+    # sensitive layers (z_mean/z_log_var/Sampling, decoder sigmoid output → loss math) are
+    # pinned fp32 in models/vae.py. Default False = fp32 end-to-end, byte-identical to before
+    # this flag existed (no policy call is made at all).
+    mixed_precision: bool = False
 
 
 @dataclass
@@ -302,6 +309,15 @@ class TrainingConfig:
     # overhead; 64 was near-optimal on both (256 ran ~2x slower on bla0).
     # TODO: re-confirm at production sample sizes (~500k) before treating as final.
     data_gen_task_size: int = 64  # Cadences per batched worker task (workers write results straight into the round memmap)
+    # On-disk dtype of the three round cadence arrays (main/true/false). "float16" halves the
+    # round footprint (~294.5 -> ~147 GB at full scale), the gather volume, and the page-cache
+    # working set — the lever that keeps overlapped epochs at page-cache speed once two rounds
+    # no longer fit in RAM — at a quantization cost of <= 2^-12 on the [0, 1] log-normalized
+    # inputs. A/B-GATED: changes input numerics; keep "float32" until the val-metric A/B on the
+    # target host shows parity. The gather map upcasts to float32 host-side, so the training
+    # graph and loss math are unchanged either way; labels + lognorm sidecars stay float32.
+    # Recorded in each round's .done manifest and validated on resume/reuse.
+    round_array_dtype: str = "float32"
 
     # Round data pipeline params (disk-backed per-round datasets, see round_data.py)
     round_data_dir: str | None = None  # Defaults to get_training_file_path("round_data") at runtime
@@ -732,6 +748,7 @@ class Config:
                 "kernel_size": self.beta_vae.kernel_size,
                 "beta": self.beta_vae.beta,
                 "alpha": self.beta_vae.alpha,
+                "mixed_precision": self.beta_vae.mixed_precision,
             },
             "reproducibility": {
                 "seed": self.reproducibility.seed,
@@ -800,6 +817,7 @@ class Config:
                 "per_replica_val_batch_size": self.training.per_replica_val_batch_size,
                 "signal_injection_chunk_size": self.training.signal_injection_chunk_size,
                 "data_gen_task_size": self.training.data_gen_task_size,
+                "round_array_dtype": self.training.round_array_dtype,
                 "round_data_dir": self.training.round_data_dir,
                 "overlap_data_generation": self.training.overlap_data_generation,
                 "keep_round_data": self.training.keep_round_data,

@@ -1045,6 +1045,7 @@ def generate_round_to_memmap(
     seed: int | None = None,
     stats_cb=None,
     progress_cb=None,
+    array_dtype: str = "float32",
 ) -> dict:
     """
     Generate one round's triplet dataset straight into disk-backed .npy memmaps.
@@ -1075,6 +1076,8 @@ def generate_round_to_memmap(
         raise ValueError(f"chunk_size must be divisible by 4, got {chunk_size}")
     if pool is None and backgrounds is None:
         raise ValueError("backgrounds must be provided when no pool is given")
+    if array_dtype not in ("float32", "float16"):
+        raise ValueError(f"array_dtype must be 'float32' or 'float16', got {array_dtype!r}")
 
     wall_start = time.time()
 
@@ -1083,11 +1086,13 @@ def generate_round_to_memmap(
     shutil.rmtree(paths.round_dir, ignore_errors=True)
     os.makedirs(paths.round_dir, exist_ok=True)
 
-    # Pre-create the three destination memmaps; workers reopen them r+ per task
+    # Pre-create the three destination memmaps; workers reopen them r+ per task and numpy
+    # downcasts on row assignment, so array_dtype="float16" needs no worker-side changes
+    # (the config.py field documents the quantization bound and the A/B gate)
     shape = (n_samples, num_observations, time_bins, width_bin)
     array_paths = paths.array_paths
     for path in array_paths.values():
-        mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+        mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.dtype(array_dtype), shape=shape)
         del mm  # Close immediately: creation only reserves the file; workers do the writing
 
     # Sibling per-observation log-norm parameter arrays ((min_log, range_log) per obs —
@@ -1220,6 +1225,7 @@ def generate_round_to_memmap(
         snr_range=snr_range,
         wall_time_s=time.time() - wall_start,
         chunk_count=n_chunks,
+        array_dtype=array_dtype,
     )
     write_done_manifest(paths, manifest)
 
@@ -1405,4 +1411,5 @@ class DataGenerator:
             round_num=round_num,
             seed=self.config.reproducibility.seed,
             stats_cb=_stats_cb,
+            array_dtype=self.config.training.round_array_dtype,
         )

@@ -20,10 +20,12 @@ from aetherscan.data_generation import (
     create_false,
     create_true_double,
     create_true_single,
+    generate_round_to_memmap,
     log_norm,
     new_cadence,
     write_segment_stats,
 )
+from aetherscan.round_data import RoundDataPaths, validate_done_manifest
 
 # Keep injection fast: small frequency axis, real-ish resolutions.
 _WIDTH_BIN = 128
@@ -348,6 +350,53 @@ class TestCreateCadences:
         _, sample_info = create_true_double(plate, **self._kwargs())
         assert sample_info["intersection_retries"] == 1
         assert sample_info["intersection_retry_capped"] is False
+
+
+class TestFloat16RoundArrays:
+    """round_array_dtype="float16" (A/B-gated): same seeded generation, on-disk quantization
+    only — the manifest records and gates the dtype."""
+
+    def _generate(self, plate, tmp_path, subdir, array_dtype):
+        paths = RoundDataPaths.for_round(str(tmp_path / subdir), 1)
+        generate_round_to_memmap(
+            paths,
+            8,
+            10.0,
+            5.0,
+            width_bin=_WIDTH_BIN,
+            num_observations=6,
+            time_bins=16,
+            chunk_size=8,
+            task_size=4,
+            freq_resolution=_FREQ_RES,
+            time_resolution=_TIME_RES,
+            backgrounds=plate,
+            round_num=1,
+            seed=11,
+            array_dtype=array_dtype,
+        )
+        return paths
+
+    def test_float16_generation_is_quantization_only(self, plate, tmp_path):
+        paths32 = self._generate(plate, tmp_path, "f32", "float32")
+        paths16 = self._generate(plate, tmp_path, "f16", "float16")
+        a32 = np.load(paths32.main_path)
+        a16 = np.load(paths16.main_path)
+        assert a32.dtype == np.float32
+        assert a16.dtype == np.float16
+        # Same seed => identical generated values; the only difference is the on-disk
+        # downcast, bounded by half-precision resolution on the [0, 1] log-normed data
+        np.testing.assert_allclose(a16.astype(np.float32), a32, atol=2**-11)
+        # Sidecars stay float32; labels identical
+        assert np.load(paths16.lognorm_paths["main"]).dtype == np.float32
+        np.testing.assert_array_equal(np.load(paths16.labels_path), np.load(paths32.labels_path))
+        # Manifest gates reuse by dtype
+        assert validate_done_manifest(paths16, expected_array_dtype="float16") is not None
+        assert validate_done_manifest(paths16, expected_array_dtype="float32") is None
+
+    def test_unknown_dtype_rejected(self, plate, tmp_path):
+        with pytest.raises(ValueError, match="array_dtype"):
+            self._generate(plate, tmp_path, "bad", "float64")
 
 
 class TestDrawFirstEquivalence:

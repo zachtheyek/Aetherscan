@@ -31,8 +31,9 @@ until a GPU OOMs and reports the largest power of two that fits — use it to si
 What this does and does NOT cover:
   - Covers the VAE training step (composite loss + backprop + clipped Adam), encoder inference,
     the decoder (inside the train step), and — with `--num-gpus > 1` — the MirroredStrategy
-    cross-replica gradient all-reduce and multi-GPU scaling. fp32, matching the pipeline (which
-    uses no mixed precision or XLA).
+    cross-replica gradient all-reduce and multi-GPU scaling. fp32 by default, matching the
+    pipeline default (no XLA); `--mixed-precision` sets the same keras mixed_bfloat16 global
+    policy as the pipeline's `beta_vae.mixed_precision` flag for A/B throughput comparisons.
   - Models gradient accumulation with `--accumulation-steps K`: one optimizer step accumulates
     all-reduced grads over K micro-batches then applies once with the global-norm clip — the
     accumulate-then-apply *cadence* of train.py's `_train_epoch` (K=1, the default, is a plain
@@ -290,6 +291,13 @@ def main() -> None:
         help="Train only: micro-batches accumulated per optimizer step (mirrors _train_epoch). "
         "Default 1 = apply every step. Ignored for --mode encode.",
     )
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Set the keras mixed_bfloat16 global policy before building the model (same "
+        "policy as the pipeline's beta_vae.mixed_precision flag, incl. the fp32 islands "
+        "in models/vae.py). Default off = fp32, matching the pipeline default.",
+    )
     parser.add_argument("--output", default=None, help="Result JSON path.")
     args = parser.parse_args()
 
@@ -298,6 +306,9 @@ def main() -> None:
     config = get_config()
     if config is None:
         raise ValueError("get_config() returned None")
+    # Must run before create_beta_vae_model so every layer picks the policy up (train.py order).
+    if args.mixed_precision:
+        tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
     # Build the model once (weights are batch-independent) and reuse across sizes.
     strategy = tf.distribute.MirroredStrategy(devices=[f"/{d}" for d in devices])
     with strategy.scope():
@@ -314,7 +325,7 @@ def main() -> None:
     )
     print(
         f"mode={args.mode}  num_gpus={len(devices)}  latent_dim={config.beta_vae.latent_dim}  "
-        f"example_shape={shape}" + train_note
+        f"example_shape={shape}  mixed_precision={args.mixed_precision}" + train_note
     )
     print(
         f"throughput = aggregate across {len(devices)} GPU(s); VRAM = peak per GPU (SI GB, 1e9 B)"
@@ -365,6 +376,7 @@ def main() -> None:
             "warmup": args.warmup,
             "steps": args.steps,
             "accumulation_steps": args.accumulation_steps if args.mode == "train" else 1,
+            "mixed_precision": args.mixed_precision,
             "gpu": machine_info()["hostname"],
         },
         results,

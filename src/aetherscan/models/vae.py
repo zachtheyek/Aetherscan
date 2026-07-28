@@ -479,9 +479,13 @@ def build_encoder(
 
     # Latent space
     # z_mean: (dense_size,) → (latent_dim,) - mean of latent distribution
+    # dtype="float32": fp32 island under beta_vae.mixed_precision — the latent heads feed the
+    # KL exp/square math and the Sampling layer, which must not run in bf16. A no-op under
+    # the default fp32 policy (identical graph).
     z_mean = layers.Dense(
         latent_dim,
         name="z_mean",
+        dtype="float32",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
         activity_regularizer=l1(0.001),
@@ -493,6 +497,7 @@ def build_encoder(
     z_log_var = layers.Dense(
         latent_dim,
         name="z_log_var",
+        dtype="float32",  # fp32 island under beta_vae.mixed_precision (see z_mean above)
         kernel_initializer=GlorotNormal(),
         bias_initializer=Constant(
             -3.0  # Negative bias initialization tightens initial posterior around prior
@@ -503,7 +508,9 @@ def build_encoder(
     )(x)
 
     # Sampling: sample z from N(z_mean, exp(z_log_var)) using reparameterization trick
-    z = Sampling()([z_mean, z_log_var])
+    # dtype="float32": fp32 island under beta_vae.mixed_precision — the exp() and epsilon
+    # draw stay fp32 (its z_mean/z_log_var inputs are fp32 via the heads above)
+    z = Sampling(dtype="float32")([z_mean, z_log_var])
 
     encoder = keras.Model(encoder_inputs, [z_mean, z_log_var, z], name="encoder")
 
@@ -732,12 +739,16 @@ def build_decoder(
     # Uses sigmoid activation to bound output to [0, 1] for binary cross-entropy loss
     # Uses GlorotNormal (like encoder's latent layers) as this is the "boundary" layer
     # Includes full regularization for symmetry with encoder's first conv layer
+    # dtype="float32": fp32 island under beta_vae.mixed_precision — the sigmoid output feeds
+    # the BCE reconstruction loss, which must compute on fp32 tensors. A no-op under the
+    # default fp32 policy (identical graph).
     decoder_outputs = layers.Conv2DTranspose(
         1,
         kernel_size,
         activation="sigmoid",
         strides=2,
         padding="same",
+        dtype="float32",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
         activity_regularizer=l1(0.001),

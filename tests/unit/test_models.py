@@ -181,6 +181,61 @@ class TestEncoderDecoderSymmetry:
         assert recon.max() <= 1.0
 
 
+@pytest.mark.slow
+class TestMixedPrecisionDtypeIslands:
+    """beta_vae.mixed_precision: under the keras mixed_bfloat16 policy the interior conv
+    stack computes in bf16, while the numerically sensitive islands — the z_mean/z_log_var
+    heads, the Sampling layer, and the decoder's sigmoid output (which feeds the BCE loss
+    math) — are pinned to fp32 in models/vae.py."""
+
+    def test_bf16_policy_keeps_fp32_islands(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models.vae import build_decoder, build_encoder  # noqa: PLC0415
+
+        previous = tf.keras.mixed_precision.global_policy().name
+        try:
+            tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
+            encoder = build_encoder()
+            decoder = build_decoder()
+        finally:
+            tf.keras.mixed_precision.set_global_policy(previous)
+
+        # fp32 islands: the latent heads, the sampled z, and the sigmoid reconstruction.
+        z_mean, z_log_var, z = encoder.outputs
+        assert tf.as_dtype(z_mean.dtype) == tf.float32
+        assert tf.as_dtype(z_log_var.dtype) == tf.float32
+        assert tf.as_dtype(z.dtype) == tf.float32
+        assert tf.as_dtype(decoder.outputs[0].dtype) == tf.float32
+        sampling = next(layer for layer in encoder.layers if isinstance(layer, Sampling))
+        assert sampling.compute_dtype == "float32"
+
+        # The interior conv stack actually picked up the bf16 compute dtype.
+        encoder_convs = [
+            layer for layer in encoder.layers if isinstance(layer, tf.keras.layers.Conv2D)
+        ]
+        assert encoder_convs
+        assert all(layer.compute_dtype == "bfloat16" for layer in encoder_convs)
+        # Variables stay fp32 under keras mixed precision (why bf16 needs no loss scaling).
+        assert all(v.dtype == tf.float32 for v in encoder.trainable_variables)
+        assert all(v.dtype == tf.float32 for v in decoder.trainable_variables)
+
+    def test_default_policy_builds_all_float32(self):
+        """Regression pin: with the flag off (no policy call), every layer is fp32 — the
+        dtype="float32" island kwargs must be no-ops under the default policy."""
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models.vae import build_decoder, build_encoder  # noqa: PLC0415
+
+        assert tf.keras.mixed_precision.global_policy().name == "float32"
+        encoder = build_encoder()
+        decoder = build_decoder()
+        for model in (encoder, decoder):
+            for layer in model.layers:
+                assert layer.compute_dtype == "float32", layer.name
+                assert layer.dtype == "float32", layer.name
+
+
 class TestSeededSamplingReproducibility:
     """#279: seed_tensorflow makes the Sampling layer's draws reproducible — the mechanism
     that makes inference candidate sets repeatable (the layer used to be entirely unseeded

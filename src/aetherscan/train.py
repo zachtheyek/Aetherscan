@@ -883,7 +883,9 @@ def prepare_distributed_train_dataset(
     def map_gather(batch_indices):
         # Pure tf.data ops on CPU: the gather runs in TF's C++ threadpool, releases nothing
         # to Python, and parallel map workers scale with cores instead of convoying on the
-        # GIL. tf.cast is a no-op passthrough for the production float32 arrays.
+        # GIL. tf.cast is a no-op passthrough for float32 round arrays and the host-side
+        # upcast under round_array_dtype="float16" (the gather itself moves half the bytes;
+        # the training graph sees float32 either way).
         with tf.device("/CPU:0"):
             concat_batch = tf.cast(tf.gather(concat_t, batch_indices), tf.float32)
             true_batch = tf.cast(tf.gather(true_t, batch_indices), tf.float32)
@@ -1143,6 +1145,18 @@ class TrainingPipeline:
 
         # Set distributed strategy
         self.strategy = strategy or tf.distribute.get_strategy()
+
+        # Opt-in bf16 mixed precision (A/B-gated; see BetaVAEConfig.mixed_precision): the
+        # global policy must be set BEFORE the models are built so every layer picks it up.
+        # bf16 needs no loss scaling, and keras keeps variables/optimizer state — and hence
+        # the gradients reaching the fp32 accumulators and NaN guard — in fp32. Flag off =>
+        # no policy call at all, preserving the fp32 pipeline's numerics byte-for-byte.
+        if self.config.beta_vae.mixed_precision:
+            tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
+            logger.info(
+                "Mixed precision enabled: keras global policy set to mixed_bfloat16 "
+                "(fp32 islands: z_mean/z_log_var/Sampling, decoder output, loss math)"
+            )
 
         # Create VAE model & optimizer inside distributed context
         with self.strategy.scope():
@@ -1460,7 +1474,11 @@ class TrainingPipeline:
             "round_data"
         )
         self._round_data_base_dir = os.path.join(round_data_root, self.config.checkpoint.save_tag)
-        prepare_round_data_dir(self._round_data_base_dir, start_round)
+        prepare_round_data_dir(
+            self._round_data_base_dir,
+            start_round,
+            expected_array_dtype=self.config.training.round_array_dtype,
+        )
 
         logger.info("Setup directories complete")
 
@@ -1537,6 +1555,7 @@ class TrainingPipeline:
                     db=self.db,
                     tag=self.config.checkpoint.save_tag,
                     seed=self.config.reproducibility.seed,
+                    array_dtype=self.config.training.round_array_dtype,
                 )
                 self._round_producer.start()
                 # Kick off the first round's data right away (nothing to overlap with yet —
@@ -1617,7 +1636,14 @@ class TrainingPipeline:
         # Obtain this round's disk-backed data: reuse a validated on-disk dataset if one
         # exists, otherwise wait on the background producer (which was asked to generate it
         # while the previous round trained) or generate in-process (overlap disabled)
-        if validate_done_manifest(paths, expected_n_samples=n_samples) is not None:
+        if (
+            validate_done_manifest(
+                paths,
+                expected_n_samples=n_samples,
+                expected_array_dtype=self.config.training.round_array_dtype,
+            )
+            is not None
+        ):
             logger.info(f"Reusing validated round {round_number} data at {paths.round_dir}")
         elif self._round_producer is not None:
             logger.info(f"Waiting for round {round_number} data from the background producer")
@@ -2679,7 +2705,14 @@ class TrainingPipeline:
             round_dir=os.path.join(self._round_data_base_dir, "rf"), round_idx=0
         )
         rf_trained = False  # Set True once RF training fully completes (drives dir deletion)
-        if validate_done_manifest(rf_paths, expected_n_samples=n_samples) is not None:
+        if (
+            validate_done_manifest(
+                rf_paths,
+                expected_n_samples=n_samples,
+                expected_array_dtype=self.config.training.round_array_dtype,
+            )
+            is not None
+        ):
             logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
         else:
             # RF data is always generated in-process (no background producer for the RF phase);
@@ -6983,9 +7016,11 @@ class TrainingPipeline:
             self._latent_viz_lognorm_params = None
             return
 
-        # Fancy indexing already creates a new independent array (no .copy() needed)
+        # Fancy indexing already creates a new independent array (no .copy() needed); the
+        # astype is a no-op for float32 rounds and upcasts float16 rounds so traversal math
+        # and plain-model encodes always see float32 (mirrors map_gather's cast)
         all_indices = np.concatenate(selected_indices)
-        self._latent_viz_batch = concat_data[all_indices]
+        self._latent_viz_batch = concat_data[all_indices].astype(np.float32, copy=False)
         self._latent_viz_labels = np.array(selected_labels, dtype="U20")
         self._latent_viz_lognorm_params = (
             lognorm_params[all_indices] if lognorm_params is not None else None

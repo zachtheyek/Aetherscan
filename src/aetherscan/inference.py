@@ -339,6 +339,9 @@ class InferencePipeline:
 
         try:
             # Load encoder within strategy scope
+            # NOTE: per-layer dtype policies are baked into the saved .keras file, so an
+            # encoder trained with beta_vae.mixed_precision infers in bf16 automatically
+            # (z_mean/z_log_var/Sampling stay fp32 islands) — no global policy call here.
             logger.info(f"Loading encoder from {encoder_path} within strategy scope")
             with self.strategy.scope():
                 self.encoder = tf.keras.models.load_model(encoder_path)
