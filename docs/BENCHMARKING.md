@@ -183,9 +183,11 @@ python benchmarks/bench_injection.py            # setigen signal injection (trai
 python benchmarks/bench_lognorm_downsample.py   # per-cadence downsample + log-norm (load path)
 python benchmarks/bench_pfb_vs_spline.py        # PFB static equalization vs per-channel spline fit
 python benchmarks/bench_rf.py                   # Random Forest stage: latent prep + fit + predict
-# Container-only additions (#276/#278 audits; bench_input_pipeline's step mode needs GPUs):
+# Container-only additions (#276/#278 audits + the generation-path A/B; bench_input_pipeline's
+# step mode needs GPUs):
 # ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode step --variant current --num-gpus 5
 # ./utils/run_container.sh python benchmarks/bench_latent_gif.py --mode all
+# ./utils/run_container.sh python benchmarks/bench_datagen.py --preload-tf --data-dir /datax/scratch/$USER/bench_datagen
 # On the clusters, through the container:
 ./utils/run_container.sh python benchmarks/bench_normality.py
 # GPU-only, container required — real Beta-VAE profiler on a cluster GPU:
@@ -206,6 +208,7 @@ the maintained per-host baseline tables.
 | `bench_gpu.py` | Beta-VAE training step (`compute_total_loss` + gradients + clipped Adam) and encoder forward on one or more GPUs | VAE training (`train.round_XX`) and encoder inference — **GPU-only, container required** |
 | `bench_input_pipeline.py` | The real memmap → tf.data → distribute → train-step input path, legacy vs current builder (current = the zero-copy pure-TF gather AND the graph-side accumulated step, mirroring train.py as checked out), with a `--gil-load` contention knob and `--profile` TF-profiler hook | The training input pipeline `bench_gpu.py` deliberately excludes — the #276 audit harness. Its profiler traces are what established that the GPUs sit idle >90% of the wall clock while doing exactly the kernel work `bench_gpu` predicts; the follow-up section of `benchmarks/README.md` carries the before/after ladder for the Python-free rewrite |
 | `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / render / assemble) with output-equality gates on every candidate optimization | The `vae_plots` latent-GIF tail — the #278 audit harness (numbers in `benchmarks/README.md`) |
+| `bench_datagen.py` | Seeded round generation through the real pooled `generate_round_to_memmap` path (shared-memory plates, per-task seed derivation, batched memmap tasks), sha256-ing every output array as the byte-compatibility gate for generation-path changes; `--preload-tf` mirrors the producer workers' TF import graph | The producer wall (`train.round_XX.data_generation`) that `bench_injection.py`'s single-process kernel can't reach — the generation-path A/B harness (ladder + mechanisms in `benchmarks/README.md`) |
 
 Only the four CPU micro-benchmarks (`bench_normality`, `bench_injection`,
 `bench_lognorm_downsample`, `bench_pfb_vs_spline`) are single-process; the pipeline

@@ -20,6 +20,9 @@ python benchmarks/bench_rf.py                    # Random Forest stage: latent p
 # Container-only (need the full TF/umap stack; bench_input_pipeline's step mode needs GPUs):
 ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode iterate --variant current
 ./utils/run_container.sh python benchmarks/bench_latent_gif.py --mode all
+# Generation-path A/B (real pooled producer path; --preload-tf needs TF, so run containerized):
+./utils/run_container.sh python benchmarks/bench_datagen.py --preload-tf \
+    --data-dir /datax/scratch/$USER/bench_datagen
 ```
 
 `bench_gpu.py` is a different animal — it profiles the Beta-VAE on a real GPU (throughput +
@@ -43,6 +46,7 @@ comparing against the baselines.
 | `bench_rf.py` | `RandomForestClassifier` fit + `predict_proba` and the `prepare_latent_features` reshape (sklearn, CPU) | Second-stage RF training + inference (`train.train_random_forest`) |
 | `bench_input_pipeline.py` | The REAL memmap → tf.data → distribute → train-step input path (gather / iterate / step modes; legacy vs current builder; `--gil-load` contention knob) — **container-only; step mode needs GPUs** | The training input pipeline `bench_gpu.py` deliberately excludes (`train.prepare_distributed_train_dataset`) — see [#276 audit](#input-pipeline-audit-276) |
 | `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / frame render / GIF assembly) with output-equality checks on every candidate optimization — **container-only** | The `vae_plots` latent-GIF tail (`train.plot_latent_space_gif`) — see [#278 audit](#latent-gif-audit-278) |
+| `bench_datagen.py` | Seeded round generation through the REAL pooled `generate_round_to_memmap` path (shared-memory plates, `_init_worker`, per-task seed derivation, batched memmap tasks) with per-array sha256 checksums — the byte-compatibility gate for generation-path changes; `--preload-tf` mirrors the producer workers' TF import graph | The producer wall (`train.round_XX.data_generation`) that `bench_injection.py`'s single-process kernel can't reach — see [Producer/data-generation follow-up](#producerdata-generation-follow-up) |
 | `parse_xplane_occupancy.py` | Post-processor, not a benchmark: per-GPU busy time / occupancy from a `--profile` run's XPlane trace (merged event intervals, strict kernel-time measure) | The "GPUs idle >90%" profiler evidence in the [#276 audit](#input-pipeline-audit-276) and its follow-up |
 
 ## Baseline numbers
@@ -454,6 +458,69 @@ stats.
   backend and float summation order changed); determinism itself is preserved — same seed, same
   split, same per-epoch batch order, byte-identical reruns — and is pinned by unit tests
   (`test_train_datasets.py`, `test_train_accumulation.py`, `test_train_distribution.py`).
+
+## Producer/data-generation follow-up
+
+With the training hot path Python-free, the wall moved. The real-run A/B above already showed
+it at test scale (round-1 training finished long before round-2 generation), and a killed
+production-scale run on blpc3 confirmed it live: ~6.2 h of data generation per round with the
+GPUs at 0% and all 32 pool workers at ~94.5% CPU, ~97% user-mode — compute inside the workers,
+not IO or scheduling. `bench_datagen.py` is the harness this follow-up was gated on: it drives
+the real pooled `generate_round_to_memmap` path (shared-memory plates, `_init_worker`, per-task
+seed derivation, batched memmap tasks) at reduced scale and sha256s every output array, so a
+generation-path change lands only if its checksums match master's byte-for-byte. `--preload-tf`
+imports TensorFlow (CUDA-blanked) into the parent before the pool forks, mirroring the import
+graph the production producer's workers inherit — without it the gc/interpreter costs read
+optimistically low against exactly the regime the live run measured.
+
+Three mechanisms shipped, all byte-identical by construction and by checksum
+(`data_generation.py`):
+
+1. **The per-injection `gc.collect()` in `new_cadence` is gone.** A full generational
+   collection ran once per injection — ~2.5M times per production round — inside pool workers
+   carrying the full TF import graph, and measured ~23 ms per call against ~4.5 ms for the
+   entire rest of the function: the dominant term of the generation wall. Refcounting already
+   frees the setigen Frame's arrays immediately; the per-chunk collect in
+   `generate_round_to_memmap` stays for cycle cleanup.
+2. **Draw-first `create_true_double`.** The intersection-acceptance test is a pure function of
+   the pre-array RNG draws, but the retry loop materialized BOTH full setigen injections before
+   testing — at the measured p≈0.42 acceptance, ~41% of all injections in a production round
+   were computed and discarded. `new_cadence` is split into `_draw_signal_params` (consumes the
+   exact 4-draw RNG sequence) and `_inject_drawn_signal` (consumes no RNG); the retry loop now
+   replays the identical per-attempt draws and materializes only the accepted pair — same
+   order, same values, pinned by byte-compat tests in `test_data_generation.py`.
+3. **One msync per array, not per task.** `_run_memmap_task`'s finally flushed its whole
+   mapping once per task — ~23,400 concurrent full-mapping msyncs per production round, a
+   driver of the #117/#118 chunk-tail stragglers. Replaced by one flush per output array
+   immediately before the `.done` manifest. The durability contract is unchanged: no array
+   bytes are trusted until the manifest exists, and the manifest is written strictly after
+   every array is msync'd.
+
+### A/B ladder (blpc3, 8192 samples × 3 arrays, 32 workers, `--preload-tf`, seed 11)
+
+| arm | wall | speedup | sha256s (all 7 outputs) |
+|---|---|---|---|
+| A: master | 282.0 s | 1.0× | baseline |
+| B: + gc removal | 18.6 s | 15.2× | identical to A |
+| C: + draw-first (as shipped) | 13.1 s | **21.5×** | identical to A |
+
+The msync change lands with arm C — it alters no bytes, only when they are flushed, and is
+covered by the same checksum gate. Projected to production scale on the same 32-core host:
+~6.2 h/round → **~20 min/round**. That is a projection from the benchmark ratio, not a measured
+production round — the next full-scale run's `data_generation` stage timers are the check.
+
+**Deferred with rationale (do not silently resurrect):** RF-dataset pre-generation on the
+producer, a direct-numpy injection bundle (bypassing setigen Frames), SHAP-stage overlap, pool
+thread-pinning, and fused moment computation — the 21.5× result collapsed their absolute value
+to ~minutes each.
+
+**Related fix from the same audit, outside the generation path:** `plot_injection_stats` issues
+~165 round-scoped queries per call against an index that leads with `(tag, timestamp)` and does
+not contain `round_number`, so its run-wide time window re-scanned the tag's whole row history
+on every query — measured **10.5× slower at 12M rows**, and quadratic over a campaign as
+history accumulates. `Database.query_injection_stat_time_span` (one whole-partition MIN/MAX
+aggregate; a superset bound, so intersecting it with a query window can never change a result
+set) now tightens the window to the plotted rounds' actual span — see `docs/DATABASE.md`.
 
 ## Latent-GIF audit (#278)
 

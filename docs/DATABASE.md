@@ -326,6 +326,20 @@ conventions:
 - JSON-typed columns (`latent_vector`, `cadence_key`, `confidence_summary`) come back as
   strings; callers `json.loads` them.
 
+One deliberate exception to the list-of-rows shape:
+**`query_injection_stat_time_span(tag, start_round_number=None, end_round_number=None)`**
+returns the `(MIN, MAX)` timestamp pair over a tag's `injection_stats` rows (optionally
+bounded to a round range), or `None` when no rows match. It is a single whole-partition
+aggregate with **no timestamp filter and no superseded/`is_finite` filtering** — a deliberate
+**superset bound**: the span covers every row a filtered query could return for those rounds,
+so a caller that intersects its own time window with the span can only narrow index scans,
+never change a result set. It exists because `idx_injection_stats_filter` leads with
+`(tag, timestamp)` and `round_number` is not in the index, so a round-scoped query with a
+run-wide window re-scans the tag's entire row history (measured 10.5× slower at 12M rows,
+quadratic over a campaign as history accumulates) — `plot_injection_stats` issues ~165 such
+queries per call and now pays this one aggregate up front, tightening every window to the
+plotted rounds' actual span (±1 s).
+
 `get_db_stats()` returns row counts per table, the covered time range, and the database file
 size — logged at startup.
 
