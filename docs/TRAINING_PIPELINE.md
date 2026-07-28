@@ -331,9 +331,13 @@ fast, with the same byte-identity discipline:
    [`DATABASE.md`](DATABASE.md#query-api)).
 3. **The UMAP GIF sweep** — the 24-combo sweep in `plot_latent_space_gif` ran strictly
    serially at ~95% single-core (~1.7–1.9 h per run) even after #278 parallelized frame
-   rendering; whole combos now run across forkserver workers. Expected ~10–15 min on
-   24+ cores (not yet measured at production scale); byte-identity pinned by test. Details
-   in [the latent-GIF plot section](#latent_space_obscadence_nnn_mdm_taggif) below.
+   rendering; whole combos now run across forkserver workers. First parallel measurement
+   (reduced 60-frame shape, 24 workers on blpc3): ~93 min — 24 concurrent single-threaded
+   UMAP fits/transforms contend for memory bandwidth, so the wall is well below the naive
+   per-combo × 24 serial bound but far from core-count scaling; the production-scale number
+   and the fit-vs-transform-vs-JIT attribution (plus whether a smaller worker cap beats 24
+   under contention) are open follow-ups. Byte-identity pinned by test. Details in
+   [the latent-GIF plot section](#latent_space_obscadence_nnn_mdm_taggif) below.
 4. **GPU thread mode** — `gpu.gpu_thread_mode` (default `"gpu_private"`, also
    `"global"`/`"gpu_shared"`) and `gpu.gpu_thread_count` (default 2) set
    `TF_GPU_THREAD_MODE`/`TF_GPU_THREAD_COUNT` in `setup_gpu_strategy` before the GPU runtime
@@ -610,10 +614,12 @@ obs/cadence) combos is an independent UMAP fit with its own derived `random_stat
 on-disk joblib bundle), and writes distinct files — so
 [`latent_gif.py`](../src/aetherscan/latent_gif.py)`:run_umap_gif_sweep` farms WHOLE combos
 (fit + joblib persist + per-snapshot transforms + frame render + GIF assembly) to forkserver
-workers (empty preload, native thread pools pinned incl. `NUMBA_NUM_THREADS` — the
-`shap_parallel.py` isolation pattern), turning a ~1.7–1.9 h serial tail (~95% single-core,
-even after #278 parallelized frame rendering) into an expected ~10–15 min on 24+ cores (not
-yet measured at production scale). Logging and Slack uploads stay in the parent process, in
+workers (empty preload; BLAS-family thread pools pinned per the `shap_parallel.py` isolation
+pattern — but deliberately NOT numba's or OMP's: UMAP grows numba's pool itself on large-N
+paths and numba hard-errors past a capped launch, see `_sweep_worker_init`). The ~1.7–1.9 h
+serial tail (~95% single-core, even after #278 parallelized frame rendering) drops to ~93 min
+at a reduced 60-frame shape with 24 workers (first measurement; memory-bandwidth contention
+between concurrent single-threaded fits — the production-scale number is pending). Logging and Slack uploads stay in the parent process, in
 the serial loop's order; byte-identity of the GIFs is pinned by a slow-marked unit test
 comparing serial vs pooled output. This is disjoint from the #278-**rejected** within-fit
 ideas: batching the per-snapshot `.transform()` calls and reusing a precomputed kNN graph
