@@ -57,6 +57,18 @@ def per_cadence_kl(z_mean_flat: np.ndarray, z_log_var_flat: np.ndarray) -> np.nd
     return kl.sum(axis=1).astype(np.float32)
 
 
+def latent_dim_variances(
+    z_mean_flat: np.ndarray, num_observations: int, latent_dim: int
+) -> np.ndarray:
+    """Per-dim z_mean variance across samples (pooling all observations) — the raw quantity
+    the Active Units threshold cuts on. Exposed so callers can log the margins: a dim a hair
+    below the cutoff and a dim that went dark read identically in the AU count but mean
+    opposite things for an A/B parity decision (#288's fp16 verdict hinged on exactly this)."""
+    per_obs = _reshape_blocks(z_mean_flat, num_observations, latent_dim)
+    pooled = per_obs.reshape(-1, latent_dim)
+    return pooled.var(axis=0)
+
+
 def active_latent_dims(
     z_mean_flat: np.ndarray, num_observations: int, latent_dim: int, threshold: float
 ) -> list[int]:
@@ -66,9 +78,7 @@ def active_latent_dims(
     contribute dead-weight log_var features — this gates the z_mean_logvar_active variant
     and feeds check_posterior_collapse.
     """
-    per_obs = _reshape_blocks(z_mean_flat, num_observations, latent_dim)
-    pooled = per_obs.reshape(-1, latent_dim)
-    variances = pooled.var(axis=0)
+    variances = latent_dim_variances(z_mean_flat, num_observations, latent_dim)
     return [int(d) for d in np.nonzero(variances > threshold)[0]]
 
 

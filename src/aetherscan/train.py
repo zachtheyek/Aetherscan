@@ -59,6 +59,7 @@ from aetherscan.latent_variants import (
     build_z_aug_training_set,
     expected_calibration_error,
     fit_probability_calibrator,
+    latent_dim_variances,
     recall_at_fpr,
     sample_z_flat,
     select_winner,
@@ -2884,10 +2885,14 @@ class TrainingPipeline:
                 latent_dim,
                 self.config.rf.active_units_threshold,
             )
+            # Per-dim variances logged alongside the count: an AU flip between runs is only
+            # interpretable with the margins (hovering-at-threshold = noise, dark = signal)
+            dim_variances = latent_dim_variances(train_mean_flat, num_observations, latent_dim)
             logger.info(
                 f"Active latent dims (z_mean variance > "
                 f"{self.config.rf.active_units_threshold}): {len(active_dims)}/{latent_dim} "
-                f"-> {active_dims}"
+                f"-> {active_dims}; per-dim variances: "
+                f"{[round(float(v), 5) for v in dim_variances]}"
             )
 
             # Partition the val split: selection (variant choice) / calibration (calibrator

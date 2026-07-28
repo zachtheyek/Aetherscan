@@ -666,6 +666,20 @@ class TestSchemaMigration:
         finally:
             database.stop()
 
+    def test_old_schema_gains_training_stats_is_finite(self):
+        # v6 (#289): pre-v6 rows were all finite by construction (a non-finite value could
+        # never be written — it bound as NULL and blew the NOT NULL constraint), so the
+        # DEFAULT 1 backfill is exact and they stay visible under the only_finite default.
+        db_path = self._create_v0_db(get_config())
+        database = Database()
+        try:
+            assert "is_finite" in self._column_names(db_path, "training_stats")
+            rows = database.query_training_stat(tag="test_v1")
+            assert len(rows) == 1
+            assert rows[0]["is_finite"] == 1
+        finally:
+            database.stop()
+
     def test_old_schema_gains_inference_cadences_table(self):
         """A pre-versioning database (v0: no inference_cadences table) must come out of
         _init_database() with the v2 manifest table present and usable."""
@@ -788,6 +802,42 @@ def _wait_backlog_empty(database, timeout: float = 15.0) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+class TestTrainingStatFiniteHandling:
+    """#289: NaN training stats used to bind as SQL NULL, blow the NOT NULL constraint, and
+    silently vanish the entire flush batch. They now store as 0.0 with is_finite=0, queries
+    filter them by default, and a batch failure falls back to per-row writes."""
+
+    def test_nan_and_none_values_stored_flagged_and_filtered(self, db):
+        db.write_training_stat("beta_vae", "good_stat", 1.5, tag="fin_v1")
+        db.write_training_stat("beta_vae", "nan_stat", float("nan"), tag="fin_v1")
+        db.write_training_stat("beta_vae", "none_stat", None, tag="fin_v1")
+        assert db.flush()
+        # Default query drops the non-finite rows...
+        rows = db.query_training_stat(tag="fin_v1", columns=["stat_name", "value"])
+        assert [r["stat_name"] for r in rows] == ["good_stat"]
+        # ...but they are recorded (0.0, is_finite=0), not lost — and the good row survived
+        # in the same batch (the pre-#289 behavior dropped all three).
+        all_rows = db.query_training_stat(
+            tag="fin_v1", only_finite=False, columns=["stat_name", "value", "is_finite"]
+        )
+        assert len(all_rows) == 3
+        flagged = {r["stat_name"]: (r["value"], r["is_finite"]) for r in all_rows}
+        assert flagged["nan_stat"] == (0.0, 0)
+        assert flagged["none_stat"] == (0.0, 0)
+        assert flagged["good_stat"] == (1.5, 1)
+
+    def test_flush_falls_back_to_per_row_on_poisoned_batch(self, db):
+        # Smuggle a raw record violating NOT NULL (stat_name=None) around the sanitized
+        # write path, alongside a good row: the batch insert fails, the fallback lands the
+        # good row and drops exactly the bad one.
+        now = time.time()
+        good = ("training_stats", (now, "m", "ok_stat", 2.0, 1, 1, "fallback_v1", None, 1))
+        bad = ("training_stats", (now, "m", None, 3.0, 1, 1, "fallback_v1", None, 1))
+        db._flush_buffer(buffer=[bad, good])
+        rows = db.query_training_stat(tag="fallback_v1", columns=["stat_name", "value"])
+        assert [(r["stat_name"], r["value"]) for r in rows] == [("ok_stat", 2.0)]
 
 
 class TestInjectionStatTimeSpan:

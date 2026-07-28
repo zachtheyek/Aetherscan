@@ -56,7 +56,11 @@ _MARK_SUPERSEDED_SENTINEL = object()
 # v5: added `inference_results.screening_proba` / `mc_mean` / `mc_std` (#282 two-pass
 #     inference: the deterministic pass-1 score plus the seeded MC mean/spread that carries
 #     the science threshold for survivors).
-_SCHEMA_VERSION = 5
+# v6: added `training_stats.is_finite` (#289) — a NaN stat value binds as SQL NULL, violated
+#     the NOT NULL constraint, and the failed executemany silently dropped the whole flush
+#     batch. Non-finite values now store as 0.0 with is_finite=0 (the injection_stats
+#     semantics), and query_training_stat filters them by default.
+_SCHEMA_VERSION = 6
 
 
 # Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
@@ -296,7 +300,8 @@ class Database:
                     epoch_number INTEGER,
                     tag TEXT,
                     metadata TEXT,
-                    superseded INTEGER DEFAULT 0
+                    superseded INTEGER DEFAULT 0,
+                    is_finite INTEGER DEFAULT 1
                 )
             """)
 
@@ -493,6 +498,15 @@ class Database:
                 if column not in columns:
                     cursor.execute(f"ALTER TABLE inference_results ADD COLUMN {column} REAL")
                     logger.info(f"Schema migration: added inference_results.{column}")
+
+        if version < 6:
+            # v6: is_finite on training_stats (#289) — the injection_stats semantics. Existing
+            # rows were all finite by construction (a non-finite value could never be written:
+            # it bound as NULL and blew the NOT NULL constraint), so DEFAULT 1 is exact.
+            columns = {row[1] for row in cursor.execute("PRAGMA table_info(training_stats)")}
+            if "is_finite" not in columns:
+                cursor.execute("ALTER TABLE training_stats ADD COLUMN is_finite INTEGER DEFAULT 1")
+                logger.info("Schema migration: added training_stats.is_finite")
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -939,6 +953,30 @@ class Database:
     # in exchange for increased memory pressure is worth it
     # As well, since our db writes happen in a background thread & don't block the main process,
     # either approach should have minimal practical impact
+    def _executemany_resilient(self, cursor, sql: str, records: list, table: str) -> None:
+        """
+        executemany with a per-row fallback (#289): if the batch insert fails, retry the
+        rows individually so one unbindable row can no longer discard everything else in
+        the flush. Offending rows are skipped with an exact count — the old behavior lost
+        the entire buffered batch (every table's rows) to a single NOT NULL violation,
+        with nothing but a one-line error to show for it.
+        """
+        try:
+            cursor.executemany(sql, records)
+        except sqlite3.Error as batch_error:
+            logger.error(
+                f"Bulk insert into {table} failed ({batch_error}); retrying "
+                f"{len(records)} row(s) individually"
+            )
+            skipped = 0
+            for record in records:
+                try:
+                    cursor.execute(sql, record)
+                except sqlite3.Error:
+                    skipped += 1
+            if skipped:
+                logger.error(f"Dropped {skipped}/{len(records)} unwritable row(s) for {table}")
+
     def _flush_buffer(self, buffer: list | None = None):
         """
         Write buffered data to database in a single transaction using executemany().
@@ -984,17 +1022,20 @@ class Database:
 
                 # Bulk insert each table type
                 if system_resources_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO system_resources
                         (timestamp, resource_type, resource_name, value, unit, tag, metadata)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         system_resources_records,
+                        "system_resources",
                     )
 
                 if injection_stats_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO injection_stats
                         (timestamp, stat_name, value, round_number, chunk_number, sample_index,
@@ -1003,21 +1044,25 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         injection_stats_records,
+                        "injection_stats",
                     )
 
                 if training_stats_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO training_stats
                         (timestamp, model_name, stat_name, value, round_number, epoch_number,
-                         tag, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         tag, metadata, is_finite)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         training_stats_records,
+                        "training_stats",
                     )
 
                 if latent_snapshots_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO latent_snapshots
                         (timestamp, model_name, round_number, epoch_number, step_number,
@@ -1026,10 +1071,12 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         latent_snapshots_records,
+                        "latent_snapshots",
                     )
 
                 if inference_results_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO inference_results
                         (timestamp, npy_path, snippet_index, prediction, confidence, latent_vector,
@@ -1038,10 +1085,12 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_results_records,
+                        "inference_results",
                     )
 
                 if inference_cadences_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO inference_cadences
                         (timestamp, tag, csv_path, cadence_key, npy_path, status, n_stamps,
@@ -1049,16 +1098,19 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         inference_cadences_records,
+                        "inference_cadences",
                     )
 
                 if pipeline_stages_records:
-                    cursor.executemany(
+                    self._executemany_resilient(
+                        cursor,
                         """
                         INSERT INTO pipeline_stages
                         (stage, start_time, end_time, duration_s, tag, metadata)
                         VALUES (?, ?, ?, ?, ?, ?)
                         """,
                         pipeline_stages_records,
+                        "pipeline_stages",
                     )
 
                 conn.commit()
@@ -1297,8 +1349,19 @@ class Database:
 
         model_name labels the model ('beta_vae', 'rf'); stat_name labels the metric ('total_loss',
         'reconstruction_loss', 'learning_rate', etc.). Timestamp defaults to current wall time.
+
+        Non-finite (or None) values are coerced to 0.0 with is_finite=0 (#289) — the
+        injection_stats semantics — so queries can drop them via the default only_finite
+        filter. Writing them raw is impossible anyway: sqlite binds NaN as NULL, and the NOT
+        NULL constraint used to make the whole flush batch vanish.
         """
         metadata_json = get_system_metadata()
+
+        is_finite = 1 if value is not None and np.isfinite(value) else 0
+        if not is_finite:
+            logger.warning(
+                f"write_training_stat: {stat_name} is {value}, storing as 0.0 with is_finite=0"
+            )
 
         self.write_queue.put(
             (
@@ -1307,11 +1370,12 @@ class Database:
                     timestamp or time.time(),
                     model_name,
                     stat_name,
-                    value,
+                    float(value) if is_finite else 0.0,
                     round_number,
                     epoch_number,
                     tag,
                     metadata_json,
+                    is_finite,
                 ),
             )
         )
@@ -1598,6 +1662,7 @@ class Database:
         "tag",
         "metadata",
         "superseded",
+        "is_finite",
     }
     _LATENT_SNAPSHOTS_COLUMNS = {
         "id",
@@ -2014,6 +2079,7 @@ class Database:
         end_time: float | None = None,
         columns: list[str] | None = None,
         include_superseded: bool = False,
+        only_finite: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Query rows from training_stats as a list of dicts.
@@ -2021,7 +2087,9 @@ class Database:
         model_name, stat_name, and tag accept either a single value (= filter) or a list
         (IN filter). start_*/end_* pairs bound the corresponding integer column (inclusive).
         include_superseded (default False) controls whether rows flagged stale by
-        mark_superseded() are returned. columns is validated against _TRAINING_STATS_COLUMNS.
+        mark_superseded() are returned. only_finite (default True) drops rows whose stat value
+        was non-finite at write time (stored as 0.0 with is_finite=0, #289) — pass False to
+        inspect them. columns is validated against _TRAINING_STATS_COLUMNS.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -2059,6 +2127,9 @@ class Database:
 
             if not include_superseded:
                 query += " AND superseded = 0"
+
+            if only_finite:
+                query += " AND is_finite = 1"
 
             if tag:
                 query = self._add_str_filter(query, params, "tag", tag)
