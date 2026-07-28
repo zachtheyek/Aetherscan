@@ -2,7 +2,8 @@
 
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
 schedules, directory archiving, encoder-trained heuristics, the val-AUC quality floor, SHAP
-output normalization, and the training stage machine (skip-if-done / record-failure semantics
+output normalization, the rf_train dataset producer-await/fallback composition
+(_obtain_rf_dataset), and the training stage machine (skip-if-done / record-failure semantics
 against a stub pipeline)."""
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import numpy as np
 import pytest
 
 from aetherscan.config import get_config
+from aetherscan.round_data import RoundDataPaths
 from aetherscan.run_state import (
     STAGE_FINAL_SAVE,
     STAGE_HF_UPLOAD,
@@ -222,6 +224,10 @@ class TestTrainRandomForestSkipIsLoud:
         pipeline.rf_model = types.SimpleNamespace(is_trained=True)
         pipeline._rf_loaded_from_tag = "test_v27"
         pipeline.rf_training_skipped_from_tag = None
+        # The skip path winds down a pending producer RF pre-generation (moot once the
+        # stage is skipped) — none exists here, the shutdown must be a clean no-op
+        pipeline._round_producer = None
+        pipeline._rf_producer_request = None
 
         with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
             pipeline.train_random_forest()
@@ -230,6 +236,141 @@ class TestTrainRandomForestSkipIsLoud:
         assert any(
             "RF training SKIPPED" in r.message and "test_v27" in r.message for r in caplog.records
         )
+
+
+class _FakeRfProducer:
+    """await_round/shutdown recorder standing in for RoundDataProducer."""
+
+    def __init__(self, log, error=None):
+        self._log = log
+        self._error = error
+        self.shutdown_calls = 0
+
+    def await_round(self, round_idx):
+        self._log.append(("await", round_idx))
+        if self._error is not None:
+            raise self._error
+        return {"n_samples": 8}
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+        self._log.append(("shutdown",))
+
+
+class _FakeRfDataGenerator:
+    """generate_round recorder standing in for DataGenerator on the in-process path."""
+
+    def __init__(self, log):
+        self._log = log
+
+    def generate_round(self, paths, n_samples, snr_base, snr_range, round_num=None):
+        self._log.append(("generate", paths.round_dir, n_samples, snr_base, snr_range, round_num))
+
+
+class TestObtainRfDataset:
+    """_obtain_rf_dataset composes producer await -> shutdown -> manifest reuse ->
+    in-process fallback. Every resume/fallback path is pinned: producer-success,
+    producer-error (falls back in-process), no-producer fresh generation, valid-dir
+    reuse, and the defensive request-less-producer wind-down."""
+
+    def _pipeline(self, log, producer=None, request=None):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline.config.training.num_training_rounds = 20
+        pipeline._round_producer = producer
+        pipeline._rf_producer_request = request
+        pipeline.data_generator = _FakeRfDataGenerator(log)
+        return pipeline
+
+    def _patch_validate(self, monkeypatch, log, manifest):
+        def _validate(paths, expected_n_samples=None, expected_array_dtype=None):
+            log.append(("validate", paths.round_dir, expected_n_samples, expected_array_dtype))
+            return manifest
+
+        monkeypatch.setattr("aetherscan.train.validate_done_manifest", _validate)
+
+    def _rf_paths(self, tmp_path):
+        return RoundDataPaths(round_dir=os.path.join(str(tmp_path), "rf"), round_idx=0)
+
+    def test_producer_success_reuses_result_without_regenerating(self, tmp_path, monkeypatch):
+        log = []
+        producer = _FakeRfProducer(log)
+        pipeline = self._pipeline(log, producer=producer, request=21)
+        self._patch_validate(monkeypatch, log, manifest={"n_samples": 8})
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        # Await precedes the manifest check (validating mid-write would race the
+        # fallback's regeneration against live producer writes), shutdown lands exactly
+        # once, and the producer's dataset is consumed without a regeneration
+        assert log == [
+            ("await", 21),
+            ("shutdown",),
+            ("validate", rf_paths.round_dir, 8, pipeline.config.training.round_array_dtype),
+        ]
+        assert producer.shutdown_calls == 1
+        assert pipeline._round_producer is None
+        assert pipeline._rf_producer_request is None
+
+    def test_producer_error_falls_back_to_in_process_generation(self, tmp_path, monkeypatch):
+        log = []
+        producer = _FakeRfProducer(log, error=RuntimeError("producer exploded"))
+        pipeline = self._pipeline(log, producer=producer, request=21)
+        self._patch_validate(monkeypatch, log, manifest=None)
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        # Producer failure still shuts it down exactly once, then the unchanged
+        # in-process path runs with the same num_training_rounds+1 sentinel round_num
+        assert log == [
+            ("await", 21),
+            ("shutdown",),
+            ("validate", rf_paths.round_dir, 8, pipeline.config.training.round_array_dtype),
+            ("generate", rf_paths.round_dir, 8, 10.0, 40.0, 21),
+        ]
+        assert producer.shutdown_calls == 1
+        assert pipeline._round_producer is None
+
+    def test_no_producer_generates_in_process(self, tmp_path, monkeypatch):
+        # Overlap disabled, sequential mode, or a resumed run entering rf_train directly
+        # (startup cleanup deleted any stale rf dir, so validation fails and regenerates)
+        log = []
+        pipeline = self._pipeline(log, producer=None, request=None)
+        self._patch_validate(monkeypatch, log, manifest=None)
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        assert log == [
+            ("validate", rf_paths.round_dir, 8, pipeline.config.training.round_array_dtype),
+            ("generate", rf_paths.round_dir, 8, 10.0, 40.0, 21),
+        ]
+
+    def test_no_producer_valid_dir_is_reused(self, tmp_path, monkeypatch):
+        log = []
+        pipeline = self._pipeline(log, producer=None, request=None)
+        self._patch_validate(monkeypatch, log, manifest={"n_samples": 8})
+
+        pipeline._obtain_rf_dataset(self._rf_paths(tmp_path), 8, 10.0, 40.0)
+
+        assert [entry[0] for entry in log] == ["validate"]
+
+    def test_producer_without_pending_request_is_still_shut_down(self, tmp_path, monkeypatch):
+        # Defensive: a live producer with no RF request pending must be wound down, not
+        # leaked (and not awaited — there is nothing to wait for)
+        log = []
+        producer = _FakeRfProducer(log)
+        pipeline = self._pipeline(log, producer=producer, request=None)
+        self._patch_validate(monkeypatch, log, manifest=None)
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        assert log[0] == ("shutdown",)
+        assert not any(entry[0] == "await" for entry in log)
+        assert producer.shutdown_calls == 1
 
 
 class _PipelineStub:

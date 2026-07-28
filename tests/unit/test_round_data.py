@@ -23,6 +23,7 @@ from aetherscan.data_generation import (
 from aetherscan.round_data import (
     RoundDataPaths,
     RoundDataProducer,
+    _default_generate,
     _producer_main,
     _reap_stale_producer,
     build_manifest,
@@ -591,6 +592,168 @@ class TestProducerProtocol:
         messages = self._run(tmp_path, _stub_generate_ok, [("bogus",)])
         assert [m[0] for m in messages] == ["shutdown_ack"]
 
+    def test_rf_request_carries_dir_and_n_samples_overrides(self, tmp_path):
+        """The RF request's overrides dict: output dir + n_samples reach the producer, and
+        the request round_idx (the seed sentinel) reaches generate_fn unchanged."""
+        calls = []
+
+        def _recording_stub(
+            paths, round_idx, snr_base, snr_range, pool, params, stats_cb, progress_cb
+        ):
+            calls.append((paths, round_idx, snr_base, snr_range, params))
+            return {"round_idx": round_idx, "n_samples": params["n_samples"]}
+
+        messages = self._run(
+            tmp_path,
+            _recording_stub,
+            [("generate", 21, 10.0, 40.0, {"dir_name": "rf", "n_samples": 4})],
+        )
+        assert [m[0] for m in messages] == ["timing", "done", "shutdown_ack"]
+        # Result (and timing) messages are keyed by the REQUEST round_idx — what
+        # train_random_forest awaits
+        assert messages[0][1] == 21
+        assert messages[1][1] == 21
+
+        ((paths, round_idx, snr_base, snr_range, params),) = calls
+        # Dir override: {base_dir}/rf with paths round_idx 0 — the exact layout
+        # train_random_forest's rf_paths validates (round_00.done, manifest round_idx 0)
+        assert paths.round_dir == os.path.join(str(tmp_path), "rf")
+        assert paths.round_idx == 0
+        # Seed identity: generate_fn's round_idx (the round_num per-task seeds derive
+        # from) is the request's sentinel, NOT the paths index
+        assert round_idx == 21
+        # Per-request n_samples override lands in the params generate_fn reads
+        assert params["n_samples"] == 4
+        assert (snr_base, snr_range) == (10.0, 40.0)
+
+    def test_rf_request_short_circuits_on_validated_rf_dir(self, tmp_path):
+        # Reuse must validate against the request's overridden n_samples, not the
+        # producer-wide beta-VAE default (params carries n_samples=8, the request 4)
+        _write_small_round(RoundDataPaths(os.path.join(str(tmp_path), "rf"), 0), n_samples=4)
+        messages = self._run(
+            tmp_path,
+            _stub_generate_boom,
+            [("generate", 21, 10, 40, {"dir_name": "rf", "n_samples": 4})],
+        )
+        assert [m[0] for m in messages] == ["done", "shutdown_ack"]
+        assert messages[0][1] == 21
+        assert messages[0][2]["n_samples"] == 4
+
+
+class TestProducerRfByteIdentity:
+    """The RF pre-generation correctness contract: the producer path (the REAL
+    _default_generate parameter mapping through _producer_main) and train_random_forest's
+    in-process fallback must produce byte-identical arrays and matching manifest
+    checksums, because both call generate_round_to_memmap with the same params and derive
+    per-task seeds from (root seed, STREAM_DATA_GEN, num_training_rounds+1). If this
+    breaks, producer pre-generation silently changes the RF training data relative to the
+    documented in-process semantics."""
+
+    def test_producer_rf_request_matches_in_process_generation(
+        self, tmp_path, monkeypatch, make_background_npy
+    ):
+        plate = np.load(make_background_npy("plate.npy", n_cadences=4, width_bin=_WIDTH_BIN))
+        sentinel = 4  # num_training_rounds=3 + 1; any value shared by both sides works
+        common = {
+            "n_samples": 8,
+            "snr_base": 10.0,
+            "snr_range": 5.0,
+            "width_bin": _WIDTH_BIN,
+            "num_observations": 6,
+            "time_bins": 16,
+            "chunk_size": 4,
+            "task_size": 3,
+            "freq_resolution": _FREQ_RES,
+            "time_resolution": _TIME_RES,
+        }
+
+        # In-process reference: exactly the fallback's call shape (rf/ dir, paths
+        # round_idx 0, sentinel round_num, root seed)
+        inproc_paths = RoundDataPaths(os.path.join(str(tmp_path), "inproc", "rf"), 0)
+        inproc_stats = []
+        inproc_manifest = generate_round_to_memmap(
+            inproc_paths,
+            backgrounds=plate,
+            round_num=sentinel,
+            seed=123,
+            stats_cb=inproc_stats.append,
+            **common,
+        )
+
+        # Producer path: the real _default_generate through the thread-driven request
+        # loop. The thread producer has no pool, so generate_round_to_memmap is patched
+        # to inject `backgrounds` (sequential execution) — the parameter MAPPING under
+        # test is _default_generate's, which the wrapper passes through untouched.
+        real_generate = generate_round_to_memmap
+
+        def _sequential(*args, **kwargs):
+            kwargs.setdefault("backgrounds", plate)
+            return real_generate(*args, **kwargs)
+
+        monkeypatch.setattr("aetherscan.data_generation.generate_round_to_memmap", _sequential)
+
+        producer_base = os.path.join(str(tmp_path), "producer")
+        params = {
+            "base_dir": producer_base,
+            "n_samples": 12,  # the beta-VAE per-round count — the request override must win
+            "seed": 123,
+            **{k: v for k, v in common.items() if k not in ("n_samples", "snr_base", "snr_range")},
+        }
+        request_queue: queue.Queue = queue.Queue()
+        result_queue: queue.Queue = queue.Queue()
+        request_queue.put(("generate", sentinel, 10.0, 5.0, {"dir_name": "rf", "n_samples": 8}))
+        request_queue.put(("shutdown",))
+        thread = threading.Thread(
+            target=_producer_main,
+            args=(request_queue, result_queue, params),
+            kwargs={"generate_fn": _default_generate},
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=120)
+        assert not thread.is_alive()
+        messages = []
+        while True:
+            try:
+                messages.append(result_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        done = [m for m in messages if m[0] == "done"]
+        assert len(done) == 1 and done[0][1] == sentinel
+        producer_manifest = done[0][2]
+
+        # Arrays byte-identical across the two paths
+        producer_paths = RoundDataPaths(os.path.join(producer_base, "rf"), 0)
+        inproc = load_round_arrays(inproc_paths)
+        produced = load_round_arrays(producer_paths)
+        for key in ("concatenated", "true", "false"):
+            np.testing.assert_array_equal(np.asarray(inproc[key]), np.asarray(produced[key]))
+        np.testing.assert_array_equal(inproc["labels"], produced["labels"])
+        np.testing.assert_array_equal(inproc["lognorm"], produced["lognorm"])
+
+        # Manifests match on everything content-derived (wall_time_s/created_at may differ)
+        for key in (
+            "round_idx",
+            "n_samples",
+            "shapes",
+            "dtypes",
+            "array_dtype",
+            "snr_base",
+            "snr_range",
+            "checksums",
+            "chunk_count",
+        ):
+            assert producer_manifest[key] == inproc_manifest[key], key
+
+        # Streamed stats carry the SAME sentinel round_number as the in-process rows —
+        # write_segment_stats takes round_number from the segment dict, so injection_stats
+        # rows land identically whichever side generated the RF set
+        stats = [m for m in messages if m[0] == "stats"]
+        assert stats
+        assert all(m[2]["round_number"] == sentinel for m in stats)
+        assert all(s["round_number"] == sentinel for s in inproc_stats)
+
 
 class TestProducerParentDeathWatch:
     """The request loop's ppid watch: an ungraceful parent death (kill -9 / OOM) never sends
@@ -914,6 +1077,39 @@ class TestRoundDataProducerDrainer:
         producer._process.alive = False
         with pytest.raises(RuntimeError, match="exited before producing"):
             producer.await_round(5)
+
+    def test_request_message_shapes_stay_backward_compatible(self, producer):
+        # Plain round requests keep the historical 4-tuple; only override-carrying
+        # requests (the RF dataset) grow the optional trailing dict
+        producer.request_generation(2, 10, 40)
+        producer.request_generation(21, 10, 40, dir_name="rf", n_samples=4)
+        assert producer._request_queue.get(timeout=5) == ("generate", 2, 10, 40)
+        assert producer._request_queue.get(timeout=5) == (
+            "generate",
+            21,
+            10,
+            40,
+            {"dir_name": "rf", "n_samples": 4},
+        )
+
+    def test_rf_timing_uses_stage_name_override(self, producer, monkeypatch):
+        # The RF request's stage_name is registered main-side (naming never crosses the
+        # process boundary) so its span lands under train.rf, not a nonexistent round_21
+        recorded = []
+        monkeypatch.setattr(
+            "aetherscan.round_data.record_stage",
+            lambda *args, **kwargs: recorded.append((args, kwargs)),
+        )
+        producer.request_generation(21, 10, 40, dir_name="rf", n_samples=4, stage_name="train.rf")
+        producer._result_queue.put(("timing", 21, 100.0, 160.0))
+        producer._result_queue.put(("done", 21, {"n_samples": 4}))
+        producer.await_round(21)
+        assert recorded == [
+            (
+                ("train.rf.data_generation", 100.0, 160.0),
+                {"tag": "test_v1", "metadata": {"source": "producer"}},
+            )
+        ]
 
 
 @pytest.mark.slow

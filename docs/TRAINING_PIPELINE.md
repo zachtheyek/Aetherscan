@@ -41,8 +41,13 @@ fresh datetime tag and starts a new run).
 
 1. **Obtain data** — reuse a validated on-disk round dataset if one exists, else wait on the
    background producer (or generate in-process when overlap is disabled).
-2. **Queue the next round** — generation of round *k+1* is requested immediately, so it runs
-   in the producer process while round *k* trains.
+2. **Queue the producer's next job** — generation of round *k+1* is requested immediately, so
+   it runs in the producer process while round *k* trains. The **last** round instead queues
+   the **RF dataset** (`num_samples_rf` samples at `snr_base` + the wide `initial_snr_range`,
+   into `round_data/{tag}/rf/`), so `rf_train` finds it ready instead of generating it with
+   the GPUs idle. The request carries the same `num_training_rounds + 1` sentinel
+   `round_num` as the in-process path, so per-task seeds derive identically and the arrays
+   are byte-identical to what `rf_train`'s fallback would generate.
 3. **Build datasets** — `prepare_distributed_train_dataset()` over the round's memmaps
    (stratified 80/20 train/val split on the labels array).
 4. **Prepare the latent-viz batch** (first round only) — 960 held-out val cadences per signal
@@ -128,7 +133,9 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
   (~590 GB peak). `cli.py:collect_validation_errors` checks free space at startup
   (`_estimate_round_data_nbytes`: 2.2× one round with overlap, 1.1× without) and hard-fails
   with the computed numbers. Round *k*'s directory is deleted as soon as round *k* finishes
-  training (`--keep-round-data` retains it for debugging).
+  training (`--keep-round-data` retains it for debugging). During the last round the RF
+  dataset (`num_samples_rf` = ⅕ of a round at defaults) is pre-generated alongside that
+  round's data — well under the two-round peak the preflight budgets for.
 
 > [!TIP]
 > **For official tagged training releases, pass `--keep-round-data`.** By default each round's
@@ -141,17 +148,28 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
 
 ### The producer process
 
-`RoundDataProducer` generates round *k+1* while round *k* trains, and isolates generation from
-the trainer's GIL (TF's prefetch/callback threads used to make round-2+ generation far slower
-than round 1's):
+`RoundDataProducer` generates round *k+1* while round *k* trains (and pre-generates the RF
+dataset while the last round trains), and isolates generation from the trainer's GIL (TF's
+prefetch/callback threads used to make round-2+ generation far slower than round 1's):
 
 - A **spawn**-started `multiprocessing.Process` (never fork — the TF/NCCL/CUDA-laden parent
   holds locks a forked child can inherit mid-acquisition and deadlock on). The producer owns
   a private fork-started worker pool whose workers attach to the background-plate shared
   memory created by the main process.
 - Protocol over two spawn-context queues: main sends `("generate", round_idx, snr_base,
-  snr_range)` / `("shutdown",)`; the producer streams back `stats` (per class-segment
-  injection statistics), `progress`, and terminal `done`/`error` messages.
+  snr_range[, overrides])` / `("shutdown",)`; the producer streams back `stats` (per
+  class-segment injection statistics), `progress`, and terminal `done`/`error` messages.
+  The optional `overrides` dict serves the RF request: `dir_name` targets `rf/` instead of
+  `round_XX/`, `n_samples` swaps in `num_samples_rf`, and the request's `round_idx` is the
+  seed-identity `round_num` (`num_training_rounds + 1`) rather than a directory index.
+- **Lifecycle.** The producer normally winds down when the round loop exits — except after a
+  successful last round, where it still owes the pre-generated RF dataset: it then stays
+  alive (idle or finishing that generation, including across `vae_plots`) until
+  `train_random_forest` awaits the result and shuts it down. On a producer error — or with
+  no producer at all (overlap disabled, or a resumed run entering `rf_train` directly) —
+  `rf_train` falls back to the unchanged in-process generation path; every failure/skip path
+  (round-loop crash, RF-stage skips, pipeline teardown) still shuts the producer down
+  exactly once.
 - **DB writes stay in the main process**: a drainer thread consumes the `stats` messages and
   calls `data_generation.write_segment_stats()` — the DB writer queue is a thread
   `queue.Queue`, not process-safe. The drainer runs while the GPUs compute, so injection-stat
@@ -369,9 +387,10 @@ pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off
   the Phase-0 throughput A/B.
 
 Deferred with rationale (recorded in `benchmarks/README.md` so they are not blindly retried):
-RF-dataset pre-generation on the producer, a direct-numpy injection bundle, SHAP-stage
-overlap, pool thread-pinning, and fused moments — the 21.5× generation result collapsed their
-absolute value.
+a direct-numpy injection bundle, SHAP-stage overlap, pool thread-pinning, and fused moments —
+the 21.5× generation result collapsed their absolute value. RF-dataset pre-generation on the
+producer, originally deferred with them, has since landed (see the
+[`rf_train` section](#random-forest-training-rf_train-stage)).
 
 ### Adaptive learning rate
 
@@ -740,10 +759,20 @@ overlap enabled) the two should visibly coincide from round 2 onward.
 
 ## Random Forest training (`rf_train` stage)
 
-`train_random_forest()` generates a fresh dataset (`num_samples_rf`, default 99 840; SNR range
-= `initial_snr_range` — the wide range, so the RF sees the full difficulty spectrum) into
-`round_data/{tag}/rf/` using the same memmap machinery (in-process; the producer has already
-shut down). It reuses `prepare_distributed_train_dataset(shuffle=False)` and encodes train and
+`train_random_forest()` consumes a fresh dataset (`num_samples_rf`, default 99 840; SNR range
+= `initial_snr_range` — the wide range, so the RF sees the full difficulty spectrum) at
+`round_data/{tag}/rf/`, built with the same memmap machinery. With overlap enabled the
+background producer **pre-generates it while the last beta-VAE round trains** (queued from
+`train_round`, awaited and validated here, after which the producer shuts down); on a
+producer error or with no producer (overlap disabled, or a resumed run entering `rf_train`
+directly — startup cleanup deletes any stale `rf/` dir) the stage generates it in-process,
+exactly as before. Both paths pass the same `num_training_rounds + 1` sentinel `round_num`
+and root seed, so the arrays — and the sentinel-tagged `injection_stats` rows — are
+identical either way. One span-attribution consequence: the producer-side generation is
+recorded as `train.rf.data_generation` (`source: producer`) but its wall time overlaps the
+last round's training (during `vae_rounds`), so it no longer nests chronologically inside
+the `train.rf` umbrella span the way the in-process (`source: in-process`) span does.
+The stage reuses `prepare_distributed_train_dataset(shuffle=False)` and encodes train and
 val cadences through the (frozen) encoder with `_distributed_encode` — note the
 `train_steps × accumulation_steps` step-count correction, guarded by an exact-count assertion.
 Since #282 the encode keeps **all three** encoder outputs (`z_mean`, `z_log_var`, `z` — the

@@ -1207,6 +1207,13 @@ class TrainingPipeline:
         # overlap_data_generation is enabled; None otherwise)
         self._round_producer: RoundDataProducer | None = None
 
+        # Request id of the RF-dataset pre-generation queued on the producer during the
+        # last beta-VAE round (the num_training_rounds+1 seed sentinel), or None when no
+        # request was issued (overlap disabled, a resumed run entering rf_train directly,
+        # or a failed round loop). When set, train_random_forest awaits the result and
+        # owns the producer shutdown; cleared by _shutdown_round_producer()
+        self._rf_producer_request: int | None = None
+
         # In-memory caches for RF eval artifacts and SHAP values, keyed by tag.
         # All ten RF plots consume the same eval-artifact joblib (and the five SHAP
         # plots additionally share a SHAP-values joblib); without these caches each
@@ -1599,17 +1606,37 @@ class TrainingPipeline:
                     self.train_round(
                         round_idx=round_idx, epochs=epochs, snr_base=snr_base, snr_range=snr_range
                     )
+        except BaseException:
+            # Any round-loop failure (or interrupt) moots a pending RF pre-generation —
+            # the retry loop rebuilds the pipeline and train_random_forest never runs on
+            # this instance, so the producer must not outlive the loop
+            self._shutdown_round_producer()
+            raise
         finally:
-            # Wind down the producer (graceful shutdown message, escalating to
-            # terminate -> kill through the ResourceManager if it's mid-generation)
-            if self._round_producer is not None:
-                self._round_producer.shutdown()
-                self._round_producer = None
+            # Success path: the producer stays alive ONLY while it still owes the RF
+            # dataset requested at the top of the last round — train_random_forest awaits
+            # that result and owns the shutdown from there (see _obtain_rf_dataset). With
+            # no pending request there is nothing left for it to do: wind it down here
+            # (graceful shutdown message, escalating to terminate -> kill through the
+            # ResourceManager if it's mid-generation), exactly as before
+            if self._rf_producer_request is None:
+                self._shutdown_round_producer()
 
             # NOTE: the latent viz batch intentionally survives this method — the vae_plots
             # stage's plot_latent_traversal re-encodes/decodes it. It is freed by
             # _clear_latent_viz_data(), called from the stage machine after vae_plots (and
             # from run_training_pipeline's cleanup on any earlier failure)
+
+    def _shutdown_round_producer(self) -> None:
+        """Wind down the background producer and clear the pending-RF-request marker.
+        Idempotent — the single shutdown owner for every exit path (round-loop failure,
+        the RF await in _obtain_rf_dataset, train_random_forest's early returns, and the
+        run_training_pipeline teardown backstop), so the producer is shut down exactly
+        once no matter which of those paths run."""
+        if self._round_producer is not None:
+            self._round_producer.shutdown()
+            self._round_producer = None
+        self._rf_producer_request = None
 
     def train_round(self, round_idx: int, epochs: int, snr_base: int, snr_range: int):
         """
@@ -1660,15 +1687,33 @@ class TrainingPipeline:
                     paths, n_samples, snr_base, snr_range, round_number
                 )
 
-        # Immediately queue generation of the next round's data so it runs in the producer
-        # process while this round's epochs train (curriculum SNR for round k+1 is
-        # deterministic, so it can be computed ahead of time)
-        if (
-            self._round_producer is not None
-            and round_number < self.config.training.num_training_rounds
-        ):
-            next_snr_base, next_snr_range = self._calculate_curriculum_snr(round_idx + 1)
-            self._round_producer.request_generation(round_number + 1, next_snr_base, next_snr_range)
+        # Immediately queue the producer's next job so it runs while this round's epochs
+        # train: rounds 1..N-1 queue round k+1's data (curriculum SNR for round k+1 is
+        # deterministic, so it can be computed ahead of time); the LAST round queues the RF
+        # dataset instead — rf_train's ~num_samples_rf generation used to run in-process
+        # after the final round with the GPUs idle. The RF request mirrors
+        # train_random_forest's in-process fallback exactly: same SNR params (snr_base +
+        # the WIDE initial_snr_range), same rf/ dir layout, and the num_training_rounds+1
+        # sentinel — carried as the request id, which the producer forwards to generation
+        # as round_num — so per-task seeds derive from the same (root seed, round_num) and
+        # the arrays are byte-identical to what the fallback would generate (see the
+        # sentinel comment in _obtain_rf_dataset)
+        if self._round_producer is not None:
+            if round_number < self.config.training.num_training_rounds:
+                next_snr_base, next_snr_range = self._calculate_curriculum_snr(round_idx + 1)
+                self._round_producer.request_generation(
+                    round_number + 1, next_snr_base, next_snr_range
+                )
+            else:
+                self._rf_producer_request = self.config.training.num_training_rounds + 1
+                self._round_producer.request_generation(
+                    self._rf_producer_request,
+                    self.config.training.snr_base,
+                    self.config.training.initial_snr_range,
+                    dir_name="rf",
+                    n_samples=self.config.training.num_samples_rf,
+                    stage_name="train.rf",
+                )
 
         # Open the round's arrays as read-only memmaps (nothing is loaded into RAM here; the
         # batched generators gather from the OS page cache during training)
@@ -2615,6 +2660,88 @@ class TrainingPipeline:
 
         return outputs
 
+    def _obtain_rf_dataset(
+        self, rf_paths: RoundDataPaths, n_samples: int, snr_base: float, snr_range: float
+    ) -> None:
+        """
+        Materialize the RF training dataset at `rf_paths`, in order of precedence:
+
+        1. Await the background producer's pre-generated result (requested at the top of
+           the LAST beta-VAE round — see train_round — so it generated while that round's
+           epochs trained), then wind the producer down: its job ends here on every path
+           (success, producer error, or an exception out of the await). The await MUST
+           precede the manifest check below — validating while the producer is still
+           writing would race the fallback's regeneration against live producer writes.
+        2. Reuse a validated on-disk dataset — how a producer success is consumed, and a
+           no-op guard for a dataset already materialized on this pipeline instance
+           (startup cleanup deletes any stale rf dir, so a resumed run never reuses one
+           across attempts).
+        3. Generate in-process — the fallback when there is no producer (overlap disabled,
+           sequential mode, or a resumed run entering rf_train directly) or the producer
+           failed (generate_round_to_memmap clears any partial dir first).
+
+        Both generation paths pass the same round_num and root seed, so per-task seeds
+        derive identically and the arrays are byte-identical whichever path ran (pinned by
+        tests/unit/test_round_data.py's byte-identity test).
+
+        round_num: a sentinel one past the last beta-VAE round, NOT the literal RF phase
+        (there is no "RF round" numbering). Passing it (instead of the default None) gives
+        every injection_stats row from this generation a real round_number, so a stale row
+        from a crashed rf_train attempt is reachable by _init_run_state's round_ge
+        supersede on the next retry. That call marks (tag, round_number >=
+        self._start_round); SQL NULLs never satisfy ">=", so a NULL round_number (the
+        previous default) permanently escaped it. resume_round (run_state.py) is
+        max(completed_rounds) + 1, and completed_rounds only ever holds values <=
+        num_training_rounds, so _start_round <= num_training_rounds + 1 always — the
+        sentinel is covered whether the crash hit the last round (producer path,
+        _start_round <= num_training_rounds) or rf_train itself (_start_round ==
+        num_training_rounds + 1). Since #277, plot_injection_stats scopes its queries to
+        rounds 1..num_training_rounds, so this sentinel round is deliberately OUTSIDE
+        every plotted range — RF-phase rows never appear in the injection figures (nor
+        block their bulk-lane backlog gate while the producer pre-generates). No other
+        consumer filters or groups on round_number, so this is safe without touching
+        mark_superseded or the DB schema. The producer path carries the sentinel as its
+        request id, which reaches generation as the same round_num.
+        """
+        if self._round_producer is not None:
+            try:
+                if self._rf_producer_request is not None:
+                    logger.info("Waiting for the RF dataset from the background producer")
+                    wait_start = time.time()
+                    try:
+                        self._round_producer.await_round(self._rf_producer_request)
+                        logger.info(f"RF dataset ready (waited {time.time() - wait_start:.1f}s)")
+                    except RuntimeError as e:
+                        logger.warning(
+                            f"Producer RF pre-generation failed — falling back to "
+                            f"in-process generation: {e}"
+                        )
+            finally:
+                self._shutdown_round_producer()
+
+        if (
+            validate_done_manifest(
+                rf_paths,
+                expected_n_samples=n_samples,
+                expected_array_dtype=self.config.training.round_array_dtype,
+            )
+            is not None
+        ):
+            logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
+            return
+
+        # In-process generation; tag source to match the per-round data_generation spans
+        # (the producer path records its span from the drainer's timing message instead —
+        # attributed to train.rf but overlapping the last round's wall time)
+        with stage_timer("data_generation", metadata={"source": "in-process"}):
+            self.data_generator.generate_round(
+                rf_paths,
+                n_samples,
+                snr_base,
+                snr_range,
+                round_num=self.config.training.num_training_rounds + 1,
+            )
+
     # NOTE: write what to db? (e.g. accuracy, F1). should we move all joblib read/writes to db read/writes?
     def train_random_forest(self):
         """Train Random Forest"""
@@ -2627,6 +2754,9 @@ class TrainingPipeline:
         # _init_run_state downgraded it to a fresh run), so stale artifacts are never
         # silently reused.
         if self._resumed and self.try_load_rf_for_resume():
+            # Nothing below will read the producer's pre-generated RF dataset — don't
+            # leave it (or the producer) alive through rf_plots/final_save
+            self._shutdown_round_producer()
             logger.info(
                 "Loaded existing Random Forest model + eval artifacts for this tag — "
                 "skipping RF data generation and retraining"
@@ -2658,6 +2788,9 @@ class TrainingPipeline:
             )
             logger.warning("=" * 60)
             self.rf_training_skipped_from_tag = source_tag
+            # A pre-loaded trained RF skips the whole stage (reachable with --load-tag of
+            # a fully-trained tag) — the producer's pending RF dataset is moot
+            self._shutdown_round_producer()
             return
 
         # # BUG:
@@ -2703,50 +2836,17 @@ class TrainingPipeline:
         time_bins = self.config.data.time_bins
         width_bin = self.config.data.width_bin // self.config.data.downsample_factor
 
-        # Generate training data (concatenated is 4-way balanced; labels track per-sample
-        # subtype) into a disk-backed dataset alongside the per-round dirs. Generation is
-        # in-process (sequential with training) — there is nothing left to overlap with, the
-        # beta-VAE producer has already been shut down by train_beta_vae()
+        # Obtain the RF training set (concatenated is 4-way balanced; labels track
+        # per-sample subtype) as a disk-backed dataset alongside the per-round dirs:
+        # pre-generated by the background producer during the last beta-VAE round when
+        # overlap is on, else generated in-process here (full precedence + fallback
+        # semantics in _obtain_rf_dataset)
         logger.info(f"Preparing training set with SNR: {snr_base}-{snr_base + snr_range}")
         rf_paths = RoundDataPaths(
             round_dir=os.path.join(self._round_data_base_dir, "rf"), round_idx=0
         )
         rf_trained = False  # Set True once RF training fully completes (drives dir deletion)
-        if (
-            validate_done_manifest(
-                rf_paths,
-                expected_n_samples=n_samples,
-                expected_array_dtype=self.config.training.round_array_dtype,
-            )
-            is not None
-        ):
-            logger.info(f"Reusing validated RF dataset at {rf_paths.round_dir}")
-        else:
-            # RF data is always generated in-process (no background producer for the RF phase);
-            # tag source to match the per-round data_generation spans (producer / in-process)
-            #
-            # round_num: a sentinel one past the last beta-VAE round, NOT the literal RF phase
-            # (there is no "RF round" numbering). Passing it (instead of the default None) gives
-            # every injection_stats row from this call a real round_number, so a stale row from a
-            # crashed rf_train attempt is reachable by _init_run_state's round_ge supersede on the
-            # next retry. That call marks (tag, round_number >= self._start_round); SQL NULLs never
-            # satisfy ">=", so a NULL round_number (the previous default) permanently escaped it.
-            # resume_round (run_state.py) is max(completed_rounds) + 1, and completed_rounds only
-            # ever holds values <= num_training_rounds, so _start_round <= num_training_rounds + 1
-            # always — and rf_train only (re)starts once vae_rounds is fully done, i.e. exactly
-            # when _start_round == num_training_rounds + 1. Since #277, plot_injection_stats
-            # scopes its queries to rounds 1..num_training_rounds, so this sentinel round is
-            # deliberately OUTSIDE every plotted range — RF-phase rows never appear in the
-            # injection figures. No other consumer filters or groups on round_number, so this
-            # is safe without touching mark_superseded or the DB schema.
-            with stage_timer("data_generation", metadata={"source": "in-process"}):
-                self.data_generator.generate_round(
-                    rf_paths,
-                    n_samples,
-                    snr_base,
-                    snr_range,
-                    round_num=self.config.training.num_training_rounds + 1,
-                )
+        self._obtain_rf_dataset(rf_paths, n_samples, snr_base, snr_range)
         rf_data = load_round_arrays(rf_paths)
 
         # Prepare distributed train+val datasets (stratified split). shuffle=False so the
@@ -7473,9 +7573,15 @@ def run_training_pipeline(
         return pipeline
 
     finally:
-        # Free shared resources on exit. The viz-batch clear matters on the failure path:
-        # a vae_rounds crash skips the vae_plots-stage clear, and the retry loop builds a
-        # fresh pipeline — don't let the dying one pin a few hundred MB of viz data
+        # Free shared resources on exit. The producer backstop matters on the failure
+        # path: it stays alive across vae_plots for the RF pre-generation, so a crash
+        # between vae_rounds and rf_train's await must shut it down here (idempotent
+        # no-op when a normal path already did) — and BEFORE data_generator.close()
+        # releases the shared memory its workers attach to. The viz-batch clear matters
+        # on the failure path too: a vae_rounds crash skips the vae_plots-stage clear,
+        # and the retry loop builds a fresh pipeline — don't let the dying one pin a few
+        # hundred MB of viz data
+        pipeline._shutdown_round_producer()
         pipeline._clear_latent_viz_data()
         pipeline.data_generator.close()
 

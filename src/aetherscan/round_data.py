@@ -13,8 +13,9 @@ This module owns:
   .tmp -> os.replace like preprocessing's _extract_stamps_worker).
 - Startup archive/reuse/delete semantics for a tag's round-data directory.
 - RoundDataProducer: a dedicated process that generates round k+1 while round k
-  trains, streaming stats back to the main process (DB writes stay in main — the
-  DB queue is a thread queue.Queue, not process-safe).
+  trains (and pre-generates the RF dataset while the last round trains), streaming
+  stats back to the main process (DB writes stay in main — the DB queue is a thread
+  queue.Queue, not process-safe).
 """
 
 from __future__ import annotations
@@ -452,7 +453,13 @@ def _producer_main(
     longer slow generation down, and generation no longer steals cycles from training).
 
     Protocol (multiprocessing.Queues):
-    - in:  ("generate", round_idx, snr_base, snr_range) | ("shutdown",)
+    - in:  ("generate", round_idx, snr_base, snr_range[, overrides]) | ("shutdown",)
+           `overrides` (optional dict, absent on plain round requests — the historical
+           4-tuple shape) customizes one request without touching `params`:
+           - "dir_name": write into {base_dir}/{dir_name} (paths round_idx pinned to 0 —
+             see the request loop) instead of round_{round_idx:02d}
+           - "n_samples": per-request sample count (the RF dataset is num_samples_rf,
+             not the num_samples_beta_vae this producer was constructed with)
     - out: ("stats", round_idx, segment_dict)            per class-segment per chunk
            ("progress", round_idx, chunk, n_chunks)      per chunk
            ("timing", round_idx, start_ts, end_ts)       generation wall-clock span, sent
@@ -565,12 +572,32 @@ def _producer_main(
                 logger.warning(f"RoundDataProducer ignoring unknown message: {message[0]!r}")
                 continue
 
-            _, round_idx, snr_base, snr_range = message
-            paths = RoundDataPaths.for_round(params["base_dir"], round_idx)
+            _, round_idx, snr_base, snr_range = message[:4]
+            overrides = message[4] if len(message) > 4 else {}
+            n_samples = overrides.get("n_samples", params["n_samples"])
+            # The override rides a shallow copy so generate_fn keeps its params-dict
+            # signature; plain round requests pass `params` through untouched
+            request_params = (
+                params if n_samples == params["n_samples"] else {**params, "n_samples": n_samples}
+            )
+            dir_name = overrides.get("dir_name")
+            if dir_name is None:
+                paths = RoundDataPaths.for_round(params["base_dir"], round_idx)
+            else:
+                # Explicit-dir request (the RF dataset). paths.round_idx is pinned to 0 to
+                # mirror train_random_forest's rf_paths exactly — same round_00.done name,
+                # same manifest round_idx — so the parent's validate_done_manifest accepts
+                # the result no matter which side generated it. The MESSAGE round_idx is the
+                # request's seed identity, not a dir index: it reaches generate_fn as
+                # round_num (for the RF set the num_training_rounds+1 sentinel — the SAME
+                # value train_random_forest's in-process path passes), so per-task seeds
+                # derive identically and the arrays are byte-identical to in-process
+                # generation. Keep in sync with train._obtain_rf_dataset.
+                paths = RoundDataPaths(os.path.join(params["base_dir"], dir_name), 0)
 
             existing = validate_done_manifest(
                 paths,
-                expected_n_samples=params["n_samples"],
+                expected_n_samples=n_samples,
                 expected_array_dtype=params.get("array_dtype", "float32"),
             )
             if existing is not None:
@@ -590,7 +617,7 @@ def _producer_main(
                     snr_base,
                     snr_range,
                     pool,
-                    params,
+                    request_params,
                     lambda segment, _r=round_idx: result_queue.put(("stats", _r, segment)),
                     lambda chunk, n_chunks, _r=round_idx: result_queue.put(
                         ("progress", _r, chunk, n_chunks)
@@ -678,6 +705,10 @@ class RoundDataProducer:
         self._drainer: threading.Thread | None = None
         self._drainer_done = False
         self._results: dict[int, tuple[str, object]] = {}
+        # Per-request stage-name overrides for the drainer's timing handler (main-side
+        # only, never crosses the queue): non-round requests like the RF dataset record
+        # their span under the right stage subtree instead of a nonexistent round_XX
+        self._stage_names: dict[int, str] = {}
         self._condition = threading.Condition()
         self._pidfile = os.path.join(base_dir, _PRODUCER_PIDFILE)
 
@@ -748,10 +779,35 @@ class RoundDataProducer:
         self._drainer.start()
         logger.info(f"RoundDataProducer process started (PID {self._process.pid})")
 
-    def request_generation(self, round_idx: int, snr_base: float, snr_range: float) -> None:
-        """Queue generation of 1-based round `round_idx` (non-blocking)."""
-        logger.info(f"Requesting background generation of round {round_idx} data")
-        self._request_queue.put(("generate", round_idx, snr_base, snr_range))
+    def request_generation(
+        self,
+        round_idx: int,
+        snr_base: float,
+        snr_range: float,
+        *,
+        dir_name: str | None = None,
+        n_samples: int | None = None,
+        stage_name: str | None = None,
+    ) -> None:
+        """Queue one generation request (non-blocking). Plain requests generate 1-based
+        round `round_idx`; `dir_name`/`n_samples` override the output dir and sample count
+        (the RF dataset — `round_idx` then carries the request's seed-identity round_num,
+        see _producer_main). `stage_name` renames the timing span the drainer records to
+        "{stage_name}.data_generation" (absolute; default round_stage_name(round_idx))."""
+        if stage_name is not None:
+            self._stage_names[round_idx] = stage_name
+        target = f"'{dir_name}' dataset" if dir_name is not None else f"round {round_idx} data"
+        logger.info(f"Requesting background generation of {target}")
+        overrides: dict = {}
+        if dir_name is not None:
+            overrides["dir_name"] = dir_name
+        if n_samples is not None:
+            overrides["n_samples"] = n_samples
+        if overrides:
+            self._request_queue.put(("generate", round_idx, snr_base, snr_range, overrides))
+        else:
+            # Plain round requests keep the historical 4-tuple shape
+            self._request_queue.put(("generate", round_idx, snr_base, snr_range))
 
     def await_round(self, round_idx: int) -> dict:
         """
@@ -823,8 +879,9 @@ class RoundDataProducer:
             # The producer's generation wall-clock span, recorded from this (main) process
             # because the DB writer queue is thread-only
             _, round_idx, start_ts, end_ts = message
+            stage = self._stage_names.get(round_idx) or round_stage_name(round_idx)
             record_stage(
-                f"{round_stage_name(round_idx)}.data_generation",
+                f"{stage}.data_generation",
                 start_ts,
                 end_ts,
                 tag=self._tag,
