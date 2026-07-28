@@ -1362,6 +1362,51 @@ class Database:
             )
         )
 
+    def write_latent_snapshots_bulk(
+        self,
+        model_name: str,
+        round_number: int,
+        epoch_number: int,
+        step_number: int,
+        snapshots: list[tuple],
+        snr_base: int | None = None,
+        snr_range: int | None = None,
+        tag: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        """
+        Queue one snapshot capture's worth of latent_snapshots rows in a single call.
+
+        `snapshots` is a list of (cadence_index, signal_type, latent_vector) tuples sharing
+        the given capture-level fields; latent_vector is array-like of shape
+        (num_observations, latent_dim). Row semantics are identical to per-row
+        write_latent_snapshot calls, but the system-metadata lookup happens once per batch
+        instead of once per cadence — the per-row Python cost ran inside the epoch loop via
+        _capture_latent_snapshot (measured ~0.12 s per capture at 3,840 rows).
+        """
+        metadata_json = get_system_metadata()
+        ts = timestamp or time.time()
+        for cadence_index, signal_type, latent_vector in snapshots:
+            self.write_queue.put(
+                (
+                    "latent_snapshots",
+                    (
+                        ts,
+                        model_name,
+                        round_number,
+                        epoch_number,
+                        step_number,
+                        cadence_index,
+                        signal_type,
+                        json.dumps(np.asarray(latent_vector).tolist()),
+                        snr_base,
+                        snr_range,
+                        tag,
+                        metadata_json,
+                    ),
+                )
+            )
+
     # TODO: write checks to sanitize values before writing to db. raise error if problematic value passed
     def write_inference_result(
         self,

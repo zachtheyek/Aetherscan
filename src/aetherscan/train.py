@@ -1158,6 +1158,7 @@ class TrainingPipeline:
         self._latent_viz_labels = None
         self._latent_viz_lognorm_params = None
         self._latent_viz_dataset = None
+        self._latent_viz_iterator = None
         self._latent_viz_n_padded = None
         self._latent_viz_n_samples = None
         self._latent_viz_steps = None
@@ -2018,7 +2019,9 @@ class TrainingPipeline:
             train_holder.clear()
             del train_dataset, val_dataset
 
-            # Clear latent viz distributed dataset (rebuilt each round)
+            # Clear latent viz distributed dataset (rebuilt each round); iterator dropped
+            # BEFORE the holder clear, same teardown order as the train/val iterators
+            self._latent_viz_iterator = None
             if self._latent_viz_holder is not None:
                 self._latent_viz_holder.clear()
             self._latent_viz_dataset = None
@@ -2490,7 +2493,7 @@ class TrainingPipeline:
         return current_lr
 
     def _distributed_encode(
-        self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False
+        self, dataset, n_steps, encode_fn, n_samples, latent_dim, logging=False, iterator=None
     ):
         """
         Run a provided @tf.function (`encode_fn`) over `n_steps` of a distributed `dataset` and
@@ -2500,9 +2503,17 @@ class TrainingPipeline:
         PerReplica tensor yields 1 output, a tuple of PerReplica tensors yields N. Per-replica
         results are gathered via experimental_local_results + np.concatenate, which is faster than
         a strategy-level gather over NCCL for the small latent payload.
+
+        `iterator` lets a caller that encodes REPEATEDLY from the same in-order infinite
+        dataset (the per-snapshot viz encode) supply a persistent iterator instead of paying
+        iter() + a gc pass per call (~1.2 s of the ~1.5 s per-snapshot cost, measured); the
+        caller then owns the iterator's lifecycle. One-shot callers (the RF stage) omit it
+        and keep the original create/teardown behavior.
         """
         # Process all batches
-        iterator = iter(dataset)
+        owns_iterator = iterator is None
+        if owns_iterator:
+            iterator = iter(dataset)
         current_idx = 0
         outputs = None
 
@@ -2558,12 +2569,13 @@ class TrainingPipeline:
             if logging:
                 logger.info(f"Finished encoding {n_steps} steps")
         finally:
-            # NOTE: should check to make sure iterator exists first
-            del iterator
-            # One collection per encode pass — a per-batch gc.collect() here used to burn
-            # GIL-holding milliseconds hundreds of times per pass (incl. inside the epoch
-            # loop via _capture_latent_snapshot)
-            gc.collect()
+            if owns_iterator:
+                del iterator
+                # One collection per encode pass — a per-batch gc.collect() here used to
+                # burn GIL-holding milliseconds hundreds of times per pass; callers with a
+                # persistent iterator skip even this (0.33 s/call measured, and the epoch
+                # loop's snapshot path is exactly that caller)
+                gc.collect()
 
         return outputs
 
@@ -7169,6 +7181,12 @@ class TrainingPipeline:
         self._latent_viz_n_samples = viz_results["n_samples"]
         self._latent_viz_steps = viz_results["viz_steps"]
         self._latent_viz_holder = viz_results["_viz_holder"]
+        # ONE iterator for the round, shared by every snapshot: iter() on a distributed
+        # dataset costs ~0.9 s on a 5-GPU strategy, and each capture consumes exactly one
+        # in-order pass of the infinite dataset, so a persistent iterator reproduces the
+        # per-capture encode order byte-for-byte (fresh-eyes audit: the fresh per-capture
+        # iterator was ~60% of the snapshot's measured cost)
+        self._latent_viz_iterator = iter(self._latent_viz_dataset)
         del viz_results
 
         time_bins = self.config.data.time_bins
@@ -7212,7 +7230,10 @@ class TrainingPipeline:
         latent_dim = self.config.beta_vae.latent_dim
 
         # TEST: make sure this works as expected
-        # Encode all cadences using distributed inference
+        # Encode all cadences using distributed inference. The persistent round-scoped
+        # iterator (each capture consumes exactly one in-order pass of the infinite viz
+        # dataset) skips the ~0.9 s iter() + ~0.3 s gc that a fresh per-capture iterator
+        # measured — this runs INSIDE the epoch loop, up to 6x per epoch at full scale
         [all_z_mean] = self._distributed_encode(
             dataset=self._latent_viz_dataset,
             n_steps=self._latent_viz_steps,
@@ -7220,6 +7241,7 @@ class TrainingPipeline:
             n_samples=n_padded * num_obs,
             latent_dim=latent_dim,
             logging=False,
+            iterator=self._latent_viz_iterator,
         )
 
         # Truncate padding and reshape to per-cadence: (n_samples, 6, latent_dim)
@@ -7227,27 +7249,25 @@ class TrainingPipeline:
         z_mean_per_cadence = all_z_mean.reshape(n_samples, num_obs, latent_dim)
         del all_z_mean
 
-        # Write to DB
-        timestamp = time.time()
-        tag = self.config.checkpoint.save_tag
-        for cadence_idx in range(n_samples):
-            # NOTE: 8 decimal precison for stored latents
-            latent_vector_list = np.round(z_mean_per_cadence[cadence_idx], 8).tolist()
-            self.db.write_latent_snapshot(
-                model_name="beta_vae",
-                round_number=round_idx + 1,
-                epoch_number=epoch + 1,
-                step_number=step + 1,
-                cadence_index=cadence_idx,
-                signal_type=str(self._latent_viz_labels[cadence_idx]),
-                latent_vector=latent_vector_list,
-                snr_base=snr_base,
-                snr_range=snr_range,
-                tag=tag,
-                timestamp=timestamp,
-            )
+        # Write to DB in one batched call: one metadata lookup and one array-wide round
+        # instead of per-cadence Python (NOTE: 8 decimal precision for stored latents)
+        rounded = np.round(z_mean_per_cadence, 8)
+        self.db.write_latent_snapshots_bulk(
+            model_name="beta_vae",
+            round_number=round_idx + 1,
+            epoch_number=epoch + 1,
+            step_number=step + 1,
+            snr_base=snr_base,
+            snr_range=snr_range,
+            tag=self.config.checkpoint.save_tag,
+            timestamp=time.time(),
+            snapshots=[
+                (cadence_idx, str(self._latent_viz_labels[cadence_idx]), rounded[cadence_idx])
+                for cadence_idx in range(n_samples)
+            ],
+        )
 
-        del z_mean_per_cadence
+        del z_mean_per_cadence, rounded
 
     def save_models(self, tag: str | None = None, dir: str | None = None):
         """Save model weights"""

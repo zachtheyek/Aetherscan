@@ -258,15 +258,23 @@ number below is from blpc3 (5× RTX PRO 6000, NGC 25.02).
    epoch (train + val) while also discarding whatever the pipeline had prefetched across the
    boundary. *Fix:* iterators are created once per round in `train_round` and passed to every
    epoch; the infinite datasets make epoch boundaries purely step-counted, so batch
-   composition is unchanged.
+   composition is unchanged. A fresh-eyes audit then found the SAME disease in the
+   latent-snapshot path (a fresh viz-dataset iterator plus a gc pass per capture: ~1.2 s of
+   the ~1.5 s per-snapshot cost, at up to 6 captures per epoch at full scale) — fixed the
+   same way (round-scoped viz iterator, `_distributed_encode(iterator=...)`), alongside
+   batching the snapshot's ~3,840 per-row DB writes into one bulk call.
 
 Design decisions worth knowing before touching this code:
 
 - **`tf.range`, not an unrolled micro-batch loop.** Unrolling K=12 overlaps enough in-flight
   activations to peak at 23–26 GB/GPU — it does not fit the 16 GB A4000 release host. The
   `tf.while_loop` form peaks at ~8.4 GB and still pipelines (autograph's default
-  `parallel_iterations=10`), costing ~15% of the unrolled variant's throughput on Blackwell
-  and nothing on bla0, whose GPUs are the binding constraint either way.
+  `parallel_iterations=10`); at the step level it costs nothing (a fresh-eyes audit measured
+  the production tf.range step FASTER than the unrolled single-GPU benchmark, 3,015 vs
+  2,907 cad/s — the shipped configuration sits at ~85% of the measured 15,112 cad/s
+  zero-communication bound, with the residual split ~7.4% MirroredStrategy lockstep +
+  ~7.6% input h2d interference, both probed for further levers with null results; see
+  `benchmarks/README.md`, "Corrected ceiling decomposition").
 - **Zero-copy has an alignment gate.** TF CHECK-aborts (uncatchable SIGABRT, not an
   exception) on CPU tensors whose buffers are under 64-byte aligned; `_as_cpu_tensor` only
   dlpack-wraps 64-aligned writable arrays (`.npy` memmaps always qualify) and falls back to a

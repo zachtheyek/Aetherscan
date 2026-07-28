@@ -321,14 +321,16 @@ What changed (see `prepare_distributed_train_dataset` and `_build_accumulated_tr
 
 ¹ `bench_gpu --mode train --num-gpus 1 --accumulation-steps 12` measured 2,907 cad/s/GPU;
 multi-GPU bench_gpu numbers are unavailable on blpc3 (its collective-ops path aborts with an
-NCCL "unhandled cuda error"; the pipeline's `strategy.reduce` path is unaffected). The shipped
-configuration therefore delivers ~74% of a zero-communication, zero-input ideal, and ~85% of
-the unrolled variant — the gap to unrolled is the `tf.while_loop`'s bounded pipelining, bought
-deliberately: the unrolled loop's in-flight activations peaked at **23.4 GB/GPU** at K=12,
-which does not fit the 16 GB A4000 release host; the tf.range loop peaks at **8.4 GB/GPU**
-(autograph's while_loop still overlaps up to `parallel_iterations=10` iterations, which is why
-it pipelines at all). On bla0 the distinction is moot — its 6-GPU ceiling (~4,770 cad/s) sits
-far below either variant, so the release host is GPU-bound both ways.
+NCCL "unhandled cuda error"; the pipeline's `strategy.reduce` path is unaffected). A later
+fresh-eyes audit measured tighter bounds — see "Corrected ceiling decomposition" below: the
+true zero-communication bound is 15,112 cad/s and the shipped configuration sits at ~85% of
+it, with the residual attributed to MirroredStrategy lockstep (7.4%) and input h2d/scheduling
+interference (7.6%), NOT to the `tf.range` loop (which at 1 GPU actually beats bench_gpu's
+unrolled step, 3,015 vs 2,907 cad/s). The unrolled-vs-range VRAM tradeoff stands on its own:
+23.4 GB/GPU at K=12 unrolled does not fit the 16 GB A4000 release host; the tf.range loop
+peaks at **8.4 GB/GPU** (autograph's while_loop still overlaps up to `parallel_iterations=10`
+iterations). On bla0 the distinction is moot — its 6-GPU ceiling (~4,770 cad/s) sits far
+below either variant, so the release host is GPU-bound both ways.
 
 ### GIL immunity (the #276 x #277 interaction, revisited)
 
@@ -367,10 +369,35 @@ XPlane trace over the timed steps of the shipped configuration
 Method note: the audited-state figures counted compute-stream kernel time; the follow-up
 figure merges all GPU-plane events (kernels + the copies that now overlap them), so it reads
 marginally high in comparison — the honest cross-check is the throughput ratio, and
-12,317 / 1,446 = 8.5x against 73.7 / 8.3 = 8.9x agrees to within the method delta. The
-remaining ~26% idle is the tf.range loop's bounded pipelining plus the per-step reduce/apply
-tail — the price of fitting the 16 GB release host, quantified in the ladder above (the
-unrolled loop reaches ~87% of the zero-communication ceiling but needs 23-26 GB/GPU).
+12,317 / 1,446 = 8.5x against 73.7 / 8.3 = 8.9x agrees to within the method delta.
+
+### Corrected ceiling decomposition (fresh-eyes audit)
+
+An independent audit of the shipped state re-measured the bounds and corrected two
+attributions an earlier revision of this section made:
+
+- **True compute bound: 15,112 cad/s** — five concurrent INDEPENDENT single-GPU processes
+  running the production-shaped tf.range step with zero input (not 14,536 = 5x bench_gpu,
+  whose unrolled single-GPU step is itself 3.7% SLOWER than the shipped graph loop:
+  2,907 vs 3,015 cad/s). The "~15% tf.range penalty" a prior revision claimed does not
+  exist at the step level.
+- **Residual split, both measured**: single-process MirroredStrategy lockstep + reduce/apply
+  costs 7.4% (zero-input in-process bound 13,997), and the real input pipeline a further
+  7.6% (12,850 mean) — h2d/scheduling interference, not gather bandwidth (the producer alone
+  sustains 4x the demand). 12,850 / 15,112 = **85% of ceiling at the step level.**
+- **Null results, pinned so they are not retried**: packing all 46 gradients into one flat
+  37.2 MB collective — no change; HierarchicalCopyAllReduce and ReductionToOneDevice — both
+  lose to NCCL; per-replica device buffer 2→6 — within run noise; XLA jit of the micro-batch
+  fn — −11% AND 26.5 GB/GPU (breaks the A4000 constraint); no thermal/concurrency penalty
+  (the 5-process bound proves it).
+- The remaining step-level headroom within the fp32 + MirroredStrategy + 16 GB constraints is
+  ~15% with no identified software lever; the levers that WOULD move the ceiling (bf16
+  mixed precision, fp16 round arrays halving gather volume) change numerics and are recorded
+  as candidate follow-up issues, not taken here.
+- **Provenance caveat**: JSONs under `benchmarks/results/` from different working-tree
+  states carry identical params blocks (e.g. `audit2_step_current.json` at ~1,400 cad/s is
+  the PRE-follow-up tree; `final_step_current.json` at 12,317 is the shipped tree) — check
+  file dates against the narrative here before comparing.
 
 ### Real-run A/B (the measurement the original audit called "the single most useful missing number")
 
@@ -402,6 +429,18 @@ Two findings beyond the headline **8.4x quiet / 5.2x contended** epoch speedup:
 The quiet-round number closes the loop against the synthetic benchmark: 38,400 cadences in
 5.8 s minus the once-per-epoch latent snapshot puts the real pipeline at the bench's
 ~10.7k cad/s steady state — the harness and the production loop now agree.
+
+**Post-A/B addendum (fresh-eyes audit follow-through).** After the third leg, the audit's
+decomposition of the remaining 5.8 s showed the once-per-epoch latent snapshot costing
+~1.5 s, of which only ~0.15 s is encode: ~0.9 s was a fresh `iter()` on the distributed viz
+dataset per capture (the same per-epoch-iterator disease fixed above for train/val), ~0.33 s
+a `gc.collect()` per capture, and ~0.12 s per-row DB payload serialization (3,840 rows). All
+three are now fixed (round-scoped viz iterator, gc skipped for persistent-iterator callers,
+one bulk DB call per capture) — semantics pinned by unit tests. The epoch-wall effect
+(predicted from the isolated measurements, not re-run at A/B scale: quiet train epoch
+5.8 → ~4.4 s, and ~7-9 s saved per production-scale epoch where the snapshot fires up to
+6x) should be treated as an estimate until the next real run reports its `train_duration`
+stats.
 
 ### Caveats
 

@@ -121,6 +121,31 @@ class TestExecutemanyBatching:
         assert db.flush(timeout=10) is True
         assert len(db.query_training_stat(tag="test_v2", stat_name="kl_loss")) == 20
 
+    def test_latent_snapshots_bulk_matches_per_row_semantics(self, db):
+        """write_latent_snapshots_bulk (one call per snapshot capture) must land rows with
+        the same content per-row write_latent_snapshot calls produce."""
+        tag = "test_v3"
+        vector = np.round(np.arange(24, dtype=np.float64).reshape(6, 4) / 7.0, 8)
+        db.write_latent_snapshots_bulk(
+            model_name="beta_vae",
+            round_number=2,
+            epoch_number=3,
+            step_number=5,
+            snr_base=10,
+            snr_range=20,
+            tag=tag,
+            timestamp=123.0,
+            snapshots=[(0, "true_only_eti", vector), (1, "false_with_rfi", vector + 1.0)],
+        )
+        assert db.flush(timeout=10) is True
+        snapshots = db.query_latent_snapshots(tag=tag)
+        assert len(snapshots) == 2
+        by_idx = {s["cadence_index"]: s for s in snapshots}
+        assert json.loads(by_idx[0]["latent_vector"]) == vector.tolist()
+        assert json.loads(by_idx[1]["latent_vector"]) == (vector + 1.0).tolist()
+        assert by_idx[0]["signal_type"] == "true_only_eti"
+        assert by_idx[1]["signal_type"] == "false_with_rfi"
+
 
 class TestIsFiniteSanitization:
     def test_non_finite_values_stored_as_zero_with_flag(self, db):
