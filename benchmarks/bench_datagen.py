@@ -71,8 +71,22 @@ def main() -> None:
     parser.add_argument("--snr-range", type=float, default=40.0)
     parser.add_argument("--data-dir", required=True, help="Scratch dir for the generated round")
     parser.add_argument("--keep", action="store_true", help="Keep the round dir (default: delete)")
+    parser.add_argument(
+        "--preload-tf",
+        action="store_true",
+        help="Import TensorFlow (CUDA-blanked) before forking the pool, so workers inherit "
+        "the same import graph the production producer's workers carry — without it, "
+        "gc/interpreter costs read optimistically low vs production",
+    )
     parser.add_argument("--output", default=None, help="Result JSON path")
     args = parser.parse_args()
+
+    if args.preload_tf:
+        # Mirror the producer: TF importable but never CUDA-initialized in generation workers
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+        import tensorflow  # noqa: F401, PLC0415
+
+        print("Preloaded TensorFlow into the parent (workers fork with the full import graph)")
 
     # Synthetic chi2 plates — seeded, so identical across arms with identical args
     rng = np.random.default_rng(args.seed)
