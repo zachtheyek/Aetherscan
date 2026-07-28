@@ -112,7 +112,11 @@ class BetaVAE(keras.Model):
         stability when latents collide) — minimizing this term pushes ON/OFF pairs apart."""
         return tf.reduce_mean(1.0 / (tf.reduce_sum(tf.square(a - b), axis=1) + 1e-8))
 
-    @tf.function
+    # Deliberately NOT @tf.function (removed with the L1/L2 activation): this runs only
+    # inside compute_total_loss's graph, and giving it its own FuncGraph strands the
+    # encoder's activity-regularizer loss tensors out of scope of the reg_loss add_n —
+    # InaccessibleTensorError, found by the first regularized run. Inlining into the outer
+    # trace keeps every penalty same-graph; standalone (eager) calls just run eagerly.
     def compute_clustering_loss_true(self, true_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for true-class (ETI-bearing) cadences: sum loss_same across all
@@ -169,7 +173,8 @@ class BetaVAE(keras.Model):
         similarity = same + difference
         return similarity
 
-    @tf.function
+    # Deliberately NOT @tf.function — same FuncGraph-stranding rationale as
+    # compute_clustering_loss_true above.
     def compute_clustering_loss_false(self, false_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for false-class (RFI / noise-only) cadences: sum loss_same across all 15
