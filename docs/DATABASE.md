@@ -171,7 +171,16 @@ class-segment, on the bounded bulk lane).
 | `slope_clamped` | INTEGER | 1 when the injection's drift slope hit the near-zero clamp |
 | `superseded` | INTEGER | Default 0 |
 
-Index: `(tag, timestamp, stat_name, signal_type, injection_stage)`.
+Indexes: `(tag, timestamp, stat_name, signal_type, injection_stage)`
+(`idx_injection_stats_filter`) plus, since v7, the stat-scoped secondary
+`(tag, stat_name, signal_type, injection_stage, timestamp)`
+(`idx_injection_stats_by_stat`) — shaped for the end-of-run plot queries, whose equality
+filters with run-wide timestamp bounds the first index can only answer by scanning the tag's
+whole timestamp range. The trailing column is deliberately `timestamp`: that shape is chosen
+by SQLite's default cost model with no `ANALYZE` stats (a `round_number`-trailing variant
+measured as never chosen without `sqlite_stat1`), and it serves the round-scoped per-round
+queries too via their span-tightened timestamp windows. No query changes: the planner picks
+the better index per query.
 
 ### `training_stats`
 
@@ -275,7 +284,7 @@ attempt, each with its own span.
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 6`). The stamp maps to schema features as:
+(`_SCHEMA_VERSION = 7`). The stamp maps to schema features as:
 
 | `user_version` | What it added | Migration work |
 | --- | --- | --- |
@@ -286,6 +295,7 @@ attempt, each with its own span.
 | v4 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
 | v5 | `screening_proba` / `mc_mean` / `mc_std` on `inference_results` (#282 two-pass inference) | additive `ALTER TABLE ... ADD COLUMN` |
 | v6 | `is_finite INTEGER DEFAULT 1` on `training_stats` (#289 NaN-write hardening) | additive `ALTER TABLE ... ADD COLUMN` |
+| v7 | the `idx_injection_stats_by_stat` secondary index on `injection_stats` | none needed (`CREATE INDEX IF NOT EXISTS`, run in `_init_database()` and re-executed in the migration block) |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -308,6 +318,14 @@ attempt, each with its own span.
   check. The `DEFAULT 1` backfill is exact, not approximate: a non-finite value could never
   have been written before v6 (it bound as NULL and the NOT NULL constraint rejected the
   whole batch), so every pre-v6 row is finite by construction.
+- **v6 → v7** (`idx_injection_stats_by_stat`): the end-of-run `plot_injection_stats` pass
+  issues ~165 queries whose equality filters (tag/stat_name/signal_type/injection_stage)
+  ride run-wide timestamp bounds, so `idx_injection_stats_filter` scanned the whole tag
+  partition per query (~6 h projected at release scale). Like v2/v4, `_init_database()` does
+  the real work — `CREATE INDEX IF NOT EXISTS` runs for old and new databases alike before
+  migration; the `if version < 7` block re-executes the (itself idempotent) statement and
+  advances the stamp. See `benchmarks/bench_injection_index.py` for the cost/benefit
+  measurement.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped.
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a

@@ -649,6 +649,19 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
+    def _index_names(self, db_path, table):
+        conn = sqlite3.connect(db_path)
+        try:
+            return {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?",
+                    (table,),
+                )
+            }
+        finally:
+            conn.close()
+
     def test_old_schema_gains_superseded_column(self):
         db_path = self._create_v0_db(get_config())
         assert self._user_version(db_path) == 0
@@ -752,6 +765,22 @@ class TestSchemaMigration:
             rows = database.query_pipeline_stages(tag="test_v2")
             assert len(rows) == 1
             assert rows[0]["duration_s"] == 2.5
+        finally:
+            database.stop()
+
+    def test_old_schema_gains_second_injection_index(self):
+        """A pre-versioning database (v0: no indexes at all) must come out of
+        _init_database() with BOTH injection_stats indexes (the v7 stat-scoped secondary
+        index next to the original filter index) and the current version stamp."""
+        db_path = self._create_v0_db(get_config())
+        assert self._index_names(db_path, "injection_stats") == set()
+
+        database = Database()
+        try:
+            index_names = self._index_names(db_path, "injection_stats")
+            assert "idx_injection_stats_filter" in index_names
+            assert "idx_injection_stats_by_stat" in index_names
+            assert self._user_version(db_path) == _SCHEMA_VERSION
         finally:
             database.stop()
 

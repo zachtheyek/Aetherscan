@@ -61,7 +61,11 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     batch. Non-finite values now store as 0.0 with is_finite=0 (the injection_stats
 #     semantics), and query_training_stat filters them by default.
 # v7: idx_injection_stats_by_stat — the end-of-run plot pass scanned the whole tag
-#     partition ~165x, ~6 h projected at release scale
+#     partition ~165x, ~6 h projected at release scale. Trailing column is timestamp (NOT
+#     round_number): with equality on the three filter columns and the range on timestamp,
+#     SQLite's default cost model picks this index with no ANALYZE stats; a
+#     round_number-trailing shape was measured to lose to idx_injection_stats_filter
+#     absent sqlite_stat1 (benchmarks/bench_injection_index.py).
 _SCHEMA_VERSION = 7
 
 
@@ -299,7 +303,7 @@ class Database:
             # planner picks the better index per query.
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_stat
-                ON injection_stats(tag, stat_name, signal_type, injection_stage, round_number)
+                ON injection_stats(tag, stat_name, signal_type, injection_stage, timestamp)
             """)
 
             # Training statistics table
@@ -529,7 +533,7 @@ class Database:
             # so re-executing it here is a safe no-op that records the step explicitly.
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_stat
-                ON injection_stats(tag, stat_name, signal_type, injection_stage, round_number)
+                ON injection_stats(tag, stat_name, signal_type, injection_stage, timestamp)
             """)
             logger.info("Schema migration: ensured injection_stats.idx_injection_stats_by_stat")
 
