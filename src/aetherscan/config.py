@@ -187,6 +187,15 @@ class GPUConfig:
     per_gpu_memory_limit_mb: int | None = None
     nccl_num_packs: int = 2
     use_async_allocator: bool = True
+    # TF_GPU_THREAD_MODE: "gpu_private" gives each GPU dedicated kernel-launch threads that
+    # tf.data host work cannot steal — the standard NGC lever for input-pipeline h2d/scheduling
+    # interference (measured at ~7.6% of step throughput on blpc3, benchmarks/README.md
+    # "Corrected ceiling decomposition"). "global" restores TF's default shared pool;
+    # "gpu_shared" is the third TF-supported value. Applied in setup_gpu_strategy before the
+    # GPU runtime initializes; inert in the producer tree (CUDA-blanked).
+    gpu_thread_mode: str = "gpu_private"
+    # TF_GPU_THREAD_COUNT: threads per GPU when gpu_thread_mode="gpu_private" (TF default 2)
+    gpu_thread_count: int = 2
 
 
 # TODO: make sure the entire pipeline respects DataConfig() values, instead of hard coding
@@ -759,6 +768,8 @@ class Config:
                 "per_gpu_memory_limit_mb": self.gpu.per_gpu_memory_limit_mb,
                 "nccl_num_packs": self.gpu.nccl_num_packs,
                 "use_async_allocator": self.gpu.use_async_allocator,
+                "gpu_thread_mode": self.gpu.gpu_thread_mode,
+                "gpu_thread_count": self.gpu.gpu_thread_count,
             },
             "data": {
                 "num_observations": self.data.num_observations,
