@@ -36,9 +36,11 @@ records into a buffer and flushes when either the buffer reaches
 100 rows was one driver of the ~590 rows/s writer that let multi-hour backlogs build) or
 `db.write_interval` (5 s) elapses. A flush
 (`_flush_buffer`) groups the buffer by table and bulk-inserts each group with a single
-`executemany()` per table — SQL parsed once, one commit per flush; the batch is
-all-or-nothing (errors are logged and the loop continues; a failed write never kills the
-thread). Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
+`executemany()` per table — SQL parsed once, one commit per flush. A failed batch falls
+back to per-row inserts (`_executemany_resilient`, #289): only the unbindable row(s) are
+dropped, with an exact count logged — before v6 a single bad row (a NaN stat binding as
+SQL NULL against a NOT NULL column) silently discarded every row in the flush. Errors are
+logged and the loop continues; a failed write never kills the thread. Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
 per-commit WAL fsync (the WAL is still synced at checkpoints) — a crash can lose the newest
 commits but never corrupts the database, ample durability for diagnostic telemetry and the
 removal of the dominant per-transaction fsync stall.
@@ -192,6 +194,7 @@ reused-tag stale scalars are absorbed.
 | `stat_name`, `value` | TEXT, REAL | |
 | `round_number`, `epoch_number` | INTEGER | 1-based |
 | `superseded` | INTEGER | Default 0 |
+| `is_finite` | INTEGER | 0 when the value was NaN/Inf/None at write time (stored as 0.0; v6, #289). `query_training_stat`'s `only_finite` default drops these — sqlite binds NaN as SQL NULL, and before v6 the resulting NOT NULL violation silently discarded the *entire* flush batch |
 
 Index: `(tag, timestamp, model_name, stat_name)`.
 
@@ -272,7 +275,7 @@ attempt, each with its own span.
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 5`). The stamp maps to schema features as:
+(`_SCHEMA_VERSION = 6`). The stamp maps to schema features as:
 
 | `user_version` | What it added | Migration work |
 | --- | --- | --- |
@@ -282,6 +285,7 @@ attempt, each with its own span.
 | v3 | `config_fingerprint TEXT` on `inference_cadences` | additive `ALTER TABLE ... ADD COLUMN` |
 | v4 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
 | v5 | `screening_proba` / `mc_mean` / `mc_std` on `inference_results` (#282 two-pass inference) | additive `ALTER TABLE ... ADD COLUMN` |
+| v6 | `is_finite INTEGER DEFAULT 1` on `training_stats` (#289 NaN-write hardening) | additive `ALTER TABLE ... ADD COLUMN` |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -299,6 +303,11 @@ attempt, each with its own span.
 - **v4 → v5** (`inference_results.{screening_proba,mc_mean,mc_std}`): additive
   `ALTER TABLE ... ADD COLUMN ... REAL` per column, idempotent via the same
   `PRAGMA table_info` existence check.
+- **v5 → v6** (`training_stats.is_finite`, #289): additive
+  `ALTER TABLE training_stats ADD COLUMN is_finite INTEGER DEFAULT 1`, same idempotence
+  check. The `DEFAULT 1` backfill is exact, not approximate: a non-finite value could never
+  have been written before v6 (it bound as NULL and the NOT NULL constraint rejected the
+  whole batch), so every pre-v6 row is finite by construction.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped.
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
