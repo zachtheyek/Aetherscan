@@ -13,12 +13,15 @@ synthesizes an on-disk round of the true production layout (three float32 memmap
     iterate  tf.data throughput of the full dataset builder (no GPU consumption): batches/s and
              effective MB/s. `--variant legacy` reproduces the pre-#276 single-generator builder
              verbatim; `--variant current` uses train.prepare_distributed_train_dataset as it is
-             today (index generators + parallel deterministic gather map). Same seed => both
-             variants produce identical batch streams, so the delta is pure pipeline overhead.
-    step     end-to-end: the real Beta-VAE training step (same accumulate-then-apply cadence as
-             train.py's _train_epoch) consuming the real input pipeline on --num-gpus GPUs.
-             Compare cadences/s against bench_gpu.py's synthetic number on the same host: the
-             gap between them IS the input-pipeline cost.
+             today (index generators + a parallel deterministic map of pure tf.gather ops over
+             zero-copy tensor views — no Python in the gather). Same seed => both variants
+             produce identical batch streams, so the delta is pure pipeline overhead.
+    step     end-to-end: the real Beta-VAE training step consuming the real input pipeline on
+             --num-gpus GPUs. `--variant legacy` drives the pre-#276-follow-up Python
+             accumulation loop (one interpreter re-entry per micro-batch plus per-variable
+             reduces); `--variant current` mirrors train.py's graph-side accumulated step (one
+             re-entry per optimizer step). Compare cadences/s against bench_gpu.py's synthetic
+             number on the same host: the gap between them IS the input-pipeline cost.
 
 Contention/determinism knobs for the #276 audit:
     --gil-load N          spawn N background threads doing write_injection_stat-shaped pure-Python
@@ -106,10 +109,13 @@ def _synthesize_round(data_dir: str, n_samples: int, regen: bool) -> dict:
         )
         np.save(labels_path, labels)
 
+    # mmap_mode="c" matches load_round_arrays, so --variant current exercises the same
+    # zero-copy dlpack wrap production takes (a read-only "r" memmap refuses dlpack export
+    # and would silently measure the convert_to_tensor fallback instead)
     return {
-        "concatenated": np.load(paths["concatenated"], mmap_mode="r"),
-        "true": np.load(paths["true"], mmap_mode="r"),
-        "false": np.load(paths["false"], mmap_mode="r"),
+        "concatenated": np.load(paths["concatenated"], mmap_mode="c"),
+        "true": np.load(paths["true"], mmap_mode="c"),
+        "false": np.load(paths["false"], mmap_mode="c"),
         "labels": np.load(labels_path),
     }
 
@@ -342,41 +348,79 @@ def _run_step(data, args, variant) -> dict:
     accumulation_steps = built["accumulation_steps"]
     global_batch = args.per_replica_batch_size * args.num_gpus
 
-    @tf.function
-    def micro_step(batch):
-        # Mirrors train.py's _distributed_train_step: per-replica loss+grads, MEAN-reduced
-        def step_fn(batch_data):
+    if variant == "legacy":
+        # The pre-#276-follow-up training loop, verbatim shape: Python drives every
+        # micro-batch, reduces each variable's gradient across replicas per micro-batch,
+        # accumulates eagerly, then clips + applies via a separate tf.function.
+        @tf.function
+        def micro_step(batch):
+            def step_fn(batch_data):
+                (main, true_, false_), target = batch_data
+                with tf.GradientTape() as tape:
+                    losses = model.compute_total_loss(main, true_, false_, target, training=True)
+                grads = tape.gradient(losses["total_loss"], model.trainable_variables)
+                return losses["total_loss"], grads
+
+            per_loss, per_grads = strategy.run(step_fn, args=(batch,))
+            loss = strategy.reduce(tf.distribute.ReduceOp.MEAN, per_loss, axis=None)
+            grads = [strategy.reduce(tf.distribute.ReduceOp.MEAN, g, axis=None) for g in per_grads]
+            return loss, grads
+
+        @tf.function
+        def apply_gradients_fn(gradients):
+            # Inside tf.function the optimizer update routes through the captured
+            # distribution strategy correctly (an eager apply hits merge_call errors)
+            clipped, _ = tf.clip_by_global_norm(gradients, _CLIP_NORM)
+            model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
+
+        def optimizer_step():
+            accumulated = None
+            for _ in range(accumulation_steps):
+                _, grads = micro_step(next(iterator))
+                if accumulated is None:
+                    accumulated = grads
+                else:
+                    accumulated = [a + g for a, g in zip(accumulated, grads, strict=False)]
+            averaged = [a / accumulation_steps for a in accumulated]
+            apply_gradients_fn(averaged)
+
+    else:
+        # Mirrors train.py's _build_accumulated_train_step: the whole optimizer step — K
+        # micro-batches into per-replica ON_READ accumulators (tf.range: sequential, K=1
+        # peak VRAM), one cross-replica aggregation per variable, clip, apply, reset —
+        # inside ONE tf.function, so Python re-enters once per optimizer step.
+        with strategy.scope():
+            accumulators = [
+                tf.Variable(
+                    tf.zeros_like(v),
+                    trainable=False,
+                    synchronization=tf.VariableSynchronization.ON_READ,
+                    aggregation=tf.VariableAggregation.SUM,
+                )
+                for v in model.trainable_variables
+            ]
+
+        def accumulate_micro(batch_data):
             (main, true_, false_), target = batch_data
             with tf.GradientTape() as tape:
                 losses = model.compute_total_loss(main, true_, false_, target, training=True)
             grads = tape.gradient(losses["total_loss"], model.trainable_variables)
-            return losses["total_loss"], grads
+            for acc, g in zip(accumulators, grads, strict=False):
+                acc.assign_add(g)
 
-        per_loss, per_grads = strategy.run(step_fn, args=(batch,))
-        loss = strategy.reduce(tf.distribute.ReduceOp.MEAN, per_loss, axis=None)
-        grads = [strategy.reduce(tf.distribute.ReduceOp.MEAN, g, axis=None) for g in per_grads]
-        return loss, grads
+        @tf.function
+        def accumulated_step(it):
+            for _ in tf.range(accumulation_steps):
+                strategy.run(accumulate_micro, args=(next(it),))
+            scale = tf.cast(accumulation_steps * strategy.num_replicas_in_sync, tf.float32)
+            grads = [acc.read_value() / scale for acc in accumulators]
+            clipped, _ = tf.clip_by_global_norm(grads, _CLIP_NORM)
+            model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
+            for acc in accumulators:
+                acc.assign(tf.zeros_like(acc))
 
-    @tf.function
-    def apply_gradients_fn(gradients):
-        # Mirrors train.py's _apply_gradients exactly: a tf.function that clips by global
-        # norm and applies — inside tf.function the optimizer update routes through the
-        # captured distribution strategy correctly (an eager apply hits merge_call errors)
-        clipped, _ = tf.clip_by_global_norm(gradients, _CLIP_NORM)
-        model.optimizer.apply_gradients(zip(clipped, model.trainable_variables, strict=False))
-
-    def optimizer_step():
-        # Mirrors _train_epoch: sum reduced grads over accumulation sub-steps in Python,
-        # average, clip + apply once via the tf.function above
-        accumulated = None
-        for _ in range(accumulation_steps):
-            _, grads = micro_step(next(iterator))
-            if accumulated is None:
-                accumulated = grads
-            else:
-                accumulated = [a + g for a, g in zip(accumulated, grads, strict=False)]
-        averaged = [a / accumulation_steps for a in accumulated]
-        apply_gradients_fn(averaged)
+        def optimizer_step():
+            accumulated_step(iterator)
 
     for _ in range(args.warmup):
         optimizer_step()

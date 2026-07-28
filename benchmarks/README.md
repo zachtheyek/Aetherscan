@@ -43,6 +43,7 @@ comparing against the baselines.
 | `bench_rf.py` | `RandomForestClassifier` fit + `predict_proba` and the `prepare_latent_features` reshape (sklearn, CPU) | Second-stage RF training + inference (`train.train_random_forest`) |
 | `bench_input_pipeline.py` | The REAL memmap → tf.data → distribute → train-step input path (gather / iterate / step modes; legacy vs current builder; `--gil-load` contention knob) — **container-only; step mode needs GPUs** | The training input pipeline `bench_gpu.py` deliberately excludes (`train.prepare_distributed_train_dataset`) — see [#276 audit](#input-pipeline-audit-276) |
 | `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / frame render / GIF assembly) with output-equality checks on every candidate optimization — **container-only** | The `vae_plots` latent-GIF tail (`train.plot_latent_space_gif`) — see [#278 audit](#latent-gif-audit-278) |
+| `parse_xplane_occupancy.py` | Post-processor, not a benchmark: per-GPU busy time / occupancy from a `--profile` run's XPlane trace (merged event intervals, strict kernel-time measure) | The "GPUs idle >90%" profiler evidence in the [#276 audit](#input-pipeline-audit-276) and its follow-up |
 
 ## Baseline numbers
 
@@ -279,6 +280,141 @@ Graded by what the data actually supports.
 process, and the ~700k context-switches/s the issue reported — the proxy hog reproduces the
 *effect*, but neither was attributed on the real process. Both want a real (small) training run on
 an otherwise idle cluster.
+
+## Input-pipeline follow-up: removing Python from the hot path
+
+The audit above ends by naming the durable lever — "a gather that never returns to Python" —
+and this follow-up lands it, together with the other host-side wall the profiler exposed: the
+training loop itself. Everything below was measured on blpc3 (5x RTX PRO 6000, NGC 25.02, July
+2026) with the same synthetic round, `--num-gpus 5 --accumulation-steps 12`, so the numbers are
+directly comparable to the tables above.
+
+What changed (see `prepare_distributed_train_dataset` and `_build_accumulated_train_step`):
+
+1. **Graph-side gather.** The index generators stay in Python (tiny, and they carry the #49
+   rng contract), but the gather is now a deterministic parallel `.map()` of pure `tf.gather`
+   ops over zero-copy dlpack tensor views of the round memmaps (`_as_cpu_tensor`;
+   `load_round_arrays` opens mmap_mode="c" so the mapping is dlpack-exportable while the files
+   stay write-protected). No `tf.numpy_function`, no interpreter re-entry, no GIL.
+2. **Per-replica elements + device prefetch.** Each index-stream element is one per-replica
+   batch handed out via `distribute_datasets_from_function` (consecutive elements -> consecutive
+   replicas, reproducing the old contiguous global-batch split exactly), with
+   `InputOptions(experimental_fetch_to_device=True, experimental_per_replica_buffer_size=2)` so
+   host->device copies overlap compute instead of serializing inside the step.
+3. **Graph-side accumulation loop.** One `tf.function` per optimizer step: K micro-batches
+   accumulated into per-replica ON_READ accumulators inside a `tf.range` loop, ONE cross-replica
+   reduction per variable, in-graph NaN/Inf guard, clip, apply, reset. The interpreter is
+   re-entered once per optimizer step instead of once per micro-batch plus one eager op per
+   variable per micro-batch (the previous loop also launched one all-reduce per variable per
+   micro-batch and per-variable NaN checks that forced device syncs).
+
+### Step-throughput ladder (5 GPUs, accum 12, idle host)
+
+| configuration | cad/s | vs pre-follow-up |
+|---|---|---|
+| numpy_function gather + Python loop (the audited #283 state) | 1,453 | 1.0x |
+| + graph accumulation loop only | 1,781 | 1.2x |
+| + pure-TF gather (global-batch split) | 9,262 | 6.4x |
+| + per-replica elements & fetch-to-device (unrolled K) | 12,618 | 8.7x |
+| **as shipped: tf.range loop, epoch-table index yields (bounded VRAM)** | **12,317** | **8.5x** |
+| bench_gpu synthetic ceiling x 5 (no input, no all-reduce)¹ | 14,536 | 10.0x |
+
+¹ `bench_gpu --mode train --num-gpus 1 --accumulation-steps 12` measured 2,907 cad/s/GPU;
+multi-GPU bench_gpu numbers are unavailable on blpc3 (its collective-ops path aborts with an
+NCCL "unhandled cuda error"; the pipeline's `strategy.reduce` path is unaffected). The shipped
+configuration therefore delivers ~74% of a zero-communication, zero-input ideal, and ~85% of
+the unrolled variant — the gap to unrolled is the `tf.while_loop`'s bounded pipelining, bought
+deliberately: the unrolled loop's in-flight activations peaked at **23.4 GB/GPU** at K=12,
+which does not fit the 16 GB A4000 release host; the tf.range loop peaks at **8.4 GB/GPU**
+(autograph's while_loop still overlaps up to `parallel_iterations=10` iterations, which is why
+it pipelines at all). On bla0 the distinction is moot — its 6-GPU ceiling (~4,770 cad/s) sits
+far below either variant, so the release host is GPU-bound both ways.
+
+### GIL immunity (the #276 x #277 interaction, revisited)
+
+| background Python threads | pre-follow-up | shipped |
+|---|---|---|
+| 0 | 1,453 cad/s | 12,317 cad/s |
+| 1 | 526 cad/s (−63%) | 12,627 cad/s (−0%) |
+| 2 | 82 cad/s (−94%) | 9,571 cad/s (−22%) |
+
+An earlier iteration that yielded one small index array per MICRO-BATCH (instead of one
+epoch table per epoch) measured a further 35% off under the two-hog regime — the
+per-micro-batch generator GIL acquisitions convoy exactly when the interpreter is busiest.
+The shipped epoch-table yield touches Python once per epoch, which is why the two-hog cost
+collapses from −94% to −22% (and the −22% itself is against a deliberately hostile synthetic
+load — see the real-writer row below).
+
+With the REAL post-#277 DB writer flooded at maximum rate through the bulk lane
+(`write_injection_stats_bulk`, segment-shaped batches; ~940K genuine rows committed during
+the timed window) instead of the synthetic hog, the design measured **within 0.3% of its
+idle throughput** (10,742 vs 10,776 cad/s on the prototype harness at that iteration; the
+delta, not the absolute, is the result). The same real-writer flood against the new gather
+paired with the OLD Python training loop cost ~3% (9,076 vs 9,353), which bounds the
+production writer's whole GIL footprint at a few percent even without the graph-side loop —
+the writer spends most of its time inside sqlite's C code with the GIL released, exactly as
+#277 intended.
+
+### Profiler evidence
+
+XPlane trace over the timed steps of the shipped configuration
+(`benchmarks/parse_xplane_occupancy.py`, merged per-GPU event intervals):
+
+| | legacy | #283 as audited | shipped follow-up |
+|---|---|---|---|
+| mean GPU occupancy | 6.3% | 8.3% | **73.7%** |
+
+Method note: the audited-state figures counted compute-stream kernel time; the follow-up
+figure merges all GPU-plane events (kernels + the copies that now overlap them), so it reads
+marginally high in comparison — the honest cross-check is the throughput ratio, and
+12,317 / 1,446 = 8.5x against 73.7 / 8.3 = 8.9x agrees to within the method delta. The
+remaining ~26% idle is the tf.range loop's bounded pipelining plus the per-step reduce/apply
+tail — the price of fitting the 16 GB release host, quantified in the ladder above (the
+unrolled loop reaches ~87% of the zero-communication ceiling but needs 23-26 GB/GPU).
+
+### Real-run A/B (the measurement the original audit called "the single most useful missing number")
+
+Three identical scaled-down real training runs on blpc3 (2 rounds x 30 epochs,
+`--num-samples-beta-vae 48000 --num-samples-rf 9600 --seed 11`, full producer + DB writer +
+monitor stack), differing only in the checked-out training code:
+
+| per-epoch wall (s) | baseline (#283 tip) | follow-up, per-epoch iterators | follow-up, round-scoped iterators |
+|---|---|---|---|
+| train, round 1 (overlapped with round-2 generation) | 56.5 | 35.9 | **10.9** |
+| train, round 2 (quiet) | 48.5 | 27.7 | **5.8** |
+| validation | 16.7 | 24.3 | **1.7** |
+
+Two findings beyond the headline **8.4x quiet / 5.2x contended** epoch speedup:
+
+1. **The middle column is the trap this table exists to record.** The first follow-up run
+   kept the old one-`iter()`-per-epoch structure and captured only 1.75x — because
+   `iter()` on a 5-GPU distributed dataset costs **~9.1 s per call** (measured directly;
+   stable across calls, and tf.function trace counts were probed and stay flat, so it is
+   iterator/device-pipeline construction, not retracing), and the old loop paid it twice per
+   epoch while also discarding cross-boundary prefetch. The fused val loop even regressed
+   (16.7 -> 24.3 s) since a fresh iterator dominated its now-tiny compute. Round-scoped
+   iterators (one per dataset per round, epoch boundaries purely step-counted) removed it.
+2. **At this test scale the producer becomes the wall**: round-1 training (5.5 min) now
+   finishes long before round-2 generation (~38 min), so the run idles in `await_round`.
+   At production scale (100 epochs x 52 steps) training still dominates and the overlap
+   behaves as designed — but any future scale-down benchmarking should expect the wait.
+
+The quiet-round number closes the loop against the synthetic benchmark: 38,400 cadences in
+5.8 s minus the once-per-epoch latent snapshot puts the real pipeline at the bench's
+~10.7k cad/s steady state — the harness and the production loop now agree.
+
+### Caveats
+
+- The synthetic-hog dose-response is the same deliberately-hostile proxy as the audit's; the
+  real writer's bulk lane spends most of its time in sqlite's C code with the GIL released, so
+  the hog rows overstate production contention (that is what makes the immunity result strong).
+- Tracing the accumulated-step graph is itself Python and competes for the GIL once per run;
+  the tf.range loop keeps that trace small (~seconds). An unrolled K=12 variant traced for
+  minutes under GIL load — a second reason it was rejected.
+- Same-seed training results are NOT bit-identical to the previous implementation (gather
+  backend and float summation order changed); determinism itself is preserved — same seed, same
+  split, same per-epoch batch order, byte-identical reruns — and is pinned by unit tests
+  (`test_train_datasets.py`, `test_train_accumulation.py`, `test_train_distribution.py`).
 
 ## Latent-GIF audit (#278)
 
