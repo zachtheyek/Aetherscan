@@ -4,12 +4,18 @@ per-snapshot splits. TF-free by design — the module mirrors shap_parallel's is
 
 from __future__ import annotations
 
+import os
+
+import joblib
 import numpy as np
+import pytest
 
 from aetherscan.latent_gif import (
     FrameCategory,
     batched_umap_transform,
+    categories_for_mode,
     render_latent_gif_frames,
+    run_umap_gif_sweep,
 )
 
 _CATEGORIES = [
@@ -156,3 +162,93 @@ class TestBatchedUmapTransform:
 
     def test_empty_list(self):
         assert batched_umap_transform(self._FakeModel(), []) == []
+
+
+@pytest.mark.slow
+class TestRunUmapGifSweep:
+    """The whole-combo sweep (fit + persist + transform + render + GIF) must be
+    byte-identical between serial and pooled execution — the #278-follow-up contract that
+    lets the 24-combo sweep parallelize without changing any output."""
+
+    def _bundle(self, tmp_path):
+        rng = np.random.default_rng(11)
+        n_frames, n_obs, n_cad, d_obs, d_cad = 3, 48, 24, 4, 8
+        labels_pool = ["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"]
+        bundle = {
+            "fit_pool_obs": rng.normal(size=(96, d_obs)).astype(np.float32),
+            "fit_pool_cadence": rng.normal(size=(64, d_cad)).astype(np.float32),
+            "coords_obs": [
+                rng.normal(size=(n_obs, d_obs)).astype(np.float32) for _ in range(n_frames)
+            ],
+            "coords_cadence": [
+                rng.normal(size=(n_cad, d_cad)).astype(np.float32) for _ in range(n_frames)
+            ],
+            "labels_obs": [
+                np.array((labels_pool * (n_obs // 4))[:n_obs], dtype="U20") for _ in range(n_frames)
+            ],
+            "labels_cadence": [
+                np.array((labels_pool * (n_cad // 4))[:n_cad], dtype="U20") for _ in range(n_frames)
+            ],
+            "onoff_obs": [
+                np.array(["ON", "OFF"] * (n_obs // 2), dtype="U3") for _ in range(n_frames)
+            ],
+            "snapshot_metadata": [
+                {
+                    "round_number": 1,
+                    "epoch_number": e,
+                    "step_number": e * 10,
+                    "snr_base": 10.0,
+                    "snr_range": 40.0,
+                }
+                for e in range(1, n_frames + 1)
+            ],
+        }
+        path = str(tmp_path / "bundle.joblib")
+        joblib.dump(bundle, path)
+        return path
+
+    def _tasks(self, bundle_path, root_dir, leg):
+        tasks = []
+        for level_idx, mode in ((0, "obs"), (1, "cadence")):
+            method_name = f"{mode}_umap_nn5_md0.1"
+            out = os.path.join(root_dir, f"{mode}_{leg}")
+            os.makedirs(out, exist_ok=True)
+            tasks.append(
+                {
+                    "mode": mode,
+                    "nn": 5,
+                    "md": 0.1,
+                    "seed": 11 + level_idx,
+                    "method_name": method_name,
+                    "display_method": f"{mode} UMAP (test)",
+                    "bundle_path": bundle_path,
+                    "frames_dir": out,
+                    "gif_path": os.path.join(out, f"latent_space_{method_name}_t.gif"),
+                    "umap_path": os.path.join(out, f"umap_{mode}_t.joblib"),
+                    "duration_ms": 200,
+                }
+            )
+        return tasks
+
+    def test_pooled_sweep_byte_identical_to_serial(self, tmp_path):
+        bundle_path = self._bundle(tmp_path)
+        serial = run_umap_gif_sweep(self._tasks(bundle_path, str(tmp_path), "s"), n_workers=1)
+        pooled = run_umap_gif_sweep(self._tasks(bundle_path, str(tmp_path), "p"), n_workers=2)
+        assert len(serial) == len(pooled) == 2
+        for s, p in zip(serial, pooled, strict=True):
+            assert s["method_name"] == p["method_name"]
+            assert s["n_frames"] == p["n_frames"] == 3
+            assert s["warnings"] == p["warnings"] == []
+            assert os.path.exists(s["umap_path"]) and os.path.exists(p["umap_path"])
+            with open(s["gif_path"], "rb") as f1, open(p["gif_path"], "rb") as f2:
+                assert f1.read() == f2.read()
+
+    def test_categories_for_mode(self):
+        obs_categories, obs_legend = categories_for_mode("obs")
+        assert len(obs_categories) == 8
+        assert obs_legend["ncol"] == 2
+        cad_categories, cad_legend = categories_for_mode("cadence")
+        assert len(cad_categories) == 4
+        assert all(c.onoff is None for c in cad_categories)
+        with pytest.raises(ValueError):
+            categories_for_mode("nope")
