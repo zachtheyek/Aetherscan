@@ -60,12 +60,29 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     the NOT NULL constraint, and the failed executemany silently dropped the whole flush
 #     batch. Non-finite values now store as 0.0 with is_finite=0 (the injection_stats
 #     semantics), and query_training_stat filters them by default.
-# v7: idx_injection_stats_by_stat — the end-of-run plot pass scanned the whole tag
-#     partition ~165x, ~6 h projected at release scale. Trailing column is timestamp (NOT
-#     round_number): with equality on the three filter columns and the range on timestamp,
-#     SQLite's default cost model picks this index with no ANALYZE stats; a
-#     round_number-trailing shape was measured to lose to idx_injection_stats_filter
-#     absent sqlite_stat1 (benchmarks/bench_injection_index.py).
+# v7: index sweep against the real production query shapes. Both changes share one lesson:
+#     with equality on the leading columns and the range (timestamp) trailing, SQLite's
+#     default cost model picks the index with no ANALYZE stats — db.py never runs ANALYZE —
+#     while a range-column-buried shape loses to a (tag, timestamp, ...) index absent
+#     sqlite_stat1.
+#     - injection_stats: added idx_injection_stats_by_stat (tag, stat_name, signal_type,
+#       injection_stage, timestamp) — the end-of-run plot pass scanned the whole tag
+#       partition ~165x, ~6 h projected at release scale; a round_number-trailing variant
+#       was measured to never be chosen (benchmarks/bench_injection_index.py).
+#     - latent_snapshots: idx_latent_snapshots_filter (tag, timestamp, ...) reshaped to
+#       idx_latent_snapshots_by_key (tag, round_number, epoch_number, step_number,
+#       model_name, timestamp) — the GIF pass loads one capture per frame (up to 500
+#       queries/run), each a whole-window scan under the old shape: measured 67x per
+#       frame at 2M rows (~1.5 h -> ~2 s per GIF pass at release scale), and the
+#       dashboard's latest-capture lookup becomes a backward index walk instead of a
+#       partition sort, at no measurable write cost
+#       (benchmarks/bench_db_index_shapes.py).
+#     The remaining tables were measured or reasoned through and deliberately left alone —
+#     notably a training_stats reshape to (tag, model_name, stat_name, timestamp) was
+#     benchmarked and REJECTED: it regressed the dominant loss-curve fetch 1.8x and cost
+#     ~20% insert throughput (scattered stat_name subtree writes vs append-only timestamp
+#     order) to speed only the minor single-stat shape on a table whose tag partitions
+#     stay ~58k rows.
 _SCHEMA_VERSION = 7
 
 
@@ -330,7 +347,14 @@ class Database:
             #     ON training_stats(tag, model_name, round_number, epoch_number, stat_name)
             # """)
 
-            # Composite index for common filter pattern (tag + timestamp + model_name + stat_name)
+            # Composite index for common filter pattern (tag + timestamp + model_name + stat_name).
+            # Deliberately kept through the v7 index sweep: an equality-first reshape
+            # (tag, model_name, stat_name, timestamp) was benchmarked and rejected — it
+            # regressed the dominant run-window loss-curve fetch 1.8x (stat-sorted index
+            # order scatters the table-row lookups that timestamp order visits
+            # sequentially) and cost ~20% insert throughput, to speed only the minor
+            # single-stat shape on ~58k-row tag partitions
+            # (benchmarks/bench_db_index_shapes.py).
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_training_stats_filter
                 ON training_stats(tag, timestamp, model_name, stat_name)
@@ -356,10 +380,19 @@ class Database:
                 )
             """)
 
-            # Composite index for common filter pattern (tag + timestamp + model_name + round_number + epoch_number + step_number)
+            # Capture-key composite index (schema v7, replacing the (tag, timestamp, ...)
+            # shape): the GIF pass loads one capture per frame — up to
+            # latent_viz_gif_max_frames (500) queries with equality on tag/round/epoch/
+            # step/model and the run window trailing — and the old shape answered each by
+            # scanning the tag's whole timestamp window (~100M rows at release scale, per
+            # frame). round/epoch/step lead so the dashboard's model-less latest-capture
+            # lookup (ORDER BY round DESC, epoch DESC, step DESC LIMIT 1) walks the index
+            # backward instead of sorting; timestamp trails as the range column
+            # (benchmarks/bench_db_index_shapes.py).
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_latent_snapshots_filter
-                ON latent_snapshots(tag, timestamp, model_name, round_number, epoch_number, step_number)
+                CREATE INDEX IF NOT EXISTS idx_latent_snapshots_by_key
+                ON latent_snapshots(tag, round_number, epoch_number, step_number,
+                                    model_name, timestamp)
             """)
 
             # Inference results table
@@ -527,15 +560,25 @@ class Database:
                 logger.info("Schema migration: added training_stats.is_finite")
 
         if version < 7:
-            # v7: idx_injection_stats_by_stat. Like the v2/v4 no-ALTER steps, the real work
-            # happens in _init_database() — its CREATE INDEX IF NOT EXISTS runs before this
-            # method for old and new databases alike, and the statement is itself idempotent,
-            # so re-executing it here is a safe no-op that records the step explicitly.
+            # v7: the index sweep (see the version-history comment). The CREATEs mirror
+            # _init_database() — it already ran for old and new databases alike, and the
+            # statements are themselves idempotent, so re-executing them here just records
+            # the step explicitly. The DROP is the real migration work: it retires the
+            # (tag, timestamp, ...) latent_snapshots shape its equality-first replacement
+            # supersedes on a pre-v7 db; on a fresh db it is a no-op.
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_stat
                 ON injection_stats(tag, stat_name, signal_type, injection_stage, timestamp)
             """)
-            logger.info("Schema migration: ensured injection_stats.idx_injection_stats_by_stat")
+            cursor.execute("DROP INDEX IF EXISTS idx_latent_snapshots_filter")
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_latent_snapshots_by_key
+                ON latent_snapshots(tag, round_number, epoch_number, step_number,
+                                    model_name, timestamp)
+            """)
+            logger.info(
+                "Schema migration: v7 index sweep (injection_stats/latent_snapshots) applied"
+            )
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -2295,15 +2338,11 @@ class Database:
             if not include_superseded:
                 query += " AND superseded = 0"
 
-            # This ORDER BY doesn't make full use of idx_latent_snapshots_filter, since the ORDER BY
-            # columns don't follow contiguously in the index
-            # However, as long as both tag & timestamp are present in the query's WHERE clause,
-            # idx_latent_snapshots_filter can still be used to optimize the query
-            # The remaining rows form a small set of DISTINCT keys that aren't expensive for SQLite
-            # to perform a filesort
-            # If you measure a bottleneck in the future, consider adding a second schema index like
-            # (tag, model_name, round_number, epoch_number, step_number, timestamp) and then sorting
-            # the rows in that order
+            # The DISTINCT set includes snr_base/snr_range, which no index carries, so this
+            # is a tag-partition scan regardless of index shape — the tag prefix of
+            # idx_latent_snapshots_by_key still bounds it to one tag. It runs once per GIF
+            # pass, and the resulting key set is small enough that the filesort for this
+            # ORDER BY (model_name leading, unlike the index) is negligible
             query += " ORDER BY model_name, round_number, epoch_number, step_number"
 
             cursor.execute(query, params)

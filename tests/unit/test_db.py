@@ -609,6 +609,19 @@ class TestSchemaMigration:
         "inference_results",
     )
 
+    # The complete expected index set per table — the v7 index sweep's final state. Both
+    # _init_database() (fresh dbs) and the `if version < 7` migration block (pre-v7 dbs)
+    # must land exactly here, so tests assert equality, not membership.
+    _EXPECTED_INDEXES = {
+        "system_resources": {"idx_system_resources_filter"},
+        "injection_stats": {"idx_injection_stats_filter", "idx_injection_stats_by_stat"},
+        "training_stats": {"idx_training_stats_filter"},
+        "latent_snapshots": {"idx_latent_snapshots_by_key"},
+        "inference_results": {"idx_inference_results_filter"},
+        "inference_cadences": {"idx_inference_cadences_filter"},
+        "pipeline_stages": {"idx_pipeline_stages_filter"},
+    }
+
     def _create_v0_db(self, config):
         """Lay down an old-schema (pre-superseded, user_version 0) db file with one row,
         at the exact path Database will open."""
@@ -768,18 +781,24 @@ class TestSchemaMigration:
         finally:
             database.stop()
 
-    def test_old_schema_gains_second_injection_index(self):
-        """A pre-versioning database (v0: no indexes at all) must come out of
-        _init_database() with BOTH injection_stats indexes (the v7 stat-scoped secondary
-        index next to the original filter index) and the current version stamp."""
+    def test_migration_reaches_final_index_set(self):
+        """A pre-v7 database — seeded with the retired (tag, timestamp, ...)
+        latent_snapshots index so the v7 DROP path is exercised, not just the CREATEs —
+        must come out of _init_database() with exactly the current index set on every
+        table, plus the version stamp."""
         db_path = self._create_v0_db(get_config())
-        assert self._index_names(db_path, "injection_stats") == set()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE INDEX idx_latent_snapshots_filter ON latent_snapshots"
+            "(tag, timestamp, model_name, round_number, epoch_number, step_number)"
+        )
+        conn.commit()
+        conn.close()
 
         database = Database()
         try:
-            index_names = self._index_names(db_path, "injection_stats")
-            assert "idx_injection_stats_filter" in index_names
-            assert "idx_injection_stats_by_stat" in index_names
+            for table, expected in self._EXPECTED_INDEXES.items():
+                assert self._index_names(db_path, table) == expected, table
             assert self._user_version(db_path) == _SCHEMA_VERSION
         finally:
             database.stop()
@@ -804,6 +823,10 @@ class TestSchemaMigration:
         for table in self._MIGRATED_TABLES:
             assert "superseded" in self._column_names(db.db_path, table)
         assert self._user_version(db.db_path) == _SCHEMA_VERSION
+        # The fresh-db index set must equal the migrated end state exactly (requirement of
+        # the v7 sweep: _init_database() and the migration block may never diverge)
+        for table, expected in self._EXPECTED_INDEXES.items():
+            assert self._index_names(db.db_path, table) == expected, table
 
 
 def _bulk_rows(n: int, round_number: int | None = 1, value: float = 1.0) -> list[dict]:
