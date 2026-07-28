@@ -189,13 +189,18 @@ class TestRegularizationActivation:
         dense_size = config.beta_vae.dense_layer_size
         tf.random.set_seed(11)
         batch = tf.random.uniform((2, 6, 16, dense_size))
+        # The DECODER's activity penalties depend on the sampled z (Sampling draws epsilon
+        # even at training=False), so reg is deterministic GIVEN THE SEED, not across
+        # unseeded calls — the same contract every seeded run relies on (#279). Re-seed
+        # before each call so the epsilon draws replay identically.
+        tf.random.set_seed(11)
         first = float(
             vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
         )
+        tf.random.set_seed(11)
         second = float(
             vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
         )
-        # Same weights + same activations => identical penalties (no RNG in regularizers)
         assert first == second
 
 
