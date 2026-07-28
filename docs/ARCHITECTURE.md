@@ -80,7 +80,7 @@ flowchart TB
         LOAD --> SHM["background plates in shared memory<br/>(DataGenerator)"]
         SHM --> PROD["RoundDataProducer (spawned process)<br/>setigen injection via worker pool"]
         PROD --> RD["round_data/{tag}/round_XX/<br/>{main,true,false,labels}.npy memmaps"]
-        RD --> DS["prepare_distributed_train_dataset()<br/>batched tf.data over memmaps"]
+        RD --> DS["prepare_distributed_train_dataset()<br/>zero-copy tf.gather tf.data over memmaps"]
         DS --> VAE["Beta-VAE rounds<br/>(MirroredStrategy, grad accumulation)"]
         VAE --> CKPT["checkpoints: vae_{encoder,decoder}_round_XX.keras"]
         VAE --> RF["train_random_forest()<br/>encode latents → fit RF"]

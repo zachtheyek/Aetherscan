@@ -175,19 +175,28 @@ path, also used automatically when `manager.n_processes == 1`).
 
 ### Datasets
 
-`prepare_distributed_train_dataset()` builds infinite `tf.data` datasets that yield **whole
-global batches** (`per_replica_batch_size × num_replicas` rows), with a leading batch
-dimension in the output signature and no `.batch()` call — batching the yields is what fixed
-the historical 0–14 % GPU utilization (per-sample Python boundary crossings). The datasets
-are cheap **index generators** followed by a parallel, deterministic `.map()` that performs
-the sorted fancy-index memmap gathers via `tf.numpy_function` on tf.data worker threads
-(#276 — a single generator thread doing the gathers starved the GPUs; numpy releases the GIL
-during the large contiguous copies, so gathers genuinely overlap). `deterministic=True`
-preserves the exact batch order of the index stream, so parallelism changes throughput only
-— epoch composition and ordering (and therefore the seeding contract below) are
-byte-identical to the single-generator implementation. Randomness lives at the epoch level
-(train indices reshuffled per pass); within a batch, indices are sorted for memmap read
-locality (the model is order-invariant within a batch).
+`prepare_distributed_train_dataset()` builds infinite `tf.data` datasets from cheap
+**index generators** followed by a parallel, deterministic `.map()` of **pure `tf.gather`
+ops** over zero-copy tensor views of the round memmaps (`_as_cpu_tensor`: dlpack export of
+the `mmap_mode="c"` arrays — no allocation, no copy, and gathers stream through the OS page
+cache exactly as before, but inside tf.data's C++ threadpool with no Python and no GIL in
+the hot path). This is the durable #276 fix: the historical single generator starved the
+GPUs on per-sample Python crossings, and the interim `tf.numpy_function` gather re-entered
+the interpreter from every map worker, so its benefit inverted whenever another Python
+thread (DB writer, producer relay) competed for the GIL — see the follow-up section of
+[`benchmarks/README.md`](../benchmarks/README.md) for the measured ladder.
+
+Each index-stream element is one **per-replica batch** (replica *r* of global batch *g* is
+element `g·R + r`), distributed via `strategy.distribute_datasets_from_function`, which
+hands consecutive elements to consecutive replicas — reproducing exactly the contiguous
+split `experimental_distribute_dataset` used to apply to whole global batches, while
+skipping the split op and prefetching each replica's batches straight to its GPU
+(`InputOptions(experimental_fetch_to_device=True)`), so host→device copies overlap compute.
+`deterministic=True` preserves the exact batch order of the index stream, so parallelism
+changes throughput only — epoch composition and ordering (and therefore the seeding
+contract below) are byte-identical to the previous implementations. Randomness lives at the
+epoch level (train indices reshuffled per pass); within a batch, indices are sorted for
+memmap read locality (the model is order-invariant within a batch).
 
 The train/val split is **stratified** over the four signal types (generation lays labels out
 contiguously per chunk, so a positional split would skew val), then trimmed to exact multiples
@@ -198,21 +207,87 @@ of `effective_batch_size` (train) and the global val batch size. With `shuffle=F
 ### Gradient accumulation
 
 Each training step accumulates `accumulation_steps = effective_batch_size /
-(per_replica_batch_size × num_replicas)` micro-batch gradients before applying
-(`_train_epoch()` → `_distributed_train_step()` → `_apply_gradients()`), giving an effective
-batch of 7680 at defaults (chosen so it divides evenly on 4-, 5-, or 6-GPU hosts) regardless of
-per-GPU memory. **Note:** 7680 is ~2.5× the previous 3072, so there are ~2.5× fewer optimizer
-updates per epoch; LR-schedule behavior calibrated to the old cadence may differ. On a fixed 4- or
-6-GPU host you can pass `--effective-batch-size 3072` to restore the old cadence (it stays valid
-there). Guards along the way: all-None
-gradient micro-batches are skipped, accumulated gradients are averaged over successful
-micro-steps, NaN/Inf gradients raise immediately, and the global gradient norm is clipped at
-1.0 with the pre-clip norm recorded per step (that's the `clipping_rate` statistic).
+(per_replica_batch_size × num_replicas)` micro-batch gradients before applying, giving an
+effective batch of 7680 at defaults (chosen so it divides evenly on 4-, 5-, or 6-GPU hosts)
+regardless of per-GPU memory. **Note:** 7680 is ~2.5× the previous 3072, so there are ~2.5×
+fewer optimizer updates per epoch; LR-schedule behavior calibrated to the old cadence may
+differ. On a fixed 4- or 6-GPU host you can pass `--effective-batch-size 3072` to restore the
+old cadence (it stays valid there).
+
+The whole optimizer step runs inside **one `tf.function`**
+(`_train_epoch()` → `_build_accumulated_train_step()`): the K micro-batches accumulate into
+per-replica `ON_READ` accumulator variables inside a `tf.range` loop (sequential graph loop —
+bounded activation memory, which is what keeps peak VRAM at ~8.4 GB/GPU instead of the
+~23 GB/GPU an unrolled K=12 loop measures, and what lets the 16 GB A4000 release host run it),
+then ONE cross-replica reduction per variable, an in-graph NaN/Inf guard (a bad step skips the
+apply so weights are never corrupted, then the Python caller raises exactly as before), a
+global-norm clip at 1.0 with the pre-clip norm recorded per step (the `clipping_rate`
+statistic), and one apply. The interpreter is re-entered once per optimizer step — the
+previous loop re-entered per micro-batch and additionally ran one `strategy.reduce` per
+variable per micro-batch plus per-variable eager NaN checks, which the #276 profiler traces
+showed dominated the host-side wall. Validation is likewise one traced graph call per epoch
+(`_build_val_loop`).
 
 The divisibility preconditions (`effective_batch_size % (per_replica × replicas) == 0`, sample
 counts divisible by batch sizes, etc.) are validated up front by
 `cli.py:collect_validation_errors` — see [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md) for the
 cross-replica constraint system and the fix proposer.
+
+### Performance engineering (the #276 follow-up, July 2026)
+
+The 2026-07 release-rehearsal runs showed the GPUs idle >90% of every epoch (profiler-verified;
+`nvidia-smi`'s sampled "utilization" reads higher — see `benchmarks/parse_xplane_occupancy.py`).
+Three successive host-side walls were identified and removed; the full measured evidence chain
+lives in the follow-up section of [`benchmarks/README.md`](../benchmarks/README.md), and every
+number below is from blpc3 (5× RTX PRO 6000, NGC 25.02).
+
+1. **Python in the gather** — first a single generator thread doing the memmap gathers, then
+   (post-#283) a `tf.numpy_function` gather whose map workers re-entered the interpreter and
+   convoyed on the GIL with the DB writer / producer-relay threads (+38% idle turned into
+   −11% under two competing Python threads). *Fix:* pure `tf.gather` over zero-copy dlpack
+   tensor views of the `mmap_mode="c"` round arrays; index generators yield one epoch table
+   per epoch, streamed by `.unbatch()`. Python touches the input path once per epoch.
+2. **Python in the training loop** — per micro-batch: one interpreter re-entry, one
+   `strategy.reduce` per variable (an all-reduce launch per variable per micro-batch), eager
+   gradient sums, and per-variable NaN checks that forced device syncs. *Fix:* the
+   accumulated-step graph described above (one re-entry and one reduction per variable per
+   optimizer step).
+3. **Per-epoch iterator lifecycle** — `iter(distributed_dataset)` costs ~9 s per call on a
+   5-GPU MirroredStrategy (measured; stable across calls, it is construction cost, not
+   tracing — trace counts were probed and stay flat), and the old loop paid it twice per
+   epoch (train + val) while also discarding whatever the pipeline had prefetched across the
+   boundary. *Fix:* iterators are created once per round in `train_round` and passed to every
+   epoch; the infinite datasets make epoch boundaries purely step-counted, so batch
+   composition is unchanged.
+
+Design decisions worth knowing before touching this code:
+
+- **`tf.range`, not an unrolled micro-batch loop.** Unrolling K=12 overlaps enough in-flight
+  activations to peak at 23–26 GB/GPU — it does not fit the 16 GB A4000 release host. The
+  `tf.while_loop` form peaks at ~8.4 GB and still pipelines (autograph's default
+  `parallel_iterations=10`), costing ~15% of the unrolled variant's throughput on Blackwell
+  and nothing on bla0, whose GPUs are the binding constraint either way.
+- **Zero-copy has an alignment gate.** TF CHECK-aborts (uncatchable SIGABRT, not an
+  exception) on CPU tensors whose buffers are under 64-byte aligned; `_as_cpu_tensor` only
+  dlpack-wraps 64-aligned writable arrays (`.npy` memmaps always qualify) and falls back to a
+  copying `tf.convert_to_tensor` otherwise.
+- **Avoid replica-context collective ops on blpc3.** `CollectiveReduceV2` (e.g. a
+  replica-context `all_reduce`, or tf_keras' own aggregation when `apply_gradients` runs in
+  replica context) aborts with an NCCL "unhandled cuda error" on the 5-GPU Blackwell host;
+  the pipeline keeps all cross-replica communication on the `strategy.reduce` /
+  cross-replica-apply path, which is proven there.
+- **Same-seed results are deterministic but not bit-compatible** with the pre-follow-up
+  implementation (gather backend and float summation order changed). The #49 contract —
+  same seed ⇒ same split, same per-epoch batch order, byte-identical reruns — is preserved
+  and pinned by `test_train_datasets.py` / `test_train_accumulation.py` /
+  `test_train_distribution.py` (the last one pins the cross-replica accumulator semantics at
+  2 CPU replicas, where a silent gradient mis-scale would otherwise hide).
+
+End-to-end effect (5 GPUs, accumulation 12): optimizer-step throughput 1,453 → 12,317 cad/s
+(8.5×), GPU occupancy 8.3% → 73.7%, the step loop is insensitive to the production DB
+writer at full flood (−0.3%), and real-run training epochs went 48.5 → 5.8 s quiet /
+56.5 → 10.9 s with generation overlapped (8.4× / 5.2×), validation 16.7 → 1.7 s. The full
+A/B and the measured ladder live in `benchmarks/README.md`.
 
 ### Adaptive learning rate
 
