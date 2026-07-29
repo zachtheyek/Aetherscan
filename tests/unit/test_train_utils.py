@@ -3,14 +3,15 @@
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
 schedules, directory archiving, encoder-trained heuristics, the val-AUC quality floor, SHAP
 output normalization, the rf_train dataset producer-await/fallback composition
-(_obtain_rf_dataset), and the training stage machine (skip-if-done / record-failure semantics
-against a stub pipeline)."""
+(_obtain_rf_dataset), the rf_plots overlap coordinator (plot_rf_diagnostics), and the training
+stage machine (skip-if-done / record-failure semantics against a stub pipeline)."""
 
 from __future__ import annotations
 
 import logging
 import math
 import os
+import threading
 import types
 
 import numpy as np
@@ -613,6 +614,121 @@ class TestCheckValAucFloor:
             "single-class" in r.message and "cannot be evaluated" in r.message
             for r in caplog.records
         )
+
+
+class TestPlotRfDiagnosticsOverlap:
+    """plot_rf_diagnostics overlaps the SHAP computation (background thread) with the five
+    non-SHAP plots: the SHAP plots run only after the thread joins, and a SHAP-compute failure
+    is recorded once per SHAP plot exactly as the sequential path would have recorded it."""
+
+    NON_SHAP = [
+        "plot_rf_confusion_matrices",
+        "plot_rf_classification_curves",
+        "plot_rf_calibration_curve",
+        "plot_rf_ensemble_accuracy_curve",
+        "plot_rf_latent_decision_boundary",
+    ]
+    SHAP = [
+        "plot_rf_shap_summary",
+        "plot_rf_shap_dependence",
+        "plot_rf_shap_interactions",
+        "plot_rf_shap_loss_monitoring",
+        "plot_rf_shap_explanation_clustering",
+    ]
+
+    @staticmethod
+    def _recorder(log, name):
+        def _record():
+            log.append(name)
+
+        return _record
+
+    def _pipeline(self, log, shap_compute=None, artifacts_error=None):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        for name in self.NON_SHAP + self.SHAP:
+            setattr(pipeline, name, self._recorder(log, name))
+
+        def _load_artifacts(tag=None):
+            if artifacts_error is not None:
+                raise artifacts_error
+            log.append("load_artifacts")
+            return {"tag": "test_v1"}
+
+        pipeline._load_rf_eval_artifacts = _load_artifacts
+        pipeline._compute_or_load_shap_values = shap_compute or (
+            lambda artifacts: log.append("shap_done")
+        )
+        return pipeline
+
+    def test_shap_plots_wait_for_background_compute(self):
+        # The stubbed SHAP compute refuses to finish until the last non-SHAP plot releases it,
+        # so "shap_done" preceding every SHAP plot in the log proves the join, and the non-SHAP
+        # names preceding "shap_done" prove they were not serialized behind the compute.
+        log = []
+        release = threading.Event()
+
+        def _shap_compute(artifacts):
+            assert release.wait(timeout=30), "non-SHAP plots never released the SHAP stub"
+            log.append("shap_done")
+
+        pipeline = self._pipeline(log, shap_compute=_shap_compute)
+
+        def _last_non_shap_plot():
+            log.append("plot_rf_latent_decision_boundary")
+            release.set()
+
+        pipeline.plot_rf_latent_decision_boundary = _last_non_shap_plot
+
+        pipeline.plot_rf_diagnostics()
+
+        assert log == ["load_artifacts", *self.NON_SHAP, "shap_done", *self.SHAP]
+
+    def test_shap_failure_records_every_shap_plot_and_spares_the_rest(self, caplog):
+        log = []
+
+        def _shap_compute(artifacts):
+            raise RuntimeError("SHAP exploded")
+
+        pipeline = self._pipeline(log, shap_compute=_shap_compute)
+        with (
+            caplog.at_level(logging.ERROR, logger="aetherscan.train"),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
+            pipeline.plot_rf_diagnostics()
+
+        # All five SHAP plot names failed, in order — the same bookkeeping the sequential path
+        # produces when each plot hits the same compute error — and each got the per-plot
+        # "Failed to execute" record; the non-SHAP successes are untouched.
+        assert str(excinfo.value) == "5 plot(s) failed: " + ", ".join(self.SHAP)
+        assert [entry for entry in log if entry in self.NON_SHAP] == self.NON_SHAP
+        assert not any(entry in self.SHAP for entry in log)  # never invoked without values
+        for name in self.SHAP:
+            assert any(
+                f"Failed to execute {name}: SHAP exploded" in r.message for r in caplog.records
+            )
+
+    def test_non_shap_failure_is_isolated(self):
+        log = []
+        pipeline = self._pipeline(log)
+
+        def _boom():
+            raise ValueError("bad plot")
+
+        pipeline.plot_rf_calibration_curve = _boom
+        with pytest.raises(RuntimeError) as excinfo:
+            pipeline.plot_rf_diagnostics()
+
+        assert str(excinfo.value) == "1 plot(s) failed: plot_rf_calibration_curve"
+        # The SHAP plots still ran, after the join.
+        assert log[-len(self.SHAP) :] == self.SHAP
+
+    def test_artifact_load_failure_falls_back_to_sequential_order(self):
+        # Preserves the pre-overlap path: every plot is still attempted individually, in the
+        # original interleaved order (in production each would re-raise the load error itself).
+        log = []
+        pipeline = self._pipeline(log, artifacts_error=FileNotFoundError("no artifacts"))
+        pipeline.plot_rf_diagnostics()
+        assert log == self.NON_SHAP[:2] + self.SHAP + self.NON_SHAP[2:]
 
 
 class _StageMachineStub:

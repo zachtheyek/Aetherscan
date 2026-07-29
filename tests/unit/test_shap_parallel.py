@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from sklearn.ensemble import RandomForestClassifier
 
-from aetherscan.shap_parallel import parallel_shap, select_positive_class_shap
+from aetherscan.shap_parallel import parallel_shap, select_positive_class_shap, shap_pool
 
 
 class TestSelectPositiveClassShap:
@@ -77,7 +77,9 @@ def small_rf(tmp_path_factory):
 
 @pytest.mark.parametrize("kind", ["summary", "interaction", "logloss"])
 def test_parallel_matches_single_process(small_rf, kind):
-    """The pooled result must equal the single-process result for every pass, in sample order."""
+    """The pooled result must equal the single-process result for every pass, in sample order.
+    24 samples across 4 workers now split into 16 chunks (~4 per worker), so this also pins the
+    multi-chunk-per-worker path against the serial computation."""
     pytest.importorskip("shap")  # the compute path needs shap in the workers
     rf_path, val_x, val_y, background = small_rf
     extra = {"background": background, "y": val_y} if kind == "logloss" else {}
@@ -87,6 +89,53 @@ def test_parallel_matches_single_process(small_rf, kind):
     assert serial.shape[0] == len(val_x)  # sample axis preserved
     # TreeSHAP is per-sample deterministic, so chunking yields a bitwise-identical result.
     np.testing.assert_array_equal(pooled, serial)
+
+
+def test_shared_pool_all_passes_match_single_process(small_rf):
+    """One shap_pool serving all three passes must reproduce each dedicated single-process
+    result bitwise — the shared pool and per-worker explainer cache cannot leak state between
+    pass kinds (a broken cache key would hand the log-loss pass the plain explainer, or vice
+    versa)."""
+    pytest.importorskip("shap")  # the compute path needs shap in the workers
+    rf_path, val_x, val_y, background = small_rf
+    serial = {
+        "summary": parallel_shap(rf_path, val_x, "summary", 1),
+        "interaction": parallel_shap(rf_path, val_x, "interaction", 1),
+        "logloss": parallel_shap(rf_path, val_x, "logloss", 1, background=background, y=val_y),
+    }
+    with shap_pool(rf_path, 4, background=background) as run_pass:
+        pooled = {
+            "summary": run_pass("summary", val_x),
+            "interaction": run_pass("interaction", val_x),
+            "logloss": run_pass("logloss", val_x, y=val_y),
+        }
+        # A summary pass AFTER the log-loss pass ran: the workers' "raw" cache slot must
+        # survive the log-loss explainer being built alongside it.
+        summary_again = run_pass("summary", val_x)
+    for kind, expected in serial.items():
+        np.testing.assert_array_equal(pooled[kind], expected)
+    np.testing.assert_array_equal(summary_again, serial["summary"])
+    # The two explainer families genuinely disagree at this scale, so the equalities above
+    # really do discriminate cross-contamination.
+    assert not np.array_equal(pooled["summary"], pooled["logloss"])
+
+
+def test_in_process_sessions_do_not_reuse_stale_explainers(small_rf, tmp_path):
+    """n_workers==1 sessions share this module's globals across calls; a second session against
+    a different RF must rebuild its explainer (not replay the first RF's values)."""
+    pytest.importorskip("shap")
+    rf_path, val_x, _, _ = small_rf
+    rng = np.random.default_rng(7)
+    other_x = rng.standard_normal((128, val_x.shape[1]))
+    other_y = (other_x[:, 1] > 0).astype(int)  # keyed on a different feature than small_rf
+    other = RandomForestClassifier(n_estimators=8, max_depth=4, random_state=7, n_jobs=1)
+    other.fit(other_x, other_y)
+    other_path = tmp_path / "other_rf.joblib"
+    joblib.dump(other, other_path)
+
+    first = parallel_shap(rf_path, val_x, "summary", 1)
+    second = parallel_shap(str(other_path), val_x, "summary", 1)
+    assert not np.array_equal(first, second)
 
 
 def test_more_workers_than_samples_is_safe(small_rf):

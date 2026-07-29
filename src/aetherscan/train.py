@@ -105,7 +105,7 @@ from aetherscan.seeding import (
     derive_seed,
     seed_tensorflow,
 )
-from aetherscan.shap_parallel import parallel_shap
+from aetherscan.shap_parallel import shap_pool
 
 logger = logging.getLogger(__name__)
 
@@ -3462,6 +3462,9 @@ class TrainingPipeline:
         Compute SHAP values for the trained RF (summary, interaction, log-loss decomposition)
         and cache to disk. Subsequent calls load the cache.
 
+        Runs on plot_rf_diagnostics' background thread while the non-SHAP plots render — keep
+        it compute + file IO + logging only (no DB writes, Slack uploads, or matplotlib).
+
         Returns a dict with keys:
             shap_values_summary ->
                 SHAP values for the positive class (true signal) on a sampled subset of val.
@@ -3529,32 +3532,31 @@ class TrainingPipeline:
         else:
             expected_value = float(ev)
 
-        shap_values_summary = parallel_shap(
-            rf_path, val_features[summary_indices], "summary", n_workers
-        )
-        shap_values_interaction = parallel_shap(
-            rf_path, val_features[interaction_indices], "interaction", n_workers
-        )
-
-        # Log-loss (interventional) decomposition: needs a background subset + per-sample y.
+        # Log-loss (interventional) decomposition needs a background subset + per-sample y. Drawn
+        # here — before any pass runs — so the shared pool can hand it to the workers at init; the
+        # rng draw order (summary, interaction, background) is unchanged, so the sampled indices
+        # are identical to the sequential-pools era.
         n_bg = min(1000, train_features.shape[0])
         bg_indices = rng.choice(train_features.shape[0], size=n_bg, replace=False)
         background = train_features[bg_indices]
-        try:
-            shap_values_logloss = parallel_shap(
-                rf_path,
-                val_features[summary_indices],
-                "logloss",
-                n_workers,
-                background=background,
-                y=val_binary_labels[summary_indices],
-            )
-        except Exception as e:
-            logger.warning(
-                f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
-                f"loss-monitoring plot will be empty"
-            )
-            shap_values_logloss = np.zeros_like(shap_values_summary)
+
+        # One pool serves all three passes: workers start, load the RF, and parse it into their
+        # explainers once per session instead of once per pass (see shap_parallel.shap_pool).
+        with shap_pool(rf_path, n_workers, background=background) as run_pass:
+            shap_values_summary = run_pass("summary", val_features[summary_indices])
+            shap_values_interaction = run_pass("interaction", val_features[interaction_indices])
+            try:
+                shap_values_logloss = run_pass(
+                    "logloss",
+                    val_features[summary_indices],
+                    y=val_binary_labels[summary_indices],
+                )
+            except Exception as e:
+                logger.warning(
+                    f"SHAP log-loss decomposition failed ({e}); falling back to zeros — "
+                    f"loss-monitoring plot will be empty"
+                )
+                shap_values_logloss = np.zeros_like(shap_values_summary)
 
         del background, bg_indices
 
@@ -7342,19 +7344,25 @@ class TrainingPipeline:
             logger.error(f"Failed to load models: {e}")
             raise  # Re-raise to propagate error
 
-    def _run_plot_group(self, plot_calls: list[tuple[Callable, str]]) -> None:
+    def _attempt_plots(self, plot_calls: list[tuple[Callable, str]], failures: list[str]) -> None:
         """
-        Run a group of plot methods, attempting every one even when some fail (a single
-        broken plot mustn't block the others), then raise a summary error listing the
-        failures so the stage machine can record the group as failed.
+        Run plot methods in order, attempting every one even when some fail (a single broken
+        plot mustn't block the others), appending each failing plot's name to ``failures``.
         """
-        failures = []
         for func, name in plot_calls:
             try:
                 func()
             except Exception as e:
                 logger.error(f"Failed to execute {name}: {e}")
                 failures.append(name)
+
+    def _run_plot_group(self, plot_calls: list[tuple[Callable, str]]) -> None:
+        """
+        Run a group of plot methods via _attempt_plots, then raise a summary error listing
+        the failures so the stage machine can record the group as failed.
+        """
+        failures: list[str] = []
+        self._attempt_plots(plot_calls, failures)
         if failures:
             raise RuntimeError(f"{len(failures)} plot(s) failed: {', '.join(failures)}")
 
@@ -7378,33 +7386,75 @@ class TrainingPipeline:
     def plot_rf_diagnostics(self) -> None:
         """
         The rf_plots stage: the ten Random Forest visualizations. All plots consume the
-        eval-artifact joblib persisted by train_random_forest() (the five SHAP plots
-        additionally share a SHAP-values joblib); every plot is attempted even when one
-        fails (e.g. an optional dep like SHAP missing), then a summary error is raised for
-        the stage machine to record. plot_rf_latent_decision_boundary relies on the
+        eval-artifact joblib persisted by train_random_forest(); the five SHAP plots
+        additionally share a SHAP-values joblib whose computation (parallel TreeSHAP, ~hours
+        at release scale) runs on a background thread while the five non-SHAP plots render
+        on the main thread — the thread mostly blocks on shap_parallel's worker pool (GIL
+        released), so main-thread matplotlib isn't starved and the overlap saves
+        ~min(SHAP time, non-SHAP plot time) of wall clock. Every plot is attempted even when
+        one fails (e.g. an optional dep like SHAP missing), then a summary error is raised
+        for the stage machine to record. plot_rf_latent_decision_boundary relies on the
         cadence-level UMAP joblibs written by plot_latent_space_gif (vae_plots stage), so
         stage ordering matters.
         """
-        self._run_plot_group(
-            [
-                (self.plot_rf_confusion_matrices, "plot_rf_confusion_matrices"),
-                (self.plot_rf_classification_curves, "plot_rf_classification_curves"),
-                (self.plot_rf_shap_summary, "plot_rf_shap_summary"),
-                (self.plot_rf_shap_dependence, "plot_rf_shap_dependence"),
-                (self.plot_rf_shap_interactions, "plot_rf_shap_interactions"),
-                (self.plot_rf_shap_loss_monitoring, "plot_rf_shap_loss_monitoring"),
-                (
-                    self.plot_rf_shap_explanation_clustering,
-                    "plot_rf_shap_explanation_clustering",
-                ),
-                (self.plot_rf_calibration_curve, "plot_rf_calibration_curve"),
-                (self.plot_rf_ensemble_accuracy_curve, "plot_rf_ensemble_accuracy_curve"),
-                (
-                    self.plot_rf_latent_decision_boundary,
-                    "plot_rf_latent_decision_boundary",
-                ),
-            ]
-        )
+        non_shap_plots = [
+            (self.plot_rf_confusion_matrices, "plot_rf_confusion_matrices"),
+            (self.plot_rf_classification_curves, "plot_rf_classification_curves"),
+            (self.plot_rf_calibration_curve, "plot_rf_calibration_curve"),
+            (self.plot_rf_ensemble_accuracy_curve, "plot_rf_ensemble_accuracy_curve"),
+            (self.plot_rf_latent_decision_boundary, "plot_rf_latent_decision_boundary"),
+        ]
+        shap_plots = [
+            (self.plot_rf_shap_summary, "plot_rf_shap_summary"),
+            (self.plot_rf_shap_dependence, "plot_rf_shap_dependence"),
+            (self.plot_rf_shap_interactions, "plot_rf_shap_interactions"),
+            (self.plot_rf_shap_loss_monitoring, "plot_rf_shap_loss_monitoring"),
+            (self.plot_rf_shap_explanation_clustering, "plot_rf_shap_explanation_clustering"),
+        ]
+
+        try:
+            # Load once on the main thread so the SHAP thread and the non-SHAP plots share the
+            # memoized dict read-only instead of racing the loader.
+            artifacts = self._load_rf_eval_artifacts()
+        except Exception as e:
+            # No artifacts, no overlap: run the sequential group in the pre-overlap order
+            # (confusion, classification, the five SHAP plots, calibration, ensemble,
+            # boundary) so every plot fails individually exactly as it always has.
+            logger.error(f"Failed to load RF eval artifacts: {e}")
+            self._run_plot_group(non_shap_plots[:2] + shap_plots + non_shap_plots[2:])
+            return
+
+        shap_errors: list[Exception] = []
+
+        def _shap_worker() -> None:
+            # _compute_or_load_shap_values is compute + file IO (worker pool, joblib cache)
+            # plus thread-safe logging — no DB, Slack, or matplotlib — so it is safe off the
+            # main thread; its exception is recorded per SHAP plot after the join.
+            try:
+                self._compute_or_load_shap_values(artifacts)
+            except Exception as e:
+                shap_errors.append(e)
+
+        failures: list[str] = []
+        shap_thread = threading.Thread(target=_shap_worker, name="rf-shap-compute")
+        shap_thread.start()
+        try:
+            self._attempt_plots(non_shap_plots, failures)
+        finally:
+            shap_thread.join()
+        if shap_errors:
+            # The shared computation failed, so every SHAP plot would have raised this same
+            # error — record each one exactly as _attempt_plots would have.
+            for _func, name in shap_plots:
+                logger.error(f"Failed to execute {name}: {shap_errors[0]}")
+                failures.append(name)
+        else:
+            # join() above is the happens-before edge: the SHAP plots read the populated
+            # _rf_shap_cache (a pure cache hit — no recompute) on the main thread, which is
+            # also where all matplotlib work stays.
+            self._attempt_plots(shap_plots, failures)
+        if failures:
+            raise RuntimeError(f"{len(failures)} plot(s) failed: {', '.join(failures)}")
 
     def final_save(self) -> None:
         """The final_save stage: persist the final models plus the resolved config JSON.
