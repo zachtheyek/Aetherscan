@@ -809,11 +809,14 @@ class TestRoundDataFlags:
 
     def test_disk_budget_error_when_insufficient(self, monkeypatch):
         config = get_config()
+        # Mirror the validator's dtype-aware estimate (round_array_dtype default is float16
+        # since 2026-07-29) — a fixed fp32 estimate would set the threshold 2x too high
         round_nbytes = cli._estimate_round_data_nbytes(
             config.training.num_samples_beta_vae,
             config.data.num_observations,
             config.data.time_bins,
             config.data.width_bin // config.data.downsample_factor,
+            bytes_per_element=2 if config.training.round_array_dtype == "float16" else 4,
         )
         # Between 1.1x and 2.2x one round: fails with overlap (default), passes without
         self._patch_free_bytes(monkeypatch, int(1.5 * round_nbytes))
@@ -833,6 +836,7 @@ class TestRoundDataFlags:
             config.data.num_observations,
             config.data.time_bins,
             config.data.width_bin // config.data.downsample_factor,
+            bytes_per_element=2 if config.training.round_array_dtype == "float16" else 4,
         )
         self._patch_free_bytes(monkeypatch, int(10 * round_nbytes))
         errors = collect_validation_errors(_parse(["train"]), None)
