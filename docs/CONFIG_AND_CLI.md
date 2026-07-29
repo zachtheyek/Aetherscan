@@ -105,12 +105,12 @@ Four config-only fields from the 2026-07 training-performance pass follow the sa
 pattern (no CLI flags): `gpu.gpu_thread_mode` (default `"gpu_private"`; also
 `"global"`/`"gpu_shared"`) and `gpu.gpu_thread_count` (default 2) set
 `TF_GPU_THREAD_MODE`/`TF_GPU_THREAD_COUNT` in `setup_gpu_strategy` before the GPU
-runtime initializes; `training.round_array_dtype` (default `"float32"`; `"float16"`
-halves the on-disk round footprint and gather volume) and `beta_vae.mixed_precision`
-(default `False`; `True` = keras `mixed_bfloat16` with fp32 islands) are **A/B-gated
-numerics levers — leave both at their defaults until the val-metric A/B documented in
-[`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md#performance-engineering-the-276-follow-up-july-2026)
-passes on the target host.** All four are emitted by `Config.to_dict()` and so are part
+runtime initializes; `training.round_array_dtype` (default `"float16"` since
+2026-07-29 — passed its val-metric A/B gate; `"float32"` restores the historical input
+numerics byte-for-byte) and `beta_vae.mixed_precision` (default `False` — failed its
+7-seed gate on a reproducible seed-13 pathology; do not enable without new evidence) are
+**A/B-gated numerics levers** — the gates and verdicts are documented in
+[`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md#performance-engineering-the-276-follow-up-july-2026). All four are emitted by `Config.to_dict()` and so are part
 of the persisted config snapshot.
 
 ## The CLI surface

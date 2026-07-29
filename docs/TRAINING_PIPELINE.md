@@ -93,8 +93,9 @@ and `injection_stats` and shows up as background shading on the training plots.
 ## Round data: memmaps + background producer
 
 A full-scale round is three arrays (`main`, `true`, `false`) of shape
-`(499200, 6, 16, 512)` — float32 at the `training.round_array_dtype` default ≈ 98 GB each,
-~294 GB per round (the A/B-gated `"float16"` setting halves all of that; see the
+`(499200, 6, 16, 512)` — ≈ 49 GB each at the `training.round_array_dtype` default of
+`"float16"` (~147 GB per round; the `"float32"` setting doubles that and restores the
+historical input numerics byte-for-byte; see the
 [performance-engineering section](#performance-engineering-the-276-follow-up-july-2026)).
 Holding that in RAM is what used to OOM-kill 503 GB training nodes; instead each round lives
 on disk under `{round_data_dir}/{save_tag}/round_{k:02d}/` (default root
@@ -366,11 +367,15 @@ fast, with the same byte-identity discipline:
 
 Two further levers landed **default-off behind an A/B gate**, because flipping either changes
 numerics. The gate is a val-metric A/B (3 seeds × 2 arms): val AUC within max(2σ, 0.002),
-losses and recalls within 2σ, the same active-dimension count, and zero NaN-guard trips.
-Until it passes on the target host, both flags stay at their defaults — which reproduce the
-pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off):
+losses and recalls within 2σ, active-dimension count within the controls' own seed
+variation (the raw count flips 6–8 across control seeds at scaled shape — judge the per-dim
+variance margins, not the count), and zero NaN-guard trips. The 2026-07 verdicts: **fp16
+PASSED** (4 seeds; default flipped) and **bf16 FAILED** (7 seeds; a reproducible seed-13
+pathology — see below). `"float32"` / `False` restore the historical numerics byte-for-byte:
 
-- **`training.round_array_dtype`** (`"float32"` default). `"float16"` halves the ~294.5 GB
+- **`training.round_array_dtype`** (**`"float16"` default since 2026-07-29** — passed the
+  gate: every fp16 seed's scores inside the 6-seed control spread, no calibration trips).
+  `"float16"` halves the ~294.5 GB
   round footprint to ~147 GB — and with it the gather volume and the page-cache working set,
   the lever that keeps overlapped epochs at page-cache speed once two rounds no longer fit in
   RAM at full scale. Quantization is ≤ 2⁻¹² on the [0, 1] log-normed inputs; the gather map's
@@ -378,7 +383,10 @@ pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off
   identically), so the training graph and loss math see float32 unchanged either way. Labels
   and lognorm sidecars stay float32; `.done` manifests record the dtypes and every
   reuse/resume path gates on them (legacy manifests read as float32).
-- **`beta_vae.mixed_precision`** (`False` default). `True` sets the keras `mixed_bfloat16`
+- **`beta_vae.mixed_precision`** (`False` default — **kept off after failing the 7-seed
+  gate**: six seeds clean, but bf16-seed-13 reproducibly degrades, recall .8432 / val AUC
+  .9807 vs the .9449 / .9925 control floor, and was the only configuration to trip the
+  ECE→calibrator gate — twice, across configs). `True` sets the keras `mixed_bfloat16`
   global policy before the model build, with fp32 islands pinned in `models/vae.py` — the
   z_mean/z_log_var heads, `Sampling`, and the decoder's sigmoid output — so everything
   reaching `compute_total_loss` stays fp32. bf16 needs no loss scaling; variables, Adam
