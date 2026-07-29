@@ -609,6 +609,19 @@ class TestSchemaMigration:
         "inference_results",
     )
 
+    # The complete expected index set per table — the v7 index sweep's final state. Both
+    # _init_database() (fresh dbs) and the `if version < 7` migration block (pre-v7 dbs)
+    # must land exactly here, so tests assert equality, not membership.
+    _EXPECTED_INDEXES = {
+        "system_resources": {"idx_system_resources_filter"},
+        "injection_stats": {"idx_injection_stats_filter", "idx_injection_stats_by_stat"},
+        "training_stats": {"idx_training_stats_filter"},
+        "latent_snapshots": {"idx_latent_snapshots_by_key"},
+        "inference_results": {"idx_inference_results_filter"},
+        "inference_cadences": {"idx_inference_cadences_filter"},
+        "pipeline_stages": {"idx_pipeline_stages_filter"},
+    }
+
     def _create_v0_db(self, config):
         """Lay down an old-schema (pre-superseded, user_version 0) db file with one row,
         at the exact path Database will open."""
@@ -649,6 +662,19 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
+    def _index_names(self, db_path, table):
+        conn = sqlite3.connect(db_path)
+        try:
+            return {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?",
+                    (table,),
+                )
+            }
+        finally:
+            conn.close()
+
     def test_old_schema_gains_superseded_column(self):
         db_path = self._create_v0_db(get_config())
         assert self._user_version(db_path) == 0
@@ -663,6 +689,20 @@ class TestSchemaMigration:
             rows = database.query_training_stat(tag="test_v1")
             assert len(rows) == 1
             assert rows[0]["superseded"] == 0
+        finally:
+            database.stop()
+
+    def test_old_schema_gains_training_stats_is_finite(self):
+        # v6 (#289): pre-v6 rows were all finite by construction (a non-finite value could
+        # never be written — it bound as NULL and blew the NOT NULL constraint), so the
+        # DEFAULT 1 backfill is exact and they stay visible under the only_finite default.
+        db_path = self._create_v0_db(get_config())
+        database = Database()
+        try:
+            assert "is_finite" in self._column_names(db_path, "training_stats")
+            rows = database.query_training_stat(tag="test_v1")
+            assert len(rows) == 1
+            assert rows[0]["is_finite"] == 1
         finally:
             database.stop()
 
@@ -741,6 +781,28 @@ class TestSchemaMigration:
         finally:
             database.stop()
 
+    def test_migration_reaches_final_index_set(self):
+        """A pre-v7 database — seeded with the retired (tag, timestamp, ...)
+        latent_snapshots index so the v7 DROP path is exercised, not just the CREATEs —
+        must come out of _init_database() with exactly the current index set on every
+        table, plus the version stamp."""
+        db_path = self._create_v0_db(get_config())
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE INDEX idx_latent_snapshots_filter ON latent_snapshots"
+            "(tag, timestamp, model_name, round_number, epoch_number, step_number)"
+        )
+        conn.commit()
+        conn.close()
+
+        database = Database()
+        try:
+            for table, expected in self._EXPECTED_INDEXES.items():
+                assert self._index_names(db_path, table) == expected, table
+            assert self._user_version(db_path) == _SCHEMA_VERSION
+        finally:
+            database.stop()
+
     def test_migration_is_idempotent_across_reopens(self):
         db_path = self._create_v0_db(get_config())
 
@@ -761,6 +823,10 @@ class TestSchemaMigration:
         for table in self._MIGRATED_TABLES:
             assert "superseded" in self._column_names(db.db_path, table)
         assert self._user_version(db.db_path) == _SCHEMA_VERSION
+        # The fresh-db index set must equal the migrated end state exactly (requirement of
+        # the v7 sweep: _init_database() and the migration block may never diverge)
+        for table, expected in self._EXPECTED_INDEXES.items():
+            assert self._index_names(db.db_path, table) == expected, table
 
 
 def _bulk_rows(n: int, round_number: int | None = 1, value: float = 1.0) -> list[dict]:
@@ -788,6 +854,57 @@ def _wait_backlog_empty(database, timeout: float = 15.0) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+class TestTrainingStatFiniteHandling:
+    """#289: NaN training stats used to bind as SQL NULL, blow the NOT NULL constraint, and
+    silently vanish the entire flush batch. They now store as 0.0 with is_finite=0, queries
+    filter them by default, and a batch failure falls back to per-row writes."""
+
+    def test_nan_and_none_values_stored_flagged_and_filtered(self, db):
+        db.write_training_stat("beta_vae", "good_stat", 1.5, tag="fin_v1")
+        db.write_training_stat("beta_vae", "nan_stat", float("nan"), tag="fin_v1")
+        db.write_training_stat("beta_vae", "none_stat", None, tag="fin_v1")
+        assert db.flush()
+        # Default query drops the non-finite rows...
+        rows = db.query_training_stat(tag="fin_v1", columns=["stat_name", "value"])
+        assert [r["stat_name"] for r in rows] == ["good_stat"]
+        # ...but they are recorded (0.0, is_finite=0), not lost — and the good row survived
+        # in the same batch (the pre-#289 behavior dropped all three).
+        all_rows = db.query_training_stat(
+            tag="fin_v1", only_finite=False, columns=["stat_name", "value", "is_finite"]
+        )
+        assert len(all_rows) == 3
+        flagged = {r["stat_name"]: (r["value"], r["is_finite"]) for r in all_rows}
+        assert flagged["nan_stat"] == (0.0, 0)
+        assert flagged["none_stat"] == (0.0, 0)
+        assert flagged["good_stat"] == (1.5, 1)
+
+    def test_flush_falls_back_to_per_row_on_poisoned_batch(self, db):
+        # Smuggle a raw record violating NOT NULL (stat_name=None) around the sanitized
+        # write path, alongside a good row: the batch insert fails, the fallback lands the
+        # good row and drops exactly the bad one.
+        now = time.time()
+        good = ("training_stats", (now, "m", "ok_stat", 2.0, 1, 1, "fallback_v1", None, 1))
+        bad = ("training_stats", (now, "m", None, 3.0, 1, 1, "fallback_v1", None, 1))
+        db._flush_buffer(buffer=[bad, good])
+        rows = db.query_training_stat(tag="fallback_v1", columns=["stat_name", "value"])
+        assert [(r["stat_name"], r["value"]) for r in rows] == [("ok_stat", 2.0)]
+
+    def test_fallback_does_not_duplicate_rows_before_a_mid_batch_poison(self, db):
+        # The poisoned row sits MID-batch: executemany steps good rows into the open
+        # transaction before failing, and without the SAVEPOINT rollback the per-row retry
+        # would re-insert them (duplicates). Exactly one copy of each good row must land.
+        now = time.time()
+        good1 = ("training_stats", (now, "m", "first_stat", 1.0, 1, 1, "fallback_v2", None, 1))
+        bad = ("training_stats", (now, "m", None, 3.0, 1, 1, "fallback_v2", None, 1))
+        good2 = ("training_stats", (now, "m", "second_stat", 2.0, 1, 1, "fallback_v2", None, 1))
+        db._flush_buffer(buffer=[good1, bad, good2])
+        rows = db.query_training_stat(tag="fallback_v2", columns=["stat_name", "value"])
+        assert sorted((r["stat_name"], r["value"]) for r in rows) == [
+            ("first_stat", 1.0),
+            ("second_stat", 2.0),
+        ]
 
 
 class TestInjectionStatTimeSpan:

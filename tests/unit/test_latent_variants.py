@@ -20,6 +20,7 @@ from aetherscan.latent_variants import (
     sample_z_flat,
     select_winner,
     variant_feature_count,
+    variant_feature_names,
 )
 
 _NUM_OBS = 6
@@ -209,3 +210,29 @@ class TestCalibrator:
         labels = np.array([0, 1, 0, 1])
         probas = np.array([0.1, 0.2, 0.8, 0.9])
         assert expected_calibration_error(labels, probas, n_bins=2) == pytest.approx(0.35)
+
+
+class TestVariantFeatureNames:
+    """variant_feature_names must stay column-for-column in lockstep with
+    build_variant_features — a length mismatch is an IndexError inside shap's plots
+    (how the hardcoded 48-name list broke on a 54-feature z_mean_obs_logvar winner)."""
+
+    @pytest.mark.parametrize("variant", VARIANT_ORDER)
+    @pytest.mark.parametrize("active_dims", [[], [1, 3], [0, 1, 2, 3, 4, 5, 6, 7]])
+    def test_names_match_feature_columns(self, variant, active_dims):
+        num_obs, latent_dim, n = 6, 8, 4
+        rng = np.random.default_rng(11)
+        lead = rng.normal(size=(n, num_obs * latent_dim)).astype(np.float32)
+        logvar = rng.normal(size=(n, num_obs * latent_dim)).astype(np.float32)
+        features = build_variant_features(
+            variant, lead, logvar, num_obs, latent_dim, active_dims=active_dims
+        )
+        names = variant_feature_names(variant, num_obs, latent_dim, active_dims=active_dims)
+        assert len(names) == features.shape[1]
+        assert len(set(names)) == len(names)  # no duplicate column names
+
+    def test_lead_block_matches_historical_convention(self):
+        names = variant_feature_names("z_mean", 6, 8)
+        assert names[0] == "ON-1_dim-0"
+        assert names[8] == "OFF-1_dim-0"
+        assert names[-1] == "OFF-3_dim-7"

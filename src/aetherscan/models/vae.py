@@ -66,7 +66,9 @@ class BetaVAE(keras.Model):
     Beta-VAE knob trading reconstruction quality for latent disentanglement).
     """
 
-    def __init__(self, encoder, decoder, alpha=10.0, beta=1.5, **kwargs):
+    def __init__(
+        self, encoder, decoder, alpha=10.0, beta=1.5, regularization_active=False, **kwargs
+    ):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
@@ -74,6 +76,14 @@ class BetaVAE(keras.Model):
         # Hyperparameters
         self.alpha = alpha
         self.beta = beta
+        # Whether the layer-declared L1/L2 penalties are ADDED to the objective. Default
+        # False (v1 decision, 2026-07-29): activating them at the declared, never-calibrated
+        # coefficients measurably degraded the model in a 5-seed A/B — recall@0.01FPR
+        # median .984 -> .954 with one seed at .72, and 1-4 latent dims per seed pushed
+        # below the active-units threshold (one seed lost 4/8). reg_loss is still computed
+        # and recorded for observability either way; coefficient calibration is tracked as
+        # a follow-up issue.
+        self.regularization_active = regularization_active
 
     def call(self, inputs, training=None):
         """
@@ -112,7 +122,15 @@ class BetaVAE(keras.Model):
         stability when latents collide) — minimizing this term pushes ON/OFF pairs apart."""
         return tf.reduce_mean(1.0 / (tf.reduce_sum(tf.square(a - b), axis=1) + 1e-8))
 
-    @tf.function
+    # Deliberately NOT @tf.function (removed with the L1/L2 activation): this runs only
+    # inside compute_total_loss's graph, and giving it its own FuncGraph strands the
+    # encoder's activity-regularizer loss tensors out of scope of the reg_loss add_n —
+    # InaccessibleTensorError, found by the first regularized run. Inlining into the outer
+    # trace keeps every penalty same-graph; standalone (eager) calls just run eagerly.
+    # ⚠ REPRODUCIBILITY: this inlining changed float summation order — same-seed results
+    # from builds before/after it differ slightly. Determinism WITHIN a build (same seed ⇒
+    # byte-identical reruns) is preserved and pinned by the train dataset/accumulation
+    # tests; cross-build comparisons must be distribution-level, never same-seed pairing.
     def compute_clustering_loss_true(self, true_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for true-class (ETI-bearing) cadences: sum loss_same across all
@@ -169,7 +187,8 @@ class BetaVAE(keras.Model):
         similarity = same + difference
         return similarity
 
-    @tf.function
+    # Deliberately NOT @tf.function — same FuncGraph-stranding rationale as
+    # compute_clustering_loss_true above.
     def compute_clustering_loss_false(self, false_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for false-class (RFI / noise-only) cadences: sum loss_same across all 15
@@ -230,11 +249,20 @@ class BetaVAE(keras.Model):
         """
         Forward-pass main_data through the VAE and return a dict with reconstruction, KL, and
         per-class clustering losses plus their weighted sum:
-            total = reconstruction + beta * kl + alpha * (true_loss + false_loss)
+            total = reconstruction + beta * kl + alpha * (true_loss + false_loss) + reg
 
         Reconstruction uses binary cross-entropy on the [0, 1]-bounded decoder output (sigmoid).
         true_data and false_data are separate cadences fed through the clustering-loss heads —
         they don't share gradients with reconstruction.
+
+        `reg` is the sum of the layer-declared regularization penalties (activated 2026-07 by
+        maintainer decision — the L1/L2 declarations existed since inception but a custom
+        training loop only applies them if it adds model.losses to the objective, so every
+        model trained before this change was effectively unregularized). Stock keras
+        semantics: kernel/bias L2 penalties appear once each; activity-L1 penalties accrue
+        once per regularized-layer forward performed inside this function (the reconstruction
+        pass AND both clustering branches), and keras batch-SUM-scales them, so the effective
+        activity coefficient scales with the per-replica batch size (128 at defaults).
         """
         # Perform forward pass through Beta-VAE
         reconstruction, z_mean, z_log_var, z = self.call(main_data, training=training)
@@ -265,10 +293,25 @@ class BetaVAE(keras.Model):
         false_loss = self.compute_clustering_loss_false(false_data)
         true_loss = self.compute_clustering_loss_true(true_data)
 
-        # Compute total loss
+        # Layer-declared regularization penalties (see docstring). Always COMPUTED and
+        # returned for observability (keras materializes the activity penalties in the
+        # forward pass regardless, so this is one add_n), but only ADDED to the objective
+        # when regularization_active — the v1 default is False (see __init__: activation at
+        # the declared coefficients measured harmful). Cast fp32 so the sum is exact under
+        # mixed_bfloat16 (activity penalties ride bf16 activations); the islands keep the
+        # rest of the loss math fp32 already.
+        if self.losses:
+            reg_loss = tf.add_n([tf.cast(loss, tf.float32) for loss in self.losses])
+        else:
+            reg_loss = tf.constant(0.0, dtype=tf.float32)
+
+        # Compute total loss (reg only when active — inactive keeps the objective
+        # byte-identical to the pre-activation pipeline)
         total_loss = (
             reconstruction_loss + self.beta * kl_loss + self.alpha * (true_loss + false_loss)
         )
+        if self.regularization_active:
+            total_loss = total_loss + reg_loss
 
         return {
             "total_loss": total_loss,
@@ -277,6 +320,7 @@ class BetaVAE(keras.Model):
             "kl_per_dim": kl_per_dim,
             "true_loss": true_loss,
             "false_loss": false_loss,
+            "reg_loss": reg_loss,
         }
 
 
@@ -787,6 +831,7 @@ def create_beta_vae_model():
         decoder,
         alpha=config.beta_vae.alpha,
         beta=config.beta_vae.beta,
+        regularization_active=config.beta_vae.regularization_active,
     )
 
     beta_vae.compile(

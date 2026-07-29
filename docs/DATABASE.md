@@ -14,7 +14,7 @@ high-volume injection-stat chunks (#277) — drained by **one background writer 
 batches rows and commits with `executemany()`; reads open short-lived connections directly.
 Failed-attempt rows are never deleted — they're flagged `superseded = 1`, and every query
 filters them out by default. Schema evolution is a minimal `PRAGMA user_version` gate
-(currently version 5).
+(currently version 7).
 
 > [!IMPORTANT]
 > The write queue is a **thread** queue, not process-safe. Worker *processes* must never call
@@ -36,9 +36,11 @@ records into a buffer and flushes when either the buffer reaches
 100 rows was one driver of the ~590 rows/s writer that let multi-hour backlogs build) or
 `db.write_interval` (5 s) elapses. A flush
 (`_flush_buffer`) groups the buffer by table and bulk-inserts each group with a single
-`executemany()` per table — SQL parsed once, one commit per flush; the batch is
-all-or-nothing (errors are logged and the loop continues; a failed write never kills the
-thread). Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
+`executemany()` per table — SQL parsed once, one commit per flush. A failed batch falls
+back to per-row inserts (`_executemany_resilient`, #289): only the unbindable row(s) are
+dropped, with an exact count logged — before v6 a single bad row (a NaN stat binding as
+SQL NULL against a NOT NULL column) silently discarded every row in the flush. Errors are
+logged and the loop continues; a failed write never kills the thread. Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
 per-commit WAL fsync (the WAL is still synced at checkpoints) — a crash can lose the newest
 commits but never corrupts the database, ample durability for diagnostic telemetry and the
 removal of the dominant per-transaction fsync stall.
@@ -169,7 +171,16 @@ class-segment, on the bounded bulk lane).
 | `slope_clamped` | INTEGER | 1 when the injection's drift slope hit the near-zero clamp |
 | `superseded` | INTEGER | Default 0 |
 
-Index: `(tag, timestamp, stat_name, signal_type, injection_stage)`.
+Indexes: `(tag, timestamp, stat_name, signal_type, injection_stage)`
+(`idx_injection_stats_filter`) plus, since v7, the stat-scoped secondary
+`(tag, stat_name, signal_type, injection_stage, timestamp)`
+(`idx_injection_stats_by_stat`) — shaped for the end-of-run plot queries, whose equality
+filters with run-wide timestamp bounds the first index can only answer by scanning the tag's
+whole timestamp range. The trailing column is deliberately `timestamp`: that shape is chosen
+by SQLite's default cost model with no `ANALYZE` stats (a `round_number`-trailing variant
+measured as never chosen without `sqlite_stat1`), and it serves the round-scoped per-round
+queries too via their span-tightened timestamp windows. No query changes: the planner picks
+the better index per query.
 
 ### `training_stats`
 
@@ -192,8 +203,15 @@ reused-tag stale scalars are absorbed.
 | `stat_name`, `value` | TEXT, REAL | |
 | `round_number`, `epoch_number` | INTEGER | 1-based |
 | `superseded` | INTEGER | Default 0 |
+| `is_finite` | INTEGER | 0 when the value was NaN/Inf/None at write time (stored as 0.0; v6, #289). `query_training_stat`'s `only_finite` default drops these — sqlite binds NaN as SQL NULL, and before v6 the resulting NOT NULL violation silently discarded the *entire* flush batch |
 
-Index: `(tag, timestamp, model_name, stat_name)`.
+Index: `(tag, timestamp, model_name, stat_name)` (`idx_training_stats_filter`).
+Deliberately kept through the v7 index sweep: an equality-first reshape
+(`tag, model_name, stat_name, timestamp`) was benchmarked and rejected — it regressed the
+dominant run-window loss-curve fetch 1.8× (stat-sorted index order scatters the table-row
+lookups timestamp order visits sequentially) and cost ~20% insert throughput, to speed only
+the minor single-stat shape on tag partitions that stay ~58 k rows
+(`benchmarks/bench_db_index_shapes.py`).
 
 ### `latent_snapshots`
 
@@ -209,7 +227,17 @@ steps — the raw material of the latent-space GIFs.
 | `snr_base`, `snr_range` | INTEGER | Curriculum stage at capture time |
 | `superseded` | INTEGER | Default 0 |
 
-Index: `(tag, timestamp, model_name, round_number, epoch_number, step_number)`.
+Index: `(tag, round_number, epoch_number, step_number, model_name, timestamp)`
+(`idx_latent_snapshots_by_key`, reshaped in v7 from the original
+`(tag, timestamp, model_name, round_number, epoch_number, step_number)`). The GIF pass
+loads one capture per frame — up to `latent_viz_gif_max_frames` (500) queries with equality
+on the capture key and the run window trailing — and the old timestamp-second shape
+answered each by scanning the tag's whole window (measured 67× slower per frame at 2 M
+rows; ~1.5 h → ~2 s per GIF pass at the ~100 M-row release scale). Key columns lead so the
+dashboard's model-less latest-capture lookup walks the index backward instead of sorting
+the partition; write cost is unchanged because `round/epoch/step` grow monotonically like
+`timestamp`, so both shapes append at the B-tree's right edge
+(`benchmarks/bench_db_index_shapes.py`).
 
 ### `inference_results`
 
@@ -272,7 +300,7 @@ attempt, each with its own span.
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 5`). The stamp maps to schema features as:
+(`_SCHEMA_VERSION = 7`). The stamp maps to schema features as:
 
 | `user_version` | What it added | Migration work |
 | --- | --- | --- |
@@ -282,6 +310,8 @@ attempt, each with its own span.
 | v3 | `config_fingerprint TEXT` on `inference_cadences` | additive `ALTER TABLE ... ADD COLUMN` |
 | v4 | the `pipeline_stages` stage-timing table | none (whole-table `CREATE TABLE IF NOT EXISTS`) |
 | v5 | `screening_proba` / `mc_mean` / `mc_std` on `inference_results` (#282 two-pass inference) | additive `ALTER TABLE ... ADD COLUMN` |
+| v6 | `is_finite INTEGER DEFAULT 1` on `training_stats` (#289 NaN-write hardening) | additive `ALTER TABLE ... ADD COLUMN` |
+| v7 | the index sweep: the `idx_injection_stats_by_stat` secondary index on `injection_stats`; `latent_snapshots`' index reshaped to `idx_latent_snapshots_by_key` | `DROP INDEX IF EXISTS idx_latent_snapshots_filter` in the migration block; the CREATEs run in `_init_database()` and are re-executed there |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -299,6 +329,32 @@ attempt, each with its own span.
 - **v4 → v5** (`inference_results.{screening_proba,mc_mean,mc_std}`): additive
   `ALTER TABLE ... ADD COLUMN ... REAL` per column, idempotent via the same
   `PRAGMA table_info` existence check.
+- **v5 → v6** (`training_stats.is_finite`, #289): additive
+  `ALTER TABLE training_stats ADD COLUMN is_finite INTEGER DEFAULT 1`, same idempotence
+  check. The `DEFAULT 1` backfill is exact, not approximate: a non-finite value could never
+  have been written before v6 (it bound as NULL and the NOT NULL constraint rejected the
+  whole batch), so every pre-v6 row is finite by construction.
+- **v6 → v7** (the index sweep — every table's indexes audited against the production
+  query shapes; per-table cost/benefit in `benchmarks/bench_injection_index.py` and
+  `benchmarks/bench_db_index_shapes.py`):
+  - `injection_stats` gains the secondary `idx_injection_stats_by_stat`: the end-of-run
+    `plot_injection_stats` pass issues ~165 queries whose equality filters
+    (tag/stat_name/signal_type/injection_stage) ride run-wide timestamp bounds, so
+    `idx_injection_stats_filter` scanned the whole tag partition per query (~6 h projected
+    at release scale).
+  - `latent_snapshots`' index is reshaped to `idx_latent_snapshots_by_key`
+    (`tag, round_number, epoch_number, step_number, model_name, timestamp`): the GIF pass's
+    up-to-500 per-frame capture fetches each scanned the tag's whole window under the old
+    timestamp-second shape (~1.5 h → ~2 s per pass at release scale, at no measurable
+    write cost). The old `idx_latent_snapshots_filter` is dropped
+    (`DROP INDEX IF EXISTS`) — the only shape it served better was already run-window ≈
+    whole-partition.
+  - Everything else was audited and deliberately kept — notably a `training_stats` reshape
+    was benchmarked and rejected (see [that table's index note](#training_stats)).
+
+  Like v2/v4, `_init_database()` does the CREATE work — `CREATE INDEX IF NOT EXISTS` runs
+  for old and new databases alike before migration; the `if version < 7` block re-executes
+  the (themselves idempotent) statements, performs the DROP, and advances the stamp.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped.
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a

@@ -104,8 +104,23 @@ class BetaVAEConfig:
     # variables/optimizer state stay fp32 under keras mixed precision, and the numerically
     # sensitive layers (z_mean/z_log_var/Sampling, decoder sigmoid output → loss math) are
     # pinned fp32 in models/vae.py. Default False = fp32 end-to-end, byte-identical to before
-    # this flag existed (no policy call is made at all).
+    # this flag existed (no policy call is made at all). STAYS OFF after the 7-seed A/B:
+    # 6 seeds clean, but seed 13 reproducibly fails (recall .8432 / val AUC .9807, far below
+    # the 6-seed control envelope, and the only runs to trip the ECE->calibrator gate were
+    # bf16-seed-13, twice, across configs) — a bf16-specific trajectory pathology the gate
+    # exists to catch. Revisit only with that pathology understood (+1.15x step throughput
+    # and ~halved activation VRAM are the upside on the table).
     mixed_precision: bool = False
+    # Whether the conv layers' declared L1/L2 penalties are ADDED to the training objective.
+    # v1 default False: the declarations were dead code since inception (a custom loop only
+    # applies them by consuming model.losses, which nothing did), and activating them at the
+    # declared, never-calibrated coefficients measurably degraded the model in a 5-seed A/B
+    # (recall@0.01FPR median .984 -> .954, worst seed .72; 1-4 latent dims per seed pushed
+    # below the active-units threshold). reg_loss is computed and recorded regardless, so
+    # every run observes what the penalties WOULD be; coefficient calibration is a tracked
+    # follow-up issue. Flipping this changes training numerics — A/B-gate like the other
+    # numerics flags.
+    regularization_active: bool = False
 
 
 @dataclass
@@ -316,11 +331,14 @@ class TrainingConfig:
     # round footprint (~294.5 -> ~147 GB at full scale), the gather volume, and the page-cache
     # working set — the lever that keeps overlapped epochs at page-cache speed once two rounds
     # no longer fit in RAM — at a quantization cost of <= 2^-12 on the [0, 1] log-normalized
-    # inputs. A/B-GATED: changes input numerics; keep "float32" until the val-metric A/B on the
-    # target host shows parity. The gather map upcasts to float32 host-side, so the training
-    # graph and loss math are unchanged either way; labels + lognorm sidecars stay float32.
-    # Recorded in each round's .done manifest and validated on resume/reuse.
-    round_array_dtype: str = "float32"
+    # inputs. DEFAULT FLIPPED to "float16" 2026-07-29 after passing the val-metric A/B gate:
+    # 4 seeds, every score metric inside the 6-seed control spread (val AUC >= .9979, recalls
+    # .9619-.9907 vs control .9449-.9907), AU within the controls' own 6-8 seed variation, no
+    # calibration trips. The gather map upcasts to float32 host-side, so the training graph
+    # and loss math are unchanged either way; labels + lognorm sidecars stay float32.
+    # Recorded in each round's .done manifest and validated on resume/reuse ("float32"
+    # restores the historical behavior byte-for-byte).
+    round_array_dtype: str = "float16"
 
     # Round data pipeline params (disk-backed per-round datasets, see round_data.py)
     round_data_dir: str | None = None  # Defaults to get_training_file_path("round_data") at runtime
@@ -364,9 +382,10 @@ class TrainingConfig:
         # whereas larger values yield better global structure
         # - 5: fine-grained local structure
         # - 15: UMAP default, good baseline
-        # - 30: balanced local/global
         # - 50: global topology emphasis
-        default_factory=lambda: [5, 15, 30, 50]
+        # (30 was dropped from the default sweep 2026-07: it sat between 15 and 50 without
+        # adding a distinct view, and each nn value costs 3 min_dist x 2 level combos)
+        default_factory=lambda: [5, 15, 50]
     )
     latent_viz_umap_min_dist: list[float] = field(
         # UMAP min_dist values to sweep
@@ -752,6 +771,7 @@ class Config:
                 "beta": self.beta_vae.beta,
                 "alpha": self.beta_vae.alpha,
                 "mixed_precision": self.beta_vae.mixed_precision,
+                "regularization_active": self.beta_vae.regularization_active,
             },
             "reproducibility": {
                 "seed": self.reproducibility.seed,

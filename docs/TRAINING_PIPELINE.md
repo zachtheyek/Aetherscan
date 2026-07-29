@@ -41,14 +41,19 @@ fresh datetime tag and starts a new run).
 
 1. **Obtain data** — reuse a validated on-disk round dataset if one exists, else wait on the
    background producer (or generate in-process when overlap is disabled).
-2. **Queue the next round** — generation of round *k+1* is requested immediately, so it runs
-   in the producer process while round *k* trains.
+2. **Queue the producer's next job** — generation of round *k+1* is requested immediately, so
+   it runs in the producer process while round *k* trains. The **last** round instead queues
+   the **RF dataset** (`num_samples_rf` samples at `snr_base` + the wide `initial_snr_range`,
+   into `round_data/{tag}/rf/`), so `rf_train` finds it ready instead of generating it with
+   the GPUs idle. The request carries the same `num_training_rounds + 1` sentinel
+   `round_num` as the in-process path, so per-task seeds derive identically and the arrays
+   are byte-identical to what `rf_train`'s fallback would generate.
 3. **Build datasets** — `prepare_distributed_train_dataset()` over the round's memmaps
    (stratified 80/20 train/val split on the labels array).
 4. **Prepare the latent-viz batch** (first round only) — 960 held-out val cadences per signal
    type, persisted across rounds so latent-space snapshots aren't confounded by curriculum
    distribution shift.
-5. **Epoch loop** — `_train_epoch()` + `_validate_epoch()`, ~21 `training_stats` rows per
+5. **Epoch loop** — `_train_epoch()` + `_validate_epoch()`, ~23 `training_stats` rows per
    epoch (losses, gradient norms, LR, durations, SNR range) plus `latent_dim` per-dimension
    KL rows (`kl_dim_NN`), adaptive LR update. At round end `check_posterior_collapse()`
    WARNs loudly (never fails) when latent dims are going dark — see
@@ -88,8 +93,9 @@ and `injection_stats` and shows up as background shading on the training plots.
 ## Round data: memmaps + background producer
 
 A full-scale round is three arrays (`main`, `true`, `false`) of shape
-`(499200, 6, 16, 512)` — float32 at the `training.round_array_dtype` default ≈ 98 GB each,
-~294 GB per round (the A/B-gated `"float16"` setting halves all of that; see the
+`(499200, 6, 16, 512)` — ≈ 49 GB each at the `training.round_array_dtype` default of
+`"float16"` (~147 GB per round; the `"float32"` setting doubles that and restores the
+historical input numerics byte-for-byte; see the
 [performance-engineering section](#performance-engineering-the-276-follow-up-july-2026)).
 Holding that in RAM is what used to OOM-kill 503 GB training nodes; instead each round lives
 on disk under `{round_data_dir}/{save_tag}/round_{k:02d}/` (default root
@@ -128,7 +134,9 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
   (~590 GB peak). `cli.py:collect_validation_errors` checks free space at startup
   (`_estimate_round_data_nbytes`: 2.2× one round with overlap, 1.1× without) and hard-fails
   with the computed numbers. Round *k*'s directory is deleted as soon as round *k* finishes
-  training (`--keep-round-data` retains it for debugging).
+  training (`--keep-round-data` retains it for debugging). During the last round the RF
+  dataset (`num_samples_rf` = ⅕ of a round at defaults) is pre-generated alongside that
+  round's data — well under the two-round peak the preflight budgets for.
 
 > [!TIP]
 > **For official tagged training releases, pass `--keep-round-data`.** By default each round's
@@ -141,17 +149,28 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
 
 ### The producer process
 
-`RoundDataProducer` generates round *k+1* while round *k* trains, and isolates generation from
-the trainer's GIL (TF's prefetch/callback threads used to make round-2+ generation far slower
-than round 1's):
+`RoundDataProducer` generates round *k+1* while round *k* trains (and pre-generates the RF
+dataset while the last round trains), and isolates generation from the trainer's GIL (TF's
+prefetch/callback threads used to make round-2+ generation far slower than round 1's):
 
 - A **spawn**-started `multiprocessing.Process` (never fork — the TF/NCCL/CUDA-laden parent
   holds locks a forked child can inherit mid-acquisition and deadlock on). The producer owns
   a private fork-started worker pool whose workers attach to the background-plate shared
   memory created by the main process.
 - Protocol over two spawn-context queues: main sends `("generate", round_idx, snr_base,
-  snr_range)` / `("shutdown",)`; the producer streams back `stats` (per class-segment
-  injection statistics), `progress`, and terminal `done`/`error` messages.
+  snr_range[, overrides])` / `("shutdown",)`; the producer streams back `stats` (per
+  class-segment injection statistics), `progress`, and terminal `done`/`error` messages.
+  The optional `overrides` dict serves the RF request: `dir_name` targets `rf/` instead of
+  `round_XX/`, `n_samples` swaps in `num_samples_rf`, and the request's `round_idx` is the
+  seed-identity `round_num` (`num_training_rounds + 1`) rather than a directory index.
+- **Lifecycle.** The producer normally winds down when the round loop exits — except after a
+  successful last round, where it still owes the pre-generated RF dataset: it then stays
+  alive (idle or finishing that generation, including across `vae_plots`) until
+  `train_random_forest` awaits the result and shuts it down. On a producer error — or with
+  no producer at all (overlap disabled, or a resumed run entering `rf_train` directly) —
+  `rf_train` falls back to the unchanged in-process generation path; every failure/skip path
+  (round-loop crash, RF-stage skips, pipeline teardown) still shuts the producer down
+  exactly once.
 - **DB writes stay in the main process**: a drainer thread consumes the `stats` messages and
   calls `data_generation.write_segment_stats()` — the DB writer queue is a thread
   `queue.Queue`, not process-safe. The drainer runs while the GPUs compute, so injection-stat
@@ -348,11 +367,15 @@ fast, with the same byte-identity discipline:
 
 Two further levers landed **default-off behind an A/B gate**, because flipping either changes
 numerics. The gate is a val-metric A/B (3 seeds × 2 arms): val AUC within max(2σ, 0.002),
-losses and recalls within 2σ, the same active-dimension count, and zero NaN-guard trips.
-Until it passes on the target host, both flags stay at their defaults — which reproduce the
-pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off):
+losses and recalls within 2σ, active-dimension count within the controls' own seed
+variation (the raw count flips 6–8 across control seeds at scaled shape — judge the per-dim
+variance margins, not the count), and zero NaN-guard trips. The 2026-07 verdicts: **fp16
+PASSED** (4 seeds; default flipped) and **bf16 FAILED** (7 seeds; a reproducible seed-13
+pathology — see below). `"float32"` / `False` restore the historical numerics byte-for-byte:
 
-- **`training.round_array_dtype`** (`"float32"` default). `"float16"` halves the ~294.5 GB
+- **`training.round_array_dtype`** (**`"float16"` default since 2026-07-29** — passed the
+  gate: every fp16 seed's scores inside the 6-seed control spread, no calibration trips).
+  `"float16"` halves the ~294.5 GB
   round footprint to ~147 GB — and with it the gather volume and the page-cache working set,
   the lever that keeps overlapped epochs at page-cache speed once two rounds no longer fit in
   RAM at full scale. Quantization is ≤ 2⁻¹² on the [0, 1] log-normed inputs; the gather map's
@@ -360,7 +383,10 @@ pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off
   identically), so the training graph and loss math see float32 unchanged either way. Labels
   and lognorm sidecars stay float32; `.done` manifests record the dtypes and every
   reuse/resume path gates on them (legacy manifests read as float32).
-- **`beta_vae.mixed_precision`** (`False` default). `True` sets the keras `mixed_bfloat16`
+- **`beta_vae.mixed_precision`** (`False` default — **kept off after failing the 7-seed
+  gate**: six seeds clean, but bf16-seed-13 reproducibly degrades, recall .8432 / val AUC
+  .9807 vs the .9449 / .9925 control floor, and was the only configuration to trip the
+  ECE→calibrator gate — twice, across configs). `True` sets the keras `mixed_bfloat16`
   global policy before the model build, with fp32 islands pinned in `models/vae.py` — the
   z_mean/z_log_var heads, `Sampling`, and the decoder's sigmoid output — so everything
   reaching `compute_total_loss` stays fp32. bf16 needs no loss scaling; variables, Adam
@@ -369,9 +395,11 @@ pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off
   the Phase-0 throughput A/B.
 
 Deferred with rationale (recorded in `benchmarks/README.md` so they are not blindly retried):
-RF-dataset pre-generation on the producer, a direct-numpy injection bundle, SHAP-stage
-overlap, pool thread-pinning, and fused moments — the 21.5× generation result collapsed their
-absolute value.
+a direct-numpy injection bundle, pool thread-pinning, and fused moments — the 21.5× generation
+result collapsed their absolute value. RF-dataset pre-generation on the producer and the
+SHAP-stage overlap, originally deferred with them, have since landed (see the
+[`rf_train` section](#random-forest-training-rf_train-stage) and the
+[SHAP performance section](#shap-explainability-performance-cpu-multiprocessing-gpu-is-a-documented-alternative)).
 
 ### Adaptive learning rate
 
@@ -512,8 +540,10 @@ out.
 ### `beta_vae_loss_curves_{tag}.png`
 
 Total loss (full-width top panel) plus reconstruction / KL / true-clustering /
-false-clustering components (bottom row), train and val overlaid, epochs on the x-axis with
-per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
+false-clustering / regularization components (bottom row; the regularization panel shows the
+recorded-but-inactive-by-default penalties — `beta_vae.regularization_active`, see
+MODELS.md — and is empty for runs predating their recording), train and val overlaid,
+epochs on the x-axis with per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
 global-epoch position (`(round − 1) · epochs_per_round + epoch`, via `build_epoch_history`):
 epochs with no committed row render as visible NaN gaps instead of silently shifting later
 epochs left, and a failed pre-plot DB flush now **skips the figure** (raised as a
@@ -608,10 +638,12 @@ late rounds mean the faint-SNR curriculum is destroying earlier structure. The f
 models are persisted (`umap_*.joblib`) and reused by the RF decision-boundary plot and by
 inference's latent-projection figure.
 
-The sweep is combo-parallel (the #278 follow-up): each of the 24 (n_neighbors × min_dist ×
-obs/cadence) combos is an independent UMAP fit with its own derived `random_state` (sub-keyed
-`(level, nn, md)`, #279), reads the shared inputs read-only (shipped to workers through one
-on-disk joblib bundle), and writes distinct files — so
+The sweep is combo-parallel (the #278 follow-up): each (n_neighbors × min_dist ×
+obs/cadence) combo — 18 at the current defaults (3 × 3 × 2; the sweep was 24 until
+`n_neighbors=30` was dropped as redundant between 15 and 50) — is an independent UMAP fit
+with its own derived `random_state` (sub-keyed `(level, nn, md)`, #279), reads the shared
+inputs read-only (shipped to workers through one on-disk joblib bundle), and writes
+distinct files — so
 [`latent_gif.py`](../src/aetherscan/latent_gif.py)`:run_umap_gif_sweep` farms WHOLE combos
 (fit + joblib persist + per-snapshot transforms + frame render + GIF assembly) to forkserver
 workers (empty preload; BLAS-family thread pools pinned per the `shap_parallel.py` isolation
@@ -656,7 +688,8 @@ in-memory viz batch never existed, so the plot skips with a warning.
 
 All consume `rf_eval_artifacts_{tag}.joblib` (val features/labels/probas thresholded at the
 **deployment** `classification_threshold`, not sklearn's 0.5 default); the five SHAP figures
-share `rf_shap_values_{tag}.joblib` (computed once, cached). Since #282 the artifacts carry
+share `rf_shap_values_{tag}.joblib` (computed once — on a background thread overlapped with
+the five non-SHAP figures, see the next section — and cached). Since #282 the artifacts carry
 the *winning variant's* features, both raw (`val_probas` — rank plots are
 calibration-invariant) and deployment-scored (`val_probas_deployed`, calibrated when a
 calibrator is active) probabilities, plus the sweep record (variant metrics, calibration
@@ -686,9 +719,22 @@ forest the step is dominated by the **interaction** pass and runs for hours-to-d
 
 SHAP values are per-sample independent, so we **chunk the samples across all cores**
 (`aetherscan.shap_parallel`, driven by `manager.n_processes` = `cpu_count()` by default): each worker
-rebuilds a *stock* `TreeExplainer` and explains its chunk, and the results are byte-identical to the
+builds a *stock* `TreeExplainer` and explains its chunks, and the results are byte-identical to the
 serial computation (measured ~40-45x on a 96-core node). This is the shipped path for all three
-passes (summary, interaction, log-loss).
+passes (summary, interaction, log-loss), and they share **one forkserver pool** (`shap_pool`): the
+workers start, load the RF, and parse it into their explainers once per session instead of once per
+pass (one cached explainer per pass family — plain for summary/interaction, interventional for
+log-loss). Each pass is split into ~4 chunks per worker to smooth stragglers; the chunk count can't
+change the numbers, because TreeSHAP is per-sample exact and the ordered-chunk concatenation is
+bitwise-identical for any chunking.
+
+The whole computation also **overlaps the non-SHAP diagnostics**: `plot_rf_diagnostics` runs
+`_compute_or_load_shap_values` on a background thread (which mostly blocks on the worker pool, so
+the GIL stays free for main-thread matplotlib) while the five non-SHAP figures render, then joins
+before the five SHAP figures — saving ~min(SHAP time, non-SHAP plot time) of wall clock. Failure
+semantics are unchanged: every figure is still attempted and recorded individually, and a failed
+SHAP computation marks exactly the five SHAP figures failed while the non-SHAP figures are
+unaffected.
 
 #### GPU is faster on interaction, but we don't use it — here's why, and how to switch
 
@@ -736,10 +782,20 @@ overlap enabled) the two should visibly coincide from round 2 onward.
 
 ## Random Forest training (`rf_train` stage)
 
-`train_random_forest()` generates a fresh dataset (`num_samples_rf`, default 99 840; SNR range
-= `initial_snr_range` — the wide range, so the RF sees the full difficulty spectrum) into
-`round_data/{tag}/rf/` using the same memmap machinery (in-process; the producer has already
-shut down). It reuses `prepare_distributed_train_dataset(shuffle=False)` and encodes train and
+`train_random_forest()` consumes a fresh dataset (`num_samples_rf`, default 99 840; SNR range
+= `initial_snr_range` — the wide range, so the RF sees the full difficulty spectrum) at
+`round_data/{tag}/rf/`, built with the same memmap machinery. With overlap enabled the
+background producer **pre-generates it while the last beta-VAE round trains** (queued from
+`train_round`, awaited and validated here, after which the producer shuts down); on a
+producer error or with no producer (overlap disabled, or a resumed run entering `rf_train`
+directly — startup cleanup deletes any stale `rf/` dir) the stage generates it in-process,
+exactly as before. Both paths pass the same `num_training_rounds + 1` sentinel `round_num`
+and root seed, so the arrays — and the sentinel-tagged `injection_stats` rows — are
+identical either way. One span-attribution consequence: the producer-side generation is
+recorded as `train.rf.data_generation` (`source: producer`) but its wall time overlaps the
+last round's training (during `vae_rounds`), so it no longer nests chronologically inside
+the `train.rf` umbrella span the way the in-process (`source: in-process`) span does.
+The stage reuses `prepare_distributed_train_dataset(shuffle=False)` and encodes train and
 val cadences through the (frozen) encoder with `_distributed_encode` — note the
 `train_steps × accumulation_steps` step-count correction, guarded by an exact-count assertion.
 Since #282 the encode keeps **all three** encoder outputs (`z_mean`, `z_log_var`, `z` — the

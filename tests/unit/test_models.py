@@ -146,6 +146,92 @@ class TestSamplingLayer:
 
 
 @pytest.mark.slow
+class TestRegularizationActivation:
+    """The layer-declared L1/L2 penalties: computed and recorded in every run, but ADDED to
+    the objective only behind beta_vae.regularization_active (v1 default False — activation
+    at the declared coefficients measured harmful in the 5-seed A/B; calibration is a
+    tracked follow-up)."""
+
+    def test_reg_loss_present_positive_and_in_total(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+
+        vae = create_beta_vae_model()
+        config = get_config()
+        dense_size = config.beta_vae.dense_layer_size
+        tf.random.set_seed(11)
+        main = tf.random.uniform((2, 6, 16, dense_size))
+        true = tf.random.uniform((2, 6, 16, dense_size))
+        false = tf.random.uniform((2, 6, 16, dense_size))
+
+        losses = vae.compute_total_loss(main, true, false, main, training=False)
+        assert "reg_loss" in losses
+        reg = float(losses["reg_loss"])
+        # Freshly initialized weights + nonzero activations => strictly positive penalties,
+        # computed for observability even though the v1 default leaves them OUT of the
+        # objective (activation at the declared coefficients measured harmful — see config)
+        assert reg > 0.0
+        assert losses["reg_loss"].dtype == tf.float32
+        assert vae.regularization_active is False
+        base_total = (
+            float(losses["reconstruction_loss"])
+            + vae.beta * float(losses["kl_loss"])
+            + vae.alpha * (float(losses["true_loss"]) + float(losses["false_loss"]))
+        )
+        # Default (inactive): the objective is byte-identical to the pre-activation pipeline
+        np.testing.assert_allclose(float(losses["total_loss"]), base_total, rtol=1e-5)
+
+    def test_reg_loss_added_only_when_active(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+
+        config = get_config()
+        config.beta_vae.regularization_active = True
+        try:
+            vae = create_beta_vae_model()
+        finally:
+            config.beta_vae.regularization_active = False
+        assert vae.regularization_active is True
+        dense_size = config.beta_vae.dense_layer_size
+        tf.random.set_seed(11)
+        batch = tf.random.uniform((2, 6, 16, dense_size))
+        losses = vae.compute_total_loss(batch, batch, batch, batch, training=False)
+        expected_total = (
+            float(losses["reconstruction_loss"])
+            + vae.beta * float(losses["kl_loss"])
+            + vae.alpha * (float(losses["true_loss"]) + float(losses["false_loss"]))
+            + float(losses["reg_loss"])
+        )
+        np.testing.assert_allclose(float(losses["total_loss"]), expected_total, rtol=1e-5)
+
+    def test_reg_loss_deterministic_across_calls(self):
+        import tensorflow as tf  # noqa: PLC0415
+
+        from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
+
+        vae = create_beta_vae_model()
+        config = get_config()
+        dense_size = config.beta_vae.dense_layer_size
+        tf.random.set_seed(11)
+        batch = tf.random.uniform((2, 6, 16, dense_size))
+        # The DECODER's activity penalties depend on the sampled z (Sampling draws epsilon
+        # even at training=False), so reg is deterministic GIVEN THE SEED, not across
+        # unseeded calls — the same contract every seeded run relies on (#279). Re-seed
+        # before each call so the epsilon draws replay identically.
+        tf.random.set_seed(11)
+        first = float(
+            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+        )
+        tf.random.set_seed(11)
+        second = float(
+            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+        )
+        assert first == second
+
+
+@pytest.mark.slow
 class TestEncoderDecoderSymmetry:
     """Builds the full Beta-VAE graph on CPU — slow but CI-safe."""
 

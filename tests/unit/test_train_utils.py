@@ -2,20 +2,23 @@
 
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
 schedules, directory archiving, encoder-trained heuristics, the val-AUC quality floor, SHAP
-output normalization, and the training stage machine (skip-if-done / record-failure semantics
-against a stub pipeline)."""
+output normalization, the rf_train dataset producer-await/fallback composition
+(_obtain_rf_dataset), the rf_plots overlap coordinator (plot_rf_diagnostics), and the training
+stage machine (skip-if-done / record-failure semantics against a stub pipeline)."""
 
 from __future__ import annotations
 
 import logging
 import math
 import os
+import threading
 import types
 
 import numpy as np
 import pytest
 
 from aetherscan.config import get_config
+from aetherscan.round_data import RoundDataPaths
 from aetherscan.run_state import (
     STAGE_FINAL_SAVE,
     STAGE_HF_UPLOAD,
@@ -222,6 +225,10 @@ class TestTrainRandomForestSkipIsLoud:
         pipeline.rf_model = types.SimpleNamespace(is_trained=True)
         pipeline._rf_loaded_from_tag = "test_v27"
         pipeline.rf_training_skipped_from_tag = None
+        # The skip path winds down a pending producer RF pre-generation (moot once the
+        # stage is skipped) — none exists here, the shutdown must be a clean no-op
+        pipeline._round_producer = None
+        pipeline._rf_producer_request = None
 
         with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
             pipeline.train_random_forest()
@@ -230,6 +237,141 @@ class TestTrainRandomForestSkipIsLoud:
         assert any(
             "RF training SKIPPED" in r.message and "test_v27" in r.message for r in caplog.records
         )
+
+
+class _FakeRfProducer:
+    """await_round/shutdown recorder standing in for RoundDataProducer."""
+
+    def __init__(self, log, error=None):
+        self._log = log
+        self._error = error
+        self.shutdown_calls = 0
+
+    def await_round(self, round_idx):
+        self._log.append(("await", round_idx))
+        if self._error is not None:
+            raise self._error
+        return {"n_samples": 8}
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+        self._log.append(("shutdown",))
+
+
+class _FakeRfDataGenerator:
+    """generate_round recorder standing in for DataGenerator on the in-process path."""
+
+    def __init__(self, log):
+        self._log = log
+
+    def generate_round(self, paths, n_samples, snr_base, snr_range, round_num=None):
+        self._log.append(("generate", paths.round_dir, n_samples, snr_base, snr_range, round_num))
+
+
+class TestObtainRfDataset:
+    """_obtain_rf_dataset composes producer await -> shutdown -> manifest reuse ->
+    in-process fallback. Every resume/fallback path is pinned: producer-success,
+    producer-error (falls back in-process), no-producer fresh generation, valid-dir
+    reuse, and the defensive request-less-producer wind-down."""
+
+    def _pipeline(self, log, producer=None, request=None):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline.config.training.num_training_rounds = 20
+        pipeline._round_producer = producer
+        pipeline._rf_producer_request = request
+        pipeline.data_generator = _FakeRfDataGenerator(log)
+        return pipeline
+
+    def _patch_validate(self, monkeypatch, log, manifest):
+        def _validate(paths, expected_n_samples=None, expected_array_dtype=None):
+            log.append(("validate", paths.round_dir, expected_n_samples, expected_array_dtype))
+            return manifest
+
+        monkeypatch.setattr("aetherscan.train.validate_done_manifest", _validate)
+
+    def _rf_paths(self, tmp_path):
+        return RoundDataPaths(round_dir=os.path.join(str(tmp_path), "rf"), round_idx=0)
+
+    def test_producer_success_reuses_result_without_regenerating(self, tmp_path, monkeypatch):
+        log = []
+        producer = _FakeRfProducer(log)
+        pipeline = self._pipeline(log, producer=producer, request=21)
+        self._patch_validate(monkeypatch, log, manifest={"n_samples": 8})
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        # Await precedes the manifest check (validating mid-write would race the
+        # fallback's regeneration against live producer writes), shutdown lands exactly
+        # once, and the producer's dataset is consumed without a regeneration
+        assert log == [
+            ("await", 21),
+            ("shutdown",),
+            ("validate", rf_paths.round_dir, 8, pipeline.config.training.round_array_dtype),
+        ]
+        assert producer.shutdown_calls == 1
+        assert pipeline._round_producer is None
+        assert pipeline._rf_producer_request is None
+
+    def test_producer_error_falls_back_to_in_process_generation(self, tmp_path, monkeypatch):
+        log = []
+        producer = _FakeRfProducer(log, error=RuntimeError("producer exploded"))
+        pipeline = self._pipeline(log, producer=producer, request=21)
+        self._patch_validate(monkeypatch, log, manifest=None)
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        # Producer failure still shuts it down exactly once, then the unchanged
+        # in-process path runs with the same num_training_rounds+1 sentinel round_num
+        assert log == [
+            ("await", 21),
+            ("shutdown",),
+            ("validate", rf_paths.round_dir, 8, pipeline.config.training.round_array_dtype),
+            ("generate", rf_paths.round_dir, 8, 10.0, 40.0, 21),
+        ]
+        assert producer.shutdown_calls == 1
+        assert pipeline._round_producer is None
+
+    def test_no_producer_generates_in_process(self, tmp_path, monkeypatch):
+        # Overlap disabled, sequential mode, or a resumed run entering rf_train directly
+        # (startup cleanup deleted any stale rf dir, so validation fails and regenerates)
+        log = []
+        pipeline = self._pipeline(log, producer=None, request=None)
+        self._patch_validate(monkeypatch, log, manifest=None)
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        assert log == [
+            ("validate", rf_paths.round_dir, 8, pipeline.config.training.round_array_dtype),
+            ("generate", rf_paths.round_dir, 8, 10.0, 40.0, 21),
+        ]
+
+    def test_no_producer_valid_dir_is_reused(self, tmp_path, monkeypatch):
+        log = []
+        pipeline = self._pipeline(log, producer=None, request=None)
+        self._patch_validate(monkeypatch, log, manifest={"n_samples": 8})
+
+        pipeline._obtain_rf_dataset(self._rf_paths(tmp_path), 8, 10.0, 40.0)
+
+        assert [entry[0] for entry in log] == ["validate"]
+
+    def test_producer_without_pending_request_is_still_shut_down(self, tmp_path, monkeypatch):
+        # Defensive: a live producer with no RF request pending must be wound down, not
+        # leaked (and not awaited — there is nothing to wait for)
+        log = []
+        producer = _FakeRfProducer(log)
+        pipeline = self._pipeline(log, producer=producer, request=None)
+        self._patch_validate(monkeypatch, log, manifest=None)
+        rf_paths = self._rf_paths(tmp_path)
+
+        pipeline._obtain_rf_dataset(rf_paths, 8, 10.0, 40.0)
+
+        assert log[0] == ("shutdown",)
+        assert not any(entry[0] == "await" for entry in log)
+        assert producer.shutdown_calls == 1
 
 
 class _PipelineStub:
@@ -472,6 +614,121 @@ class TestCheckValAucFloor:
             "single-class" in r.message and "cannot be evaluated" in r.message
             for r in caplog.records
         )
+
+
+class TestPlotRfDiagnosticsOverlap:
+    """plot_rf_diagnostics overlaps the SHAP computation (background thread) with the five
+    non-SHAP plots: the SHAP plots run only after the thread joins, and a SHAP-compute failure
+    is recorded once per SHAP plot exactly as the sequential path would have recorded it."""
+
+    NON_SHAP = [
+        "plot_rf_confusion_matrices",
+        "plot_rf_classification_curves",
+        "plot_rf_calibration_curve",
+        "plot_rf_ensemble_accuracy_curve",
+        "plot_rf_latent_decision_boundary",
+    ]
+    SHAP = [
+        "plot_rf_shap_summary",
+        "plot_rf_shap_dependence",
+        "plot_rf_shap_interactions",
+        "plot_rf_shap_loss_monitoring",
+        "plot_rf_shap_explanation_clustering",
+    ]
+
+    @staticmethod
+    def _recorder(log, name):
+        def _record():
+            log.append(name)
+
+        return _record
+
+    def _pipeline(self, log, shap_compute=None, artifacts_error=None):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        for name in self.NON_SHAP + self.SHAP:
+            setattr(pipeline, name, self._recorder(log, name))
+
+        def _load_artifacts(tag=None):
+            if artifacts_error is not None:
+                raise artifacts_error
+            log.append("load_artifacts")
+            return {"tag": "test_v1"}
+
+        pipeline._load_rf_eval_artifacts = _load_artifacts
+        pipeline._compute_or_load_shap_values = shap_compute or (
+            lambda artifacts: log.append("shap_done")
+        )
+        return pipeline
+
+    def test_shap_plots_wait_for_background_compute(self):
+        # The stubbed SHAP compute refuses to finish until the last non-SHAP plot releases it,
+        # so "shap_done" preceding every SHAP plot in the log proves the join, and the non-SHAP
+        # names preceding "shap_done" prove they were not serialized behind the compute.
+        log = []
+        release = threading.Event()
+
+        def _shap_compute(artifacts):
+            assert release.wait(timeout=30), "non-SHAP plots never released the SHAP stub"
+            log.append("shap_done")
+
+        pipeline = self._pipeline(log, shap_compute=_shap_compute)
+
+        def _last_non_shap_plot():
+            log.append("plot_rf_latent_decision_boundary")
+            release.set()
+
+        pipeline.plot_rf_latent_decision_boundary = _last_non_shap_plot
+
+        pipeline.plot_rf_diagnostics()
+
+        assert log == ["load_artifacts", *self.NON_SHAP, "shap_done", *self.SHAP]
+
+    def test_shap_failure_records_every_shap_plot_and_spares_the_rest(self, caplog):
+        log = []
+
+        def _shap_compute(artifacts):
+            raise RuntimeError("SHAP exploded")
+
+        pipeline = self._pipeline(log, shap_compute=_shap_compute)
+        with (
+            caplog.at_level(logging.ERROR, logger="aetherscan.train"),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
+            pipeline.plot_rf_diagnostics()
+
+        # All five SHAP plot names failed, in order — the same bookkeeping the sequential path
+        # produces when each plot hits the same compute error — and each got the per-plot
+        # "Failed to execute" record; the non-SHAP successes are untouched.
+        assert str(excinfo.value) == "5 plot(s) failed: " + ", ".join(self.SHAP)
+        assert [entry for entry in log if entry in self.NON_SHAP] == self.NON_SHAP
+        assert not any(entry in self.SHAP for entry in log)  # never invoked without values
+        for name in self.SHAP:
+            assert any(
+                f"Failed to execute {name}: SHAP exploded" in r.message for r in caplog.records
+            )
+
+    def test_non_shap_failure_is_isolated(self):
+        log = []
+        pipeline = self._pipeline(log)
+
+        def _boom():
+            raise ValueError("bad plot")
+
+        pipeline.plot_rf_calibration_curve = _boom
+        with pytest.raises(RuntimeError) as excinfo:
+            pipeline.plot_rf_diagnostics()
+
+        assert str(excinfo.value) == "1 plot(s) failed: plot_rf_calibration_curve"
+        # The SHAP plots still ran, after the join.
+        assert log[-len(self.SHAP) :] == self.SHAP
+
+    def test_artifact_load_failure_falls_back_to_sequential_order(self):
+        # Preserves the pre-overlap path: every plot is still attempted individually, in the
+        # original interleaved order (in production each would re-raise the load error itself).
+        log = []
+        pipeline = self._pipeline(log, artifacts_error=FileNotFoundError("no artifacts"))
+        pipeline.plot_rf_diagnostics()
+        assert log == self.NON_SHAP[:2] + self.SHAP + self.NON_SHAP[2:]
 
 
 class _StageMachineStub:

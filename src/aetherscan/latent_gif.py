@@ -179,7 +179,7 @@ def render_latent_gif_frames(
 
     n_workers = max(1, min(n_workers, len(frames)))
     if n_workers == 1:
-        # In-process render — reset worker globals afterwards so repeated calls (the 24-GIF
+        # In-process render — reset worker globals afterwards so repeated calls (the multi-GIF
         # sweep runs in one process) rebuild against the new style
         global _FIG, _AX, _ARTISTS, _STYLE
         try:

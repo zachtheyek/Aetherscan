@@ -57,6 +57,18 @@ def per_cadence_kl(z_mean_flat: np.ndarray, z_log_var_flat: np.ndarray) -> np.nd
     return kl.sum(axis=1).astype(np.float32)
 
 
+def latent_dim_variances(
+    z_mean_flat: np.ndarray, num_observations: int, latent_dim: int
+) -> np.ndarray:
+    """Per-dim z_mean variance across samples (pooling all observations) — the raw quantity
+    the Active Units threshold cuts on. Exposed so callers can log the margins: a dim a hair
+    below the cutoff and a dim that went dark read identically in the AU count but mean
+    opposite things for an A/B parity decision (#288's fp16 verdict hinged on exactly this)."""
+    per_obs = _reshape_blocks(z_mean_flat, num_observations, latent_dim)
+    pooled = per_obs.reshape(-1, latent_dim)
+    return pooled.var(axis=0)
+
+
 def active_latent_dims(
     z_mean_flat: np.ndarray, num_observations: int, latent_dim: int, threshold: float
 ) -> list[int]:
@@ -66,9 +78,7 @@ def active_latent_dims(
     contribute dead-weight log_var features — this gates the z_mean_logvar_active variant
     and feeds check_posterior_collapse.
     """
-    per_obs = _reshape_blocks(z_mean_flat, num_observations, latent_dim)
-    pooled = per_obs.reshape(-1, latent_dim)
-    variances = pooled.var(axis=0)
+    variances = latent_dim_variances(z_mean_flat, num_observations, latent_dim)
     return [int(d) for d in np.nonzero(variances > threshold)[0]]
 
 
@@ -140,6 +150,46 @@ def build_variant_features(
             # Every dim collapsed (or none measured active) — degenerate to plain z_mean
             return lead
         return np.hstack([lead, z_log_var[:, columns]])
+    raise ValueError(f"Unknown latent variant {variant!r}; expected one of {VARIANT_ORDER}")
+
+
+def variant_feature_names(
+    variant: str,
+    num_observations: int,
+    latent_dim: int,
+    active_dims: list[int] | None = None,
+) -> list[str]:
+    """
+    Human-readable column names mirroring build_variant_features' exact layout —
+    [lead | extras], obs-major within blocks. Even-indexed observations are ON, odd are OFF,
+    pairs numbered 1..3 (the data_generation cadence convention). MUST stay column-for-column
+    in lockstep with build_variant_features: the SHAP plots pair these names with the feature
+    matrix, and a length mismatch is an IndexError inside shap (a 54-feature
+    z_mean_obs_logvar winner against the old hardcoded 48-name list is exactly how this
+    function came to exist).
+    """
+
+    def obs_label(o: int) -> str:
+        return f"{'ON' if o % 2 == 0 else 'OFF'}-{o // 2 + 1}"
+
+    lead = [f"{obs_label(o)}_dim-{d}" for o in range(num_observations) for d in range(latent_dim)]
+    if variant in ("z", "z_mean", "z_aug"):
+        return lead
+    if variant == "z_mean_logvar":
+        return lead + [
+            f"logvar_{obs_label(o)}_dim-{d}"
+            for o in range(num_observations)
+            for d in range(latent_dim)
+        ]
+    if variant == "z_mean_total_kl":
+        return lead + ["total_kl"]
+    if variant == "z_mean_obs_logvar":
+        return lead + [f"logvar_mean_{obs_label(o)}" for o in range(num_observations)]
+    if variant == "z_mean_dim_logvar":
+        return lead + [f"logvar_mean_dim-{d}" for d in range(latent_dim)]
+    if variant == "z_mean_logvar_active":
+        columns = _active_logvar_columns(active_dims or [], num_observations, latent_dim)
+        return lead + [f"logvar_{obs_label(c // latent_dim)}_dim-{c % latent_dim}" for c in columns]
     raise ValueError(f"Unknown latent variant {variant!r}; expected one of {VARIANT_ORDER}")
 
 
