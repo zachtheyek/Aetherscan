@@ -106,6 +106,16 @@ class BetaVAEConfig:
     # pinned fp32 in models/vae.py. Default False = fp32 end-to-end, byte-identical to before
     # this flag existed (no policy call is made at all).
     mixed_precision: bool = False
+    # Whether the conv layers' declared L1/L2 penalties are ADDED to the training objective.
+    # v1 default False: the declarations were dead code since inception (a custom loop only
+    # applies them by consuming model.losses, which nothing did), and activating them at the
+    # declared, never-calibrated coefficients measurably degraded the model in a 5-seed A/B
+    # (recall@0.01FPR median .984 -> .954, worst seed .72; 1-4 latent dims per seed pushed
+    # below the active-units threshold). reg_loss is computed and recorded regardless, so
+    # every run observes what the penalties WOULD be; coefficient calibration is a tracked
+    # follow-up issue. Flipping this changes training numerics — A/B-gate like the other
+    # numerics flags.
+    regularization_active: bool = False
 
 
 @dataclass
@@ -753,6 +763,7 @@ class Config:
                 "beta": self.beta_vae.beta,
                 "alpha": self.beta_vae.alpha,
                 "mixed_precision": self.beta_vae.mixed_precision,
+                "regularization_active": self.beta_vae.regularization_active,
             },
             "reproducibility": {
                 "seed": self.reproducibility.seed,

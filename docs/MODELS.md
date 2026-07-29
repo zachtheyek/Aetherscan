@@ -93,18 +93,23 @@ Each training batch is a triplet `(main, true, false)` of cadence batches
 arrays are generated):
 
 ```
-total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(false)) + reg
+total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(false)) [+ reg]
 ```
 
-- **Regularization** (`reg`, activated 2026-07 by maintainer decision): the sum of the
-  layer-declared penalties — L2(0.01) on every conv kernel and bias plus L1(0.001) on conv
-  activations. These declarations existed since inception but were never consumed: a custom
-  training loop only applies them if it adds `model.losses` to the objective, so **every
-  model trained before the activation was effectively unregularized** (the docstrings'
-  claims notwithstanding). Stock keras semantics apply: weight penalties count once;
-  activity penalties are batch-SUM-scaled and accrue once per regularized-layer forward
-  inside the loss (the reconstruction pass and both clustering branches), so the effective
-  activity coefficient scales with the per-replica batch size (128 at defaults).
+- **Regularization** (`reg`, behind `beta_vae.regularization_active`, **default OFF for
+  v1**): the sum of the layer-declared penalties — L2(0.01) on every conv kernel and bias
+  plus L1(0.001) on conv activations. These declarations existed since inception but were
+  never consumed: a custom training loop only applies them if it adds `model.losses` to the
+  objective, so **every model this pipeline has trained is effectively unregularized**. A
+  2026-07 activation attempt at the declared (never-calibrated) coefficients measurably
+  degraded the model in a 5-seed A/B — recall@0.01FPR median .984 → .954 with a worst seed
+  at .72, and 1–4 latent dims per seed pushed below the active-units threshold — so v1
+  ships with the flag off and the objective byte-identical to the historical pipeline.
+  `reg_loss` is still computed and recorded every run for observability (stock keras
+  semantics: weight penalties once; activity penalties batch-SUM-scaled, once per
+  regularized-layer forward inside the loss), so calibration work has live data; the
+  coefficient-calibration question is a tracked follow-up issue. Flipping the flag changes
+  training numerics — A/B-gate it like the other numerics flags.
 - **Reconstruction**: `main` is reshaped to `(B·6, 16, 512, 1)`, encoded, decoded, and scored
   with binary cross-entropy summed over the spectrogram and averaged over the batch
   (`from_logits=False`; the decoder output is already sigmoid-bounded).

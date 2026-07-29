@@ -66,7 +66,9 @@ class BetaVAE(keras.Model):
     Beta-VAE knob trading reconstruction quality for latent disentanglement).
     """
 
-    def __init__(self, encoder, decoder, alpha=10.0, beta=1.5, **kwargs):
+    def __init__(
+        self, encoder, decoder, alpha=10.0, beta=1.5, regularization_active=False, **kwargs
+    ):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
@@ -74,6 +76,14 @@ class BetaVAE(keras.Model):
         # Hyperparameters
         self.alpha = alpha
         self.beta = beta
+        # Whether the layer-declared L1/L2 penalties are ADDED to the objective. Default
+        # False (v1 decision, 2026-07-29): activating them at the declared, never-calibrated
+        # coefficients measurably degraded the model in a 5-seed A/B — recall@0.01FPR
+        # median .984 -> .954 with one seed at .72, and 1-4 latent dims per seed pushed
+        # below the active-units threshold (one seed lost 4/8). reg_loss is still computed
+        # and recorded for observability either way; coefficient calibration is tracked as
+        # a follow-up issue.
+        self.regularization_active = regularization_active
 
     def call(self, inputs, training=None):
         """
@@ -279,21 +289,25 @@ class BetaVAE(keras.Model):
         false_loss = self.compute_clustering_loss_false(false_data)
         true_loss = self.compute_clustering_loss_true(true_data)
 
-        # Layer-declared regularization penalties (see docstring). Cast fp32 so the sum is
-        # exact under mixed_bfloat16 (activity penalties on bf16 activations); the islands
-        # keep the rest of the loss math fp32 already.
+        # Layer-declared regularization penalties (see docstring). Always COMPUTED and
+        # returned for observability (keras materializes the activity penalties in the
+        # forward pass regardless, so this is one add_n), but only ADDED to the objective
+        # when regularization_active — the v1 default is False (see __init__: activation at
+        # the declared coefficients measured harmful). Cast fp32 so the sum is exact under
+        # mixed_bfloat16 (activity penalties ride bf16 activations); the islands keep the
+        # rest of the loss math fp32 already.
         if self.losses:
             reg_loss = tf.add_n([tf.cast(loss, tf.float32) for loss in self.losses])
         else:
             reg_loss = tf.constant(0.0, dtype=tf.float32)
 
-        # Compute total loss
+        # Compute total loss (reg only when active — inactive keeps the objective
+        # byte-identical to the pre-activation pipeline)
         total_loss = (
-            reconstruction_loss
-            + self.beta * kl_loss
-            + self.alpha * (true_loss + false_loss)
-            + reg_loss
+            reconstruction_loss + self.beta * kl_loss + self.alpha * (true_loss + false_loss)
         )
+        if self.regularization_active:
+            total_loss = total_loss + reg_loss
 
         return {
             "total_loss": total_loss,
@@ -813,6 +827,7 @@ def create_beta_vae_model():
         decoder,
         alpha=config.beta_vae.alpha,
         beta=config.beta_vae.beta,
+        regularization_active=config.beta_vae.regularization_active,
     )
 
     beta_vae.compile(
