@@ -387,10 +387,11 @@ pre-flag pipeline byte-for-byte (neither makes so much as a policy call when off
   the Phase-0 throughput A/B.
 
 Deferred with rationale (recorded in `benchmarks/README.md` so they are not blindly retried):
-a direct-numpy injection bundle, SHAP-stage overlap, pool thread-pinning, and fused moments —
-the 21.5× generation result collapsed their absolute value. RF-dataset pre-generation on the
-producer, originally deferred with them, has since landed (see the
-[`rf_train` section](#random-forest-training-rf_train-stage)).
+a direct-numpy injection bundle, pool thread-pinning, and fused moments — the 21.5× generation
+result collapsed their absolute value. RF-dataset pre-generation on the producer and the
+SHAP-stage overlap, originally deferred with them, have since landed (see the
+[`rf_train` section](#random-forest-training-rf_train-stage) and the
+[SHAP performance section](#shap-explainability-performance-cpu-multiprocessing-gpu-is-a-documented-alternative)).
 
 ### Adaptive learning rate
 
@@ -531,10 +532,10 @@ out.
 ### `beta_vae_loss_curves_{tag}.png`
 
 Total loss (full-width top panel) plus reconstruction / KL / true-clustering /
-false-clustering / regularization components (bottom row; the regularization panel is empty
-for runs predating the 2026-07 L1/L2 activation — see MODELS.md), train and val overlaid,
-epochs on the x-axis with
-per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
+false-clustering / regularization components (bottom row; the regularization panel shows the
+recorded-but-inactive-by-default penalties — `beta_vae.regularization_active`, see
+MODELS.md — and is empty for runs predating their recording), train and val overlaid,
+epochs on the x-axis with per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
 global-epoch position (`(round − 1) · epochs_per_round + epoch`, via `build_epoch_history`):
 epochs with no committed row render as visible NaN gaps instead of silently shifting later
 epochs left, and a failed pre-plot DB flush now **skips the figure** (raised as a
@@ -679,7 +680,8 @@ in-memory viz batch never existed, so the plot skips with a warning.
 
 All consume `rf_eval_artifacts_{tag}.joblib` (val features/labels/probas thresholded at the
 **deployment** `classification_threshold`, not sklearn's 0.5 default); the five SHAP figures
-share `rf_shap_values_{tag}.joblib` (computed once, cached). Since #282 the artifacts carry
+share `rf_shap_values_{tag}.joblib` (computed once — on a background thread overlapped with
+the five non-SHAP figures, see the next section — and cached). Since #282 the artifacts carry
 the *winning variant's* features, both raw (`val_probas` — rank plots are
 calibration-invariant) and deployment-scored (`val_probas_deployed`, calibrated when a
 calibrator is active) probabilities, plus the sweep record (variant metrics, calibration
@@ -709,9 +711,22 @@ forest the step is dominated by the **interaction** pass and runs for hours-to-d
 
 SHAP values are per-sample independent, so we **chunk the samples across all cores**
 (`aetherscan.shap_parallel`, driven by `manager.n_processes` = `cpu_count()` by default): each worker
-rebuilds a *stock* `TreeExplainer` and explains its chunk, and the results are byte-identical to the
+builds a *stock* `TreeExplainer` and explains its chunks, and the results are byte-identical to the
 serial computation (measured ~40-45x on a 96-core node). This is the shipped path for all three
-passes (summary, interaction, log-loss).
+passes (summary, interaction, log-loss), and they share **one forkserver pool** (`shap_pool`): the
+workers start, load the RF, and parse it into their explainers once per session instead of once per
+pass (one cached explainer per pass family — plain for summary/interaction, interventional for
+log-loss). Each pass is split into ~4 chunks per worker to smooth stragglers; the chunk count can't
+change the numbers, because TreeSHAP is per-sample exact and the ordered-chunk concatenation is
+bitwise-identical for any chunking.
+
+The whole computation also **overlaps the non-SHAP diagnostics**: `plot_rf_diagnostics` runs
+`_compute_or_load_shap_values` on a background thread (which mostly blocks on the worker pool, so
+the GIL stays free for main-thread matplotlib) while the five non-SHAP figures render, then joins
+before the five SHAP figures — saving ~min(SHAP time, non-SHAP plot time) of wall clock. Failure
+semantics are unchanged: every figure is still attempted and recorded individually, and a failed
+SHAP computation marks exactly the five SHAP figures failed while the non-SHAP figures are
+unaffected.
 
 #### GPU is faster on interaction, but we don't use it — here's why, and how to switch
 
