@@ -127,6 +127,10 @@ class BetaVAE(keras.Model):
     # encoder's activity-regularizer loss tensors out of scope of the reg_loss add_n —
     # InaccessibleTensorError, found by the first regularized run. Inlining into the outer
     # trace keeps every penalty same-graph; standalone (eager) calls just run eagerly.
+    # ⚠ REPRODUCIBILITY: this inlining changed float summation order — same-seed results
+    # from builds before/after it differ slightly. Determinism WITHIN a build (same seed ⇒
+    # byte-identical reruns) is preserved and pinned by the train dataset/accumulation
+    # tests; cross-build comparisons must be distribution-level, never same-seed pairing.
     def compute_clustering_loss_true(self, true_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for true-class (ETI-bearing) cadences: sum loss_same across all

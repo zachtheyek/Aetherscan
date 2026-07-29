@@ -126,6 +126,11 @@ def _get_explainer(kind: str):
     """
     import shap  # noqa: PLC0415  (deferred so the worker pins threads before shap/BLAS init)
 
+    # Validate here, not just at the top-level API: the in-process (n_workers <= 1) path
+    # reaches _worker without _validate_pass, and silently collapsing an unknown kind into
+    # the "raw" slot would hand a future pass the wrong explainer.
+    if kind != _LOGLOSS_KIND and kind not in _RAW_KINDS:
+        raise ValueError(f"unknown SHAP kind {kind!r}")
     key = _LOGLOSS_KIND if kind == _LOGLOSS_KIND else "raw"
     explainer = _EXPLAINERS.get(key)
     if explainer is None:

@@ -1032,10 +1032,19 @@ class Database:
         the flush. Offending rows are skipped with an exact count — the old behavior lost
         the entire buffered batch (every table's rows) to a single NOT NULL violation,
         with nothing but a one-line error to show for it.
+
+        The batch attempt runs inside a SAVEPOINT: executemany inserts each row into the
+        open transaction as it steps, so a mid-batch failure leaves the rows BEFORE the
+        offender committed-in-progress — retrying per-row without rolling those back would
+        duplicate them. ROLLBACK TO restores a clean slate before the per-row pass.
         """
         try:
+            cursor.execute("SAVEPOINT resilient_batch")
             cursor.executemany(sql, records)
+            cursor.execute("RELEASE SAVEPOINT resilient_batch")
         except sqlite3.Error as batch_error:
+            cursor.execute("ROLLBACK TO SAVEPOINT resilient_batch")
+            cursor.execute("RELEASE SAVEPOINT resilient_batch")
             logger.error(
                 f"Bulk insert into {table} failed ({batch_error}); retrying "
                 f"{len(records)} row(s) individually"

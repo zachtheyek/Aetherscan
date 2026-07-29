@@ -891,6 +891,21 @@ class TestTrainingStatFiniteHandling:
         rows = db.query_training_stat(tag="fallback_v1", columns=["stat_name", "value"])
         assert [(r["stat_name"], r["value"]) for r in rows] == [("ok_stat", 2.0)]
 
+    def test_fallback_does_not_duplicate_rows_before_a_mid_batch_poison(self, db):
+        # The poisoned row sits MID-batch: executemany steps good rows into the open
+        # transaction before failing, and without the SAVEPOINT rollback the per-row retry
+        # would re-insert them (duplicates). Exactly one copy of each good row must land.
+        now = time.time()
+        good1 = ("training_stats", (now, "m", "first_stat", 1.0, 1, 1, "fallback_v2", None, 1))
+        bad = ("training_stats", (now, "m", None, 3.0, 1, 1, "fallback_v2", None, 1))
+        good2 = ("training_stats", (now, "m", "second_stat", 2.0, 1, 1, "fallback_v2", None, 1))
+        db._flush_buffer(buffer=[good1, bad, good2])
+        rows = db.query_training_stat(tag="fallback_v2", columns=["stat_name", "value"])
+        assert sorted((r["stat_name"], r["value"]) for r in rows) == [
+            ("first_stat", 1.0),
+            ("second_stat", 2.0),
+        ]
+
 
 class TestInjectionStatTimeSpan:
     """query_injection_stat_time_span: the whole-partition MIN/MAX aggregate that callers use
