@@ -63,6 +63,7 @@ from aetherscan.latent_variants import (
     recall_at_fpr,
     sample_z_flat,
     select_winner,
+    variant_feature_names,
 )
 from aetherscan.logger import get_logger
 from aetherscan.models import (
@@ -6152,21 +6153,18 @@ class TrainingPipeline:
         gc.collect()
 
     def _rf_feature_names(self) -> list[str]:
-        """Human-readable names for the 48 flattened latent features.
+        """Human-readable names for the winner variant's feature columns (#282).
 
-        Naming follows the cadence convention from data_generation.py: even-indexed
-        observations are ON, odd-indexed are OFF. Each ON/OFF pair is numbered 1..3.
-        Example for 6 obs / 8 dims: ON-1_dim-0 ... ON-1_dim-7, OFF-1_dim-0 ... OFF-3_dim-7.
+        Delegates to latent_variants.variant_feature_names so the names track the persisted
+        winner's exact layout — the old hardcoded 48-name list broke every SHAP plot that
+        pairs names with features whenever a logvar-augmented variant won (54+ columns).
         """
-        num_obs = self.config.data.num_observations
-        latent_dim = self.config.beta_vae.latent_dim
-        names = []
-        for o in range(num_obs):
-            kind = "ON" if o % 2 == 0 else "OFF"
-            pair_idx = o // 2 + 1
-            for d in range(latent_dim):
-                names.append(f"{kind}-{pair_idx}_dim-{d}")
-        return names
+        return variant_feature_names(
+            self.config.rf.latent_variant,
+            self.config.data.num_observations,
+            self.config.beta_vae.latent_dim,
+            self.config.rf.active_dims,
+        )
 
     def plot_rf_shap_summary(self, tag: str | None = None, dir: str | None = None):
         """

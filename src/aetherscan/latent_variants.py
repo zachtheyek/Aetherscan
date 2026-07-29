@@ -153,6 +153,46 @@ def build_variant_features(
     raise ValueError(f"Unknown latent variant {variant!r}; expected one of {VARIANT_ORDER}")
 
 
+def variant_feature_names(
+    variant: str,
+    num_observations: int,
+    latent_dim: int,
+    active_dims: list[int] | None = None,
+) -> list[str]:
+    """
+    Human-readable column names mirroring build_variant_features' exact layout —
+    [lead | extras], obs-major within blocks. Even-indexed observations are ON, odd are OFF,
+    pairs numbered 1..3 (the data_generation cadence convention). MUST stay column-for-column
+    in lockstep with build_variant_features: the SHAP plots pair these names with the feature
+    matrix, and a length mismatch is an IndexError inside shap (a 54-feature
+    z_mean_obs_logvar winner against the old hardcoded 48-name list is exactly how this
+    function came to exist).
+    """
+
+    def obs_label(o: int) -> str:
+        return f"{'ON' if o % 2 == 0 else 'OFF'}-{o // 2 + 1}"
+
+    lead = [f"{obs_label(o)}_dim-{d}" for o in range(num_observations) for d in range(latent_dim)]
+    if variant in ("z", "z_mean", "z_aug"):
+        return lead
+    if variant == "z_mean_logvar":
+        return lead + [
+            f"logvar_{obs_label(o)}_dim-{d}"
+            for o in range(num_observations)
+            for d in range(latent_dim)
+        ]
+    if variant == "z_mean_total_kl":
+        return lead + ["total_kl"]
+    if variant == "z_mean_obs_logvar":
+        return lead + [f"logvar_mean_{obs_label(o)}" for o in range(num_observations)]
+    if variant == "z_mean_dim_logvar":
+        return lead + [f"logvar_mean_dim-{d}" for d in range(latent_dim)]
+    if variant == "z_mean_logvar_active":
+        columns = _active_logvar_columns(active_dims or [], num_observations, latent_dim)
+        return lead + [f"logvar_{obs_label(c // latent_dim)}_dim-{c % latent_dim}" for c in columns]
+    raise ValueError(f"Unknown latent variant {variant!r}; expected one of {VARIANT_ORDER}")
+
+
 def sample_z_flat(
     z_mean_flat: np.ndarray, z_log_var_flat: np.ndarray, rng: np.random.Generator
 ) -> np.ndarray:
