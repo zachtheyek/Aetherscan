@@ -111,6 +111,7 @@ _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS = frozenset(
         "max_candidate_plots",  # viz only
         "max_retries",  # retry loop only
         "retry_delay",  # retry loop only
+        "prefetch_depth",  # scheduling only; per-cadence results are depth-invariant (#298 N2)
     }
 )
 _INFERENCE_FINGERPRINT_DATA_KEYS = frozenset(

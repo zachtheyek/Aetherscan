@@ -855,6 +855,26 @@ class TestRoundDataFlags:
         assert cli._nearest_existing_ancestor(str(tmp_path)) == str(tmp_path)
 
 
+class TestPrefetchDepthValidation:
+    """--prefetch-depth must be >= 1 (#298 N2): 0 would leave the streaming loop with no
+    in-flight prefetch and nothing to consume."""
+
+    def test_zero_rejected(self):
+        errors = collect_validation_errors(_parse(["inference", "--prefetch-depth", "0"]), None)
+        assert any(
+            e.field == "inference.prefetch_depth" and e.fix_kind == "clamp_low" and e.min_val == 1
+            for e in errors
+        )
+
+    def test_negative_rejected(self):
+        errors = collect_validation_errors(_parse(["inference", "--prefetch-depth", "-1"]), None)
+        assert any(e.field == "inference.prefetch_depth" for e in errors)
+
+    def test_depth_two_accepted(self):
+        errors = collect_validation_errors(_parse(["inference", "--prefetch-depth", "2"]), None)
+        assert not any(e.field == "inference.prefetch_depth" for e in errors)
+
+
 class TestMaxRetriesValidation:
     """--max-retries must be >= 1: 0 would run zero attempts and exit 0 having trained nothing."""
 

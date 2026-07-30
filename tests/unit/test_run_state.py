@@ -304,6 +304,9 @@ class TestInferenceConfigFingerprint:
             ("coarse_channel_log_interval", 8),
             ("max_retries", 9),
             ("inference_viz_enabled", False),
+            # prefetch_depth is scheduling only (#298 N2): per-cadence results are
+            # depth-invariant, so changing it must not force a re-inference on resume.
+            ("prefetch_depth", 2),
         ],
     )
     def test_inert_inference_change_keeps_fingerprint(self, key, value):

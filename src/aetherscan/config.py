@@ -475,6 +475,15 @@ class InferenceConfig:
     # candidate against the survey population rather than against other candidates. 0
     # disables the cloud (and the plot's background).
     reference_cloud_size: int = 10000
+    # Streaming-loop prefetch depth (#298 N2): cadences preprocessed+loaded concurrently
+    # ahead of the GPU stage. Depth 1 = the historical behavior (one in-flight cadence);
+    # depth 2 overlaps one cadence's disk-bound energy detection with the previous one's
+    # decompression-bound extraction and fills the worker pool during per-cadence serial
+    # sections, at the cost of one extra in-flight cadence of RAM (stamps + loaded array,
+    # up to ~10-20 GB each). Default stays 1 until the post-I1 on-cluster A/B decides the
+    # flip — per-cadence outputs are identical at any depth (results are consumed in
+    # catalog order and seeding keys on the catalog index).
+    prefetch_depth: int = 1
 
     # NOTE: come back to this later (is this the optimal grouping?)
     # Energy detection preprocessing
@@ -886,6 +895,7 @@ class Config:
                 "screening_threshold": self.inference.screening_threshold,
                 "mc_draws": self.inference.mc_draws,
                 "reference_cloud_size": self.inference.reference_cloud_size,
+                "prefetch_depth": self.inference.prefetch_depth,
                 "cadence_group_by_cols": self.inference.cadence_group_by_cols,
                 "cadence_h5_path_col": self.inference.cadence_h5_path_col,
                 "cadence_expected_obs": self.inference.cadence_expected_obs,

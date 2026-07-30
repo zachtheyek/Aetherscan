@@ -303,6 +303,46 @@ class TestStreamingResumeStateMachine:
         b_rows = db.query_inference_cadences(tag="test_v1", npy_path=fail_path)
         assert [r["status"] for r in b_rows] == ["inferred"]
 
+    def test_prefetch_depth_2_preserves_catalog_order(self, stubbed_streaming):
+        """#298 N2: at depth 2 the futures are consumed strictly in catalog order, so
+        inference order, manifest rows, and totals are identical to depth 1."""
+        db, make_preprocessor = stubbed_streaming
+        get_config().inference.prefetch_depth = 2
+        preprocessor = make_preprocessor(keys=[("A", "1"), ("B", "2"), ("C", "3"), ("D", "4")])
+
+        totals = _run_streaming_csv_inference(preprocessor, strategy=None)
+
+        assert totals["n_cadences"] == 4
+        pipeline = _StubPipeline.instances[-1]
+        assert pipeline.inferred_paths == [u.npy_path for u in preprocessor.units]
+        assert db.flush(timeout=10) is True
+        assert len(db.query_inference_cadences(tag="test_v1", status="inferred")) == 4
+
+    def test_prefetch_load_failure_falls_back_to_inference_thread(self, stubbed_streaming):
+        """#298 I5-overlap: a prefetch-side load failure must not abort the pass one
+        iteration later — the inference thread retries the load under its own per-cadence
+        containment."""
+        db, make_preprocessor = stubbed_streaming
+        preprocessor = make_preprocessor()
+        fail_once_path = preprocessor.units[0].npy_path
+        original_load = preprocessor.load_inference_data
+        failed: list[str] = []
+
+        def flaky_load(override_filepaths=None, parallel=True):
+            if override_filepaths == [fail_once_path] and fail_once_path not in failed:
+                failed.append(fail_once_path)
+                raise OSError("simulated transient read failure")
+            return original_load(override_filepaths=override_filepaths, parallel=parallel)
+
+        preprocessor.load_inference_data = flaky_load
+
+        totals = _run_streaming_csv_inference(preprocessor, strategy=None)
+
+        assert totals["n_cadences"] == 2
+        assert failed == [fail_once_path]  # prefetch failed once, fallback succeeded
+        assert db.flush(timeout=10) is True
+        assert len(db.query_inference_cadences(tag="test_v1", status="inferred")) == 2
+
     def test_stale_inference_results_superseded_on_retry(self, stubbed_streaming):
         """Partial positives written by a dead attempt must be flagged before the re-run's
         rows land, so candidates can't double up."""

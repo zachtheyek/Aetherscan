@@ -884,6 +884,12 @@ def _add_inference_flags_to(parser):
         default=None,
         help="Size of the seeded uniform reservoir of pass-1 rejects MC-scored as the candidate uncertainty plot's survey background (0 disables)",
     )
+    parser.add_argument(
+        "--prefetch-depth",
+        type=int,
+        default=None,
+        help="Cadences preprocessed+loaded ahead of the GPU stage in the streaming loop (>= 1). Depth 2 overlaps one cadence's energy-detection reads with the previous one's stamp extraction, costing one extra in-flight cadence of RAM; outputs are identical at any depth",
+    )
 
     # Energy detection preprocessing
     parser.add_argument(
@@ -1370,6 +1376,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.mc_draws = args.mc_draws
     if hasattr(args, "reference_cloud_size") and args.reference_cloud_size is not None:
         config.inference.reference_cloud_size = args.reference_cloud_size
+    if hasattr(args, "prefetch_depth") and args.prefetch_depth is not None:
+        config.inference.prefetch_depth = args.prefetch_depth
     if (
         hasattr(args, "per_replica_batch_size")
         and args.per_replica_batch_size is not None
@@ -2283,6 +2291,18 @@ def collect_validation_errors(
                     message=f"--reference-cloud-size must be >= 0, got {cloud_size}",
                     fix_kind="clamp_low",
                     min_val=0,
+                )
+            )
+
+        prefetch_depth = _resolve(args, "prefetch_depth", config.inference.prefetch_depth)
+        if prefetch_depth is not None and prefetch_depth < 1:
+            errors.append(
+                ValidationError(
+                    field="inference.prefetch_depth",
+                    current=prefetch_depth,
+                    message=f"--prefetch-depth must be a positive integer, got {prefetch_depth}",
+                    fix_kind="clamp_low",
+                    min_val=1,
                 )
             )
 

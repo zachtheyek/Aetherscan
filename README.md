@@ -779,6 +779,7 @@ usage: inference [-h] [--seed SEED]
                  [--screening-threshold SCREENING_THRESHOLD]
                  [--mc-draws MC_DRAWS]
                  [--reference-cloud-size REFERENCE_CLOUD_SIZE]
+                 [--prefetch-depth PREFETCH_DEPTH]
                  [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
@@ -894,6 +895,12 @@ options:
                         Size of the seeded uniform reservoir of pass-1 rejects
                         MC-scored as the candidate uncertainty plot's survey
                         background (0 disables)
+  --prefetch-depth PREFETCH_DEPTH
+                        Cadences preprocessed+loaded ahead of the GPU stage in
+                        the streaming loop (>= 1). Depth 2 overlaps one
+                        cadence's energy-detection reads with the previous
+                        one's stamp extraction, costing one extra in-flight
+                        cadence of RAM; outputs are identical at any depth
   --cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]
                         Space-separated list of CSV column names whose joint
                         value defines cadence membership (e.g., Target Session
