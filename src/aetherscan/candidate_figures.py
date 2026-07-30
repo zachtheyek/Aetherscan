@@ -53,8 +53,42 @@ def load_display_cadence(npy_path: str, snippet_index: int) -> np.ndarray:
     return log_norm(snippet)
 
 
-def draw_cadence_strip(axes_column, snippet: np.ndarray, label_rows: bool) -> None:
-    """Draw one snippet's 6 observation waterfalls down a column of axes."""
+def cadence_metadata_path(npy_path: str) -> str:
+    """Sibling .json path for a cadence's metadata — the same naming rule as
+    preprocessing.DataPreprocessor.cadence_metadata_path, duplicated here (one line) so
+    render workers never import the preprocessing module (manager/db singletons, setigen)."""
+    return os.path.splitext(npy_path)[0] + ".json"
+
+
+def stamp_frequency_range_mhz(metadata: dict, snippet_index: int) -> tuple[float, float] | None:
+    """
+    Frequency range (MHz) spanned by one stamp's frequency axis — bin 0 through the last
+    RAW bin — from the cadence metadata sidecar: header fch1/foff plus the stamp's start
+    index and stamp_width (#298 follow-up: cadence-snippet plots label their x-axis with
+    the frequency span). Returned in bin order, so a negative foff yields a descending
+    (high → low) pair — callers print it as-is. None when any field is missing or malformed
+    (legacy sidecars): callers keep the unlabeled axis.
+    """
+    try:
+        header = metadata.get("header") or {}
+        fch1 = float(header["fch1"])
+        foff = float(header["foff"])
+        start = int((metadata.get("stamp_starts") or [])[snippet_index])
+        width = int(metadata["stamp_width"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return fch1 + foff * start, fch1 + foff * (start + width - 1)
+
+
+def draw_cadence_strip(
+    axes_column,
+    snippet: np.ndarray,
+    label_rows: bool,
+    freq_range_mhz: tuple[float, float] | None = None,
+) -> None:
+    """Draw one snippet's 6 observation waterfalls down a column of axes. With
+    freq_range_mhz, the bottom axis is labeled with the stamp's frequency span (bin order,
+    so a descending pair reflects a negative foff)."""
     for obs_idx, ax in enumerate(axes_column):
         ax.imshow(
             snippet[obs_idx],
@@ -69,6 +103,9 @@ def draw_cadence_strip(axes_column, snippet: np.ndarray, label_rows: bool) -> No
         ax.set_yticks([])
         if label_rows:
             ax.set_ylabel(OBS_ROW_LABELS[obs_idx], fontsize=8, rotation=0, ha="right", va="center")
+    if freq_range_mhz is not None:
+        low, high = freq_range_mhz
+        axes_column[-1].set_xlabel(f"{low:.4f} → {high:.4f} MHz", fontsize=6)
 
 
 def candidate_annotation(row: dict) -> str:
@@ -87,13 +124,33 @@ def candidate_annotation(row: dict) -> str:
     return "\n".join(lines)
 
 
-def render_candidate_figure(row: dict, index: int, tag: str, plots_dir: str) -> str:
+def candidate_frequency_range_mhz(row: dict) -> tuple[float, float] | None:
+    """Best-effort frequency span for one candidate row: read its cadence's metadata
+    sidecar (derived from npy_path) and look up the stamp's range. None on any failure —
+    the figure keeps its generic axis label."""
+    try:
+        with open(cadence_metadata_path(str(row["npy_path"]))) as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+    return stamp_frequency_range_mhz(metadata, int(row["snippet_index"]))
+
+
+def render_candidate_figure(
+    row: dict,
+    index: int,
+    tag: str,
+    plots_dir: str,
+    freq_range_mhz: tuple[float, float] | None = None,
+) -> str:
     """
     Build and save one candidate's figure (the long-standing inference.py stub): 6-panel
     cadence waterfall of its stamp, annotated with confidence / frequency / target /
     session / band, plus the latent vector as a bar chart. Returns the saved PNG path.
-    Pure function of (row, index, tag, plots_dir) — no config/db/logger singletons — so it
-    runs identically in-process and in a forkserver worker.
+    Pure function of its arguments — no config/db/logger singletons — so it runs
+    identically in-process and in a forkserver worker. freq_range_mhz labels the waterfall
+    x-axis with the stamp's frequency span (callers precompute it from the metadata
+    sidecar; the axis stays generic when None).
     """
     snippet = load_display_cadence(str(row["npy_path"]), int(row["snippet_index"]))
     n_obs = snippet.shape[0]
@@ -102,7 +159,11 @@ def render_candidate_figure(row: dict, index: int, tag: str, plots_dir: str) -> 
     grid = fig.add_gridspec(n_obs, 2, width_ratios=(2.2, 1.6), hspace=0.15, wspace=0.25, right=0.97)
     waterfall_axes = [fig.add_subplot(grid[i, 0]) for i in range(n_obs)]
     draw_cadence_strip(waterfall_axes, snippet, label_rows=True)
-    waterfall_axes[-1].set_xlabel("frequency bin")
+    if freq_range_mhz is not None:
+        low, high = freq_range_mhz
+        waterfall_axes[-1].set_xlabel(f"frequency: {low:.6f} → {high:.6f} MHz")
+    else:
+        waterfall_axes[-1].set_xlabel("frequency bin")
 
     # Right column: latent bar chart on top, provenance text below. A nested gridspec gives
     # the two panels a dedicated vertical gap so the bar chart's x-axis label can never
@@ -156,9 +217,9 @@ def _pin_worker_threads() -> None:
 def _render_task(args: tuple) -> tuple[int, str | None]:
     """Worker body: render one candidate with _viz_safe-style containment (a failed figure
     must degrade the suite, never abort the pool pass)."""
-    row, index, tag, plots_dir = args
+    row, index, tag, plots_dir, freq_range_mhz = args
     try:
-        return index, render_candidate_figure(row, index, tag, plots_dir)
+        return index, render_candidate_figure(row, index, tag, plots_dir, freq_range_mhz)
     except Exception as e:
         logger.error(f"Candidate figure {index} failed (suite continues without it): {e}")
         return index, None
@@ -172,8 +233,13 @@ def render_candidate_figures(
     a forkserver process pool, falling back to in-process rendering for small candidate
     counts or any pool-level failure. Rows must be plain dicts of primitives (the
     inference_results row shape); paths are None for candidates whose render failed.
+    Frequency spans are resolved in the PARENT (one sidecar read per row, best-effort) so
+    workers stay pure.
     """
-    tasks = [(row, index, tag, plots_dir) for index, row in enumerate(rows)]
+    tasks = [
+        (row, index, tag, plots_dir, candidate_frequency_range_mhz(row))
+        for index, row in enumerate(rows)
+    ]
     if not tasks:
         return []
 

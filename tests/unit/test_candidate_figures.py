@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 
 from aetherscan.candidate_figures import (
+    candidate_frequency_range_mhz,
     render_candidate_figure,
     render_candidate_figures,
+    stamp_frequency_range_mhz,
 )
 
 
@@ -36,6 +38,48 @@ def candidate_rows(tmp_path):
         return row
 
     return _row
+
+
+class TestStampFrequencyRange:
+    """#298 follow-up: cadence-snippet plots label their x-axis with the stamp's frequency
+    span, computed from the metadata sidecar's header + stamp geometry."""
+
+    METADATA = {
+        "header": {"fch1": 2300.0, "foff": -1e-6},  # MHz per fine bin, descending
+        "stamp_starts": [0, 1000],
+        "stamp_width": 4096,
+    }
+
+    def test_exact_range_bin_order(self):
+        low, high = stamp_frequency_range_mhz(self.METADATA, 1)
+        assert low == 2300.0 - 1e-6 * 1000  # bin 0 of the stamp
+        assert high == 2300.0 - 1e-6 * (1000 + 4095)  # last raw bin
+        assert low > high  # negative foff: descending in bin order
+
+    @pytest.mark.parametrize(
+        "broken",
+        [
+            {},
+            {"header": {"fch1": 2300.0}},  # no foff
+            {"header": {"fch1": 2300.0, "foff": -1e-6}, "stamp_starts": []},  # index missing
+            {"header": {"fch1": 2300.0, "foff": -1e-6}, "stamp_starts": [0]},  # no stamp_width
+        ],
+    )
+    def test_missing_fields_return_none(self, broken):
+        assert stamp_frequency_range_mhz(broken, 0) is None
+
+    def test_candidate_range_reads_sidecar(self, tmp_path):
+        import json  # noqa: PLC0415
+
+        npy_path = tmp_path / "cad.npy"
+        with open(tmp_path / "cad.json", "w") as f:
+            json.dump(self.METADATA, f)
+        row = {"npy_path": str(npy_path), "snippet_index": 0}
+        assert candidate_frequency_range_mhz(row) == (2300.0, 2300.0 - 1e-6 * 4095)
+
+    def test_candidate_range_missing_sidecar_is_none(self, tmp_path):
+        row = {"npy_path": str(tmp_path / "nope.npy"), "snippet_index": 0}
+        assert candidate_frequency_range_mhz(row) is None
 
 
 class TestRenderCandidateFigure:

@@ -42,10 +42,12 @@ from matplotlib.figure import Figure
 
 from aetherscan.candidate_figures import (
     OBS_ROW_LABELS,
+    candidate_frequency_range_mhz,
     draw_cadence_strip,
     load_display_cadence,
     render_candidate_figure,
     render_candidate_figures,
+    stamp_frequency_range_mhz,
 )
 from aetherscan.config import get_config
 from aetherscan.db import get_db
@@ -592,7 +594,12 @@ def plot_stamp_gallery(records: list[CadenceVizRecord], metadatas: dict[str, dic
             for row in range(n_rows):
                 axes[row][col].set_axis_off()
             continue
-        draw_cadence_strip([axes[row][col] for row in range(n_rows)], snippet, label_rows=col == 0)
+        draw_cadence_strip(
+            [axes[row][col] for row in range(n_rows)],
+            snippet,
+            label_rows=col == 0,
+            freq_range_mhz=stamp_frequency_range_mhz(metadatas.get(record.npy_path) or {}, idx),
+        )
         axes[0][col].set_title(
             f"$k^2$={stat:.3g}\n{freq:.4f} MHz\n{_key_label(record.key, 20)}", fontsize=7
         )
@@ -718,7 +725,9 @@ def plot_candidate(row: dict, index: int) -> str | None:
     over the TF-free candidate_figures.render_candidate_figure (#298 I9 — the gallery path
     renders these across a forkserver pool; this in-process form serves direct callers)."""
     tag = get_config().checkpoint.save_tag
-    save_path = render_candidate_figure(row, index, tag, _plots_dir(tag))
+    save_path = render_candidate_figure(
+        row, index, tag, _plots_dir(tag), candidate_frequency_range_mhz(row)
+    )
     logger.info(f"Inference viz saved: {save_path}")
     _uploader.submit(save_path, f"Candidate {index} - ({tag}, {socket.gethostname()})")
     return save_path
@@ -774,7 +783,12 @@ def plot_candidate_gallery() -> str | None:
             for r in range(n_rows):
                 axes[r][col].set_axis_off()
             continue
-        draw_cadence_strip([axes[r][col] for r in range(n_rows)], snippet, label_rows=col == 0)
+        draw_cadence_strip(
+            [axes[r][col] for r in range(n_rows)],
+            snippet,
+            label_rows=col == 0,
+            freq_range_mhz=candidate_frequency_range_mhz(row),
+        )
         freq = row.get("frequency_mhz")
         freq_label = f"{freq:.4f} MHz" if freq is not None else "freq n/a"
         axes[0][col].set_title(
