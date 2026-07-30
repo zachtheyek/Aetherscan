@@ -190,6 +190,10 @@ def _init_plain_worker():
     """
     init_worker_logging()
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Marks this process as a pool worker: gates the per-worker h5 handle cache, which must
+    # never engage on the parent's (multi-threaded) sequential path — see _cached_h5_file
+    global _IN_POOL_WORKER
+    _IN_POOL_WORKER = True
 
 
 # NOTE: come back to this later
@@ -615,6 +619,35 @@ def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int)
     return k2
 
 
+# Per-worker cache of read-only h5py handles for the fused ED tasks (#298 rider): each
+# worker used to open/close the same 3 ON files once per coarse channel — ~2,859
+# open/close cycles per cadence against a network filesystem. Small LRU (the current
+# cadence's ON files plus slack); read-only input files, so a held handle can never go
+# stale, and handles die with the worker process. ED reads visit each chunk exactly once,
+# so the h5py default chunk cache on these handles is irrelevant (extraction, which DOES
+# revisit chunks, opens its own rdcc-sized handles — see _extract_stamps_worker).
+# POOL WORKERS ONLY (_IN_POOL_WORKER, set by _init_plain_worker): in sequential mode the
+# ED chain runs on the parent's prefetch thread(s), and h5py File objects must not be
+# shared across threads — the sequential path keeps its per-call open/close.
+_H5_HANDLE_CACHE: OrderedDict = OrderedDict()
+_H5_HANDLE_CACHE_MAX = 4
+_IN_POOL_WORKER = False
+
+
+def _cached_h5_file(h5_path: str):
+    handle = _H5_HANDLE_CACHE.get(h5_path)
+    if handle is not None and handle.id.valid:
+        _H5_HANDLE_CACHE.move_to_end(h5_path)
+        return handle
+    handle = h5py.File(h5_path, "r")
+    _H5_HANDLE_CACHE[h5_path] = handle
+    while len(_H5_HANDLE_CACHE) > _H5_HANDLE_CACHE_MAX:
+        _, evicted = _H5_HANDLE_CACHE.popitem(last=False)
+        with contextlib.suppress(Exception):
+            evicted.close()
+    return handle
+
+
 def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]:
     """
     Fused worker: run the complete energy-detection chain for one coarse channel — read the
@@ -644,8 +677,13 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
 
     start = channel_index * coarse_channel_width
     end = (channel_index + 1) * coarse_channel_width
-    with h5py.File(h5_path, "r") as hf:
-        channel = hf["data"][:time_bins, 0, start:end]
+    if _IN_POOL_WORKER:
+        channel = _cached_h5_file(h5_path)["data"][:time_bins, 0, start:end]
+    else:
+        # Sequential mode runs on the parent's prefetch thread(s) — h5py handles must not
+        # be shared across threads, so keep the per-call open/close there
+        with h5py.File(h5_path, "r") as hf:
+            channel = hf["data"][:time_bins, 0, start:end]
 
     # In-place DC spike removal. The spike sits at the channel center and the interpolation
     # offsets reach at most ±3 bins around it (see _remove_dc_spike), so per-channel
@@ -2424,7 +2462,12 @@ class DataPreprocessor:
         """
         if not hits:
             return []
-        sorted_hits = sorted(hits, key=lambda h: h[0])
+        # Stable argsort on the center index alone — the identical permutation to the old
+        # sorted(key=lambda h: h[0]) (stability preserves input order on ties), without
+        # comparing ~1e6 Python tuples on RFI-dense cadences (#298 rider; this runs
+        # serially on the prefetch critical path)
+        centers = np.fromiter((h[0] for h in hits), dtype=np.int64, count=len(hits))
+        sorted_hits = [hits[i] for i in np.argsort(centers, kind="stable")]
         half = stamp_width // 2
         merged: list[tuple] = [sorted_hits[0]]
         for h in sorted_hits[1:]:
