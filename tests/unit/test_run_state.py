@@ -23,6 +23,7 @@ from aetherscan.run_state import (
     config_fingerprint,
     inference_config_fingerprint,
     load_run_state,
+    preprocessing_config_fingerprint,
     run_state_path,
     save_run_state,
 )
@@ -313,3 +314,92 @@ class TestInferenceConfigFingerprint:
         d = copy.deepcopy(self.BASE)
         d["inference"][key] = value
         assert inference_config_fingerprint(d) == inference_config_fingerprint(self.BASE)
+
+
+class TestPreprocessingConfigFingerprint:
+    """preprocessing_config_fingerprint (#298 I3): keys the fingerprint-scoped stamp cache
+    directory. Scoring/model knobs must NOT flip it (a new encoder/threshold reuses stamps —
+    the whole point); ED-affecting keys and unknown new keys MUST flip it (fail-safe
+    denylist: an unrecognized key over-invalidates rather than silently reusing stamps)."""
+
+    BASE = {
+        "inference": {
+            "encoder_path": "/models/a/vae_encoder.keras",
+            "rf_path": "/models/a/random_forest.joblib",
+            "classification_threshold": 0.99,
+            "screening_threshold": 0.5,
+            "mc_draws": 32,
+            "reference_cloud_size": 10000,
+            "stat_threshold": 2048.0,
+            "coarse_channel_width": 1048576,
+            "bandpass_method": "pfb",
+            "pfb_taps_per_channel": 12,
+            "stamp_width": 4096,
+            "overlap_fraction": 0.5,
+            "cadence_group_by_cols": ["Target", "Session"],
+            "max_retries": 3,
+        },
+        "data": {
+            "downsample_factor": 8,
+            "width_bin": 4096,
+            "num_observations": 6,
+            "time_bins": 16,
+        },
+    }
+
+    def _mutate(self, section, key, value):
+        d = copy.deepcopy(self.BASE)
+        d[section][key] = value
+        return d
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("encoder_path", "/models/b/vae_encoder.keras"),
+            ("rf_path", "/models/b/random_forest.joblib"),
+            ("classification_threshold", 0.5),
+            ("screening_threshold", 0.25),
+            ("mc_draws", 64),
+            ("reference_cloud_size", 0),
+            ("max_retries", 9),
+        ],
+    )
+    def test_scoring_and_inert_keys_keep_fingerprint(self, key, value):
+        assert preprocessing_config_fingerprint(
+            self._mutate("inference", key, value)
+        ) == preprocessing_config_fingerprint(self.BASE)
+
+    @pytest.mark.parametrize(
+        "section,key,value",
+        [
+            ("inference", "stat_threshold", 1024.0),
+            ("inference", "coarse_channel_width", 524288),
+            ("inference", "bandpass_method", "spline"),
+            ("inference", "pfb_taps_per_channel", 4),
+            ("inference", "stamp_width", 2048),
+            ("inference", "overlap_fraction", 0.25),
+            ("inference", "cadence_group_by_cols", ["Target"]),
+            ("data", "downsample_factor", 4),
+            ("data", "width_bin", 2048),
+        ],
+    )
+    def test_ed_affecting_change_flips_fingerprint(self, section, key, value):
+        assert preprocessing_config_fingerprint(
+            self._mutate(section, key, value)
+        ) != preprocessing_config_fingerprint(self.BASE)
+
+    def test_unknown_new_key_over_invalidates(self):
+        # The denylist's fail-safe: a future inference field this module has never heard of
+        # must flip the fingerprint (forcing a harmless re-preprocess), never reuse stamps.
+        d = copy.deepcopy(self.BASE)
+        d["inference"]["some_future_ed_knob"] = 7
+        assert preprocessing_config_fingerprint(d) != preprocessing_config_fingerprint(self.BASE)
+
+    def test_differs_from_inference_fingerprint_scope(self):
+        # Scoring changes flip the RESUME fingerprint (re-infer) while keeping the
+        # PREPROCESSING fingerprint (reuse stamps) — the two guards protect different things.
+        changed = self._mutate("inference", "classification_threshold", 0.5)
+        assert inference_config_fingerprint(changed) != inference_config_fingerprint(self.BASE)
+        assert preprocessing_config_fingerprint(changed) == preprocessing_config_fingerprint(
+            self.BASE
+        )

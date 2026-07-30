@@ -536,9 +536,12 @@ class InferenceConfig:
     side_channel_count: int = 0
 
     # Per-cadence .npy output directory for energy-detection preprocessing. None (default)
-    # resolves per CSV to {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/ — tag
-    # scoping keeps runs isolated (same-tag retries resume; a new tag starts clean). Set
-    # explicitly to share/reuse one directory across runs and CSVs.
+    # resolves per CSV to {data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/, keyed
+    # on the ED-config fingerprint (#298 I3): runs sharing an ED config share stamps (a
+    # threshold sweep or re-inference with new weights skips preprocessing entirely), while
+    # any ED-config change lands in a different directory by construction. Set explicitly
+    # to pin one directory across runs and CSVs (the resume guard still verifies each
+    # sidecar's h5_paths and recorded fingerprint before reuse).
     preprocess_output_dir: str | None = None
 
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming

@@ -40,6 +40,7 @@ from aetherscan.preprocessing import (
     derive_cadence_provenance,
     group_observations_from_csv,
 )
+from aetherscan.run_state import preprocessing_config_fingerprint
 
 _TESTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES_DIR = os.path.join(_TESTS_ROOT, "fixtures")
@@ -1025,11 +1026,13 @@ class TestDecimateForPlot:
 
 
 class TestPlanCadencesOutputDir:
-    """plan_cadences resolves the .npy output dir per CSV: tag-scoped default under
-    {data_path}/inference/preprocessed/, with an explicit --preprocess-output-dir shared
-    across CSVs."""
+    """plan_cadences resolves the .npy output dir per CSV: ED-fingerprint-scoped default
+    under {data_path}/inference/preprocessed/ (#298 I3 — runs sharing an ED config share
+    stamps), with an explicit --preprocess-output-dir shared across CSVs."""
 
-    def test_default_is_per_csv_tag_scoped(self, initialized_runtime, make_inference_csv):
+    def test_default_is_fingerprint_scoped_not_tag_scoped(
+        self, initialized_runtime, make_inference_csv
+    ):
         config = get_config()
         make_inference_csv("subset.csv")
         config.data.inference_files = ["subset.csv"]
@@ -1038,26 +1041,44 @@ class TestPlanCadencesOutputDir:
         units = DataPreprocessor().plan_cadences()
 
         assert len(units) == 1
-        expected_dir = os.path.join(config.data_path, "inference", "preprocessed", "subset_test_v1")
+        fingerprint = preprocessing_config_fingerprint(config.to_dict())
+        expected_dir = os.path.join(
+            config.data_path, "inference", "preprocessed", f"subset_ed{fingerprint[:12]}"
+        )
         assert os.path.dirname(units[0].npy_path) == expected_dir
         assert os.path.isdir(expected_dir)
+        assert "test_v1" not in os.path.basename(expected_dir)
 
-    def test_new_tag_gets_clean_directory(self, initialized_runtime, make_inference_csv):
+    def test_scoring_change_reuses_directory(self, initialized_runtime, make_inference_csv):
+        # The point of #298 I3: a new threshold / model must land in the SAME stamp dir
         config = get_config()
         make_inference_csv("subset.csv")
         config.data.inference_files = ["subset.csv"]
 
         config.checkpoint.save_tag = "test_v1"
         first = DataPreprocessor().plan_cadences()
-        # Plant a stale stamp from the old tag's attempt at exactly the path resume keys on
+        config.checkpoint.save_tag = "test_v2"
+        config.inference.classification_threshold = 0.5
+        config.inference.encoder_path = "/some/other/encoder.keras"
+        second = DataPreprocessor().plan_cadences()
+
+        assert os.path.dirname(first[0].npy_path) == os.path.dirname(second[0].npy_path)
+
+    def test_ed_change_gets_clean_directory(self, initialized_runtime, make_inference_csv):
+        config = get_config()
+        make_inference_csv("subset.csv")
+        config.data.inference_files = ["subset.csv"]
+
+        first = DataPreprocessor().plan_cadences()
+        # Plant a stale stamp at exactly the path resume keys on
         with open(first[0].npy_path, "wb") as f:
             f.write(b"stale")
-        config.checkpoint.save_tag = "test_v2"
+        config.inference.stat_threshold = 4096.0  # an ED-affecting change
         second = DataPreprocessor().plan_cadences()
 
         assert os.path.dirname(first[0].npy_path) != os.path.dirname(second[0].npy_path)
-        # The new tag's unit must not see the old stamp — process_pending_cadence would
-        # otherwise resume-skip the cadence off the stale file.
+        # The new config's unit must not see the old stamp — process_pending_cadence would
+        # otherwise resume-skip the cadence off stamps produced under a different ED config.
         assert not os.path.exists(second[0].npy_path)
 
     def test_duplicate_csv_basenames_rejected(self, initialized_runtime, make_inference_csv):
@@ -1085,6 +1106,66 @@ class TestPlanCadencesOutputDir:
 
         assert len(units) == 2
         assert {os.path.dirname(u.npy_path) for u in units} == {override}
+
+
+class TestResumeProvenanceGuard:
+    """#298 I3: an existing stamp .npy is only reused when its metadata sidecar's h5_paths
+    and recorded ED fingerprint match; missing/legacy metadata degrades to warn-and-reuse."""
+
+    def _group_and_paths(self, tmp_path, h5_paths=None):
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        group = CadenceGroup(
+            key=("T", "S", "L", "1", "1400"),
+            h5_paths=h5_paths or [f"/data/obs_{i}.h5" for i in range(6)],
+            csv_path="catalog.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "cadence.npy")
+        metadata_path = DataPreprocessor.cadence_metadata_path(npy_path)
+        return group, npy_path, metadata_path
+
+    def _write_metadata(self, metadata_path, **fields):
+        with open(metadata_path, "w") as f:
+            json.dump(fields, f)
+
+    def test_matching_metadata_reuses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(
+            metadata_path,
+            h5_paths=group.h5_paths,
+            ed_config_fingerprint=preprocessing_config_fingerprint(get_config().to_dict()),
+        )
+        assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_h5_path_mismatch_reprocesses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(metadata_path, h5_paths=[f"/other/obs_{i}.h5" for i in range(6)])
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_fingerprint_mismatch_reprocesses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, ed_config_fingerprint="deadbeef"
+        )
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_missing_metadata_reuses_with_warning(self, tmp_path, initialized_runtime, caplog):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        assert any("unguarded" in r.message for r in caplog.records)
+
+    def test_legacy_metadata_without_fingerprint_reuses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(metadata_path, h5_paths=group.h5_paths)
+        assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
 
 
 class TestLoadInferenceDataPaths:

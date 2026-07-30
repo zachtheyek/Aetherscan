@@ -12,6 +12,7 @@ import contextlib
 import csv
 import functools
 import gc
+import glob
 import json
 import logging
 import math
@@ -41,6 +42,7 @@ from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 from aetherscan.pfb import edge_mid_band_slices, equalize_passband, gen_coarse_channel_response
+from aetherscan.run_state import preprocessing_config_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,10 @@ _CHUNK_CACHE_NSLOTS = 10007
 # ~44% of worker-seconds. ~4 tasks/worker keeps the tail to ~1/4 of one task length while
 # each task still spans enough contiguous sorted stamps for chunk-cache reuse to pay.
 _EXTRACT_TASKS_PER_WORKER = 4
+# Age past which an unpromoted *.tmp.npy in the (cross-run, #298 I3) stamp cache directory
+# is considered abandoned and removed. Live writes are minutes-scale; a day of margin means
+# a concurrent run's in-progress tmp can never be mistaken for a dead one.
+_STALE_TMP_MAX_AGE_S = 24 * 3600
 
 
 def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
@@ -920,10 +926,6 @@ class DataPreprocessor:
         # Persistent worker pool for energy detection + stamp extraction, shared across all
         # cadences of a run (see start/stop_energy_detection_pool)
         self._ed_pool: Pool | None = None
-        # Verified PFB response sidecars, keyed by (fine_per_coarse, n_coarse, taps): skips
-        # the per-cadence np.load + np.array_equal re-verification of the ~8 MB sidecar
-        # once this run has already validated it (#298 rider)
-        self._verified_pfb_response_paths: dict[tuple[int, int, int], str] = {}
 
     # NOTE: come back to this later
     def close(self):
@@ -1469,10 +1471,10 @@ class DataPreprocessor:
             logger.warning("plan_cadences() called with no inference_files configured")
             return []
 
-        # Fail fast on duplicate CSV basename stems: both the tag-scoped default output dir
-        # and the per-cadence stamp .npy names are keyed on the stem, so two entries like
-        # runA/x.csv and runB/x.csv would silently share a directory (and/or stamp filenames)
-        # and cross-resume each other's cadences.
+        # Fail fast on duplicate CSV basename stems: both the fingerprint-scoped default
+        # output dir and the per-cadence stamp .npy names are keyed on the stem, so two
+        # entries like runA/x.csv and runB/x.csv would silently share a directory (and/or
+        # stamp filenames) and cross-resume each other's cadences.
         stem_sources: dict[str, str] = {}
         for csv_filename in inference_files:
             stem = os.path.splitext(os.path.basename(csv_filename))[0]
@@ -1485,15 +1487,21 @@ class DataPreprocessor:
                 )
             stem_sources[stem] = csv_filename
 
-        # Output directory resolution: an explicit --preprocess-output-dir is used as-is
-        # (shared across CSVs); otherwise each CSV gets its own tag-scoped default,
-        # {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/. Tag scoping trades
-        # cross-run caching for isolation: a retry under the same tag still resumes via the
-        # existing-.npy skip, while a fresh run (new datetime tag) starts from a clean
-        # directory that stale stamps from an older failed attempt can't leak into. To reuse
-        # an old run's preprocessing, pass its directory explicitly.
+        # Output directory resolution (#298 I3): an explicit --preprocess-output-dir is
+        # used as-is (shared across CSVs); otherwise each CSV gets its own ED-FINGERPRINT-
+        # scoped default, {data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/. Energy
+        # detection is deterministic given (csv, h5 files, ED config), so any run sharing
+        # the ED config reuses the stamps — threshold sweeps and re-inference with new
+        # weights skip preprocessing entirely — while any ED-config change lands in a
+        # different directory by construction (the fingerprint is a fail-safe denylist —
+        # see run_state.preprocessing_config_fingerprint). Staleness is impossible for a
+        # published .npy (atomic tmp -> os.replace publication + per-run-unique tmp names);
+        # the resume guard additionally verifies each sidecar's h5_paths and fingerprint.
+        # This deliberately replaces the old <csv_stem>_<save_tag> tag-scoped default
+        # (maintainer decision on #298): scores stay tag-scoped in the DB — only the
+        # deterministic preprocessing artifacts are shared.
         explicit_output_dir = self.config.inference.preprocess_output_dir
-        save_tag = self.config.checkpoint.save_tag
+        ed_fingerprint = preprocessing_config_fingerprint(self.config.to_dict())
 
         group_by_cols = self.config.inference.cadence_group_by_cols
         h5_path_col = self.config.inference.cadence_h5_path_col
@@ -1523,7 +1531,7 @@ class DataPreprocessor:
             csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
 
             output_dir = explicit_output_dir or self.config.get_inference_file_path(
-                os.path.join("preprocessed", f"{csv_stem}_{save_tag}")
+                os.path.join("preprocessed", f"{csv_stem}_ed{ed_fingerprint[:12]}")
             )
             os.makedirs(output_dir, exist_ok=True)
             logger.info(f"Preprocessing output directory for {csv_filename}: {output_dir}")
@@ -1568,16 +1576,19 @@ class DataPreprocessor:
                 # Fall through (no return) to the _process_cadence call below so a
                 # corrupted .npy gets regenerated rather than silently skipped.
             else:
-                logger.info(
-                    f"Skipping cadence {group.key}: {npy_path} already exists ({n_hits} hits)"
-                )
-                return CadenceResult(
-                    npy_path=npy_path,
-                    h5_paths=group.h5_paths,
-                    key=group.key,
-                    n_hits=n_hits,
-                    metadata_path=metadata_path,
-                )
+                if self._resume_provenance_ok(group, npy_path, metadata_path):
+                    logger.info(
+                        f"Skipping cadence {group.key}: {npy_path} already exists ({n_hits} hits)"
+                    )
+                    return CadenceResult(
+                        npy_path=npy_path,
+                        h5_paths=group.h5_paths,
+                        key=group.key,
+                        n_hits=n_hits,
+                        metadata_path=metadata_path,
+                    )
+                # Guard failed: fall through and reprocess (the atomic tmp -> os.replace
+                # publication overwrites the mismatched artifact)
 
         try:
             # Umbrella stage span for this cadence's preprocessing phase — the per-ON-file
@@ -1588,6 +1599,47 @@ class DataPreprocessor:
         except Exception as e:
             logger.error(f"Failed to process cadence {group.key}: {e}")
             return None
+
+    def _resume_provenance_ok(self, group: CadenceGroup, npy_path: str, metadata_path: str) -> bool:
+        """
+        Provenance guard on stamp reuse (#298 I3): an existing .npy is trusted only when its
+        sidecar metadata's h5_paths match this cadence's files and its recorded
+        ed_config_fingerprint (when present) matches the current config's. With the
+        fingerprint-scoped default directory the fingerprint check is belt-and-braces (a
+        changed ED config lands in a different directory by construction); the h5_paths
+        check is what protects an EXPLICIT --preprocess-output-dir against reusing another
+        catalog's stamps. Missing/unreadable metadata or a metadata file without the
+        fingerprint field (a pre-#298 artifact in an explicitly shared directory) degrades
+        to a warn-and-reuse — the historical, unguarded behavior — never a hard failure.
+        """
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                f"Cadence {group.key}: existing stamps at {npy_path} have no readable "
+                f"metadata sidecar ({e}); reusing them unguarded (historical behavior)"
+            )
+            return True
+
+        recorded_h5_paths = metadata.get("h5_paths")
+        if recorded_h5_paths is not None and list(recorded_h5_paths) != list(group.h5_paths):
+            logger.warning(
+                f"Cadence {group.key}: existing stamps at {npy_path} were extracted from "
+                f"DIFFERENT .h5 files than this cadence's; reprocessing instead of reusing"
+            )
+            return False
+
+        recorded_fingerprint = metadata.get("ed_config_fingerprint")
+        if recorded_fingerprint is not None:
+            current = preprocessing_config_fingerprint(self.config.to_dict())
+            if recorded_fingerprint != current:
+                logger.warning(
+                    f"Cadence {group.key}: existing stamps at {npy_path} were written under "
+                    f"a DIFFERENT energy-detection config; reprocessing instead of reusing"
+                )
+                return False
+        return True
 
     # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
     def find_hits(self) -> list[CadenceResult]:
@@ -1910,16 +1962,25 @@ class DataPreprocessor:
         # (which treats npy_path's existence as proof of a complete write) still holds.
         n_stamps = len(stamp_centers)
         stored_width = stamp_width // downsample_factor
-        tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
-        # A leftover .tmp.npy means a previous attempt died (e.g. SIGKILL) between memmap
-        # creation and os.replace; it was never promoted to npy_path, so it's safe to drop
-        # (open_memmap would truncate it anyway — the warning is the point)
-        if os.path.exists(tmp_npy_path):
-            logger.warning(
-                f"Cadence {group.key}: removing stale partial output {tmp_npy_path} "
-                f"from an interrupted previous run"
-            )
-            os.remove(tmp_npy_path)
+        # Per-run-unique tmp name (#298 I3): the default output dir is now shared across
+        # runs with the same ED config, and a single fixed "<stem>.tmp.npy" would let two
+        # concurrent runs truncate/delete each other's in-progress write. Content is
+        # deterministic given the ED config, so whichever writer publishes last is
+        # harmless; os.replace stays atomic.
+        tmp_npy_path = f"{os.path.splitext(npy_path)[0]}.{os.getpid()}.{uuid.uuid4().hex}.tmp.npy"
+        # A leftover *.tmp.npy means an attempt died (e.g. SIGKILL) between memmap creation
+        # and os.replace; it was never promoted to npy_path, so it is safe to drop once
+        # clearly abandoned. Only age-expired tmps are removed — a fresh one may be a live
+        # concurrent run's in-progress write.
+        stale_cutoff = time.time() - _STALE_TMP_MAX_AGE_S
+        for stale in glob.glob(f"{glob.escape(os.path.splitext(npy_path)[0])}.*.tmp.npy"):
+            with contextlib.suppress(OSError):
+                if os.path.getmtime(stale) < stale_cutoff:
+                    logger.warning(
+                        f"Cadence {group.key}: removing stale partial output {stale} "
+                        f"from an interrupted previous run"
+                    )
+                    os.remove(stale)
         # NOTE: np.lib.format.open_memmap is a semi-public numpy API (stable across 1.x and
         # documented via np.lib.format); revisit if a future numpy bump moves it
         memmap = np.lib.format.open_memmap(
@@ -2005,10 +2066,17 @@ class DataPreprocessor:
             "n_merged_hits": len(merged_hits),
             "raw_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in all_hits],
             "merged_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in merged_hits],
+            # The ED config these stamps were produced under (#298 I3) — checked by the
+            # resume guard before an existing .npy is reused
+            "ed_config_fingerprint": preprocessing_config_fingerprint(self.config.to_dict()),
         }
-        tmp_metadata_path = metadata_path + ".tmp"
+        # Per-run-unique tmp + compact separators (#298 I3 + rider): the metadata sidecar
+        # shares the cross-run cache directory (same clobber race as the .npy tmp), and
+        # indent=2 over the 1e4-1e5-float hit lists cost ~0.5-1.5 s per cadence ON THE
+        # PREFETCH CRITICAL PATH for purely cosmetic whitespace.
+        tmp_metadata_path = f"{metadata_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(tmp_metadata_path, "w") as f:
-            json.dump(self._to_json_safe(metadata), f, indent=2)
+            json.dump(self._to_json_safe(metadata), f, separators=(",", ":"))
         os.replace(tmp_metadata_path, metadata_path)
 
         # NOTE: the full gc.collect() that used to run here sat on the PREFETCH thread's
@@ -2092,14 +2160,10 @@ class DataPreprocessor:
         stale-run leftovers are impossible; a corrupt or mismatched file is rewritten. Writes
         are atomic (tmp + os.replace), matching the stamp-extraction pattern.
         """
-        # Once this run has verified (or written) the sidecar for a parameter tuple, skip
-        # the per-cadence np.load + np.array_equal round trip (#298 rider) — the file is
-        # content-addressed and nothing in-run rewrites a verified path.
-        memo_key = (fine_per_coarse, num_coarse_channels, taps_per_channel)
-        memoized = self._verified_pfb_response_paths.get(memo_key)
-        if memoized is not None and os.path.exists(memoized):
-            return memoized
-
+        # NOTE: deliberately NOT memoized (#298 considered and rejected it): the per-cadence
+        # np.load + np.array_equal round trip (~15 ms) is what makes the documented
+        # "a corrupt or mismatched sidecar is transparently rewritten" contract hold
+        # WITHIN a run, and the saving is sub-noise against a multi-minute cadence.
         response = gen_coarse_channel_response(
             fine_per_coarse, num_coarse_channels, taps_per_channel
         )
@@ -2115,7 +2179,6 @@ class DataPreprocessor:
             try:
                 existing = np.load(path)
                 if np.array_equal(existing, response):
-                    self._verified_pfb_response_paths[memo_key] = path
                     return path
                 logger.warning(f"PFB response cache {path} does not match; rewriting")
             except Exception as e:
@@ -2129,7 +2192,6 @@ class DataPreprocessor:
             np.save(f, response)
         os.replace(tmp_path, path)
         logger.info(f"Wrote PFB response cache: {path}")
-        self._verified_pfb_response_paths[memo_key] = path
         return path
 
     @staticmethod

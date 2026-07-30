@@ -117,6 +117,47 @@ _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS = frozenset(
 _INFERENCE_FINGERPRINT_DATA_KEYS = frozenset(
     {"downsample_factor", "width_bin", "num_observations", "time_bins"}
 )
+# Scoring/model keys excluded ON TOP of the inference denylist for the PREPROCESSING
+# fingerprint (#298 I3): energy detection is deterministic given (csv files, h5 files, ED
+# config), so a changed encoder/RF/threshold must REUSE stamps — that is the whole point of
+# the fingerprint-scoped stamp cache. Everything else in the inference section (cadence
+# grouping columns, channelization, bandpass method/taps, detection windows/threshold, stamp
+# geometry, overlap, the downsample toggle) stays IN the hash. This too is a DENYLIST, never
+# an ED-key allowlist: an allowlist that missed a key (say coarse_channel_width) would
+# silently REUSE WRONG STAMPS when that key changes; a denylist can only over-invalidate.
+_PREPROCESSING_FINGERPRINT_EXTRA_EXCLUDE_KEYS = frozenset(
+    {
+        "encoder_path",
+        "rf_path",
+        "classification_threshold",
+        "screening_threshold",
+        "mc_draws",
+        "reference_cloud_size",
+    }
+)
+
+
+def preprocessing_config_fingerprint(config_dict: dict) -> str:
+    """
+    Stable hash of the PREPROCESSING-result-affecting config — everything that changes what
+    energy detection writes into a stamp .npy (#298 I3). Keys the default stamp cache
+    directory ({data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/), is persisted into
+    each cadence's metadata JSON as ed_config_fingerprint, and is verified by the resume
+    guard — so runs sharing an ED config share stamps, and any ED-config change lands in a
+    different directory by construction.
+    """
+    inference = config_dict.get("inference") or {}
+    data = config_dict.get("data") or {}
+    excluded = (
+        _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS
+        | _PREPROCESSING_FINGERPRINT_EXTRA_EXCLUDE_KEYS
+    )
+    relevant = {
+        "inference": {k: v for k, v in inference.items() if k not in excluded},
+        "data": {k: data[k] for k in _INFERENCE_FINGERPRINT_DATA_KEYS if k in data},
+    }
+    canonical = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def inference_config_fingerprint(config_dict: dict) -> str:

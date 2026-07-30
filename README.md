@@ -967,12 +967,14 @@ options:
                         overlap-search stamps (default: 0.5)
   --preprocess-output-dir PREPROCESS_OUTPUT_DIR
                         Directory for per-cadence .npy outputs from
-                        preprocessing. Default: a per-CSV, tag-scoped
-                        directory {data_path}/inference/preprocessed/<csv_stem
-                        >_<save_tag>/ — retrying with the same tag resumes
-                        from existing .npy files, while a new tag starts
-                        clean. Pass an old run's directory explicitly to reuse
-                        its preprocessing (shared across CSVs)
+                        preprocessing. Default: a per-CSV directory {data_path
+                        }/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on
+                        the energy-detection config fingerprint — runs sharing
+                        an ED config reuse each other's stamps automatically,
+                        and any ED-config change resolves to a fresh
+                        directory. Pass a directory explicitly to pin/share
+                        one location (reuse is still guarded by the sidecar's
+                        recorded h5 paths and ED fingerprint)
   --inference-viz, --no-inference-viz
                         Render the inference visualization suite (energy
                         detection distributions, hit spectrum, bandpass
