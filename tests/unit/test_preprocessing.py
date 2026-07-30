@@ -557,16 +557,32 @@ class TestProcessCadenceEndToEnd:
         npy_path = str(tmp_path / "out" / "cadence.npy")
         os.makedirs(os.path.dirname(npy_path), exist_ok=True)
 
-        # A stale partial output from an interrupted previous run must be detected,
-        # warned about, and removed before extraction proceeds
+        # Abandoned partial outputs are age-swept (#298 I3: tmp names are per-run-unique in
+        # the shared cache dir, so only AGE proves abandonment): an expired tmp — legacy
+        # fixed name or unique-name — is removed; a fresh unique-name tmp may be a live
+        # concurrent run's in-progress write and must survive.
+        import time as time_module  # noqa: PLC0415
+
+        expired = (time_module.time() - 25 * 3600,) * 2
         stale_tmp = os.path.splitext(npy_path)[0] + ".tmp.npy"
         with open(stale_tmp, "wb") as f:
+            f.write(b"junk from a SIGKILLed pre-#298 run")
+        os.utime(stale_tmp, expired)
+        stale_unique_tmp = os.path.splitext(npy_path)[0] + ".12345.deadbeef.tmp.npy"
+        with open(stale_unique_tmp, "wb") as f:
             f.write(b"junk from a SIGKILLed run")
+        os.utime(stale_unique_tmp, expired)
+        fresh_tmp = os.path.splitext(npy_path)[0] + ".67890.cafebabe.tmp.npy"
+        with open(fresh_tmp, "wb") as f:
+            f.write(b"a live concurrent run's in-progress write")
 
         preprocessor = DataPreprocessor()
         result = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
 
         assert not os.path.exists(stale_tmp)
+        assert not os.path.exists(stale_unique_tmp)
+        assert os.path.exists(fresh_tmp)
+        os.remove(fresh_tmp)
         assert result is not None
         assert result.npy_path == npy_path
         stamps = np.load(npy_path)

@@ -1971,9 +1971,11 @@ class DataPreprocessor:
         # A leftover *.tmp.npy means an attempt died (e.g. SIGKILL) between memmap creation
         # and os.replace; it was never promoted to npy_path, so it is safe to drop once
         # clearly abandoned. Only age-expired tmps are removed — a fresh one may be a live
-        # concurrent run's in-progress write.
+        # concurrent run's in-progress write. The fixed pre-#298 "<stem>.tmp.npy" name is
+        # swept too (legacy leftovers in explicitly shared directories).
         stale_cutoff = time.time() - _STALE_TMP_MAX_AGE_S
-        for stale in glob.glob(f"{glob.escape(os.path.splitext(npy_path)[0])}.*.tmp.npy"):
+        stem = os.path.splitext(npy_path)[0]
+        for stale in glob.glob(f"{glob.escape(stem)}.*.tmp.npy") + [f"{stem}.tmp.npy"]:
             with contextlib.suppress(OSError):
                 if os.path.getmtime(stale) < stale_cutoff:
                     logger.warning(
