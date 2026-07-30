@@ -31,6 +31,8 @@ from aetherscan.preprocessing import (
     _energy_detect_channel_worker,
     _extract_stamps_worker,
     _fit_channel_bandpass,
+    _log_norm_chunk_vectorized,
+    _lognorm_worker,
     _pfb_flatten_bandpass,
     _remove_dc_spike,
     _sliding_normality_k2,
@@ -351,6 +353,49 @@ class TestDeriveCadenceProvenance:
         assert prov["session"] is None
         assert prov["band"] is None
         assert prov["cadence_id"] is None
+
+
+class TestLogNormChunkVectorized:
+    """#298 I5: the vectorized chunk log-norm must reproduce _lognorm_worker bit-for-bit —
+    same validity decisions, same float32 arithmetic, same zero-range guard."""
+
+    def _chunk(self, dtype=np.float32):
+        rng = np.random.default_rng(31)
+        chunk = rng.chisquare(df=4, size=(7, 6, 4, 16)).astype(dtype)
+        chunk[1, 0, 0, 0] = np.nan  # invalid: NaN
+        chunk[3, 2, 1, 5] = np.inf  # invalid: Inf
+        chunk[5] = 0.0  # invalid: non-positive max
+        chunk[6] = 2.5  # valid but constant: zero range after the log shift
+        return chunk
+
+    def _worker_reference(self, chunk, monkeypatch):
+        import aetherscan.preprocessing as preprocessing_module  # noqa: PLC0415
+
+        monkeypatch.setattr(preprocessing_module, "_GLOBAL_CHUNK_DATA", chunk)
+        rows, valid = [], []
+        for i in range(len(chunk)):
+            result = _lognorm_worker((i,))
+            valid.append(result is not None)
+            if result is not None:
+                rows.append(result)
+        return np.array(rows, dtype=np.float32), np.array(valid)
+
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_matches_lognorm_worker_bitwise(self, dtype, monkeypatch):
+        chunk = self._chunk(dtype)
+        expected_rows, expected_valid = self._worker_reference(chunk, monkeypatch)
+
+        normalized, valid = _log_norm_chunk_vectorized(chunk)
+
+        np.testing.assert_array_equal(valid, expected_valid)
+        np.testing.assert_array_equal(normalized, expected_rows)
+        assert normalized.dtype == np.float32
+
+    def test_all_invalid_chunk_returns_empty(self):
+        chunk = np.zeros((3, 6, 4, 16), dtype=np.float32)
+        normalized, valid = _log_norm_chunk_vectorized(chunk)
+        assert len(normalized) == 0
+        assert not valid.any()
 
 
 class TestChunkCacheKwargs:

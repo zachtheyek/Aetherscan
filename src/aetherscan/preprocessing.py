@@ -248,6 +248,36 @@ def _lognorm_worker(args):
     return log_norm(cadence.astype(np.float32))
 
 
+def _log_norm_chunk_vectorized(chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized equivalent of mapping _lognorm_worker over every cadence of `chunk`
+    (n, obs, time_bins, width): returns (normalized_valid_rows, valid_mask) (#298 I5).
+
+    Bit-identical per element to the per-cadence path, by construction: the validity rule is
+    the same (any NaN/Inf or non-positive max rejects the cadence — NaN/Inf rows fail the
+    finite mask, so the max comparison never decides them); the arithmetic runs in float32
+    with the same scalar casts (numpy converts the 1e-10 epsilon and the per-cadence min/max
+    scalars to float32 in both forms); min/max are exact order-independent reductions; and
+    rows whose post-shift range is 0 skip the division exactly as log_norm's range_log > 0
+    guard does. Pinned by a unit test against _lognorm_worker on a mixed valid/invalid chunk.
+    """
+    reduce_axes = (1, 2, 3)
+    finite = np.isfinite(chunk).all(axis=reduce_axes)
+    maxes = chunk.max(axis=reduce_axes)
+    with np.errstate(invalid="ignore"):
+        valid = finite & (maxes > 0)
+
+    # Advanced indexing always yields a fresh array we own, so copy=False only avoids a
+    # second copy when the dtype is already float32 — in-place mutation below is safe.
+    data = chunk[valid].astype(np.float32, copy=False)
+    data += 1e-10
+    np.log(data, out=data)
+    data -= data.min(axis=reduce_axes, keepdims=True)
+    ranges = data.max(axis=reduce_axes, keepdims=True)
+    np.divide(data, ranges, out=data, where=ranges > 0)
+    return data, valid
+
+
 # NOTE: come back to this later (mirrors preprocess_fine.py:72-75 from the reference implementation)
 def _remove_dc_spike(
     block_data: np.ndarray, coarse_channel_width: int, n_coarse_channels: int
@@ -1000,6 +1030,9 @@ class DataPreprocessor:
                     self.manager.close_pool(chunk_pool)
                     chunk_pool = None
                 del chunk_shm, chunk_pool
+                # Release the module-global staging reference (#298 rider) — same leak as
+                # the inference loader: the local dels above don't clear the global name
+                _GLOBAL_CHUNK_DATA = None
                 gc.collect()
 
             # Clear raw_data reference
@@ -1071,7 +1104,11 @@ class DataPreprocessor:
         logger.info(f"Processing chunks of: {chunk_size}")
         logger.info(f"Final resolution: {final_width}")
 
-        all_cadences = []
+        global _GLOBAL_CHUNK_DATA
+        # Per-chunk float32 blocks of already-normalized cadences, concatenated once at the
+        # end (#298 I5) — replaces the per-cadence list whose final np.array() restack
+        # re-copied every row through a Python loop.
+        all_blocks: list[np.ndarray] = []
 
         if override_filepaths is not None:
             # Iterate absolute paths directly (e.g. per-cadence .npy outputs from find_hits)
@@ -1216,8 +1253,29 @@ class DataPreprocessor:
                     # TEST: does return order matter?
                     results = chunk_pool.map(worker_fn, args_list, chunksize=chunksize)
 
+                elif already_downsampled:
+                    # Sequential + already-downsampled — the streaming per-cadence path:
+                    # vectorized log-norm over the whole chunk (#298 I5), bit-identical per
+                    # element to mapping _lognorm_worker (see _log_norm_chunk_vectorized),
+                    # without the per-stamp Python loop and without staging the chunk in
+                    # the module global at all.
+                    logger.info(
+                        f"DataPreprocessor running vectorized sequential log-norm "
+                        f"(parallel={parallel}, n_processes={n_processes})"
+                    )
+
+                    chunk_shm = None
+                    chunk_pool = None
+                    shared_chunk = None
+                    results = []
+
+                    normalized, _ = _log_norm_chunk_vectorized(chunk_data)
+                    if len(normalized):
+                        all_blocks.append(normalized)
+                    del normalized
+
                 else:
-                    # Sequential processing
+                    # Sequential processing (legacy full-width files: downsample workers)
                     logger.info(
                         f"DataPreprocessor running in sequential mode "
                         f"(parallel={parallel}, n_processes={n_processes})"
@@ -1227,21 +1285,23 @@ class DataPreprocessor:
                     chunk_pool = None
 
                     # Set global variable manually since no initializer ran
-                    global _GLOBAL_CHUNK_DATA
                     shared_chunk = chunk_data
                     _GLOBAL_CHUNK_DATA = shared_chunk
 
                     results = [worker_fn(args) for args in args_list]
 
                 # NOTE: is there a more efficient/elegant way to do this (e.g. with list comprehension/slicing)?
-                # Collect valid results (filter out None from invalid cadences)
-                for result in results:
-                    if result is not None:
-                        if already_downsampled:
-                            all_cadences.append(result)
-                        else:
-                            # Legacy path: per-cadence log-norm in-process, as before
-                            all_cadences.append(log_norm(result))
+                # Collect valid results (filter out None from invalid cadences) and stack
+                # them into one float32 block per chunk (the vectorized branch has already
+                # appended its block; its results list is empty)
+                chunk_cadences = [
+                    result if already_downsampled else log_norm(result)
+                    for result in results
+                    if result is not None
+                ]
+                if chunk_cadences:
+                    all_blocks.append(np.array(chunk_cadences, dtype=np.float32))
+                del chunk_cadences
 
                 # Clear chunk data & shared resources. No gc.collect() here or below:
                 # everything freed on these paths is refcount-managed (ndarrays, SHM
@@ -1255,18 +1315,24 @@ class DataPreprocessor:
                     self.manager.close_pool(chunk_pool)
                     chunk_pool = None
                 del chunk_shm, chunk_pool
+                # Release the module-global staging reference (#298 rider): it otherwise
+                # pins the last chunk (~6-10 GB of stamps) in the main process for the
+                # whole encode/RF phase, until the next cadence's load overwrites it
+                _GLOBAL_CHUNK_DATA = None
 
             # Clear raw_data reference
             del raw_data
 
-        if len(all_cadences) == 0:
+        if not all_blocks:
             raise ValueError("No data loaded successfully")
 
-        # Stack all_cadences together (every cadence is downsampled + log-normalized by now)
-        cadence_array = np.array(all_cadences, dtype=np.float32)
+        # One contiguous float32 array (every cadence is downsampled + log-normalized by
+        # now); the single-block case — the streaming loop's, always — is returned as-is
+        # rather than paying a full concatenate copy
+        cadence_array = all_blocks[0] if len(all_blocks) == 1 else np.concatenate(all_blocks)
 
-        # Clear all_cadences reference
-        del all_cadences
+        # Clear all_blocks reference
+        del all_blocks
 
         # Sanity check: print descriptive stats
         min_val = np.min(cadence_array)
