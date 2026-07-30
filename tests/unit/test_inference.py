@@ -1,7 +1,6 @@
-"""Unit tests for aetherscan.inference: the tail-padding fix in
-prepare_distributed_inf_dataset (regression for the silent partial-batch drop), the
-encoded-padding-row truncation in run_inference, the InfDataHolder clear semantics, and the
-confidence-summary math backing the inference_cadences manifest."""
+"""Unit tests for aetherscan.inference: the bucketed numpy-slice encode path (#298 I2+I4 —
+order preservation, tail padding/truncation, bounded trace shapes), the batched MC cascade
+(#298 I8), and the confidence-summary math backing the inference_cadences manifest."""
 
 from __future__ import annotations
 
@@ -11,11 +10,10 @@ import tensorflow as tf
 
 from aetherscan.config import get_config
 from aetherscan.inference import (
-    InfDataHolder,
+    _MIN_ENCODE_BUCKET,
     InferencePipeline,
     ReferenceCloudReservoir,
     _batched_mc_scores,
-    prepare_distributed_inf_dataset,
     summarize_confidences,
 )
 from aetherscan.latent_variants import (
@@ -26,13 +24,6 @@ from aetherscan.latent_variants import (
 )
 
 
-def _collect_batches(result: dict) -> np.ndarray:
-    """Materialize inf_steps batches from the (infinite, repeated) distributed dataset."""
-    iterator = iter(result["inf_dataset"])
-    batches = [next(iterator).numpy() for _ in range(result["inf_steps"])]
-    return np.concatenate(batches, axis=0)
-
-
 def _make_data(n: int) -> np.ndarray:
     # Give every sample a unique signature so padding/ordering is verifiable
     return np.arange(n, dtype=np.float32)[:, None, None, None] * np.ones(
@@ -40,110 +31,87 @@ def _make_data(n: int) -> np.ndarray:
     )
 
 
-class TestPrepareDistributedInfDataset:
-    @pytest.fixture
-    def strategy(self):
-        return tf.distribute.get_strategy()  # default no-op strategy (1 replica, CPU-safe)
+class TestEncodeBucket:
+    """#298 I2+I4: the final-partial-step bucket must cover the remainder, stay a power of
+    two in [_MIN_ENCODE_BUCKET, max_bucket], and bound padding waste."""
 
-    def test_partial_tail_batch_is_padded_not_dropped(self, strategy):
-        # Regression: 5 samples with global batch 2 used to yield inf_steps = 2 with
-        # drop_remainder=True — the 5th sample was silently never processed.
-        data = _make_data(5)
-        result = prepare_distributed_inf_dataset(
-            data=data,
-            n_samples=5,
-            per_replica_inf_batch_size=2,
-            num_replicas=1,
-            strategy=strategy,
+    def test_small_remainders_take_the_floor_bucket(self):
+        assert InferencePipeline._encode_bucket(1, 1, 256) == _MIN_ENCODE_BUCKET
+        assert InferencePipeline._encode_bucket(5, 5, 256) == _MIN_ENCODE_BUCKET
+
+    def test_bucket_covers_the_per_replica_need(self):
+        # remaining=900 over 5 replicas -> need 180 -> next power of two 256
+        assert InferencePipeline._encode_bucket(900, 5, 256) == 256
+        # remaining=300 over 5 replicas -> need 60 -> 64
+        assert InferencePipeline._encode_bucket(300, 5, 256) == 64
+
+    def test_bucket_never_exceeds_the_configured_cap(self):
+        assert InferencePipeline._encode_bucket(10_000, 1, 256) == 256
+        assert InferencePipeline._encode_bucket(3, 1, 2) == 2
+
+    def test_bucket_ladder_is_bounded(self):
+        # Whatever the catalog mix, the set of shapes is the power-of-two ladder
+        buckets = {InferencePipeline._encode_bucket(r, 5, 256) for r in range(1, 256 * 5)}
+        assert buckets <= {16, 32, 64, 128, 256}
+
+
+def _bare_pipeline(per_replica_batch: int, latent_dim: int = 1) -> InferencePipeline:
+    """Minimal pipeline wired for _distributed_encode on the default (CPU) strategy."""
+    config = get_config()
+    config.data.time_bins = 4
+    config.data.width_bin = 64
+    config.data.downsample_factor = 8  # encode reshape width: 64 // 8 = 8
+
+    pipeline = InferencePipeline.__new__(InferencePipeline)
+    pipeline.config = config
+    pipeline.strategy = tf.distribute.get_strategy()
+    pipeline.num_replicas = 1
+    pipeline.encoder = _StubEncoder()
+    pipeline.latent_dim = latent_dim
+    pipeline.num_observations = 6
+    pipeline.per_replica_inf_batch_size = per_replica_batch
+    pipeline._encode_step = None
+    return pipeline
+
+
+class TestDistributedEncodeSlicing:
+    """#298 I2 option (b): the numpy-slice encode must return exactly the real snippets'
+    latent rows, in snippet-major order, whatever the bucket/padding geometry."""
+
+    def _signatures(self, z_mean: np.ndarray, n: int) -> None:
+        # _StubEncoder emits each observation's mean power == the snippet's signature value
+        np.testing.assert_allclose(z_mean[:, 0], np.repeat(np.arange(n, dtype=np.float32), 6))
+
+    @pytest.mark.parametrize("n_samples", [1, 3, 16, 21, 47])
+    def test_all_real_rows_in_order_no_padding_leak(self, n_samples):
+        pipeline = _bare_pipeline(per_replica_batch=16)
+        z_mean, z_log_var = pipeline._distributed_encode(_make_data(n_samples))
+        assert z_mean.shape == (n_samples * 6, 1)
+        assert z_log_var.shape == (n_samples * 6, 1)
+        self._signatures(z_mean, n_samples)
+
+    def test_multi_step_full_buckets_then_partial(self):
+        # 40 samples at per-replica 16: two full steps (16, 16) + one padded step (8 -> 16)
+        pipeline = _bare_pipeline(per_replica_batch=16)
+        z_mean, _ = pipeline._distributed_encode(_make_data(40))
+        assert z_mean.shape == (240, 1)
+        self._signatures(z_mean, 40)
+
+    def test_zero_samples_raises_in_run_inference(self):
+        pipeline = _bare_pipeline(per_replica_batch=16)
+        pipeline.rf_model = _RecordingRF()
+        pipeline.threshold = 0.99
+        pipeline.screening_threshold = 0.5
+        pipeline.mc_draws = 2
+        pipeline.calibrator = None
+        pipeline._reference_reservoir = ReferenceCloudReservoir(
+            capacity=0, rng=np.random.default_rng(0)
         )
-        assert result["n_samples"] == 5
-        assert result["n_padded"] == 6
-        assert result["inf_steps"] == 3
-
-        out = _collect_batches(result)
-        assert out.shape[0] == 6
-        np.testing.assert_array_equal(out[:5], data)
-        # Padding duplicates rows cycled from the front
-        np.testing.assert_array_equal(out[5], data[0])
-
-    def test_cadence_smaller_than_one_batch_processes_everything(self, strategy):
-        # Regression: with per-cadence batches, a cadence with fewer stamps than one global
-        # batch used to process *nothing* (inf_steps == 0).
-        data = _make_data(3)
-        result = prepare_distributed_inf_dataset(
-            data=data,
-            n_samples=3,
-            per_replica_inf_batch_size=8,
-            num_replicas=1,
-            strategy=strategy,
-        )
-        assert result["inf_steps"] == 1
-        assert result["n_padded"] == 8
-
-        out = _collect_batches(result)
-        np.testing.assert_array_equal(out[:3], data)
-        # 5 pad rows cycle deterministically over the 3 real samples
-        np.testing.assert_array_equal(out[3:], data[np.arange(5) % 3])
-
-    def test_exact_multiple_needs_no_padding(self, strategy):
-        data = _make_data(4)
-        result = prepare_distributed_inf_dataset(
-            data=data,
-            n_samples=4,
-            per_replica_inf_batch_size=2,
-            num_replicas=1,
-            strategy=strategy,
-        )
-        assert result["n_padded"] == 4
-        assert result["inf_steps"] == 2
-        np.testing.assert_array_equal(_collect_batches(result), data)
-
-    def test_zero_samples_raises(self, strategy):
+        pipeline._write_inference_results = lambda **kwargs: 0
         with pytest.raises(ValueError, match="Not enough samples"):
-            prepare_distributed_inf_dataset(
-                data=np.zeros((0, 6, 4, 8), dtype=np.float32),
-                n_samples=0,
-                per_replica_inf_batch_size=2,
-                num_replicas=1,
-                strategy=strategy,
+            pipeline.run_inference(
+                data=np.zeros((0, 6, 4, 8), dtype=np.float32), npy_path="/fake.npy"
             )
-
-    def test_order_is_preserved(self, strategy):
-        data = _make_data(7)
-        result = prepare_distributed_inf_dataset(
-            data=data,
-            n_samples=7,
-            per_replica_inf_batch_size=3,
-            num_replicas=1,
-            strategy=strategy,
-        )
-        out = _collect_batches(result)
-        np.testing.assert_array_equal(out[:7, 0, 0, 0], np.arange(7, dtype=np.float32))
-
-    @pytest.mark.parametrize("num_replicas", [1, 2])
-    def test_multi_replica_global_batch_geometry(self, strategy, num_replicas):
-        """global_batch = per_replica x num_replicas — the production geometry the tail-drop
-        fix targets. num_replicas is a plain argument to the padding/step math (independent
-        of the CPU default strategy used here); true cross-replica distribution is only
-        exercised by the gpu-marked integration smoke."""
-        data = _make_data(5)
-        result = prepare_distributed_inf_dataset(
-            data=data,
-            n_samples=5,
-            per_replica_inf_batch_size=2,
-            num_replicas=num_replicas,
-            strategy=strategy,
-        )
-        global_batch = 2 * num_replicas
-        expected_padded = -(-5 // global_batch) * global_batch  # 6 for 1 replica, 8 for 2
-        assert result["n_padded"] == expected_padded
-        assert result["inf_steps"] == expected_padded // global_batch
-
-        out = _collect_batches(result)
-        assert out.shape[0] == expected_padded
-        np.testing.assert_array_equal(out[:5], data)
-        # Padding rows cycle deterministically from the front, whatever the replica count
-        np.testing.assert_array_equal(out[5:], data[np.arange(expected_padded - 5) % 5])
 
 
 class _StubEncoder:
@@ -216,15 +184,6 @@ class TestLatentPaddingRowTruncation:
         np.testing.assert_allclose(
             results["latents"][:, 0], np.repeat(np.arange(5, dtype=np.float32), 6)
         )
-
-
-class TestInfDataHolder:
-    def test_clear_is_idempotent(self):
-        holder = InfDataHolder(np.ones(3))
-        holder.clear()
-        assert holder.data is None
-        holder.clear()  # second clear is a no-op
-        assert holder.data is None
 
 
 class TestSummarizeConfidences:

@@ -461,7 +461,13 @@ class InferenceConfig:
     encoder_path: str = None
     rf_path: str = None
     config_path: str = None
-    per_replica_batch_size: int = 2048  # NOTE: come back to this later
+    # Per-replica encode batch in SNIPPETS (each snippet = num_observations independent
+    # encoder inputs, so 256 snippets = 1,536 observation forwards — near the measured
+    # ~1024-obs single-GPU encode throughput peak; see benchmarks/README.md). The old 2048
+    # default was a units conflation (#298 I4): 2048 SNIPPETS = a 12,288-obs per-replica
+    # forward, past the throughput peak and above the bench's documented >~8192-obs int32
+    # launch-config abort. Also the cap of _distributed_encode's bucketed batch geometry.
+    per_replica_batch_size: int = 256
     classification_threshold: float = 0.99
     # Two-pass cascade (#282). Pass 1 scores EVERY snippet deterministically (z_mean-based
     # features) against this permissive screening threshold, tuned for recall — its only job
