@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
-from datetime import datetime
 
 import pytest
 
@@ -72,7 +72,10 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
             pytest.skip("/datag not mounted and no preprocessed subset stamps to resume from")
         extra_flags = ["--preprocess-output-dir", legacy_dir]
 
-    tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # --save-tag takes a BARE PREFIX since #272 (the run stamps its own datetime); this
+    # smoke passed a bare datetime — rejected by validation — and had been silently broken
+    # since the tag refactor (#298 repair). The resolved inf_{datetime} tag is recovered
+    # from the run's own output below.
     proc = run_pipeline(
         [
             "inference",
@@ -85,7 +88,7 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
             "--inference-files",
             _CSV_NAME,
             "--save-tag",
-            tag,
+            "inf",
             "--max-retries",
             "1",
             *extra_flags,
@@ -93,8 +96,11 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
     )
 
     tail = "\n".join(proc.stdout.splitlines()[-40:])
-    assert proc.returncode == 0, f"inference smoke run failed (tag={tag}); last output:\n{tail}"
+    assert proc.returncode == 0, f"inference smoke run failed; last output:\n{tail}"
     assert "Inference completed successfully!" in proc.stdout
+    tag_match = re.search(r"\binf_\d{8}_\d{6}\b", proc.stdout)
+    assert tag_match, "resolved inf_{datetime} tag not found in the run output"
+    tag = tag_match.group(0)
     assert os.path.exists(os.path.join(output_path, f"config_{tag}.json"))
 
     # End-of-run benchmark report: pins the #203 _post_benchmark_report hook's real
