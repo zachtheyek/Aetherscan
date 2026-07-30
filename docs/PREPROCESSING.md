@@ -19,7 +19,9 @@ from all six observations, so the models see the full ON/OFF context at each hit
 Per cadence (`DataPreprocessor._process_cadence`), the chain is:
 
 ```
-for each ON file:                      (one fused pool task per coarse channel)
+one ordered file-major imap over all 3 ON files   (one fused pool task per coarse channel;
+                                                   the PFB residual check rides the pool
+                                                   alongside — #298)
     read h5 slice → remove DC spike → flatten bandpass (pfb | spline)
     → vectorized k² over sliding windows → threshold → per-channel hit list
 aggregate hits → deduplicate → build stamp centers (± overlap offsets)
@@ -103,7 +105,10 @@ produced the `.h5`; a cheap residual-flatness sanity check (`_warn_on_pfb_respon
 flattens several sampled channels of each cadence's primary ON file with the active response
 and compares the median flattened edge/mid power ratio (`pfb.edge_mid_power_ratio`) against
 1.0 — i.e. it asks directly whether dividing by `H` actually flattens the data — warning once
-per file when the deviation exceeds ~10 %. The warning is **informational**: the residual
+per file when the deviation exceeds ~10 %. The sampled-channel reads ride the worker pool
+alongside energy detection (#298 — the old parent-serial form idled every worker for its
+band reads; the per-cadence warning semantics, including the cross-file consistency signal,
+are unchanged). The warning is **informational**: the residual
 still carries analog-frontend tilt and edge RFI the response doesn't model, so only a large
 or consistent deviation across files points at a wrong tap count (fallback:
 `--bandpass-method spline`); the threshold stays provisional until the pfb_taps-vs-backend
@@ -188,15 +193,23 @@ dozens of step-offset duplicates.
 Each surviving hit becomes a stamp center; with `overlap_search` (default on), two extra
 copies offset by `±overlap_fraction × stamp_width` (±2 048 bins at defaults) are added so a
 signal drifting out of one stamp's frame is centered in a neighbor. Out-of-band stamps are
-dropped; centers are sorted by start index before extraction (sequential reads let the HDF5
-chunk cache reuse decompressed bitshuffle chunks across adjacent stamps).
+dropped; centers are sorted by start index before extraction, and each worker's handle is
+opened with an HDF5 chunk cache **sized from the file's actual chunk layout** (#298:
+`_chunk_cache_kwargs` — h5py's 1 MiB default cannot hold one decompressed BL-scale
+bitshuffle chunk, so every stamp used to re-decompress its full ~16-chunk stripe; with the
+sized cache, sequential start order makes each chunk decompress once per task, the reuse
+the sort was always meant to buy).
 
 ### Stamp extraction and storage math
 
 Extraction writes straight into a memmap-backed `.npy` of shape
 `(n_stamps, 6, time_bins, stored_width)` float32, filled by pool workers over disjoint
-(observation, stamp-range) slices (`_extract_stamps_worker`), with `.tmp` → `os.replace`
-atomicity — the resume path treats the `.npy`'s existence as proof of a complete write.
+(observation, stamp-range) slices (`_extract_stamps_worker`) at ~4 tasks per worker (#298 —
+oversubscription keeps the stage's final wave to a fraction of one task, drained via
+`imap_unordered`; rows land at absolute indices, so completion order is irrelevant), with a
+per-run-unique `.tmp` → `os.replace` atomicity — the resume path treats the `.npy`'s
+existence as proof of a complete write, and abandoned tmps are age-swept (see the guarded
+cross-run stamp cache in [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)).
 
 **Downsample-at-extraction** (`store_downsampled_stamps`, default on): each stamp is reduced
 along frequency with `skimage.transform.downscale_local_mean(stamp, (1, downsample_factor))`
@@ -214,9 +227,12 @@ metadata JSON records `stored_width` and `downsample_factor_applied`; the `.npy`
 self-describes, and the loader handles both layouts (below). Disable to archive raw-resolution
 stamps.
 
-The metadata JSON also carries the full ED provenance for the visualization suite: per-stamp
-starts/frequencies/statistics/p-values, raw and merged hit frequency lists, the per-ON-file
-statistic histograms, and the `.h5` header.
+The metadata JSON also carries the full ED provenance for the visualization suite —
+per-stamp starts/frequencies/statistics/p-values, raw and merged hit frequency lists, the
+per-ON-file statistic histograms, and the `.h5` header — plus the `ed_config_fingerprint`
+the stamp-cache resume guard verifies (#298). It is written with compact separators (the
+old `indent=2` pretty-printing cost ~0.5–1.5 s per RFI-dense cadence on the prefetch
+critical path).
 
 ## Loading paths
 

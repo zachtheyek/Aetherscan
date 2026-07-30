@@ -69,6 +69,7 @@ tests/
 │   ├── test_db.py                   # writer thread, flush/supersede sentinels, migrations, queries
 │   ├── test_manager.py              # pool/SHM tracking and cleanup idempotence
 │   ├── test_benchmark.py            # stage_timer nesting/failures, report tree math + suggestions
+│   ├── test_candidate_figures.py    # TF-free candidate renderer: pool/serial parity, containment
 │   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
 │   ├── test_dashboard_cli.py        # aetherscan-dashboard console entry: exec-argv builder + streamlit-missing guard
 │   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths

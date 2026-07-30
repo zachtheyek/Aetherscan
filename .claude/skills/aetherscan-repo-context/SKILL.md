@@ -112,6 +112,7 @@ src/aetherscan/
 ├── run_state.py         # Persisted training-run manifest (stage-aware resume)
 ├── inference.py         # Inference orchestration, candidate detection
 ├── inference_viz.py     # End-of-run inference visualization suite
+├── candidate_figures.py # Per-candidate figure renderer (TF-free; forkserver pool; called by inference_viz.py)
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
 ├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection — batched memmap workers + background producer
@@ -154,7 +155,7 @@ benchmarks/              # Standalone benchmarks — CPU micro-benchmarks + a GP
 - **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing. A persisted run manifest (`run_state_{save_tag}.json`) drives fault-tolerant resume: an explicit stage machine (vae_rounds → vae_plots → rf_train → rf_plots → final_save) skips completed stages, and stale DB rows from failed attempts are marked superseded (never deleted).
 - **Thread-safe singletons** — `Config`, `Database`, `ResourceManager`. Always use the accessors `get_config()`, `get_db()`, `get_manager()`; never instantiate directly.
 - **Shared-memory zero-copy parallelism** — worker pools communicate via shared memory (no serialization). Allocate via `manager.create_shared_memory()`; ResourceManager owns cleanup. Only the **creator** may call `shm.unlink()`, never workers. Training-round datasets are disk-backed memmaps (`round_data.py`): workers write disjoint row ranges in-place, eliminating per-sample IPC; steady-state reads come from page cache.
-- **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) and `InfDataHolder` (`inference.py`) wrap memmap references (or arrays) with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes.
+- **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) wrap memmap references (or arrays) with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes. (Inference encodes directly from numpy slices since #298 — no holder on that path.)
 - **Background data producer** — `RoundDataProducer` (spawn-started process with its own worker pool) generates round k+1 while round k trains; registered with ResourceManager as a `ManagedProcess`. `CUDA_VISIBLE_DEVICES` is blanked so the producer tree never initializes CUDA; logging crosses the spawn boundary via a `QueueListener` relay.
 - **Worker cleanup** — custom SIGTERM handlers free resources on interruption. **Never log inside SIGTERM handlers** (deadlock risk).
 

@@ -19,16 +19,19 @@ inference_command() (main.py)
     └── _run_streaming_csv_inference():
         units = plan_cadences()                     # CSV rows → cadence work units, no work yet
         skip units with a live 'inferred' manifest row for this tag
-        pipeline = InferencePipeline(strategy)      # encoder + RF loaded once
-        for each pending cadence (prefetch depth 1):
-            [prefetch thread] preprocess cadence i+1 (energy detection → stamp .npy)
-            [main thread]     load cadence i's stamps → encode on GPUs → RF →
-                              write inference_results (positives) + inference_cadences row
+        start ED pool + first prefetch, then InferencePipeline(strategy)
+                                                    # encoder + RF load once, hidden under
+                                                    # the first cadence's energy detection
+        for each pending cadence (prefetch depth = inference.prefetch_depth):
+            [prefetch thread(s)] preprocess + load/log-norm upcoming cadences
+                                 (energy detection → stamp .npy → snippet array)
+            [main thread]        encode cadence i on GPUs → RF → write
+                                 inference_results (positives) + inference_cadences row
         render_inference_visualizations()           # on a fully successful pass
 ```
 
-Peak memory is one cadence's stamps plus the next cadence's in-flight preprocessing —
-**independent of catalog size**. Two input modes:
+Peak memory is up to `inference.prefetch_depth` in-flight cadences (stamps + loaded
+arrays) plus the one being inferred — **independent of catalog size**. Two input modes:
 
 - `--inference-files <catalog.csv>` — the production path described here: raw `.h5`
   observations grouped into cadences, energy-detection preprocessing, streaming inference.
@@ -54,15 +57,23 @@ from `inference.cadence_h5_path_col` (default `".h5 path"`):
 `DataPreprocessor.plan_cadences()` turns the valid groups into `PendingCadence` work units,
 each paired with a deterministic output path
 `{output_dir}/{csv_stem}_{sanitized_group_key}.npy`. The output directory default is
-**tag-scoped per CSV** — `{data_path}/inference/preprocessed/<csv_stem>_<save_tag>/` — so a
-same-tag retry resumes off its own stamps while a fresh run (new datetime tag) starts clean
-and can never pick up a dead run's partial output. Pass `--preprocess-output-dir` explicitly
-to share/reuse one directory across runs (the deliberate trade of tag isolation for
-cross-run caching). Because both the tag-scoped output directory and per-cadence stamp
-filenames are keyed on the CSV basename stem, all `inference_files` entries must have
-**unique basename stems** — `plan_cadences()` raises `ValueError` naming both colliding
-entries if two share a stem (e.g. `runA/x.csv` and `runB/x.csv`). The fix is to rename one
-CSV so basenames are distinct.
+**ED-fingerprint-scoped per CSV** (#298) —
+`{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/`, where the hash is
+`run_state.preprocessing_config_fingerprint`: a fail-safe **denylist** hash of the inference
+config minus its scoring/model/viz/retry/batching keys, plus the data-section geometry.
+Energy detection is deterministic given (csv, h5 files, ED config), so **runs sharing an ED
+config share stamps** — a threshold sweep or a re-inference with new weights skips
+preprocessing entirely — while any ED-config change lands in a different directory by
+construction (an unknown new config key over-invalidates rather than ever reusing wrong
+stamps). Published `.npy` files can't be stale (atomic per-run-unique tmp → `os.replace`
+publication), and the resume guard additionally verifies each sidecar's `h5_paths` and
+recorded `ed_config_fingerprint` before reuse; only scores stay tag-scoped (in the DB).
+Pass `--preprocess-output-dir` explicitly to pin one directory across runs and CSVs (reuse
+is still guarded). Because both the output directory and per-cadence stamp filenames are
+keyed on the CSV basename stem, all `inference_files` entries must have **unique basename
+stems** — `plan_cadences()` raises `ValueError` naming both colliding entries if two share
+a stem (e.g. `runA/x.csv` and `runB/x.csv`). The fix is to rename one CSV so basenames are
+distinct.
 
 ## Model loading
 
@@ -172,27 +183,30 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
    collector; on a mismatch the cadence is re-inferred instead of reused, so a reused
    `--save-tag` with a changed inference config (threshold / model / geometry) never serves
    stale results (the supersede step retires the old row).
-2. **Models load once** (`InferencePipeline`), reused by every cadence. The distributed
-   encode step is a lazily-built, cached `tf.function` — repeated `run_inference` calls reuse
-   one trace instead of retracing per cadence.
-3. **Persistent worker pool.** `preprocessor.start_energy_detection_pool()` starts the single
-   pool that serves energy detection *and* stamp extraction for the whole run — started from
-   the main thread before the prefetch thread exists (forking after background threads spin
-   up risks children inheriting mid-operation locks).
-4. **Prefetch depth 1.** A one-worker `ThreadPoolExecutor` runs
-   `process_pending_cadence(unit i+1)` (CPU-bound work happens in the pool's child processes;
-   the thread mostly waits) while the main thread loads, encodes, and classifies cadence *i*
-   on the GPUs.
+2. **Persistent worker pool first.** `preprocessor.start_energy_detection_pool()` starts the
+   single pool that serves energy detection *and* stamp extraction for the whole run —
+   started from the main thread before any background thread exists (forking after threads
+   spin up risks children inheriting mid-operation locks).
+3. **Models load once** (`InferencePipeline`), reused by every cadence — constructed AFTER
+   the first prefetch is submitted (#298), so the 10–60 s encoder+RF+calibrator load hides
+   under the first cadence's energy detection. The distributed encode step is a
+   lazily-built, cached `tf.function` — repeated `run_inference` calls reuse a bounded set
+   of traces (one per batch-shape bucket) instead of retracing per cadence.
+4. **Prefetch depth = `inference.prefetch_depth`** (#298, default 1). A
+   `ThreadPoolExecutor` keeps that many `_prefetch_cadence` futures in flight — each
+   preprocesses AND loads/log-norms its cadence (`load_inference_data(parallel=False)`:
+   the sequential vectorized branch, since the persistent energy-detection pool already
+   owns the CPU) — consumed strictly in catalog order, so results, manifest ordering, and
+   per-cadence seeding are identical at any depth. Depth 2 overlaps one cadence's
+   disk-bound energy detection with the previous one's decompression-bound extraction, at
+   the cost of one extra in-flight cadence of RAM. A prefetch-side load failure degrades to
+   loading on the inference thread under the per-cadence containment below.
 5. **Per-cadence inference** (`main.py:_infer_cadence`):
    - provenance derived from the group key + metadata JSON
      (`preprocessing.derive_cadence_provenance`): target, session, band, cadence id, header
      `tstart`, first `.h5` path, and the per-stamp center frequencies;
-   - stamps loaded via `load_inference_data(override_filepaths=[npy_path], parallel=False)`
-     (log-norm only for downsampled stamps; legacy full-width files also get downsampled —
-     see [`PREPROCESSING.md`](PREPROCESSING.md)). `parallel=False` forces the sequential
-     in-process branch: the prefetch thread is already driving the persistent
-     energy-detection pool at full width, and a second per-chunk pool would double-subscribe
-     the CPU for a single cheap vectorized log-norm;
+   - the prefetched snippet array is consumed directly (see step 4; log-norm details in
+     [`PREPROCESSING.md`](PREPROCESSING.md));
    - `mark_superseded("inference_results", tag, npy_path=...)` — partial positives from a
      dead attempt are retired *before* fresh rows land;
    - `run_inference()` (below), then a superseding `inference_cadences` row with
@@ -211,26 +225,30 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
 The retry loop wraps all of it: transient failures (I/O hiccups, GPU errors) retry up to
 `inference.max_retries` with `inference.retry_delay` between passes; `KeyboardInterrupt`
 propagates; state-based resume (stamp `.npy` for preprocessing, manifest rows for inference)
-lets the in-process retry loop pick up where the last pass died. A full relaunch mints a fresh
-datetime tag and starts clean — to reuse a prior run's preprocessing, point
-`--preprocess-output-dir` at its stamp directory.
+lets the in-process retry loop pick up where the last pass died. A full relaunch mints a
+fresh datetime tag and starts clean on the scoring side — its preprocessing reuses the
+fingerprint-scoped stamp cache automatically (see the output-directory paragraph above).
 
 ## The GPU stage: `InferencePipeline.run_inference()`
 
 For one cadence's snippet array `(n, 6, 16, 512)`:
 
-1. `prepare_distributed_inf_dataset()` pads the array with duplicate rows (cycled from the
-   front) up to the next global-batch multiple (`per_replica_batch_size × num_replicas`,
-   default 2048 per replica), so the final partial batch is **encoded rather than silently
-   dropped** — with per-cadence batches, a cadence smaller than one global batch would
-   otherwise process nothing at all. Order is preserved (no shuffle).
-2. `_distributed_encode()` runs the cached encode step over the distributed dataset; each
-   snippet's 6 observations go through the encoder as independent `(16, 512, 1)` inputs and
-   come back as the **deterministic posterior parameters** `z_mean` / `z_log_var` (#282 —
-   no stochastic `z` ever crosses the GPU boundary; the MC draws below are reparameterized
-   in NumPy from these, seeded per cadence). Per-replica results are gathered with
-   `experimental_local_results` + `np.concatenate` (cheaper than an NCCL gather for the tiny
-   latent payload), then truncated back to `n × 6` rows to drop the padding.
+1. `_distributed_encode()` (#298) feeds the replicas **directly from numpy slices** via
+   `experimental_distribute_values_from_function` — no per-cadence `tf.data` dataset,
+   distribution, or iterator rebuild. Full steps run at `per_replica_batch_size` snippets
+   per replica (default 256 — each snippet is 6 encoder inputs, so 1,536 observation
+   forwards, near the measured single-GPU encode throughput peak); the final partial step
+   drops to a power-of-two bucket (floor 16), its tail padded with duplicate rows cycled
+   from the cadence front so the remainder is **encoded rather than silently dropped**, and
+   the padded outputs never leave the encode (only real rows are written out). Order is
+   preserved (no shuffle), and the traced-shape count is bounded by the bucket ladder for
+   any catalog.
+2. Each snippet's 6 observations go through the encoder as independent `(16, 512, 1)`
+   inputs and come back as the **deterministic posterior parameters** `z_mean` /
+   `z_log_var` (#282 — no stochastic `z` ever crosses the GPU boundary; the MC draws below
+   are reparameterized in NumPy from these, seeded per cadence). Per-replica results are
+   gathered with `experimental_local_results` + `np.concatenate` (cheaper than an NCCL
+   gather for the tiny latent payload).
 3. **Two-pass cascade** (#282). Features are rebuilt per the saved config's winning
    representation (`rf.latent_variant` / `rf.active_dims` — see [`MODELS.md`](MODELS.md)),
    and the calibrator is applied to every probability when active:
@@ -330,7 +348,7 @@ flagged while later writes stay live (`Database.mark_superseded`).
 
 | Artifact | Where | Notes |
 | --- | --- | --- |
-| Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_<tag>/*.npy` + `.json` | The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, raw/merged hit lists, the `.h5` header. |
+| Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/*.npy` + `.json` | Shared across runs with the same ED config (#298). The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, raw/merged hit lists, the `.h5` header, and the `ed_config_fingerprint` the resume guard checks. |
 | Candidate rows | `inference_results` table | Positives only, with latents + provenance + the two-pass scores (`screening_proba`/`mc_mean`/`mc_std`, schema v5). |
 | Run manifest | `inference_cadences` table | Per-cadence stages, aggregates, durations. |
 | Reference cloud | `{output_path}/inference_reference_cloud_{tag}.npz` | MC scores for the seeded uniform reservoir of pass-1 rejects — the survey background of the candidate uncertainty figure (regenerable without re-running inference). |
@@ -372,7 +390,12 @@ sources: the bounded in-memory `InferenceVizCollector` (per-cadence aggregates +
 reservoir-sampled latent pool, memory O(#cadences), candidates always kept), the durable
 per-cadence metadata JSONs, and the DB tables — so figures also cover cadences that were
 skipped by the resume. Every figure is wrapped in `_viz_safe` (log-and-swallow): a plot bug
-can never kill a science run.
+can never kill a science run. Slack uploads go through a single-worker FIFO background
+uploader (#298 — figure ordering and API rate unchanged; drained before teardown), and the
+per-candidate figures render across a forkserver process pool in the TF-free
+[`candidate_figures.py`](../src/aetherscan/candidate_figures.py) (empty preload — the
+`shap_parallel`/`latent_gif` isolation pattern; per-figure failures degrade the suite
+exactly like `_viz_safe`).
 
 | File | Contents | What to look for |
 | --- | --- | --- |
@@ -405,6 +428,7 @@ Inference-specific fields live on `InferenceConfig`
 | --- | --- |
 | Models | `encoder_path`, `rf_path`, `config_path` |
 | Classification | `per_replica_batch_size`, `classification_threshold`, `screening_threshold`, `mc_draws`, `reference_cloud_size` |
+| Streaming | `prefetch_depth` |
 | Cadence grouping | `cadence_group_by_cols`, `cadence_h5_path_col`, `cadence_expected_obs` |
 | Energy detection | `coarse_channel_width`, `coarse_channel_log_interval`, `bandpass_method`, `pfb_taps_per_channel`, `bandpass_debug_plot`, `spline_order`, `detection_window_size`, `detection_step_size`, `stat_threshold` |
 | Stamps | `stamp_width`, `store_downsampled_stamps`, `overlap_search`, `overlap_fraction`, `preprocess_output_dir` |
