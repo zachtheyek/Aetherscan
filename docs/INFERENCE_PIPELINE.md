@@ -192,7 +192,8 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
    under the first cadence's energy detection. The distributed encode step is a
    lazily-built, cached `tf.function` — repeated `run_inference` calls reuse a bounded set
    of traces (one per batch-shape bucket) instead of retracing per cadence.
-4. **Prefetch depth = `inference.prefetch_depth`** (#298, default 1). A
+4. **Prefetch depth = `inference.prefetch_depth`** (#298, default 2 — measured ~16%
+   lower end-to-end wall vs depth 1 on fresh /datag cadences, identical candidates). A
    `ThreadPoolExecutor` keeps that many `_prefetch_cadence` futures in flight — each
    preprocesses AND loads/log-norms its cadence (`load_inference_data(parallel=False)`:
    the sequential vectorized branch, since the persistent energy-detection pool already
