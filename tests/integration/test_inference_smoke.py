@@ -10,10 +10,11 @@ bind by default — either bind it explicitly:
     SINGULARITY_BIND=/datag ./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
 
 or rely on the resume path: preprocessing skips any cadence whose stamp .npy already exists.
-The default stamp directory is tag-scoped ({data_path}/inference/preprocessed/
-<csv_stem>_<save_tag>/), so a fresh-tagged run never resumes on its own — when /datag is not
-mounted and legacy stamps exist under <output>/preprocessed, the test points
---preprocess-output-dir at them explicitly (the documented reuse escape hatch).
+Since #298 the default stamp directory is ED-fingerprint-scoped ({data_path}/inference/
+preprocessed/<csv_stem>_ed<hash12>/), shared across runs with the same ED config — so a
+fresh-tagged run resumes automatically off any prior same-config run's stamps. When /datag
+is not mounted and only legacy stamps exist under <output>/preprocessed, the test still
+points --preprocess-output-dir at them explicitly (the pinned-directory escape hatch).
 """
 
 from __future__ import annotations
