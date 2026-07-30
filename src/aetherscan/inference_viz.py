@@ -28,7 +28,9 @@ import contextlib
 import json
 import logging
 import os
+import queue
 import socket
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -38,8 +40,14 @@ import h5py
 import numpy as np
 from matplotlib.figure import Figure
 
+from aetherscan.candidate_figures import (
+    OBS_ROW_LABELS,
+    draw_cadence_strip,
+    load_display_cadence,
+    render_candidate_figure,
+    render_candidate_figures,
+)
 from aetherscan.config import get_config
-from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
 from aetherscan.logger import get_logger
 from aetherscan.models import prepare_latent_features
@@ -64,8 +72,64 @@ _HIT_SPECTRUM_BINS = 200
 # are governed separately by config.inference.max_candidate_plots).
 _CANDIDATE_GALLERY_MAX = 12
 
-# ON/OFF row labels for 6-observation ABACAD cadence strips.
-_OBS_ROW_LABELS = ("ON", "OFF", "ON", "OFF", "ON", "OFF")
+# ON/OFF row labels for 6-observation ABACAD cadence strips — canonical definition lives in
+# the TF-free candidate_figures module (#298 I9); re-exported here for the suite's figures.
+_OBS_ROW_LABELS = OBS_ROW_LABELS
+
+# Bounded wait for the async Slack uploader's drain at suite end: uploads are best-effort
+# (same contract as _viz_safe), so a stuck Slack API must not hold the run open forever.
+_UPLOAD_DRAIN_TIMEOUT_S = 180.0
+
+
+class _AsyncUploader:
+    """
+    Single-worker FIFO Slack uploader (#298 I9): fig.savefig stays on the caller; the 3-4
+    HTTP round trips per figure — plus any retry-backoff sleeps on a flaky Slack — leave
+    the render critical path. ONE worker, deliberately: it preserves the suite's
+    Slack-thread figure ordering and keeps the effective API rate identical to the old
+    synchronous path. drain() must run before logger teardown;
+    render_inference_visualizations guarantees it in a finally.
+    """
+
+    def __init__(self):
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+
+    def submit(self, save_path: str, title: str) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="viz_slack_upload", daemon=True)
+            self._thread.start()
+        self._queue.put((save_path, title))
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            save_path, title = item
+            try:
+                logger_instance = get_logger()
+                if logger_instance:
+                    logger_instance.upload_image_to_slack(save_path, title=title)
+            except Exception as e:
+                logger.error(f"Async Slack upload failed for {save_path}: {e}")
+
+    def drain(self) -> None:
+        """Flush the queue and stop the worker (bounded — uploads are best-effort)."""
+        if self._thread is None:
+            return
+        self._queue.put(None)
+        self._thread.join(timeout=_UPLOAD_DRAIN_TIMEOUT_S)
+        if self._thread.is_alive():
+            logger.warning(
+                f"Async Slack uploader did not drain within {_UPLOAD_DRAIN_TIMEOUT_S:.0f}s; "
+                f"remaining uploads abandoned (figures are on disk; the daemon thread "
+                f"cannot block shutdown)"
+            )
+        self._thread = None
+
+
+_uploader = _AsyncUploader()
 
 
 @dataclass
@@ -204,23 +268,20 @@ def _plots_dir(tag: str) -> str:
 
 
 def _save_and_upload(fig: Figure, filename: str, slack_title: str) -> str:
-    """Save a figure under plots/inference/{tag}/ and upload it to Slack (train.py's plot
-    tail, minus pyplot). Returns the saved path."""
+    """Save a figure under plots/inference/{tag}/ and queue its Slack upload (#298 I9 —
+    the upload's HTTP round trips run on the async FIFO uploader, drained before teardown
+    by render_inference_visualizations). Returns the saved path."""
     tag = get_config().checkpoint.save_tag
     save_path = os.path.join(_plots_dir(tag), filename)
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     # Eagerly release the figure's artists/render buffers. OO-API Figures aren't tracked by
     # a global registry, so this isn't a leak fix — it just frees the backing memory now
     # instead of at garbage collection (relevant for dense stamp/candidate galleries). The
-    # Slack upload below reads the saved PNG, not the figure.
+    # Slack upload reads the saved PNG, not the figure.
     fig.clear()
     logger.info(f"Inference viz saved: {save_path}")
 
-    logger_instance = get_logger()
-    if logger_instance:
-        logger_instance.upload_image_to_slack(
-            save_path, title=f"{slack_title} - ({tag}, {socket.gethostname()})"
-        )
+    _uploader.submit(save_path, f"{slack_title} - ({tag}, {socket.gethostname()})")
     return save_path
 
 
@@ -234,31 +295,9 @@ def _load_metadata(record: CadenceVizRecord) -> dict | None:
         return None
 
 
-def _load_display_cadence(npy_path: str, snippet_index: int) -> np.ndarray:
-    """Load one snippet's (num_obs, time_bins, width) stamp from its .npy and log-normalize
-    it for display (the same transform the model input path applies)."""
-    stamps = np.load(npy_path, mmap_mode="r")
-    snippet = np.array(stamps[snippet_index], dtype=np.float32)
-    del stamps
-    return log_norm(snippet)
-
-
-def _draw_cadence_strip(axes_column, snippet: np.ndarray, label_rows: bool) -> None:
-    """Draw one snippet's 6 observation waterfalls down a column of axes."""
-    for obs_idx, ax in enumerate(axes_column):
-        ax.imshow(
-            snippet[obs_idx],
-            aspect="auto",
-            origin="lower",
-            cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
-            interpolation="nearest",
-        )
-        ax.set_xticks([])
-        ax.set_yticks([])
-        if label_rows:
-            ax.set_ylabel(_OBS_ROW_LABELS[obs_idx], fontsize=8, rotation=0, ha="right", va="center")
+# _load_display_cadence and _draw_cadence_strip moved to the TF-free candidate_figures
+# module (#298 I9) so forkserver render workers can import them without pulling TF;
+# the suite uses them via the load_display_cadence / draw_cadence_strip imports above.
 
 
 def _key_label(key: tuple, max_len: int = 28) -> str:
@@ -547,13 +586,13 @@ def plot_stamp_gallery(records: list[CadenceVizRecord], metadatas: dict[str, dic
 
     for col, (record, idx, stat, freq) in enumerate(selected):
         try:
-            snippet = _load_display_cadence(record.npy_path, idx)
+            snippet = load_display_cadence(record.npy_path, idx)
         except Exception as e:
             logger.warning(f"Viz: failed to load stamp {idx} from {record.npy_path}: {e}")
             for row in range(n_rows):
                 axes[row][col].set_axis_off()
             continue
-        _draw_cadence_strip([axes[row][col] for row in range(n_rows)], snippet, label_rows=col == 0)
+        draw_cadence_strip([axes[row][col] for row in range(n_rows)], snippet, label_rows=col == 0)
         axes[0][col].set_title(
             f"$k^2$={stat:.3g}\n{freq:.4f} MHz\n{_key_label(record.key, 20)}", fontsize=7
         )
@@ -672,66 +711,17 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     return _save_and_upload(fig, f"confidence_distribution_{tag}.png", "Confidence Distribution")
 
 
-def _candidate_annotation(row: dict) -> str:
-    lines = [f"confidence: {row.get('confidence', float('nan')):.4f}"]
-    if row.get("frequency_mhz") is not None:
-        lines.append(f"frequency: {row['frequency_mhz']:.6f} MHz")
-    for label in ("target", "session", "band", "cadence_id"):
-        if row.get(label) is not None:
-            lines.append(f"{label}: {row[label]}")
-    if row.get("timestamp_observed") is not None:
-        lines.append(f"tstart (MJD): {row['timestamp_observed']:.5f}")
-    if row.get("h5_path"):
-        lines.append(f"h5: {os.path.basename(str(row['h5_path']))}")
-    lines.append(f"npy: {os.path.basename(str(row.get('npy_path', '')))}")
-    lines.append(f"snippet: {row.get('snippet_index')}")
-    return "\n".join(lines)
-
-
 def plot_candidate(row: dict, index: int) -> str | None:
     """One candidate's full picture (implements the long-standing inference.py stub):
     6-panel cadence waterfall of its stamp, annotated with confidence / frequency /
-    target / session / band, plus the 48-dim latent vector as a bar chart."""
+    target / session / band, plus the 48-dim latent vector as a bar chart. Thin wrapper
+    over the TF-free candidate_figures.render_candidate_figure (#298 I9 — the gallery path
+    renders these across a forkserver pool; this in-process form serves direct callers)."""
     tag = get_config().checkpoint.save_tag
-
-    snippet = _load_display_cadence(str(row["npy_path"]), int(row["snippet_index"]))
-    n_obs = snippet.shape[0]
-
-    fig = Figure(figsize=(11, 7))
-    grid = fig.add_gridspec(n_obs, 2, width_ratios=(2.2, 1.6), hspace=0.15, wspace=0.25, right=0.97)
-    waterfall_axes = [fig.add_subplot(grid[i, 0]) for i in range(n_obs)]
-    _draw_cadence_strip(waterfall_axes, snippet, label_rows=True)
-    waterfall_axes[-1].set_xlabel("frequency bin")
-
-    # Right column: latent bar chart on top, provenance text below. A nested gridspec gives
-    # the two panels a dedicated vertical gap so the bar chart's x-axis label can never
-    # collide with the first metadata line; the text panel takes the taller share so all of
-    # the provenance lines stay clear of the axis label regardless of how many there are.
-    right_grid = grid[:, 1].subgridspec(2, 1, height_ratios=(1.0, 1.3), hspace=0.55)
-    latent_ax = fig.add_subplot(right_grid[0])
-    latent_json = row.get("latent_vector")
-    if latent_json:
-        latent = np.asarray(json.loads(latent_json), dtype=np.float64).ravel()
-        latent_dim = latent.size // n_obs if latent.size % n_obs == 0 else latent.size
-        colors = [f"C{(i // latent_dim) % 10}" for i in range(latent.size)]
-        latent_ax.bar(np.arange(latent.size), latent, color=colors)
-        latent_ax.set_xlabel("latent dimension (colored per observation)", fontsize=8)
-        latent_ax.set_ylabel("z", fontsize=8)
-        latent_ax.tick_params(labelsize=7)
-        latent_ax.grid(True, axis="y", alpha=0.2)
-    else:
-        latent_ax.set_axis_off()
-        latent_ax.text(0.5, 0.5, "no latent vector stored", ha="center", va="center")
-
-    text_ax = fig.add_subplot(right_grid[1])
-    text_ax.set_axis_off()
-    text_ax.text(
-        0.0, 1.0, _candidate_annotation(row), va="top", ha="left", fontsize=9, family="monospace"
-    )
-
-    fig.suptitle(f"Candidate {index} ({tag}) — P(true) = {row.get('confidence', 0):.4f}")
-
-    return _save_and_upload(fig, f"candidate_{index}_{tag}.png", f"Candidate {index}")
+    save_path = render_candidate_figure(row, index, tag, _plots_dir(tag))
+    logger.info(f"Inference viz saved: {save_path}")
+    _uploader.submit(save_path, f"Candidate {index} - ({tag}, {socket.gethostname()})")
+    return save_path
 
 
 def plot_candidate_gallery() -> str | None:
@@ -753,9 +743,18 @@ def plot_candidate_gallery() -> str | None:
         return None
     rows.sort(key=lambda r: r.get("confidence") or 0.0, reverse=True)
 
-    # Per-candidate figures (highest confidence first, capped)
-    for index, row in enumerate(rows[:max_candidate_plots]):
-        _viz_safe(f"candidate_{index}", plot_candidate, row, index)
+    # Per-candidate figures (highest confidence first, capped): rendered across the
+    # forkserver pool (#298 I9 — independent row dict + memmap read + PNG each; per-figure
+    # failures return None and degrade the suite exactly like _viz_safe), then uploaded in
+    # index order through the async FIFO uploader.
+    top_rows = rows[:max_candidate_plots]
+    rendered = render_candidate_figures(top_rows, tag, _plots_dir(tag))
+    hostname = socket.gethostname()
+    for index, save_path in rendered:
+        if save_path is None:
+            continue
+        logger.info(f"Inference viz saved: {save_path}")
+        _uploader.submit(save_path, f"Candidate {index} - ({tag}, {hostname})")
     if len(rows) > max_candidate_plots:
         logger.info(
             f"Viz: rendered {max_candidate_plots} of {len(rows)} candidate figures "
@@ -769,13 +768,13 @@ def plot_candidate_gallery() -> str | None:
     axes = fig.subplots(n_rows, n_cols, squeeze=False)
     for col, row in enumerate(gallery_rows):
         try:
-            snippet = _load_display_cadence(str(row["npy_path"]), int(row["snippet_index"]))
+            snippet = load_display_cadence(str(row["npy_path"]), int(row["snippet_index"]))
         except Exception as e:
             logger.warning(f"Viz: failed to load candidate stamp ({e})")
             for r in range(n_rows):
                 axes[r][col].set_axis_off()
             continue
-        _draw_cadence_strip([axes[r][col] for r in range(n_rows)], snippet, label_rows=col == 0)
+        draw_cadence_strip([axes[r][col] for r in range(n_rows)], snippet, label_rows=col == 0)
         freq = row.get("frequency_mhz")
         freq_label = f"{freq:.4f} MHz" if freq is not None else "freq n/a"
         axes[0][col].set_title(
@@ -1109,15 +1108,21 @@ def render_inference_visualizations(
         if metadata is not None:
             metadatas[record.npy_path] = metadata
 
-    _viz_safe("ed_stat_distributions", plot_ed_stat_distributions, records, metadatas)
-    _viz_safe("ed_hit_spectrum", plot_ed_hit_spectrum, records, metadatas)
-    _viz_safe("bandpass_flattening", plot_bandpass_flattening, preprocessor, records, metadatas)
-    _viz_safe("stamp_gallery", plot_stamp_gallery, records, metadatas)
-    _viz_safe("preproc_funnel", plot_preproc_funnel, records, metadatas)
-    _viz_safe("confidence_distribution", plot_confidence_distribution, records)
-    _viz_safe("candidate_gallery", plot_candidate_gallery)
-    _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
-    _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
-    _viz_safe("inference_summary", plot_inference_summary, records, metadatas, totals)
+    try:
+        _viz_safe("ed_stat_distributions", plot_ed_stat_distributions, records, metadatas)
+        _viz_safe("ed_hit_spectrum", plot_ed_hit_spectrum, records, metadatas)
+        _viz_safe("bandpass_flattening", plot_bandpass_flattening, preprocessor, records, metadatas)
+        _viz_safe("stamp_gallery", plot_stamp_gallery, records, metadatas)
+        _viz_safe("preproc_funnel", plot_preproc_funnel, records, metadatas)
+        _viz_safe("confidence_distribution", plot_confidence_distribution, records)
+        _viz_safe("candidate_gallery", plot_candidate_gallery)
+        _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
+        _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
+        _viz_safe("inference_summary", plot_inference_summary, records, metadatas, totals)
+    finally:
+        # The async uploader must be empty before the caller reaches logger teardown
+        # (#298 I9) — uploads queued by any figure above are flushed here even when a
+        # figure raised through _viz_safe's own guard
+        _uploader.drain()
 
     logger.info("Inference visualization suite complete")
