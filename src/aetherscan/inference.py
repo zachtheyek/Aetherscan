@@ -456,8 +456,13 @@ class InferencePipeline:
                 strategy=self.strategy,
             )
 
+            # NOTE: no gc.collect() here (or after del results below) — `data` is still
+            # referenced by the caller (main._infer_cadence holds cadence_data until after
+            # run_inference returns), so a full collection frees nothing material and each
+            # one costs ~0.3 s with TF's object graph loaded while holding the GIL against
+            # the prefetch thread (#298 I7). The finally-block collect below is the one
+            # per-call collection point.
             del data
-            gc.collect()
 
             inf_dataset = results["inf_dataset"]
             n_padded = results["n_padded"]
@@ -465,7 +470,6 @@ class InferencePipeline:
             inf_holder = results["_inf_holder"]
 
             del results
-            gc.collect()
 
             logger.info(
                 f"Generating latents for {n_samples} cadence snippets "
@@ -690,8 +694,10 @@ class InferencePipeline:
                 if (step + 1) % 10 == 0 or (step + 1) == n_steps:
                     logger.info(f"Encoded step {step + 1}/{n_steps}")
 
+                # Refcount-managed numpy arrays and eager tensors: freed on del. The full
+                # gc.collect() that used to run here EVERY STEP (~0.3 s each with TF
+                # loaded, GIL held) reclaimed nothing cyclic (#298 I7).
                 del per_replica_mean, per_replica_log_var, batch_mean, batch_log_var
-                gc.collect()
 
         except Exception as e:
             logger.error(f"Error in _distributed_encode(): {e}")

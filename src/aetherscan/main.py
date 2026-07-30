@@ -497,8 +497,9 @@ def _infer_cadence(
             seed_key=unit.index,
             **provenance,
         )
+        # cadence_data is a plain ndarray (no cycles): the del refcount-frees it, and
+        # run_inference's finally block already ran this cadence's one gc pass (#298 I7)
         del cadence_data
-        gc.collect()
 
         duration_s = time.time() - stage_start
 

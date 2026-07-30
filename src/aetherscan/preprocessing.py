@@ -1243,7 +1243,10 @@ class DataPreprocessor:
                             # Legacy path: per-cadence log-norm in-process, as before
                             all_cadences.append(log_norm(result))
 
-                # Clear chunk data & shared resources
+                # Clear chunk data & shared resources. No gc.collect() here or below:
+                # everything freed on these paths is refcount-managed (ndarrays, SHM
+                # handles), and each full collection costs ~0.3 s with TF loaded — the
+                # streaming loop calls this once per cadence (#298 I7).
                 del chunk_data, shared_chunk
                 if chunk_shm:
                     self.manager.close_shared_memory(chunk_shm)
@@ -1252,11 +1255,9 @@ class DataPreprocessor:
                     self.manager.close_pool(chunk_pool)
                     chunk_pool = None
                 del chunk_shm, chunk_pool
-                gc.collect()
 
             # Clear raw_data reference
             del raw_data
-            gc.collect()
 
         if len(all_cadences) == 0:
             raise ValueError("No data loaded successfully")
@@ -1266,7 +1267,6 @@ class DataPreprocessor:
 
         # Clear all_cadences reference
         del all_cadences
-        gc.collect()
 
         # Sanity check: print descriptive stats
         min_val = np.min(cadence_array)
@@ -1862,7 +1862,9 @@ class DataPreprocessor:
             json.dump(self._to_json_safe(metadata), f, indent=2)
         os.replace(tmp_metadata_path, metadata_path)
 
-        gc.collect()
+        # NOTE: the full gc.collect() that used to run here sat on the PREFETCH thread's
+        # critical path (once per cadence, ~0.3 s with TF loaded, GIL held against the
+        # encode feed) and freed nothing refcounting doesn't (#298 I7)
 
         # Record the stage transition in the inference_cadences run manifest. Written only
         # when preprocessing actually ran (the resume path never re-writes it); a crash
