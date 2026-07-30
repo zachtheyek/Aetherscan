@@ -354,6 +354,70 @@ def _load_pfb_response(response_path: str) -> np.ndarray:
     return response
 
 
+def _flattened_edge_mid_ratio_banded(
+    h5_path: str,
+    channel_index: int,
+    response: np.ndarray,
+    width: int,
+    time_bins: int,
+    open_kwargs: dict | None = None,
+) -> float:
+    """
+    Edge/mid power ratio of one coarse channel AFTER flattening by the static response H.
+
+    Reads only the bands edge_mid_power_ratio actually evaluates (edge_mid_band_slices:
+    the outermost width // 16 bins each side plus a central band of the same width) as
+    native float32 and time-integrates each immediately — ~10x less I/O than the
+    full-channel float64 read of _read_despiked_channel, and no fp64 blowup, which is what
+    keeps the per-file sanity check cheap at GBT scale. The DC spike (2 bins at
+    width // 2) sits inside the mid band; its interpolation (_remove_dc_spike) is linear,
+    so it commutes with the time mean and is replicated on the integrated slice. Matches
+    edge_mid_power_ratio(equalize_passband(channel, response).mean(axis=0)) on the
+    despiked full read, up to float32-read rounding (pinned by a unit test).
+
+    Module-level (not a DataPreprocessor method) so the pool-side _pfb_ratio_worker can
+    share the exact same body (#298 I6) — both venues must produce identical ratios.
+    """
+    start = channel_index * width
+    left, mid, right = edge_mid_band_slices(width)
+    # Widen the mid slice so the DC-spike interpolation sources (up to 3 bins around
+    # width // 2, see _remove_dc_spike) are always present.
+    lo = max(0, min(mid.start, width // 2 - 3))
+    hi = max(mid.stop, width // 2 + 3)
+    # The three band reads all live in the same chunk-column stripe; a sized chunk cache
+    # (computed once per file by the caller) decompresses each chunk once instead of once
+    # per band read.
+    with h5py.File(h5_path, "r", **(open_kwargs or {})) as hf:
+        data = hf["data"]
+        left_int = data[:time_bins, 0, start + left.start : start + left.stop].mean(axis=0)
+        right_int = data[:time_bins, 0, start + right.start : start + right.stop].mean(axis=0)
+        mid_int = data[:time_bins, 0, start + lo : start + hi].mean(axis=0)
+    dc = width // 2 - lo
+    mid_int[dc] = (mid_int[dc + 1] + mid_int[dc - 3]) / 2
+    mid_int[dc - 1] = (mid_int[dc + 2] + mid_int[dc - 2]) / 2
+    mid_int = mid_int[mid.start - lo : mid.stop - lo]
+
+    # Same divide-by-H (with equalize_passband's defensive floor) as the real flattener;
+    # per-bin division commutes with the time mean, so integrating first is equivalent.
+    floor = np.maximum(response, 1e-10)
+    edge = 0.5 * (float((left_int / floor[left]).mean()) + float((right_int / floor[right]).mean()))
+    return edge / float((mid_int / floor[mid]).mean())
+
+
+def _pfb_ratio_worker(args: tuple) -> float:
+    """
+    Pool worker for the PFB residual-flatness check (#298 I6): one sampled channel's
+    flattened edge/mid power ratio. The static response arrives as its content-addressed
+    sidecar PATH — _load_pfb_response caches the ~8 MB array per worker process, and the
+    sidecar was np.array_equal-verified against the generated response in the parent, so
+    pool-side ratios are bit-identical to the old parent-side computation.
+    """
+    h5_path, channel_index, width, time_bins, response_path, open_kwargs = args
+    return _flattened_edge_mid_ratio_banded(
+        h5_path, channel_index, _load_pfb_response(response_path), width, time_bins, open_kwargs
+    )
+
+
 def _pfb_flatten_bandpass(channel: np.ndarray, response_path: str) -> np.ndarray:
     """
     PFB static-equalization bandpass flattener (--bandpass-method pfb, the default): divide the
@@ -856,6 +920,10 @@ class DataPreprocessor:
         # Persistent worker pool for energy detection + stamp extraction, shared across all
         # cadences of a run (see start/stop_energy_detection_pool)
         self._ed_pool: Pool | None = None
+        # Verified PFB response sidecars, keyed by (fine_per_coarse, n_coarse, taps): skips
+        # the per-cadence np.load + np.array_equal re-verification of the ~8 MB sidecar
+        # once this run has already validated it (#298 rider)
+        self._verified_pfb_response_paths: dict[tuple[int, int, int], str] = {}
 
     # NOTE: come back to this later
     def close(self):
@@ -1719,53 +1787,68 @@ class DataPreprocessor:
         all_hits: list[tuple] = []  # (abs_idx, stat, p)
         stat_hists = np.zeros((len(on_source_paths), len(ED_STAT_HIST_EDGES) - 1), dtype=np.int64)
 
-        for on_source_idx, on_h5 in enumerate(on_source_paths):
-            logger.info(
-                f"Cadence {group.key}: running energy detection on ON-source "
-                f"{on_source_idx + 1}/{len(on_source_paths)}: {on_h5}"
+        # One fused, ORDERED, file-major imap over all three ON files (#298 I6): the old
+        # one-drained-imap-per-file shape paid three straggler tails per cadence and left
+        # the pool idle between files. Ordered iteration makes all_hits assembly
+        # byte-identical to the per-file loops (file 0's channels, then file 1's, ...),
+        # and the task position recovers the ON-file index for the per-file histograms.
+        # The per-file read_ed_on{1..3} spans collapse into one read_ed span.
+        logger.info(
+            f"Cadence {group.key}: running energy detection on "
+            f"{len(on_source_paths)} ON-source files x {n_coarse_total} coarse channels"
+        )
+        with stage_timer("read_ed"):
+            # Residual-flatness sanity check — primary ON file only (the static response is
+            # a property of the backend, shared by every file). Runs ON THE POOL alongside
+            # energy detection (#298 I6): the serial parent-side version idled all workers
+            # for its ~27 chunk-stripe band reads; the median + warning still land once per
+            # cadence, after the ED drain below.
+            pfb_check = (
+                self._start_pfb_response_check(primary_h5, n_coarse_total, bandpass_flatten)
+                if pfb_active
+                else None
             )
 
-            # One stage span per ON file (read + DC spike + bandpass flatten + threshold)
-            with stage_timer(f"read_ed_on{on_source_idx + 1}"):
-                if pfb_active and on_source_idx == 0:
-                    # Cheap residual-flatness sanity check — primary ON file only: the static
-                    # response is a property of the backend, shared by every file of the cadence
-                    self._warn_on_pfb_response_mismatch(on_h5, n_coarse_total)
+            tasks = [
+                (
+                    on_h5,
+                    ch,
+                    coarse_channel_width,
+                    time_bins,
+                    bandpass_flatten,
+                    window_size,
+                    step_size,
+                    stat_threshold,
+                )
+                for on_h5 in on_source_paths
+                for ch in range(n_coarse_total)
+            ]
 
-                tasks = [
-                    (
-                        on_h5,
-                        ch,
-                        coarse_channel_width,
-                        time_bins,
-                        bandpass_flatten,
-                        window_size,
-                        step_size,
-                        stat_threshold,
+            if self._ed_pool is not None:
+                # imap (ordered, chunksize 1) keeps every worker busy across the whole
+                # cadence while results stream back for progress logging
+                channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
+            else:
+                if n_processes > 1:
+                    logger.info(
+                        "Energy detection running sequentially: no persistent pool "
+                        "started (call start_energy_detection_pool() to parallelize)"
                     )
-                    for ch in range(n_coarse_total)
-                ]
+                channel_hits_iter = map(_energy_detect_channel_worker, tasks)
 
-                if self._ed_pool is not None:
-                    # imap (ordered, chunksize 1) keeps every worker busy across the whole
-                    # file while results stream back for progress logging
-                    channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
-                else:
-                    if n_processes > 1:
-                        logger.info(
-                            "Energy detection running sequentially: no persistent pool "
-                            "started (call start_energy_detection_pool() to parallelize)"
-                        )
-                    channel_hits_iter = map(_energy_detect_channel_worker, tasks)
+            for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter):
+                on_source_idx = done // n_coarse_total
+                file_done = done % n_coarse_total + 1
+                all_hits.extend(channel_hits)
+                stat_hists[on_source_idx] += channel_hist
+                if file_done % progress_chunk == 0 or file_done == n_coarse_total:
+                    logger.info(
+                        f"  Coarse channel {file_done}/{n_coarse_total} of ON-source "
+                        f"{on_source_idx + 1}/{len(on_source_paths)}"
+                    )
 
-                for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter, start=1):
-                    all_hits.extend(channel_hits)
-                    stat_hists[on_source_idx] += channel_hist
-                    if done % progress_chunk == 0 or done == n_coarse_total:
-                        logger.info(
-                            f"  Coarse channel {done}/{n_coarse_total} of ON-source "
-                            f"{on_source_idx + 1}/{len(on_source_paths)}"
-                        )
+            if pfb_check is not None:
+                self._finish_pfb_response_check(pfb_check, primary_h5)
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
@@ -2009,6 +2092,14 @@ class DataPreprocessor:
         stale-run leftovers are impossible; a corrupt or mismatched file is rewritten. Writes
         are atomic (tmp + os.replace), matching the stamp-extraction pattern.
         """
+        # Once this run has verified (or written) the sidecar for a parameter tuple, skip
+        # the per-cadence np.load + np.array_equal round trip (#298 rider) — the file is
+        # content-addressed and nothing in-run rewrites a verified path.
+        memo_key = (fine_per_coarse, num_coarse_channels, taps_per_channel)
+        memoized = self._verified_pfb_response_paths.get(memo_key)
+        if memoized is not None and os.path.exists(memoized):
+            return memoized
+
         response = gen_coarse_channel_response(
             fine_per_coarse, num_coarse_channels, taps_per_channel
         )
@@ -2024,6 +2115,7 @@ class DataPreprocessor:
             try:
                 existing = np.load(path)
                 if np.array_equal(existing, response):
+                    self._verified_pfb_response_paths[memo_key] = path
                     return path
                 logger.warning(f"PFB response cache {path} does not match; rewriting")
             except Exception as e:
@@ -2037,6 +2129,7 @@ class DataPreprocessor:
             np.save(f, response)
         os.replace(tmp_path, path)
         logger.info(f"Wrote PFB response cache: {path}")
+        self._verified_pfb_response_paths[memo_key] = path
         return path
 
     @staticmethod
@@ -2065,47 +2158,16 @@ class DataPreprocessor:
         response: np.ndarray,
         open_kwargs: dict | None = None,
     ) -> float:
-        """
-        Edge/mid power ratio of one coarse channel AFTER flattening by the static response H.
-
-        Reads only the bands edge_mid_power_ratio actually evaluates (edge_mid_band_slices:
-        the outermost width // 16 bins each side plus a central band of the same width) as
-        native float32 and time-integrates each immediately — ~10x less I/O than the
-        full-channel float64 read of _read_despiked_channel, and no fp64 blowup, which is what
-        keeps the per-file sanity check cheap at GBT scale. The DC spike (2 bins at
-        width // 2) sits inside the mid band; its interpolation (_remove_dc_spike) is linear,
-        so it commutes with the time mean and is replicated on the integrated slice. Matches
-        edge_mid_power_ratio(equalize_passband(channel, response).mean(axis=0)) on the
-        despiked full read, up to float32-read rounding (pinned by a unit test).
-        """
-        width = self.config.inference.coarse_channel_width
-        time_bins = self.config.data.time_bins
-        start = channel_index * width
-        left, mid, right = edge_mid_band_slices(width)
-        # Widen the mid slice so the DC-spike interpolation sources (up to 3 bins around
-        # width // 2, see _remove_dc_spike) are always present.
-        lo = max(0, min(mid.start, width // 2 - 3))
-        hi = max(mid.stop, width // 2 + 3)
-        # The three band reads all live in the same chunk-column stripe; a sized chunk cache
-        # (passed by _warn_on_pfb_response_mismatch, computed once per file) decompresses
-        # each chunk once instead of once per band read.
-        with h5py.File(h5_path, "r", **(open_kwargs or {})) as hf:
-            data = hf["data"]
-            left_int = data[:time_bins, 0, start + left.start : start + left.stop].mean(axis=0)
-            right_int = data[:time_bins, 0, start + right.start : start + right.stop].mean(axis=0)
-            mid_int = data[:time_bins, 0, start + lo : start + hi].mean(axis=0)
-        dc = width // 2 - lo
-        mid_int[dc] = (mid_int[dc + 1] + mid_int[dc - 3]) / 2
-        mid_int[dc - 1] = (mid_int[dc + 2] + mid_int[dc - 2]) / 2
-        mid_int = mid_int[mid.start - lo : mid.stop - lo]
-
-        # Same divide-by-H (with equalize_passband's defensive floor) as the real flattener;
-        # per-bin division commutes with the time mean, so integrating first is equivalent.
-        floor = np.maximum(response, 1e-10)
-        edge = 0.5 * (
-            float((left_int / floor[left]).mean()) + float((right_int / floor[right]).mean())
+        """Config-bound wrapper over _flattened_edge_mid_ratio_banded (the module-level body
+        is shared with the pool-side _pfb_ratio_worker, #298 I6)."""
+        return _flattened_edge_mid_ratio_banded(
+            h5_path,
+            channel_index,
+            response,
+            self.config.inference.coarse_channel_width,
+            self.config.data.time_bins,
+            open_kwargs,
         )
-        return edge / float((mid_int / floor[mid]).mean())
 
     def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
         """
@@ -2129,22 +2191,72 @@ class DataPreprocessor:
         property of the backend shared by every file.
         """
         width = self.config.inference.coarse_channel_width
-        taps = self.config.inference.pfb_taps_per_channel
         try:
-            response = gen_coarse_channel_response(width, n_coarse_total, taps)
+            response = gen_coarse_channel_response(
+                width, n_coarse_total, self.config.inference.pfb_taps_per_channel
+            )
             open_kwargs = _chunk_cache_kwargs(h5_path, time_bins=self.config.data.time_bins)
-            # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
             ratios = [
                 self._flattened_edge_mid_ratio(h5_path, ch, response, open_kwargs)
                 for ch in self._sample_channel_indices(
                     n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
                 )
             ]
-            median = float(np.median(ratios))
         except Exception as e:
             logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
             return
 
+        self._log_pfb_ratio_verdict(ratios, h5_path)
+
+    def _start_pfb_response_check(
+        self, h5_path: str, n_coarse_total: int, bandpass_flatten: functools.partial
+    ):
+        """
+        Run the residual-flatness check on the worker pool instead of the parent (#298 I6):
+        submit one small task per sampled channel via map_async and return the handle for
+        _finish_pfb_response_check. The parent-side serial version idled every worker for
+        its ~27 chunk-stripe band reads; pool-side, the reads overlap energy detection and
+        the warning semantics are unchanged (same per-cadence cadence, same median of
+        bit-identical ratios). Falls back to the synchronous check (returning None) when no
+        pool exists; a failure to start is logged and swallowed — the check is
+        informational and must never fail the cadence.
+        """
+        if self._ed_pool is None:
+            self._warn_on_pfb_response_mismatch(h5_path, n_coarse_total)
+            return None
+        try:
+            width = self.config.inference.coarse_channel_width
+            time_bins = self.config.data.time_bins
+            response_path = bandpass_flatten.keywords["response_path"]
+            open_kwargs = _chunk_cache_kwargs(h5_path, time_bins)
+            tasks = [
+                (h5_path, ch, width, time_bins, response_path, open_kwargs)
+                for ch in self._sample_channel_indices(
+                    n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
+                )
+            ]
+            return self._ed_pool.map_async(_pfb_ratio_worker, tasks)
+        except Exception as e:
+            logger.warning(f"PFB static-response sanity check failed to start for {h5_path}: {e}")
+            return None
+
+    def _finish_pfb_response_check(self, pfb_check, h5_path: str) -> None:
+        """Collect the pool-side ratios (all tasks have drained by the time the fused ED
+        imap completes) and emit the same once-per-file verdict as the synchronous check."""
+        try:
+            ratios = pfb_check.get()
+        except Exception as e:
+            logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
+            return
+        self._log_pfb_ratio_verdict(ratios, h5_path)
+
+    def _log_pfb_ratio_verdict(self, ratios: list[float], h5_path: str) -> None:
+        """Median the sampled flattened edge/mid ratios and warn once per file when the
+        deviation from 1.0 exceeds _PFB_RESIDUAL_FLATNESS_TOL (informational — see
+        _warn_on_pfb_response_mismatch's docstring for the interpretation contract)."""
+        taps = self.config.inference.pfb_taps_per_channel
+        # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
+        median = float(np.median(ratios))
         deviation = abs(median - 1.0)
         if deviation > _PFB_RESIDUAL_FLATNESS_TOL:
             logger.warning(
