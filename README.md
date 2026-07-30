@@ -412,7 +412,7 @@ options:
 The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py train` (container) or `PYTHONPATH=src python utils/print_cli_help.py train` (source).
 
 ```
-usage: train [-h] [--seed SEED]
+usage: train [-h] [--seed SEED] [--unseeded]
              [--tf-deterministic-ops | --no-tf-deterministic-ops]
              [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
@@ -486,13 +486,18 @@ options:
                         (training AND inference), the random forest,
                         UMAP/KMeans plot fits, and plot subsampling. Defaults
                         to a concrete value (reproducible out of the box);
-                        must be >= 0.
+                        must be >= 0. To run unseeded, pass --unseeded
+  --unseeded            Opt OUT of the seeded default: draw every random
+                        stream from OS entropy (non-reproducible). Mutually
+                        exclusive with --seed
   --tf-deterministic-ops, --no-tf-deterministic-ops
                         Force deterministic TensorFlow/cuDNN op
                         implementations
                         (tf.config.experimental.enable_op_determinism) for
-                        bit-exact GPU reproducibility at some speed cost. Only
-                        meaningful together with a seed (default: disabled)
+                        bit-exact GPU reproducibility at some speed cost.
+                        Default: enabled — without it, cuDNN autotune noise
+                        can flip near-threshold candidates between identical
+                        runs; opt out with --no-tf-deterministic-ops
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -761,7 +766,7 @@ options:
 The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py inference` (container) or `PYTHONPATH=src python utils/print_cli_help.py inference` (source).
 
 ```
-usage: inference [-h] [--seed SEED]
+usage: inference [-h] [--seed SEED] [--unseeded]
                  [--tf-deterministic-ops | --no-tf-deterministic-ops]
                  [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
@@ -811,13 +816,18 @@ options:
                         (training AND inference), the random forest,
                         UMAP/KMeans plot fits, and plot subsampling. Defaults
                         to a concrete value (reproducible out of the box);
-                        must be >= 0.
+                        must be >= 0. To run unseeded, pass --unseeded
+  --unseeded            Opt OUT of the seeded default: draw every random
+                        stream from OS entropy (non-reproducible). Mutually
+                        exclusive with --seed
   --tf-deterministic-ops, --no-tf-deterministic-ops
                         Force deterministic TensorFlow/cuDNN op
                         implementations
                         (tf.config.experimental.enable_op_determinism) for
-                        bit-exact GPU reproducibility at some speed cost. Only
-                        meaningful together with a seed (default: disabled)
+                        bit-exact GPU reproducibility at some speed cost.
+                        Default: enabled — without it, cuDNN autotune noise
+                        can flip near-threshold candidates between identical
+                        runs; opt out with --no-tf-deterministic-ops
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)

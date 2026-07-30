@@ -137,7 +137,12 @@ class ReproducibilityConfig:
     seed: int | None = 11
     # Force deterministic TF/cuDNN op implementations (tf.config.experimental
     # .enable_op_determinism) at some speed cost. Only meaningful alongside `seed`.
-    tf_deterministic_ops: bool = False
+    # Default ON (#298, maintainer decision): without it, cuDNN autotune may select
+    # different conv algorithms run to run, and the resulting low-bit latent drift is
+    # enough to flip near-threshold candidates between otherwise identical inference runs
+    # (measured live: 3 candidate flips between two identical unflagged runs; two flagged
+    # runs were bit-identical). Opt out with --no-tf-deterministic-ops.
+    tf_deterministic_ops: bool = True
 
 
 @dataclass

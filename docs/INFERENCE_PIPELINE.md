@@ -321,10 +321,15 @@ feed the reservoir (manifest-skipped cadences never re-offer their rejects).
 Inference used to be entirely unseeded: the encoder's `Sampling` layer drew fresh entropy
 every run, so the same encoder + RF + stamps could yield a different candidate set each time.
 Since #279 the `InferencePipeline` constructor seeds TF's global RNG from the shared root
-seed (`config.reproducibility.seed`, default 11; `--seed` and `--tf-deterministic-ops` are on
-the inference subparser too), and `run_inference` re-seeds per cadence keyed on the stable
-catalog index — so a cadence's results depend only on (root seed, cadence), reproducible even
-when the catalog is subset or a run resumes partway. The pass-2 MC draws and the
+seed (`config.reproducibility.seed`, default 11; `--seed`/`--unseeded` and
+`--tf-deterministic-ops`/`--no-tf-deterministic-ops` are on the inference subparser too),
+and `run_inference` re-seeds per cadence keyed on the stable catalog index — so a cadence's
+results depend only on (root seed, cadence), reproducible even when the catalog is subset
+or a run resumes partway. Deterministic ops are **ON by default** (#298): without them,
+cuDNN autotune noise between otherwise identical runs is enough to flip candidates sitting
+at the 0.99 threshold (measured live: 3 flips between two identical unflagged runs; two
+flagged runs were bit-identical). Neither reproducibility field is layered from the saved
+`--config-path` — opting out is always an explicit CLI act. The pass-2 MC draws and the
 reference-cloud reservoir derive their own NumPy streams from the same root (see
 [`seeding.py`](../src/aetherscan/seeding.py) and the Reproducibility section of
 [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)).

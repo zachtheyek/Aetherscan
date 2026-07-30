@@ -450,10 +450,15 @@ warned once per process).
   `Config.resolved_rf_seed()` reports the value actually used. The RF *dataset* borrows the
   round-`0` `STREAM_DATASET` key while curriculum (beta-VAE) rounds are 1-based, so their
   streams never collide.
-- **`--tf-deterministic-ops`** (`config.reproducibility.tf_deterministic_ops`, off by default;
-  on both subcommands) forces deterministic TF/cuDNN kernels via
-  `tf.config.experimental.enable_op_determinism()`. It costs some speed and is only meaningful
-  alongside a seed — enabling it without one logs a warning and buys nothing.
+- **`--tf-deterministic-ops`** (`config.reproducibility.tf_deterministic_ops`, **ON by
+  default** since #298; on both subcommands) forces deterministic TF/cuDNN kernels via
+  `tf.config.experimental.enable_op_determinism()`. It costs some speed and is only
+  meaningful alongside a seed. Opt out with `--no-tf-deterministic-ops` — without it, cuDNN
+  autotune may pick different conv algorithms run to run, whose low-bit drift is enough to
+  flip near-threshold inference candidates between otherwise identical runs (measured live).
+  Likewise `--unseeded` is the explicit opt-out of the seeded default. Neither
+  reproducibility field is ever layered from a saved `--config-path` (they are run-scoped,
+  not model provenance), so disabling either is always a deliberate CLI act.
 - **Approximate vs. bit-exact.** Seeding alone gives *approximate* run-to-run reproducibility;
   *bit-exact* GPU reproducibility additionally requires `--tf-deterministic-ops` plus identical
   hardware and software.

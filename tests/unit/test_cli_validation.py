@@ -210,6 +210,32 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(["train", "--rf-seed", "-1"]), None)
         assert any(e.field == "rf.seed" and e.fix_kind == "clamp_low" for e in errors)
 
+    def test_deterministic_ops_defaults_on(self):
+        # #298: determinism is the default; disabling is an explicit CLI act
+        config = get_config()
+        assert config.reproducibility.tf_deterministic_ops is True
+        assert config.reproducibility.seed == 11
+
+    def test_unseeded_opt_out_sets_seed_none(self):
+        args = _parse(["inference", "--unseeded"])
+        apply_args_to_config(args)
+        assert get_config().reproducibility.seed is None
+
+    def test_no_tf_deterministic_ops_opt_out(self):
+        args = _parse(["inference", "--no-tf-deterministic-ops"])
+        apply_args_to_config(args)
+        assert get_config().reproducibility.tf_deterministic_ops is False
+
+    def test_unseeded_and_seed_mutually_exclusive(self):
+        errors = collect_validation_errors(_parse(["inference", "--unseeded", "--seed", "7"]), None)
+        assert any(
+            e.field == "reproducibility.seed" and e.fix_kind == "cross_param" for e in errors
+        )
+
+    def test_unseeded_alone_passes_validation(self):
+        errors = collect_validation_errors(_parse(["inference", "--unseeded"]), None)
+        assert not any(e.field == "reproducibility.seed" for e in errors)
+
     def test_curriculum_schedule_enum(self):
         errors = collect_validation_errors(
             _parse(["train", "--curriculum-schedule", "sigmoid"]), None
@@ -585,6 +611,21 @@ class TestApplySavedConfigPrecedence:
         assert config.inference.per_replica_batch_size == default_batch
         assert config.inference.prefetch_depth == default_depth
         assert config.inference.classification_threshold == 0.42  # still layered
+
+    def test_reproducibility_never_layered(self, tmp_path):
+        """#298: determinism defaults ON — a config saved by a pre-#298 training run
+        (tf_deterministic_ops false) must not silently disable it on inference; opting
+        out is a CLI act (--no-tf-deterministic-ops / --unseeded), never a config-path
+        side effect."""
+        config = get_config()
+
+        saved = {"reproducibility": {"seed": 99, "tf_deterministic_ops": False}}
+        path = tmp_path / "saved_config.json"
+        path.write_text(json.dumps(saved))
+        apply_saved_config(str(path))
+
+        assert config.reproducibility.seed == 11
+        assert config.reproducibility.tf_deterministic_ops is True
 
     def test_missing_file_raises(self):
         with pytest.raises(ValueError, match="does not exist"):

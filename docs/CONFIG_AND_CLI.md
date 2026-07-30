@@ -74,7 +74,7 @@ subcommand uses it:
 | `ManagerConfig`      | Multiprocessing pool sizing                                                                                                        |
 | `MonitorConfig`      | Resource-monitor cadence and timeouts, stage-band plot annotation toggle, live-dashboard enable (`dashboard_enabled`) and port (`dashboard_port`) |
 | `LoggerConfig`       | Console / file / Slack log routing                                                                                                 |
-| `ReproducibilityConfig` | The pipeline root seed (`seed`, default 11 — every random stream in **both** modes derives from it; see `seeding.py`) and `tf_deterministic_ops` |
+| `ReproducibilityConfig` | The pipeline root seed (`seed`, default 11 — every random stream in **both** modes derives from it; see `seeding.py`) and `tf_deterministic_ops` (default **on** since #298; opt out with `--no-tf-deterministic-ops`, unseed with `--unseeded`) |
 | `BetaVAEConfig`      | Beta-VAE model hyperparameters, plus the A/B-gated `mixed_precision` (bf16) opt-in (default off)                                   |
 | `RandomForestConfig` | RF classifier hyperparameters, the #282 latent-variant sweep/selection/calibration knobs, and the override-only `seed` (default `None` = derived from the root seed) |
 | `GPUConfig`          | TF strategy: replica count, memory growth, NCCL packs, allocator toggles, GPU thread mode (`gpu_thread_mode` / `gpu_thread_count`) |
@@ -201,7 +201,7 @@ Current Pattern B flags:
 - `--dashboard` / `--no-dashboard` (`BooleanOptionalAction`) → `config.monitor.dashboard_enabled`
 - `--dashboard-port` → `config.monitor.dashboard_port`
 - `--benchmark-report` / `--no-benchmark-report` (`BooleanOptionalAction`) → `config.monitor.benchmark_report_enabled`
-- `--seed` → `config.reproducibility.seed` (registered via `_add_reproducibility_flags_to`)
+- `--seed` / `--unseeded` → `config.reproducibility.seed` (registered via `_add_reproducibility_flags_to`; `--unseeded` sets it to None, mutually exclusive with `--seed`)
 - `--tf-deterministic-ops` (`BooleanOptionalAction`) → `config.reproducibility.tf_deterministic_ops` (same helper)
 
 #### Pattern C — shared flag, divergent destination

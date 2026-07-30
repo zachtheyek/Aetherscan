@@ -245,13 +245,19 @@ def _add_reproducibility_flags_to(parser):
         "--seed",
         type=int,
         default=None,
-        help="Root random seed for reproducible runs: every random stream derives from it — data generation, dataset split/shuffles, TF weight init, the VAE sampling layer (training AND inference), the random forest, UMAP/KMeans plot fits, and plot subsampling. Defaults to a concrete value (reproducible out of the box); must be >= 0.",
+        help="Root random seed for reproducible runs: every random stream derives from it — data generation, dataset split/shuffles, TF weight init, the VAE sampling layer (training AND inference), the random forest, UMAP/KMeans plot fits, and plot subsampling. Defaults to a concrete value (reproducible out of the box); must be >= 0. To run unseeded, pass --unseeded",
+    )
+    parser.add_argument(
+        "--unseeded",
+        action="store_true",
+        default=False,
+        help="Opt OUT of the seeded default: draw every random stream from OS entropy (non-reproducible). Mutually exclusive with --seed",
     )
     parser.add_argument(
         "--tf-deterministic-ops",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some speed cost. Only meaningful together with a seed (default: disabled)",
+        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some speed cost. Default: enabled — without it, cuDNN autotune noise can flip near-threshold candidates between identical runs; opt out with --no-tf-deterministic-ops",
     )
 
 
@@ -1058,15 +1064,19 @@ def _add_inference_flags_to(parser):
 
 
 # NOTE: come back to this later
-# Per-section fields apply_saved_config never layers from a saved config (#298 I4): these
-# are HOST-TUNING knobs (batching / prefetch scheduling), not model provenance — a config
-# saved by an older training run would otherwise silently re-impose its host's values on
-# every future inference run (e.g. a pre-#298 config re-imposing per_replica_batch_size
-# 2048 over the corrected 256 default). Both are provably result-invariant (they sit in
-# run_state's inference-fingerprint denylist for the same reason); current defaults + CLI
-# flags stay authoritative for them.
+# Per-section fields apply_saved_config never layers from a saved config (#298): these are
+# RUN-SCOPED knobs, not model provenance — a config saved by an older training run would
+# otherwise silently re-impose its values on every future inference run.
+# - inference batching/prefetch are host tuning (a pre-#298 config would re-impose
+#   per_replica_batch_size 2048 over the corrected 256 default); both are provably
+#   result-invariant (they sit in run_state's inference-fingerprint denylist).
+# - reproducibility is the RUN'S OWN contract: determinism defaults ON and opting out must
+#   be an explicit CLI act (--no-tf-deterministic-ops / --unseeded), never a side effect of
+#   loading a training config recorded before the default flipped.
+# Current defaults + CLI flags stay authoritative for all of these.
 _SAVED_CONFIG_SKIP_FIELDS: dict[str, frozenset[str]] = {
     "inference": frozenset({"per_replica_batch_size", "prefetch_depth"}),
+    "reproducibility": frozenset({"seed", "tf_deterministic_ops"}),
 }
 
 
@@ -1219,8 +1229,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     if hasattr(args, "inference_files") and args.inference_files is not None:
         config.data.inference_files = args.inference_files
 
-    # Reproducibility (#279): shared by both subparsers
-    if hasattr(args, "seed") and args.seed is not None:
+    # Reproducibility (#279): shared by both subparsers. --unseeded is the explicit opt-out
+    # of the seeded default (#298) — validate_args rejects passing it together with --seed.
+    if hasattr(args, "unseeded") and args.unseeded:
+        config.reproducibility.seed = None
+    elif hasattr(args, "seed") and args.seed is not None:
         config.reproducibility.seed = args.seed
     # tf_deterministic_ops uses argparse.BooleanOptionalAction with default=None so the CLI
     # can express "leave the config default" (omit), "force on", and "force off" — same
@@ -1527,6 +1540,18 @@ def collect_validation_errors(
                 message=f"--seed must be a non-negative integer, got {seed}",
                 fix_kind="clamp_low",
                 min_val=0,
+            )
+        )
+
+    # --unseeded is the explicit opt-out of the seeded default (#298); combining it with an
+    # explicit --seed is contradictory — refuse rather than silently picking one
+    if getattr(args, "unseeded", False) and getattr(args, "seed", None) is not None:
+        errors.append(
+            ValidationError(
+                field="reproducibility.seed",
+                current=args.seed,
+                message="--unseeded and --seed are mutually exclusive: pass one or the other",
+                fix_kind="cross_param",
             )
         )
 
