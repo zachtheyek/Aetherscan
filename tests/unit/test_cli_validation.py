@@ -563,6 +563,29 @@ class TestApplySavedConfigPrecedence:
         assert not hasattr(config.training, "not_a_field")
         assert not hasattr(config, "not_a_section")
 
+    def test_host_tuning_knobs_never_layered(self, tmp_path):
+        """#298 I4: batching/prefetch are host tuning, not model provenance — a config
+        saved by a pre-#298 training run must not re-impose its per_replica_batch_size
+        (2048) over the corrected default; shape-critical fields still layer."""
+        config = get_config()
+        default_batch = config.inference.per_replica_batch_size
+        default_depth = config.inference.prefetch_depth
+
+        saved = {
+            "inference": {
+                "per_replica_batch_size": 2048,
+                "prefetch_depth": 7,
+                "classification_threshold": 0.42,
+            }
+        }
+        path = tmp_path / "saved_config.json"
+        path.write_text(json.dumps(saved))
+        apply_saved_config(str(path))
+
+        assert config.inference.per_replica_batch_size == default_batch
+        assert config.inference.prefetch_depth == default_depth
+        assert config.inference.classification_threshold == 0.42  # still layered
+
     def test_missing_file_raises(self):
         with pytest.raises(ValueError, match="does not exist"):
             apply_saved_config("/nonexistent/config.json")

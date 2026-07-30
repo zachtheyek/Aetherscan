@@ -1058,6 +1058,18 @@ def _add_inference_flags_to(parser):
 
 
 # NOTE: come back to this later
+# Per-section fields apply_saved_config never layers from a saved config (#298 I4): these
+# are HOST-TUNING knobs (batching / prefetch scheduling), not model provenance — a config
+# saved by an older training run would otherwise silently re-impose its host's values on
+# every future inference run (e.g. a pre-#298 config re-imposing per_replica_batch_size
+# 2048 over the corrected 256 default). Both are provably result-invariant (they sit in
+# run_state's inference-fingerprint denylist for the same reason); current defaults + CLI
+# flags stay authoritative for them.
+_SAVED_CONFIG_SKIP_FIELDS: dict[str, frozenset[str]] = {
+    "inference": frozenset({"per_replica_batch_size", "prefetch_depth"}),
+}
+
+
 def apply_saved_config(config_path: str) -> None:
     """Layer a saved JSON config (e.g. from a prior training run) onto the singleton.
 
@@ -1106,8 +1118,9 @@ def apply_saved_config(config_path: str) -> None:
         if target is None:
             continue
         if is_dataclass(target) and isinstance(value, dict):
+            skipped = _SAVED_CONFIG_SKIP_FIELDS.get(key, frozenset())
             for sub_key, sub_val in value.items():
-                if hasattr(target, sub_key):
+                if sub_key not in skipped and hasattr(target, sub_key):
                     setattr(target, sub_key, sub_val)
         else:
             # Top-level scalar (data_path, model_path, output_path, ...).
