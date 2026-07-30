@@ -202,6 +202,48 @@ def prepare_distributed_inf_dataset(
     }
 
 
+def _batched_mc_scores(
+    rf_model: RandomForestModel,
+    calibrator: dict | None,
+    variant: str,
+    mean_flat: np.ndarray,
+    logvar_flat: np.ndarray,
+    num_observations: int,
+    latent_dim: int,
+    active_dims: list[int] | None,
+    mc_draws: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Score `mc_draws` reparameterized draws with ONE stacked predict_proba call, returning
+    scores of shape (mc_draws, n_rows) — row-for-row what the old per-draw loop produced
+    (#298 I8). Correctness rests on three invariants: the draws are generated SEQUENTIALLY
+    from `rng` first, so the #279 stream consumption order is byte-identical to the loop;
+    sklearn's predict_proba consumes no numpy RNG and scores rows independently, so batch
+    composition cannot change any row's probability; and the calibrator is elementwise
+    (isotonic interpolation / per-row logistic). What changes is only the fixed per-call
+    overhead — check_array + a 1000-tree joblib dispatch — paid once instead of mc_draws
+    times (dispatch dominates at typical survivor counts). Bit-identity is pinned by a
+    unit test at n_jobs=1 (threaded tree accumulation order is sklearn's own run-to-run
+    nondeterminism, present in the old loop too).
+    """
+    draw_features = [
+        build_variant_features(
+            variant,
+            sample_z_flat(mean_flat, logvar_flat, rng),
+            logvar_flat,
+            num_observations,
+            latent_dim,
+            active_dims,
+        )
+        for _ in range(mc_draws)
+    ]
+    stacked_scores = apply_probability_calibrator(
+        calibrator, rf_model.model.predict_proba(np.vstack(draw_features))[:, 1]
+    )
+    return stacked_scores.reshape(mc_draws, -1)
+
+
 class ReferenceCloudReservoir:
     """
     Seeded uniform reservoir (algorithm R) over the pass-1 rejects' posterior parameters
@@ -524,23 +566,18 @@ class InferencePipeline:
                         else (STREAM_INFERENCE_MC, seed_key)
                     )
                     mc_rng = derive_rng(self.config.reproducibility.seed, *mc_key)
-                    draw_scores = np.empty((self.mc_draws, len(survivor_idx)))
-                    for draw_index in range(self.mc_draws):
-                        draw_flat = sample_z_flat(
-                            mean_flat[survivor_idx], logvar_flat[survivor_idx], mc_rng
-                        )
-                        draw_features = build_variant_features(
-                            variant,
-                            draw_flat,
-                            logvar_flat[survivor_idx],
-                            num_observations,
-                            latent_dim,
-                            active_dims,
-                        )
-                        draw_scores[draw_index] = apply_probability_calibrator(
-                            self.calibrator,
-                            self.rf_model.model.predict_proba(draw_features)[:, 1],
-                        )
+                    draw_scores = _batched_mc_scores(
+                        self.rf_model,
+                        self.calibrator,
+                        variant,
+                        mean_flat[survivor_idx],
+                        logvar_flat[survivor_idx],
+                        num_observations,
+                        latent_dim,
+                        active_dims,
+                        self.mc_draws,
+                        mc_rng,
+                    )
                     mc_mean[survivor_idx] = draw_scores.mean(axis=0)
                     mc_std[survivor_idx] = draw_scores.std(axis=0)
                     del draw_scores
@@ -741,7 +778,6 @@ class InferencePipeline:
             raise RuntimeError("No database instance detected - cannot store inference results")
 
         tag = self.config.checkpoint.save_tag
-        n_candidates = 0
 
         def _optional_float(values, index):
             if values is None:
@@ -749,43 +785,43 @@ class InferencePipeline:
             value = float(values[index])
             return None if np.isnan(value) else value
 
-        for idx in range(len(confidence_scores)):
+        # NOTE: should we just store everything? benchmark storage requirements
+        # Only store candidates above threshold (to reduce db size). Iterate the positives
+        # directly (rider on #298 I8) — identical rows in identical order, without a Python
+        # loop over every negative snippet of a 1e4-1e5-stamp cadence.
+        positive_indices = np.nonzero(np.asarray(predictions) == 1)[0]
+        n_candidates = len(positive_indices)
+        for raw_idx in positive_indices:
+            idx = int(raw_idx)
             confidence = float(confidence_scores[idx])
             prediction = int(predictions[idx])
 
-            # NOTE: should we just store everything? benchmark storage requirements
-            # Only store candidates above threshold (to reduce db size)
-            if prediction == 1:
-                n_candidates += 1
+            snippet_frequency_mhz = frequency_mhz
+            if stamp_frequencies_mhz is not None:
+                snippet_frequency_mhz = float(stamp_frequencies_mhz[idx])
 
-                snippet_frequency_mhz = frequency_mhz
-                if stamp_frequencies_mhz is not None:
-                    snippet_frequency_mhz = float(stamp_frequencies_mhz[idx])
+            # One latent row per observation -> flatten the snippet's num_observations
+            # rows into a single (num_observations * latent_dim,) vector
+            latent_rows = latents[idx * self.num_observations : (idx + 1) * self.num_observations]
 
-                # One latent row per observation -> flatten the snippet's num_observations
-                # rows into a single (num_observations * latent_dim,) vector
-                latent_rows = latents[
-                    idx * self.num_observations : (idx + 1) * self.num_observations
-                ]
-
-                self.db.write_inference_result(
-                    npy_path=npy_path,
-                    snippet_index=idx,
-                    prediction=prediction,
-                    confidence=confidence,
-                    latent_vector=latent_rows.reshape(-1),
-                    target=target,
-                    session=session,
-                    cadence_id=cadence_id,
-                    band=band,
-                    frequency_mhz=snippet_frequency_mhz,
-                    timestamp_observed=timestamp_observed,
-                    h5_path=h5_path,
-                    tag=tag,
-                    screening_proba=_optional_float(screening_probas, idx),
-                    mc_mean=_optional_float(mc_mean, idx),
-                    mc_std=_optional_float(mc_std, idx),
-                )
+            self.db.write_inference_result(
+                npy_path=npy_path,
+                snippet_index=idx,
+                prediction=prediction,
+                confidence=confidence,
+                latent_vector=latent_rows.reshape(-1),
+                target=target,
+                session=session,
+                cadence_id=cadence_id,
+                band=band,
+                frequency_mhz=snippet_frequency_mhz,
+                timestamp_observed=timestamp_observed,
+                h5_path=h5_path,
+                tag=tag,
+                screening_proba=_optional_float(screening_probas, idx),
+                mc_mean=_optional_float(mc_mean, idx),
+                mc_std=_optional_float(mc_std, idx),
+            )
 
         logger.info(f"Wrote {n_candidates} candidates to database")
         return n_candidates
@@ -814,20 +850,18 @@ class InferencePipeline:
         variant = self.config.rf.latent_variant
         active_dims = self.config.rf.active_dims
         cloud_rng = derive_rng(self.config.reproducibility.seed, STREAM_REFERENCE_CLOUD, 1)
-        draw_scores = np.empty((self.mc_draws, len(screening)))
-        for draw_index in range(self.mc_draws):
-            draw_flat = sample_z_flat(mean_flat, logvar_flat, cloud_rng)
-            draw_features = build_variant_features(
-                variant,
-                draw_flat,
-                logvar_flat,
-                self.num_observations,
-                self.latent_dim,
-                active_dims,
-            )
-            draw_scores[draw_index] = apply_probability_calibrator(
-                self.calibrator, self.rf_model.model.predict_proba(draw_features)[:, 1]
-            )
+        draw_scores = _batched_mc_scores(
+            self.rf_model,
+            self.calibrator,
+            variant,
+            mean_flat,
+            logvar_flat,
+            self.num_observations,
+            self.latent_dim,
+            active_dims,
+            self.mc_draws,
+            cloud_rng,
+        )
 
         tag = self.config.checkpoint.save_tag
         cloud_path = os.path.join(self.config.output_path, f"inference_reference_cloud_{tag}.npz")

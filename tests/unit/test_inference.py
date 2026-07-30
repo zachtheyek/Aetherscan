@@ -14,8 +14,15 @@ from aetherscan.inference import (
     InfDataHolder,
     InferencePipeline,
     ReferenceCloudReservoir,
+    _batched_mc_scores,
     prepare_distributed_inf_dataset,
     summarize_confidences,
+)
+from aetherscan.latent_variants import (
+    apply_probability_calibrator,
+    build_variant_features,
+    fit_probability_calibrator,
+    sample_z_flat,
 )
 
 
@@ -257,6 +264,100 @@ class TestSummarizeConfidences:
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="at least one confidence"):
             summarize_confidences(np.array([]), threshold=0.5)
+
+
+class TestBatchedMcScores:
+    """#298 I8: one stacked predict_proba call must reproduce the retired per-draw loop
+    bit-for-bit (n_jobs=1) — same values, same positions, same RNG stream consumption."""
+
+    NUM_OBS, LATENT_DIM = 4, 2
+
+    def _tiny_rf(self, n_features):
+        import types  # noqa: PLC0415
+
+        from sklearn.ensemble import RandomForestClassifier  # noqa: PLC0415
+
+        rng = np.random.default_rng(5)
+        features = rng.standard_normal((80, n_features))
+        labels = (features[:, 0] > 0).astype(int)
+        model = RandomForestClassifier(n_estimators=16, random_state=0, n_jobs=1).fit(
+            features, labels
+        )
+        # _batched_mc_scores only touches rf_model.model.predict_proba
+        return types.SimpleNamespace(model=model)
+
+    def _blocks(self, n):
+        rng = np.random.default_rng(9)
+        base = self.NUM_OBS * self.LATENT_DIM
+        mean_flat = rng.standard_normal((n, base)).astype(np.float32)
+        logvar_flat = (rng.standard_normal((n, base)) - 2.0).astype(np.float32)
+        return mean_flat, logvar_flat
+
+    def _reference_loop(
+        self, rf, calibrator, variant, mean_flat, logvar_flat, active_dims, draws, rng
+    ):
+        """Verbatim re-implementation of the pre-#298 per-draw loop."""
+        out = np.empty((draws, len(mean_flat)))
+        for draw_index in range(draws):
+            draw_flat = sample_z_flat(mean_flat, logvar_flat, rng)
+            feats = build_variant_features(
+                variant, draw_flat, logvar_flat, self.NUM_OBS, self.LATENT_DIM, active_dims
+            )
+            out[draw_index] = apply_probability_calibrator(
+                calibrator, rf.model.predict_proba(feats)[:, 1]
+            )
+        return out
+
+    @pytest.mark.parametrize("variant", ["z_mean", "z_mean_obs_logvar"])
+    def test_matches_per_draw_loop_bitwise(self, variant):
+        base = self.NUM_OBS * self.LATENT_DIM
+        n_features = base if variant == "z_mean" else base + self.NUM_OBS
+        rf = self._tiny_rf(n_features)
+        mean_flat, logvar_flat = self._blocks(12)
+
+        expected = self._reference_loop(
+            rf, None, variant, mean_flat, logvar_flat, None, 8, np.random.default_rng(77)
+        )
+        actual = _batched_mc_scores(
+            rf,
+            None,
+            variant,
+            mean_flat,
+            logvar_flat,
+            self.NUM_OBS,
+            self.LATENT_DIM,
+            None,
+            8,
+            np.random.default_rng(77),
+        )
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.shape == (8, 12)
+
+    def test_matches_with_calibrator(self):
+        base = self.NUM_OBS * self.LATENT_DIM
+        rf = self._tiny_rf(base)
+        mean_flat, logvar_flat = self._blocks(10)
+        cal_rng = np.random.default_rng(3)
+        calibrator = fit_probability_calibrator(
+            cal_rng.random(200), (cal_rng.random(200) > 0.5).astype(int), min_isotonic=50
+        )
+
+        expected = self._reference_loop(
+            rf, calibrator, "z_mean", mean_flat, logvar_flat, None, 6, np.random.default_rng(21)
+        )
+        actual = _batched_mc_scores(
+            rf,
+            calibrator,
+            "z_mean",
+            mean_flat,
+            logvar_flat,
+            self.NUM_OBS,
+            self.LATENT_DIM,
+            None,
+            6,
+            np.random.default_rng(21),
+        )
+        np.testing.assert_array_equal(actual, expected)
 
 
 class TestReferenceCloudReservoir:
