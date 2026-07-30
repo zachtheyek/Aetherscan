@@ -83,6 +83,12 @@ _PLOT_MAX_POINTS_PER_LINE = 4096
 _CHUNK_CACHE_STRIPES = 4
 _CHUNK_CACHE_MAX_NBYTES = 512 * 1024**2
 _CHUNK_CACHE_NSLOTS = 10007
+# Stamp-extraction task granularity: target this many tasks per pool worker. At 1 task per
+# worker (the old ceil(n_processes / n_files) split -> 36 near-equal tasks on 32 workers)
+# the stage quantizes to two waves — a full wave plus a small remainder wave that idles
+# ~44% of worker-seconds. ~4 tasks/worker keeps the tail to ~1/4 of one task length while
+# each task still spans enough contiguous sorted stamps for chunk-cache reuse to pay.
+_EXTRACT_TASKS_PER_WORKER = 4
 
 
 def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
@@ -1779,8 +1785,12 @@ class DataPreprocessor:
         stamp_starts = [start for start, _, _ in stamp_centers]
         # Split each obs file's (already start-sorted) stamps into contiguous chunks so more
         # than len(h5_paths) workers can run, while keeping each worker's reads sequential to
-        # preserve the hdf5 chunk-cache reuse that the sort above buys us.
-        chunks_per_file = max(1, -(-n_processes // len(group.h5_paths)))  # ceil div
+        # preserve the hdf5 chunk-cache reuse that the sort above buys us. Oversubscribe to
+        # ~_EXTRACT_TASKS_PER_WORKER tasks per worker so the stage's final wave is a fraction
+        # of one task instead of doubling the makespan (see the constant's rationale).
+        chunks_per_file = max(
+            1, -(-(_EXTRACT_TASKS_PER_WORKER * n_processes) // len(group.h5_paths))
+        )  # ceil div
         chunk_size = max(1, -(-n_stamps // chunks_per_file))  # ceil div
         tasks = [
             (
@@ -1800,8 +1810,11 @@ class DataPreprocessor:
         with stage_timer("extract"):
             if self._ed_pool is not None and len(tasks) > 1:
                 # Reuse the persistent energy-detection pool — extraction workers are plain
-                # (no shared memory), so the same pool serves both stages without churn
-                self._ed_pool.map(_extract_stamps_worker, tasks)
+                # (no shared memory), so the same pool serves both stages without churn.
+                # imap_unordered: workers write disjoint absolute rows (base_idx offsets),
+                # so completion order is irrelevant and stragglers backfill immediately.
+                for _ in self._ed_pool.imap_unordered(_extract_stamps_worker, tasks):
+                    pass
             else:
                 for task in tasks:
                     _extract_stamps_worker(task)
