@@ -196,6 +196,29 @@ def _init_plain_worker():
     _IN_POOL_WORKER = True
 
 
+def _downsample_cadence(cadence, downsample_factor: int, final_width: int):
+    """
+    Downsample one cadence's 6 observations, or return None for an invalid cadence
+    (NaN/Inf or non-positive max). Pure function of its arguments — the thread-safe core
+    shared by the pool worker (which resolves its cadence from _GLOBAL_CHUNK_DATA) and the
+    sequential path (which passes the row directly, so it never touches the module global
+    and stays safe on the multi-threaded prefetch side — #298 review note).
+    """
+    # Skip invalid cadences
+    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+        return None
+
+    # Downsample each observation separately
+    downsampled_cadence = np.zeros((6, 16, final_width), dtype=np.float32)
+
+    for obs_idx in range(6):
+        downsampled_cadence[obs_idx] = downscale_local_mean(
+            cadence[obs_idx], (1, downsample_factor)
+        ).astype(np.float32)
+
+    return downsampled_cadence
+
+
 # NOTE: come back to this later
 def _downsample_worker(args):
     """
@@ -208,27 +231,11 @@ def _downsample_worker(args):
     """
     cadence_idx, downsample_factor, final_width = args
 
-    # Get cadence from global chunk data
-    if _GLOBAL_CHUNK_DATA is not None:
-        cadence = _GLOBAL_CHUNK_DATA[cadence_idx]
-
-        # Skip invalid cadences
-        if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
-            return None
-
-        # Downsample each observation separately
-        downsampled_cadence = np.zeros((6, 16, final_width), dtype=np.float32)
-
-        for obs_idx in range(6):
-            downsampled_cadence[obs_idx] = downscale_local_mean(
-                cadence[obs_idx], (1, downsample_factor)
-            ).astype(np.float32)
-
-        return downsampled_cadence
-
-    else:
+    if _GLOBAL_CHUNK_DATA is None:
         logger.warning("No global chunk data available")
         return None
+
+    return _downsample_cadence(_GLOBAL_CHUNK_DATA[cadence_idx], downsample_factor, final_width)
 
 
 def _lognorm_worker(args):
@@ -391,9 +398,11 @@ def _flattened_edge_mid_ratio_banded(
     start = channel_index * width
     left, mid, right = edge_mid_band_slices(width)
     # Widen the mid slice so the DC-spike interpolation sources (up to 3 bins around
-    # width // 2, see _remove_dc_spike) are always present.
+    # width // 2, see _remove_dc_spike) are always present. The min(width) bound is
+    # defensive documentation: at any real width the center+3 widening cannot reach the
+    # channel end (mid.stop < width for width >= 16), so the clamp never bites in practice.
     lo = max(0, min(mid.start, width // 2 - 3))
-    hi = max(mid.stop, width // 2 + 3)
+    hi = min(width, max(mid.stop, width // 2 + 3))
     # The three band reads all live in the same chunk-column stripe; a sized chunk cache
     # (computed once per file by the caller) decompresses each chunk once instead of once
     # per band read.
@@ -1194,10 +1203,14 @@ class DataPreprocessor:
 
         parallel=False routes every chunk through the sequential in-process branch (no chunk
         pool, no shared memory) regardless of manager.n_processes. The streaming per-cadence
-        path (main._infer_cadence) uses this: it loads exactly one already-downsampled cadence
-        .npy whose per-cadence work is a cheap vectorized log-norm, while the prefetch thread
-        is already driving the persistent energy-detection pool at full n_processes width —
-        forking a second n_processes pool for that would double-subscribe the CPU.
+        path (main._prefetch_cadence) uses this: it loads exactly one already-downsampled
+        cadence .npy whose per-cadence work is a cheap vectorized log-norm, while the
+        persistent energy-detection pool is already busy at full n_processes width — forking
+        a second n_processes pool for that would double-subscribe the CPU. THREAD CONTRACT
+        (#298): parallel=False may be called from prefetch_depth CONCURRENT threads, so
+        neither sequential branch may touch module-global state — the vectorized log-norm
+        path is pure, and the legacy downsample path passes rows to _downsample_cadence
+        directly (never via _GLOBAL_CHUNK_DATA, which stays a pool-worker-only mechanism).
         """
         logger.info(f"Loading backgrounds from {self.config.data_path} for inference")
 
@@ -1383,7 +1396,12 @@ class DataPreprocessor:
                     del normalized
 
                 else:
-                    # Sequential processing (legacy full-width files: downsample workers)
+                    # Sequential processing (legacy full-width files). Rows are passed to
+                    # the downsample core DIRECTLY — never via _GLOBAL_CHUNK_DATA: this
+                    # branch runs on the caller's thread, and the streaming loop calls
+                    # load_inference_data(parallel=False) from prefetch_depth concurrent
+                    # threads, where a module-global staging slot would race (#298 review
+                    # note). The global stays a pool-worker-only mechanism.
                     logger.info(
                         f"DataPreprocessor running in sequential mode "
                         f"(parallel={parallel}, n_processes={n_processes})"
@@ -1391,12 +1409,12 @@ class DataPreprocessor:
 
                     chunk_shm = None
                     chunk_pool = None
+                    shared_chunk = None
 
-                    # Set global variable manually since no initializer ran
-                    shared_chunk = chunk_data
-                    _GLOBAL_CHUNK_DATA = shared_chunk
-
-                    results = [worker_fn(args) for args in args_list]
+                    results = [
+                        _downsample_cadence(chunk_data[i], downsample_factor, final_width)
+                        for i, _, _ in args_list
+                    ]
 
                 # NOTE: is there a more efficient/elegant way to do this (e.g. with list comprehension/slicing)?
                 # Collect valid results (filter out None from invalid cadences) and stack

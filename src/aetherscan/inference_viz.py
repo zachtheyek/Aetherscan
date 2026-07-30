@@ -96,6 +96,7 @@ class _AsyncUploader:
     def __init__(self):
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
 
     def submit(self, save_path: str, title: str) -> None:
         if self._thread is None:
@@ -104,10 +105,18 @@ class _AsyncUploader:
         self._queue.put((save_path, title))
 
     def _run(self) -> None:
+        # Capture THIS thread's stop event: drain() re-arms self._stop for any successor
+        # thread, and a timed-out predecessor must keep honoring its own signal.
+        stop = self._stop
         while True:
             item = self._queue.get()
             if item is None:
                 return
+            if stop.is_set():
+                # Timed-out drain: discard the remaining backlog and spin to the sentinel
+                # so the thread exits promptly after its in-flight upload (#298 review
+                # note — no abandoned worker plodding through a dead queue)
+                continue
             save_path, title = item
             try:
                 logger_instance = get_logger()
@@ -117,18 +126,22 @@ class _AsyncUploader:
                 logger.error(f"Async Slack upload failed for {save_path}: {e}")
 
     def drain(self) -> None:
-        """Flush the queue and stop the worker (bounded — uploads are best-effort)."""
+        """Flush the queue and stop the worker (bounded — uploads are best-effort). On
+        timeout the worker is signalled to discard its backlog and exit after the in-flight
+        upload, rather than being abandoned mid-queue."""
         if self._thread is None:
             return
         self._queue.put(None)
         self._thread.join(timeout=_UPLOAD_DRAIN_TIMEOUT_S)
         if self._thread.is_alive():
+            self._stop.set()
             logger.warning(
                 f"Async Slack uploader did not drain within {_UPLOAD_DRAIN_TIMEOUT_S:.0f}s; "
-                f"remaining uploads abandoned (figures are on disk; the daemon thread "
-                f"cannot block shutdown)"
+                f"remaining uploads discarded once the in-flight call returns (figures are "
+                f"on disk; the daemon thread cannot block shutdown)"
             )
         self._thread = None
+        self._stop = threading.Event()
 
 
 _uploader = _AsyncUploader()

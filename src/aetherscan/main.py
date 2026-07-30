@@ -741,6 +741,11 @@ def _run_streaming_csv_inference(
                             current_fingerprint,
                             cadence_data=cadence_data,
                         )
+                        # Release the prefetched array as soon as _infer_cadence returns
+                        # (its own del only clears the callee's reference): with
+                        # prefetch_depth cadences already loading behind this one, holding
+                        # it until the next iteration's rebind would stack an extra
+                        # cadence-sized array on peak RAM
                         del cadence_data
                     except Exception as e:
                         logger.error(
