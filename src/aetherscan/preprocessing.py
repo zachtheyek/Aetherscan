@@ -73,6 +73,44 @@ _PFB_MISMATCH_SAMPLE_CHANNELS = 9
 # Target bin count for _decimate_for_plot: spectrum lines in the bandpass debug/viz figures
 # are reduced to at most 2 * this many points (a min/max pair per bin) before plotting.
 _PLOT_MAX_POINTS_PER_LINE = 4096
+# HDF5 chunk-cache sizing for read paths that revisit chunks (stamp extraction, the PFB
+# residual check). h5py's default cache is 1 MiB — smaller than one decompressed bitshuffle
+# chunk at BL scale (~4 MiB for (1, 1, 1048576) float32), and HDF5 never caches a chunk
+# larger than the cache, so every access re-decompresses from scratch. _chunk_cache_kwargs
+# sizes the cache from the file's actual chunk layout: 4 chunk-column time-stripes resident,
+# capped here. rdcc_nslots is a prime ~100x the resident-chunk count (HDF5 guidance);
+# rdcc_w0=0 evicts fully-read chunks first, matching the monotonic start-sorted read order.
+_CHUNK_CACHE_STRIPES = 4
+_CHUNK_CACHE_MAX_NBYTES = 512 * 1024**2
+_CHUNK_CACHE_NSLOTS = 10007
+
+
+def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
+    """
+    h5py.File open kwargs sizing the HDF5 chunk cache to the file's actual chunk layout.
+
+    Reads the 'data' dataset's chunk shape and returns {rdcc_nbytes, rdcc_nslots, rdcc_w0}
+    sized to hold _CHUNK_CACHE_STRIPES full chunk-column time-stripes (the set of chunks one
+    stamp read touches is ceil(time_bins / chunk_time) chunks per column). Returns {} — the
+    h5py defaults — for contiguous datasets, layouts the default cache already covers, or any
+    inspection failure, so callers degrade gracefully on non-BL chunk layouts.
+    """
+    try:
+        with h5py.File(h5_path, "r") as hf:
+            dset = hf["data"]
+            chunks = dset.chunks
+            if not chunks:
+                return {}
+            chunk_nbytes = int(np.prod(chunks)) * dset.dtype.itemsize
+    except Exception as e:
+        logger.warning(f"Could not inspect chunk layout of {h5_path} ({e}); using default cache")
+        return {}
+
+    stripe_nbytes = math.ceil(time_bins / chunks[0]) * chunk_nbytes
+    rdcc_nbytes = min(_CHUNK_CACHE_STRIPES * stripe_nbytes, _CHUNK_CACHE_MAX_NBYTES)
+    if rdcc_nbytes <= 1024**2:
+        return {}
+    return {"rdcc_nbytes": rdcc_nbytes, "rdcc_nslots": _CHUNK_CACHE_NSLOTS, "rdcc_w0": 0.0}
 
 
 def _init_worker(shm_name, shape, dtype):
@@ -560,7 +598,11 @@ def _extract_stamps_worker(args: tuple) -> None:
     ) = args
     out = np.lib.format.open_memmap(npy_path, mode="r+")
     try:
-        with h5py.File(obs_h5, "r") as hf:
+        # Chunk-cache sizing is what makes the caller's start-sorted stamp order pay off:
+        # with the h5py default (1 MiB) a BL-scale bitshuffle chunk never fits, so every
+        # stamp re-decompresses its full chunk stripe; sized from the actual layout, each
+        # chunk decompresses once per task (see _chunk_cache_kwargs).
+        with h5py.File(obs_h5, "r", **_chunk_cache_kwargs(obs_h5, time_bins)) as hf:
             dset = hf["data"]
             for local_i, start in enumerate(stamp_starts):
                 stamp = dset[:time_bins, 0, start : start + stamp_width]
@@ -1936,7 +1978,11 @@ class DataPreprocessor:
         return channel
 
     def _flattened_edge_mid_ratio(
-        self, h5_path: str, channel_index: int, response: np.ndarray
+        self,
+        h5_path: str,
+        channel_index: int,
+        response: np.ndarray,
+        open_kwargs: dict | None = None,
     ) -> float:
         """
         Edge/mid power ratio of one coarse channel AFTER flattening by the static response H.
@@ -1959,7 +2005,10 @@ class DataPreprocessor:
         # width // 2, see _remove_dc_spike) are always present.
         lo = max(0, min(mid.start, width // 2 - 3))
         hi = max(mid.stop, width // 2 + 3)
-        with h5py.File(h5_path, "r") as hf:
+        # The three band reads all live in the same chunk-column stripe; a sized chunk cache
+        # (passed by _warn_on_pfb_response_mismatch, computed once per file) decompresses
+        # each chunk once instead of once per band read.
+        with h5py.File(h5_path, "r", **(open_kwargs or {})) as hf:
             data = hf["data"]
             left_int = data[:time_bins, 0, start + left.start : start + left.stop].mean(axis=0)
             right_int = data[:time_bins, 0, start + right.start : start + right.stop].mean(axis=0)
@@ -2002,9 +2051,10 @@ class DataPreprocessor:
         taps = self.config.inference.pfb_taps_per_channel
         try:
             response = gen_coarse_channel_response(width, n_coarse_total, taps)
+            open_kwargs = _chunk_cache_kwargs(h5_path, time_bins=self.config.data.time_bins)
             # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
             ratios = [
-                self._flattened_edge_mid_ratio(h5_path, ch, response)
+                self._flattened_edge_mid_ratio(h5_path, ch, response, open_kwargs)
                 for ch in self._sample_channel_indices(
                     n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
                 )

@@ -26,6 +26,7 @@ from aetherscan.preprocessing import (
     ED_STAT_HIST_EDGES,
     DataPreprocessor,
     PendingCadence,
+    _chunk_cache_kwargs,
     _decimate_for_plot,
     _energy_detect_channel_worker,
     _extract_stamps_worker,
@@ -352,14 +353,42 @@ class TestDeriveCadenceProvenance:
         assert prov["cadence_id"] is None
 
 
+class TestChunkCacheKwargs:
+    def test_chunked_compressed_dataset_gets_sized_cache(self, make_h5_observation):
+        # 16 chunks of (1, 1, 256) float32 = 1 KiB each -> stripe far below the 1 MiB
+        # default, so force visibility by checking the sizing arithmetic directly
+        path = make_h5_observation("chunked.h5", n_chans=2048, chunks=(1, 1, 256))
+        kwargs = _chunk_cache_kwargs(str(path), time_bins=16)
+        # Tiny chunks: default cache already covers the stripe -> no override
+        assert kwargs == {}
+
+    def test_large_chunks_get_cache_override(self, make_h5_observation):
+        # One full-width chunk per time row (256 KiB each x 16 rows = 4 MiB stripe):
+        # exceeds the 1 MiB default, so the cache must be sized up
+        path = make_h5_observation("bigchunks.h5", n_chans=65536, chunks=(1, 1, 65536))
+        kwargs = _chunk_cache_kwargs(str(path), time_bins=16)
+        stripe = 16 * 65536 * 4
+        assert kwargs["rdcc_nbytes"] >= stripe
+        assert kwargs["rdcc_nbytes"] <= 512 * 1024**2
+        assert kwargs["rdcc_w0"] == 0.0
+        assert kwargs["rdcc_nslots"] > 0
+
+    def test_contiguous_dataset_returns_defaults(self, make_h5_observation):
+        path = make_h5_observation("contig.h5", n_chans=2048)
+        assert _chunk_cache_kwargs(str(path), time_bins=16) == {}
+
+    def test_missing_file_returns_defaults(self, tmp_path):
+        assert _chunk_cache_kwargs(str(tmp_path / "nope.h5"), time_bins=16) == {}
+
+
 class TestExtractStampsWorkerDownsample:
-    def _run_worker(self, tmp_path, make_h5_observation, downsample_factor):
+    def _run_worker(self, tmp_path, make_h5_observation, downsample_factor, **h5_kwargs):
         import h5py  # noqa: PLC0415
 
         time_bins, stamp_width = 16, 64
         stored_width = stamp_width // downsample_factor
         stamp_starts = [0, 512, 1000]
-        h5_path = make_h5_observation("obs.h5", n_chans=2048)
+        h5_path = make_h5_observation("obs.h5", n_chans=2048, **h5_kwargs)
         npy_path = str(tmp_path / f"stamps_x{downsample_factor}.npy")
 
         out = np.lib.format.open_memmap(
@@ -390,6 +419,16 @@ class TestExtractStampsWorkerDownsample:
         written, raw = self._run_worker(tmp_path, make_h5_observation, 1)
         for i, stamp in enumerate(raw):
             np.testing.assert_array_equal(written[i, 1], stamp)
+
+    def test_chunked_compressed_input_is_byte_identical(self, tmp_path, make_h5_observation):
+        # The chunk-cache sizing is pure cache tuning: a chunked+compressed input (gzip
+        # stands in for bitshuffle) must produce byte-identical stamps to the raw reads
+        written, raw = self._run_worker(
+            tmp_path, make_h5_observation, 8, chunks=(1, 1, 256), compression="gzip"
+        )
+        for i, stamp in enumerate(raw):
+            expected = downscale_local_mean(stamp, (1, 8)).astype(np.float32)
+            np.testing.assert_array_equal(written[i, 1], expected)
 
 
 @pytest.fixture

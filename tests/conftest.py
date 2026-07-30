@@ -168,18 +168,20 @@ def make_background_npy(tmp_path):
 def make_h5_observation(tmp_path):
     """Factory for tiny .h5 observation files matching the filterbank-style layout.
 
-    Returns a callable(filename, n_chans=2048, time_bins=16) -> Path that writes an .h5 with a
-    'data' dataset of shape (time_bins, 1, n_chans) plus fch1/foff/nchans attrs (plain h5py,
-    no bitshuffle).
+    Returns a callable(filename, n_chans=2048, time_bins=16, chunks=None, compression=None)
+    -> Path that writes an .h5 with a 'data' dataset of shape (time_bins, 1, n_chans) plus
+    fch1/foff/nchans attrs (plain h5py, no bitshuffle). chunks/compression pass through to
+    create_dataset for tests exercising chunked/compressed read paths (CI-safe gzip stands in
+    for bitshuffle — the chunk-cache mechanics are codec-independent).
     """
     import h5py  # noqa: PLC0415
 
-    def _make(filename="obs.h5", n_chans=2048, time_bins=16):
+    def _make(filename="obs.h5", n_chans=2048, time_bins=16, chunks=None, compression=None):
         rng = np.random.default_rng(7)
         data = rng.chisquare(df=4, size=(time_bins, 1, n_chans)).astype(np.float32)
         path = tmp_path / filename
         with h5py.File(path, "w") as hf:
-            dset = hf.create_dataset("data", data=data)
+            dset = hf.create_dataset("data", data=data, chunks=chunks, compression=compression)
             dset.attrs["fch1"] = 8421.386717353016
             dset.attrs["foff"] = -2.7939677238464355e-06
             dset.attrs["nchans"] = n_chans
