@@ -666,7 +666,7 @@ class TestApplyArgsToConfig:
     def test_seed_flags_apply_to_reproducibility_config(self):
         config = get_config()
         assert config.reproducibility.seed == 11  # #279: reproducible out of the box
-        assert config.reproducibility.tf_deterministic_ops is False
+        assert config.reproducibility.tf_deterministic_ops is True  # #298: det by default
         apply_args_to_config(_parse(["train", "--seed", "123", "--tf-deterministic-ops"]))
         assert config.reproducibility.seed == 123
         assert config.reproducibility.tf_deterministic_ops is True
