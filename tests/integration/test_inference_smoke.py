@@ -43,15 +43,28 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
 
     encoder = os.path.join(model_path, f"vae_encoder_{smoke_model_tag}.keras")
     rf = os.path.join(model_path, f"random_forest_{smoke_model_tag}.joblib")
-    saved_config = os.path.join(model_path, f"config_{smoke_model_tag}.json")
+    # Training saves config_{tag}.json under OUTPUT_path (tag_guards); only hand-placed
+    # legacy artifacts (test_v17) kept a copy in model_path — accept either location so
+    # the smoke runs against freshly trained models without manual copying (#298).
+    saved_config = next(
+        (
+            path
+            for path in (
+                os.path.join(model_path, f"config_{smoke_model_tag}.json"),
+                os.path.join(output_path, f"config_{smoke_model_tag}.json"),
+            )
+            if os.path.exists(path)
+        ),
+        os.path.join(output_path, f"config_{smoke_model_tag}.json"),
+    )
     csv_path = os.path.join(data_path, "inference", _CSV_NAME)
     for required in (encoder, rf, saved_config, csv_path):
         if not os.path.exists(required):
             pytest.skip(f"required cluster artifact missing: {required}")
 
-    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional, but the
-    # tag-scoped default output dir means a fresh tag never sees them — reuse requires
-    # passing their directory explicitly.
+    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional (and since
+    # #298 the fingerprint-scoped default cache resumes same-ED-config stamps on its own);
+    # only legacy stamps under <output>/preprocessed still need the explicit directory.
     extra_flags: list[str] = []
     if not os.path.exists("/datag"):
         legacy_dir = os.path.join(output_path, "preprocessed")
