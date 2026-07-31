@@ -83,7 +83,12 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     ~20% insert throughput (scattered stat_name subtree writes vs append-only timestamp
 #     order) to speed only the minor single-stat shape on a table whose tag partitions
 #     stay ~58k rows.
-_SCHEMA_VERSION = 7
+# v8: added idx_inference_results_supersede — a partial index on (tag, npy_path) WHERE
+#     superseded = 0, matching _execute_mark_superseded's exact predicate. The only prior
+#     index led with (tag, timestamp, ...), so the once-per-cadence supersede UPDATE (which
+#     BLOCKS the inference thread via the writer-queue sentinel) visited every live row of
+#     the tag partition — a quadratic-in-catalog term on RFI-dense 6k-cadence runs (#301).
+_SCHEMA_VERSION = 8
 
 
 # Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
@@ -218,9 +223,15 @@ class Database:
         self._init_database()
 
         logger.info(f"Database initialized at: {self.db_path}")
-        db_stats = self.get_db_stats()
-        for name, value in db_stats.items():
-            logger.info(f"  {name}: {value}")
+        # Startup logs only O(1) facts. The per-table COUNT(*) summary that used to print
+        # here (get_db_stats) cost a measured ~13 min per cold-cache process launch on a
+        # catalog-scale DB (80 GB, ~190M injection_stats rows) and was re-paid on every
+        # retry-loop relaunch (#301); get_db_stats() remains for on-demand diagnostics.
+        with self._get_connection() as conn:
+            db_size_bytes = conn.execute(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()"
+            ).fetchone()[0]
+        logger.info(f"  db_size_bytes: {db_size_bytes}")
         logger.info(f"Write interval: {self.write_interval} seconds")
         logger.info(f"Max buffer size: {self.write_buffer_max_size} records")
 
@@ -427,6 +438,15 @@ class Database:
                 ON inference_results(tag, timestamp, confidence, prediction)
             """)
 
+            # Partial index matching _execute_mark_superseded's predicate exactly (v8):
+            # the per-cadence supersede UPDATE blocks the inference thread, and without
+            # this the (tag, timestamp, ...) index above only narrows to the tag
+            # partition — a whole-partition visit per cadence at catalog scale (#301)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inference_results_supersede
+                ON inference_results(tag, npy_path) WHERE superseded = 0
+            """)
+
             # Inference cadence manifest table (schema v2): one row per (cadence, stage
             # transition) — status 'preprocessed' when the stamp .npy lands, a superseding
             # 'inferred' row (with aggregate stats) when inference completes, and 'failed'
@@ -579,6 +599,16 @@ class Database:
             logger.info(
                 "Schema migration: v7 index sweep (injection_stats/latent_snapshots) applied"
             )
+
+        if version < 8:
+            # v8: the supersede partial index (see the version-history comment). Like v7,
+            # the CREATE mirrors _init_database() — already executed for old and new
+            # databases alike and idempotent; re-executing records the step explicitly.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inference_results_supersede
+                ON inference_results(tag, npy_path) WHERE superseded = 0
+            """)
+            logger.info("Schema migration: v8 supersede partial index applied")
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -2610,7 +2640,10 @@ class Database:
 
     # NOTE: this call gets expensive as db grows. create a separate schema to track num_rows_added per pipeline run. then count & update as part of db cleanup routine? or use SQLite's dbstat virtual table or periodic ANALYZE?
     def get_db_stats(self) -> dict[str, Any]:
-        """Get summary statistics for the database"""
+        """Get summary statistics for the database.
+
+        On-demand diagnostics only — deliberately NOT called at init: the per-table
+        COUNT(*) scans cost ~13 min on a cold-cache catalog-scale DB (#301)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
