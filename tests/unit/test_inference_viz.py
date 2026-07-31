@@ -193,6 +193,20 @@ class TestCollector:
         for row in features:
             assert any(np.array_equal(row, expected) for expected in expected_full)
 
+    def test_gallery_pixel_pool_bounded_and_feeds_gallery(self, collector):
+        """#302: the pool captures per-cadence top-K pixels before pruning deletes the
+        .npy; the stamp gallery then renders from the pool instead of blank columns."""
+        summaries = _build_summaries(collector.records, get_config().inference.stamp_gallery_top_k)
+        for record in collector.records:
+            collector.pool_gallery_pixels(record.metadata_path, record.npy_path)
+        pool = collector.gallery_pixels()
+        # 2 cadences x N_STAMPS distinct-stat reps, truncated at the global top-K bound
+        assert len(pool) == min(2 * N_STAMPS, get_config().inference.stamp_gallery_top_k)
+
+        for record in collector.records:
+            os.remove(record.npy_path)  # the prune
+        _assert_figure(plot_stamp_gallery(collector.records, summaries, pool))
+
     def test_budget_exhausted_appends_nothing(self):
         """The spent-budget early return (#301): once no rows can be kept, the method may
         not build anything — this is every non-candidate cadence after the first one or

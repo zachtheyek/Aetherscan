@@ -551,6 +551,18 @@ class InferenceConfig:
     # to pin one directory across runs and CSVs (the resume guard still verifies each
     # sidecar's h5_paths and recorded fingerprint before reuse).
     preprocess_output_dir: str | None = None
+    # Stamp-cache pruning (#302): delete a cadence's stamp .npy right after its 'inferred'
+    # manifest row lands (metadata .json always kept; resume rides the DB row; each
+    # candidate's snippet is snapshotted into a ~196 KB .candidates.npz sidecar and a
+    # bounded in-memory pixel pool keeps the stamp gallery whole). Without pruning a full
+    # catalog writes ~30-90 TB of stamps vs ~2.7 TB free on /datax — the run dies on disk
+    # after a few hundred cadences. None (default) = AUTO: ON for the fingerprint-scoped
+    # default cache dir, OFF when preprocess_output_dir is explicitly set (an
+    # operator-curated cache is never destroyed implicitly). Only stamps THIS run freshly
+    # extracted are ever pruned — a resumed run never deletes a cache it was handed.
+    # Trade: pruning forfeits the cross-run stamp-reuse rerun win for pruned cadences
+    # (re-extraction ~5-15 min each); same-run resume/retry is unaffected.
+    prune_stamps: bool | None = None
 
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming
     # CSV inference run, saved under {output_path}/plots/inference/{save_tag}/ and uploaded
@@ -937,7 +949,12 @@ class Config:
                 "discard_side_channels": self.inference.discard_side_channels,
                 "side_channel_count": self.inference.side_channel_count,
                 "preprocess_output_dir": self.inference.preprocess_output_dir,
+                # NOTE: any key added here also enters BOTH inference fingerprints unless
+                # it joins the run_state.py denylists — prune_stamps and
+                # inference_viz_scope are excluded there (#301/#302: retention/viz only)
+                "prune_stamps": self.inference.prune_stamps,
                 "inference_viz_enabled": self.inference.inference_viz_enabled,
+                "inference_viz_scope": self.inference.inference_viz_scope,
                 "stamp_gallery_top_k": self.inference.stamp_gallery_top_k,
                 "max_candidate_plots": self.inference.max_candidate_plots,
                 "max_retries": self.inference.max_retries,

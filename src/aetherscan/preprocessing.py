@@ -861,6 +861,10 @@ class CadenceResult:
     # is NOT the raw energy-detection hit count (metadata's n_raw_hits carries that).
     n_hits: int
     metadata_path: str  # Sibling .json with hit details
+    # True iff THIS run's _process_cadence wrote the .npy (False on the resume path).
+    # Stamp-cache pruning (#302) only ever deletes freshly-extracted stamps, so a run
+    # resumed over a handed-over cache can never destroy it.
+    freshly_extracted: bool = False
 
 
 # NOTE: come back to this later
@@ -2296,6 +2300,7 @@ class DataPreprocessor:
             key=group.key,
             n_hits=n_stamps,
             metadata_path=metadata_path,
+            freshly_extracted=True,
         )
 
     def _get_bandpass_flattener(

@@ -688,12 +688,17 @@ class TestProcessCadenceEndToEnd:
         assert json.loads(manifest[0]["cadence_key"]) == ["T1", "S1", "L", "7", "2251"]
         assert manifest[0]["duration_s"] > 0
 
+        # Fresh extraction is flagged prunable; the resume path below must NOT be (#302:
+        # pruning only ever deletes stamps this run freshly extracted)
+        assert result.freshly_extracted is True
+
         # Resume path: a second call must skip reprocessing and report the same hit count,
         # without duplicating the manifest row
         resumed = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
         assert resumed is not None
         assert resumed.n_hits == result.n_hits
         assert resumed.npy_path == npy_path
+        assert resumed.freshly_extracted is False
         assert db.flush(timeout=10) is True
         manifest = db.query_inference_cadences(tag=config.checkpoint.save_tag, npy_path=npy_path)
         assert len(manifest) == 1

@@ -1002,6 +1002,13 @@ def _add_inference_flags_to(parser):
         help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV directory {data_path}/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on the energy-detection config fingerprint — runs sharing an ED config reuse each other's stamps automatically, and any ED-config change resolves to a fresh directory. Pass a directory explicitly to pin/share one location (reuse is still guarded by the sidecar's recorded h5 paths and ED fingerprint)",
     )
 
+    parser.add_argument(
+        "--prune-stamps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Without pruning a full catalog writes ~30-90 TB of stamps. Default: AUTO — enabled for the fingerprint-scoped default cache directory, disabled when --preprocess-output-dir is set explicitly. Pass --no-prune-stamps to keep every stamp (slice-scale runs wanting the cross-run rerun cache).",
+    )
+
     # Visualization suite
     parser.add_argument(
         "--inference-viz",
@@ -1471,6 +1478,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # inference_viz uses argparse.BooleanOptionalAction with default=None so that the CLI
     # can express "leave the config default" (omit), "force on" (--inference-viz), and
     # "force off" (--no-inference-viz)
+    # prune_stamps uses BooleanOptionalAction with default=None, where None means AUTO
+    # (on for the fingerprint-default cache dir, off for an explicit one) — resolved at
+    # run time by main._resolve_prune_stamps, so only explicit flags land here
+    if hasattr(args, "prune_stamps") and args.prune_stamps is not None:
+        config.inference.prune_stamps = args.prune_stamps
     if hasattr(args, "inference_viz") and args.inference_viz is not None:
         config.inference.inference_viz_enabled = args.inference_viz
     if hasattr(args, "inference_viz_scope") and args.inference_viz_scope is not None:

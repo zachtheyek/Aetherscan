@@ -6,6 +6,7 @@ Entry point for Aetherscan Pipeline
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import importlib.util
 import json
@@ -22,6 +23,7 @@ import tensorflow as tf
 from dotenv import find_dotenv, load_dotenv
 
 from aetherscan.benchmark import stage_timer
+from aetherscan.candidate_figures import write_candidate_snippet_sidecar
 from aetherscan.cli import (
     apply_args_to_config,
     apply_saved_config,
@@ -459,6 +461,49 @@ def _prefetch_cadence(preprocessor: DataPreprocessor, unit: PendingCadence) -> t
     return cadence_result, cadence_data
 
 
+def _resolve_prune_stamps(config) -> bool:
+    """Resolve the stamp-cache pruning mode (#302): an explicit inference.prune_stamps
+    wins; the None default means AUTO — ON for the fingerprint-scoped default cache
+    directory, OFF when --preprocess-output-dir pins an operator-curated one (a handed
+    cache is never destroyed implicitly)."""
+    if config.inference.prune_stamps is not None:
+        return bool(config.inference.prune_stamps)
+    return config.inference.preprocess_output_dir is None
+
+
+def _prune_cadence_stamps(
+    cadence_result: CadenceResult, results: dict, collector: InferenceVizCollector | None
+) -> None:
+    """Delete one scored cadence's stamp .npy (#302), keeping everything the rest of the
+    run needs: the metadata .json (provenance + viz + resume guard), a ~196 KB
+    .candidates.npz snippet sidecar per candidate (the candidate figures' read path), and
+    the collector's bounded top-K pixel pool (the stamp gallery's). Runs strictly AFTER
+    the cadence's 'inferred' manifest row and viz collection — resume rides the DB row
+    and never touches the .npy. Best-effort: a pruning failure keeps the stamps and the
+    run continues (disk pressure is a slow failure; a science pass must not die for it)."""
+    npy_path = cadence_result.npy_path
+    try:
+        candidate_idx = np.nonzero(np.asarray(results["predictions"]) == 1)[0]
+        if len(candidate_idx):
+            write_candidate_snippet_sidecar(npy_path, candidate_idx)
+        if collector is not None:
+            collector.pool_gallery_pixels(cadence_result.metadata_path, npy_path)
+        size_gb = 0.0
+        with contextlib.suppress(OSError):
+            size_gb = os.path.getsize(npy_path) / 1e9
+        os.remove(npy_path)
+        logger.info(
+            f"Pruned stamp cache for cadence {cadence_result.key}: removed {npy_path} "
+            f"({size_gb:.2f} GB; metadata kept, {len(candidate_idx)} candidate snippet(s) "
+            f"sidecarred)"
+        )
+    except Exception as e:
+        logger.error(
+            f"Stamp pruning failed for cadence {cadence_result.key} ({e}); stamps kept; "
+            f"run continues"
+        )
+
+
 def _infer_cadence(
     pipeline: InferencePipeline,
     preprocessor: DataPreprocessor,
@@ -681,6 +726,13 @@ def _run_streaming_csv_inference(
         f"({totals['n_skipped']} already inferred, resumed from manifest)"
     )
 
+    prune_stamps = _resolve_prune_stamps(config)
+    logger.info(
+        f"Stamp-cache pruning: {'ON' if prune_stamps else 'OFF'} "
+        f"({'explicit' if config.inference.prune_stamps is not None else 'auto'}; "
+        f"{'default fingerprint-scoped cache dir' if config.inference.preprocess_output_dir is None else 'explicit --preprocess-output-dir'})"
+    )
+
     failed_keys: list[tuple] = []
     if pending:
         # Start the persistent energy-detection pool from the main thread BEFORE any
@@ -790,6 +842,13 @@ def _run_streaming_csv_inference(
                                 f"Viz collection failed for cadence {cadence_result.key} "
                                 f"({e}); plots will be degraded; run continues"
                             )
+
+                    # Stamp-cache pruning (#302): strictly after the 'inferred' manifest
+                    # row (inside _infer_cadence) and viz collection above, and only for
+                    # stamps THIS run freshly extracted — a resumed run never deletes a
+                    # cache it was handed
+                    if prune_stamps and cadence_result.freshly_extracted:
+                        _prune_cadence_stamps(cadence_result, results, collector)
 
                     logger.info(
                         f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "

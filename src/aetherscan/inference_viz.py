@@ -51,6 +51,7 @@ from aetherscan.candidate_figures import (
     stamp_frequency_range_mhz,
 )
 from aetherscan.config import get_config
+from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
 from aetherscan.logger import get_logger
 from aetherscan.pfb import gen_coarse_channel_response
@@ -192,6 +193,11 @@ class InferenceVizCollector:
         config = get_config()
         root_seed = config.reproducibility.seed if config is not None else None
         self._rng = derive_rng(root_seed, STREAM_INFERENCE_VIZ)
+        # Bounded top-K stamp-pixel pool (#302): raw pixels of the strongest stamps seen
+        # so far, captured just before pruning deletes a cadence's .npy, so the stamp
+        # gallery stays whole (~196 KB x top_k ≈ 2.4 MB at defaults)
+        self._gallery_top_k = config.inference.stamp_gallery_top_k if config is not None else 12
+        self._gallery_pixel_pool: list[tuple[float, str, int, np.ndarray]] = []
 
     def record_skipped(
         self, key: tuple, npy_path: str, metadata_path: str, manifest_row: dict
@@ -276,6 +282,36 @@ class InferenceVizCollector:
         if not self._latent_chunks:
             return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=bool)
         return np.concatenate(self._latent_chunks), np.concatenate(self._candidate_chunks)
+
+    def pool_gallery_pixels(self, metadata_path: str, npy_path: str) -> None:
+        """Capture this cadence's top-K stamp pixels into the bounded global pool (#302):
+        called by the pruning step just before it deletes the stamp .npy. The global
+        top-K is a subset of the per-cadence top-Ks, so pooling per-cadence top-K and
+        truncating globally preserves exactly the stamps plot_stamp_gallery will select.
+        Best-effort — a failure degrades the gallery, never the run."""
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            representatives = _cadence_top_stamps(metadata, self._gallery_top_k)
+            if not representatives:
+                return
+            stamps = np.load(npy_path, mmap_mode="r")
+            for stat, idx, _freq, _freq_range in representatives:
+                self._gallery_pixel_pool.append(
+                    (stat, npy_path, int(idx), np.array(stamps[int(idx)], dtype=np.float32))
+                )
+            del stamps
+            self._gallery_pixel_pool.sort(key=lambda entry: entry[0], reverse=True)
+            del self._gallery_pixel_pool[self._gallery_top_k :]
+        except Exception as e:
+            logger.warning(
+                f"Gallery pixel pooling failed for {npy_path} ({e}); the stamp gallery "
+                f"may show blank columns for this cadence"
+            )
+
+    def gallery_pixels(self) -> dict[tuple[str, int], np.ndarray]:
+        """(npy_path, snippet_index) -> raw stamp pixels for the pooled top-K stamps."""
+        return {(path, idx): pixels for _, path, idx, pixels in self._gallery_pixel_pool}
 
 
 # ---------------------------------------------------------------------------
@@ -783,10 +819,14 @@ def _select_top_stamps(
 
 
 def plot_stamp_gallery(
-    records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary]
+    records: list[CadenceVizRecord],
+    summaries: dict[str, CadenceVizSummary],
+    pixel_pool: dict[tuple[str, int], np.ndarray] | None = None,
 ) -> str | None:
     """Top-K stamps by detection statistic, each rendered as the 6-observation cadence
-    waterfall grid scientists actually inspect (ON/OFF rows, one stamp per column)."""
+    waterfall grid scientists actually inspect (ON/OFF rows, one stamp per column).
+    pixel_pool carries raw pixels the collector captured before pruning deleted their
+    .npy (#302) — the fallback when the direct load fails."""
     config = get_config()
     tag = config.checkpoint.save_tag
     top_k = config.inference.stamp_gallery_top_k
@@ -805,10 +845,14 @@ def plot_stamp_gallery(
         try:
             snippet = load_display_cadence(record.npy_path, idx)
         except Exception as e:
-            logger.warning(f"Viz: failed to load stamp {idx} from {record.npy_path}: {e}")
-            for row in range(n_rows):
-                axes[row][col].set_axis_off()
-            continue
+            pooled = (pixel_pool or {}).get((record.npy_path, idx))
+            if pooled is None:
+                logger.warning(f"Viz: failed to load stamp {idx} from {record.npy_path}: {e}")
+                for row in range(n_rows):
+                    axes[row][col].set_axis_off()
+                continue
+            # Same display transform load_display_cadence applies to the raw stamp
+            snippet = log_norm(np.array(pooled, dtype=np.float32))
         draw_cadence_strip(
             [axes[row][col] for row in range(n_rows)],
             snippet,
@@ -1370,7 +1414,9 @@ def render_inference_visualizations(
         _viz_safe("ed_stat_distributions", plot_ed_stat_distributions, records, summaries)
         _viz_safe("ed_hit_spectrum", plot_ed_hit_spectrum, records, summaries)
         _viz_safe("bandpass_flattening", plot_bandpass_flattening, preprocessor, records, summaries)
-        _viz_safe("stamp_gallery", plot_stamp_gallery, records, summaries)
+        _viz_safe(
+            "stamp_gallery", plot_stamp_gallery, records, summaries, collector.gallery_pixels()
+        )
         _viz_safe("preproc_funnel", plot_preproc_funnel, records, summaries)
         _viz_safe("confidence_distribution", plot_confidence_distribution, records)
         _viz_safe("candidate_gallery", plot_candidate_gallery)
