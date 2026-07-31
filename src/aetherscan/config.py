@@ -137,7 +137,12 @@ class ReproducibilityConfig:
     seed: int | None = 11
     # Force deterministic TF/cuDNN op implementations (tf.config.experimental
     # .enable_op_determinism) at some speed cost. Only meaningful alongside `seed`.
-    tf_deterministic_ops: bool = False
+    # Default ON (#298, maintainer decision): without it, cuDNN autotune may select
+    # different conv algorithms run to run, and the resulting low-bit latent drift is
+    # enough to flip near-threshold candidates between otherwise identical inference runs
+    # (measured live: 3 candidate flips between two identical unflagged runs; two flagged
+    # runs were bit-identical). Opt out with --no-tf-deterministic-ops.
+    tf_deterministic_ops: bool = True
 
 
 @dataclass
@@ -461,7 +466,13 @@ class InferenceConfig:
     encoder_path: str = None
     rf_path: str = None
     config_path: str = None
-    per_replica_batch_size: int = 2048  # NOTE: come back to this later
+    # Per-replica encode batch in SNIPPETS (each snippet = num_observations independent
+    # encoder inputs, so 256 snippets = 1,536 observation forwards — near the measured
+    # ~1024-obs single-GPU encode throughput peak; see benchmarks/README.md). The old 2048
+    # default was a units conflation (#298 I4): 2048 SNIPPETS = a 12,288-obs per-replica
+    # forward, past the throughput peak and above the bench's documented >~8192-obs int32
+    # launch-config abort. Also the cap of _distributed_encode's bucketed batch geometry.
+    per_replica_batch_size: int = 256
     classification_threshold: float = 0.99
     # Two-pass cascade (#282). Pass 1 scores EVERY snippet deterministically (z_mean-based
     # features) against this permissive screening threshold, tuned for recall — its only job
@@ -475,6 +486,16 @@ class InferenceConfig:
     # candidate against the survey population rather than against other candidates. 0
     # disables the cloud (and the plot's background).
     reference_cloud_size: int = 10000
+    # Streaming-loop prefetch depth (#298 N2): cadences preprocessed+loaded concurrently
+    # ahead of the GPU stage. Depth 2 overlaps one cadence's disk-bound energy detection
+    # with the previous one's decompression-bound extraction and fills the worker pool
+    # during per-cadence serial sections, at the cost of one extra in-flight cadence of
+    # RAM (stamps + loaded array, up to ~10-20 GB each). Default 2 per the on-cluster A/B
+    # (8 fresh /datag cadences: ~16% lower end-to-end wall vs depth 1, identical
+    # candidates). Per-cadence outputs are identical at any depth (results are consumed
+    # in catalog order and seeding keys on the catalog index); depth 1 restores the
+    # historical serial behavior.
+    prefetch_depth: int = 2
 
     # NOTE: come back to this later (is this the optimal grouping?)
     # Energy detection preprocessing
@@ -521,9 +542,12 @@ class InferenceConfig:
     side_channel_count: int = 0
 
     # Per-cadence .npy output directory for energy-detection preprocessing. None (default)
-    # resolves per CSV to {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/ — tag
-    # scoping keeps runs isolated (same-tag retries resume; a new tag starts clean). Set
-    # explicitly to share/reuse one directory across runs and CSVs.
+    # resolves per CSV to {data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/, keyed
+    # on the ED-config fingerprint (#298 I3): runs sharing an ED config share stamps (a
+    # threshold sweep or re-inference with new weights skips preprocessing entirely), while
+    # any ED-config change lands in a different directory by construction. Set explicitly
+    # to pin one directory across runs and CSVs (the resume guard still verifies each
+    # sidecar's h5_paths and recorded fingerprint before reuse).
     preprocess_output_dir: str | None = None
 
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming
@@ -886,6 +910,7 @@ class Config:
                 "screening_threshold": self.inference.screening_threshold,
                 "mc_draws": self.inference.mc_draws,
                 "reference_cloud_size": self.inference.reference_cloud_size,
+                "prefetch_depth": self.inference.prefetch_depth,
                 "cadence_group_by_cols": self.inference.cadence_group_by_cols,
                 "cadence_h5_path_col": self.inference.cadence_h5_path_col,
                 "cadence_expected_obs": self.inference.cadence_expected_obs,

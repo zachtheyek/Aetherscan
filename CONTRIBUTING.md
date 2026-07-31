@@ -173,6 +173,7 @@ Aetherscan/
 │   ├── run_state.py            # Persisted training-run manifest (stage-aware resume)
 │   ├── inference.py            # Inference orchestration
 │   ├── inference_viz.py        # Inference visualization suite
+│   ├── candidate_figures.py    # Per-candidate figure renderer (TF-free; forkserver pool; called by inference_viz.py)
 │   ├── preprocessing.py        # Data preprocessing + energy detection
 │   ├── pfb.py                  # PFB static passband equalization
 │   ├── data_generation.py      # Synthetic signal injection
@@ -256,6 +257,7 @@ Aetherscan/
 | `run_state.py`            | Persisted training-run manifest driving stage-aware resume             |
 | `inference.py`            | Model inference, candidate detection                                   |
 | `inference_viz.py`        | End-of-run inference visualization suite                               |
+| `candidate_figures.py`    | Per-candidate figure rendering (TF-free; forkserver + empty preload; called by `inference_viz.py`) |
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `pfb.py`                  | Polyphase-filterbank static passband response (bandpass flattening)    |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |

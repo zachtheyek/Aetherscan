@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -425,12 +426,46 @@ class NonRetryableInferenceError(RuntimeError):
     """
 
 
+def _prefetch_cadence(preprocessor: DataPreprocessor, unit: PendingCadence) -> tuple:
+    """
+    Prefetch-thread task for one cadence: preprocess (energy detection -> stamp .npy), then
+    load + log-norm the stamps (#298 I5-overlap — the load_lognorm span used to run on the
+    GPU main thread between cadences; here it hides under the prefetch pipeline).
+
+    Returns (cadence_result, cadence_data). cadence_result is None when the cadence produced
+    no stamps. cadence_data is None when the load failed — the load is retried on the
+    inference thread inside _infer_cadence, whose per-cadence failure containment covers it
+    (a prefetch-side load exception must not abort the whole pass one iteration later).
+    """
+    cadence_result = preprocessor.process_pending_cadence(unit)
+    if cadence_result is None:
+        return None, None
+    try:
+        # copy=False: the loader already returns float32; don't duplicate GBs of stamps.
+        # parallel=False: this loads exactly one already-downsampled cadence .npy whose
+        # per-cadence work is one vectorized log-norm pass, while the persistent
+        # energy-detection pool is busy at full n_processes width — forking a second
+        # chunk pool here would double-subscribe the CPU.
+        with stage_timer("load_lognorm"):
+            cadence_data = preprocessor.load_inference_data(
+                override_filepaths=[cadence_result.npy_path], parallel=False
+            ).astype(np.float32, copy=False)
+    except Exception as e:
+        logger.error(
+            f"Cadence {cadence_result.key}: prefetch-side load failed ({e}); "
+            f"the inference thread will retry the load"
+        )
+        cadence_data = None
+    return cadence_result, cadence_data
+
+
 def _infer_cadence(
     pipeline: InferencePipeline,
     preprocessor: DataPreprocessor,
     unit: PendingCadence,
     cadence_result: CadenceResult,
     config_fingerprint: str,
+    cadence_data: np.ndarray | None = None,
 ) -> dict:
     """
     Run the inference stage for one preprocessed cadence: derive provenance, load its stamps
@@ -474,18 +509,17 @@ def _infer_cadence(
 
     stage_start = time.time()
 
-    # Umbrella stage span for this cadence's inference phase — the load_lognorm /
-    # encode / rf / db_write sub-stages inside nest under it via thread-local naming
+    # Umbrella stage span for this cadence's inference phase — the encode / rf / db_write
+    # sub-stages inside nest under it via thread-local naming (load_lognorm normally ran
+    # on the prefetch thread already — see _prefetch_cadence)
     with stage_timer(f"inference.infer_cadence_{unit.index:03d}"):
-        # copy=False: the loader already returns float32; don't duplicate GBs of stamps.
-        # parallel=False: this loads exactly one already-downsampled cadence .npy whose
-        # per-cadence work is a cheap vectorized log-norm, while the prefetch thread is
-        # driving the persistent energy-detection pool at full n_processes width — forking
-        # a second n_processes chunk pool here would double-subscribe the CPU.
-        with stage_timer("load_lognorm"):
-            cadence_data = preprocessor.load_inference_data(
-                override_filepaths=[cadence_result.npy_path], parallel=False
-            ).astype(np.float32, copy=False)
+        if cadence_data is None:
+            # Fallback: the prefetch task's load failed (or a caller passed none) — load
+            # here so the per-cadence containment around this function covers a bad .npy
+            with stage_timer("load_lognorm"):
+                cadence_data = preprocessor.load_inference_data(
+                    override_filepaths=[cadence_result.npy_path], parallel=False
+                ).astype(np.float32, copy=False)
 
         # Step 1: retire any partial rows from a dead attempt before fresh ones land
         db.mark_superseded("inference_results", tag, npy_path=cadence_result.npy_path)
@@ -497,8 +531,9 @@ def _infer_cadence(
             seed_key=unit.index,
             **provenance,
         )
+        # cadence_data is a plain ndarray (no cycles): the del refcount-frees it, and
+        # run_inference's finally block already ran this cadence's one gc pass (#298 I7)
         del cadence_data
-        gc.collect()
 
         duration_s = time.time() - stage_start
 
@@ -532,18 +567,20 @@ def _run_streaming_csv_inference(
     Per-cadence streaming inference over the configured CSV catalogs, with stage-aware
     resume off the inference_cadences run manifest.
 
-    Flow (peak memory = one cadence's stamps + the next cadence's in-flight preprocessing,
-    independent of catalog size):
+    Flow (peak memory = up to inference.prefetch_depth in-flight cadences of stamps +
+    loaded arrays plus the one being inferred, independent of catalog size):
 
         units = plan_cadences()                # cadence groups + .npy paths, no work yet
         skip units with a live 'inferred' manifest row for this tag (fold their stored
             aggregates into the totals); for the rest:
-        pipeline = InferencePipeline(strategy) # models loaded once for the whole run
-        for each pending cadence (prefetch depth 1):
-            [background thread] preprocess cadence i+1 (energy detection; skipped when its
-                                stamp .npy already exists — preprocessing-artifact resume)
-            [main thread]       load cadence i's stamps -> encode on GPUs -> RF -> write
-                                per-cadence results + manifest row (_infer_cadence)
+        start the ED pool + first prefetch, then InferencePipeline(strategy) — models load
+            once, hidden under the first cadence's energy detection
+        for each pending cadence (prefetch depth = inference.prefetch_depth, #298 N2):
+            [prefetch thread(s)] preprocess + load/log-norm upcoming cadences (energy
+                                 detection skipped when the stamp .npy already exists —
+                                 preprocessing-artifact resume; see _prefetch_cadence)
+            [main thread]        encode cadence i on GPUs -> RF -> write per-cadence
+                                 results + manifest row (_infer_cadence), in catalog order
 
     Failure containment mirrors preprocessing's: a cadence whose inference stage fails is
     logged, recorded as status='failed' in the manifest, and the loop continues; the pass
@@ -646,33 +683,47 @@ def _run_streaming_csv_inference(
 
     failed_keys: list[tuple] = []
     if pending:
-        # Load models once; every cadence reuses this pipeline
-        pipeline = InferencePipeline(strategy=strategy)
-
-        # Start the persistent energy-detection pool from the main thread (forking after
-        # background threads exist risks inheriting mid-operation locks in the children)
+        # Start the persistent energy-detection pool from the main thread BEFORE any
+        # background thread exists (forking after threads spin up risks inheriting
+        # mid-operation locks in the children)
         preprocessor.start_energy_detection_pool()
         try:
+            # Prefetch depth (#298 N2): `depth` cadences preprocess+load concurrently ahead
+            # of the GPU stage. Futures are consumed strictly in catalog order, so results,
+            # manifest/supersede ordering, the reference-cloud offer order, and per-cadence
+            # seeding (keyed on unit.index — the catalog position, not execution order) are
+            # identical at any depth. Cost: up to `depth` in-flight cadences of RAM.
+            depth = max(1, config.inference.prefetch_depth)
             with ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="preproc_prefetch"
+                max_workers=depth, thread_name_prefix="preproc_prefetch"
             ) as prefetch:
-                future = prefetch.submit(preprocessor.process_pending_cadence, pending[0])
+                futures = deque(
+                    prefetch.submit(_prefetch_cadence, preprocessor, unit)
+                    for unit in pending[:depth]
+                )
+                next_submit = len(futures)
+
+                # Load models AFTER the first prefetch is in flight (#298 rider): the
+                # 10-60 s encoder+RF+calibrator load hides under the first cadence's
+                # energy detection. The worker pool was forked before any thread existed,
+                # and every cadence reuses this one pipeline.
+                pipeline = InferencePipeline(strategy=strategy)
 
                 for i, unit in enumerate(pending):
                     # NOTE: an exception inside a prefetched preprocessing task surfaces
-                    # here, one iteration after it was submitted, when its future is
+                    # here, `depth` iterations after it was submitted, when its future is
                     # resolved — and then propagates to inference_command's retry loop. In
                     # practice process_pending_cadence swallows per-cadence failures
-                    # (returns None), so only infrastructure-level errors (e.g. a broken
-                    # worker pool) raise.
-                    cadence_result = future.result()
+                    # (returns None) and _prefetch_cadence contains load failures, so only
+                    # infrastructure-level errors (e.g. a broken worker pool) raise.
+                    cadence_result, cadence_data = futures.popleft().result()
 
-                    # Prefetch depth 1: kick off cadence i+1's CPU preprocessing while the
-                    # main thread loads + encodes cadence i on the GPUs
-                    if i + 1 < len(pending):
-                        future = prefetch.submit(
-                            preprocessor.process_pending_cadence, pending[i + 1]
+                    # Keep `depth` cadences in flight while the main thread encodes this one
+                    if next_submit < len(pending):
+                        futures.append(
+                            prefetch.submit(_prefetch_cadence, preprocessor, pending[next_submit])
                         )
+                        next_submit += 1
 
                     if cadence_result is None:
                         logger.info(f"Cadence {unit.group.key}: no stamps produced; skipping")
@@ -683,8 +734,19 @@ def _run_streaming_csv_inference(
                     # raises after the loop so the retry loop re-attempts failed cadences.
                     try:
                         results = _infer_cadence(
-                            pipeline, preprocessor, unit, cadence_result, current_fingerprint
+                            pipeline,
+                            preprocessor,
+                            unit,
+                            cadence_result,
+                            current_fingerprint,
+                            cadence_data=cadence_data,
                         )
+                        # Release the prefetched array as soon as _infer_cadence returns
+                        # (its own del only clears the callee's reference): with
+                        # prefetch_depth cadences already loading behind this one, holding
+                        # it until the next iteration's rebind would stack an extra
+                        # cadence-sized array on peak RAM
+                        del cadence_data
                     except Exception as e:
                         logger.error(
                             f"Cadence {cadence_result.key}: inference stage failed ({e}); "
@@ -870,8 +932,9 @@ def inference_command():
 
             if config.data.inference_files is not None:
                 # Streaming CSV path: per-cadence preprocess -> load -> encode -> RF ->
-                # write, with models loaded once and prefetch depth 1 (see
-                # _run_streaming_csv_inference). Memory stays independent of catalog size.
+                # write, with models loaded once and inference.prefetch_depth cadences in
+                # flight (see _run_streaming_csv_inference). Memory stays independent of
+                # catalog size.
                 results = _run_streaming_csv_inference(preprocessor, strategy)
             else:
                 if not config.data.test_files:

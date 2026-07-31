@@ -26,10 +26,13 @@ from aetherscan.preprocessing import (
     ED_STAT_HIST_EDGES,
     DataPreprocessor,
     PendingCadence,
+    _chunk_cache_kwargs,
     _decimate_for_plot,
     _energy_detect_channel_worker,
     _extract_stamps_worker,
     _fit_channel_bandpass,
+    _log_norm_chunk_vectorized,
+    _lognorm_worker,
     _pfb_flatten_bandpass,
     _remove_dc_spike,
     _sliding_normality_k2,
@@ -37,6 +40,7 @@ from aetherscan.preprocessing import (
     derive_cadence_provenance,
     group_observations_from_csv,
 )
+from aetherscan.run_state import preprocessing_config_fingerprint
 
 _TESTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES_DIR = os.path.join(_TESTS_ROOT, "fixtures")
@@ -352,14 +356,85 @@ class TestDeriveCadenceProvenance:
         assert prov["cadence_id"] is None
 
 
+class TestLogNormChunkVectorized:
+    """#298 I5: the vectorized chunk log-norm must reproduce _lognorm_worker bit-for-bit —
+    same validity decisions, same float32 arithmetic, same zero-range guard."""
+
+    def _chunk(self, dtype=np.float32):
+        rng = np.random.default_rng(31)
+        chunk = rng.chisquare(df=4, size=(7, 6, 4, 16)).astype(dtype)
+        chunk[1, 0, 0, 0] = np.nan  # invalid: NaN
+        chunk[3, 2, 1, 5] = np.inf  # invalid: Inf
+        chunk[5] = 0.0  # invalid: non-positive max
+        chunk[6] = 2.5  # valid but constant: zero range after the log shift
+        return chunk
+
+    def _worker_reference(self, chunk, monkeypatch):
+        import aetherscan.preprocessing as preprocessing_module  # noqa: PLC0415
+
+        monkeypatch.setattr(preprocessing_module, "_GLOBAL_CHUNK_DATA", chunk)
+        rows, valid = [], []
+        for i in range(len(chunk)):
+            result = _lognorm_worker((i,))
+            valid.append(result is not None)
+            if result is not None:
+                rows.append(result)
+        return np.array(rows, dtype=np.float32), np.array(valid)
+
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_matches_lognorm_worker_bitwise(self, dtype, monkeypatch):
+        chunk = self._chunk(dtype)
+        expected_rows, expected_valid = self._worker_reference(chunk, monkeypatch)
+
+        normalized, valid = _log_norm_chunk_vectorized(chunk)
+
+        np.testing.assert_array_equal(valid, expected_valid)
+        np.testing.assert_array_equal(normalized, expected_rows)
+        assert normalized.dtype == np.float32
+
+    def test_all_invalid_chunk_returns_empty(self):
+        chunk = np.zeros((3, 6, 4, 16), dtype=np.float32)
+        normalized, valid = _log_norm_chunk_vectorized(chunk)
+        assert len(normalized) == 0
+        assert not valid.any()
+
+
+class TestChunkCacheKwargs:
+    def test_chunked_compressed_dataset_gets_sized_cache(self, make_h5_observation):
+        # 16 chunks of (1, 1, 256) float32 = 1 KiB each -> stripe far below the 1 MiB
+        # default, so force visibility by checking the sizing arithmetic directly
+        path = make_h5_observation("chunked.h5", n_chans=2048, chunks=(1, 1, 256))
+        kwargs = _chunk_cache_kwargs(str(path), time_bins=16)
+        # Tiny chunks: default cache already covers the stripe -> no override
+        assert kwargs == {}
+
+    def test_large_chunks_get_cache_override(self, make_h5_observation):
+        # One full-width chunk per time row (256 KiB each x 16 rows = 4 MiB stripe):
+        # exceeds the 1 MiB default, so the cache must be sized up
+        path = make_h5_observation("bigchunks.h5", n_chans=65536, chunks=(1, 1, 65536))
+        kwargs = _chunk_cache_kwargs(str(path), time_bins=16)
+        stripe = 16 * 65536 * 4
+        assert kwargs["rdcc_nbytes"] >= stripe
+        assert kwargs["rdcc_nbytes"] <= 512 * 1024**2
+        assert kwargs["rdcc_w0"] == 0.0
+        assert kwargs["rdcc_nslots"] > 0
+
+    def test_contiguous_dataset_returns_defaults(self, make_h5_observation):
+        path = make_h5_observation("contig.h5", n_chans=2048)
+        assert _chunk_cache_kwargs(str(path), time_bins=16) == {}
+
+    def test_missing_file_returns_defaults(self, tmp_path):
+        assert _chunk_cache_kwargs(str(tmp_path / "nope.h5"), time_bins=16) == {}
+
+
 class TestExtractStampsWorkerDownsample:
-    def _run_worker(self, tmp_path, make_h5_observation, downsample_factor):
+    def _run_worker(self, tmp_path, make_h5_observation, downsample_factor, **h5_kwargs):
         import h5py  # noqa: PLC0415
 
         time_bins, stamp_width = 16, 64
         stored_width = stamp_width // downsample_factor
         stamp_starts = [0, 512, 1000]
-        h5_path = make_h5_observation("obs.h5", n_chans=2048)
+        h5_path = make_h5_observation("obs.h5", n_chans=2048, **h5_kwargs)
         npy_path = str(tmp_path / f"stamps_x{downsample_factor}.npy")
 
         out = np.lib.format.open_memmap(
@@ -390,6 +465,16 @@ class TestExtractStampsWorkerDownsample:
         written, raw = self._run_worker(tmp_path, make_h5_observation, 1)
         for i, stamp in enumerate(raw):
             np.testing.assert_array_equal(written[i, 1], stamp)
+
+    def test_chunked_compressed_input_is_byte_identical(self, tmp_path, make_h5_observation):
+        # The chunk-cache sizing is pure cache tuning: a chunked+compressed input (gzip
+        # stands in for bitshuffle) must produce byte-identical stamps to the raw reads
+        written, raw = self._run_worker(
+            tmp_path, make_h5_observation, 8, chunks=(1, 1, 256), compression="gzip"
+        )
+        for i, stamp in enumerate(raw):
+            expected = downscale_local_mean(stamp, (1, 8)).astype(np.float32)
+            np.testing.assert_array_equal(written[i, 1], expected)
 
 
 @pytest.fixture
@@ -472,16 +557,32 @@ class TestProcessCadenceEndToEnd:
         npy_path = str(tmp_path / "out" / "cadence.npy")
         os.makedirs(os.path.dirname(npy_path), exist_ok=True)
 
-        # A stale partial output from an interrupted previous run must be detected,
-        # warned about, and removed before extraction proceeds
+        # Abandoned partial outputs are age-swept (#298 I3: tmp names are per-run-unique in
+        # the shared cache dir, so only AGE proves abandonment): an expired tmp — legacy
+        # fixed name or unique-name — is removed; a fresh unique-name tmp may be a live
+        # concurrent run's in-progress write and must survive.
+        import time as time_module  # noqa: PLC0415
+
+        expired = (time_module.time() - 25 * 3600,) * 2
         stale_tmp = os.path.splitext(npy_path)[0] + ".tmp.npy"
         with open(stale_tmp, "wb") as f:
+            f.write(b"junk from a SIGKILLed pre-#298 run")
+        os.utime(stale_tmp, expired)
+        stale_unique_tmp = os.path.splitext(npy_path)[0] + ".12345.deadbeef.tmp.npy"
+        with open(stale_unique_tmp, "wb") as f:
             f.write(b"junk from a SIGKILLed run")
+        os.utime(stale_unique_tmp, expired)
+        fresh_tmp = os.path.splitext(npy_path)[0] + ".67890.cafebabe.tmp.npy"
+        with open(fresh_tmp, "wb") as f:
+            f.write(b"a live concurrent run's in-progress write")
 
         preprocessor = DataPreprocessor()
         result = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
 
         assert not os.path.exists(stale_tmp)
+        assert not os.path.exists(stale_unique_tmp)
+        assert os.path.exists(fresh_tmp)
+        os.remove(fresh_tmp)
         assert result is not None
         assert result.npy_path == npy_path
         stamps = np.load(npy_path)
@@ -941,11 +1042,13 @@ class TestDecimateForPlot:
 
 
 class TestPlanCadencesOutputDir:
-    """plan_cadences resolves the .npy output dir per CSV: tag-scoped default under
-    {data_path}/inference/preprocessed/, with an explicit --preprocess-output-dir shared
-    across CSVs."""
+    """plan_cadences resolves the .npy output dir per CSV: ED-fingerprint-scoped default
+    under {data_path}/inference/preprocessed/ (#298 I3 — runs sharing an ED config share
+    stamps), with an explicit --preprocess-output-dir shared across CSVs."""
 
-    def test_default_is_per_csv_tag_scoped(self, initialized_runtime, make_inference_csv):
+    def test_default_is_fingerprint_scoped_not_tag_scoped(
+        self, initialized_runtime, make_inference_csv
+    ):
         config = get_config()
         make_inference_csv("subset.csv")
         config.data.inference_files = ["subset.csv"]
@@ -954,26 +1057,44 @@ class TestPlanCadencesOutputDir:
         units = DataPreprocessor().plan_cadences()
 
         assert len(units) == 1
-        expected_dir = os.path.join(config.data_path, "inference", "preprocessed", "subset_test_v1")
+        fingerprint = preprocessing_config_fingerprint(config.to_dict())
+        expected_dir = os.path.join(
+            config.data_path, "inference", "preprocessed", f"subset_ed{fingerprint[:12]}"
+        )
         assert os.path.dirname(units[0].npy_path) == expected_dir
         assert os.path.isdir(expected_dir)
+        assert "test_v1" not in os.path.basename(expected_dir)
 
-    def test_new_tag_gets_clean_directory(self, initialized_runtime, make_inference_csv):
+    def test_scoring_change_reuses_directory(self, initialized_runtime, make_inference_csv):
+        # The point of #298 I3: a new threshold / model must land in the SAME stamp dir
         config = get_config()
         make_inference_csv("subset.csv")
         config.data.inference_files = ["subset.csv"]
 
         config.checkpoint.save_tag = "test_v1"
         first = DataPreprocessor().plan_cadences()
-        # Plant a stale stamp from the old tag's attempt at exactly the path resume keys on
+        config.checkpoint.save_tag = "test_v2"
+        config.inference.classification_threshold = 0.5
+        config.inference.encoder_path = "/some/other/encoder.keras"
+        second = DataPreprocessor().plan_cadences()
+
+        assert os.path.dirname(first[0].npy_path) == os.path.dirname(second[0].npy_path)
+
+    def test_ed_change_gets_clean_directory(self, initialized_runtime, make_inference_csv):
+        config = get_config()
+        make_inference_csv("subset.csv")
+        config.data.inference_files = ["subset.csv"]
+
+        first = DataPreprocessor().plan_cadences()
+        # Plant a stale stamp at exactly the path resume keys on
         with open(first[0].npy_path, "wb") as f:
             f.write(b"stale")
-        config.checkpoint.save_tag = "test_v2"
+        config.inference.stat_threshold = 4096.0  # an ED-affecting change
         second = DataPreprocessor().plan_cadences()
 
         assert os.path.dirname(first[0].npy_path) != os.path.dirname(second[0].npy_path)
-        # The new tag's unit must not see the old stamp — process_pending_cadence would
-        # otherwise resume-skip the cadence off the stale file.
+        # The new config's unit must not see the old stamp — process_pending_cadence would
+        # otherwise resume-skip the cadence off stamps produced under a different ED config.
         assert not os.path.exists(second[0].npy_path)
 
     def test_duplicate_csv_basenames_rejected(self, initialized_runtime, make_inference_csv):
@@ -1001,6 +1122,66 @@ class TestPlanCadencesOutputDir:
 
         assert len(units) == 2
         assert {os.path.dirname(u.npy_path) for u in units} == {override}
+
+
+class TestResumeProvenanceGuard:
+    """#298 I3: an existing stamp .npy is only reused when its metadata sidecar's h5_paths
+    and recorded ED fingerprint match; missing/legacy metadata degrades to warn-and-reuse."""
+
+    def _group_and_paths(self, tmp_path, h5_paths=None):
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        group = CadenceGroup(
+            key=("T", "S", "L", "1", "1400"),
+            h5_paths=h5_paths or [f"/data/obs_{i}.h5" for i in range(6)],
+            csv_path="catalog.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "cadence.npy")
+        metadata_path = DataPreprocessor.cadence_metadata_path(npy_path)
+        return group, npy_path, metadata_path
+
+    def _write_metadata(self, metadata_path, **fields):
+        with open(metadata_path, "w") as f:
+            json.dump(fields, f)
+
+    def test_matching_metadata_reuses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(
+            metadata_path,
+            h5_paths=group.h5_paths,
+            ed_config_fingerprint=preprocessing_config_fingerprint(get_config().to_dict()),
+        )
+        assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_h5_path_mismatch_reprocesses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(metadata_path, h5_paths=[f"/other/obs_{i}.h5" for i in range(6)])
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_fingerprint_mismatch_reprocesses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, ed_config_fingerprint="deadbeef"
+        )
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_missing_metadata_reuses_with_warning(self, tmp_path, initialized_runtime, caplog):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        assert any("unguarded" in r.message for r in caplog.records)
+
+    def test_legacy_metadata_without_fingerprint_reuses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(metadata_path, h5_paths=group.h5_paths)
+        assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
 
 
 class TestLoadInferenceDataPaths:

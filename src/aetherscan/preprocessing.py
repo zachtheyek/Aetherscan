@@ -12,6 +12,7 @@ import contextlib
 import csv
 import functools
 import gc
+import glob
 import json
 import logging
 import math
@@ -41,6 +42,7 @@ from aetherscan.db import get_db
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 from aetherscan.pfb import edge_mid_band_slices, equalize_passband, gen_coarse_channel_response
+from aetherscan.run_state import preprocessing_config_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,54 @@ _PFB_MISMATCH_SAMPLE_CHANNELS = 9
 # Target bin count for _decimate_for_plot: spectrum lines in the bandpass debug/viz figures
 # are reduced to at most 2 * this many points (a min/max pair per bin) before plotting.
 _PLOT_MAX_POINTS_PER_LINE = 4096
+# HDF5 chunk-cache sizing for read paths that revisit chunks (stamp extraction, the PFB
+# residual check). h5py's default cache is 1 MiB — smaller than one decompressed bitshuffle
+# chunk at BL scale (~4 MiB for (1, 1, 1048576) float32), and HDF5 never caches a chunk
+# larger than the cache, so every access re-decompresses from scratch. _chunk_cache_kwargs
+# sizes the cache from the file's actual chunk layout: 4 chunk-column time-stripes resident,
+# capped here. rdcc_nslots is a prime ~100x the resident-chunk count (HDF5 guidance);
+# rdcc_w0=0 evicts fully-read chunks first, matching the monotonic start-sorted read order.
+_CHUNK_CACHE_STRIPES = 4
+_CHUNK_CACHE_MAX_NBYTES = 512 * 1024**2
+_CHUNK_CACHE_NSLOTS = 10007
+# Stamp-extraction task granularity: target this many tasks per pool worker. At 1 task per
+# worker (the old ceil(n_processes / n_files) split -> 36 near-equal tasks on 32 workers)
+# the stage quantizes to two waves — a full wave plus a small remainder wave that idles
+# ~44% of worker-seconds. ~4 tasks/worker keeps the tail to ~1/4 of one task length while
+# each task still spans enough contiguous sorted stamps for chunk-cache reuse to pay.
+_EXTRACT_TASKS_PER_WORKER = 4
+# Age past which an unpromoted *.tmp.npy in the (cross-run, #298 I3) stamp cache directory
+# is considered abandoned and removed. Live writes are minutes-scale; a day of margin means
+# a concurrent run's in-progress tmp can never be mistaken for a dead one.
+_STALE_TMP_MAX_AGE_S = 24 * 3600
+
+
+def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
+    """
+    h5py.File open kwargs sizing the HDF5 chunk cache to the file's actual chunk layout.
+
+    Reads the 'data' dataset's chunk shape and returns {rdcc_nbytes, rdcc_nslots, rdcc_w0}
+    sized to hold _CHUNK_CACHE_STRIPES full chunk-column time-stripes (the set of chunks one
+    stamp read touches is ceil(time_bins / chunk_time) chunks per column). Returns {} — the
+    h5py defaults — for contiguous datasets, layouts the default cache already covers, or any
+    inspection failure, so callers degrade gracefully on non-BL chunk layouts.
+    """
+    try:
+        with h5py.File(h5_path, "r") as hf:
+            dset = hf["data"]
+            chunks = dset.chunks
+            if not chunks:
+                return {}
+            chunk_nbytes = int(np.prod(chunks)) * dset.dtype.itemsize
+    except Exception as e:
+        logger.warning(f"Could not inspect chunk layout of {h5_path} ({e}); using default cache")
+        return {}
+
+    stripe_nbytes = math.ceil(time_bins / chunks[0]) * chunk_nbytes
+    rdcc_nbytes = min(_CHUNK_CACHE_STRIPES * stripe_nbytes, _CHUNK_CACHE_MAX_NBYTES)
+    if rdcc_nbytes <= 1024**2:
+        return {}
+    return {"rdcc_nbytes": rdcc_nbytes, "rdcc_nslots": _CHUNK_CACHE_NSLOTS, "rdcc_w0": 0.0}
 
 
 def _init_worker(shm_name, shape, dtype):
@@ -140,6 +190,33 @@ def _init_plain_worker():
     """
     init_worker_logging()
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Marks this process as a pool worker: gates the per-worker h5 handle cache, which must
+    # never engage on the parent's (multi-threaded) sequential path — see _cached_h5_file
+    global _IN_POOL_WORKER
+    _IN_POOL_WORKER = True
+
+
+def _downsample_cadence(cadence, downsample_factor: int, final_width: int):
+    """
+    Downsample one cadence's 6 observations, or return None for an invalid cadence
+    (NaN/Inf or non-positive max). Pure function of its arguments — the thread-safe core
+    shared by the pool worker (which resolves its cadence from _GLOBAL_CHUNK_DATA) and the
+    sequential path (which passes the row directly, so it never touches the module global
+    and stays safe on the multi-threaded prefetch side — #298 review note).
+    """
+    # Skip invalid cadences
+    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+        return None
+
+    # Downsample each observation separately
+    downsampled_cadence = np.zeros((6, 16, final_width), dtype=np.float32)
+
+    for obs_idx in range(6):
+        downsampled_cadence[obs_idx] = downscale_local_mean(
+            cadence[obs_idx], (1, downsample_factor)
+        ).astype(np.float32)
+
+    return downsampled_cadence
 
 
 # NOTE: come back to this later
@@ -154,27 +231,11 @@ def _downsample_worker(args):
     """
     cadence_idx, downsample_factor, final_width = args
 
-    # Get cadence from global chunk data
-    if _GLOBAL_CHUNK_DATA is not None:
-        cadence = _GLOBAL_CHUNK_DATA[cadence_idx]
-
-        # Skip invalid cadences
-        if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
-            return None
-
-        # Downsample each observation separately
-        downsampled_cadence = np.zeros((6, 16, final_width), dtype=np.float32)
-
-        for obs_idx in range(6):
-            downsampled_cadence[obs_idx] = downscale_local_mean(
-                cadence[obs_idx], (1, downsample_factor)
-            ).astype(np.float32)
-
-        return downsampled_cadence
-
-    else:
+    if _GLOBAL_CHUNK_DATA is None:
         logger.warning("No global chunk data available")
         return None
+
+    return _downsample_cadence(_GLOBAL_CHUNK_DATA[cadence_idx], downsample_factor, final_width)
 
 
 def _lognorm_worker(args):
@@ -202,6 +263,36 @@ def _lognorm_worker(args):
         return None
 
     return log_norm(cadence.astype(np.float32))
+
+
+def _log_norm_chunk_vectorized(chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized equivalent of mapping _lognorm_worker over every cadence of `chunk`
+    (n, obs, time_bins, width): returns (normalized_valid_rows, valid_mask) (#298 I5).
+
+    Bit-identical per element to the per-cadence path, by construction: the validity rule is
+    the same (any NaN/Inf or non-positive max rejects the cadence — NaN/Inf rows fail the
+    finite mask, so the max comparison never decides them); the arithmetic runs in float32
+    with the same scalar casts (numpy converts the 1e-10 epsilon and the per-cadence min/max
+    scalars to float32 in both forms); min/max are exact order-independent reductions; and
+    rows whose post-shift range is 0 skip the division exactly as log_norm's range_log > 0
+    guard does. Pinned by a unit test against _lognorm_worker on a mixed valid/invalid chunk.
+    """
+    reduce_axes = (1, 2, 3)
+    finite = np.isfinite(chunk).all(axis=reduce_axes)
+    maxes = chunk.max(axis=reduce_axes)
+    with np.errstate(invalid="ignore"):
+        valid = finite & (maxes > 0)
+
+    # Advanced indexing always yields a fresh array we own, so copy=False only avoids a
+    # second copy when the dtype is already float32 — in-place mutation below is safe.
+    data = chunk[valid].astype(np.float32, copy=False)
+    data += 1e-10
+    np.log(data, out=data)
+    data -= data.min(axis=reduce_axes, keepdims=True)
+    ranges = data.max(axis=reduce_axes, keepdims=True)
+    np.divide(data, ranges, out=data, where=ranges > 0)
+    return data, valid
 
 
 # NOTE: come back to this later (mirrors preprocess_fine.py:72-75 from the reference implementation)
@@ -278,6 +369,72 @@ def _load_pfb_response(response_path: str) -> np.ndarray:
     response = np.load(response_path)
     response.setflags(write=False)
     return response
+
+
+def _flattened_edge_mid_ratio_banded(
+    h5_path: str,
+    channel_index: int,
+    response: np.ndarray,
+    width: int,
+    time_bins: int,
+    open_kwargs: dict | None = None,
+) -> float:
+    """
+    Edge/mid power ratio of one coarse channel AFTER flattening by the static response H.
+
+    Reads only the bands edge_mid_power_ratio actually evaluates (edge_mid_band_slices:
+    the outermost width // 16 bins each side plus a central band of the same width) as
+    native float32 and time-integrates each immediately — ~10x less I/O than the
+    full-channel float64 read of _read_despiked_channel, and no fp64 blowup, which is what
+    keeps the per-file sanity check cheap at GBT scale. The DC spike (2 bins at
+    width // 2) sits inside the mid band; its interpolation (_remove_dc_spike) is linear,
+    so it commutes with the time mean and is replicated on the integrated slice. Matches
+    edge_mid_power_ratio(equalize_passband(channel, response).mean(axis=0)) on the
+    despiked full read, up to float32-read rounding (pinned by a unit test).
+
+    Module-level (not a DataPreprocessor method) so the pool-side _pfb_ratio_worker can
+    share the exact same body (#298 I6) — both venues must produce identical ratios.
+    """
+    start = channel_index * width
+    left, mid, right = edge_mid_band_slices(width)
+    # Widen the mid slice so the DC-spike interpolation sources (up to 3 bins around
+    # width // 2, see _remove_dc_spike) are always present. The min(width) bound is
+    # defensive documentation: at any real width the center+3 widening cannot reach the
+    # channel end (mid.stop < width for width >= 16), so the clamp never bites in practice.
+    lo = max(0, min(mid.start, width // 2 - 3))
+    hi = min(width, max(mid.stop, width // 2 + 3))
+    # The three band reads all live in the same chunk-column stripe; a sized chunk cache
+    # (computed once per file by the caller) decompresses each chunk once instead of once
+    # per band read.
+    with h5py.File(h5_path, "r", **(open_kwargs or {})) as hf:
+        data = hf["data"]
+        left_int = data[:time_bins, 0, start + left.start : start + left.stop].mean(axis=0)
+        right_int = data[:time_bins, 0, start + right.start : start + right.stop].mean(axis=0)
+        mid_int = data[:time_bins, 0, start + lo : start + hi].mean(axis=0)
+    dc = width // 2 - lo
+    mid_int[dc] = (mid_int[dc + 1] + mid_int[dc - 3]) / 2
+    mid_int[dc - 1] = (mid_int[dc + 2] + mid_int[dc - 2]) / 2
+    mid_int = mid_int[mid.start - lo : mid.stop - lo]
+
+    # Same divide-by-H (with equalize_passband's defensive floor) as the real flattener;
+    # per-bin division commutes with the time mean, so integrating first is equivalent.
+    floor = np.maximum(response, 1e-10)
+    edge = 0.5 * (float((left_int / floor[left]).mean()) + float((right_int / floor[right]).mean()))
+    return edge / float((mid_int / floor[mid]).mean())
+
+
+def _pfb_ratio_worker(args: tuple) -> float:
+    """
+    Pool worker for the PFB residual-flatness check (#298 I6): one sampled channel's
+    flattened edge/mid power ratio. The static response arrives as its content-addressed
+    sidecar PATH — _load_pfb_response caches the ~8 MB array per worker process, and the
+    sidecar was np.array_equal-verified against the generated response in the parent, so
+    pool-side ratios are bit-identical to the old parent-side computation.
+    """
+    h5_path, channel_index, width, time_bins, response_path, open_kwargs = args
+    return _flattened_edge_mid_ratio_banded(
+        h5_path, channel_index, _load_pfb_response(response_path), width, time_bins, open_kwargs
+    )
 
 
 def _pfb_flatten_bandpass(channel: np.ndarray, response_path: str) -> np.ndarray:
@@ -471,6 +628,35 @@ def _sliding_normality_k2(channel: np.ndarray, window_size: int, step_size: int)
     return k2
 
 
+# Per-worker cache of read-only h5py handles for the fused ED tasks (#298 rider): each
+# worker used to open/close the same 3 ON files once per coarse channel — ~2,859
+# open/close cycles per cadence against a network filesystem. Small LRU (the current
+# cadence's ON files plus slack); read-only input files, so a held handle can never go
+# stale, and handles die with the worker process. ED reads visit each chunk exactly once,
+# so the h5py default chunk cache on these handles is irrelevant (extraction, which DOES
+# revisit chunks, opens its own rdcc-sized handles — see _extract_stamps_worker).
+# POOL WORKERS ONLY (_IN_POOL_WORKER, set by _init_plain_worker): in sequential mode the
+# ED chain runs on the parent's prefetch thread(s), and h5py File objects must not be
+# shared across threads — the sequential path keeps its per-call open/close.
+_H5_HANDLE_CACHE: OrderedDict = OrderedDict()
+_H5_HANDLE_CACHE_MAX = 4
+_IN_POOL_WORKER = False
+
+
+def _cached_h5_file(h5_path: str):
+    handle = _H5_HANDLE_CACHE.get(h5_path)
+    if handle is not None and handle.id.valid:
+        _H5_HANDLE_CACHE.move_to_end(h5_path)
+        return handle
+    handle = h5py.File(h5_path, "r")
+    _H5_HANDLE_CACHE[h5_path] = handle
+    while len(_H5_HANDLE_CACHE) > _H5_HANDLE_CACHE_MAX:
+        _, evicted = _H5_HANDLE_CACHE.popitem(last=False)
+        with contextlib.suppress(Exception):
+            evicted.close()
+    return handle
+
+
 def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]:
     """
     Fused worker: run the complete energy-detection chain for one coarse channel — read the
@@ -500,8 +686,13 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
 
     start = channel_index * coarse_channel_width
     end = (channel_index + 1) * coarse_channel_width
-    with h5py.File(h5_path, "r") as hf:
-        channel = hf["data"][:time_bins, 0, start:end]
+    if _IN_POOL_WORKER:
+        channel = _cached_h5_file(h5_path)["data"][:time_bins, 0, start:end]
+    else:
+        # Sequential mode runs on the parent's prefetch thread(s) — h5py handles must not
+        # be shared across threads, so keep the per-call open/close there
+        with h5py.File(h5_path, "r") as hf:
+            channel = hf["data"][:time_bins, 0, start:end]
 
     # In-place DC spike removal. The spike sits at the channel center and the interpolation
     # offsets reach at most ±3 bins around it (see _remove_dc_spike), so per-channel
@@ -560,7 +751,11 @@ def _extract_stamps_worker(args: tuple) -> None:
     ) = args
     out = np.lib.format.open_memmap(npy_path, mode="r+")
     try:
-        with h5py.File(obs_h5, "r") as hf:
+        # Chunk-cache sizing is what makes the caller's start-sorted stamp order pay off:
+        # with the h5py default (1 MiB) a BL-scale bitshuffle chunk never fits, so every
+        # stamp re-decompresses its full chunk stripe; sized from the actual layout, each
+        # chunk decompresses once per task (see _chunk_cache_kwargs).
+        with h5py.File(obs_h5, "r", **_chunk_cache_kwargs(obs_h5, time_bins)) as hf:
             dset = hf["data"]
             for local_i, start in enumerate(stamp_starts):
                 stamp = dset[:time_bins, 0, start : start + stamp_width]
@@ -952,6 +1147,9 @@ class DataPreprocessor:
                     self.manager.close_pool(chunk_pool)
                     chunk_pool = None
                 del chunk_shm, chunk_pool
+                # Release the module-global staging reference (#298 rider) — same leak as
+                # the inference loader: the local dels above don't clear the global name
+                _GLOBAL_CHUNK_DATA = None
                 gc.collect()
 
             # Clear raw_data reference
@@ -1005,10 +1203,14 @@ class DataPreprocessor:
 
         parallel=False routes every chunk through the sequential in-process branch (no chunk
         pool, no shared memory) regardless of manager.n_processes. The streaming per-cadence
-        path (main._infer_cadence) uses this: it loads exactly one already-downsampled cadence
-        .npy whose per-cadence work is a cheap vectorized log-norm, while the prefetch thread
-        is already driving the persistent energy-detection pool at full n_processes width —
-        forking a second n_processes pool for that would double-subscribe the CPU.
+        path (main._prefetch_cadence) uses this: it loads exactly one already-downsampled
+        cadence .npy whose per-cadence work is a cheap vectorized log-norm, while the
+        persistent energy-detection pool is already busy at full n_processes width — forking
+        a second n_processes pool for that would double-subscribe the CPU. THREAD CONTRACT
+        (#298): parallel=False may be called from prefetch_depth CONCURRENT threads, so
+        neither sequential branch may touch module-global state — the vectorized log-norm
+        path is pure, and the legacy downsample path passes rows to _downsample_cadence
+        directly (never via _GLOBAL_CHUNK_DATA, which stays a pool-worker-only mechanism).
         """
         logger.info(f"Loading backgrounds from {self.config.data_path} for inference")
 
@@ -1023,7 +1225,11 @@ class DataPreprocessor:
         logger.info(f"Processing chunks of: {chunk_size}")
         logger.info(f"Final resolution: {final_width}")
 
-        all_cadences = []
+        global _GLOBAL_CHUNK_DATA
+        # Per-chunk float32 blocks of already-normalized cadences, concatenated once at the
+        # end (#298 I5) — replaces the per-cadence list whose final np.array() restack
+        # re-copied every row through a Python loop.
+        all_blocks: list[np.ndarray] = []
 
         if override_filepaths is not None:
             # Iterate absolute paths directly (e.g. per-cadence .npy outputs from find_hits)
@@ -1168,8 +1374,34 @@ class DataPreprocessor:
                     # TEST: does return order matter?
                     results = chunk_pool.map(worker_fn, args_list, chunksize=chunksize)
 
+                elif already_downsampled:
+                    # Sequential + already-downsampled — the streaming per-cadence path:
+                    # vectorized log-norm over the whole chunk (#298 I5), bit-identical per
+                    # element to mapping _lognorm_worker (see _log_norm_chunk_vectorized),
+                    # without the per-stamp Python loop and without staging the chunk in
+                    # the module global at all.
+                    logger.info(
+                        f"DataPreprocessor running vectorized sequential log-norm "
+                        f"(parallel={parallel}, n_processes={n_processes})"
+                    )
+
+                    chunk_shm = None
+                    chunk_pool = None
+                    shared_chunk = None
+                    results = []
+
+                    normalized, _ = _log_norm_chunk_vectorized(chunk_data)
+                    if len(normalized):
+                        all_blocks.append(normalized)
+                    del normalized
+
                 else:
-                    # Sequential processing
+                    # Sequential processing (legacy full-width files). Rows are passed to
+                    # the downsample core DIRECTLY — never via _GLOBAL_CHUNK_DATA: this
+                    # branch runs on the caller's thread, and the streaming loop calls
+                    # load_inference_data(parallel=False) from prefetch_depth concurrent
+                    # threads, where a module-global staging slot would race (#298 review
+                    # note). The global stays a pool-worker-only mechanism.
                     logger.info(
                         f"DataPreprocessor running in sequential mode "
                         f"(parallel={parallel}, n_processes={n_processes})"
@@ -1177,25 +1409,30 @@ class DataPreprocessor:
 
                     chunk_shm = None
                     chunk_pool = None
+                    shared_chunk = None
 
-                    # Set global variable manually since no initializer ran
-                    global _GLOBAL_CHUNK_DATA
-                    shared_chunk = chunk_data
-                    _GLOBAL_CHUNK_DATA = shared_chunk
-
-                    results = [worker_fn(args) for args in args_list]
+                    results = [
+                        _downsample_cadence(chunk_data[i], downsample_factor, final_width)
+                        for i, _, _ in args_list
+                    ]
 
                 # NOTE: is there a more efficient/elegant way to do this (e.g. with list comprehension/slicing)?
-                # Collect valid results (filter out None from invalid cadences)
-                for result in results:
-                    if result is not None:
-                        if already_downsampled:
-                            all_cadences.append(result)
-                        else:
-                            # Legacy path: per-cadence log-norm in-process, as before
-                            all_cadences.append(log_norm(result))
+                # Collect valid results (filter out None from invalid cadences) and stack
+                # them into one float32 block per chunk (the vectorized branch has already
+                # appended its block; its results list is empty)
+                chunk_cadences = [
+                    result if already_downsampled else log_norm(result)
+                    for result in results
+                    if result is not None
+                ]
+                if chunk_cadences:
+                    all_blocks.append(np.array(chunk_cadences, dtype=np.float32))
+                del chunk_cadences
 
-                # Clear chunk data & shared resources
+                # Clear chunk data & shared resources. No gc.collect() here or below:
+                # everything freed on these paths is refcount-managed (ndarrays, SHM
+                # handles), and each full collection costs ~0.3 s with TF loaded — the
+                # streaming loop calls this once per cadence (#298 I7).
                 del chunk_data, shared_chunk
                 if chunk_shm:
                     self.manager.close_shared_memory(chunk_shm)
@@ -1204,21 +1441,24 @@ class DataPreprocessor:
                     self.manager.close_pool(chunk_pool)
                     chunk_pool = None
                 del chunk_shm, chunk_pool
-                gc.collect()
+                # Release the module-global staging reference (#298 rider): it otherwise
+                # pins the last chunk (~6-10 GB of stamps) in the main process for the
+                # whole encode/RF phase, until the next cadence's load overwrites it
+                _GLOBAL_CHUNK_DATA = None
 
             # Clear raw_data reference
             del raw_data
-            gc.collect()
 
-        if len(all_cadences) == 0:
+        if not all_blocks:
             raise ValueError("No data loaded successfully")
 
-        # Stack all_cadences together (every cadence is downsampled + log-normalized by now)
-        cadence_array = np.array(all_cadences, dtype=np.float32)
+        # One contiguous float32 array (every cadence is downsampled + log-normalized by
+        # now); the single-block case — the streaming loop's, always — is returned as-is
+        # rather than paying a full concatenate copy
+        cadence_array = all_blocks[0] if len(all_blocks) == 1 else np.concatenate(all_blocks)
 
-        # Clear all_cadences reference
-        del all_cadences
-        gc.collect()
+        # Clear all_blocks reference
+        del all_blocks
 
         # Sanity check: print descriptive stats
         min_val = np.min(cadence_array)
@@ -1287,10 +1527,10 @@ class DataPreprocessor:
             logger.warning("plan_cadences() called with no inference_files configured")
             return []
 
-        # Fail fast on duplicate CSV basename stems: both the tag-scoped default output dir
-        # and the per-cadence stamp .npy names are keyed on the stem, so two entries like
-        # runA/x.csv and runB/x.csv would silently share a directory (and/or stamp filenames)
-        # and cross-resume each other's cadences.
+        # Fail fast on duplicate CSV basename stems: both the fingerprint-scoped default
+        # output dir and the per-cadence stamp .npy names are keyed on the stem, so two
+        # entries like runA/x.csv and runB/x.csv would silently share a directory (and/or
+        # stamp filenames) and cross-resume each other's cadences.
         stem_sources: dict[str, str] = {}
         for csv_filename in inference_files:
             stem = os.path.splitext(os.path.basename(csv_filename))[0]
@@ -1303,15 +1543,21 @@ class DataPreprocessor:
                 )
             stem_sources[stem] = csv_filename
 
-        # Output directory resolution: an explicit --preprocess-output-dir is used as-is
-        # (shared across CSVs); otherwise each CSV gets its own tag-scoped default,
-        # {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/. Tag scoping trades
-        # cross-run caching for isolation: a retry under the same tag still resumes via the
-        # existing-.npy skip, while a fresh run (new datetime tag) starts from a clean
-        # directory that stale stamps from an older failed attempt can't leak into. To reuse
-        # an old run's preprocessing, pass its directory explicitly.
+        # Output directory resolution (#298 I3): an explicit --preprocess-output-dir is
+        # used as-is (shared across CSVs); otherwise each CSV gets its own ED-FINGERPRINT-
+        # scoped default, {data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/. Energy
+        # detection is deterministic given (csv, h5 files, ED config), so any run sharing
+        # the ED config reuses the stamps — threshold sweeps and re-inference with new
+        # weights skip preprocessing entirely — while any ED-config change lands in a
+        # different directory by construction (the fingerprint is a fail-safe denylist —
+        # see run_state.preprocessing_config_fingerprint). Staleness is impossible for a
+        # published .npy (atomic tmp -> os.replace publication + per-run-unique tmp names);
+        # the resume guard additionally verifies each sidecar's h5_paths and fingerprint.
+        # This deliberately replaces the old <csv_stem>_<save_tag> tag-scoped default
+        # (maintainer decision on #298): scores stay tag-scoped in the DB — only the
+        # deterministic preprocessing artifacts are shared.
         explicit_output_dir = self.config.inference.preprocess_output_dir
-        save_tag = self.config.checkpoint.save_tag
+        ed_fingerprint = preprocessing_config_fingerprint(self.config.to_dict())
 
         group_by_cols = self.config.inference.cadence_group_by_cols
         h5_path_col = self.config.inference.cadence_h5_path_col
@@ -1341,7 +1587,7 @@ class DataPreprocessor:
             csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
 
             output_dir = explicit_output_dir or self.config.get_inference_file_path(
-                os.path.join("preprocessed", f"{csv_stem}_{save_tag}")
+                os.path.join("preprocessed", f"{csv_stem}_ed{ed_fingerprint[:12]}")
             )
             os.makedirs(output_dir, exist_ok=True)
             logger.info(f"Preprocessing output directory for {csv_filename}: {output_dir}")
@@ -1386,16 +1632,19 @@ class DataPreprocessor:
                 # Fall through (no return) to the _process_cadence call below so a
                 # corrupted .npy gets regenerated rather than silently skipped.
             else:
-                logger.info(
-                    f"Skipping cadence {group.key}: {npy_path} already exists ({n_hits} hits)"
-                )
-                return CadenceResult(
-                    npy_path=npy_path,
-                    h5_paths=group.h5_paths,
-                    key=group.key,
-                    n_hits=n_hits,
-                    metadata_path=metadata_path,
-                )
+                if self._resume_provenance_ok(group, npy_path, metadata_path):
+                    logger.info(
+                        f"Skipping cadence {group.key}: {npy_path} already exists ({n_hits} hits)"
+                    )
+                    return CadenceResult(
+                        npy_path=npy_path,
+                        h5_paths=group.h5_paths,
+                        key=group.key,
+                        n_hits=n_hits,
+                        metadata_path=metadata_path,
+                    )
+                # Guard failed: fall through and reprocess (the atomic tmp -> os.replace
+                # publication overwrites the mismatched artifact)
 
         try:
             # Umbrella stage span for this cadence's preprocessing phase — the per-ON-file
@@ -1406,6 +1655,47 @@ class DataPreprocessor:
         except Exception as e:
             logger.error(f"Failed to process cadence {group.key}: {e}")
             return None
+
+    def _resume_provenance_ok(self, group: CadenceGroup, npy_path: str, metadata_path: str) -> bool:
+        """
+        Provenance guard on stamp reuse (#298 I3): an existing .npy is trusted only when its
+        sidecar metadata's h5_paths match this cadence's files and its recorded
+        ed_config_fingerprint (when present) matches the current config's. With the
+        fingerprint-scoped default directory the fingerprint check is belt-and-braces (a
+        changed ED config lands in a different directory by construction); the h5_paths
+        check is what protects an EXPLICIT --preprocess-output-dir against reusing another
+        catalog's stamps. Missing/unreadable metadata or a metadata file without the
+        fingerprint field (a pre-#298 artifact in an explicitly shared directory) degrades
+        to a warn-and-reuse — the historical, unguarded behavior — never a hard failure.
+        """
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                f"Cadence {group.key}: existing stamps at {npy_path} have no readable "
+                f"metadata sidecar ({e}); reusing them unguarded (historical behavior)"
+            )
+            return True
+
+        recorded_h5_paths = metadata.get("h5_paths")
+        if recorded_h5_paths is not None and list(recorded_h5_paths) != list(group.h5_paths):
+            logger.warning(
+                f"Cadence {group.key}: existing stamps at {npy_path} were extracted from "
+                f"DIFFERENT .h5 files than this cadence's; reprocessing instead of reusing"
+            )
+            return False
+
+        recorded_fingerprint = metadata.get("ed_config_fingerprint")
+        if recorded_fingerprint is not None:
+            current = preprocessing_config_fingerprint(self.config.to_dict())
+            if recorded_fingerprint != current:
+                logger.warning(
+                    f"Cadence {group.key}: existing stamps at {npy_path} were written under "
+                    f"a DIFFERENT energy-detection config; reprocessing instead of reusing"
+                )
+                return False
+        return True
 
     # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
     def find_hits(self) -> list[CadenceResult]:
@@ -1605,53 +1895,68 @@ class DataPreprocessor:
         all_hits: list[tuple] = []  # (abs_idx, stat, p)
         stat_hists = np.zeros((len(on_source_paths), len(ED_STAT_HIST_EDGES) - 1), dtype=np.int64)
 
-        for on_source_idx, on_h5 in enumerate(on_source_paths):
-            logger.info(
-                f"Cadence {group.key}: running energy detection on ON-source "
-                f"{on_source_idx + 1}/{len(on_source_paths)}: {on_h5}"
+        # One fused, ORDERED, file-major imap over all three ON files (#298 I6): the old
+        # one-drained-imap-per-file shape paid three straggler tails per cadence and left
+        # the pool idle between files. Ordered iteration makes all_hits assembly
+        # byte-identical to the per-file loops (file 0's channels, then file 1's, ...),
+        # and the task position recovers the ON-file index for the per-file histograms.
+        # The per-file read_ed_on{1..3} spans collapse into one read_ed span.
+        logger.info(
+            f"Cadence {group.key}: running energy detection on "
+            f"{len(on_source_paths)} ON-source files x {n_coarse_total} coarse channels"
+        )
+        with stage_timer("read_ed"):
+            # Residual-flatness sanity check — primary ON file only (the static response is
+            # a property of the backend, shared by every file). Runs ON THE POOL alongside
+            # energy detection (#298 I6): the serial parent-side version idled all workers
+            # for its ~27 chunk-stripe band reads; the median + warning still land once per
+            # cadence, after the ED drain below.
+            pfb_check = (
+                self._start_pfb_response_check(primary_h5, n_coarse_total, bandpass_flatten)
+                if pfb_active
+                else None
             )
 
-            # One stage span per ON file (read + DC spike + bandpass flatten + threshold)
-            with stage_timer(f"read_ed_on{on_source_idx + 1}"):
-                if pfb_active and on_source_idx == 0:
-                    # Cheap residual-flatness sanity check — primary ON file only: the static
-                    # response is a property of the backend, shared by every file of the cadence
-                    self._warn_on_pfb_response_mismatch(on_h5, n_coarse_total)
+            tasks = [
+                (
+                    on_h5,
+                    ch,
+                    coarse_channel_width,
+                    time_bins,
+                    bandpass_flatten,
+                    window_size,
+                    step_size,
+                    stat_threshold,
+                )
+                for on_h5 in on_source_paths
+                for ch in range(n_coarse_total)
+            ]
 
-                tasks = [
-                    (
-                        on_h5,
-                        ch,
-                        coarse_channel_width,
-                        time_bins,
-                        bandpass_flatten,
-                        window_size,
-                        step_size,
-                        stat_threshold,
+            if self._ed_pool is not None:
+                # imap (ordered, chunksize 1) keeps every worker busy across the whole
+                # cadence while results stream back for progress logging
+                channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
+            else:
+                if n_processes > 1:
+                    logger.info(
+                        "Energy detection running sequentially: no persistent pool "
+                        "started (call start_energy_detection_pool() to parallelize)"
                     )
-                    for ch in range(n_coarse_total)
-                ]
+                channel_hits_iter = map(_energy_detect_channel_worker, tasks)
 
-                if self._ed_pool is not None:
-                    # imap (ordered, chunksize 1) keeps every worker busy across the whole
-                    # file while results stream back for progress logging
-                    channel_hits_iter = self._ed_pool.imap(_energy_detect_channel_worker, tasks)
-                else:
-                    if n_processes > 1:
-                        logger.info(
-                            "Energy detection running sequentially: no persistent pool "
-                            "started (call start_energy_detection_pool() to parallelize)"
-                        )
-                    channel_hits_iter = map(_energy_detect_channel_worker, tasks)
+            for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter):
+                on_source_idx = done // n_coarse_total
+                file_done = done % n_coarse_total + 1
+                all_hits.extend(channel_hits)
+                stat_hists[on_source_idx] += channel_hist
+                if file_done % progress_chunk == 0 or file_done == n_coarse_total:
+                    logger.info(
+                        f"  Coarse channel {file_done}/{n_coarse_total} of ON-source "
+                        f"{on_source_idx + 1}/{len(on_source_paths)}"
+                    )
 
-                for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter, start=1):
-                    all_hits.extend(channel_hits)
-                    stat_hists[on_source_idx] += channel_hist
-                    if done % progress_chunk == 0 or done == n_coarse_total:
-                        logger.info(
-                            f"  Coarse channel {done}/{n_coarse_total} of ON-source "
-                            f"{on_source_idx + 1}/{len(on_source_paths)}"
-                        )
+            if pfb_check is not None:
+                self._finish_pfb_response_check(pfb_check, primary_h5)
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
@@ -1713,16 +2018,27 @@ class DataPreprocessor:
         # (which treats npy_path's existence as proof of a complete write) still holds.
         n_stamps = len(stamp_centers)
         stored_width = stamp_width // downsample_factor
-        tmp_npy_path = os.path.splitext(npy_path)[0] + ".tmp.npy"
-        # A leftover .tmp.npy means a previous attempt died (e.g. SIGKILL) between memmap
-        # creation and os.replace; it was never promoted to npy_path, so it's safe to drop
-        # (open_memmap would truncate it anyway — the warning is the point)
-        if os.path.exists(tmp_npy_path):
-            logger.warning(
-                f"Cadence {group.key}: removing stale partial output {tmp_npy_path} "
-                f"from an interrupted previous run"
-            )
-            os.remove(tmp_npy_path)
+        # Per-run-unique tmp name (#298 I3): the default output dir is now shared across
+        # runs with the same ED config, and a single fixed "<stem>.tmp.npy" would let two
+        # concurrent runs truncate/delete each other's in-progress write. Content is
+        # deterministic given the ED config, so whichever writer publishes last is
+        # harmless; os.replace stays atomic.
+        tmp_npy_path = f"{os.path.splitext(npy_path)[0]}.{os.getpid()}.{uuid.uuid4().hex}.tmp.npy"
+        # A leftover *.tmp.npy means an attempt died (e.g. SIGKILL) between memmap creation
+        # and os.replace; it was never promoted to npy_path, so it is safe to drop once
+        # clearly abandoned. Only age-expired tmps are removed — a fresh one may be a live
+        # concurrent run's in-progress write. The fixed pre-#298 "<stem>.tmp.npy" name is
+        # swept too (legacy leftovers in explicitly shared directories).
+        stale_cutoff = time.time() - _STALE_TMP_MAX_AGE_S
+        stem = os.path.splitext(npy_path)[0]
+        for stale in glob.glob(f"{glob.escape(stem)}.*.tmp.npy") + [f"{stem}.tmp.npy"]:
+            with contextlib.suppress(OSError):
+                if os.path.getmtime(stale) < stale_cutoff:
+                    logger.warning(
+                        f"Cadence {group.key}: removing stale partial output {stale} "
+                        f"from an interrupted previous run"
+                    )
+                    os.remove(stale)
         # NOTE: np.lib.format.open_memmap is a semi-public numpy API (stable across 1.x and
         # documented via np.lib.format); revisit if a future numpy bump moves it
         memmap = np.lib.format.open_memmap(
@@ -1737,8 +2053,12 @@ class DataPreprocessor:
         stamp_starts = [start for start, _, _ in stamp_centers]
         # Split each obs file's (already start-sorted) stamps into contiguous chunks so more
         # than len(h5_paths) workers can run, while keeping each worker's reads sequential to
-        # preserve the hdf5 chunk-cache reuse that the sort above buys us.
-        chunks_per_file = max(1, -(-n_processes // len(group.h5_paths)))  # ceil div
+        # preserve the hdf5 chunk-cache reuse that the sort above buys us. Oversubscribe to
+        # ~_EXTRACT_TASKS_PER_WORKER tasks per worker so the stage's final wave is a fraction
+        # of one task instead of doubling the makespan (see the constant's rationale).
+        chunks_per_file = max(
+            1, -(-(_EXTRACT_TASKS_PER_WORKER * n_processes) // len(group.h5_paths))
+        )  # ceil div
         chunk_size = max(1, -(-n_stamps // chunks_per_file))  # ceil div
         tasks = [
             (
@@ -1758,8 +2078,11 @@ class DataPreprocessor:
         with stage_timer("extract"):
             if self._ed_pool is not None and len(tasks) > 1:
                 # Reuse the persistent energy-detection pool — extraction workers are plain
-                # (no shared memory), so the same pool serves both stages without churn
-                self._ed_pool.map(_extract_stamps_worker, tasks)
+                # (no shared memory), so the same pool serves both stages without churn.
+                # imap_unordered: workers write disjoint absolute rows (base_idx offsets),
+                # so completion order is irrelevant and stragglers backfill immediately.
+                for _ in self._ed_pool.imap_unordered(_extract_stamps_worker, tasks):
+                    pass
             else:
                 for task in tasks:
                     _extract_stamps_worker(task)
@@ -1801,13 +2124,22 @@ class DataPreprocessor:
             "n_merged_hits": len(merged_hits),
             "raw_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in all_hits],
             "merged_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in merged_hits],
+            # The ED config these stamps were produced under (#298 I3) — checked by the
+            # resume guard before an existing .npy is reused
+            "ed_config_fingerprint": preprocessing_config_fingerprint(self.config.to_dict()),
         }
-        tmp_metadata_path = metadata_path + ".tmp"
+        # Per-run-unique tmp + compact separators (#298 I3 + rider): the metadata sidecar
+        # shares the cross-run cache directory (same clobber race as the .npy tmp), and
+        # indent=2 over the 1e4-1e5-float hit lists cost ~0.5-1.5 s per cadence ON THE
+        # PREFETCH CRITICAL PATH for purely cosmetic whitespace.
+        tmp_metadata_path = f"{metadata_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(tmp_metadata_path, "w") as f:
-            json.dump(self._to_json_safe(metadata), f, indent=2)
+            json.dump(self._to_json_safe(metadata), f, separators=(",", ":"))
         os.replace(tmp_metadata_path, metadata_path)
 
-        gc.collect()
+        # NOTE: the full gc.collect() that used to run here sat on the PREFETCH thread's
+        # critical path (once per cadence, ~0.3 s with TF loaded, GIL held against the
+        # encode feed) and freed nothing refcounting doesn't (#298 I7)
 
         # Record the stage transition in the inference_cadences run manifest. Written only
         # when preprocessing actually ran (the resume path never re-writes it); a crash
@@ -1886,6 +2218,10 @@ class DataPreprocessor:
         stale-run leftovers are impossible; a corrupt or mismatched file is rewritten. Writes
         are atomic (tmp + os.replace), matching the stamp-extraction pattern.
         """
+        # NOTE: deliberately NOT memoized (#298 considered and rejected it): the per-cadence
+        # np.load + np.array_equal round trip (~15 ms) is what makes the documented
+        # "a corrupt or mismatched sidecar is transparently rewritten" contract hold
+        # WITHIN a run, and the saving is sub-noise against a multi-minute cadence.
         response = gen_coarse_channel_response(
             fine_per_coarse, num_coarse_channels, taps_per_channel
         )
@@ -1936,46 +2272,22 @@ class DataPreprocessor:
         return channel
 
     def _flattened_edge_mid_ratio(
-        self, h5_path: str, channel_index: int, response: np.ndarray
+        self,
+        h5_path: str,
+        channel_index: int,
+        response: np.ndarray,
+        open_kwargs: dict | None = None,
     ) -> float:
-        """
-        Edge/mid power ratio of one coarse channel AFTER flattening by the static response H.
-
-        Reads only the bands edge_mid_power_ratio actually evaluates (edge_mid_band_slices:
-        the outermost width // 16 bins each side plus a central band of the same width) as
-        native float32 and time-integrates each immediately — ~10x less I/O than the
-        full-channel float64 read of _read_despiked_channel, and no fp64 blowup, which is what
-        keeps the per-file sanity check cheap at GBT scale. The DC spike (2 bins at
-        width // 2) sits inside the mid band; its interpolation (_remove_dc_spike) is linear,
-        so it commutes with the time mean and is replicated on the integrated slice. Matches
-        edge_mid_power_ratio(equalize_passband(channel, response).mean(axis=0)) on the
-        despiked full read, up to float32-read rounding (pinned by a unit test).
-        """
-        width = self.config.inference.coarse_channel_width
-        time_bins = self.config.data.time_bins
-        start = channel_index * width
-        left, mid, right = edge_mid_band_slices(width)
-        # Widen the mid slice so the DC-spike interpolation sources (up to 3 bins around
-        # width // 2, see _remove_dc_spike) are always present.
-        lo = max(0, min(mid.start, width // 2 - 3))
-        hi = max(mid.stop, width // 2 + 3)
-        with h5py.File(h5_path, "r") as hf:
-            data = hf["data"]
-            left_int = data[:time_bins, 0, start + left.start : start + left.stop].mean(axis=0)
-            right_int = data[:time_bins, 0, start + right.start : start + right.stop].mean(axis=0)
-            mid_int = data[:time_bins, 0, start + lo : start + hi].mean(axis=0)
-        dc = width // 2 - lo
-        mid_int[dc] = (mid_int[dc + 1] + mid_int[dc - 3]) / 2
-        mid_int[dc - 1] = (mid_int[dc + 2] + mid_int[dc - 2]) / 2
-        mid_int = mid_int[mid.start - lo : mid.stop - lo]
-
-        # Same divide-by-H (with equalize_passband's defensive floor) as the real flattener;
-        # per-bin division commutes with the time mean, so integrating first is equivalent.
-        floor = np.maximum(response, 1e-10)
-        edge = 0.5 * (
-            float((left_int / floor[left]).mean()) + float((right_int / floor[right]).mean())
+        """Config-bound wrapper over _flattened_edge_mid_ratio_banded (the module-level body
+        is shared with the pool-side _pfb_ratio_worker, #298 I6)."""
+        return _flattened_edge_mid_ratio_banded(
+            h5_path,
+            channel_index,
+            response,
+            self.config.inference.coarse_channel_width,
+            self.config.data.time_bins,
+            open_kwargs,
         )
-        return edge / float((mid_int / floor[mid]).mean())
 
     def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
         """
@@ -1999,21 +2311,72 @@ class DataPreprocessor:
         property of the backend shared by every file.
         """
         width = self.config.inference.coarse_channel_width
-        taps = self.config.inference.pfb_taps_per_channel
         try:
-            response = gen_coarse_channel_response(width, n_coarse_total, taps)
-            # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
+            response = gen_coarse_channel_response(
+                width, n_coarse_total, self.config.inference.pfb_taps_per_channel
+            )
+            open_kwargs = _chunk_cache_kwargs(h5_path, time_bins=self.config.data.time_bins)
             ratios = [
-                self._flattened_edge_mid_ratio(h5_path, ch, response)
+                self._flattened_edge_mid_ratio(h5_path, ch, response, open_kwargs)
                 for ch in self._sample_channel_indices(
                     n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
                 )
             ]
-            median = float(np.median(ratios))
         except Exception as e:
             logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
             return
 
+        self._log_pfb_ratio_verdict(ratios, h5_path)
+
+    def _start_pfb_response_check(
+        self, h5_path: str, n_coarse_total: int, bandpass_flatten: functools.partial
+    ):
+        """
+        Run the residual-flatness check on the worker pool instead of the parent (#298 I6):
+        submit one small task per sampled channel via map_async and return the handle for
+        _finish_pfb_response_check. The parent-side serial version idled every worker for
+        its ~27 chunk-stripe band reads; pool-side, the reads overlap energy detection and
+        the warning semantics are unchanged (same per-cadence cadence, same median of
+        bit-identical ratios). Falls back to the synchronous check (returning None) when no
+        pool exists; a failure to start is logged and swallowed — the check is
+        informational and must never fail the cadence.
+        """
+        if self._ed_pool is None:
+            self._warn_on_pfb_response_mismatch(h5_path, n_coarse_total)
+            return None
+        try:
+            width = self.config.inference.coarse_channel_width
+            time_bins = self.config.data.time_bins
+            response_path = bandpass_flatten.keywords["response_path"]
+            open_kwargs = _chunk_cache_kwargs(h5_path, time_bins)
+            tasks = [
+                (h5_path, ch, width, time_bins, response_path, open_kwargs)
+                for ch in self._sample_channel_indices(
+                    n_coarse_total, _PFB_MISMATCH_SAMPLE_CHANNELS
+                )
+            ]
+            return self._ed_pool.map_async(_pfb_ratio_worker, tasks)
+        except Exception as e:
+            logger.warning(f"PFB static-response sanity check failed to start for {h5_path}: {e}")
+            return None
+
+    def _finish_pfb_response_check(self, pfb_check, h5_path: str) -> None:
+        """Collect the pool-side ratios (all tasks have drained by the time the fused ED
+        imap completes) and emit the same once-per-file verdict as the synchronous check."""
+        try:
+            ratios = pfb_check.get()
+        except Exception as e:
+            logger.warning(f"PFB static-response sanity check failed for {h5_path}: {e}")
+            return
+        self._log_pfb_ratio_verdict(ratios, h5_path)
+
+    def _log_pfb_ratio_verdict(self, ratios: list[float], h5_path: str) -> None:
+        """Median the sampled flattened edge/mid ratios and warn once per file when the
+        deviation from 1.0 exceeds _PFB_RESIDUAL_FLATNESS_TOL (informational — see
+        _warn_on_pfb_response_mismatch's docstring for the interpretation contract)."""
+        taps = self.config.inference.pfb_taps_per_channel
+        # Median (not mean) so a single RFI-heavy sampled channel doesn't skew the statistic.
+        median = float(np.median(ratios))
         deviation = abs(median - 1.0)
         if deviation > _PFB_RESIDUAL_FLATNESS_TOL:
             logger.warning(
@@ -2117,7 +2480,12 @@ class DataPreprocessor:
         """
         if not hits:
             return []
-        sorted_hits = sorted(hits, key=lambda h: h[0])
+        # Stable argsort on the center index alone — the identical permutation to the old
+        # sorted(key=lambda h: h[0]) (stability preserves input order on ties), without
+        # comparing ~1e6 Python tuples on RFI-dense cadences (#298 rider; this runs
+        # serially on the prefetch critical path)
+        centers = np.fromiter((h[0] for h in hits), dtype=np.int64, count=len(hits))
+        sorted_hits = [hits[i] for i in np.argsort(centers, kind="stable")]
         half = stamp_width // 2
         merged: list[tuple] = [sorted_hits[0]]
         for h in sorted_hits[1:]:

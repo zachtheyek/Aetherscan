@@ -412,7 +412,7 @@ options:
 The Aetherscan training pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py train` (container) or `PYTHONPATH=src python utils/print_cli_help.py train` (source).
 
 ```
-usage: train [-h] [--seed SEED]
+usage: train [-h] [--seed SEED] [--unseeded]
              [--tf-deterministic-ops | --no-tf-deterministic-ops]
              [--data-path DATA_PATH] [--model-path MODEL_PATH]
              [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
@@ -486,13 +486,18 @@ options:
                         (training AND inference), the random forest,
                         UMAP/KMeans plot fits, and plot subsampling. Defaults
                         to a concrete value (reproducible out of the box);
-                        must be >= 0.
+                        must be >= 0. To run unseeded, pass --unseeded
+  --unseeded            Opt OUT of the seeded default: draw every random
+                        stream from OS entropy (non-reproducible). Mutually
+                        exclusive with --seed
   --tf-deterministic-ops, --no-tf-deterministic-ops
                         Force deterministic TensorFlow/cuDNN op
                         implementations
                         (tf.config.experimental.enable_op_determinism) for
-                        bit-exact GPU reproducibility at some speed cost. Only
-                        meaningful together with a seed (default: disabled)
+                        bit-exact GPU reproducibility at some speed cost.
+                        Default: enabled — without it, cuDNN autotune noise
+                        can flip near-threshold candidates between identical
+                        runs; opt out with --no-tf-deterministic-ops
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -761,7 +766,7 @@ options:
 The Aetherscan inference pipeline exposes the following CLI flags to the user. Regenerate this output with `./utils/run_container.sh python utils/print_cli_help.py inference` (container) or `PYTHONPATH=src python utils/print_cli_help.py inference` (source).
 
 ```
-usage: inference [-h] [--seed SEED]
+usage: inference [-h] [--seed SEED] [--unseeded]
                  [--tf-deterministic-ops | --no-tf-deterministic-ops]
                  [--data-path DATA_PATH] [--model-path MODEL_PATH]
                  [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
@@ -779,6 +784,7 @@ usage: inference [-h] [--seed SEED]
                  [--screening-threshold SCREENING_THRESHOLD]
                  [--mc-draws MC_DRAWS]
                  [--reference-cloud-size REFERENCE_CLOUD_SIZE]
+                 [--prefetch-depth PREFETCH_DEPTH]
                  [--cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]]
                  [--cadence-h5-path-col CADENCE_H5_PATH_COL]
                  [--cadence-expected-obs CADENCE_EXPECTED_OBS]
@@ -810,13 +816,18 @@ options:
                         (training AND inference), the random forest,
                         UMAP/KMeans plot fits, and plot subsampling. Defaults
                         to a concrete value (reproducible out of the box);
-                        must be >= 0.
+                        must be >= 0. To run unseeded, pass --unseeded
+  --unseeded            Opt OUT of the seeded default: draw every random
+                        stream from OS entropy (non-reproducible). Mutually
+                        exclusive with --seed
   --tf-deterministic-ops, --no-tf-deterministic-ops
                         Force deterministic TensorFlow/cuDNN op
                         implementations
                         (tf.config.experimental.enable_op_determinism) for
-                        bit-exact GPU reproducibility at some speed cost. Only
-                        meaningful together with a seed (default: disabled)
+                        bit-exact GPU reproducibility at some speed cost.
+                        Default: enabled — without it, cuDNN autotune noise
+                        can flip near-threshold candidates between identical
+                        runs; opt out with --no-tf-deterministic-ops
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -894,6 +905,12 @@ options:
                         Size of the seeded uniform reservoir of pass-1 rejects
                         MC-scored as the candidate uncertainty plot's survey
                         background (0 disables)
+  --prefetch-depth PREFETCH_DEPTH
+                        Cadences preprocessed+loaded ahead of the GPU stage in
+                        the streaming loop (>= 1). Depth 2 overlaps one
+                        cadence's energy-detection reads with the previous
+                        one's stamp extraction, costing one extra in-flight
+                        cadence of RAM; outputs are identical at any depth
   --cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]
                         Space-separated list of CSV column names whose joint
                         value defines cadence membership (e.g., Target Session
@@ -960,12 +977,14 @@ options:
                         overlap-search stamps (default: 0.5)
   --preprocess-output-dir PREPROCESS_OUTPUT_DIR
                         Directory for per-cadence .npy outputs from
-                        preprocessing. Default: a per-CSV, tag-scoped
-                        directory {data_path}/inference/preprocessed/<csv_stem
-                        >_<save_tag>/ — retrying with the same tag resumes
-                        from existing .npy files, while a new tag starts
-                        clean. Pass an old run's directory explicitly to reuse
-                        its preprocessing (shared across CSVs)
+                        preprocessing. Default: a per-CSV directory {data_path
+                        }/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on
+                        the energy-detection config fingerprint — runs sharing
+                        an ED config reuse each other's stamps automatically,
+                        and any ED-config change resolves to a fresh
+                        directory. Pass a directory explicitly to pin/share
+                        one location (reuse is still guarded by the sidecar's
+                        recorded h5 paths and ED fingerprint)
   --inference-viz, --no-inference-viz
                         Render the inference visualization suite (energy
                         detection distributions, hit spectrum, bandpass

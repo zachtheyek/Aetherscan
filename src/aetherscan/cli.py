@@ -245,13 +245,19 @@ def _add_reproducibility_flags_to(parser):
         "--seed",
         type=int,
         default=None,
-        help="Root random seed for reproducible runs: every random stream derives from it — data generation, dataset split/shuffles, TF weight init, the VAE sampling layer (training AND inference), the random forest, UMAP/KMeans plot fits, and plot subsampling. Defaults to a concrete value (reproducible out of the box); must be >= 0.",
+        help="Root random seed for reproducible runs: every random stream derives from it — data generation, dataset split/shuffles, TF weight init, the VAE sampling layer (training AND inference), the random forest, UMAP/KMeans plot fits, and plot subsampling. Defaults to a concrete value (reproducible out of the box); must be >= 0. To run unseeded, pass --unseeded",
+    )
+    parser.add_argument(
+        "--unseeded",
+        action="store_true",
+        default=False,
+        help="Opt OUT of the seeded default: draw every random stream from OS entropy (non-reproducible). Mutually exclusive with --seed",
     )
     parser.add_argument(
         "--tf-deterministic-ops",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some speed cost. Only meaningful together with a seed (default: disabled)",
+        help="Force deterministic TensorFlow/cuDNN op implementations (tf.config.experimental.enable_op_determinism) for bit-exact GPU reproducibility at some speed cost. Default: enabled — without it, cuDNN autotune noise can flip near-threshold candidates between identical runs; opt out with --no-tf-deterministic-ops",
     )
 
 
@@ -884,6 +890,12 @@ def _add_inference_flags_to(parser):
         default=None,
         help="Size of the seeded uniform reservoir of pass-1 rejects MC-scored as the candidate uncertainty plot's survey background (0 disables)",
     )
+    parser.add_argument(
+        "--prefetch-depth",
+        type=int,
+        default=None,
+        help="Cadences preprocessed+loaded ahead of the GPU stage in the streaming loop (>= 1). Depth 2 overlaps one cadence's energy-detection reads with the previous one's stamp extraction, costing one extra in-flight cadence of RAM; outputs are identical at any depth",
+    )
 
     # Energy detection preprocessing
     parser.add_argument(
@@ -987,7 +999,7 @@ def _add_inference_flags_to(parser):
         "--preprocess-output-dir",
         type=str,
         default=None,
-        help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV, tag-scoped directory {data_path}/inference/preprocessed/<csv_stem>_<save_tag>/ — retrying with the same tag resumes from existing .npy files, while a new tag starts clean. Pass an old run's directory explicitly to reuse its preprocessing (shared across CSVs)",
+        help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV directory {data_path}/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on the energy-detection config fingerprint — runs sharing an ED config reuse each other's stamps automatically, and any ED-config change resolves to a fresh directory. Pass a directory explicitly to pin/share one location (reuse is still guarded by the sidecar's recorded h5 paths and ED fingerprint)",
     )
 
     # Visualization suite
@@ -1052,6 +1064,22 @@ def _add_inference_flags_to(parser):
 
 
 # NOTE: come back to this later
+# Per-section fields apply_saved_config never layers from a saved config (#298): these are
+# RUN-SCOPED knobs, not model provenance — a config saved by an older training run would
+# otherwise silently re-impose its values on every future inference run.
+# - inference batching/prefetch are host tuning (a pre-#298 config would re-impose
+#   per_replica_batch_size 2048 over the corrected 256 default); both are provably
+#   result-invariant (they sit in run_state's inference-fingerprint denylist).
+# - reproducibility is the RUN'S OWN contract: determinism defaults ON and opting out must
+#   be an explicit CLI act (--no-tf-deterministic-ops / --unseeded), never a side effect of
+#   loading a training config recorded before the default flipped.
+# Current defaults + CLI flags stay authoritative for all of these.
+_SAVED_CONFIG_SKIP_FIELDS: dict[str, frozenset[str]] = {
+    "inference": frozenset({"per_replica_batch_size", "prefetch_depth"}),
+    "reproducibility": frozenset({"seed", "tf_deterministic_ops"}),
+}
+
+
 def apply_saved_config(config_path: str) -> None:
     """Layer a saved JSON config (e.g. from a prior training run) onto the singleton.
 
@@ -1100,8 +1128,9 @@ def apply_saved_config(config_path: str) -> None:
         if target is None:
             continue
         if is_dataclass(target) and isinstance(value, dict):
+            skipped = _SAVED_CONFIG_SKIP_FIELDS.get(key, frozenset())
             for sub_key, sub_val in value.items():
-                if hasattr(target, sub_key):
+                if sub_key not in skipped and hasattr(target, sub_key):
                     setattr(target, sub_key, sub_val)
         else:
             # Top-level scalar (data_path, model_path, output_path, ...).
@@ -1200,8 +1229,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     if hasattr(args, "inference_files") and args.inference_files is not None:
         config.data.inference_files = args.inference_files
 
-    # Reproducibility (#279): shared by both subparsers
-    if hasattr(args, "seed") and args.seed is not None:
+    # Reproducibility (#279): shared by both subparsers. --unseeded is the explicit opt-out
+    # of the seeded default (#298) — validate_args rejects passing it together with --seed.
+    if hasattr(args, "unseeded") and args.unseeded:
+        config.reproducibility.seed = None
+    elif hasattr(args, "seed") and args.seed is not None:
         config.reproducibility.seed = args.seed
     # tf_deterministic_ops uses argparse.BooleanOptionalAction with default=None so the CLI
     # can express "leave the config default" (omit), "force on", and "force off" — same
@@ -1370,6 +1402,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.mc_draws = args.mc_draws
     if hasattr(args, "reference_cloud_size") and args.reference_cloud_size is not None:
         config.inference.reference_cloud_size = args.reference_cloud_size
+    if hasattr(args, "prefetch_depth") and args.prefetch_depth is not None:
+        config.inference.prefetch_depth = args.prefetch_depth
     if (
         hasattr(args, "per_replica_batch_size")
         and args.per_replica_batch_size is not None
@@ -1506,6 +1540,18 @@ def collect_validation_errors(
                 message=f"--seed must be a non-negative integer, got {seed}",
                 fix_kind="clamp_low",
                 min_val=0,
+            )
+        )
+
+    # --unseeded is the explicit opt-out of the seeded default (#298); combining it with an
+    # explicit --seed is contradictory — refuse rather than silently picking one
+    if getattr(args, "unseeded", False) and getattr(args, "seed", None) is not None:
+        errors.append(
+            ValidationError(
+                field="reproducibility.seed",
+                current=args.seed,
+                message="--unseeded and --seed are mutually exclusive: pass one or the other",
+                fix_kind="cross_param",
             )
         )
 
@@ -2283,6 +2329,18 @@ def collect_validation_errors(
                     message=f"--reference-cloud-size must be >= 0, got {cloud_size}",
                     fix_kind="clamp_low",
                     min_val=0,
+                )
+            )
+
+        prefetch_depth = _resolve(args, "prefetch_depth", config.inference.prefetch_depth)
+        if prefetch_depth is not None and prefetch_depth < 1:
+            errors.append(
+                ValidationError(
+                    field="inference.prefetch_depth",
+                    current=prefetch_depth,
+                    message=f"--prefetch-depth must be a positive integer, got {prefetch_depth}",
+                    fix_kind="clamp_low",
+                    min_val=1,
                 )
             )
 

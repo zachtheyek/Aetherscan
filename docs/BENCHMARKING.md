@@ -83,7 +83,7 @@ are shown at full depth; the leaf component is what the report tool and resource
 | `train.rf_plots` | `train.py` | RF plot stage |
 | `train.final_save` | `train.py` | Final model + config save (+ HF upload) |
 | `inference.infer` | `inference.py` | Legacy single-array `run_inference` span |
-| `inference.preprocess_cadence_{i:03d}` (`.read_ed_on{1..3}`, `.dedup`, `.extract`) | `main.py` / `preprocessing.py` | Per-cadence energy detection |
+| `inference.preprocess_cadence_{i:03d}` (`.read_ed`, `.dedup`, `.extract`) | `main.py` / `preprocessing.py` | Per-cadence energy detection |
 | `inference.infer_cadence_{i:03d}` (`.load_lognorm`, `.encode`, `.rf`, `.db_write`) | `main.py` / `inference.py` | Per-cadence GPU inference + write |
 | `inference.viz` | `main.py` | Visualization suite |
 
@@ -200,7 +200,7 @@ the maintained per-host baseline tables.
 
 | Script | Kernel it isolates | Pipeline stage it models |
 | --- | --- | --- |
-| `bench_normality.py` | vectorized `_sliding_normality_k2` vs the historical per-window `scipy.stats.normaltest` loop | ED thresholding (`inference.*.read_ed_on*`) |
+| `bench_normality.py` | vectorized `_sliding_normality_k2` vs the historical per-window `scipy.stats.normaltest` loop | ED thresholding (`inference.*.read_ed`) |
 | `bench_injection.py` | `data_generation.new_cadence` narrowband injection | `train.round_XX.data_generation` |
 | `bench_lognorm_downsample.py` | per-obs `downscale_local_mean` (×8) + per-cadence `log_norm` | stamp downsample + `inference.*.load_lognorm` |
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` vs `_spline_flatten_bandpass` on one 1M-bin coarse channel | bandpass flattening inside ED |

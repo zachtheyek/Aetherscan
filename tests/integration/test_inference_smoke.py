@@ -10,18 +10,19 @@ bind by default — either bind it explicitly:
     SINGULARITY_BIND=/datag ./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
 
 or rely on the resume path: preprocessing skips any cadence whose stamp .npy already exists.
-The default stamp directory is tag-scoped ({data_path}/inference/preprocessed/
-<csv_stem>_<save_tag>/), so a fresh-tagged run never resumes on its own — when /datag is not
-mounted and legacy stamps exist under <output>/preprocessed, the test points
---preprocess-output-dir at them explicitly (the documented reuse escape hatch).
+Since #298 the default stamp directory is ED-fingerprint-scoped ({data_path}/inference/
+preprocessed/<csv_stem>_ed<hash12>/), shared across runs with the same ED config — so a
+fresh-tagged run resumes automatically off any prior same-config run's stamps. When /datag
+is not mounted and only legacy stamps exist under <output>/preprocessed, the test still
+points --preprocess-output-dir at them explicitly (the pinned-directory escape hatch).
 """
 
 from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
-from datetime import datetime
 
 import pytest
 
@@ -42,15 +43,28 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
 
     encoder = os.path.join(model_path, f"vae_encoder_{smoke_model_tag}.keras")
     rf = os.path.join(model_path, f"random_forest_{smoke_model_tag}.joblib")
-    saved_config = os.path.join(model_path, f"config_{smoke_model_tag}.json")
+    # Training saves config_{tag}.json under OUTPUT_path (tag_guards); only hand-placed
+    # legacy artifacts (test_v17) kept a copy in model_path — accept either location so
+    # the smoke runs against freshly trained models without manual copying (#298).
+    saved_config = next(
+        (
+            path
+            for path in (
+                os.path.join(model_path, f"config_{smoke_model_tag}.json"),
+                os.path.join(output_path, f"config_{smoke_model_tag}.json"),
+            )
+            if os.path.exists(path)
+        ),
+        os.path.join(output_path, f"config_{smoke_model_tag}.json"),
+    )
     csv_path = os.path.join(data_path, "inference", _CSV_NAME)
     for required in (encoder, rf, saved_config, csv_path):
         if not os.path.exists(required):
             pytest.skip(f"required cluster artifact missing: {required}")
 
-    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional, but the
-    # tag-scoped default output dir means a fresh tag never sees them — reuse requires
-    # passing their directory explicitly.
+    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional (and since
+    # #298 the fingerprint-scoped default cache resumes same-ED-config stamps on its own);
+    # only legacy stamps under <output>/preprocessed still need the explicit directory.
     extra_flags: list[str] = []
     if not os.path.exists("/datag"):
         legacy_dir = os.path.join(output_path, "preprocessed")
@@ -58,7 +72,10 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
             pytest.skip("/datag not mounted and no preprocessed subset stamps to resume from")
         extra_flags = ["--preprocess-output-dir", legacy_dir]
 
-    tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # --save-tag takes a BARE PREFIX since #272 (the run stamps its own datetime); this
+    # smoke passed a bare datetime — rejected by validation — and had been silently broken
+    # since the tag refactor (#298 repair). The resolved inf_{datetime} tag is recovered
+    # from the run's own output below.
     proc = run_pipeline(
         [
             "inference",
@@ -71,7 +88,7 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
             "--inference-files",
             _CSV_NAME,
             "--save-tag",
-            tag,
+            "inf",
             "--max-retries",
             "1",
             *extra_flags,
@@ -79,8 +96,11 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
     )
 
     tail = "\n".join(proc.stdout.splitlines()[-40:])
-    assert proc.returncode == 0, f"inference smoke run failed (tag={tag}); last output:\n{tail}"
+    assert proc.returncode == 0, f"inference smoke run failed; last output:\n{tail}"
     assert "Inference completed successfully!" in proc.stdout
+    tag_match = re.search(r"\binf_\d{8}_\d{6}\b", proc.stdout)
+    assert tag_match, "resolved inf_{datetime} tag not found in the run output"
+    tag = tag_match.group(0)
     assert os.path.exists(os.path.join(output_path, f"config_{tag}.json"))
 
     # End-of-run benchmark report: pins the #203 _post_benchmark_report hook's real

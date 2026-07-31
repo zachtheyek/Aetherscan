@@ -38,7 +38,7 @@ comparing against the baselines.
 
 | Script | Kernel | Pipeline stage it models |
 |---|---|---|
-| `bench_normality.py` | `preprocessing._sliding_normality_k2` vs the historical per-window `scipy.stats.normaltest` loop | Energy detection thresholding (`inference.*.read_ed_on*`) |
+| `bench_normality.py` | `preprocessing._sliding_normality_k2` vs the historical per-window `scipy.stats.normaltest` loop | Energy detection thresholding (`inference.*.read_ed`) |
 | `bench_injection.py` | `data_generation.new_cadence` (setigen narrowband injection into a stacked 96x4096 cadence) | Training data generation (`train.round_XX.data_generation`) |
 | `bench_lognorm_downsample.py` | per-observation `downscale_local_mean` (x8) and per-cadence `log_norm` | Stamp extraction downsample + inference load (`inference.*.load_lognorm`) |
 | `bench_pfb_vs_spline.py` | `pfb.equalize_passband` (static response divide) vs `preprocessing._spline_flatten_bandpass` (order-16 fit) on one 1M-bin coarse channel | Bandpass flattening inside energy detection |
@@ -125,7 +125,8 @@ accumulator and throughput reflects the once-per-K apply cadence. `--find-max` i
 `--max-batch 4096`: a single encoder forward whose conv feature
 maps exceed 2^31 elements (batch ≳ 8192) trips an uncatchable TensorFlow int32 launch-config abort
 rather than a clean OOM, and 4096 already covers the training VRAM ceiling and a generous inference
-range (the pipeline's inference default is 2048).
+range (the pipeline's inference default is 256 SNIPPETS per replica = 1,536 obs forwards —
+see the takeaway below).
 
 ### Baseline: blpc3 (1× RTX PRO 6000 Blackwell, 96 GB, NGC 25.02, July 2026)
 
@@ -154,8 +155,12 @@ Encoder inference — per-replica batch of observations:
 per-replica batch ~128 (2.81 GB) and does *not* improve — it slightly declines — as the batch grows
 toward the 76 GB VRAM ceiling; inference throughput peaks near batch ~1024 using under 2 GB. On a
 large-VRAM card (e.g. the 96 GB Blackwell) the spare memory cannot be converted into throughput for
-this compact model, so the defaults (train 128, inference 2048) are already near-optimal — size the
-per-replica batch for constraint-divisibility and convenience, not to fill VRAM.
+this compact model, so the defaults are already near-optimal — size the per-replica batch for
+constraint-divisibility and convenience, not to fill VRAM. ⚠ Units: this table sweeps
+OBSERVATIONS per forward; `inference.per_replica_batch_size` counts SNIPPETS (= 6
+observations each). The old 2048-snippet default was exactly that conflation — a
+12,288-obs per-replica forward, past the ~1024-obs peak above and above the int32 abort
+cliff — which is why #298 set it to 256 snippets (1,536 obs).
 
 ### Baseline: bla0 (6× RTX A4000 16 GB, NGC 25.02, July 2026)
 

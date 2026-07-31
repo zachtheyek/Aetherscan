@@ -76,17 +76,34 @@ def test_snr_confidence_monotonicity(cluster_paths, smoke_model_tag):
     np.random.seed(_SEED)
     tf.random.set_seed(_SEED)
 
-    # Background plates shaped (n, 6, 16, width_bin_downsampled), same as training. mmap
-    # keeps the (potentially multi-GB) file on disk; create_true_single reads one
-    # background per cadence.
-    plate = np.load(background_path, mmap_mode="r")
-    _, num_observations, time_bins, width_bin = plate.shape
-
     # Load the persisted models the same way inference does (encoder inside strategy scope).
     strategy = tf.distribute.get_strategy()
     with strategy.scope():
         encoder = tf.keras.models.load_model(encoder_path)
     rf = joblib.load(rf_path)
+
+    # Background plates on disk are RAW width (4096); training downsamples them to the
+    # model width BEFORE injection (load_train_data -> _downsample_worker), so this gate
+    # must do the same — feeding raw-width cadences to the encoder is a shape error, and
+    # injecting at raw width would exercise a geometry the model never saw (#298 fix:
+    # this previously assumed an already-downsampled plate). The factor is derived from
+    # the persisted encoder's own input width so the gate follows the model, not config.
+    from skimage.transform import downscale_local_mean  # noqa: PLC0415
+
+    plate = np.load(background_path, mmap_mode="r")
+    _, num_observations, time_bins, width_bin = plate.shape
+    model_width = int(encoder.input_shape[2])
+    if width_bin % model_width != 0:
+        pytest.skip(
+            f"background width {width_bin} is not an integer multiple of the encoder "
+            f"input width {model_width}; cannot downsample the plate for this gate"
+        )
+    factor = width_bin // model_width
+    if factor > 1:
+        # Downsample once up front (mirrors _downsample_worker's per-cadence
+        # downscale_local_mean); the plate is a few GB raw, ~1/8 after this.
+        plate = downscale_local_mean(np.asarray(plate), (1, 1, 1, factor)).astype(np.float32)
+        width_bin = model_width
 
     mean_proba_true = []
     for snr in _SNRS:

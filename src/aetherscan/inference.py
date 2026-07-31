@@ -10,7 +10,6 @@ from __future__ import annotations
 import gc
 import logging
 import os
-import threading
 import time
 
 import joblib
@@ -69,137 +68,53 @@ def summarize_confidences(proba_true: np.ndarray, threshold: float) -> dict:
     }
 
 
-# Create data holder objects, to be paired with data generators, for TF's distributed datasets
-# Allows for explicit dereferencing of large arrays using DataHolder.clear(), which lets
-# Python's garbage collector free up memory on-demand
-# Note, DataHolder.clear() is only useful at the end of an epoch, once indices have been exhausted,
-# since the data generators' local caches maintain references to the data until then
-# This is not an issue in our current implementation, where we only clear & reset resources at the
-# end of a round. However, if you require early exit behavior, you may want to remove the _lock and
-# use explicit _cleared() checks instead, which negates the need for local caches (see commit hash
-# 2a404a4). The trade-off being that you're at risk of race conditions if multiple threads attempt
-# to access/clear the DataHolder simultaneously. While this is not the case in our current
-# implementation, we opted for a more defensive approach rather than accomodating future design
-# patterns. As well, the data should not be modified once the DataHolder has been initialized to
-# prevent corrupted state in the DataHolder
-# Note, there's a potential deadlock issue with DataHolder's lock contention
-# Since the generators acquire locks at the start of every loop iteration, if TF's prefetch threads
-# (.prefetch(tf.data.AUTOTUNE)) are blocked waiting on this lock while the main thread is trying to
-# call self.data_generator.clear() (which also needs the lock), there could be contention.
-# This has not been an issue so far, but if you encounter this in the future, pls update this
-# comment with your findings
-class InfDataHolder:
-    def __init__(self, data):
-        self._cleared = False
-        self._lock = threading.Lock()
-        self.data = data
-
-    def clear(self):
-        with self._lock:
-            if self._cleared:
-                return
-            self._cleared = True
-            self.data = None
+# Final-partial-step bucket floor for _distributed_encode (#298 I2+I4): per-replica batch
+# sizes are powers of two in [_MIN_ENCODE_BUCKET, inference.per_replica_batch_size], so the
+# number of distinct traced shapes (and cuDNN autotune events) stays bounded across any
+# catalog while tiny cadences never launch degenerate single-digit-row kernels.
+_MIN_ENCODE_BUCKET = 16
 
 
-def prepare_distributed_inf_dataset(
-    data: np.ndarray,
-    n_samples: int,
-    per_replica_inf_batch_size: int,
-    num_replicas: int,
-    strategy: tf.distribute.Strategy,
-) -> dict:
+def _batched_mc_scores(
+    rf_model: RandomForestModel,
+    calibrator: dict | None,
+    variant: str,
+    mean_flat: np.ndarray,
+    logvar_flat: np.ndarray,
+    num_observations: int,
+    latent_dim: int,
+    active_dims: list[int] | None,
+    mc_draws: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
     """
-    Build a distributed inference dataset from `data` (shape (n_samples, 6, 16, 512)) and return
-    a dict with the dataset, padded/real sample counts, step count, and the InfDataHolder.
-
-    Distinct from train.py's RF-training counterpart: signal classes are not assumed to be known
-    ahead of time, so the dataset yields raw cadences without label channels. Order is preserved
-    (no shuffle) since gradients aren't computed during inference.
-
-    When n_samples isn't divisible by the global batch size, the data is padded with duplicate
-    rows up to the next batch multiple (mirroring train.py's viz-dataset padding pattern) so the
-    final partial batch is encoded rather than silently dropped — callers truncate the encoded
-    latents back to n_samples. The previous behavior (inf_steps = n // global_batch with
-    drop_remainder=True and no padding) never processed the tail; with per-cadence batches a
-    cadence smaller than one global batch would have processed nothing at all.
+    Score `mc_draws` reparameterized draws with ONE stacked predict_proba call, returning
+    scores of shape (mc_draws, n_rows) — row-for-row what the old per-draw loop produced
+    (#298 I8). Correctness rests on three invariants: the draws are generated SEQUENTIALLY
+    from `rng` first, so the #279 stream consumption order is byte-identical to the loop;
+    sklearn's predict_proba consumes no numpy RNG and scores rows independently, so batch
+    composition cannot change any row's probability; and the calibrator is elementwise
+    (isotonic interpolation / per-row logistic). What changes is only the fixed per-call
+    overhead — check_array + a 1000-tree joblib dispatch — paid once instead of mc_draws
+    times (dispatch dominates at typical survivor counts). Bit-identity is pinned by a
+    unit test at n_jobs=1 (threaded tree accumulation order is sklearn's own run-to-run
+    nondeterminism, present in the old loop too).
     """
-    global_inf_batch_size = per_replica_inf_batch_size * num_replicas
-
-    # Sanity check: verify there's at least one sample to run inference on
-    if n_samples == 0:
-        raise ValueError("Not enough samples (0) to run inference")
-
-    # Pad with duplicate rows (cycled from the front, deterministic) to the next global-batch
-    # multiple; the encoded outputs for the padded rows are discarded by the caller.
-    # NOTE: np.concatenate materializes a full copy of the cadence's stamps, briefly doubling
-    # that cadence's memory footprint. Acceptable at per-cadence scale (the padding itself is
-    # under one global batch); revisit if batches ever wrap multi-cadence arrays again.
-    n_padded = int(np.ceil(n_samples / global_inf_batch_size)) * global_inf_batch_size
-    if n_padded > n_samples:
-        pad_count = n_padded - n_samples
-        pad_indices = np.arange(pad_count) % n_samples
-        inf_data = np.concatenate([data, data[pad_indices]], axis=0)
-        logger.info(f"Data alignment: Inf {n_samples}→{n_padded} (padded {pad_count})")
-    else:
-        inf_data = data
-        logger.info(f"Data alignment: Inf {n_samples} (no padding needed)")
-    inf_holder = InfDataHolder(inf_data)
-
-    # Create generator function for memory-efficient data loading
-    def inf_generator():
-        while True:  # Make generator infinite to reset state between passes
-            # Acquire lock to check cleared status and capture data references
-            # Local references keep data alive even if clear() is called mid-epoch
-            with inf_holder._lock:
-                if inf_holder._cleared:
-                    return  # Exit if data already cleared
-                # Cache references while holding lock
-                data = inf_holder.data
-
-            # Maintain order on each epoch since shuffling provides no benefits (no gradients
-            # are calculated during inference)
-            for idx in range(len(data)):
-                yield data[idx]
-
-            # Remove cache references for future garbage collection
-            del data
-
-    # Determine dataset output signature
-    sample_shape = inf_data.shape[1:]
-    output_signature = tf.TensorSpec(shape=sample_shape, dtype=tf.float32)
-
-    # Create dataset using generator to reduce GPU memory pressure
-    # Data is kept on CPU & transferred to GPU in batches on-demand
-    # Note that the dataset yields data in batches before being sharded (distributed) across replicas
-    # Hence, we use global batch sizes here to ensure per replica batch sizes match expectations
-    logger.info(
-        f"Creating infinite dataset from generator with global batch size: {global_inf_batch_size}"
+    draw_features = [
+        build_variant_features(
+            variant,
+            sample_z_flat(mean_flat, logvar_flat, rng),
+            logvar_flat,
+            num_observations,
+            latent_dim,
+            active_dims,
+        )
+        for _ in range(mc_draws)
+    ]
+    stacked_scores = apply_probability_calibrator(
+        calibrator, rf_model.model.predict_proba(np.vstack(draw_features))[:, 1]
     )
-
-    inf_dataset = (
-        tf.data.Dataset.from_generator(inf_generator, output_signature=output_signature)
-        .batch(global_inf_batch_size, drop_remainder=True)
-        # NOTE: do we need repeat for inf dataset? run test without repeat & see if anything breaks?
-        .repeat()
-        .prefetch(tf.data.AUTOTUNE)
-    )
-
-    # Distribute dataset across GPUs
-    logger.info(f"Distributing dataset across {num_replicas} GPUs")
-
-    inf_dataset_distributed = strategy.experimental_distribute_dataset(inf_dataset)
-
-    # Calculate steps (n_padded is an exact multiple of the global batch size by construction)
-    inf_steps = n_padded // global_inf_batch_size
-
-    return {
-        "inf_dataset": inf_dataset_distributed,
-        "n_padded": n_padded,
-        "n_samples": n_samples,
-        "inf_steps": inf_steps,
-        "_inf_holder": inf_holder,
-    }
+    return stacked_scores.reshape(mc_draws, -1)
 
 
 class ReferenceCloudReservoir:
@@ -433,11 +348,11 @@ class InferencePipeline:
         if seed_key is not None:
             seed_tensorflow(self.config.reproducibility.seed, False, 1, seed_key)
 
-        inf_holder = None
-        inf_dataset = None
-
         try:
             n_samples = data.shape[0]
+            # Sanity check: verify there's at least one sample to run inference on
+            if n_samples == 0:
+                raise ValueError("Not enough samples (0) to run inference")
             logger.info(f"Running inference on {n_samples} cadence snippets from {npy_path}")
 
             if stamp_frequencies_mhz is not None and len(stamp_frequencies_mhz) != n_samples:
@@ -447,38 +362,20 @@ class InferencePipeline:
                 )
                 stamp_frequencies_mhz = None
 
-            # Prepare distributed dataset for inference (pads to a global-batch multiple)
-            results = prepare_distributed_inf_dataset(
-                data=data,
-                n_samples=n_samples,
-                per_replica_inf_batch_size=self.per_replica_inf_batch_size,
-                num_replicas=self.num_replicas,
-                strategy=self.strategy,
-            )
-
-            del data
-            gc.collect()
-
-            inf_dataset = results["inf_dataset"]
-            n_padded = results["n_padded"]
-            inf_steps = results["inf_steps"]
-            inf_holder = results["_inf_holder"]
-
-            del results
-            gc.collect()
-
-            logger.info(
-                f"Generating latents for {n_samples} cadence snippets "
-                f"({n_padded} padded) using distributed inference"
-            )
-
+            # Encode directly from numpy slices (#298 I2+I4): no per-cadence tf.data
+            # dataset build / distribute / iter() churn, no full-array pad copy — see
+            # _distributed_encode for the bucketed batch geometry and padding semantics.
+            # Only the real snippets' latent rows come back (padding never leaves encode).
             with stage_timer("encode"):
-                z_mean, z_log_var = self._distributed_encode(inf_dataset, n_padded, inf_steps)
+                z_mean, z_log_var = self._distributed_encode(data)
 
-            # Drop the encoded padding rows: the first n_samples * num_observations latent
-            # rows correspond exactly to the real snippets (row order is snippet-major)
-            z_mean = z_mean[: n_samples * self.num_observations]
-            z_log_var = z_log_var[: n_samples * self.num_observations]
+            # NOTE: no gc.collect() here — `data` is still referenced by the caller
+            # (main._infer_cadence holds cadence_data until after run_inference returns),
+            # so a full collection frees nothing material and each one costs ~0.3 s with
+            # TF's object graph loaded while holding the GIL against the prefetch thread
+            # (#298 I7). The finally-block collect below is the one per-call collection
+            # point.
+            del data
 
             # Two-pass cascade (#282). Pass 1 scores EVERY snippet deterministically
             # (features per the saved config's winning variant, z_mean in the lead slot)
@@ -520,23 +417,18 @@ class InferencePipeline:
                         else (STREAM_INFERENCE_MC, seed_key)
                     )
                     mc_rng = derive_rng(self.config.reproducibility.seed, *mc_key)
-                    draw_scores = np.empty((self.mc_draws, len(survivor_idx)))
-                    for draw_index in range(self.mc_draws):
-                        draw_flat = sample_z_flat(
-                            mean_flat[survivor_idx], logvar_flat[survivor_idx], mc_rng
-                        )
-                        draw_features = build_variant_features(
-                            variant,
-                            draw_flat,
-                            logvar_flat[survivor_idx],
-                            num_observations,
-                            latent_dim,
-                            active_dims,
-                        )
-                        draw_scores[draw_index] = apply_probability_calibrator(
-                            self.calibrator,
-                            self.rf_model.model.predict_proba(draw_features)[:, 1],
-                        )
+                    draw_scores = _batched_mc_scores(
+                        self.rf_model,
+                        self.calibrator,
+                        variant,
+                        mean_flat[survivor_idx],
+                        logvar_flat[survivor_idx],
+                        num_observations,
+                        latent_dim,
+                        active_dims,
+                        self.mc_draws,
+                        mc_rng,
+                    )
                     mc_mean[survivor_idx] = draw_scores.mean(axis=0)
                     mc_std[survivor_idx] = draw_scores.std(axis=0)
                     del draw_scores
@@ -590,13 +482,11 @@ class InferencePipeline:
             raise  # Re-raise to propagate error
 
         finally:
-            # Clear per-call dataset state (guarded: an early failure may predate creation).
-            # Note tf.keras.backend.clear_session() is intentionally NOT called here — the
-            # streaming loop reuses this pipeline's loaded models across cadences; the caller
-            # clears the session once when the whole run is done.
-            if inf_holder is not None:
-                inf_holder.clear()
-            del inf_dataset
+            # One full collection per call (#298 I7 kept exactly this one) — clears any
+            # cyclic debris from the encode/cascade path. tf.keras.backend.clear_session()
+            # is intentionally NOT called here: the streaming loop reuses this pipeline's
+            # loaded models across cadences; the caller clears the session once when the
+            # whole run is done.
             gc.collect()
 
         return {
@@ -611,26 +501,51 @@ class InferencePipeline:
             "mc_std": mc_std,
         }
 
-    def _distributed_encode(
-        self,
-        dataset: tf.distribute.DistributedDataset,
-        n_samples: int,
-        n_steps: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    @staticmethod
+    def _encode_bucket(remaining: int, num_replicas: int, max_bucket: int) -> int:
         """
-        Encode `n_steps` worth of batches from a distributed `dataset` into pre-allocated
+        Per-replica batch size for a final partial encode step: the smallest power of two
+        (floor _MIN_ENCODE_BUCKET, cap max_bucket) covering ceil(remaining / num_replicas).
+
+        Bucketing bounds two costs at once: padding waste (always under one bucketed global
+        batch per cadence — the old pad-to-full-global policy encoded a 100-stamp cadence
+        as 10,240 rows) and the number of distinct traced shapes / cuDNN autotune events
+        (at most len({16, 32, ..., max_bucket}) per run, however heterogeneous the catalog).
+        """
+        need = -(-remaining // num_replicas)  # ceil div
+        bucket = _MIN_ENCODE_BUCKET
+        while bucket < need and bucket < max_bucket:
+            bucket *= 2
+        return min(bucket, max_bucket)
+
+    def _distributed_encode(self, data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Encode `data` (n_samples, num_obs, time_bins, width) into pre-allocated
         (n_samples * num_observations, latent_dim) arrays of z_mean and z_log_var — the
         DETERMINISTIC posterior parameters (#282: pass 1 scores on z_mean-based features;
         pass-2 MC draws are reparameterized in numpy from these, seeded per cadence, so no
-        stochastic z ever crosses the GPU boundary). Per-replica results are gathered via
-        experimental_local_results + np.concatenate (faster than a strategy-level gather
-        over NCCL for the small latent payload).
+        stochastic z ever crosses the GPU boundary).
+
+        Feeds the replicas directly from numpy slices via
+        experimental_distribute_values_from_function (#298 I2 option (b)): no tf.data
+        dataset, no per-cadence distribute/iter() rebuild (measured ~9.1 s per iter() on a
+        5-GPU distributed dataset), no per-element generator crossings, and no full-array
+        pad copy. Full steps run at per_replica_batch_size; the final partial step drops to
+        a bucketed size (_encode_bucket) with its tail padded by cycling rows from the
+        cadence start — padded outputs never leave this function (only real rows are
+        written to the output arrays). Batch-shape changes can flip cuDNN algorithm
+        selection, so kept-row latents may differ from the tf.data path in low bits —
+        same science, gated on candidate-set + mc_mean/mc_std equality in the on-cluster
+        A/B (#298). Per-replica results are gathered via experimental_local_results +
+        np.concatenate (cheaper than an NCCL gather for the small latent payload).
         """
+        n_samples = len(data)
+        num_replicas = self.num_replicas
+        max_bucket = self.per_replica_inf_batch_size
+
         # Pre-allocate output arrays
         # Use np.empty() instead of np.zeros() so problematic latent values don't fail silently
-        z_mean_out = np.empty(
-            (n_samples * self.num_observations, self.latent_dim), dtype=np.float32
-        )
+        z_mean_out = np.empty((n_samples * self.num_observations, self.latent_dim), np.float32)
         z_log_var_out = np.empty_like(z_mean_out)
 
         if self._encode_step is None:
@@ -654,52 +569,61 @@ class InferencePipeline:
             self._encode_step = encode_step
 
         encode_step = self._encode_step
+        n_steps = 0
+        out_idx = 0
+        start = 0
+        while start < n_samples:
+            remaining = n_samples - start
+            if remaining >= max_bucket * num_replicas:
+                bucket = max_bucket
+            else:
+                bucket = self._encode_bucket(remaining, num_replicas, max_bucket)
+            global_rows = bucket * num_replicas
 
-        # Process all batches
-        iterator = iter(dataset)
-        current_idx = 0
+            if remaining >= global_rows:
+                step_slice = data[start : start + global_rows]
+                real_rows = global_rows
+            else:
+                # Pad the final step with duplicate rows cycled from the cadence start
+                # (deterministic, same semantics as the retired dataset padding); their
+                # encoded outputs are sliced off below and never leave this method
+                pad_indices = np.arange(global_rows - remaining) % n_samples
+                step_slice = np.concatenate([data[start:], data[pad_indices]], axis=0)
+                real_rows = remaining
 
-        try:
-            for step in range(n_steps):
-                batch = next(iterator)
+            def value_fn(ctx, step_slice=step_slice, bucket=bucket):
+                replica = ctx.replica_id_in_sync_group
+                return tf.convert_to_tensor(step_slice[replica * bucket : (replica + 1) * bucket])
 
-                # Get per-replica posterior parameters for this batch
-                per_replica_mean, per_replica_log_var = encode_step(batch)
+            per_replica_batch = self.strategy.experimental_distribute_values_from_function(value_fn)
+            per_replica_mean, per_replica_log_var = encode_step(per_replica_batch)
 
-                # Extract results from each replica and concatenate
-                # This avoids the inefficient gather operation with NCCL
-                batch_mean = np.concatenate(
-                    [r.numpy() for r in self.strategy.experimental_local_results(per_replica_mean)],
-                    axis=0,
-                )
-                batch_log_var = np.concatenate(
-                    [
-                        r.numpy()
-                        for r in self.strategy.experimental_local_results(per_replica_log_var)
-                    ],
-                    axis=0,
-                )
+            # Extract results from each replica and concatenate
+            # This avoids the inefficient gather operation with NCCL
+            batch_mean = np.concatenate(
+                [r.numpy() for r in self.strategy.experimental_local_results(per_replica_mean)],
+                axis=0,
+            )
+            batch_log_var = np.concatenate(
+                [r.numpy() for r in self.strategy.experimental_local_results(per_replica_log_var)],
+                axis=0,
+            )
 
-                batch_size = batch_mean.shape[0]
-                z_mean_out[current_idx : current_idx + batch_size] = batch_mean
-                z_log_var_out[current_idx : current_idx + batch_size] = batch_log_var
+            # Only the real rows land in the outputs (obs-major: real_rows snippets)
+            out_rows = real_rows * self.num_observations
+            z_mean_out[out_idx : out_idx + out_rows] = batch_mean[:out_rows]
+            z_log_var_out[out_idx : out_idx + out_rows] = batch_log_var[:out_rows]
 
-                current_idx += batch_size
+            out_idx += out_rows
+            start += real_rows
+            n_steps += 1
+            if n_steps % 10 == 0 or start >= n_samples:
+                logger.info(f"Encoded {start}/{n_samples} snippets ({n_steps} steps)")
 
-                # Log progress
-                if (step + 1) % 10 == 0 or (step + 1) == n_steps:
-                    logger.info(f"Encoded step {step + 1}/{n_steps}")
-
-                del per_replica_mean, per_replica_log_var, batch_mean, batch_log_var
-                gc.collect()
-
-        except Exception as e:
-            logger.error(f"Error in _distributed_encode(): {e}")
-            raise  # Re-raise to propagate error
-
-        finally:
-            # NOTE: should check to make sure iterator exist first
-            del iterator
+            # Refcount-managed numpy arrays and eager tensors: freed on del. The full
+            # gc.collect() that used to run here EVERY STEP (~0.3 s each with TF
+            # loaded, GIL held) reclaimed nothing cyclic (#298 I7).
+            del per_replica_mean, per_replica_log_var, batch_mean, batch_log_var
 
         return z_mean_out, z_log_var_out
 
@@ -735,7 +659,6 @@ class InferencePipeline:
             raise RuntimeError("No database instance detected - cannot store inference results")
 
         tag = self.config.checkpoint.save_tag
-        n_candidates = 0
 
         def _optional_float(values, index):
             if values is None:
@@ -743,43 +666,43 @@ class InferencePipeline:
             value = float(values[index])
             return None if np.isnan(value) else value
 
-        for idx in range(len(confidence_scores)):
+        # NOTE: should we just store everything? benchmark storage requirements
+        # Only store candidates above threshold (to reduce db size). Iterate the positives
+        # directly (rider on #298 I8) — identical rows in identical order, without a Python
+        # loop over every negative snippet of a 1e4-1e5-stamp cadence.
+        positive_indices = np.nonzero(np.asarray(predictions) == 1)[0]
+        n_candidates = len(positive_indices)
+        for raw_idx in positive_indices:
+            idx = int(raw_idx)
             confidence = float(confidence_scores[idx])
             prediction = int(predictions[idx])
 
-            # NOTE: should we just store everything? benchmark storage requirements
-            # Only store candidates above threshold (to reduce db size)
-            if prediction == 1:
-                n_candidates += 1
+            snippet_frequency_mhz = frequency_mhz
+            if stamp_frequencies_mhz is not None:
+                snippet_frequency_mhz = float(stamp_frequencies_mhz[idx])
 
-                snippet_frequency_mhz = frequency_mhz
-                if stamp_frequencies_mhz is not None:
-                    snippet_frequency_mhz = float(stamp_frequencies_mhz[idx])
+            # One latent row per observation -> flatten the snippet's num_observations
+            # rows into a single (num_observations * latent_dim,) vector
+            latent_rows = latents[idx * self.num_observations : (idx + 1) * self.num_observations]
 
-                # One latent row per observation -> flatten the snippet's num_observations
-                # rows into a single (num_observations * latent_dim,) vector
-                latent_rows = latents[
-                    idx * self.num_observations : (idx + 1) * self.num_observations
-                ]
-
-                self.db.write_inference_result(
-                    npy_path=npy_path,
-                    snippet_index=idx,
-                    prediction=prediction,
-                    confidence=confidence,
-                    latent_vector=latent_rows.reshape(-1),
-                    target=target,
-                    session=session,
-                    cadence_id=cadence_id,
-                    band=band,
-                    frequency_mhz=snippet_frequency_mhz,
-                    timestamp_observed=timestamp_observed,
-                    h5_path=h5_path,
-                    tag=tag,
-                    screening_proba=_optional_float(screening_probas, idx),
-                    mc_mean=_optional_float(mc_mean, idx),
-                    mc_std=_optional_float(mc_std, idx),
-                )
+            self.db.write_inference_result(
+                npy_path=npy_path,
+                snippet_index=idx,
+                prediction=prediction,
+                confidence=confidence,
+                latent_vector=latent_rows.reshape(-1),
+                target=target,
+                session=session,
+                cadence_id=cadence_id,
+                band=band,
+                frequency_mhz=snippet_frequency_mhz,
+                timestamp_observed=timestamp_observed,
+                h5_path=h5_path,
+                tag=tag,
+                screening_proba=_optional_float(screening_probas, idx),
+                mc_mean=_optional_float(mc_mean, idx),
+                mc_std=_optional_float(mc_std, idx),
+            )
 
         logger.info(f"Wrote {n_candidates} candidates to database")
         return n_candidates
@@ -808,20 +731,18 @@ class InferencePipeline:
         variant = self.config.rf.latent_variant
         active_dims = self.config.rf.active_dims
         cloud_rng = derive_rng(self.config.reproducibility.seed, STREAM_REFERENCE_CLOUD, 1)
-        draw_scores = np.empty((self.mc_draws, len(screening)))
-        for draw_index in range(self.mc_draws):
-            draw_flat = sample_z_flat(mean_flat, logvar_flat, cloud_rng)
-            draw_features = build_variant_features(
-                variant,
-                draw_flat,
-                logvar_flat,
-                self.num_observations,
-                self.latent_dim,
-                active_dims,
-            )
-            draw_scores[draw_index] = apply_probability_calibrator(
-                self.calibrator, self.rf_model.model.predict_proba(draw_features)[:, 1]
-            )
+        draw_scores = _batched_mc_scores(
+            self.rf_model,
+            self.calibrator,
+            variant,
+            mean_flat,
+            logvar_flat,
+            self.num_observations,
+            self.latent_dim,
+            active_dims,
+            self.mc_draws,
+            cloud_rng,
+        )
 
         tag = self.config.checkpoint.save_tag
         cloud_path = os.path.join(self.config.output_path, f"inference_reference_cloud_{tag}.npz")
