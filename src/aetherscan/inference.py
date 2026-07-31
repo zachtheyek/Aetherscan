@@ -265,6 +265,22 @@ class InferencePipeline:
             logger.info(f"Loading encoder from {encoder_path} within strategy scope")
             with self.strategy.scope():
                 self.encoder = tf.keras.models.load_model(encoder_path)
+                # Encode-only view (#301): inference consumes z_mean/z_log_var and
+                # discards the sampled z, but the Sampling layer's tf.random draw is a
+                # STATEFUL op that graph pruning must retain — it executed per step per
+                # replica for nothing. Slicing the functional model's first two outputs
+                # excludes the sampling branch from the traced graph entirely; z_mean /
+                # z_log_var tensors are the same graph nodes, so outputs are unchanged.
+                try:
+                    self._encode_model = tf.keras.Model(
+                        self.encoder.inputs, self.encoder.outputs[:2]
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Encode-only submodel derivation failed ({e}); using the full "
+                        f"encoder (the discarded sampling op will run per step)"
+                    )
+                    self._encode_model = self.encoder
             logger.info("Encoder loaded successfully")
         except Exception as e:
             logger.error(f"Error loading encoder: {e}")
@@ -557,6 +573,10 @@ class InferencePipeline:
             # Cache dimensions for tf.function
             time_bins = self.config.data.time_bins
             width_bin = self.config.data.width_bin // self.config.data.downsample_factor
+            # The encode-only submodel when init_models derived one (#301: skips the
+            # discarded sampling draw); a bare stub/full encoder still works — the first
+            # two outputs are z_mean/z_log_var either way
+            encode_model = getattr(self, "_encode_model", None) or self.encoder
 
             @tf.function
             def encode_step(batch_data):
@@ -564,9 +584,8 @@ class InferencePipeline:
                     """Per-replica encoding step"""
                     # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
                     reshaped = tf.reshape(data, [-1, time_bins, width_bin, 1])
-                    # Encode (returns mean, log_var, z) — keep the posterior parameters
-                    z_mean, z_log_var, _ = self.encoder(reshaped, training=False)
-                    return z_mean, z_log_var
+                    outputs = encode_model(reshaped, training=False)
+                    return outputs[0], outputs[1]  # z_mean, z_log_var
 
                 # Run encoding on all replicas
                 return self.strategy.run(encode_fn, args=(batch_data,))
@@ -574,6 +593,32 @@ class InferencePipeline:
             self._encode_step = encode_step
 
         encode_step = self._encode_step
+
+        def _harvest(entry) -> None:
+            # Extract results from each replica and concatenate (cheaper than an NCCL
+            # gather for the small latent payload). The .numpy() calls block until the
+            # step's kernels finish — which, in the pipelined loop below, overlaps the
+            # NEXT step's device work instead of serializing against it.
+            per_replica_mean, per_replica_log_var, out_rows, write_idx = entry
+            batch_mean = np.concatenate(
+                [r.numpy() for r in self.strategy.experimental_local_results(per_replica_mean)],
+                axis=0,
+            )
+            batch_log_var = np.concatenate(
+                [r.numpy() for r in self.strategy.experimental_local_results(per_replica_log_var)],
+                axis=0,
+            )
+            # Only the real rows land in the outputs (obs-major: out_rows snippet rows)
+            z_mean_out[write_idx : write_idx + out_rows] = batch_mean[:out_rows]
+            z_log_var_out[write_idx : write_idx + out_rows] = batch_log_var[:out_rows]
+
+        # One-step-deep software pipeline (#301): dispatch step k+1 (h2d + kernels are
+        # enqueued asynchronously by eager TF) BEFORE harvesting step k, so the host-side
+        # d2h + numpy writes of step k run while step k+1 computes on the GPUs. The old
+        # loop harvested immediately, fully serializing convert -> compute -> sync per
+        # step (~2% of benched encode throughput). Numerics are untouched: same tensors,
+        # same step geometry, same write order — only the harvest timing moves.
+        pending = None
         n_steps = 0
         out_idx = 0
         start = 0
@@ -591,7 +636,7 @@ class InferencePipeline:
             else:
                 # Pad the final step with duplicate rows cycled from the cadence start
                 # (deterministic, same semantics as the retired dataset padding); their
-                # encoded outputs are sliced off below and never leave this method
+                # encoded outputs are sliced off in _harvest and never leave this method
                 pad_indices = np.arange(global_rows - remaining) % n_samples
                 step_slice = np.concatenate([data[start:], data[pad_indices]], axis=0)
                 real_rows = remaining
@@ -603,21 +648,11 @@ class InferencePipeline:
             per_replica_batch = self.strategy.experimental_distribute_values_from_function(value_fn)
             per_replica_mean, per_replica_log_var = encode_step(per_replica_batch)
 
-            # Extract results from each replica and concatenate
-            # This avoids the inefficient gather operation with NCCL
-            batch_mean = np.concatenate(
-                [r.numpy() for r in self.strategy.experimental_local_results(per_replica_mean)],
-                axis=0,
-            )
-            batch_log_var = np.concatenate(
-                [r.numpy() for r in self.strategy.experimental_local_results(per_replica_log_var)],
-                axis=0,
-            )
+            if pending is not None:
+                _harvest(pending)
 
-            # Only the real rows land in the outputs (obs-major: real_rows snippets)
             out_rows = real_rows * self.num_observations
-            z_mean_out[out_idx : out_idx + out_rows] = batch_mean[:out_rows]
-            z_log_var_out[out_idx : out_idx + out_rows] = batch_log_var[:out_rows]
+            pending = (per_replica_mean, per_replica_log_var, out_rows, out_idx)
 
             out_idx += out_rows
             start += real_rows
@@ -625,10 +660,14 @@ class InferencePipeline:
             if n_steps % 10 == 0 or start >= n_samples:
                 logger.info(f"Encoded {start}/{n_samples} snippets ({n_steps} steps)")
 
-            # Refcount-managed numpy arrays and eager tensors: freed on del. The full
-            # gc.collect() that used to run here EVERY STEP (~0.3 s each with TF
-            # loaded, GIL held) reclaimed nothing cyclic (#298 I7).
-            del per_replica_mean, per_replica_log_var, batch_mean, batch_log_var
+            # Refcount-managed numpy arrays and eager tensors: freed on del/rebind. The
+            # full gc.collect() that used to run here EVERY STEP (~0.3 s each with TF
+            # loaded, GIL held) reclaimed nothing cyclic (#298 I7). At most one extra
+            # step of outputs stays live (the pipeline depth).
+            del per_replica_mean, per_replica_log_var
+
+        if pending is not None:
+            _harvest(pending)
 
         return z_mean_out, z_log_var_out
 
