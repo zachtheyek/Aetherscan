@@ -16,6 +16,7 @@ from aetherscan.config import get_config
 from aetherscan.inference_viz import (
     CONFIDENCE_HIST_EDGES,
     InferenceVizCollector,
+    _build_summaries,
     plot_bandpass_flattening,
     plot_candidate,
     plot_candidate_gallery,
@@ -127,12 +128,12 @@ def collector(tmp_path):
 
 
 @pytest.fixture
-def metadatas(collector):
-    result = {}
-    for record in collector.records:
-        with open(record.metadata_path) as f:
-            result[record.npy_path] = json.load(f)
-    return result
+def summaries(collector):
+    """Bounded per-cadence summaries reduced from the on-disk sidecars (#301) — the shape
+    every metadata-driven figure consumes now. The fixture's legacy-form metadata (raw
+    hit-frequency lists, no pre-binned hists or envelopes) exercises the back-compat
+    reduction path."""
+    return _build_summaries(collector.records, get_config().inference.stamp_gallery_top_k)
 
 
 def _assert_figure(path):
@@ -223,20 +224,20 @@ class TestSelectTopStamps:
 
         coll = InferenceVizCollector()
         coll.record_processed(("O",), npy_path, metadata_path, {}, _fake_results(n=4), 1.0)
-        metadatas = {npy_path: metadata}
+        summaries = _build_summaries(coll.records, gallery_top_k=4)
 
-        selected = _select_top_stamps(coll.records, metadatas, top_k=4)
-        starts = [metadata["stamp_starts"][idx] for _, idx, _, _ in selected]
+        selected = _select_top_stamps(coll.records, summaries, top_k=4)
+        starts = [metadata["stamp_starts"][idx] for _, idx, _, _, _ in selected]
         assert len([s for s in starts if s in (872, 1000, 1128)]) == 1
         assert 5000 in starts
 
 
 class TestFigureSmoke:
-    def test_ed_stat_distributions(self, collector, metadatas):
-        _assert_figure(plot_ed_stat_distributions(collector.records, metadatas))
+    def test_ed_stat_distributions(self, collector, summaries):
+        _assert_figure(plot_ed_stat_distributions(collector.records, summaries))
 
     def test_ed_stat_distributions_drops_mismatched_bins_consistently(
-        self, tmp_path, collector, metadatas, monkeypatch
+        self, tmp_path, collector, monkeypatch
     ):
         """A cadence dropped for mismatched ED-hist bins must be excluded from the title's
         above-threshold and cadence counts too — otherwise the above/total pair mixes
@@ -249,7 +250,7 @@ class TestFigureSmoke:
         with open(metadata_path, "w") as f:
             json.dump(metadata, f)
         collector.record_processed(("C",), npy_path, metadata_path, {}, _fake_results(), 1.0)
-        metadatas[npy_path] = metadata
+        summaries = _build_summaries(collector.records, gallery_top_k=12)
 
         captured: dict[str, str] = {}
 
@@ -258,7 +259,7 @@ class TestFigureSmoke:
             return filename
 
         monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
-        assert plot_ed_stat_distributions(collector.records, metadatas) is not None
+        assert plot_ed_stat_distributions(collector.records, summaries) is not None
 
         title = captured["title"]
         # Only the two good cadences contribute: 3 * N_STAMPS raw hits each
@@ -266,14 +267,67 @@ class TestFigureSmoke:
         assert "(2 cadence(s))" in title
         assert "finite windows" in title
 
-    def test_ed_hit_spectrum(self, collector, metadatas):
-        _assert_figure(plot_ed_hit_spectrum(collector.records, metadatas))
+    def test_ed_hit_spectrum(self, collector, summaries):
+        _assert_figure(plot_ed_hit_spectrum(collector.records, summaries))
 
-    def test_stamp_gallery(self, collector, metadatas):
-        _assert_figure(plot_stamp_gallery(collector.records, metadatas))
+    def test_ed_hit_spectrum_prebinned_matches_legacy_totals(self, collector, monkeypatch):
+        """New sidecars carry hit_spectrum_hist pre-binned by preprocessing; legacy
+        sidecars reduce their raw float lists at load (#301). Both routes must report the
+        same hit totals for the same underlying hits."""
+        legacy = _build_summaries(collector.records, gallery_top_k=12)
 
-    def test_preproc_funnel(self, collector, metadatas):
-        _assert_figure(plot_preproc_funnel(collector.records, metadatas))
+        # Rewrite each sidecar into the NEW pre-binned form (drop the raw list)
+        for record in collector.records:
+            with open(record.metadata_path) as f:
+                metadata = json.load(f)
+            raw = metadata.pop("raw_hit_frequencies_mhz")
+            merged = metadata["merged_hit_frequencies_mhz"]
+            edges = np.linspace(1400.0, 1411.0, 8193)
+            metadata["hit_spectrum_hist"] = {
+                "freq_lo": 1400.0,
+                "freq_hi": 1411.0,
+                "n_bins": 8192,
+                "raw_counts": np.histogram(raw, bins=edges)[0].tolist(),
+                "merged_counts": np.histogram(merged, bins=edges)[0].tolist(),
+                "raw_freq_min": float(np.min(raw)),
+                "raw_freq_max": float(np.max(raw)),
+            }
+            with open(record.metadata_path, "w") as f:
+                json.dump(metadata, f)
+        prebinned = _build_summaries(collector.records, gallery_top_k=12)
+
+        titles: list[str] = []
+
+        def _capture(fig, filename, slack_title):
+            titles.append(fig.axes[0].get_title())
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_ed_hit_spectrum(collector.records, legacy) is not None
+        assert plot_ed_hit_spectrum(collector.records, prebinned) is not None
+        assert titles[0] == titles[1]  # same raw/merged totals either route
+
+    def test_stamp_gallery(self, collector, summaries):
+        _assert_figure(plot_stamp_gallery(collector.records, summaries))
+
+    def test_preproc_funnel(self, collector, summaries):
+        _assert_figure(plot_preproc_funnel(collector.records, summaries))
+
+    def test_preproc_funnel_aggregates_past_cap(self, collector, summaries, monkeypatch):
+        """#301: past _FUNNEL_MAX_CADENCES the figure must aggregate the remainder into
+        one bar instead of growing past Agg's 2^16-px canvas limit and silently failing."""
+        monkeypatch.setattr("aetherscan.inference_viz._FUNNEL_MAX_CADENCES", 1)
+        captured: dict[str, str] = {}
+
+        def _capture(fig, filename, slack_title):
+            captured["title"] = fig.axes[0].get_title()
+            captured["n_bars"] = len(fig.axes[0].get_xticklabels())
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_preproc_funnel(collector.records, summaries) is not None
+        assert "aggregated" in captured["title"]
+        assert captured["n_bars"] == 2  # 1 individual + the aggregate bar
 
     def test_confidence_distribution(self, collector):
         _assert_figure(plot_confidence_distribution(collector.records))
@@ -292,9 +346,8 @@ class TestFigureSmoke:
         )
         coll = InferenceVizCollector()
         coll.record_processed(("H",), npy_path, metadata_path, {}, _fake_results(), 1.0)
-        with open(metadata_path) as f:
-            metas = {npy_path: json.load(f)}
-        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, metas))
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
 
     def test_bandpass_flattening_header_without_nchans(
         self, tmp_path, initialized_runtime, collector, make_h5_observation
@@ -315,8 +368,30 @@ class TestFigureSmoke:
             json.dump(metadata, f)
         coll = InferenceVizCollector()
         coll.record_processed(("H2",), npy_path, metadata_path, {}, _fake_results(), 1.0)
-        metas = {npy_path: metadata}
-        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, metas))
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
+
+    def test_bandpass_flattening_from_stored_envelopes(self, tmp_path, initialized_runtime):
+        """A sidecar carrying bandpass_envelopes (#301) must render WITHOUT touching any
+        .h5 — the h5 paths here don't exist, which is exactly the point (the live-read
+        fallback would fail on them)."""
+        npy_path, metadata_path, metadata = _write_cadence_artifacts(tmp_path, "cad_env", ("E",))
+        assert not os.path.exists(metadata["h5_paths"][0])
+        metadata["bandpass_envelopes"] = [
+            {
+                "channel": 3,
+                "overlay_label": "scaled PFB response H",
+                "raw": {"idx": [0, 1, 2, 3], "values": [1.0, 2.0, 2.0, 1.0]},
+                "flat": {"idx": [0, 1, 2, 3], "values": [1.0, 1.0, 1.0, 1.0]},
+                "overlay": {"idx": [0, 1, 2, 3], "values": [1.0, 2.0, 2.0, 1.0]},
+            }
+        ]
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+        coll = InferenceVizCollector()
+        coll.record_processed(("E",), npy_path, metadata_path, {}, _fake_results(), 1.0)
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
 
     def test_candidate_gallery_and_per_candidate(self, initialized_runtime, collector):
         db = initialized_runtime
@@ -391,7 +466,7 @@ class TestFigureSmoke:
         config.inference.config_path = str(config_json)
         assert plot_inference_latent_projection(collector) is None
 
-    def test_inference_summary(self, initialized_runtime, collector, metadatas):
+    def test_inference_summary(self, initialized_runtime, collector, summaries):
         db = initialized_runtime
         db.write_inference_cadence(
             npy_path=collector.records[0].npy_path,
@@ -415,10 +490,10 @@ class TestFigureSmoke:
             "n_cadences": 2,
             "n_skipped": 0,
         }
-        _assert_figure(plot_inference_summary(collector.records, metadatas, totals))
+        _assert_figure(plot_inference_summary(collector.records, summaries, totals))
 
     def test_inference_summary_counts_superseded_preprocessing(
-        self, initialized_runtime, collector, metadatas, monkeypatch
+        self, initialized_runtime, collector, summaries, monkeypatch
     ):
         """Regression: _infer_cadence supersedes each cadence's 'preprocessed' row just before
         writing its live 'inferred' row, so on a fully successful run every 'preprocessed' row
@@ -461,7 +536,7 @@ class TestFigureSmoke:
             "n_cadences": 1,
             "n_skipped": 0,
         }
-        plot_inference_summary(collector.records, metadatas, totals)
+        plot_inference_summary(collector.records, summaries, totals)
 
         lines = captured["text"].splitlines()
         preproc_line = next(line for line in lines if line.startswith("preprocessing time"))
@@ -502,3 +577,15 @@ class TestSuiteEntryPoint:
         render_inference_visualizations(
             coll, DataPreprocessor(), {"n_cadence_snippets": 1, "n_cadences": 1}
         )
+
+    def test_scope_new_excludes_resumed_cadences(self, initialized_runtime, collector):
+        """--inference-viz-scope new (#301): resumed cadences drop out of the
+        metadata-driven figures, so a multi-pass campaign stops re-paying the whole
+        catalog's viz tail every pass."""
+        get_config().inference.inference_viz_scope = "new"
+        collector.record_skipped(("R",), "/nope/resumed.npy", "/nope/resumed.json", {})
+        totals = {"n_cadence_snippets": 10, "n_cadences": 3, "n_skipped": 1}
+        render_inference_visualizations(collector, DataPreprocessor(), totals)
+        # The resumed record's missing sidecar would have warned; the two live ones render
+        tag_dir = os.path.join(get_config().output_path, "plots", "inference", TAG)
+        assert f"ed_stat_distributions_{TAG}.png" in os.listdir(tag_dir)

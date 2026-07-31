@@ -1945,6 +1945,54 @@ class Database:
             # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
+    def query_system_resource_decimated(
+        self,
+        tag: str,
+        start_time: float,
+        end_time: float,
+        max_points_per_series: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Per-series uniformly-strided subset of system_resources rows for the teardown
+        resource plot (#301): a multi-week catalog run accumulates tens of millions of
+        rows while the plot renders ~2k px wide, so materializing every row cost a
+        multi-GB teardown RAM spike for invisible detail. The stride is computed from the
+        LARGEST series so every (resource_type, resource_name) line keeps up to
+        max_points_per_series uniformly-spaced points; stride 1 degenerates to the full
+        query. Returns the same dict shape as query_system_resource.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT MAX(cnt) FROM (SELECT COUNT(*) AS cnt FROM system_resources"
+                " WHERE tag = ? AND timestamp >= ? AND timestamp <= ?"
+                " GROUP BY resource_type, resource_name)",
+                (tag, start_time, end_time),
+            )
+            max_series = cursor.fetchone()[0] or 0
+            stride = max(1, -(-max_series // max_points_per_series))  # ceil div
+            if stride == 1:
+                # Small run: identical to the unstrided query (window overhead skipped)
+                return self.query_system_resource(tag=tag, start_time=start_time, end_time=end_time)
+            cursor.execute(
+                "SELECT * FROM ("
+                " SELECT *, ROW_NUMBER() OVER ("
+                "   PARTITION BY resource_type, resource_name ORDER BY timestamp"
+                " ) AS _rn FROM system_resources"
+                " WHERE tag = ? AND timestamp >= ? AND timestamp <= ?"
+                ") WHERE (_rn - 1) % ? = 0",
+                (tag, start_time, end_time, stride),
+            )
+            result_columns = [desc[0] for desc in cursor.description]
+            rows = [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+            for row in rows:
+                row.pop("_rn", None)
+            logger.info(
+                f"Resource-plot query decimated by stride {stride} "
+                f"(largest series {max_series} rows -> <= {max_points_per_series}/series)"
+            )
+            return rows
+
     def query_injection_stat_time_span(
         self,
         tag: str,

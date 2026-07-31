@@ -1010,6 +1010,13 @@ def _add_inference_flags_to(parser):
         help="Render the inference visualization suite (energy detection distributions, hit spectrum, bandpass overlay, stamp/candidate galleries, confidence distribution, latent projection, summary card) at the end of a CSV inference run, saved under plots/inference/{save_tag}/ and uploaded to Slack (default: enabled). Pass --no-inference-viz to disable.",
     )
     parser.add_argument(
+        "--inference-viz-scope",
+        type=str,
+        choices=["full", "new"],
+        default=None,
+        help="Which cadences the metadata-driven viz figures cover: 'full' (default) renders the whole accumulated tag every successful pass; 'new' renders only cadences inferred this pass — recommended for resumed multi-pass catalog campaigns, where 'full' re-pays the entire catalog's viz tail on every pass. DB-sourced candidate figures always cover the full tag either way.",
+    )
+    parser.add_argument(
         "--stamp-gallery-top-k",
         type=int,
         default=None,
@@ -1466,6 +1473,8 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # "force off" (--no-inference-viz)
     if hasattr(args, "inference_viz") and args.inference_viz is not None:
         config.inference.inference_viz_enabled = args.inference_viz
+    if hasattr(args, "inference_viz_scope") and args.inference_viz_scope is not None:
+        config.inference.inference_viz_scope = args.inference_viz_scope
     if hasattr(args, "stamp_gallery_top_k") and args.stamp_gallery_top_k is not None:
         config.inference.stamp_gallery_top_k = args.stamp_gallery_top_k
     if hasattr(args, "max_candidate_plots") and args.max_candidate_plots is not None:

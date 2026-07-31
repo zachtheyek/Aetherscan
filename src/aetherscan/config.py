@@ -557,6 +557,11 @@ class InferenceConfig:
     # to Slack. Every figure is individually exception-guarded — a plot bug can never kill
     # a science run.
     inference_viz_enabled: bool = True
+    # Which cadences the metadata-driven figures cover: "full" (default) renders the whole
+    # accumulated tag every successful pass; "new" renders only cadences inferred THIS
+    # pass (#301 — a resumed catalog campaign re-paid the full O(catalog) viz tail on
+    # every pass). DB-sourced candidate figures always cover the full tag either way.
+    inference_viz_scope: str = "full"
     # Number of top-statistic stamps shown in the stamp gallery (6-obs waterfall grids).
     stamp_gallery_top_k: int = 12
     # Cap on per-candidate figures (candidate_{i}_{tag}.png), highest confidence first.

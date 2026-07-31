@@ -101,6 +101,16 @@ _STALE_TMP_MAX_AGE_S = 24 * 3600
 # wide float32 buffer at ~64 MiB per worker (16 time rows) even across an RFI comb whose
 # windows chain for a whole coarse channel.
 _COALESCE_MAX_BINS = 2**20
+# Fixed per-cadence bin count for the pre-binned hit-frequency histograms stored in the
+# metadata sidecar (#301): the raw per-hit frequency lists ran ~19 MB of JSON on an
+# RFI-dense cadence (~117 GB over the full catalog) and forced the viz suite to hold every
+# cadence's floats in RAM. 8192 bins over the file band keeps the rebinned hit-spectrum
+# figure visually identical (fine-bin width ≪ the figure's global bin width) at ~20-50 KB.
+_HIT_HIST_BINS = 8192
+# Decimation budget for the bandpass envelopes persisted per cadence (#301): the viz
+# figure renders ~2,100 px wide, so 1,024 min/max pairs per line lose nothing visually,
+# and the stored envelopes spare the figure its ~114 s of cold /datag channel re-reads.
+_ENVELOPE_MAX_POINTS = 1024
 
 
 def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
@@ -663,21 +673,24 @@ def _cached_h5_file(h5_path: str):
     return handle
 
 
-def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]:
+def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray, np.ndarray | None]:
     """
     Fused worker: run the complete energy-detection chain for one coarse channel — read the
     channel's h5 slice, remove the DC spike, flatten the bandpass, and threshold the vectorized
-    normality statistic. Returns (hits, stat_hist): hits is a small list of
+    normality statistic. Returns (hits, stat_hist, integrated): hits is a small list of
     (absolute_fine_channel_index, statistic, pvalue) tuples; stat_hist is the histogram of
     *all* finite window statistics (not just hits) over the fixed ED_STAT_HIST_EDGES bins, so
     the parent can cheaply accumulate the full per-file statistic distribution for the
-    visualization suite. The bulky (time_bins, coarse_channel_width) intermediates never leave
+    visualization suite; integrated is the despiked channel's time-integrated spectrum
+    (float64, only when want_spectrum — the parent turns the few sampled channels' spectra
+    into the persisted bandpass envelopes, #301, sparing the viz suite its cold h5 re-reads).
+    The bulky (time_bins, coarse_channel_width) intermediates never leave
     the worker, so no shared memory or per-block parent arrays are needed.
 
     args is (h5_path, channel_index, coarse_channel_width, time_bins, bandpass_flatten,
-    window_size, step_size, stat_threshold). bandpass_flatten is a picklable callable
-    (channel) -> residuals (see _spline_flatten_bandpass). Each worker opens its own h5py.File
-    since h5py file handles are fork-unsafe to share.
+    window_size, step_size, stat_threshold, want_spectrum). bandpass_flatten is a picklable
+    callable (channel) -> residuals (see _spline_flatten_bandpass). Each worker opens its own
+    h5py.File since h5py file handles are fork-unsafe to share.
     """
     (
         h5_path,
@@ -688,6 +701,7 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
         window_size,
         step_size,
         stat_threshold,
+        want_spectrum,
     ) = args
 
     start = channel_index * coarse_channel_width
@@ -706,6 +720,10 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
     # offsets can never cross a coarse-channel boundary.
     _remove_dc_spike(channel, coarse_channel_width, 1)
 
+    # float64 accumulation matches the viz path this replaces (_read_despiked_channel
+    # casts to float64 before integrating); one mean over the already-resident channel.
+    integrated = channel.mean(axis=0, dtype=np.float64) if want_spectrum else None
+
     residuals = bandpass_flatten(channel)
 
     k2 = _sliding_normality_k2(residuals, window_size, step_size)
@@ -720,7 +738,7 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
 
     hit_windows = np.nonzero(k2 > stat_threshold)[0]
     if hit_windows.size == 0:
-        return [], stat_hist
+        return [], stat_hist, integrated
 
     # p-values are only stored in metadata, so chi2.sf runs on the (small) hit subset only
     pvalues = stats.chi2.sf(k2[hit_windows], 2)
@@ -728,7 +746,7 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
         (start + int(j) * step_size, float(k2[j]), float(p))
         for j, p in zip(hit_windows, pvalues, strict=True)
     ]
-    return hits, stat_hist
+    return hits, stat_hist, integrated
 
 
 def _coalesce_stamp_groups(stamp_starts, stamp_width: int) -> list[list[int]]:
@@ -1980,6 +1998,11 @@ class DataPreprocessor:
                 else None
             )
 
+            # The few channels whose despiked integrated spectra feed the persisted
+            # bandpass envelopes (#301) — primary ON file only, same sampling as the
+            # figure this replaces; the spectra ride back with the ED results, so no
+            # extra h5 reads happen at all
+            envelope_channels = set(self._sample_channel_indices(n_coarse_total))
             tasks = [
                 (
                     on_h5,
@@ -1990,6 +2013,7 @@ class DataPreprocessor:
                     window_size,
                     step_size,
                     stat_threshold,
+                    on_h5 == primary_h5 and ch in envelope_channels,
                 )
                 for on_h5 in on_source_paths
                 for ch in range(n_coarse_total)
@@ -2007,11 +2031,14 @@ class DataPreprocessor:
                     )
                 channel_hits_iter = map(_energy_detect_channel_worker, tasks)
 
-            for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter):
+            integrated_by_channel: dict[int, np.ndarray] = {}
+            for done, (channel_hits, channel_hist, integrated) in enumerate(channel_hits_iter):
                 on_source_idx = done // n_coarse_total
                 file_done = done % n_coarse_total + 1
                 all_hits.extend(channel_hits)
                 stat_hists[on_source_idx] += channel_hist
+                if integrated is not None:
+                    integrated_by_channel[done % n_coarse_total] = integrated
                 if file_done in progress_points:
                     logger.info(
                         f"  Coarse channel {file_done}/{n_coarse_total} of ON-source "
@@ -2020,6 +2047,17 @@ class DataPreprocessor:
 
             if pfb_check is not None:
                 self._finish_pfb_response_check(pfb_check, primary_h5)
+
+        # Persisted bandpass envelopes (#301): decimated raw/flattened/overlay lines per
+        # sampled channel, computed from the spectra that rode back with ED. Viz-only —
+        # a failure degrades one figure, never the cadence.
+        bandpass_envelopes = None
+        try:
+            bandpass_envelopes = self._build_bandpass_envelopes(
+                integrated_by_channel, bandpass_flatten, pfb_active
+            )
+        except Exception as e:
+            logger.warning(f"Cadence {group.key}: bandpass envelope computation failed ({e})")
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
@@ -2164,6 +2202,26 @@ class DataPreprocessor:
         stamp_stats = [float(s) for _, s, _ in stamp_centers]
         stamp_pvals = [float(p) for _, _, p in stamp_centers]
 
+        # Pre-binned hit-frequency histograms (#301): a fixed per-cadence grid spanning
+        # the file band, fine enough (_HIT_HIST_BINS) that the viz suite's rebinning onto
+        # its global axis is visually exact. The exact raw-hit min/max ride along so the
+        # figure reproduces the historical axis bounds. merged_hits is non-empty here and
+        # all_hits ⊇ merged_hits, so the min/max are well-defined.
+        raw_freq_values = np.array([fch1 + foff * idx for idx, _, _ in all_hits])
+        merged_freq_values = np.array([fch1 + foff * idx for idx, _, _ in merged_hits])
+        band_lo = min(fch1, fch1 + foff * n_chans)
+        band_hi = max(fch1, fch1 + foff * n_chans)
+        band_edges = np.linspace(band_lo, band_hi, _HIT_HIST_BINS + 1)
+        hit_spectrum_hist = {
+            "freq_lo": float(band_lo),
+            "freq_hi": float(band_hi),
+            "n_bins": _HIT_HIST_BINS,
+            "raw_counts": np.histogram(raw_freq_values, bins=band_edges)[0].tolist(),
+            "merged_counts": np.histogram(merged_freq_values, bins=band_edges)[0].tolist(),
+            "raw_freq_min": float(raw_freq_values.min()),
+            "raw_freq_max": float(raw_freq_values.max()),
+        }
+
         metadata = {
             "key": group.key,
             "csv_path": group.csv_path,
@@ -2179,20 +2237,23 @@ class DataPreprocessor:
             "overlap_search": overlap_search,
             "overlap_fraction": overlap_fraction if overlap_search else None,
             # Energy-detection provenance for the visualization suite: the all-window
-            # statistic histograms (per ON file, fixed log-spaced bins) and the hit
-            # frequencies before/after deduplication (hit spectrum + funnel figures).
-            # NOTE: the frequency lists are stored raw (unlike the pre-binned stat
-            # histograms — an asymmetry): tens of thousands of floats per RFI-dense
-            # cadence, bounded at current catalog scale. If metadata JSONs grow unwieldy,
-            # pre-bin these onto a fixed frequency grid the way ed_stat_hist does.
+            # statistic histograms (per ON file, fixed log-spaced bins) and the pre-binned
+            # hit-frequency histograms (hit spectrum + funnel figures). Raw per-hit
+            # frequency lists are no longer stored (#301 — this discharges the old
+            # pre-binning NOTE): they ran ~19 MB of JSON on an RFI-dense cadence and had
+            # exactly one consumer, the hit-spectrum figure, which now rebins
+            # hit_spectrum_hist instead. The post-dedup merged list stays (small, the
+            # scientifically meaningful set); raw counts survive in n_raw_hits + the
+            # histogram.
             "ed_stat_hist": {
                 "bin_edges": [float(e) for e in ED_STAT_HIST_EDGES],
                 "counts_per_on_file": stat_hists.tolist(),
             },
             "n_raw_hits": len(all_hits),
             "n_merged_hits": len(merged_hits),
-            "raw_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in all_hits],
+            "hit_spectrum_hist": hit_spectrum_hist,
             "merged_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in merged_hits],
+            "bandpass_envelopes": bandpass_envelopes,
             # The ED config these stamps were produced under (#298 I3) — checked by the
             # resume guard before an existing .npy is reused
             "ed_config_fingerprint": preprocessing_config_fingerprint(self.config.to_dict()),
@@ -2357,6 +2418,42 @@ class DataPreprocessor:
             self.config.data.time_bins,
             open_kwargs,
         )
+
+    def _build_bandpass_envelopes(
+        self,
+        integrated_by_channel: dict[int, np.ndarray],
+        bandpass_flatten: functools.partial,
+        pfb_active: bool,
+    ) -> list[dict] | None:
+        """Decimated raw/flattened/overlay integrated-spectrum lines for the sampled coarse
+        channels, persisted in the metadata sidecar (#301) so the bandpass-flattening viz
+        figure renders from ~KB of stored points instead of re-reading (cold) coarse
+        channels from the .h5 at viz time (measured 114 s = 74% of a cached rerun's viz
+        span). Exact w.r.t. the figure's own math: the PFB divide and the spline
+        subtraction both commute with the time mean, and the workers integrate in float64
+        over the same despiked channel the figure would read."""
+        if not integrated_by_channel:
+            return None
+        envelopes: list[dict] = []
+        for ch in sorted(integrated_by_channel):
+            raw_int = np.asarray(integrated_by_channel[ch], dtype=np.float64)
+            if pfb_active:
+                response = _load_pfb_response(bandpass_flatten.keywords["response_path"])
+                flat_int = raw_int / np.maximum(response, 1e-10)
+                overlay = response * (float(raw_int @ response) / float(response @ response))
+                overlay_label = "scaled PFB response H"
+            else:
+                overlay = _fit_channel_bandpass(
+                    raw_int, raw_int.shape[0], self.config.inference.spline_order
+                )
+                flat_int = raw_int - overlay
+                overlay_label = "spline fit"
+            entry: dict = {"channel": int(ch), "overlay_label": overlay_label}
+            for name, line in (("raw", raw_int), ("flat", flat_int), ("overlay", overlay)):
+                idx, values = _decimate_for_plot(np.asarray(line), _ENVELOPE_MAX_POINTS)
+                entry[name] = {"idx": [int(i) for i in idx], "values": [float(v) for v in values]}
+            envelopes.append(entry)
+        return envelopes
 
     def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
         """

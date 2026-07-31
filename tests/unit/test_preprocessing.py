@@ -657,14 +657,26 @@ class TestProcessCadenceEndToEnd:
         assert len(metadata["stamp_starts"]) == result.n_hits
 
         # Viz-suite provenance: per-ON-file all-window statistic histograms on the shared
-        # bins, plus pre-/post-dedup hit frequency lists
+        # bins, the pre-binned hit-frequency histograms (#301 — the raw per-hit list is no
+        # longer stored), the post-dedup merged list, and the bandpass envelopes
         ed_hist = metadata["ed_stat_hist"]
         assert ed_hist["bin_edges"] == pytest.approx(list(ED_STAT_HIST_EDGES))
         assert len(ed_hist["counts_per_on_file"]) == 3  # one histogram per ON file
         assert all(sum(counts) > 0 for counts in ed_hist["counts_per_on_file"])
         assert metadata["n_raw_hits"] >= metadata["n_merged_hits"] > 0
-        assert len(metadata["raw_hit_frequencies_mhz"]) == metadata["n_raw_hits"]
+        assert "raw_hit_frequencies_mhz" not in metadata
+        hit_hist = metadata["hit_spectrum_hist"]
+        assert sum(hit_hist["raw_counts"]) == metadata["n_raw_hits"]
+        assert sum(hit_hist["merged_counts"]) == metadata["n_merged_hits"]
+        assert hit_hist["freq_lo"] <= hit_hist["raw_freq_min"] <= hit_hist["raw_freq_max"]
         assert len(metadata["merged_hit_frequencies_mhz"]) == metadata["n_merged_hits"]
+        # Envelopes: one entry per sampled channel, three decimated lines each, exact
+        # per the commuting-mean argument (raw/H for pfb, raw - fit for spline)
+        envelopes = metadata["bandpass_envelopes"]
+        assert envelopes and all(
+            set(entry) >= {"channel", "overlay_label", "raw", "flat", "overlay"}
+            for entry in envelopes
+        )
 
         # Preprocessing completion is recorded in the inference_cadences run manifest
         db = initialized_runtime

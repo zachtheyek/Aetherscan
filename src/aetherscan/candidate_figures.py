@@ -20,6 +20,7 @@ index order from the returned paths.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import multiprocessing as mp
@@ -124,14 +125,29 @@ def candidate_annotation(row: dict) -> str:
     return "\n".join(lines)
 
 
+@functools.lru_cache(maxsize=4)
+def _load_sidecar_cached(metadata_path: str) -> dict | None:
+    """Small parent-side LRU over parsed metadata sidecars (#301): candidates cluster on
+    few cadences, and the gallery/task-build path parsed the SAME multi-MB JSON once per
+    candidate row (~15-20 s serial before the render pool even started). Sidecars are
+    immutable once published (atomic tmp -> os.replace), so a cached parse can never go
+    stale; maxsize bounds the held dicts."""
+    try:
+        with open(metadata_path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def candidate_frequency_range_mhz(row: dict) -> tuple[float, float] | None:
     """Best-effort frequency span for one candidate row: read its cadence's metadata
-    sidecar (derived from npy_path) and look up the stamp's range. None on any failure —
-    the figure keeps its generic axis label."""
+    sidecar (derived from npy_path, cached across rows) and look up the stamp's range.
+    None on any failure — the figure keeps its generic axis label."""
     try:
-        with open(cadence_metadata_path(str(row["npy_path"]))) as f:
-            metadata = json.load(f)
-    except (OSError, json.JSONDecodeError, KeyError):
+        metadata = _load_sidecar_cached(cadence_metadata_path(str(row["npy_path"])))
+    except KeyError:
+        return None
+    if metadata is None:
         return None
     return stamp_frequency_range_mhz(metadata, int(row["snippet_index"]))
 
