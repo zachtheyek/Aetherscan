@@ -232,17 +232,27 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
    `--no-prune-stamps` override), each cadence's multi-GB stamp `.npy` is deleted right
    after its `'inferred'` manifest row lands and viz collection ran — without pruning a
    full catalog writes ~30–90 TB of stamps. The metadata `.json` always stays (provenance,
-   viz, resume guard), resume rides the DB row, and only stamps **this run freshly
-   extracted** are ever pruned (`CadenceResult.freshly_extracted`) — a resumed run never
-   deletes a cache it was handed. Before deletion each candidate's snippet (~196 KB) is
-   snapshotted into an atomic `.candidates.npz` sidecar and the viz collector pools the
-   global top-K stamp pixels (~2.4 MB), so candidate figures and the stamp gallery survive
-   pruning; `'failed'` cadences keep their stamps until they succeed. Best-effort: any
-   pruning failure keeps the stamps and the run continues. Both `prune_stamps` and
+   viz, resume guard), resume rides the DB row, and only stamps **this run extracted** are
+   ever pruned — tracked by an in-process set on the preprocessor, so a genuinely handed
+   cache (extracted by another process/operator) is never deleted, while a cadence *this*
+   run extracted then failed-and-retried IS pruned on success (a per-attempt
+   `freshly_extracted` flag alone would leak it forever, #305). Before deletion each
+   candidate's snippet (~196 KB) is snapshotted into an atomic `.candidates.npz` sidecar and
+   the viz collector pools the global top-K stamp pixels (~2.4 MB, persisted across the
+   in-process retry attempts), so candidate figures and the stamp gallery survive pruning;
+   `'failed'` cadences keep their stamps until they succeed. Best-effort: any pruning
+   failure keeps the stamps and the run continues. Both `prune_stamps` and
    `inference_viz_scope` sit in `run_state.py`'s fingerprint denylists, so fingerprints —
    and hence resume rows and cache directories — are unchanged. The trade: cross-run
    re-scoring under a new tag re-pays extraction for pruned cadences; same-run resume/retry
-   is unaffected.
+   is science-unaffected. **Limitations** (viz-only, graceful): a cross-*process* relaunch
+   can't recover an earlier process's pruned pixels, so the stamp gallery may show blank
+   columns for earlier-run cadences; and two runs sharing the default cache dir with pruning
+   ON can race (one deletes/overwrites a `.npy` or `.candidates.npz` another is mid-read of —
+   contained, self-heals via retry). Run concurrently in one dir only with a per-run
+   `--preprocess-output-dir` or `--no-prune-stamps` (a deliberate design choice — cross-
+   process file locking was deferred as disproportionate for a self-healing, science-neutral
+   race).
 7. **Failure containment.** A cadence whose inference stage throws is logged, recorded as
    `status='failed'` in the manifest, and the loop moves on — one bad cadence never aborts
    the catalog. After the loop, the pass raises so the retry loop re-attempts, and the
@@ -464,7 +474,7 @@ cadences).
 | `ed_stat_distributions_{tag}.png` | Log-log histogram of the D'Agostino–Pearson k² statistic over **all** windows (not just hits), per-ON-file overlay + total, threshold line. | The bulk should be a compact low-k² mass (noise ≈ χ², df=2) with a long RFI tail. The threshold should sit far into the tail: if the noise bulk crosses it, the stamp count explodes; if one ON file's curve is shifted, that file has a bandpass/level problem. |
 | `ed_hit_spectrum_{tag}.png` | Hit density vs frequency (MHz), pre- vs post-deduplication — rendered by rebinning each cadence's fine pre-binned `hit_spectrum_hist` (≥ 40× finer than the figure's bins) onto one global axis (#301): visually identical to histogramming the raw hit lists, which the sidecars no longer store. | Instantly shows RFI comb structure (regular spikes) and band edges. Dedup should collapse combs dramatically; a band where post-dedup density is still high dominates your stamp budget. |
 | `bandpass_flattening_{tag}.png` | Raw vs flattened integrated spectrum for a few sampled coarse channels, with the removed model (scaled PFB response H or spline fit) overlaid. Rendered from the sidecar's stored `bandpass_envelopes` when present (#301 — zero `.h5` reads at viz time); legacy sidecars keep the live-read path. | The flattened spectrum should be level across the channel. Residual scalloping under PFB means the static response doesn't match the recording — check `--pfb-taps-per-channel` or fall back to `--bandpass-method spline` (the log's edge/mid-ratio warning fires on the same condition). |
-| `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. Cadences pruned this run render from the collector's pooled pixels (#302); cadences pruned by an earlier pass degrade to blank columns. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
+| `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. Cadences pruned in this run (incl. across its in-process retries) render from the collector's pooled pixels (#302); cadences pruned by an earlier *process* (a relaunch-resume) degrade to blank columns. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
 | `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. Past 120 cadences the strongest (by raw hits) keep individual bars and the rest aggregate into one summary bar (#301 — the unbounded figure exceeded Agg's 2¹⁶-px canvas limit past 242 cadences and was silently lost). | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
 | `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |

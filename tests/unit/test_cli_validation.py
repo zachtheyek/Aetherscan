@@ -588,7 +588,9 @@ class TestApplySavedConfigPrecedence:
         env+defaults+CLI."""
         saved = {
             "beta_vae": {"latent_dim": 16},
-            "inference": {"mc_draws": 64, "stat_threshold": 4096.0},
+            # screening_threshold explicitly included (#305 note): it is result-affecting
+            # and fingerprinted, so it MUST layer — previously no test asserted it did.
+            "inference": {"mc_draws": 64, "stat_threshold": 4096.0, "screening_threshold": 0.7},
             "data": {"downsample_factor": 4},
             "rf": {"latent_variant": "z_mean_obs_logvar"},
             "training": {"num_training_rounds": 7, "snr_base": 33},
@@ -606,6 +608,7 @@ class TestApplySavedConfigPrecedence:
         assert config.beta_vae.latent_dim == 16
         assert config.inference.mc_draws == 64
         assert config.inference.stat_threshold == 4096.0
+        assert config.inference.screening_threshold == 0.7
         assert config.data.downsample_factor == 4
         assert config.rf.latent_variant == "z_mean_obs_logvar"
         # Never layered: training section + top-level (legacy flat) paths
@@ -756,6 +759,21 @@ class TestApplySavedConfigPrecedence:
             == _SAVED_CONFIG_FIELD_ALLOWLIST["inference"]
         )
         assert _SAVED_CONFIG_FIELD_ALLOWLIST["data"] == frozenset(_INFERENCE_FINGERPRINT_DATA_KEYS)
+
+    def test_rf_and_beta_vae_allowlists_pinned_to_literals(self):
+        """#305 note: the inference/data sub-allowlists are derived-and-drift-pinned above,
+        but the rf field allowlist and the beta_vae SECTION allowlist are hardcoded literals
+        (rf is not in any fingerprint), so nothing else pins them. Freeze them here: a change
+        to the deployed-representation contract must be a deliberate test edit, not silent."""
+        from aetherscan.cli import (  # noqa: PLC0415
+            _SAVED_CONFIG_FIELD_ALLOWLIST,
+            _SAVED_CONFIG_SECTION_ALLOWLIST,
+        )
+
+        assert _SAVED_CONFIG_FIELD_ALLOWLIST["rf"] == frozenset(
+            {"latent_variant", "active_dims", "calibration_active", "calibration_method"}
+        )
+        assert frozenset({"beta_vae"}) == _SAVED_CONFIG_SECTION_ALLOWLIST
 
     def test_host_tuning_knobs_never_layered(self, tmp_path):
         """#298 I4: batching/prefetch are host tuning, not model provenance — a config

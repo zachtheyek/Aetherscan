@@ -73,10 +73,16 @@ startup diff line, so nothing disappears silently. The old inverse design (apply
 minus a skip-list) left every host-scoped field unsafe by default — the live footgun being
 `manager.n_processes`: a config saved on a 96-core host silently 3×-oversubscribed a
 32-core host's worker pool, with no CLI rescue before `--n-processes` existed. The
-allowlist is **derived from `run_state.py`'s fingerprint key sets** and pinned by a drift
-test, so `cli.py` and `run_state.py` can never silently disagree about what is
-result-affecting: a new result-affecting field defaults to layering, a new host field
-defaults to ignored — both fail-safe.
+inference and data sub-allowlists are **derived from `run_state.py`'s fingerprint key
+sets** and pinned by a drift test, so `cli.py` and `run_state.py` can never silently
+disagree about which inference/data fields are result-affecting; the `rf` field allowlist
+and the `beta_vae` section allowlist are literal (`rf` is in no fingerprint) and pinned by
+their own equality test. One trap this design does **not** remove: a *new* field added to
+`InferenceConfig` defaults **into** the allowlist (it is `fields(InferenceConfig)` minus the
+exclude set) and — once mirrored into `to_dict` — into both fingerprints, so a new
+host-tuning knob on `InferenceConfig` must be added to the run_state denylists explicitly,
+exactly as `prune_stamps`/`inference_viz_scope` were. Only a field added to a
+non-allowlisted section (`manager`, `gpu`, `db`, …) is ignored by default.
 
 ## The configuration singleton
 
