@@ -556,15 +556,22 @@ class InferenceConfig:
     preprocess_output_dir: str | None = None
     # Stamp-cache pruning (#302): delete a cadence's stamp .npy right after its 'inferred'
     # manifest row lands (metadata .json always kept; resume rides the DB row; each
-    # candidate's snippet is snapshotted into a ~196 KB .candidates.npz sidecar and a
-    # bounded in-memory pixel pool keeps the stamp gallery whole). Without pruning a full
-    # catalog writes ~30-90 TB of stamps vs ~2.7 TB free on /datax — the run dies on disk
-    # after a few hundred cadences. None (default) = AUTO: ON for the fingerprint-scoped
-    # default cache dir, OFF when preprocess_output_dir is explicitly set (an
-    # operator-curated cache is never destroyed implicitly). Only stamps THIS run freshly
-    # extracted are ever pruned — a resumed run never deletes a cache it was handed.
-    # Trade: pruning forfeits the cross-run stamp-reuse rerun win for pruned cadences
-    # (re-extraction ~5-15 min each); same-run resume/retry is unaffected.
+    # candidate's snippet is snapshotted into a ~196 KB .candidates.npz sidecar so the
+    # candidate figures survive, and a bounded top-K pixel pool — persisted across the
+    # in-process retry attempts, #305 — keeps the stamp gallery whole within one run).
+    # Without pruning a full catalog writes ~30-90 TB of stamps vs ~2.7 TB free on /datax —
+    # the run dies on disk after a few hundred cadences. None (default) = AUTO: ON for the
+    # fingerprint-scoped default cache dir, OFF when preprocess_output_dir is explicitly set
+    # (an operator-curated cache is never destroyed implicitly). Only stamps THIS run
+    # extracted are pruned (a resumed run never deletes a handed cache; a failed-then-retried
+    # cadence of the same run IS pruned). Same-run resume/retry is science-unaffected.
+    # Known limitations (viz-only, graceful): a cross-PROCESS relaunch cannot recover an
+    # earlier process's pruned pixels, so its stamp gallery may show blank columns for
+    # earlier-run cadences; and concurrent runs sharing the default cache dir with pruning
+    # ON can race (one deletes/overwrites a .npy or .candidates.npz another is mid-read of —
+    # self-heals via retry). Use a per-run --preprocess-output-dir or --no-prune-stamps to
+    # run concurrently in one dir. Trade: pruning forfeits the cross-run stamp-reuse rerun
+    # win for pruned cadences (re-extraction ~5-15 min each).
     prune_stamps: bool | None = None
 
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming

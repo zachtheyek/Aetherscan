@@ -24,7 +24,6 @@ background threads, and pyplot's global figure registry is not thread-safe.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -184,7 +183,11 @@ class InferenceVizCollector:
     subsampled against a global budget (candidates always kept).
     """
 
-    def __init__(self, max_latent_points: int = _MAX_LATENT_POINTS):
+    def __init__(
+        self,
+        max_latent_points: int = _MAX_LATENT_POINTS,
+        gallery_pool: list | None = None,
+    ):
         self.records: list[CadenceVizRecord] = []
         self._max_latent_points = max_latent_points
         self._latent_chunks: list[np.ndarray] = []  # (k, num_obs * latent_dim) each
@@ -195,9 +198,16 @@ class InferenceVizCollector:
         self._rng = derive_rng(root_seed, STREAM_INFERENCE_VIZ)
         # Bounded top-K stamp-pixel pool (#302): raw pixels of the strongest stamps seen
         # so far, captured just before pruning deletes a cadence's .npy, so the stamp
-        # gallery stays whole (~196 KB x top_k ≈ 2.4 MB at defaults)
+        # gallery stays whole (~196 KB x top_k ≈ 2.4 MB at defaults). A caller-supplied
+        # list persists it ACROSS the in-process retry attempts (#305 fix): each attempt
+        # builds a fresh collector, but a cadence pruned in an earlier attempt is
+        # resume-skipped (never re-pooled) in later ones, so a per-attempt pool would blank
+        # its gallery column on the retry render. Cross-PROCESS relaunch still can't recover
+        # those pixels (documented) — but a full-catalog run rarely relaunches.
         self._gallery_top_k = config.inference.stamp_gallery_top_k if config is not None else 12
-        self._gallery_pixel_pool: list[tuple[float, str, int, np.ndarray]] = []
+        self._gallery_pixel_pool: list[tuple[float, str, int, np.ndarray]] = (
+            gallery_pool if gallery_pool is not None else []
+        )
 
     def record_skipped(
         self, key: tuple, npy_path: str, metadata_path: str, manifest_row: dict
@@ -459,8 +469,21 @@ def _reduce_metadata(
     summary.n_raw_hits = int(metadata.get("n_raw_hits") or 0)
     summary.n_merged_hits = int(metadata.get("n_merged_hits") or 0)
     summary.n_stamp_rows = len(metadata.get("stamp_starts") or []) or record.n_stamps
-    with contextlib.suppress(OSError):
+    try:
         summary.npy_size_bytes = float(os.path.getsize(record.npy_path))
+    except OSError:
+        # The .npy was pruned after scoring (#302 default) — reconstruct the size the run
+        # transiently held from the stored geometry so the funnel/summary storage figures
+        # don't silently collapse to nan/0 on every default run. The .npy shape is
+        # (n_stamps, n_obs, time_bins, stored_width) float32 + a ~128-byte header.
+        config = get_config()
+        stored_width = metadata.get("stored_width")
+        time_bins = config.data.time_bins if config is not None else None
+        n_obs = len(metadata.get("h5_paths") or []) or 6
+        if stored_width and time_bins:
+            summary.npy_size_bytes = float(
+                summary.n_stamp_rows * n_obs * int(time_bins) * int(stored_width) * 4 + 128
+            )
     ed_hist = metadata.get("ed_stat_hist")
     if ed_hist:
         summary.ed_hist_edges = np.asarray(ed_hist["bin_edges"], dtype=np.float64)
@@ -579,14 +602,27 @@ def plot_ed_stat_distributions(
     return _save_and_upload(fig, f"ed_stat_distributions_{tag}.png", "ED Statistic Distribution")
 
 
+def _clamp_hit_spectrum_bins(
+    lo: float, hi: float, coarsest_fine_width: float, max_bins: int
+) -> int:
+    """Number of hit-spectrum figure bins over [lo, hi] that keeps each figure bin no finer
+    than the coarsest stored fine grid (>= one fine bin per figure bin), so the rebin can't
+    alias into a picket-fence (#305). Returns max_bins when the span is wide (the common
+    case) and fewer as the span narrows toward the fine-grid resolution."""
+    if coarsest_fine_width <= 0 or hi <= lo:
+        return max_bins
+    return max(1, min(max_bins, int((hi - lo) / coarsest_fine_width)))
+
+
 def plot_ed_hit_spectrum(
     records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary]
 ) -> str | None:
     """Hit density vs frequency (MHz) across the band, pre- vs post-deduplication — RFI comb
     structure shows up immediately as spikes/picket-fences. Rendered by rebinning each
     cadence's bounded fine histogram (pre-binned by preprocessing, or reduced from a legacy
-    sidecar's raw lists at load — #301) onto one global axis: the fine bins are ≥40x finer
-    than the figure's, so the result is visually identical to histogramming the raw floats
+    sidecar's raw lists at load — #301) onto one global axis whose bin count is clamped so
+    the figure bins are never finer than the stored fine grid — so the result is visually
+    faithful to histogramming the raw floats (identical for the wide-span common case)
     while never holding the catalog's hit lists in RAM."""
     tag = get_config().checkpoint.save_tag
 
@@ -603,10 +639,21 @@ def plot_ed_hit_spectrum(
     hi = max(s.hit_hist["raw_freq_max"] for s in with_hits)
     if lo == hi:  # single-frequency degenerate range: give the histogram some width
         lo, hi = lo - 0.5, hi + 0.5
-    bins = np.linspace(lo, hi, _HIT_SPECTRUM_BINS + 1)
 
-    raw_total = np.zeros(_HIT_SPECTRUM_BINS, dtype=np.float64)
-    merged_total = np.zeros(_HIT_SPECTRUM_BINS, dtype=np.float64)
+    # Clamp the figure's bin count so its bins are never FINER than the stored fine grid
+    # over this span (#305 review): new sidecars pre-bin over the whole file band, so when
+    # the catalog-wide hit span is narrow (< ~band/41) the 200-bin figure axis would be
+    # finer than the fine bins and the center-weighted rebin below would draw a spurious
+    # picket-fence (empty bins between populated ones) not present in the data.
+    coarsest_fine_width = max(
+        (s.hit_hist["freq_hi"] - s.hit_hist["freq_lo"]) / max(1, len(s.hit_hist["raw_counts"]))
+        for s in with_hits
+    )
+    n_fig_bins = _clamp_hit_spectrum_bins(lo, hi, coarsest_fine_width, _HIT_SPECTRUM_BINS)
+    bins = np.linspace(lo, hi, n_fig_bins + 1)
+
+    raw_total = np.zeros(n_fig_bins, dtype=np.float64)
+    merged_total = np.zeros(n_fig_bins, dtype=np.float64)
     for s in with_hits:
         h = s.hit_hist
         fine_edges = np.linspace(h["freq_lo"], h["freq_hi"], len(h["raw_counts"]) + 1)

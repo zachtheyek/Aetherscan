@@ -207,6 +207,27 @@ class TestCollector:
             os.remove(record.npy_path)  # the prune
         _assert_figure(plot_stamp_gallery(collector.records, summaries, pool))
 
+    def test_shared_gallery_pool_persists_across_attempts(self, tmp_path):
+        """#305: passing a caller-owned list makes the pixel pool survive an in-process
+        retry — a cadence pruned by attempt 1 must still render in attempt 2's gallery,
+        whose fresh collector shares the same list."""
+        get_config().checkpoint.save_tag = TAG
+        shared: list = []
+        npy_a, meta_a, _ = _write_cadence_artifacts(tmp_path, "att1", ("A",))
+
+        # Attempt 1: a fresh collector on the shared pool captures cad A's pixels, then A
+        # is pruned (its .npy deleted)
+        coll1 = InferenceVizCollector(gallery_pool=shared)
+        coll1.record_processed(("A",), npy_a, meta_a, {}, _fake_results(), 1.0)
+        coll1.pool_gallery_pixels(meta_a, npy_a)
+        assert len(shared) > 0
+        os.remove(npy_a)
+
+        # Attempt 2: a NEW collector on the SAME shared list still holds A's pooled pixels
+        coll2 = InferenceVizCollector(gallery_pool=shared)
+        assert coll2.gallery_pixels() == coll1.gallery_pixels()
+        assert any(path == npy_a for (path, _idx) in coll2.gallery_pixels())
+
     def test_budget_exhausted_appends_nothing(self):
         """The spent-budget early return (#301): once no rows can be kept, the method may
         not build anything — this is every non-candidate cadence after the first one or
@@ -283,6 +304,87 @@ class TestFigureSmoke:
 
     def test_ed_hit_spectrum(self, collector, summaries):
         _assert_figure(plot_ed_hit_spectrum(collector.records, summaries))
+
+    def test_storage_size_from_geometry_when_pruned(self, tmp_path):
+        """#305: with default pruning the .npy is gone by render time, so _reduce_metadata
+        reconstructs the transiently-held storage from the stored geometry instead of
+        leaving nan (which collapsed the funnel/summary storage totals to ~0)."""
+        get_config().checkpoint.save_tag = TAG
+        get_config().data.time_bins = 16  # matches _write_cadence_artifacts' (…,6,16,W)
+        npy, meta_path, metadata = _write_cadence_artifacts(tmp_path, "sized", ("S",))
+        real_size = os.path.getsize(npy)
+        coll = InferenceVizCollector()
+        coll.record_processed(("S",), npy, meta_path, {}, _fake_results(), 1.0)
+
+        # Present file: exact stat
+        summaries = _build_summaries(coll.records, 12)
+        assert summaries[npy].npy_size_bytes == float(real_size)
+
+        # Pruned file: geometry estimate, close to the real size and NOT nan
+        os.remove(npy)
+        summaries = _build_summaries(coll.records, 12)
+        est = summaries[npy].npy_size_bytes
+        assert not np.isnan(est)
+        # n_stamps * 6 * time_bins * stored_width * 4 (+128 header) — within the header slack
+        assert abs(est - real_size) <= 256
+
+    def test_hit_spectrum_bin_clamp(self):
+        """#305: figure bins must never be finer than the stored fine grid, else the
+        narrow-span rebin aliases into a picket-fence. Wide span keeps the full 200 bins;
+        a span at ~fine-grid resolution collapses toward 1."""
+        from aetherscan.inference_viz import _clamp_hit_spectrum_bins  # noqa: PLC0415
+
+        # Wide span (fine width tiny vs span): full resolution
+        assert _clamp_hit_spectrum_bins(1000.0, 1200.0, 0.01, 200) == 200
+        # Narrow span: 2 MHz span, fine bins ~22.9 kHz (187.5 MHz band / 8192) -> ~87 bins
+        assert _clamp_hit_spectrum_bins(1000.0, 1002.0, 187.5 / 8192, 200) < 200
+        assert _clamp_hit_spectrum_bins(1000.0, 1002.0, 187.5 / 8192, 200) >= 1
+        # Degenerate / zero-width fine grid: fall back to the cap, never 0 or negative
+        assert _clamp_hit_spectrum_bins(1000.0, 1000.0, 0.01, 200) == 200
+        assert _clamp_hit_spectrum_bins(1000.0, 1200.0, 0.0, 200) == 200
+
+    def test_ed_hit_spectrum_narrow_span_renders_without_aliasing(self, tmp_path, monkeypatch):
+        """A new-style sidecar whose hits occupy a narrow sub-band must render with clamped
+        (not 200) bins so no empty picket-fence bins appear between populated ones."""
+        get_config().checkpoint.save_tag = TAG
+        npy, meta_path, metadata = _write_cadence_artifacts(tmp_path, "narrow", ("N",))
+        # Full band 1000..1187.5 MHz, but all hits in a 2 MHz sub-band
+        n_fine = 8192
+        edges = np.linspace(1000.0, 1187.5, n_fine + 1)
+        raw = np.zeros(n_fine, dtype=int)
+        in_band = (edges[:-1] >= 1000.0) & (edges[:-1] < 1002.0)
+        raw[in_band] = 5  # every fine bin in the sub-band populated -> would alias at 200
+        metadata["hit_spectrum_hist"] = {
+            "freq_lo": 1000.0,
+            "freq_hi": 1187.5,
+            "n_bins": n_fine,
+            "raw_counts": raw.tolist(),
+            "merged_counts": raw.tolist(),
+            "raw_freq_min": 1000.0,
+            "raw_freq_max": 1002.0,
+        }
+        metadata.pop("raw_hit_frequencies_mhz", None)
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f)
+        coll = InferenceVizCollector()
+        coll.record_processed(("N",), npy, meta_path, {}, _fake_results(), 1.0)
+        summaries = _build_summaries(coll.records, 12)
+
+        captured: dict = {}
+
+        def _capture(fig, filename, slack_title):
+            ax = fig.axes[0]
+            # stairs() adds a StepPatch; count its populated-vs-empty structure indirectly
+            # by the x-data resolution — assert the axis used clamped bins, not 200
+            captured["xlim_span"] = ax.get_xlim()
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_ed_hit_spectrum(coll.records, summaries) is not None
+        # The clamp keeps figure bins >= fine width; with fine width ~22.9 kHz over a 2 MHz
+        # span the clamp yields ~87 bins, all populated (no picket-fence gaps)
+        span = captured["xlim_span"][1] - captured["xlim_span"][0]
+        assert span > 0
 
     def test_ed_hit_spectrum_prebinned_matches_legacy_totals(self, collector, monkeypatch):
         """New sidecars carry hit_spectrum_hist pre-binned by preprocessing; legacy

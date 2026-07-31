@@ -511,6 +511,46 @@ class TestExtractStampsWorkerDownsample:
                 )
                 np.testing.assert_array_equal(written[i, 1], expected)
 
+    def test_stale_tmp_sweep_covers_all_tmp_suffixes(self, tmp_path, monkeypatch):
+        """#305: the age-gated sweep must catch the metadata '.json.<pid>.<hex>.tmp' and
+        candidate-sidecar '.candidates.npz.<pid>.<hex>.tmp' orphans, not just the stamp
+        '.tmp.npy' — a crash between np.savez/json.dump and os.replace otherwise leaks them
+        forever in the shared cache dir."""
+        import glob as _glob  # noqa: PLC0415
+        import time as _time  # noqa: PLC0415
+
+        from aetherscan.preprocessing import _STALE_TMP_MAX_AGE_S  # noqa: PLC0415
+
+        stem = str(tmp_path / "cad")
+        old = _time.time() - _STALE_TMP_MAX_AGE_S - 100
+        fresh = _time.time()
+        tmps = {
+            f"{stem}.12345.abcdef.tmp.npy": old,  # stamp memmap tmp (already swept)
+            f"{stem}.json.12345.abcdef.tmp": old,  # metadata tmp (was leaked)
+            f"{stem}.candidates.npz.12345.abcdef.tmp": old,  # #302 sidecar tmp (was leaked)
+            f"{stem}.99999.fedcba.tmp": fresh,  # a live concurrent run's tmp — must survive
+        }
+        for path, mtime in tmps.items():
+            open(path, "wb").close()
+            os.utime(path, (mtime, mtime))
+
+        # Exercise the exact sweep expression from _process_cadence
+        stale_cutoff = _time.time() - _STALE_TMP_MAX_AGE_S
+        escaped = _glob.escape(stem)
+        swept = (
+            _glob.glob(f"{escaped}.*.tmp.npy")
+            + _glob.glob(f"{escaped}.*.tmp")
+            + [f"{stem}.tmp.npy"]
+        )
+        for stale in swept:
+            if os.path.exists(stale) and os.path.getmtime(stale) < stale_cutoff:
+                os.remove(stale)
+
+        assert not os.path.exists(f"{stem}.json.12345.abcdef.tmp")
+        assert not os.path.exists(f"{stem}.candidates.npz.12345.abcdef.tmp")
+        assert not os.path.exists(f"{stem}.12345.abcdef.tmp.npy")
+        assert os.path.exists(f"{stem}.99999.fedcba.tmp")  # fresh tmp untouched
+
     def test_coalesce_grouping_rules(self):
         from aetherscan.preprocessing import (  # noqa: PLC0415
             _COALESCE_MAX_BINS,
@@ -690,17 +730,24 @@ class TestProcessCadenceEndToEnd:
         assert json.loads(manifest[0]["cadence_key"]) == ["T1", "S1", "L", "7", "2251"]
         assert manifest[0]["duration_s"] > 0
 
-        # Fresh extraction is flagged prunable; the resume path below must NOT be (#302:
-        # pruning only ever deletes stamps this run freshly extracted)
+        # Fresh extraction is flagged prunable (#302)
         assert result.freshly_extracted is True
 
         # Resume path: a second call must skip reprocessing and report the same hit count,
-        # without duplicating the manifest row
+        # without duplicating the manifest row. Because THIS preprocessor extracted the
+        # .npy, its resume is still prunable (#305 disk-leak fix: a failed-then-retried
+        # cadence of the same run must not escape pruning forever).
         resumed = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
         assert resumed is not None
         assert resumed.n_hits == result.n_hits
         assert resumed.npy_path == npy_path
-        assert resumed.freshly_extracted is False
+        assert resumed.freshly_extracted is True
+
+        # A DIFFERENT preprocessor (a genuinely handed cache — separate process/operator)
+        # resuming the same .npy must NOT be prunable: its extracted-set is empty.
+        handed = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert handed is not None
+        assert handed.freshly_extracted is False
         assert db.flush(timeout=10) is True
         manifest = db.query_inference_cadences(tag=config.checkpoint.save_tag, npy_path=npy_path)
         assert len(manifest) == 1

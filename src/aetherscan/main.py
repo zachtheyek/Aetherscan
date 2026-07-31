@@ -606,7 +606,9 @@ def _infer_cadence(
 
 
 def _run_streaming_csv_inference(
-    preprocessor: DataPreprocessor, strategy: tf.distribute.Strategy
+    preprocessor: DataPreprocessor,
+    strategy: tf.distribute.Strategy,
+    gallery_pool: list | None = None,
 ) -> dict:
     """
     Per-cadence streaming inference over the configured CSV catalogs, with stage-aware
@@ -659,7 +661,14 @@ def _run_streaming_csv_inference(
         "n_cadences": 0,
         "n_skipped": 0,
     }
-    collector = InferenceVizCollector() if config.inference.inference_viz_enabled else None
+    # gallery_pool (a run-scoped list from inference_command) persists the stamp-gallery
+    # pixel pool across the in-process retry attempts (#305): a fresh collector per attempt
+    # would otherwise blank the gallery for cadences an earlier attempt pruned.
+    collector = (
+        InferenceVizCollector(gallery_pool=gallery_pool)
+        if config.inference.inference_viz_enabled
+        else None
+    )
 
     # Stage-aware resume: a live 'inferred' manifest row for (tag, npy_path) means the cadence
     # completed on an earlier attempt — skip it and reuse its aggregates, but ONLY when it was
@@ -984,6 +993,11 @@ def inference_command():
     max_retries = config.inference.max_retries
     retry_delay = config.inference.retry_delay
     results = None
+    # Run-scoped stamp-gallery pixel pool: persists across the retry attempts below so a
+    # cadence pruned in an earlier attempt still renders in the final attempt's gallery
+    # (#305). Bounded to top-K pixels (~2.4 MB); the preprocessor likewise persists, so its
+    # freshly-extracted set survives too.
+    gallery_pool: list = []
 
     for attempt in range(max_retries):
         try:
@@ -994,7 +1008,7 @@ def inference_command():
                 # write, with models loaded once and inference.prefetch_depth cadences in
                 # flight (see _run_streaming_csv_inference). Memory stays independent of
                 # catalog size.
-                results = _run_streaming_csv_inference(preprocessor, strategy)
+                results = _run_streaming_csv_inference(preprocessor, strategy, gallery_pool)
             else:
                 if not config.data.test_files:
                     logger.error(

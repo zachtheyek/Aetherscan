@@ -1043,6 +1043,13 @@ class DataPreprocessor:
         # cadences of a run (see start/stop_energy_detection_pool)
         self._ed_pool: Pool | None = None
 
+        # npy_paths THIS process freshly extracted (#302 disk-leak fix): survives the
+        # in-process retry loop because the preprocessor outlives it. A cadence this run
+        # extracted then resumes on a later attempt (its stamps were kept because its
+        # inference stage failed) is still prunable — unlike a genuinely handed cache,
+        # which this process never extracted and so is absent from the set.
+        self._extracted_this_run: set[str] = set()
+
     # NOTE: come back to this later
     def close(self):
         """Explicitly close the multiprocessing pool and shared memory"""
@@ -1722,6 +1729,9 @@ class DataPreprocessor:
                         key=group.key,
                         n_hits=n_hits,
                         metadata_path=metadata_path,
+                        # Prunable iff THIS process extracted it (a failed-then-retried
+                        # cadence of this run), not if it is a handed cache (#302 leak fix)
+                        freshly_extracted=npy_path in self._extracted_this_run,
                     )
                 # Guard failed: fall through and reprocess (the atomic tmp -> os.replace
                 # publication overwrites the mismatched artifact)
@@ -2133,14 +2143,24 @@ class DataPreprocessor:
         # deterministic given the ED config, so whichever writer publishes last is
         # harmless; os.replace stays atomic.
         tmp_npy_path = f"{os.path.splitext(npy_path)[0]}.{os.getpid()}.{uuid.uuid4().hex}.tmp.npy"
-        # A leftover *.tmp.npy means an attempt died (e.g. SIGKILL) between memmap creation
-        # and os.replace; it was never promoted to npy_path, so it is safe to drop once
-        # clearly abandoned. Only age-expired tmps are removed — a fresh one may be a live
-        # concurrent run's in-progress write. The fixed pre-#298 "<stem>.tmp.npy" name is
-        # swept too (legacy leftovers in explicitly shared directories).
+        # A leftover per-cadence tmp means an attempt died (e.g. SIGKILL) between creation
+        # and os.replace; it was never promoted, so it is safe to drop once clearly
+        # abandoned. Only age-expired tmps are removed — a fresh one may be a live
+        # concurrent run's in-progress write. The glob "<stem>.*.tmp" sweeps every
+        # per-cadence tmp uniformly: the stamp memmap "<stem>.<pid>.<hex>.tmp.npy", the
+        # metadata "<stem>.json.<pid>.<hex>.tmp", and the #302 candidate sidecar
+        # "<stem>.candidates.npz.<pid>.<hex>.tmp" (the latter two ended in ".tmp" but not
+        # ".tmp.npy", so the old ".*.tmp.npy" glob leaked them). The fixed pre-#298
+        # "<stem>.tmp.npy" legacy name is swept too.
         stale_cutoff = time.time() - _STALE_TMP_MAX_AGE_S
         stem = os.path.splitext(npy_path)[0]
-        for stale in glob.glob(f"{glob.escape(stem)}.*.tmp.npy") + [f"{stem}.tmp.npy"]:
+        escaped = glob.escape(stem)
+        stale_tmps = (
+            glob.glob(f"{escaped}.*.tmp.npy")  # stamp memmap tmps
+            + glob.glob(f"{escaped}.*.tmp")  # metadata + candidate-sidecar tmps
+            + [f"{stem}.tmp.npy"]  # fixed pre-#298 legacy name
+        )
+        for stale in stale_tmps:
             with contextlib.suppress(OSError):
                 if os.path.getmtime(stale) < stale_cutoff:
                     logger.warning(
@@ -2298,6 +2318,9 @@ class DataPreprocessor:
             f"{npy_path} (metadata: {metadata_path})"
         )
 
+        # Record for the disk-leak guard: a later retry attempt that resumes this .npy
+        # (kept because this attempt's inference failed) is still this run's work to prune
+        self._extracted_this_run.add(npy_path)
         return CadenceResult(
             npy_path=npy_path,
             h5_paths=group.h5_paths,
