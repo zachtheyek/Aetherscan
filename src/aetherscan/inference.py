@@ -278,11 +278,15 @@ class InferencePipeline:
                     # Shape contract the traced encode step relies on (outputs[0] =
                     # z_mean, outputs[1] = z_log_var — vae.py's head order): a future
                     # encoder with a different head count must land in the fallback
-                    # below loudly, not mis-slice silently (#305 review note)
-                    if len(self._encode_model.outputs) != 2:
+                    # below loudly, not mis-slice silently. Check the ORIGINAL encoder's
+                    # output count — the derived submodel's is always min(2, N) by
+                    # construction and would let a 3+-output refactor pass unnoticed
+                    # (#305 pass-2 review note).
+                    if len(self.encoder.outputs) != 2:
                         raise ValueError(
-                            f"encode submodel has {len(self._encode_model.outputs)} "
-                            f"outputs, expected 2 (z_mean, z_log_var)"
+                            f"encoder has {len(self.encoder.outputs)} outputs, "
+                            f"expected 2 (z_mean, z_log_var); refusing to build a "
+                            f"potentially mis-ordered encode submodel"
                         )
                 except Exception as e:
                     logger.warning(
