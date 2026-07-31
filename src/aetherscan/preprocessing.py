@@ -95,6 +95,12 @@ _EXTRACT_TASKS_PER_WORKER = 4
 # is considered abandoned and removed. Live writes are minutes-scale; a day of margin means
 # a concurrent run's in-progress tmp can never be mistaken for a dead one.
 _STALE_TMP_MAX_AGE_S = 24 * 3600
+# Cap on one coalesced extraction read (#301): overlapping/abutting stamp windows (the
+# overlap_search triplets abut at offset stamp_width // 2) are fetched as ONE wide h5
+# read and sliced, instead of re-reading the shared span per stamp. 2**20 bins bounds the
+# wide float32 buffer at ~64 MiB per worker (16 time rows) even across an RFI comb whose
+# windows chain for a whole coarse channel.
+_COALESCE_MAX_BINS = 2**20
 
 
 def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
@@ -725,19 +731,49 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
     return hits, stat_hist
 
 
+def _coalesce_stamp_groups(stamp_starts, stamp_width: int) -> list[list[int]]:
+    """Group indices of start-sorted stamps whose read windows overlap or abut, so each
+    group pays one wide h5 read (#301). A group is capped at _COALESCE_MAX_BINS total
+    span to bound the wide buffer. Disjoint windows stay singleton groups — the read
+    pattern is then exactly the historical per-stamp one."""
+    groups: list[list[int]] = []
+    current = [0]
+    for i in range(1, len(stamp_starts)):
+        fits = stamp_starts[i] + stamp_width - stamp_starts[current[0]] <= _COALESCE_MAX_BINS
+        if stamp_starts[i] <= stamp_starts[current[-1]] + stamp_width and fits:
+            current.append(i)
+        else:
+            groups.append(current)
+            current = [i]
+    groups.append(current)
+    return groups
+
+
 def _extract_stamps_worker(args: tuple) -> None:
     """Fill one (obs_file, stamp-range) slice of the memmap-backed cadence .npy.
 
     Each worker opens its own hdf5 handle and its own r+ view of the shared .npy, then
     copies a stamp_width-wide window (over the first `time_bins` rows, polarization 0) around
-    each hit. When downsample_factor > 1 the stamp is downsampled along frequency with
+    each hit. Overlapping/abutting windows (the overlap_search triplets abut at offset
+    stamp_width // 2) are fetched as one coalesced wide read and sliced per stamp —
+    byte-identical values, ~one read instead of three over an RFI comb (#301). When
+    downsample_factor > 1 each stamp is downsampled along frequency with
     downscale_local_mean before writing, so the memmap stores width
     stamp_width // downsample_factor — this is the same operation load_inference_data used to
     apply after the fact, moved to extraction time to cut storage by the same factor. Tasks
     address disjoint output regions — distinct obs_idx and/or non-overlapping stamp indices —
     so concurrent writes from the pool never collide. `stamp_starts` is the contiguous,
     start-sorted slice for this task; `base_idx` is its offset into the full stamp list so the
-    worker writes to the correct absolute rows.
+    worker writes to the correct absolute rows. `open_kwargs` is the chunk-cache sizing
+    computed ONCE per obs file in the parent (#301 — each task used to re-open the file just
+    to inspect its chunk layout; same hoist as the PFB-check tasks).
+
+    NOTE: no out.flush() before the memmap closes (#301). flush() msync(MS_SYNC)s the ENTIRE
+    multi-GB mapping once per task (~132 tasks/cadence), serializing writeback into worker
+    time; closing the mapping leaves the dirty pages to the kernel's async writeback with
+    identical read coherence (unified page cache). Crash durability is unchanged — the
+    os.replace publication never fsynced the data pages anyway, and an unpublished tmp is
+    re-extracted by design.
     """
     (
         npy_path,
@@ -748,6 +784,7 @@ def _extract_stamps_worker(args: tuple) -> None:
         time_bins,
         stamp_width,
         downsample_factor,
+        open_kwargs,
     ) = args
     out = np.lib.format.open_memmap(npy_path, mode="r+")
     try:
@@ -755,14 +792,20 @@ def _extract_stamps_worker(args: tuple) -> None:
         # with the h5py default (1 MiB) a BL-scale bitshuffle chunk never fits, so every
         # stamp re-decompresses its full chunk stripe; sized from the actual layout, each
         # chunk decompresses once per task (see _chunk_cache_kwargs).
-        with h5py.File(obs_h5, "r", **_chunk_cache_kwargs(obs_h5, time_bins)) as hf:
+        with h5py.File(obs_h5, "r", **(open_kwargs or {})) as hf:
             dset = hf["data"]
-            for local_i, start in enumerate(stamp_starts):
-                stamp = dset[:time_bins, 0, start : start + stamp_width]
-                if downsample_factor > 1:
-                    stamp = downscale_local_mean(stamp, (1, downsample_factor)).astype(np.float32)
-                out[base_idx + local_i, obs_idx] = stamp
-        out.flush()
+            for group in _coalesce_stamp_groups(stamp_starts, stamp_width):
+                group_start = stamp_starts[group[0]]
+                group_end = stamp_starts[group[-1]] + stamp_width
+                wide = dset[:time_bins, 0, group_start:group_end]
+                for local_i in group:
+                    offset = stamp_starts[local_i] - group_start
+                    stamp = wide[:, offset : offset + stamp_width]
+                    if downsample_factor > 1:
+                        stamp = downscale_local_mean(stamp, (1, downsample_factor)).astype(
+                            np.float32
+                        )
+                    out[base_idx + local_i, obs_idx] = stamp
     finally:
         del out
 
@@ -1315,13 +1358,21 @@ class DataPreprocessor:
 
             # Divide background into equal chunks, then cutoff if exceeds max_chunks
             n_cadences_total = raw_data.shape[0]
-            n_chunks = (n_cadences_total + chunk_size - 1) // chunk_size
+            # One chunk per already-downsampled file on the sequential path (#301): the
+            # chunking bounds the SHM block on the pooled path and RAM on legacy
+            # full-width loads, but here it only split one cadence's stamps into blocks
+            # that then paid a full-array np.concatenate re-copy at the end — peak
+            # transient is ~2x the array either way.
+            effective_chunk_size = chunk_size
+            if already_downsampled and not parallel:
+                effective_chunk_size = max(chunk_size, n_cadences_total)
+            n_chunks = (n_cadences_total + effective_chunk_size - 1) // effective_chunk_size
 
             for chunk_idx in range(n_chunks):
                 logger.info(f"Processing {filename}: chunk {chunk_idx + 1}/{n_chunks}")
 
-                chunk_start = chunk_idx * chunk_size
-                chunk_end = min((chunk_idx + 1) * chunk_size, n_cadences_total)
+                chunk_start = chunk_idx * effective_chunk_size
+                chunk_end = min((chunk_idx + 1) * effective_chunk_size, n_cadences_total)
 
                 # Load chunk into memory
                 chunk_data = np.array(raw_data[chunk_start:chunk_end])
@@ -1460,7 +1511,13 @@ class DataPreprocessor:
         # Clear all_blocks reference
         del all_blocks
 
-        # Sanity check: print descriptive stats
+        # Sanity check: print descriptive stats. NaN detection rides the min reduction
+        # (NaN propagates through np.min, and NaN > 1.0 / NaN < 0.0 are both False, so a
+        # NaN array reaches that branch exactly as it did via the old full-array
+        # .any() pass); the two extra full-array validity passes and their full-size
+        # bool temporaries are gone (#301). The old isinf branch was unreachable: +inf
+        # always tripped the max check first, -inf the min check, and NaN the isnan
+        # branch — outcomes and messages are unchanged for every input.
         min_val = np.min(cadence_array)
         max_val = np.max(cadence_array)
         mean_val = np.mean(cadence_array)
@@ -1471,11 +1528,8 @@ class DataPreprocessor:
         elif min_val < 0.0:
             logger.error(f"Cadence array values too small! Min: {min_val}")
             raise ValueError("Preprocessing normalization check failed")
-        elif np.isnan(cadence_array).any():
+        elif np.isnan(min_val):
             logger.error("Cadence array contains NaN values!")
-            raise ValueError("Preprocessing normalization check failed")
-        elif np.isinf(cadence_array).any():
-            logger.error("Cadence array contains Inf values!")
             raise ValueError("Preprocessing normalization check failed")
         else:
             logger.info("Cadence array properly normalized")
@@ -1800,7 +1854,6 @@ class DataPreprocessor:
         downsample_factor = self.config.data.downsample_factor if store_downsampled else 1
         time_bins = self.config.data.time_bins
         n_processes = self.config.manager.n_processes
-        progress_chunk = max(1, log_interval if log_interval is not None else n_processes)
 
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
@@ -1905,6 +1958,16 @@ class DataPreprocessor:
             f"Cadence {group.key}: running energy detection on "
             f"{len(on_source_paths)} ON-source files x {n_coarse_total} coarse channels"
         )
+        # Progress-log points per ON file (#301): an explicit coarse_channel_log_interval
+        # keeps the historical every-N-channels cadence; the None default logs at ~25%
+        # milestones instead of every n_processes channels — the per-channel progress
+        # lines were a measured 62% of a run's total log volume, all Slack-bound
+        # (~594k lines over a full catalog).
+        if log_interval is not None:
+            step = max(1, log_interval)
+            progress_points = set(range(step, n_coarse_total + 1, step)) | {n_coarse_total}
+        else:
+            progress_points = {max(1, (n_coarse_total * q) // 4) for q in (1, 2, 3, 4)}
         with stage_timer("read_ed"):
             # Residual-flatness sanity check — primary ON file only (the static response is
             # a property of the backend, shared by every file). Runs ON THE POOL alongside
@@ -1949,7 +2012,7 @@ class DataPreprocessor:
                 file_done = done % n_coarse_total + 1
                 all_hits.extend(channel_hits)
                 stat_hists[on_source_idx] += channel_hist
-                if file_done % progress_chunk == 0 or file_done == n_coarse_total:
+                if file_done in progress_points:
                     logger.info(
                         f"  Coarse channel {file_done}/{n_coarse_total} of ON-source "
                         f"{on_source_idx + 1}/{len(on_source_paths)}"
@@ -2060,6 +2123,11 @@ class DataPreprocessor:
             1, -(-(_EXTRACT_TASKS_PER_WORKER * n_processes) // len(group.h5_paths))
         )  # ceil div
         chunk_size = max(1, -(-n_stamps // chunks_per_file))  # ceil div
+        # Chunk-cache kwargs are a pure function of each file's layout — computed once per
+        # obs file here instead of once per task in the workers (#301: ~2 redundant
+        # network-FS open/inspect cycles x ~132 tasks per cadence; the same hoist the
+        # PFB-check tasks already used)
+        cache_kwargs = {obs_h5: _chunk_cache_kwargs(obs_h5, time_bins) for obs_h5 in group.h5_paths}
         tasks = [
             (
                 tmp_npy_path,
@@ -2070,6 +2138,7 @@ class DataPreprocessor:
                 time_bins,
                 stamp_width,
                 downsample_factor,
+                cache_kwargs[obs_h5],
             )
             for obs_idx, obs_h5 in enumerate(group.h5_paths)
             for base in range(0, n_stamps, chunk_size)

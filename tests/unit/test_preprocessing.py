@@ -428,23 +428,40 @@ class TestChunkCacheKwargs:
 
 
 class TestExtractStampsWorkerDownsample:
-    def _run_worker(self, tmp_path, make_h5_observation, downsample_factor, **h5_kwargs):
+    def _run_worker(
+        self, tmp_path, make_h5_observation, downsample_factor, stamp_starts=None, **h5_kwargs
+    ):
         import h5py  # noqa: PLC0415
 
         time_bins, stamp_width = 16, 64
         stored_width = stamp_width // downsample_factor
-        stamp_starts = [0, 512, 1000]
+        stamp_starts = stamp_starts if stamp_starts is not None else [0, 512, 1000]
         h5_path = make_h5_observation("obs.h5", n_chans=2048, **h5_kwargs)
         npy_path = str(tmp_path / f"stamps_x{downsample_factor}.npy")
 
         out = np.lib.format.open_memmap(
-            npy_path, mode="w+", dtype=np.float32, shape=(3, 6, time_bins, stored_width)
+            npy_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(len(stamp_starts), 6, time_bins, stored_width),
         )
         out.flush()
         del out
 
+        # open_kwargs is computed once per obs file by the parent and shipped in the task
+        # args (#301) — mirror that here
         _extract_stamps_worker(
-            (npy_path, 1, str(h5_path), stamp_starts, 0, time_bins, stamp_width, downsample_factor)
+            (
+                npy_path,
+                1,
+                str(h5_path),
+                stamp_starts,
+                0,
+                time_bins,
+                stamp_width,
+                downsample_factor,
+                _chunk_cache_kwargs(str(h5_path), time_bins),
+            )
         )
 
         written = np.load(npy_path)
@@ -475,6 +492,43 @@ class TestExtractStampsWorkerDownsample:
         for i, stamp in enumerate(raw):
             expected = downscale_local_mean(stamp, (1, 8)).astype(np.float32)
             np.testing.assert_array_equal(written[i, 1], expected)
+
+    def test_overlapping_windows_coalesce_byte_identical(self, tmp_path, make_h5_observation):
+        """#301 fetches overlapping/abutting windows (the overlap_search triplet shape:
+        gaps of stamp_width // 2) as one wide read sliced per stamp — the written stamps
+        must be byte-identical to independent per-stamp reads, for both raw and
+        downsampled storage."""
+        overlapping = [0, 32, 64, 512, 544, 1000]  # two triplet-shaped chains + a loner
+        for factor in (1, 8):
+            written, raw = self._run_worker(
+                tmp_path, make_h5_observation, factor, stamp_starts=overlapping
+            )
+            for i, stamp in enumerate(raw):
+                expected = (
+                    stamp
+                    if factor == 1
+                    else downscale_local_mean(stamp, (1, factor)).astype(np.float32)
+                )
+                np.testing.assert_array_equal(written[i, 1], expected)
+
+    def test_coalesce_grouping_rules(self):
+        from aetherscan.preprocessing import (  # noqa: PLC0415
+            _COALESCE_MAX_BINS,
+            _coalesce_stamp_groups,
+        )
+
+        # Overlap/abut chains group; disjoint windows stay singletons
+        assert _coalesce_stamp_groups([0, 32, 64, 512], 64) == [[0, 1, 2], [3]]
+        # Abutting exactly (next start == previous end) still groups
+        assert _coalesce_stamp_groups([0, 64, 128], 64) == [[0, 1, 2]]
+        # A gap of one bin splits
+        assert _coalesce_stamp_groups([0, 65], 64) == [[0], [1]]
+        # The span cap breaks an otherwise-endless chain
+        starts = list(range(0, _COALESCE_MAX_BINS + 4096, 32))
+        groups = _coalesce_stamp_groups(starts, 64)
+        assert len(groups) > 1
+        for group in groups:
+            assert starts[group[-1]] + 64 - starts[group[0]] <= _COALESCE_MAX_BINS
 
 
 @pytest.fixture

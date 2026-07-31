@@ -507,9 +507,11 @@ class InferenceConfig:
 
     # NOTE: come back to this later (are these params correct?)
     coarse_channel_width: int = 1048576
-    # Progress-logging chunk size for energy detection (coarse channels per log line).
-    # None -> use manager.n_processes. Parallelism itself comes from the persistent worker
-    # pool (one fused task per coarse channel), not from this knob.
+    # Progress-logging cadence for energy detection. None (default) logs ~25% milestones
+    # per ON file (#301 — the per-channel lines were 62% of a run's log volume, all
+    # Slack-bound); an explicit N restores the historical every-N-channels lines.
+    # Parallelism itself comes from the persistent worker pool (one fused task per coarse
+    # channel), not from this knob.
     coarse_channel_log_interval: int | None = None
     # Bandpass flattening method for energy detection: "pfb" divides each coarse channel by
     # the instrument's static polyphase-filterbank response (computed once per run); "spline"
