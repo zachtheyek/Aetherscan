@@ -389,6 +389,7 @@ class TestFigureSmoke:
         """A sidecar carrying bandpass_envelopes (#301) must render WITHOUT touching any
         .h5 — the h5 paths here don't exist, which is exactly the point (the live-read
         fallback would fail on them)."""
+        get_config().checkpoint.save_tag = TAG  # figures save under plots/inference/{tag}/
         npy_path, metadata_path, metadata = _write_cadence_artifacts(tmp_path, "cad_env", ("E",))
         assert not os.path.exists(metadata["h5_paths"][0])
         metadata["bandpass_envelopes"] = [

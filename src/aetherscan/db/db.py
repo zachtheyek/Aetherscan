@@ -438,14 +438,12 @@ class Database:
                 ON inference_results(tag, timestamp, confidence, prediction)
             """)
 
-            # Partial index matching _execute_mark_superseded's predicate exactly (v8):
-            # the per-cadence supersede UPDATE blocks the inference thread, and without
-            # this the (tag, timestamp, ...) index above only narrows to the tag
-            # partition — a whole-partition visit per cadence at catalog scale (#301)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_inference_results_supersede
-                ON inference_results(tag, npy_path) WHERE superseded = 0
-            """)
+            # v8's idx_inference_results_supersede is created ONLY in _migrate_schema
+            # (unlike the indexes here): its partial-index predicate references the
+            # superseded column, which a pre-v1 database gains from the v1 ALTER — a
+            # CREATE here would run before that ALTER and fail with "no such column"
+            # on any legacy file. Fresh databases still get it at init because
+            # _migrate_schema always runs (version 0 -> current).
 
             # Inference cadence manifest table (schema v2): one row per (cadence, stage
             # transition) — status 'preprocessed' when the stamp .npy lands, a superseding
@@ -601,9 +599,12 @@ class Database:
             )
 
         if version < 8:
-            # v8: the supersede partial index (see the version-history comment). Like v7,
-            # the CREATE mirrors _init_database() — already executed for old and new
-            # databases alike and idempotent; re-executing records the step explicitly.
+            # v8: the supersede partial index (see the version-history comment). UNLIKE
+            # v7, this CREATE lives only here and deliberately NOT in _init_database():
+            # its WHERE superseded = 0 predicate needs the column the v1 block above
+            # adds, so on a pre-v1 file an init-time CREATE would precede the ALTER and
+            # fail. Fresh databases reach this block too (version 0 -> current), so both
+            # paths land the same final index set.
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_inference_results_supersede
                 ON inference_results(tag, npy_path) WHERE superseded = 0

@@ -1656,7 +1656,7 @@ class TestEnergyDetectChannelWorker:
         h5_path = make_h5_observation("obs.h5", n_chans=n_chans)
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=spl_order)
 
-        hits, stat_hist = _energy_detect_channel_worker(
+        hits, stat_hist, integrated = _energy_detect_channel_worker(
             (
                 str(h5_path),
                 channel_index,
@@ -1666,6 +1666,7 @@ class TestEnergyDetectChannelWorker:
                 window_size,
                 step_size,
                 stat_threshold,
+                True,  # want_spectrum (#301): the despiked integrated spectrum rides along
             )
         )
 
@@ -1689,6 +1690,10 @@ class TestEnergyDetectChannelWorker:
             np.testing.assert_allclose(stat_val, expected[idx], rtol=1e-9)
             np.testing.assert_allclose(pval, stats.chi2.sf(stat_val, 2), rtol=1e-9)
 
+        # want_spectrum: the integrated spectrum is the despiked channel's float64 time
+        # mean — the exact quantity the persisted bandpass envelopes are built from (#301)
+        np.testing.assert_array_equal(integrated, channel.astype(np.float64).mean(axis=0))
+
         # The summary histogram covers every finite window statistic, not just hits, on the
         # fixed shared bins — one count per window
         assert stat_hist.shape == (len(ED_STAT_HIST_EDGES) - 1,)
@@ -1702,9 +1707,20 @@ class TestEnergyDetectChannelWorker:
         coarse_width = 512
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=4)
         for channel_index in (0, 3):
-            hits, _ = _energy_detect_channel_worker(
-                (str(h5_path), channel_index, coarse_width, 16, bandpass_flatten, 64, 32, 0.0)
+            hits, _, integrated = _energy_detect_channel_worker(
+                (
+                    str(h5_path),
+                    channel_index,
+                    coarse_width,
+                    16,
+                    bandpass_flatten,
+                    64,
+                    32,
+                    0.0,
+                    False,
+                )
             )
+            assert integrated is None  # want_spectrum=False returns no spectrum
             starts = [idx for idx, _, _ in hits]
             assert len(starts) > 0  # threshold 0.0 must produce hits; else all(...) is vacuous
             assert all(
@@ -1717,8 +1733,8 @@ class TestEnergyDetectChannelWorker:
         histogram must still be populated (it feeds the viz suite regardless of hits)."""
         h5_path = make_h5_observation("obs.h5", n_chans=2048)
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=4)
-        hits, stat_hist = _energy_detect_channel_worker(
-            (str(h5_path), 0, 512, 16, bandpass_flatten, 64, 32, 1e12)
+        hits, stat_hist, _ = _energy_detect_channel_worker(
+            (str(h5_path), 0, 512, 16, bandpass_flatten, 64, 32, 1e12, False)
         )
         assert hits == []
         assert stat_hist.sum() > 0
