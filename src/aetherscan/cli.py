@@ -947,7 +947,7 @@ def _add_inference_flags_to(parser):
         "--coarse-channel-log-interval",
         type=int,
         default=None,
-        help="Progress-logging chunk size for energy detection, in coarse channels per log line (default: the number of worker processes). Parallelism itself comes from the persistent worker pool, not this knob.",
+        help="Progress-logging cadence for energy detection, in coarse channels per log line. Default: ~25%% milestone lines per ON file (the per-channel lines were 62%% of a run's Slack-bound log volume); pass an explicit N to restore every-N-channels lines. Parallelism itself comes from the persistent worker pool, not this knob.",
     )
     parser.add_argument(
         "--bandpass-method",

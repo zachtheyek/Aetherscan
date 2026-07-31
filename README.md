@@ -414,9 +414,9 @@ The Aetherscan training pipeline exposes the following CLI flags to the user. Re
 ```
 usage: train [-h] [--seed SEED] [--unseeded]
              [--tf-deterministic-ops | --no-tf-deterministic-ops]
-             [--data-path DATA_PATH] [--model-path MODEL_PATH]
-             [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
-             [--dashboard-port DASHBOARD_PORT]
+             [--n-processes N_PROCESSES] [--data-path DATA_PATH]
+             [--model-path MODEL_PATH] [--output-path OUTPUT_PATH]
+             [--dashboard | --no-dashboard] [--dashboard-port DASHBOARD_PORT]
              [--benchmark-report | --no-benchmark-report]
              [--vae-latent-dim VAE_LATENT_DIM]
              [--vae-dense-layer-size VAE_DENSE_LAYER_SIZE]
@@ -498,6 +498,13 @@ options:
                         Default: enabled — without it, cuDNN autotune noise
                         can flip near-threshold candidates between identical
                         runs; opt out with --no-tf-deterministic-ops
+  --n-processes N_PROCESSES
+                        Worker-process count for the multiprocessing pools
+                        (energy detection + stamp extraction at inference;
+                        data generation at training). Default: all cores. Host
+                        tuning: never layered from a saved --config-path, so a
+                        config recorded on a bigger host cannot oversubscribe
+                        this one (must be >= 1)
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -768,8 +775,9 @@ The Aetherscan inference pipeline exposes the following CLI flags to the user. R
 ```
 usage: inference [-h] [--seed SEED] [--unseeded]
                  [--tf-deterministic-ops | --no-tf-deterministic-ops]
-                 [--data-path DATA_PATH] [--model-path MODEL_PATH]
-                 [--output-path OUTPUT_PATH] [--dashboard | --no-dashboard]
+                 [--n-processes N_PROCESSES] [--data-path DATA_PATH]
+                 [--model-path MODEL_PATH] [--output-path OUTPUT_PATH]
+                 [--dashboard | --no-dashboard]
                  [--dashboard-port DASHBOARD_PORT]
                  [--benchmark-report | --no-benchmark-report]
                  [--num-replicas NUM_REPLICAS]
@@ -801,7 +809,9 @@ usage: inference [-h] [--seed SEED] [--unseeded]
                  [--overlap-search | --no-overlap-search]
                  [--overlap-fraction OVERLAP_FRACTION]
                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
+                 [--prune-stamps | --no-prune-stamps]
                  [--inference-viz | --no-inference-viz]
+                 [--inference-viz-scope {full,new}]
                  [--stamp-gallery-top-k STAMP_GALLERY_TOP_K]
                  [--max-candidate-plots MAX_CANDIDATE_PLOTS]
                  [--max-retries MAX_RETRIES] [--retry-delay RETRY_DELAY]
@@ -828,6 +838,13 @@ options:
                         Default: enabled — without it, cuDNN autotune noise
                         can flip near-threshold candidates between identical
                         runs; opt out with --no-tf-deterministic-ops
+  --n-processes N_PROCESSES
+                        Worker-process count for the multiprocessing pools
+                        (energy detection + stamp extraction at inference;
+                        data generation at training). Default: all cores. Host
+                        tuning: never layered from a saved --config-path, so a
+                        config recorded on a bigger host cannot oversubscribe
+                        this one (must be >= 1)
   --data-path DATA_PATH
                         Path to data directory (overrides AETHERSCAN_DATA_PATH
                         environment variable)
@@ -925,10 +942,12 @@ options:
                         Number of fine channels per coarse channel (default:
                         1048576)
   --coarse-channel-log-interval COARSE_CHANNEL_LOG_INTERVAL
-                        Progress-logging chunk size for energy detection, in
-                        coarse channels per log line (default: the number of
-                        worker processes). Parallelism itself comes from the
-                        persistent worker pool, not this knob.
+                        Progress-logging cadence for energy detection, in
+                        coarse channels per log line. Default: ~25% milestone
+                        lines per ON file (the per-channel lines were 62% of a
+                        run's Slack-bound log volume); pass an explicit N to
+                        restore every-N-channels lines. Parallelism itself
+                        comes from the persistent worker pool, not this knob.
   --bandpass-method BANDPASS_METHOD
                         Bandpass flattening method for energy detection: 'pfb'
                         (default) divides each coarse channel by the
@@ -985,6 +1004,18 @@ options:
                         directory. Pass a directory explicitly to pin/share
                         one location (reuse is still guarded by the sidecar's
                         recorded h5 paths and ED fingerprint)
+  --prune-stamps, --no-prune-stamps
+                        Delete each cadence's stamp .npy right after its
+                        'inferred' manifest row lands, keeping the metadata
+                        .json plus a ~196 KB snippet sidecar per candidate —
+                        resume rides the DB row, and only stamps this run
+                        freshly extracted are ever pruned. Without pruning a
+                        full catalog writes ~30-90 TB of stamps. Default: AUTO
+                        — enabled for the fingerprint-scoped default cache
+                        directory, disabled when --preprocess-output-dir is
+                        set explicitly. Pass --no-prune-stamps to keep every
+                        stamp (slice-scale runs wanting the cross-run rerun
+                        cache).
   --inference-viz, --no-inference-viz
                         Render the inference visualization suite (energy
                         detection distributions, hit spectrum, bandpass
@@ -994,6 +1025,15 @@ options:
                         plots/inference/{save_tag}/ and uploaded to Slack
                         (default: enabled). Pass --no-inference-viz to
                         disable.
+  --inference-viz-scope {full,new}
+                        Which cadences the metadata-driven viz figures cover:
+                        'full' (default) renders the whole accumulated tag
+                        every successful pass; 'new' renders only cadences
+                        inferred this pass — recommended for resumed multi-
+                        pass catalog campaigns, where 'full' re-pays the
+                        entire catalog's viz tail on every pass. DB-sourced
+                        candidate figures always cover the full tag either
+                        way.
   --stamp-gallery-top-k STAMP_GALLERY_TOP_K
                         Number of top-statistic stamps shown in the stamp
                         gallery figure, each as a 6-observation waterfall grid
