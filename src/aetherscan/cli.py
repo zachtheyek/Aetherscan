@@ -2164,8 +2164,13 @@ def collect_validation_errors(
                 # and the run dies at rf_train with "train_steps < 1" — after the beta-VAE
                 # rounds already trained (#297). Divisibility is deliberately NOT required:
                 # the defaults themselves rely on the trim (79,872 % 7,680 != 0); only the
-                # >= one-effective-batch floor is a hard constraint.
-                rf_train_samples = round(nsr * tvs)
+                # >= one-effective-batch floor is a hard constraint. int(), not round():
+                # the runtime split truncates PER LABEL (sum of int(count_l * tvs)), so
+                # round()'s upward half could pass a config the runtime kills. Truncating
+                # the total still over-estimates the per-label sum by at most
+                # (n_labels - 1) samples — negligible against a multi-thousand-row batch
+                # and covered by the runtime backstop for exact-floor pathologies.
+                rf_train_samples = int(nsr * tvs)
                 if eb > rf_train_samples:
                     errors.append(
                         ValidationError(
@@ -2447,6 +2452,20 @@ def collect_validation_errors(
                     message=f"--prefetch-depth must be a positive integer, got {prefetch_depth}",
                     fix_kind="clamp_low",
                     min_val=1,
+                )
+            )
+
+        # The CLI enforces choices=["full", "new"], but the config field can be set
+        # programmatically (or by a hand-edited config file passed through a future
+        # surface) — a typo would otherwise silently render full-scope (#301 review note)
+        viz_scope = _resolve(args, "inference_viz_scope", config.inference.inference_viz_scope)
+        if viz_scope not in (None, "full", "new"):
+            errors.append(
+                ValidationError(
+                    field="inference.inference_viz_scope",
+                    current=viz_scope,
+                    message=f"--inference-viz-scope must be 'full' or 'new', got {viz_scope!r}",
+                    fix_kind="format",
                 )
             )
 
@@ -2784,8 +2803,9 @@ def _check_cross_constraints(
             return False
         # RF train-split floor (#297): mirrors collect_validation_errors — the RF stage
         # trims its train split to a multiple of the effective batch, so it needs at
-        # least one full effective batch after the split.
-        if effective_batch_size > round(num_samples_rf * train_val_split):
+        # least one full effective batch after the split. int() matches the validator
+        # (the runtime truncates per label; see the comment there).
+        if effective_batch_size > int(num_samples_rf * train_val_split):
             return False
         if effective_batch_size % gtrain != 0:
             return False

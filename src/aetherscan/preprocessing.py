@@ -754,6 +754,10 @@ def _coalesce_stamp_groups(stamp_starts, stamp_width: int) -> list[list[int]]:
     group pays one wide h5 read (#301). A group is capped at _COALESCE_MAX_BINS total
     span to bound the wide buffer. Disjoint windows stay singleton groups — the read
     pattern is then exactly the historical per-stamp one."""
+    if not len(stamp_starts):
+        # Unreachable from the extract-task construction (chunks are never empty), but a
+        # bare [0] seed group would index-error on any future empty caller
+        return []
     groups: list[list[int]] = []
     current = [0]
     for i in range(1, len(stamp_starts)):

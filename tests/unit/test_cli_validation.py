@@ -241,6 +241,16 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(["train", "--seed", "-1"]), None)
         assert any(e.field == "reproducibility.seed" and e.fix_kind == "clamp_low" for e in errors)
 
+    def test_viz_scope_domain_checked_at_config_level(self):
+        # The CLI's choices= covers the flag path; the validator covers programmatic sets
+        # (review note on #305): a typo'd scope must error, not silently render full
+        get_config().inference.inference_viz_scope = "typo"
+        errors = collect_validation_errors(_parse(["inference"]), None)
+        assert any(e.field == "inference.inference_viz_scope" for e in errors)
+        get_config().inference.inference_viz_scope = "new"
+        clean = collect_validation_errors(_parse(["inference"]), None)
+        assert not any(e.field == "inference.inference_viz_scope" for e in clean)
+
     @pytest.mark.parametrize("command", ["train", "inference"])
     def test_n_processes_floor_on_both_subcommands(self, command):
         errors = collect_validation_errors(_parse([command, "--n-processes", "0"]), None)

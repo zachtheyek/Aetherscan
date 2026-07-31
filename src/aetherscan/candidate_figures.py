@@ -173,7 +173,11 @@ def _load_sidecar_cached(metadata_path: str) -> dict | None:
     few cadences, and the gallery/task-build path parsed the SAME multi-MB JSON once per
     candidate row (~15-20 s serial before the render pool even started). Sidecars are
     immutable once published (atomic tmp -> os.replace), so a cached parse can never go
-    stale; maxsize bounds the held dicts."""
+    stale; maxsize bounds the held dicts.
+
+    CONTRACT: the returned dict is the CACHED object, aliased across every caller —
+    treat it as immutable (a mutation would silently poison all later readers of the
+    same sidecar; a copy here would defeat the memory bound)."""
     try:
         with open(metadata_path) as f:
             return json.load(f)

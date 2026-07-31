@@ -517,6 +517,8 @@ class TestExtractStampsWorkerDownsample:
             _coalesce_stamp_groups,
         )
 
+        # Empty input hardening (review note on #305): no [[0]] seed group
+        assert _coalesce_stamp_groups([], 64) == []
         # Overlap/abut chains group; disjoint windows stay singletons
         assert _coalesce_stamp_groups([0, 32, 64, 512], 64) == [[0, 1, 2], [3]]
         # Abutting exactly (next start == previous end) still groups
