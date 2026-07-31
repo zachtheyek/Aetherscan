@@ -202,7 +202,9 @@ latent-space *visualizations* always use the deterministic `z_mean` regardless o
 
 `RandomForestClassifier(n_estimators=1000, bootstrap=True, max_features="sqrt",
 random_state=<derived from the root seed>, n_jobs=-1)`, fit on binary labels (`true_*`
-subtypes = 1). Prediction surfaces:
+subtypes = 1). `n_jobs` is a predict-time execution knob: `RandomForestModel.load()`
+re-pins it from the **runtime** config (#301) — the pickled artifact otherwise carried the
+training host's value wholesale. Prediction surfaces:
 
 - `predict_proba` → `(n, 2)` columns `[P(false), P(true)]`. With 1000 bootstrap trees the
   probability resolution is fine enough for a 0.99 operating point to be meaningful.
