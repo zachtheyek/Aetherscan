@@ -52,7 +52,6 @@ from aetherscan.candidate_figures import (
 from aetherscan.config import get_config
 from aetherscan.db import get_db
 from aetherscan.logger import get_logger
-from aetherscan.models import prepare_latent_features
 from aetherscan.pfb import gen_coarse_channel_response
 from aetherscan.seeding import STREAM_INFERENCE_VIZ, derive_rng
 
@@ -234,11 +233,6 @@ class InferenceVizCollector:
         concatenated), candidates always kept; non-candidates fill whatever global budget
         remains, uniformly subsampled WITHIN this cadence when they'd overflow it (later
         cadences get nothing once the budget is spent)."""
-        config = get_config()
-        features = prepare_latent_features(
-            np.asarray(latents), config.data.num_observations
-        ).astype(np.float32)
-
         keep = np.nonzero(is_candidate)[0]
         budget = self._max_latent_points - self._latent_count - keep.size
         non_candidates = np.nonzero(~is_candidate)[0]
@@ -248,8 +242,18 @@ class InferenceVizCollector:
             keep = np.concatenate([keep, non_candidates])
 
         if keep.size == 0:
+            # Once the global budget is spent (a cadence or two into the catalog), every
+            # non-candidate cadence lands here — so nothing may be built before this
+            # return. The full-cadence feature matrix this method used to construct first
+            # (~190 MB float64 for a 330k-stamp cadence) was thrown away each time (#301).
             return
-        self._latent_chunks.append(features[keep])
+        # Cadence-level rows for the kept indices only. Value-identical to
+        # prepare_latent_features(latents)[keep].astype(np.float32): the helper's
+        # float32 -> float64 -> float32 round trip is exact, and the row-major
+        # reshape is the helper's own documented layout (fancy indexing yields a
+        # fresh array, so the chunk owns its memory).
+        features = np.asarray(latents, dtype=np.float32).reshape(len(is_candidate), -1)[keep]
+        self._latent_chunks.append(features)
         self._candidate_chunks.append(is_candidate[keep])
         self._latent_count += keep.size
 

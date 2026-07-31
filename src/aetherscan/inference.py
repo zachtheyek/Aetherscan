@@ -111,8 +111,13 @@ def _batched_mc_scores(
         )
         for _ in range(mc_draws)
     ]
+    stacked_features = np.vstack(draw_features)
+    # Release the per-draw list before the forest runs: holding it across predict_proba
+    # doubled the MC transient (mc_draws x n_rows x n_features, twice) for no reason —
+    # the stacked copy is the only thing the predict needs (#301)
+    del draw_features
     stacked_scores = apply_probability_calibrator(
-        calibrator, rf_model.model.predict_proba(np.vstack(draw_features))[:, 1]
+        calibrator, rf_model.model.predict_proba(stacked_features)[:, 1]
     )
     return stacked_scores.reshape(mc_draws, -1)
 

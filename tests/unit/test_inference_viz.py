@@ -173,6 +173,36 @@ class TestCollector:
         assert record.n_stamps == 9
         assert record.confidence_hist is None
 
+    def test_budget_fill_values_match_shared_helper(self):
+        """#301 builds pool rows via a direct float32 reshape instead of the full-cadence
+        float64 feature matrix it used to construct (and mostly discard). The kept rows
+        must stay value-identical to the shared-helper path."""
+        from aetherscan.models import prepare_latent_features  # noqa: PLC0415
+
+        rng = np.random.default_rng(3)
+        latents = rng.standard_normal((5 * 6, 8)).astype(np.float32)
+        is_candidate = np.array([True, False, False, True, False])
+        coll = InferenceVizCollector(max_latent_points=3)
+        coll._budget_fill_add(latents, is_candidate)
+        features, kept_mask = coll.latent_pool()
+
+        assert features.dtype == np.float32
+        assert int(kept_mask.sum()) == 2  # both candidates kept
+        expected_full = prepare_latent_features(latents, 6).astype(np.float32)
+        for row in features:
+            assert any(np.array_equal(row, expected) for expected in expected_full)
+
+    def test_budget_exhausted_appends_nothing(self):
+        """The spent-budget early return (#301): once no rows can be kept, the method may
+        not build anything — this is every non-candidate cadence after the first one or
+        two of a catalog."""
+        coll = InferenceVizCollector(max_latent_points=0)
+        coll._budget_fill_add(np.zeros((4 * 6, 8), np.float32), np.zeros(4, dtype=bool))
+        features, kept_mask = coll.latent_pool()
+        assert features.size == 0
+        assert kept_mask.size == 0
+        assert coll._latent_chunks == []
+
 
 class TestSelectTopStamps:
     def test_overlap_offset_duplicates_are_skipped(self, tmp_path):
