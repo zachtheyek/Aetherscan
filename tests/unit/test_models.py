@@ -256,26 +256,46 @@ class TestRegularizationActivation:
     def test_reg_loss_deterministic_across_calls(self):
         import tensorflow as tf  # noqa: PLC0415
 
+        # Private counterparts of the public enable_op_determinism (TF 2.17 exposes no
+        # public getter/disable; TF's own test suite uses these) — needed to capture and
+        # restore the process-global determinism flag around this test.
+        from tensorflow.python.framework import config as tf_framework_config  # noqa: PLC0415
+
         from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
 
         vae = create_beta_vae_model()
         config = get_config()
         dense_size = config.beta_vae.dense_layer_size
-        tf.random.set_seed(11)
-        batch = tf.random.uniform((2, 6, 16, dense_size))
-        # The DECODER's activity penalties depend on the sampled z (Sampling draws epsilon
-        # even at training=False), so reg is deterministic GIVEN THE SEED, not across
-        # unseeded calls — the same contract every seeded run relies on (#279). Re-seed
-        # before each call so the epsilon draws replay identically.
-        tf.random.set_seed(11)
-        first = float(
-            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
-        )
-        tf.random.set_seed(11)
-        second = float(
-            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
-        )
-        assert first == second
+
+        # On GPU hosts, cuDNN AUTOTUNE may select different (equally valid) convolution
+        # algorithms between two otherwise identical calls in one process, moving the
+        # accumulated loss by low-order bits (observed on blpc3: 284.269287109375 vs
+        # 284.2692565917969) — same-seed exactness across calls is only a real contract
+        # under deterministic ops, which is exactly how production pins it
+        # (tf_deterministic_ops defaults ON, #298). Enable it for the two calls and
+        # restore the prior state after, so this test never leaks determinism into (or
+        # out of) the rest of the suite.
+        was_enabled = tf_framework_config.is_op_determinism_enabled()
+        tf.config.experimental.enable_op_determinism()
+        try:
+            tf.random.set_seed(11)
+            batch = tf.random.uniform((2, 6, 16, dense_size))
+            # The DECODER's activity penalties depend on the sampled z (Sampling draws
+            # epsilon even at training=False), so reg is deterministic GIVEN THE SEED, not
+            # across unseeded calls — the same contract every seeded run relies on (#279).
+            # Re-seed before each call so the epsilon draws replay identically.
+            tf.random.set_seed(11)
+            first = float(
+                vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+            )
+            tf.random.set_seed(11)
+            second = float(
+                vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+            )
+            assert first == second
+        finally:
+            if not was_enabled:
+                tf_framework_config.disable_op_determinism()
 
 
 @pytest.mark.slow
