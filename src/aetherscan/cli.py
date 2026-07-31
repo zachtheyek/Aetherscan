@@ -914,7 +914,7 @@ def _add_inference_flags_to(parser):
         "--prefetch-depth",
         type=int,
         default=None,
-        help="Cadences preprocessed+loaded ahead of the GPU stage in the streaming loop (>= 1). Depth 2 overlaps one cadence's energy-detection reads with the previous one's stamp extraction, costing one extra in-flight cadence of RAM; outputs are identical at any depth",
+        help="Cadences preprocessed+loaded ahead of the GPU stage in the streaming loop (>= 1). Each unit of depth overlaps energy-detection reads with stamp extraction and the serial per-cadence sections, costing one in-flight cadence of RAM (up to ~65 GB for RFI-dense C-band cadences); outputs are identical at any depth (default: 3 per the on-cluster A/B)",
     )
 
     # Energy detection preprocessing

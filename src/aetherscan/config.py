@@ -487,15 +487,18 @@ class InferenceConfig:
     # disables the cloud (and the plot's background).
     reference_cloud_size: int = 10000
     # Streaming-loop prefetch depth (#298 N2): cadences preprocessed+loaded concurrently
-    # ahead of the GPU stage. Depth 2 overlaps one cadence's disk-bound energy detection
-    # with the previous one's decompression-bound extraction and fills the worker pool
-    # during per-cadence serial sections, at the cost of one extra in-flight cadence of
-    # RAM (stamps + loaded array, up to ~10-20 GB each). Default 2 per the on-cluster A/B
-    # (8 fresh /datag cadences: ~16% lower end-to-end wall vs depth 1, identical
-    # candidates). Per-cadence outputs are identical at any depth (results are consumed
-    # in catalog order and seeding keys on the catalog index); depth 1 restores the
-    # historical serial behavior.
-    prefetch_depth: int = 2
+    # ahead of the GPU stage, overlapping disk-bound energy detection with
+    # decompression-bound extraction and the per-cadence serial sections, at the cost of
+    # one in-flight cadence of RAM per unit of depth (stamps + loaded array — up to
+    # ~65 GB each for RFI-dense C-band cadences, so depth 3 budgets ~4 in-flight worst
+    # case ≈ 260 GB on a 503 GB host). Default 3 per the #301 on-cluster A/B (the same 8
+    # fresh /datag cadences as the #298 depth-1→2 A/B: depth 3 = 4,071 s vs depth 2 =
+    # 5,118 s wall, ~-20%, identical candidates with 0.0 score deltas; caveat: the
+    # depth-3 leg ran last and warmest, so treat the honest win as ~10-20% — same
+    # confound structure the 1→2 flip carried). Per-cadence outputs are identical at any
+    # depth (results are consumed in catalog order and seeding keys on the catalog
+    # index); depth 1 restores the historical serial behavior.
+    prefetch_depth: int = 3
 
     # NOTE: come back to this later (is this the optimal grouping?)
     # Energy detection preprocessing
