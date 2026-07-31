@@ -275,6 +275,15 @@ class InferencePipeline:
                     self._encode_model = tf.keras.Model(
                         self.encoder.inputs, self.encoder.outputs[:2]
                     )
+                    # Shape contract the traced encode step relies on (outputs[0] =
+                    # z_mean, outputs[1] = z_log_var — vae.py's head order): a future
+                    # encoder with a different head count must land in the fallback
+                    # below loudly, not mis-slice silently (#305 review note)
+                    if len(self._encode_model.outputs) != 2:
+                        raise ValueError(
+                            f"encode submodel has {len(self._encode_model.outputs)} "
+                            f"outputs, expected 2 (z_mean, z_log_var)"
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Encode-only submodel derivation failed ({e}); using the full "
