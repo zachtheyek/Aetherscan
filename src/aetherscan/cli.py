@@ -11,11 +11,16 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, field, is_dataclass
+from dataclasses import fields as dataclass_fields
 from datetime import datetime
 from math import gcd, lcm
 from typing import Any
 
-from aetherscan.config import get_config
+from aetherscan.config import InferenceConfig, get_config
+from aetherscan.run_state import (
+    _INFERENCE_FINGERPRINT_DATA_KEYS,
+    _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,14 +266,28 @@ def _add_reproducibility_flags_to(parser):
     )
 
 
+def _add_runtime_flags_to(parser):
+    """
+    Add the shared host-runtime flags — registered on BOTH subparsers via one helper so
+    the train and inference surfaces cannot drift (#303).
+    """
+    parser.add_argument(
+        "--n-processes",
+        type=int,
+        default=None,
+        help="Worker-process count for the multiprocessing pools (energy detection + stamp extraction at inference; data generation at training). Default: all cores. Host tuning: never layered from a saved --config-path, so a config recorded on a bigger host cannot oversubscribe this one (must be >= 1)",
+    )
+
+
 def _add_train_flags_to(parser):
     """
     Add all training-mode CLI flags to `parser`. Defined separately from the subparser wrapper
     so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
     surface without re-declaring every argument.
     """
-    # Shared reproducibility flags (#279) — one helper, both subparsers
+    # Shared reproducibility + host-runtime flags — one helper each, both subparsers
     _add_reproducibility_flags_to(parser)
+    _add_runtime_flags_to(parser)
 
     # Path arguments (overrides environment variables)
     parser.add_argument(
@@ -764,8 +783,9 @@ def _add_inference_flags_to(parser):
     so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
     surface without re-declaring every argument.
     """
-    # Shared reproducibility flags (#279) — one helper, both subparsers
+    # Shared reproducibility + host-runtime flags — one helper each, both subparsers
     _add_reproducibility_flags_to(parser)
+    _add_runtime_flags_to(parser)
 
     # Path arguments
     parser.add_argument(
@@ -1077,20 +1097,38 @@ def _add_inference_flags_to(parser):
     )
 
 
-# NOTE: come back to this later
-# Per-section fields apply_saved_config never layers from a saved config (#298): these are
-# RUN-SCOPED knobs, not model provenance — a config saved by an older training run would
-# otherwise silently re-impose its values on every future inference run.
-# - inference batching/prefetch are host tuning (a pre-#298 config would re-impose
-#   per_replica_batch_size 2048 over the corrected 256 default); both are provably
-#   result-invariant (they sit in run_state's inference-fingerprint denylist).
-# - reproducibility is the RUN'S OWN contract: determinism defaults ON and opting out must
-#   be an explicit CLI act (--no-tf-deterministic-ops / --unseeded), never a side effect of
-#   loading a training config recorded before the default flipped.
-# Current defaults + CLI flags stay authoritative for all of these.
-_SAVED_CONFIG_SKIP_FIELDS: dict[str, frozenset[str]] = {
-    "inference": frozenset({"per_replica_batch_size", "prefetch_depth"}),
-    "reproducibility": frozenset({"seed", "tf_deterministic_ops"}),
+# Saved-config ALLOWLIST (#303): apply_saved_config layers ONLY these fields from a saved
+# training config; everything else always comes from env + defaults + CLI. The old design
+# was the inverse — apply everything minus a skip-list — which left every host-scoped
+# field unsafe by default and needed a new amendment each time one bit (checkpoint, then
+# inference batching/prefetch, then reproducibility). The live footgun: a config saved on
+# 96-core bla0 carries manager.n_processes=96 and silently 3x-oversubscribed 32-core
+# blpc3's ED pool, with no CLI rescue before --n-processes existed.
+#
+# The allowlist is DERIVED from run_state.py's result-fingerprint key sets so the two can
+# never drift (test-pinned): every field the fingerprints treat as result-affecting keeps
+# layering — de-layering one would silently change science relative to the artifact's
+# validation, and would also stale the resume fingerprints — while host/runtime fields
+# (gpu, manager, db, logger, monitor, paths, hf, training, checkpoint, reproducibility)
+# never layer. An allowlist can only under-layer (visible in the startup diff log below,
+# fixable via CLI); the old shape could silently import a foreign host's tuning.
+# - beta_vae: whole section — model contract (latent_dim drives the scoring feature
+#   layout; dense_layer_size/kernel_size feed shape validation; loss/precision fields are
+#   inert at inference because the encoder is loaded whole from the .keras file).
+# - rf: the deployed-representation contract only — NOT n_jobs (host tuning, re-pinned
+#   from the runtime config at load) and NOT seeds (run-scoped, #279).
+# - inference: exactly the fields inference_config_fingerprint hashes (thresholds,
+#   mc_draws, ED params — training certifies the threshold cascade against this specific
+#   model, so the artifact carrying its own science params is correct provenance) minus
+#   the artifact paths (host-local; CLI/HF-resolved).
+# - data: the stamp/encoder geometry keys the fingerprints use.
+_SAVED_CONFIG_SECTION_ALLOWLIST = frozenset({"beta_vae"})
+_SAVED_CONFIG_FIELD_ALLOWLIST: dict[str, frozenset[str]] = {
+    "data": frozenset(_INFERENCE_FINGERPRINT_DATA_KEYS),
+    "inference": frozenset(f.name for f in dataclass_fields(InferenceConfig))
+    - _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS
+    - frozenset({"encoder_path", "rf_path", "config_path"}),
+    "rf": frozenset({"latent_variant", "active_dims", "calibration_active", "calibration_method"}),
 }
 
 
@@ -1102,21 +1140,18 @@ def apply_saved_config(config_path: str) -> None:
     `_resolve`, and any CLI flags the user also passes will override them in the
     subsequent `apply_args_to_config` call.
 
-    Priority order ends up as:
+    Priority order for ALLOWLISTED fields ends up as:
 
         defaults  <  saved config  <  CLI args
 
-    For each top-level key in the JSON the corresponding sub-dataclass on the
-    singleton is located by name (`data`, `inference`, `gpu`, ...) and the saved
-    fields are written via setattr. Unknown keys/fields are skipped to stay
-    forward-compat with newer/older saved configs. Top-level scalar entries
-    (`data_path`, `model_path`, `output_path`) are applied directly.
-
-    The `checkpoint` section is skipped entirely: a saved *training* config's
-    checkpoint fields (most damagingly `save_tag`) are never what an inference run
-    wants — layering them would make this run masquerade under the training run's
-    tag, corrupting DB provenance and output paths. This run's resolved save_tag
-    (set once in main() by resolve_save_tag) stays authoritative.
+    Only the model-contract / result-affecting fields in _SAVED_CONFIG_FIELD_ALLOWLIST /
+    _SAVED_CONFIG_SECTION_ALLOWLIST layer (#303); every other saved field — paths, gpu,
+    manager, db/logger/monitor, hf, training, checkpoint (most damagingly save_tag, which
+    would make this run masquerade under the training run's tag), reproducibility (the
+    run's own contract: opting out of determinism is an explicit CLI act) — is ignored,
+    with every ignored field whose saved value differs from the resolved one logged as a
+    startup diff line so nothing disappears silently. Unknown keys/fields are skipped to
+    stay forward-compat with newer/older saved configs.
 
     Raises `ValueError` if the file is missing or malformed — caught by main.py's
     wrapper alongside `validate_args` failures.
@@ -1133,22 +1168,38 @@ def apply_saved_config(config_path: str) -> None:
     if config is None:
         raise ValueError("get_config() returned None")
 
+    ignored_diffs: list[str] = []
     for key, value in saved.items():
-        if key == "checkpoint":
-            # Never layer a saved training run's checkpoint section (save_tag/load_tag/
-            # load_dir/start_round) under CLI flags — see docstring.
-            continue
         target = getattr(config, key, None)
-        if target is None:
+        if not (is_dataclass(target) and isinstance(value, dict)):
+            # Top-level scalars (a legacy flat config's data_path/model_path/...) and
+            # unknown sections never layer: paths and host layout always come from
+            # env + defaults + CLI (#303; current-format configs nest paths under a
+            # "paths" key that was never applied anyway — this formalizes that).
+            if not isinstance(value, dict) and value != target:
+                ignored_diffs.append(f"{key}: saved={value!r} ignored")
             continue
-        if is_dataclass(target) and isinstance(value, dict):
-            skipped = _SAVED_CONFIG_SKIP_FIELDS.get(key, frozenset())
-            for sub_key, sub_val in value.items():
-                if sub_key not in skipped and hasattr(target, sub_key):
-                    setattr(target, sub_key, sub_val)
+        if key in _SAVED_CONFIG_SECTION_ALLOWLIST:
+            allowed = {f.name for f in dataclass_fields(target)}
         else:
-            # Top-level scalar (data_path, model_path, output_path, ...).
-            setattr(config, key, value)
+            allowed = _SAVED_CONFIG_FIELD_ALLOWLIST.get(key, frozenset())
+        for sub_key, sub_val in value.items():
+            if not hasattr(target, sub_key):
+                continue
+            if sub_key in allowed:
+                setattr(target, sub_key, sub_val)
+            else:
+                current = getattr(target, sub_key)
+                if current != sub_val:
+                    ignored_diffs.append(
+                        f"{key}.{sub_key}: saved={sub_val!r} ignored, using {current!r}"
+                    )
+    if ignored_diffs:
+        logger.info(
+            f"Saved-config fields NOT layered ({len(ignored_diffs)} host/run-scoped "
+            f"difference(s); the #303 allowlist keeps paths and host tuning with "
+            f"env+defaults+CLI): {'; '.join(ignored_diffs)}"
+        )
 
 
 def apply_args_to_config(args: argparse.Namespace) -> None:
@@ -1158,6 +1209,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     config = get_config()
     if config is None:
         raise ValueError("get_config() returned None")
+
+    # Host-runtime overrides (#303): the only way to size the worker pools besides the
+    # cpu_count() default — never layered from a saved config
+    if hasattr(args, "n_processes") and args.n_processes is not None:
+        config.manager.n_processes = args.n_processes
 
     # Path overrides (must be done first as they affect file loading)
     if hasattr(args, "data_path") and args.data_path is not None:
@@ -1522,6 +1578,19 @@ def collect_validation_errors(
 
     cmd = getattr(args, "command", None)
     errors: list[ValidationError] = []
+
+    # Shared host-runtime flags (#303) — both subcommands
+    nproc = _resolve(args, "n_processes", config.manager.n_processes)
+    if nproc is not None and nproc < 1:
+        errors.append(
+            ValidationError(
+                field="manager.n_processes",
+                current=nproc,
+                message=f"--n-processes must be >= 1, got {nproc}",
+                fix_kind="clamp_low",
+                min_val=1,
+            )
+        )
 
     # --num-replicas validation (>= 1 and <= available GPUs) is performed upstream
     # by _resolve_num_replicas(), which validate_args() calls before

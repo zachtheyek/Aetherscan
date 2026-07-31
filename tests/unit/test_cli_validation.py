@@ -241,6 +241,13 @@ class TestSemanticChecks:
         errors = collect_validation_errors(_parse(["train", "--seed", "-1"]), None)
         assert any(e.field == "reproducibility.seed" and e.fix_kind == "clamp_low" for e in errors)
 
+    @pytest.mark.parametrize("command", ["train", "inference"])
+    def test_n_processes_floor_on_both_subcommands(self, command):
+        errors = collect_validation_errors(_parse([command, "--n-processes", "0"]), None)
+        assert any(e.field == "manager.n_processes" and e.fix_kind == "clamp_low" for e in errors)
+        clean = collect_validation_errors(_parse([command, "--n-processes", "4"]), None)
+        assert not any(e.field == "manager.n_processes" for e in clean)
+
     def test_negative_seed_rejected_on_inference_too(self):
         # #279: --seed is a shared flag; the bound applies on the inference subparser as well
         errors = collect_validation_errors(_parse(["inference", "--seed", "-1"]), None)
@@ -565,19 +572,36 @@ class TestCrossParamSolver:
 
 
 class TestApplySavedConfigPrecedence:
-    def test_saved_config_overrides_defaults(self, tmp_path):
+    def test_allowlisted_fields_override_defaults(self, tmp_path):
+        """#303: model-contract fields layer from the saved config (defaults < saved),
+        host/run-scoped ones do NOT — training params and paths always come from
+        env+defaults+CLI."""
         saved = {
+            "beta_vae": {"latent_dim": 16},
+            "inference": {"mc_draws": 64, "stat_threshold": 4096.0},
+            "data": {"downsample_factor": 4},
+            "rf": {"latent_variant": "z_mean_obs_logvar"},
             "training": {"num_training_rounds": 7, "snr_base": 33},
             "data_path": "/saved/data/path",
         }
         path = tmp_path / "saved_config.json"
         path.write_text(json.dumps(saved))
 
-        apply_saved_config(str(path))
         config = get_config()
-        assert config.training.num_training_rounds == 7
-        assert config.training.snr_base == 33
-        assert config.data_path == "/saved/data/path"
+        default_rounds = config.training.num_training_rounds
+        default_snr = config.training.snr_base
+        default_data_path = config.data_path
+        apply_saved_config(str(path))
+
+        assert config.beta_vae.latent_dim == 16
+        assert config.inference.mc_draws == 64
+        assert config.inference.stat_threshold == 4096.0
+        assert config.data.downsample_factor == 4
+        assert config.rf.latent_variant == "z_mean_obs_logvar"
+        # Never layered: training section + top-level (legacy flat) paths
+        assert config.training.num_training_rounds == default_rounds
+        assert config.training.snr_base == default_snr
+        assert config.data_path == default_data_path
 
     def test_checkpoint_section_is_never_applied(self, tmp_path):
         """Regression: a saved *training* config's checkpoint section (most damagingly
@@ -610,29 +634,118 @@ class TestApplySavedConfigPrecedence:
         assert config.beta_vae.latent_dim == 16
 
     def test_cli_args_override_saved_config(self, tmp_path):
-        saved = {"training": {"snr_base": 33, "num_training_rounds": 7}}
+        saved = {"beta_vae": {"latent_dim": 16}, "inference": {"mc_draws": 64}}
         path = tmp_path / "saved_config.json"
         path.write_text(json.dumps(saved))
         apply_saved_config(str(path))
 
-        args = _parse(["train", "--snr-base", "44"])
+        args = _parse(["train", "--vae-latent-dim", "32"])
         apply_args_to_config(args)
         config = get_config()
-        assert config.training.snr_base == 44  # CLI wins over saved
-        assert config.training.num_training_rounds == 7  # saved wins over default (20)
+        assert config.beta_vae.latent_dim == 32  # CLI wins over saved
+        assert config.inference.mc_draws == 64  # saved wins over default (32)
 
     def test_unknown_keys_and_fields_skipped(self, tmp_path):
         saved = {
             "not_a_section": {"whatever": 1},
-            "training": {"not_a_field": 123, "snr_base": 21},
+            "inference": {"not_a_field": 123, "mc_draws": 21},
         }
         path = tmp_path / "saved_config.json"
         path.write_text(json.dumps(saved))
         apply_saved_config(str(path))
         config = get_config()
-        assert config.training.snr_base == 21
-        assert not hasattr(config.training, "not_a_field")
+        assert config.inference.mc_draws == 21
+        assert not hasattr(config.inference, "not_a_field")
         assert not hasattr(config, "not_a_section")
+
+    def test_manager_section_never_layered(self, tmp_path, caplog):
+        """#303, the confirmed v1 footgun: a config saved on 96-core bla0 carries
+        manager.n_processes=96 and used to layer it wholesale onto 32-core blpc3,
+        3x-oversubscribing the ED pool with no CLI rescue. The manager section must never
+        layer, the ignored difference must be visible in the startup diff log, and the
+        new --n-processes flag is the operator override."""
+        config = get_config()
+        default_nproc = config.manager.n_processes
+
+        saved = {"manager": {"n_processes": 9999}}
+        path = tmp_path / "saved_config.json"
+        path.write_text(json.dumps(saved))
+        with caplog.at_level(logging.INFO, logger="aetherscan.cli"):
+            apply_saved_config(str(path))
+
+        assert config.manager.n_processes == default_nproc
+        assert any(
+            "NOT layered" in r.message and "manager.n_processes" in r.message
+            for r in caplog.records
+        )
+
+        apply_args_to_config(_parse(["inference", "--n-processes", "8"]))
+        assert config.manager.n_processes == 8
+
+    def test_paths_never_layered_nested_or_flat(self, tmp_path):
+        """Paths always come from env+defaults+CLI (#303): neither the current nested
+        'paths' form (never applied historically — to_dict nests it and Config has no
+        matching attribute) nor a legacy flat form may re-point this host's layout."""
+        config = get_config()
+        defaults = (config.data_path, config.model_path, config.output_path)
+
+        saved = {
+            "paths": {"data_path": "/train/host/data", "model_path": "/train/host/models"},
+            "model_path": "/train/host/models",
+            "output_path": "/train/host/outputs",
+        }
+        path = tmp_path / "saved_config.json"
+        path.write_text(json.dumps(saved))
+        apply_saved_config(str(path))
+        assert (config.data_path, config.model_path, config.output_path) == defaults
+
+    def test_rf_contract_layers_but_host_and_seed_fields_do_not(self, tmp_path):
+        config = get_config()
+        default_n_jobs = config.rf.n_jobs
+        default_seed = config.rf.seed
+        saved = {
+            "rf": {
+                "latent_variant": "z_mean_logvar",
+                "active_dims": [0, 2, 5],
+                "calibration_active": True,
+                "calibration_method": "isotonic",
+                "n_jobs": 96,
+                "seed": 1234,
+            }
+        }
+        path = tmp_path / "saved_config.json"
+        path.write_text(json.dumps(saved))
+        apply_saved_config(str(path))
+
+        assert config.rf.latent_variant == "z_mean_logvar"
+        assert config.rf.active_dims == [0, 2, 5]
+        assert config.rf.calibration_active is True
+        assert config.rf.calibration_method == "isotonic"
+        assert config.rf.n_jobs == default_n_jobs
+        assert config.rf.seed == default_seed
+
+    def test_allowlist_derived_from_fingerprint_key_sets(self):
+        """Drift pin (#303): the allowlist is DERIVED from run_state.py's fingerprint key
+        sets — every result-affecting (fingerprinted) inference field must layer (minus
+        the host-local artifact paths), and the data allowlist must equal the geometry
+        keys the fingerprints hash. If this fails, cli.py and run_state.py disagree about
+        what is result-affecting; reconcile them, never silently."""
+        from dataclasses import fields as dc_fields  # noqa: PLC0415
+
+        from aetherscan.cli import _SAVED_CONFIG_FIELD_ALLOWLIST  # noqa: PLC0415
+        from aetherscan.config import InferenceConfig  # noqa: PLC0415
+        from aetherscan.run_state import (  # noqa: PLC0415
+            _INFERENCE_FINGERPRINT_DATA_KEYS,
+            _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS,
+        )
+
+        inference_fields = {f.name for f in dc_fields(InferenceConfig)}
+        fingerprinted = inference_fields - _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS
+        assert (
+            fingerprinted - {"encoder_path", "rf_path", "config_path"}
+            == _SAVED_CONFIG_FIELD_ALLOWLIST["inference"]
+        )
+        assert _SAVED_CONFIG_FIELD_ALLOWLIST["data"] == frozenset(_INFERENCE_FINGERPRINT_DATA_KEYS)
 
     def test_host_tuning_knobs_never_layered(self, tmp_path):
         """#298 I4: batching/prefetch are host tuning, not model provenance — a config
