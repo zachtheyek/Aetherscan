@@ -2069,6 +2069,22 @@ def collect_validation_errors(
                             fix_kind="cross_param",
                         )
                     )
+                # The RF's TRAIN split is trimmed to a multiple of effective_batch_size at
+                # runtime (create_train_val_split); below one full batch it trims to ZERO
+                # and the run dies at rf_train with "train_steps < 1" — after the beta-VAE
+                # rounds already trained (#297). Divisibility is deliberately NOT required:
+                # the defaults themselves rely on the trim (79,872 % 7,680 != 0); only the
+                # >= one-effective-batch floor is a hard constraint.
+                rf_train_samples = round(nsr * tvs)
+                if eb > rf_train_samples:
+                    errors.append(
+                        ValidationError(
+                            field="training.num_samples_rf",
+                            current=nsr,
+                            message=f"num_samples_rf * train_val_split ({nsr} * {tvs:.4f} = {rf_train_samples}) must be >= --effective-batch-size ({eb}) — the RF train split trims to a multiple of the effective batch, so below one batch it trims to zero and rf_train fails at runtime",
+                            fix_kind="cross_param",
+                        )
+                    )
                 if latent_total > val_samples:
                     errors.append(
                         ValidationError(
@@ -2675,6 +2691,11 @@ def _check_cross_constraints(
         if gval > num_samples_beta_vae * (1 - train_val_split):
             return False
         if gval > num_samples_rf:
+            return False
+        # RF train-split floor (#297): mirrors collect_validation_errors — the RF stage
+        # trims its train split to a multiple of the effective batch, so it needs at
+        # least one full effective batch after the split.
+        if effective_batch_size > round(num_samples_rf * train_val_split):
             return False
         if effective_batch_size % gtrain != 0:
             return False

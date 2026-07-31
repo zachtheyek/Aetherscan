@@ -160,6 +160,51 @@ class TestCrossReplicaDivisibilityMatrix:
         assert _cross_param_errors(_parse(["train", *_SMOKE_FLAGS_5_REPLICAS]), None) == []
 
 
+class TestRfTrainSplitFloor:
+    """#297: the RF stage trims its train split (num_samples_rf * train_val_split) to a
+    multiple of effective_batch_size at runtime; below one full batch it trims to zero and
+    the run dies at rf_train AFTER the beta-VAE rounds trained. Parse-time validation must
+    catch it. Divisibility is deliberately NOT required — the defaults themselves rely on
+    the trim (79,872 % 7,680 != 0)."""
+
+    @pytest.mark.parametrize("num_replicas", [4, 5, 6])
+    def test_issue_297_repro_rejected(self, num_replicas):
+        # The verbatim #297 repro: --num-samples-rf 1600 passed every parse-time check
+        # (1600 % 4 == 0, val side 320 >= gval) yet 1600 * 0.8 = 1280 < 7680 dies at runtime.
+        errors = _cross_param_errors(_parse(["train", "--num-samples-rf", "1600"]), num_replicas)
+        assert any(
+            e.field == "training.num_samples_rf" and "train_val_split" in e.message for e in errors
+        )
+
+    def test_exactly_one_effective_batch_passes(self):
+        # Boundary: 9600 * 0.8 == 7680 == effective_batch_size — one full batch survives
+        # the trim, so the floor check must not fire.
+        errors = _cross_param_errors(_parse(["train", "--num-samples-rf", "9600"]), 5)
+        assert not any(
+            e.field == "training.num_samples_rf" and "train_val_split" in e.message for e in errors
+        )
+
+    def test_defaults_unaffected_by_floor(self):
+        # 99,840 * 0.8 = 79,872 >= 7,680 but NOT divisible by it — the runtime trim covers
+        # that by design, so the floor check must stay a >= check, never a divisibility one.
+        assert _cross_param_errors(_parse(["train"]), 5) == []
+
+    def test_solver_checker_mirrors_floor(self):
+        # _check_cross_constraints is the single source of truth for suggested fixes — it
+        # must reject the same configs the validator rejects (else the solver could suggest
+        # a config that dies at rf_train).
+        base = {
+            "num_samples_beta_vae": 499200,
+            "train_val_split": 0.8,
+            "per_replica_batch_size": 128,
+            "effective_batch_size": 7680,
+            "per_replica_val_batch_size": 64,
+            "num_replicas_list": [5],
+        }
+        assert _check_cross_constraints(num_samples_rf=1600, **base) is False
+        assert _check_cross_constraints(num_samples_rf=9600, **base) is True
+
+
 class TestSemanticChecks:
     def test_save_tag_format_error(self):
         errors = collect_validation_errors(_parse(["train", "--save-tag", "bogus"]), None)
