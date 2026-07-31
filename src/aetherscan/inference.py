@@ -183,6 +183,42 @@ class ReferenceCloudReservoir:
         )
 
 
+def _derive_encode_model(encoder):
+    """Encode-only view of the VAE encoder (#301): inference consumes z_mean/z_log_var and
+    discards the sampled z, but the Sampling layer's tf.random draw is a STATEFUL op that
+    graph pruning must retain — it executed per step per replica for nothing. Slicing the
+    functional encoder's first two outputs excludes the sampling branch from the traced
+    graph (the z_mean/z_log_var tensors are the same graph nodes, so outputs are unchanged).
+
+    Must be called inside strategy.scope() (its Model wraps the encoder's mirrored
+    variables). Returns the full encoder unchanged as a graceful fallback when the submodel
+    can't be built.
+
+    Shape contract the traced encode step relies on: the encoder is
+    keras.Model(inputs, [z_mean, z_log_var, z]) (vae.py — 3 heads). The guard checks the
+    SOURCE encoder's head COUNT (not the derived model's, which is always <= 2 by
+    construction, #305 pass-2 note): a future encoder that adds or drops a head falls back
+    loudly instead of the [:2] slice silently taking the wrong two tensors. A head REORDER
+    at the same count is still vae.py's construction contract (unguardable by shape alone).
+    """
+    import tensorflow as tf  # noqa: PLC0415  (module already imports it; local keeps the helper self-contained)
+
+    try:
+        if len(encoder.outputs) != 3:
+            raise ValueError(
+                f"encoder has {len(encoder.outputs)} outputs, expected 3 "
+                f"(z_mean, z_log_var, z); refusing to build a potentially mis-sliced "
+                f"encode submodel"
+            )
+        return tf.keras.Model(encoder.inputs, encoder.outputs[:2])
+    except Exception as e:
+        logger.warning(
+            f"Encode-only submodel derivation failed ({e}); using the full encoder "
+            f"(the discarded sampling op will run per step)"
+        )
+        return encoder
+
+
 class InferencePipeline:
     """Inference pipeline"""
 
@@ -271,25 +307,7 @@ class InferencePipeline:
                 # replica for nothing. Slicing the functional model's first two outputs
                 # excludes the sampling branch from the traced graph entirely; z_mean /
                 # z_log_var tensors are the same graph nodes, so outputs are unchanged.
-                try:
-                    self._encode_model = tf.keras.Model(
-                        self.encoder.inputs, self.encoder.outputs[:2]
-                    )
-                    # Shape contract the traced encode step relies on (outputs[0] =
-                    # z_mean, outputs[1] = z_log_var — vae.py's head order): a future
-                    # encoder with a different head count must land in the fallback
-                    # below loudly, not mis-slice silently (#305 review note)
-                    if len(self._encode_model.outputs) != 2:
-                        raise ValueError(
-                            f"encode submodel has {len(self._encode_model.outputs)} "
-                            f"outputs, expected 2 (z_mean, z_log_var)"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Encode-only submodel derivation failed ({e}); using the full "
-                        f"encoder (the discarded sampling op will run per step)"
-                    )
-                    self._encode_model = self.encoder
+                self._encode_model = _derive_encode_model(self.encoder)
             logger.info("Encoder loaded successfully")
         except Exception as e:
             logger.error(f"Error loading encoder: {e}")
