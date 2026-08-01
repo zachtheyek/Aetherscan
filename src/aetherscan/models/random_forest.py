@@ -10,6 +10,7 @@ import logging
 
 import joblib
 import numpy as np
+import numpy.typing as npt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils import shuffle
 
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 def prepare_latent_features(
     latent_vectors: np.ndarray,
     num_observations: int = 6,
-    dtype: np.typing.DTypeLike = np.float64,
+    dtype: npt.DTypeLike = np.float64,
 ) -> np.ndarray:
     """
     Reshape per-observation latent vectors of shape (num_cadences * num_observations, latent_dim)

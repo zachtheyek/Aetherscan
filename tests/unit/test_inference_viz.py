@@ -514,9 +514,11 @@ class TestFigureSmoke:
         self, tmp_path, initialized_runtime
     ):
         """#301 bound: plot_bandpass_flattening reads envelopes from only the FIRST cadence
-        (records order) that has them, so _build_summaries keeps them on that one and drops
-        the rest — otherwise every cadence's envelopes stay resident (~GB at catalog scale).
-        Figure output is unchanged because the same first cadence is selected."""
+        (records order) that has them, so _build_summaries keeps them on that one and drops the
+        rest — otherwise every cadence's envelopes stay resident (~GB at catalog scale). Pins
+        (a) exactly one summary retains them, (b) it's the first in records order, and (c) the
+        consumer still renders from the nulled summaries (same cadence selected)."""
+        get_config().checkpoint.save_tag = TAG  # figure saves under plots/inference/{tag}/
         env = [
             {
                 "channel": 3,
@@ -540,6 +542,9 @@ class TestFigureSmoke:
         # same one plot_bandpass_flattening would pick.
         assert retained == [True, False, False]
         assert summaries[coll.records[0].npy_path].bandpass_envelopes == env
+        # The nulled summaries still render (from the retained first cadence's envelopes),
+        # without touching any .h5 — proving the consumer is unaffected.
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
 
     def test_candidate_gallery_and_per_candidate(self, initialized_runtime, collector):
         db = initialized_runtime

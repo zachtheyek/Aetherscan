@@ -3126,8 +3126,11 @@ class TrainingPipeline:
             # persisted to disk above (random_forest_{tag}_{variant}.joblib) and never
             # referenced again — but the memory-heavy tail (calibration, the MC screening-
             # validation loop, the eval-artifact dump, metrics) would otherwise run at peak
-            # RSS carrying all 8. The winner survives via self.rf_model.model.
+            # RSS carrying all 8. `clf` (the fit-loop variable) still binds the LAST variant's
+            # forest, so it must be dropped too, else the tail carries 2 forests, not 1. The
+            # winner survives via self.rf_model.model.
             variant_models = {winner: variant_models[winner]}
+            del clf
             gc.collect()
             # Record the winner + calibration outcome on the config singleton so
             # final_save's config_{tag}.json tells inference exactly how to rebuild

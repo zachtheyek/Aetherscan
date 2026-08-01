@@ -1910,17 +1910,22 @@ class DataPreprocessor:
         # (n_stamps, 6, time_bins, stored_width) memmap slot — a short ON file additionally
         # degrades the k2 statistic silently first, since _sliding_normality_k2 derives its
         # sample count from the rows it receives. Frequency WIDTH is validated for the same
-        # reason: extraction reads the SAME primary-derived channel window [0:n_chans] from
-        # every file, so a file narrower than the primary truncates into a short stamp (the
-        # same broadcast ValueError), and any width mismatch violates the single-shared-grid
-        # assumption the cadence rests on. The whole cadence is skipped rather than
+        # reason: extraction reads the SAME [0:n_chans] channel window from every file, so a
+        # file with FEWER than n_chans channels truncates into a short stamp (the same broadcast
+        # ValueError deep in a worker). The check is `< n_chans` (not strict equality): a file
+        # at least n_chans wide reads cleanly and processed fine on master, so it is left alone —
+        # this only converts the crash case into a clean up-front skip. The whole cadence is
+        # skipped rather than
         # just the offending file: the 6-observation stamp tensor and the num_observations
         # contract downstream (encoder reshape, RF features, ABACAD viz) have no
         # representation for a 5-observation cadence.
+        # n_chans (header channel count, falling back to the data width) is the [0:n_chans]
+        # window read from EVERY file, so it is the reference for the width check below.
+        # Computed here, before the loop, so the geometry pass can use it.
+        n_chans = int(header.get("nchans", data_shape[-1]))
         rank_problems: list[str] = []
         short_problems: list[str] = []
         width_problems: list[str] = []
-        primary_width = int(data_shape[-1])
         for idx, obs_h5 in enumerate(group.h5_paths):
             if idx == 0:
                 # group.h5_paths[0] == primary_h5, already opened above for header/data_shape —
@@ -1936,9 +1941,10 @@ class DataPreprocessor:
                 continue
             if int(obs_shape[0]) < time_bins:
                 short_problems.append(f"{obs_h5} has only {int(obs_shape[0])} time bins")
-            if int(obs_shape[-1]) != primary_width:
+            if int(obs_shape[-1]) < n_chans:
                 width_problems.append(
-                    f"{obs_h5} has frequency width {int(obs_shape[-1])} (primary {primary_width})"
+                    f"{obs_h5} has {int(obs_shape[-1])} frequency channels < the {n_chans}-channel "
+                    f"read window"
                 )
         if rank_problems:
             # The caller (process_pending_cadence) turns this ValueError into a logged skip,
@@ -1957,14 +1963,12 @@ class DataPreprocessor:
             return None
         if width_problems:
             logger.warning(
-                f"Cadence {group.key}: every observation file must share the primary's "
-                f"frequency width ({primary_width}) — the same channel window is read from "
-                f"all 6 files; skipping whole cadence — offending file(s): "
-                f"{'; '.join(width_problems)}"
+                f"Cadence {group.key}: every observation file needs >= {n_chans} frequency "
+                f"channels (the window read from all 6 files); skipping whole cadence — "
+                f"offending file(s): {'; '.join(width_problems)}"
             )
             return None
 
-        n_chans = int(header.get("nchans", data_shape[-1]))
         foff = float(header["foff"])
         fch1 = float(header["fch1"])
 

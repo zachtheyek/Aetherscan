@@ -602,6 +602,26 @@ class TestStageAStatsMemo:
         assert b_stats != a_stats
         data_generation._STAGE_A_STATS_CACHE.clear()
 
+    def test_init_worker_clears_stage_a_cache(self):
+        """A recycled worker that re-attaches (possibly a DIFFERENT) background block must drop
+        stats memoized against the prior attachment — _init_worker's cache clear is the sole
+        guard for that, so pin it via the real production entry point rather than a manual clear."""
+        import contextlib  # noqa: PLC0415
+        from multiprocessing.shared_memory import SharedMemory  # noqa: PLC0415
+
+        data_generation._STAGE_A_STATS_CACHE[999] = {"stale": 1.0}
+        plate = np.zeros((2, 6, 4, 4), dtype=np.float32)
+        shm = SharedMemory(create=True, size=plate.nbytes)
+        try:
+            np.ndarray(plate.shape, dtype=plate.dtype, buffer=shm.buf)[:] = plate
+            data_generation._init_worker(shm.name, plate.shape, plate.dtype)
+            assert data_generation._STAGE_A_STATS_CACHE == {}
+        finally:
+            with contextlib.suppress(Exception):
+                data_generation._GLOBAL_SHM.close()  # the view _init_worker attached
+            shm.close()
+            shm.unlink()
+
 
 class _RecordingDB:
     """Minimal stand-in for the DB singleton: records injection-stat rows. Since #277

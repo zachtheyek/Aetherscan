@@ -906,15 +906,13 @@ class TestProcessCadenceEndToEnd:
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(short_path in m and "time bins" in m for m in warnings)
 
-    @pytest.mark.parametrize("width_delta", [-64, 64])
-    def test_frequency_width_mismatch_in_any_file_skips_whole_cadence(
-        self, tmp_path, initialized_runtime, caplog, width_delta
+    @pytest.mark.parametrize("channel_deficit", [64, 1])
+    def test_narrow_frequency_width_in_any_file_skips_whole_cadence(
+        self, tmp_path, initialized_runtime, caplog, channel_deficit
     ):
-        """One observation file whose frequency width differs from the primary — narrower
-        (extraction would truncate into a short stamp, a broadcast ValueError deep in a worker)
-        or wider (violates the single-shared-frequency-grid assumption) — skips the whole
-        cadence up front with a warning naming the file. Equal width (the real-data norm) is a
-        no-op, so well-formed cadences are unaffected."""
+        """An observation file with FEWER channels than the [0:n_chans] read window would
+        truncate into a short stamp — a broadcast ValueError deep in a pool worker — so the
+        up-front geometry check turns it into a clean skip-and-warn naming the file."""
         import h5py  # noqa: PLC0415
 
         from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
@@ -927,7 +925,7 @@ class TestProcessCadenceEndToEnd:
             t, p, w = hf["data"].shape
             del hf["data"]
             dset = hf.create_dataset(
-                "data", data=np.ones((t, p, w + width_delta), dtype=np.float32)
+                "data", data=np.ones((t, p, w - channel_deficit), dtype=np.float32)
             )
             for k, v in attrs.items():
                 dset.attrs[k] = v
@@ -938,7 +936,7 @@ class TestProcessCadenceEndToEnd:
             expected_obs=6,
             is_valid=True,
         )
-        npy_path = str(tmp_path / "out" / "cad_bad_width.npy")
+        npy_path = str(tmp_path / "out" / "cad_narrow_width.npy")
         os.makedirs(os.path.dirname(npy_path), exist_ok=True)
 
         with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
@@ -948,7 +946,46 @@ class TestProcessCadenceEndToEnd:
         assert not os.path.exists(npy_path)
         assert not os.path.exists(os.path.splitext(npy_path)[0] + ".tmp.npy")
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(off_path in m and "frequency width" in m for m in warnings)
+        assert any(off_path in m and "read window" in m for m in warnings)
+
+    def test_wider_off_file_is_not_rejected(self, tmp_path, initialized_runtime, caplog):
+        """A file WIDER than the n_chans read window reads cleanly ([0:n_chans]) and processed
+        on master, so the width guard deliberately leaves it alone — the check is `< n_chans`,
+        not strict equality. Only genuinely narrow files (the crash case) are skipped."""
+        import h5py  # noqa: PLC0415
+
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        off_path = h5_paths[1]
+        with h5py.File(off_path, "r+") as hf:
+            attrs = dict(hf["data"].attrs)  # nchans stays 2048 -> read window unchanged
+            data = hf["data"][:]
+            del hf["data"]
+            pad = np.random.default_rng(7).normal(
+                1000.0, 10.0, size=(data.shape[0], data.shape[1], 64)
+            )
+            wider = np.concatenate([data, pad.astype(np.float32)], axis=-1)
+            dset = hf.create_dataset("data", data=wider)
+            for k, v in attrs.items():
+                dset.attrs[k] = v
+        group = CadenceGroup(
+            key=("T9", "S1", "L", "15", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cad_wider.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
+            DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("read window" in m for m in warnings)  # width guard did NOT fire
+        assert os.path.exists(npy_path)  # processed through to writing stamps, like master
 
     def test_wrong_rank_data_is_skipped_not_fatal(self, tmp_path, initialized_runtime):
         """process_pending_cadence swallows the rank ValueError into a logged skip (returns
