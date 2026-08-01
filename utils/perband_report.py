@@ -203,7 +203,8 @@ def map_catalog_cadences(
     [(N, band, frequency_mhz), ...] for every VALID cadence (obs count == expected_obs), with N
     the global 1-based planner index (== PendingCadence.index). CSVs are processed in the given
     order and their valid groups share one running index, matching plan_cadences(). Returns
-    None when any CSV can't be read or lacks the Band/Frequency columns.
+    None when any CSV can't be read or is missing any column the planner grouping requires
+    (Band/Frequency, a group-by column, or the h5-path column — see _group_catalog_csv).
     """
     if group_by_cols is None:
         group_by_cols = DEFAULT_GROUP_BY_COLS
