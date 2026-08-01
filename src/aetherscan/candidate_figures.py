@@ -130,8 +130,9 @@ def draw_cadence_strip(
     freq_range_mhz: tuple[float, float] | None = None,
 ) -> None:
     """Draw one snippet's 6 observation waterfalls down a column of axes. With
-    freq_range_mhz, the bottom axis is labeled with the stamp's frequency span (bin order,
-    so a descending pair reflects a negative foff)."""
+    freq_range_mhz, the bottom panel's x-axis carries a "Frequency (MHz)" title and two
+    tick labels — the frequency at the left and right borders (bin order, so a descending
+    pair reflects a negative foff)."""
     for obs_idx, ax in enumerate(axes_column):
         ax.imshow(
             snippet[obs_idx],
@@ -147,8 +148,15 @@ def draw_cadence_strip(
         if label_rows:
             ax.set_ylabel(OBS_ROW_LABELS[obs_idx], fontsize=8, rotation=0, ha="right", va="center")
     if freq_range_mhz is not None:
-        low, high = freq_range_mhz
-        axes_column[-1].set_xlabel(f"{low:.4f} → {high:.4f} MHz", fontsize=6)
+        # Annotate the frequency axis at its left/right borders under a "Frequency (MHz)"
+        # title (bin 0 → last bin, so a negative foff prints the borders high → low).
+        left_mhz, right_mhz = freq_range_mhz
+        bottom = axes_column[-1]
+        n_freq_bins = snippet.shape[-1]
+        bottom.set_xticks([0, n_freq_bins - 1])
+        bottom.set_xticklabels([f"{left_mhz:.4f}", f"{right_mhz:.4f}"])
+        bottom.tick_params(axis="x", length=2, pad=1, labelsize=6)
+        bottom.set_xlabel("Frequency (MHz)", fontsize=7)
 
 
 def candidate_annotation(row: dict) -> str:
@@ -220,12 +228,7 @@ def render_candidate_figure(
     fig = Figure(figsize=(11, 7))
     grid = fig.add_gridspec(n_obs, 2, width_ratios=(2.2, 1.6), hspace=0.15, wspace=0.25, right=0.97)
     waterfall_axes = [fig.add_subplot(grid[i, 0]) for i in range(n_obs)]
-    draw_cadence_strip(waterfall_axes, snippet, label_rows=True)
-    if freq_range_mhz is not None:
-        low, high = freq_range_mhz
-        waterfall_axes[-1].set_xlabel(f"frequency: {low:.6f} → {high:.6f} MHz")
-    else:
-        waterfall_axes[-1].set_xlabel("frequency bin")
+    draw_cadence_strip(waterfall_axes, snippet, label_rows=True, freq_range_mhz=freq_range_mhz)
 
     # Right column: latent bar chart on top, provenance text below. A nested gridspec gives
     # the two panels a dedicated vertical gap so the bar chart's x-axis label can never

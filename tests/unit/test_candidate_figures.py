@@ -8,10 +8,12 @@ import os
 
 import numpy as np
 import pytest
+from matplotlib.figure import Figure
 
 from aetherscan.candidate_figures import (
     candidate_frequency_range_mhz,
     candidate_sidecar_path,
+    draw_cadence_strip,
     load_display_cadence,
     render_candidate_figure,
     render_candidate_figures,
@@ -156,3 +158,33 @@ class TestRenderCandidateFigures:
 
     def test_empty_rows(self, tmp_path):
         assert render_candidate_figures([], "test_v1", str(tmp_path)) == []
+
+
+class TestDrawCadenceStripFreqAxis:
+    """Task J: the cadence-strip frequency axis annotates the left/right border MHz values
+    under a "Frequency (MHz)" title (border ticks), replacing the old "low → high MHz"
+    span-string x-label. Only the bottom panel carries the axis; the rest stay blank."""
+
+    def _strip(self, freq_range):
+        snippet = np.random.default_rng(0).random((6, 16, 512)).astype(np.float32)
+        fig = Figure(figsize=(3, 7))
+        axes = [fig.add_subplot(6, 1, i + 1) for i in range(6)]
+        draw_cadence_strip(axes, snippet, label_rows=True, freq_range_mhz=freq_range)
+        return fig, axes, snippet
+
+    def test_border_ticks_and_title(self):
+        _fig, axes, snippet = self._strip((1420.5000, 1420.1000))  # descending (negative foff)
+        bottom = axes[-1]
+        width = snippet.shape[-1]
+        assert list(bottom.get_xticks()) == [0, width - 1]
+        assert [t.get_text() for t in bottom.get_xticklabels()] == ["1420.5000", "1420.1000"]
+        assert bottom.get_xlabel() == "Frequency (MHz)"
+        for ax in axes[:-1]:  # every non-bottom panel keeps a blank x-axis
+            assert list(ax.get_xticks()) == []
+            assert ax.get_xlabel() == ""
+
+    def test_no_freq_range_leaves_axis_blank(self):
+        _fig, axes, _snippet = self._strip(None)
+        bottom = axes[-1]
+        assert list(bottom.get_xticks()) == []
+        assert bottom.get_xlabel() == ""
