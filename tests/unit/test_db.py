@@ -33,6 +33,21 @@ def db(tmp_path):
     database.stop()
 
 
+class TestConnectionPragmas:
+    def test_temp_store_is_memory(self, db):
+        """_get_connection sets temp_store=MEMORY so large GROUP BY/ORDER BY/window sorts in the
+        teardown/plot passes stay in RAM instead of spilling to an on-disk temp b-tree
+        (2 == MEMORY; 0 == DEFAULT, 1 == FILE)."""
+        with db._get_connection() as conn:
+            assert conn.execute("PRAGMA temp_store").fetchone()[0] == 2
+
+    def test_synchronous_is_normal(self, db):
+        """The pre-existing synchronous=NORMAL pragma (#277) must still apply alongside the new
+        temp_store setting (1 == NORMAL)."""
+        with db._get_connection() as conn:
+            assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+
+
 class TestWriterThreadLifecycle:
     def test_start_spawns_writer_thread(self, db):
         assert db.writer_thread is not None
