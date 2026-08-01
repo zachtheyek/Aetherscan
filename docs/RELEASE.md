@@ -218,13 +218,15 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
    CD's HF-verify checks it); re-running for an existing tag errors clearly rather than
    duplicating.
 
-6. **Sign + push the tag (maintainer ONLY).** Make sure local `master` is at the release PR's merge
+6. **Sign + push the tag (maintainer ONLY).** Update local `master` to the release PR's merge
    commit (`git checkout master && git pull`), then:
    ```bash
    git tag -s vX.Y.Z && git push origin vX.Y.Z
    ```
-   Signed with your GPG key — **the assistant cannot do this step.** The push is the point of no
-   return: it triggers the real CD, and PyPI versions are immutable.
+   Signed with your GPG key — **the assistant cannot do this step.** If unrelated work merged to
+   `master` after the release PR, don't tag `HEAD` — tag that PR's merge commit explicitly so the
+   release captures exactly the reviewed tree: `git tag -s vX.Y.Z <release-PR-merge-sha>`. The push
+   is the point of no return: it triggers the real CD, and PyPI versions are immutable.
 
 7. **CD does the rest (automatic — watch it).** guard (signed tag + `tag == v+version`) → tests →
    HF-weights verify → build + wheel smoke → publish to PyPI (trusted publishing) → GitHub Release
