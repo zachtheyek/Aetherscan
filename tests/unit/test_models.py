@@ -58,6 +58,25 @@ class TestPrepareLatentFeatures:
         assert features.dtype == np.float64
         np.testing.assert_array_equal(features, expected)
 
+    def test_dtype_float32_is_opt_in_and_byte_identical_downstream(self):
+        """Inference passes dtype=np.float32 to skip the float64 widening. The result must be
+        (a) float32, (b) exactly the default float64 output cast to float32, and (c) for a
+        float32 input, bit-identical to the input reshaped — i.e. float32->float64->float32
+        round-trips exactly, so every float32-casting inference consumer sees the same bytes."""
+        rng = np.random.default_rng(11)
+        latents = rng.standard_normal((40 * 6, 8)).astype(np.float32)
+
+        default = prepare_latent_features(latents, num_observations=6)  # float64
+        f32 = prepare_latent_features(latents, num_observations=6, dtype=np.float32)
+
+        assert default.dtype == np.float64  # default unchanged (training AU-gate contract)
+        assert f32.dtype == np.float32
+        # The float32 output is exactly the float64 output downcast — what every inference
+        # consumer would compute either way.
+        np.testing.assert_array_equal(f32, default.astype(np.float32))
+        # And for a float32 input the reshape is bit-exact against a plain reshape.
+        np.testing.assert_array_equal(f32, latents.reshape(40, 6 * 8))
+
     def test_non_contiguous_input(self):
         """A strided view (e.g. a column-sliced latent block) must still reshape into the
         same layout the loop produced — reshape copies when it must, never mis-strides."""

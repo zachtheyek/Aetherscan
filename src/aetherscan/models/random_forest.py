@@ -18,14 +18,19 @@ from aetherscan.config import get_config
 logger = logging.getLogger(__name__)
 
 
-def prepare_latent_features(latent_vectors: np.ndarray, num_observations: int = 6) -> np.ndarray:
+def prepare_latent_features(
+    latent_vectors: np.ndarray,
+    num_observations: int = 6,
+    dtype: np.typing.DTypeLike = np.float64,
+) -> np.ndarray:
     """
     Reshape per-observation latent vectors of shape (num_cadences * num_observations, latent_dim)
     into per-cadence features of shape (num_cadences, num_observations * latent_dim), so each
     cadence's 6 latents are concatenated into a single feature row for the RF.
 
     Caller must keep row i..i+num_observations-1 grouped as cadence i. Raises ValueError if the
-    row count isn't divisible by num_observations.
+    row count isn't divisible by num_observations. `dtype` defaults to float64 (see the note at
+    the return) — training callers MUST keep it; inference passes float32.
     """
     # Expected shape: (num_cadences * num_observations, latent_dim)
     num_latents = latent_vectors.shape[0]
@@ -43,11 +48,16 @@ def prepare_latent_features(latent_vectors: np.ndarray, num_observations: int = 
     # We flatten the observations so all 6 latents in a cadence are grouped together.
     # A row-major reshape IS that flatten (row i = rows i*num_obs..(i+1)*num_obs-1
     # raveled) — the per-row Python loop this replaces cost ~0.1-0.5 s per RFI-dense
-    # cadence at inference (#301). The float64 dtype is deliberate and load-bearing:
-    # the historical np.zeros default, and the training-side Active-Units gate computes
-    # .var() on this output, whose float32 accumulation differs in exactly the low bits
-    # that decide a hovering-at-threshold dim (#288's margin lesson).
-    return np.asarray(latent_vectors, dtype=np.float64).reshape(
+    # cadence at inference (#301). `dtype` defaults to float64 and MUST stay float64 for
+    # the TRAINING callers: the Active-Units gate computes .var() on this output, whose
+    # float32 accumulation differs in exactly the low bits that decide a hovering-at-
+    # threshold dim (#288's margin lesson). Inference passes dtype=float32 — it never runs
+    # that .var() gate (active_dims is loaded from the saved config, not recomputed), and
+    # every inference consumer (build_variant_features, sample_z_flat, predict_proba) casts
+    # to float32 anyway, so float32 here is byte-identical downstream (float32->float64->
+    # float32 round-trips exactly) while skipping two full-matrix float64 widenings per
+    # cadence on the GPU-idle RF stage.
+    return np.asarray(latent_vectors, dtype=dtype).reshape(
         num_cadences, num_observations * latent_dim
     )
 
