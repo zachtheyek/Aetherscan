@@ -22,7 +22,7 @@ its matching weights at runtime because the package version is the default HF re
 
 ```
 pip install aetherscan==1.0.0
-aetherscan.main inference ...        # no model-path flags
+python -m aetherscan.main inference ...   # no model-path flags
   → resolves HF revision v1.0.0 → downloads the blessed weights → runs
 ```
 
@@ -85,7 +85,7 @@ versioning**:
 | Tag family | Created by | Points at |
 | --- | --- | --- |
 | Training tags (`train_20260101_120000`, ...) | Training runs with `--hf-upload` (tag = the run's `save_tag`) | The commit that upload produced |
-| Release tags (`v1.0.0`, ...) | The release runbook (step 3 below) | The blessed training upload's commit |
+| Release tags (`v1.0.0`, ...) | The release runbook (the bless, step 5 below) | The blessed training upload's commit |
 
 Uploads need a write-scoped `HF_TOKEN` in the environment (`.env` on the clusters —
 gitignored, forwarded into the container; never logged, never committed). Upload failure
@@ -139,45 +139,128 @@ recommended dry-run before the first real release.
 
 ### One-time setup (maintainer)
 
-- **PyPI**: create the `aetherscan` project and add GitHub as a **trusted publisher** —
-  repository `zachtheyek/Aetherscan`, workflow `release.yml`, environment `pypi`. This is
-  what step 6 authenticates against; no token to rotate, nothing to leak.
-- **HF**: confirm the model repo `zachtheyek/aetherscan` exists and that the clusters'
-  `.env` files carry a write-scoped `HF_TOKEN` (for training uploads only — CD never
-  writes to HF).
+All of this is already done for `zachtheyek/Aetherscan` — it is listed so a fork or a future
+maintainer can reproduce it, and so the runbook's prereq check (step 1) has something concrete to
+verify against.
+
+- **PyPI (real release)**: create the `aetherscan` project on pypi.org and add GitHub as a
+  **trusted publisher** — repository `zachtheyek/Aetherscan`, workflow `release.yml`, environment
+  `pypi` — then create the `pypi` environment in this repo (Settings → Environments). The publish
+  step authenticates against this via OIDC; no API token is ever stored or rotated.
+- **TestPyPI (dry run)**: the **same** trusted-publisher setup on test.pypi.org, with a `testpypi`
+  environment in this repo. Required for the dry-run step (runbook step 4) to publish — without it
+  the dry run's build/tests still run but its final publish step fails at authentication.
+- **HF**: confirm the model repo `zachtheyek/aetherscan` exists and is **public** (inference
+  downloads need no token), and that wherever the bless is run (a cluster, or any machine running
+  `hf_tag_release.py`) has a **write-scoped** `HF_TOKEN` in its gitignored `.env`. CD never writes
+  to HF — only the training upload and the bless do.
+- **Verify** the environments exist before a release:
+  `gh api repos/zachtheyek/Aetherscan/environments --jq '.environments[].name'` must list both
+  `pypi` and `testpypi`.
 
 ## Release runbook
 
-Steps for cutting `vX.Y.Z` (maintainer + agent together):
+The concrete, in-order sequence for cutting `vX.Y.Z`. **This is the exact process used for the
+v1.0.0 release** — substitute your version and training tag. Roles: **maintainer** = a human with
+repo admin + a registered GPG signing key + (for the bless) a write `HF_TOKEN`; **agent** = steps
+the assistant can drive; **CD** = automatic. Each step gates the next; do not reorder.
 
-1. **Prereqs** — one-time setup above is done; all intended PRs are merged; `master` is
-   green.
-2. **Train the release model** — full-scale
-   `train --save-tag train --hf-upload` on the chosen cluster (the run tag resolves to
-   `train_{YYYYMMDD_HHMMSS}` — note it for the next step). Weights land locally and on HF tagged
-   with that run tag. **Review the training artifacts** — the loss curves, injection
-   stats, latent diagnostics, and RF plots ([`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md))
-   are the release-qualification evidence.
-3. **Bless the weights** — create the release tag on HF pointing at the training upload:
-   `utils/hf_tag_release.py --save-tag train_{YYYYMMDD_HHMMSS} --release vX.Y.Z` (the run tag from
-   step 2; a thin wrapper over `HfApi.create_tag`). This is the human "these weights are the
-   release" decision — CD deliberately cannot make it.
-4. **Release PR** — bump `version = "X.Y.Z"` in `pyproject.toml`, revisit the Development
-   Status classifier, draft the release notes (curate the `claude-release-notes` comments),
-   regenerate anything version-stamped. Merge through normal review.
-5. **Tag** — from the release PR's merge commit on master:
-   `git tag -s vX.Y.Z && git push origin vX.Y.Z` (signed, like every commit in this repo).
-6. **CD does the rest** — guard → tests → HF verify → build → PyPI → GitHub Release. Watch
-   the run. If the HF-verify step fails, you skipped step 3: don't touch the git tag (it's
-   already correct) — run step 3, then re-run the failed workflow.
-7. **Smoke the release** — on a clean venv/machine:
-   `pip install aetherscan==X.Y.Z`, then run inference with **no model-path flags** against
-   a small catalog; confirm it downloads the `vX.Y.Z` weights and completes. That closes the
-   loop on the contract.
+1. **Prereqs (maintainer/agent).** One-time setup above is done — verify with
+   `gh api repos/zachtheyek/Aetherscan/environments --jq '.environments[].name'` (must list `pypi`
+   and `testpypi`). Every intended PR is merged and `master` is green
+   (`gh run list --branch master --limit 1`). Decide two things up front: the version `X.Y.Z` and
+   the Development-Status classifier (`4 - Beta` vs `5 - Production/Stable`).
+
+2. **Train the release model (maintainer).** Full-scale `train --save-tag train --hf-upload` on
+   the chosen cluster. The run stamps its own datetime, so the tag resolves to
+   `train_{YYYYMMDD_HHMMSS}` — **copy it from the startup log; every later step needs it.** Weights
+   land locally *and* on HF under that training tag (this upload is separate from the release tag
+   created in step 5). **Review the artifacts** (loss curves, injection stats, latent diagnostics,
+   RF plots — [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)); this is the release-qualification
+   evidence. Recommended: also do a Phase-3 inference pass on a real `/datag` catalog subset — it
+   sanity-checks the weights on real data and captures the inference RAM/VRAM/disk numbers (from
+   the always-on `system_resources` DB rows) that the README update in step 3 needs.
+
+3. **Release PR (agent drafts, maintainer merges).** One PR that:
+   - bumps `version` in `pyproject.toml` to `X.Y.Z` — the single source of truth; CD enforces the
+     pushed git tag equals `v` + this;
+   - sets the Development-Status classifier per step 1;
+   - updates the README **System Requirements** with the real RAM/VRAM/disk numbers from the
+     training + inference runs (issue #183; read them off the `system_resources` DB rows — cite the
+     run tags + hardware for provenance);
+   - bumps `CITATION.cff` `version` and `date-released`;
+   - links the release issue (`Closes #183`).
+   Run the normal review loop. **This repo allows merge commits only** (rebase/squash are
+   disabled), and branch protection keeps the PR at `mergeStateStatus: BLOCKED` until it has a
+   review approval — merge after approval, or with `gh pr merge <n> --admin --merge --delete-branch`
+   if an admin is cutting the release directly.
+
+4. **Dry-run to TestPyPI (agent/maintainer).** *After* the release PR merges (so the build carries
+   the real `X.Y.Z`, not the dev pre-release), trigger the dry run on master and watch it:
+   ```bash
+   gh workflow run release.yml -f test_pypi=true --ref master
+   gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+   ```
+   The dry run does guard → tests → build + **wheel smoke** → publish to test.pypi.org. It
+   **skips** the signed-tag gate, the HF-weights verification, and the GitHub Release — so it needs
+   **no bless and no git tag**. Its whole job is to catch packaging / version-single-sourcing /
+   build breakage *before* you spend the immutable real version number. Confirm it went green (and,
+   if you like, that `aetherscan X.Y.Z` shows up on test.pypi.org) before continuing.
+
+5. **Bless the weights (maintainer, or agent if authorized + `HF_TOKEN` is present).** Create the
+   release tag *on HF*, pointing at the training upload's commit:
+   ```bash
+   python utils/hf_tag_release.py --save-tag train_{YYYYMMDD_HHMMSS} --release vX.Y.Z
+   ```
+   Run it where a write-scoped `HF_TOKEN` is available (a cluster `.env`, etc.); it is a thin
+   wrapper over `HfApi.create_tag`. This is the human "these weights **are** the release" decision
+   — CD verifies the tag but deliberately cannot create it. It must be done before step 6 (the real
+   CD's HF-verify checks it); re-running for an existing tag errors clearly rather than
+   duplicating.
+
+6. **Sign + push the tag (maintainer ONLY).** Update local `master` to the release PR's merge
+   commit (`git checkout master && git pull`), then:
+   ```bash
+   git tag -s vX.Y.Z && git push origin vX.Y.Z
+   ```
+   Signed with your GPG key — **the assistant cannot do this step.** If unrelated work merged to
+   `master` after the release PR, don't tag `HEAD` — tag that PR's merge commit explicitly so the
+   release captures exactly the reviewed tree: `git tag -s vX.Y.Z <release-PR-merge-sha>`. The push
+   is the point of no return: it triggers the real CD, and PyPI versions are immutable.
+
+7. **CD does the rest (automatic — watch it).** guard (signed tag + `tag == v+version`) → tests →
+   HF-weights verify → build + wheel smoke → publish to PyPI (trusted publishing) → GitHub Release
+   (notes + sdist/wheel). If **HF-verify** fails, you skipped step 5: the git tag is already
+   correct, so **do NOT retag** — run step 5, then re-run the failed workflow
+   (`gh run rerun <run-id> --failed`).
+
+8. **Smoke the release (agent/maintainer).** On a clean venv/machine (**not** the source tree, so
+   `__version__` comes from the installed package):
+   ```bash
+   pip install aetherscan==X.Y.Z
+   python -m aetherscan.main inference --inference-files <small_catalog.csv>   # no --encoder-path/--rf-path/--config-path
+   ```
+   Confirm it lazily downloads the `vX.Y.Z` weights from HF and completes. That closes the loop on
+   the version-coupling contract.
+
+9. **Reset the dev version (agent drafts, maintainer merges).** Small follow-up chore PR right
+   after the release lands: bump `pyproject.toml` `version` from `X.Y.Z` to the next pre-release
+   (e.g. `X.Y.(Z+1).dev0`) so `master` stops advertising itself as a shipped stable version between
+   releases (`src/aetherscan/__init__.py` reads it back via `importlib.metadata`). Revisit the
+   Development-Status classifier only if the maturity level actually changed.
+
+> **Release notes.** CD creates the GitHub Release with `--generate-notes`; curate the body
+> afterward from the per-merge `claude-release-notes` comments (see
+> [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md)) — they are the raw material, written one merge at
+> a time for exactly this purpose.
+>
+> **Recovering from a broken release.** PyPI versions are immutable: if a published release is
+> broken, fix forward with `vX.Y.(Z+1)` (a fresh release PR + tag). You can `pip`-yank the bad
+> version on PyPI so resolvers skip it, but the number is spent.
 
 ## FAQ
 
-- *Can GitHub releases and HF tagged weights get out of sync?* Only by skipping step 3 —
+- *Can GitHub releases and HF tagged weights get out of sync?* Only by skipping the bless (step 5) —
   and then CD refuses to publish. The same tag string on both sides, with CD enforcing
   existence, is the whole synchronization mechanism.
 - *Why can't CI produce the weights?* Training needs cluster GPUs, hundreds of GB of

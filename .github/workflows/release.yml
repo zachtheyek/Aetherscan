@@ -18,9 +18,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Dry-run path (recommended before the first real release): manual dispatch publishes to
-  # test.pypi.org. Real releases only ever happen via tag pushes — a manual run with
-  # test_pypi unchecked fails the guard.
+  # Dry-run path (recommended before EVERY release — docs/RELEASE.md runbook step 4): manual
+  # dispatch publishes to test.pypi.org. Real releases only ever happen via tag pushes — a manual
+  # run with test_pypi unchecked fails the guard.
   workflow_dispatch:
     inputs:
       test_pypi:
