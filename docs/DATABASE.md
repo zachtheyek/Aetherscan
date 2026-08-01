@@ -43,7 +43,14 @@ SQL NULL against a NOT NULL column) silently discarded every row in the flush. E
 logged and the loop continues; a failed write never kills the thread. Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
 per-commit WAL fsync (the WAL is still synced at checkpoints) — a crash can lose the newest
 commits but never corrupts the database, ample durability for diagnostic telemetry and the
-removal of the dominant per-transaction fsync stall.
+removal of the dominant per-transaction fsync stall. Connections also set
+`PRAGMA temp_store=MEMORY` (#309) so the large `GROUP BY` / `ORDER BY` / window-function sorts
+on the read-heavy end-of-round and teardown passes (per-round injection-stat aggregates, the
+decimated resource-monitor window query, whole-tag plot scans) stay in RAM instead of spilling
+to an on-disk temp b-tree; small result sets never spill, so it is free otherwise —
+per-connection and numerics-neutral. `mmap_size` is deliberately **not** set: its benefit is
+largely lost to this per-query open/close model, and SQLite mmap I/O faults surface as `SIGBUS`
+on shared cluster nodes — not worth the marginal gain.
 
 ### The bulk lane (#277)
 
