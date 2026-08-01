@@ -267,13 +267,20 @@ def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
     An explicitly requested tag must exist on disk — we never fall back to "the latest" tag,
     which could silently resume from a stale, unrelated model while reporting success (issue
     #142). The tag=None default loads the conventional "final" model, or fails loudly.
+
+    NOTE: existence is checked against this host's machine-scoped display tag (via
+    _model_pair_exists), so a model pair copied from another host is not resolvable via --load-tag.
     """
     if tag is not None:
         if _model_pair_exists(base_dir, tag):
             return tag
         msg = (
             f"No models tagged '{tag}' in {base_dir} — refusing to fall back to the latest tag "
-            f"for an explicitly requested tag."
+            f"for an explicitly requested tag. On-disk model filenames are machine-scoped "
+            f"(vae_encoder_{{command}}_{{machine}}_{{datetime}}.keras) and this looked for the "
+            f"local machine's display tag, so a run's artifacts copied from another host won't be "
+            f"found by --load-tag; for cross-host inference use explicit "
+            f"--encoder-path/--rf-path/--config-path, or the HuggingFace path (fixed filenames)."
         )
         # The per-round-checkpoint hint only helps for a round_XX tag; for any other explicit
         # tag (e.g. a typo'd full run tag) it's a red herring, so only append it for round tags.

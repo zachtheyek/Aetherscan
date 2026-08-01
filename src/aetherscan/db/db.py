@@ -97,6 +97,11 @@ _SCHEMA_VERSION = 8
 # round (#277). A spawned child process re-imports the module and rebuilds its own cache, so
 # the PID is always correct.
 _SYSTEM_METADATA_CACHE: str | None = None
+# Per-process cache for get_machine_name(): the machine name is a process-constant too, and the
+# display-tag hot sites now call get_machine_name() several times back-to-back (_model_pair_exists
+# twice, save_models/load_models 3x, every `dtag = ...` line). Memoized off the same metadata as
+# _SYSTEM_METADATA_CACHE; neither is reset in-process, so both survive singleton teardown together.
+_MACHINE_NAME_CACHE: str | None = None
 
 
 def get_system_metadata() -> str:
@@ -150,11 +155,17 @@ def get_machine_name() -> str:
     The single accessor for the machine name: it unifies the two divergent sources that used to
     coexist — ``json.loads(get_system_metadata())["machine_name"]`` (training plots + monitor) and
     a raw ``socket.gethostname()`` (inference-viz, Slack banner) — so every filename / plot title /
-    Slack message derives the identical string. A cached-metadata read, so it is cheap to call at
-    each site (no per-call socket work). See ``aetherscan.display_tag.display_tag``, which composes
-    this into the presentation/filename "display tag".
+    Slack message derives the identical string. A per-process memoized constant: the machine name is
+    derived once (off the already-cached system metadata) and returned directly thereafter, so the
+    display-tag hot sites can call it several times back-to-back at no cost. See
+    ``aetherscan.display_tag.display_tag``, which composes this into the presentation/filename
+    "display tag".
     """
-    return json.loads(get_system_metadata())["machine_name"]
+    global _MACHINE_NAME_CACHE
+    if _MACHINE_NAME_CACHE is not None:
+        return _MACHINE_NAME_CACHE
+    _MACHINE_NAME_CACHE = json.loads(get_system_metadata())["machine_name"]
+    return _MACHINE_NAME_CACHE
 
 
 class Database:
