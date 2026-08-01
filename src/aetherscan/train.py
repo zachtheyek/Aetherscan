@@ -3121,6 +3121,14 @@ class TrainingPipeline:
             # and release tagging all pick it up unchanged
             self.rf_model.model = variant_models[winner]
             self.rf_model.is_trained = True
+            # Free the 7 non-winner fitted forests now rather than at the end of the block:
+            # each is a full n_estimators-tree forest (tens-to-hundreds of MB), already
+            # persisted to disk above (random_forest_{tag}_{variant}.joblib) and never
+            # referenced again — but the memory-heavy tail (calibration, the MC screening-
+            # validation loop, the eval-artifact dump, metrics) would otherwise run at peak
+            # RSS carrying all 8. The winner survives via self.rf_model.model.
+            variant_models = {winner: variant_models[winner]}
+            gc.collect()
             # Record the winner + calibration outcome on the config singleton so
             # final_save's config_{tag}.json tells inference exactly how to rebuild
             # features. Single-threaded orchestration point (same precedent as the
