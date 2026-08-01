@@ -58,6 +58,40 @@ class TestPrepareLatentFeatures:
         assert features.dtype == np.float64
         np.testing.assert_array_equal(features, expected)
 
+    def test_dtype_float32_is_opt_in_and_byte_identical_downstream(self):
+        """Inference passes dtype=np.float32 to skip the float64 widening. The result must be
+        (a) float32, (b) exactly the default float64 output cast to float32, (c) for a float32
+        input, bit-identical to the input reshaped (float32->float64->float32 round-trips
+        exactly), and (d) byte-identical THROUGH a real consumer that uses both blocks
+        (build_variant_features casts to float32), which is the property the inference change
+        actually relies on."""
+        from aetherscan.latent_variants import build_variant_features  # noqa: PLC0415
+
+        rng = np.random.default_rng(11)
+        latents = rng.standard_normal((40 * 6, 8)).astype(np.float32)
+        logvars = rng.standard_normal((40 * 6, 8)).astype(np.float32)
+
+        default = prepare_latent_features(latents, num_observations=6)  # float64
+        f32 = prepare_latent_features(latents, num_observations=6, dtype=np.float32)
+
+        assert default.dtype == np.float64  # default unchanged (training AU-gate contract)
+        assert f32.dtype == np.float32
+        # The float32 output is exactly the float64 output downcast — what every inference
+        # consumer would compute either way.
+        np.testing.assert_array_equal(f32, default.astype(np.float32))
+        # And for a float32 input the reshape is bit-exact against a plain reshape.
+        np.testing.assert_array_equal(f32, latents.reshape(40, 6 * 8))
+
+        # Through a real consumer that uses BOTH the lead and the logvar block: the features
+        # built from float32 prepare-outputs must be byte-identical to those from float64
+        # outputs, since build_variant_features casts everything to float32.
+        default_lv = prepare_latent_features(logvars, num_observations=6)
+        f32_lv = prepare_latent_features(logvars, num_observations=6, dtype=np.float32)
+        dims = [0, 1, 2, 3, 4, 5, 6, 7]
+        feats64 = build_variant_features("z_mean_logvar", default, default_lv, 6, 8, dims)
+        feats32 = build_variant_features("z_mean_logvar", f32, f32_lv, 6, 8, dims)
+        np.testing.assert_array_equal(feats64, feats32)
+
     def test_non_contiguous_input(self):
         """A strided view (e.g. a column-sliced latent block) must still reshape into the
         same layout the loop produced — reshape copies when it must, never mis-strides."""

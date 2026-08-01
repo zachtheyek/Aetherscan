@@ -437,8 +437,14 @@ class InferencePipeline:
                 active_dims = self.config.rf.active_dims
                 latent_dim = self.latent_dim
                 num_observations = self.num_observations
-                mean_flat = prepare_latent_features(z_mean, num_observations)
-                logvar_flat = prepare_latent_features(z_log_var, num_observations)
+                # float32 here (not the training default float64): inference never runs the
+                # Active-Units .var() gate (active_dims comes from the saved config), and every
+                # downstream consumer — build_variant_features, sample_z_flat, the reference
+                # reservoir, predict_proba — casts to float32 anyway, so this is byte-identical
+                # while skipping two full-matrix float64 widenings per cadence on the RF stage
+                # that runs on the main thread while the GPUs are idle.
+                mean_flat = prepare_latent_features(z_mean, num_observations, dtype=np.float32)
+                logvar_flat = prepare_latent_features(z_log_var, num_observations, dtype=np.float32)
 
                 pass1_features = build_variant_features(
                     variant, mean_flat, logvar_flat, num_observations, latent_dim, active_dims

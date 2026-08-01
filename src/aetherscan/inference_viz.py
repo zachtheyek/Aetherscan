@@ -504,10 +504,24 @@ def _build_summaries(
     """One pass over the records' metadata sidecars: parse, reduce, drop — the only place
     the suite touches the raw JSONs (#301)."""
     summaries: dict[str, CadenceVizSummary] = {}
+    envelopes_captured = False
     for record in records:
         metadata = _load_metadata(record)
         if metadata is not None:
-            summaries[record.npy_path] = _reduce_metadata(record, metadata, gallery_top_k)
+            summary = _reduce_metadata(record, metadata, gallery_top_k)
+            # Only plot_bandpass_flattening reads bandpass_envelopes, and it uses the FIRST
+            # cadence (in records order) that carries them, then returns — so retaining every
+            # cadence's envelopes (each ~hundreds of KB of parsed floats) for the whole render
+            # is ~GB of dead RAM at catalog scale, undoing the O(1)-per-cadence bound the
+            # summaries were introduced (#301) to guarantee. Keep them on the first summary
+            # that has them and drop the rest: _build_summaries iterates records in the same
+            # order as the consumer, so the identical cadence is selected — byte-identical figure.
+            if summary.bandpass_envelopes is not None:
+                if envelopes_captured:
+                    summary.bandpass_envelopes = None
+                else:
+                    envelopes_captured = True
+            summaries[record.npy_path] = summary
         del metadata
     return summaries
 

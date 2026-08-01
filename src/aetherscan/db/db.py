@@ -626,6 +626,14 @@ class Database:
             # never corrupts the database. That durability is ample for diagnostic telemetry
             # and removes the dominant per-transaction fsync stall (#277).
             conn.execute("PRAGMA synchronous=NORMAL")
+            # Keep GROUP BY / ORDER BY / window-function sorts in RAM instead of spilling to an
+            # on-disk temp b-tree. The read-heavy end-of-round / teardown passes that sort large
+            # scans (per-round injection-stat aggregates, the decimated resource-monitor window
+            # query, whole-tag plot scans) benefit; small result sets never spill, so it is free
+            # otherwise. Per-connection and numerics-neutral. (mmap_size is deliberately NOT set:
+            # its benefit is largely lost to this per-query open/close model, and SQLite mmap I/O
+            # faults surface as SIGBUS on a shared node — not worth the marginal gain.)
+            conn.execute("PRAGMA temp_store=MEMORY")
             yield conn
         finally:
             conn.close()
