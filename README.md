@@ -38,7 +38,7 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
   - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - VRAM: **≥8 GB per GPU** recommended — measured peaks ~6 GB/GPU (training) and ~2.5 GB/GPU (inference) on the v1.0.0 release runs; gradient accumulation keeps per-GPU VRAM low
-- RAM: **≥256 GB** for full-scale training and default catalog-scale inference — measured peaks ~260 GB (training; mean ~150 GB) and ~200 GB (inference at the default `--prefetch-depth 3`; mean ~36 GB). Inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
+- RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
 - Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~3 TB with `--keep-round-data`; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook

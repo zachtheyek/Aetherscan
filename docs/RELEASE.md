@@ -174,6 +174,11 @@ Steps for cutting `vX.Y.Z` (maintainer + agent together):
    `pip install aetherscan==X.Y.Z`, then run inference with **no model-path flags** against
    a small catalog; confirm it downloads the `vX.Y.Z` weights and completes. That closes the
    loop on the contract.
+8. **Reset the dev version** — in a small follow-up chore PR right after the release lands, bump
+   `pyproject.toml` `version` from the just-released `X.Y.Z` to the next pre-release (e.g.
+   `X.Y.(Z+1).dev0`) so `master` no longer advertises itself as a shipped stable version between
+   releases (`src/aetherscan/__init__.py` reads it back via `importlib.metadata`). Revisit the
+   Development-Status classifier only if the maturity level actually changes.
 
 ## FAQ
 
