@@ -40,16 +40,16 @@ def prepare_latent_features(latent_vectors: np.ndarray, num_observations: int = 
 
     # Target shape: (num_cadences, num_observations * latent_dim)
     # Where each element in the latent vector is treated as a feature by the Random Forest
-    # We flatten the observations so all 6 latents in a cadence are grouped together
-    features = np.zeros((num_cadences, num_observations * latent_dim))
-
-    for i in range(num_cadences):
-        # Flatten & concatenate the latent vectors according to the number of observations
-        features[i, :] = latent_vectors[
-            i * num_observations : (i + 1) * num_observations, :
-        ].ravel()
-
-    return features
+    # We flatten the observations so all 6 latents in a cadence are grouped together.
+    # A row-major reshape IS that flatten (row i = rows i*num_obs..(i+1)*num_obs-1
+    # raveled) — the per-row Python loop this replaces cost ~0.1-0.5 s per RFI-dense
+    # cadence at inference (#301). The float64 dtype is deliberate and load-bearing:
+    # the historical np.zeros default, and the training-side Active-Units gate computes
+    # .var() on this output, whose float32 accumulation differs in exactly the low bits
+    # that decide a hovering-at-threshold dim (#288's margin lesson).
+    return np.asarray(latent_vectors, dtype=np.float64).reshape(
+        num_cadences, num_observations * latent_dim
+    )
 
 
 class RandomForestModel:
@@ -149,5 +149,12 @@ class RandomForestModel:
             logger.warning("Overriding trained model")
 
         self.model = joblib.load(filepath)
+        # Predict-time parallelism must come from the RUNTIME config, not the training
+        # host's pickled value (#301): joblib.load replaces the estimator wholesale, so
+        # the constructor's rf.n_jobs was silently dead on every loaded model. n_jobs is
+        # a predict-time execution knob on a fitted forest — reassigning it cannot touch
+        # the trees. Default (-1) matches the deployed artifacts, so behavior only
+        # changes when an operator asks for it.
+        self.model.n_jobs = self.config.rf.n_jobs
         self.is_trained = True
         logger.info(f"Loaded Random Forest model from {filepath}")

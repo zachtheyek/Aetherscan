@@ -83,7 +83,12 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     ~20% insert throughput (scattered stat_name subtree writes vs append-only timestamp
 #     order) to speed only the minor single-stat shape on a table whose tag partitions
 #     stay ~58k rows.
-_SCHEMA_VERSION = 7
+# v8: added idx_inference_results_supersede — a partial index on (tag, npy_path) WHERE
+#     superseded = 0, matching _execute_mark_superseded's exact predicate. The only prior
+#     index led with (tag, timestamp, ...), so the once-per-cadence supersede UPDATE (which
+#     BLOCKS the inference thread via the writer-queue sentinel) visited every live row of
+#     the tag partition — a quadratic-in-catalog term on RFI-dense 6k-cadence runs (#301).
+_SCHEMA_VERSION = 8
 
 
 # Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
@@ -218,9 +223,15 @@ class Database:
         self._init_database()
 
         logger.info(f"Database initialized at: {self.db_path}")
-        db_stats = self.get_db_stats()
-        for name, value in db_stats.items():
-            logger.info(f"  {name}: {value}")
+        # Startup logs only O(1) facts. The per-table COUNT(*) summary that used to print
+        # here (get_db_stats) cost a measured ~13 min per cold-cache process launch on a
+        # catalog-scale DB (80 GB, ~190M injection_stats rows) and was re-paid on every
+        # retry-loop relaunch (#301); get_db_stats() remains for on-demand diagnostics.
+        with self._get_connection() as conn:
+            db_size_bytes = conn.execute(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()"
+            ).fetchone()[0]
+        logger.info(f"  db_size_bytes: {db_size_bytes}")
         logger.info(f"Write interval: {self.write_interval} seconds")
         logger.info(f"Max buffer size: {self.write_buffer_max_size} records")
 
@@ -427,6 +438,13 @@ class Database:
                 ON inference_results(tag, timestamp, confidence, prediction)
             """)
 
+            # v8's idx_inference_results_supersede is created ONLY in _migrate_schema
+            # (unlike the indexes here): its partial-index predicate references the
+            # superseded column, which a pre-v1 database gains from the v1 ALTER — a
+            # CREATE here would run before that ALTER and fail with "no such column"
+            # on any legacy file. Fresh databases still get it at init because
+            # _migrate_schema always runs (version 0 -> current).
+
             # Inference cadence manifest table (schema v2): one row per (cadence, stage
             # transition) — status 'preprocessed' when the stamp .npy lands, a superseding
             # 'inferred' row (with aggregate stats) when inference completes, and 'failed'
@@ -579,6 +597,19 @@ class Database:
             logger.info(
                 "Schema migration: v7 index sweep (injection_stats/latent_snapshots) applied"
             )
+
+        if version < 8:
+            # v8: the supersede partial index (see the version-history comment). UNLIKE
+            # v7, this CREATE lives only here and deliberately NOT in _init_database():
+            # its WHERE superseded = 0 predicate needs the column the v1 block above
+            # adds, so on a pre-v1 file an init-time CREATE would precede the ALTER and
+            # fail. Fresh databases reach this block too (version 0 -> current), so both
+            # paths land the same final index set.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inference_results_supersede
+                ON inference_results(tag, npy_path) WHERE superseded = 0
+            """)
+            logger.info("Schema migration: v8 supersede partial index applied")
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -1915,6 +1946,54 @@ class Database:
             # Pair column names with values and return to user as a dict
             return [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
 
+    def query_system_resource_decimated(
+        self,
+        tag: str,
+        start_time: float,
+        end_time: float,
+        max_points_per_series: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Per-series uniformly-strided subset of system_resources rows for the teardown
+        resource plot (#301): a multi-week catalog run accumulates tens of millions of
+        rows while the plot renders ~2k px wide, so materializing every row cost a
+        multi-GB teardown RAM spike for invisible detail. The stride is computed from the
+        LARGEST series so every (resource_type, resource_name) line keeps up to
+        max_points_per_series uniformly-spaced points; stride 1 degenerates to the full
+        query. Returns the same dict shape as query_system_resource.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT MAX(cnt) FROM (SELECT COUNT(*) AS cnt FROM system_resources"
+                " WHERE tag = ? AND timestamp >= ? AND timestamp <= ?"
+                " GROUP BY resource_type, resource_name)",
+                (tag, start_time, end_time),
+            )
+            max_series = cursor.fetchone()[0] or 0
+            stride = max(1, -(-max_series // max_points_per_series))  # ceil div
+            if stride == 1:
+                # Small run: identical to the unstrided query (window overhead skipped)
+                return self.query_system_resource(tag=tag, start_time=start_time, end_time=end_time)
+            cursor.execute(
+                "SELECT * FROM ("
+                " SELECT *, ROW_NUMBER() OVER ("
+                "   PARTITION BY resource_type, resource_name ORDER BY timestamp"
+                " ) AS _rn FROM system_resources"
+                " WHERE tag = ? AND timestamp >= ? AND timestamp <= ?"
+                ") WHERE (_rn - 1) % ? = 0",
+                (tag, start_time, end_time, stride),
+            )
+            result_columns = [desc[0] for desc in cursor.description]
+            rows = [dict(zip(result_columns, row, strict=False)) for row in cursor.fetchall()]
+            for row in rows:
+                row.pop("_rn", None)
+            logger.info(
+                f"Resource-plot query decimated by stride {stride} "
+                f"(largest series {max_series} rows -> <= {max_points_per_series}/series)"
+            )
+            return rows
+
     def query_injection_stat_time_span(
         self,
         tag: str,
@@ -2610,7 +2689,10 @@ class Database:
 
     # NOTE: this call gets expensive as db grows. create a separate schema to track num_rows_added per pipeline run. then count & update as part of db cleanup routine? or use SQLite's dbstat virtual table or periodic ANALYZE?
     def get_db_stats(self) -> dict[str, Any]:
-        """Get summary statistics for the database"""
+        """Get summary statistics for the database.
+
+        On-demand diagnostics only — deliberately NOT called at init: the per-table
+        COUNT(*) scans cost ~13 min on a cold-cache catalog-scale DB (#301)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 

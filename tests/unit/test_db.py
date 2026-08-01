@@ -617,7 +617,7 @@ class TestSchemaMigration:
         "injection_stats": {"idx_injection_stats_filter", "idx_injection_stats_by_stat"},
         "training_stats": {"idx_training_stats_filter"},
         "latent_snapshots": {"idx_latent_snapshots_by_key"},
-        "inference_results": {"idx_inference_results_filter"},
+        "inference_results": {"idx_inference_results_filter", "idx_inference_results_supersede"},
         "inference_cadences": {"idx_inference_cadences_filter"},
         "pipeline_stages": {"idx_pipeline_stages_filter"},
     }
@@ -827,6 +827,25 @@ class TestSchemaMigration:
         # the v7 sweep: _init_database() and the migration block may never diverge)
         for table, expected in self._EXPECTED_INDEXES.items():
             assert self._index_names(db.db_path, table) == expected, table
+
+    def test_init_never_runs_the_count_storm(self, monkeypatch):
+        """#301: Database.__init__ must not call get_db_stats — its per-table COUNT(*)
+        scans cost a measured ~13 min per cold-cache launch on a catalog-scale DB. The
+        method stays available for on-demand diagnostics, but startup may only log O(1)
+        facts."""
+
+        def _boom(self):
+            raise AssertionError("get_db_stats must not run at Database init (#301)")
+
+        monkeypatch.setattr(Database, "get_db_stats", _boom)
+        database = Database()
+        try:
+            # ...and the method itself still works when explicitly requested
+            monkeypatch.undo()
+            stats = database.get_db_stats()
+            assert "db_size_bytes" in stats
+        finally:
+            database.stop()
 
 
 def _bulk_rows(n: int, round_number: int | None = 1, value: float = 1.0) -> list[dict]:

@@ -20,10 +20,12 @@ index order from the returned paths.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import multiprocessing as mp
 import os
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -44,12 +46,53 @@ _MAX_RENDER_WORKERS = 8
 _MIN_ROWS_FOR_POOL = 4
 
 
-def load_display_cadence(npy_path: str, snippet_index: int) -> np.ndarray:
-    """Load one snippet's (num_obs, time_bins, width) stamp from its .npy and log-normalize
-    it for display (the same transform the model input path applies)."""
+def candidate_sidecar_path(npy_path: str) -> str:
+    """Sibling .candidates.npz path for a cadence's pruned candidate snippets (#302)."""
+    return os.path.splitext(npy_path)[0] + ".candidates.npz"
+
+
+def write_candidate_snippet_sidecar(npy_path: str, snippet_indices) -> str:
+    """Snapshot the candidate snippets (~196 KB each) of a cadence into an atomic
+    .candidates.npz sidecar next to its metadata (#302): stamp-cache pruning deletes the
+    multi-GB stamp .npy after scoring, and the candidate figures re-read their snippets
+    from this sidecar instead. Raw (pre-log-norm) values, exactly as stored in the .npy,
+    so load_display_cadence's fallback applies the identical display transform."""
     stamps = np.load(npy_path, mmap_mode="r")
-    snippet = np.array(stamps[snippet_index], dtype=np.float32)
+    indices = np.asarray(sorted({int(i) for i in snippet_indices}), dtype=np.int64)
+    rows = np.array(stamps[indices], dtype=np.float32)
     del stamps
+    path = candidate_sidecar_path(npy_path)
+    tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    with open(tmp_path, "wb") as f:
+        np.savez(f, snippet_indices=indices, stamps=rows)
+    os.replace(tmp_path, path)
+    return path
+
+
+def _load_snippet_from_sidecar(npy_path: str, snippet_index: int) -> np.ndarray:
+    """Read one candidate snippet from the pruned cadence's sidecar; raises KeyError when
+    the snippet was not a candidate (non-candidate pixels are gone by design, #302)."""
+    with np.load(candidate_sidecar_path(npy_path)) as sidecar:
+        match = np.nonzero(sidecar["snippet_indices"] == int(snippet_index))[0]
+        if not len(match):
+            raise KeyError(
+                f"snippet {snippet_index} is not in the candidate sidecar for {npy_path} "
+                f"(its stamp .npy was pruned and only candidate snippets were kept)"
+            )
+        return np.array(sidecar["stamps"][int(match[0])], dtype=np.float32)
+
+
+def load_display_cadence(npy_path: str, snippet_index: int) -> np.ndarray:
+    """Load one snippet's (num_obs, time_bins, width) stamp from its .npy — falling back
+    to the candidate snippet sidecar when the .npy was pruned (#302) — and log-normalize
+    it for display (the same transform the model input path applies)."""
+    try:
+        stamps = np.load(npy_path, mmap_mode="r")
+    except OSError:
+        snippet = _load_snippet_from_sidecar(npy_path, snippet_index)
+    else:
+        snippet = np.array(stamps[snippet_index], dtype=np.float32)
+        del stamps
     return log_norm(snippet)
 
 
@@ -124,14 +167,33 @@ def candidate_annotation(row: dict) -> str:
     return "\n".join(lines)
 
 
+@functools.lru_cache(maxsize=4)
+def _load_sidecar_cached(metadata_path: str) -> dict | None:
+    """Small parent-side LRU over parsed metadata sidecars (#301): candidates cluster on
+    few cadences, and the gallery/task-build path parsed the SAME multi-MB JSON once per
+    candidate row (~15-20 s serial before the render pool even started). Sidecars are
+    immutable once published (atomic tmp -> os.replace), so a cached parse can never go
+    stale; maxsize bounds the held dicts.
+
+    CONTRACT: the returned dict is the CACHED object, aliased across every caller —
+    treat it as immutable (a mutation would silently poison all later readers of the
+    same sidecar; a copy here would defeat the memory bound)."""
+    try:
+        with open(metadata_path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def candidate_frequency_range_mhz(row: dict) -> tuple[float, float] | None:
     """Best-effort frequency span for one candidate row: read its cadence's metadata
-    sidecar (derived from npy_path) and look up the stamp's range. None on any failure —
-    the figure keeps its generic axis label."""
+    sidecar (derived from npy_path, cached across rows) and look up the stamp's range.
+    None on any failure — the figure keeps its generic axis label."""
     try:
-        with open(cadence_metadata_path(str(row["npy_path"]))) as f:
-            metadata = json.load(f)
-    except (OSError, json.JSONDecodeError, KeyError):
+        metadata = _load_sidecar_cached(cadence_metadata_path(str(row["npy_path"])))
+    except KeyError:
+        return None
+    if metadata is None:
         return None
     return stamp_frequency_range_mhz(metadata, int(row["snippet_index"]))
 

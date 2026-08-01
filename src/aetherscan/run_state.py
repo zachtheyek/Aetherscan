@@ -107,11 +107,17 @@ _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS = frozenset(
         "bandpass_debug_plot",  # opt-in debug artifact
         "preprocess_output_dir",  # where stamps are written (folded into npy_path, not values)
         "inference_viz_enabled",  # viz toggle
+        "inference_viz_scope",  # viz only (#301)
         "stamp_gallery_top_k",  # viz only
         "max_candidate_plots",  # viz only
         "max_retries",  # retry loop only
         "retry_delay",  # retry loop only
         "prefetch_depth",  # scheduling only; per-cadence results are depth-invariant (#298 N2)
+        # Stamp-cache retention only (#302): deletes already-scored artifacts, never
+        # changes what a cadence scores. MUST stay excluded — as a new inference key it
+        # would otherwise enter BOTH fingerprints, staling every 'inferred' resume row
+        # and renaming every ED cache directory on upgrade.
+        "prune_stamps",
     }
 )
 _INFERENCE_FINGERPRINT_DATA_KEYS = frozenset(

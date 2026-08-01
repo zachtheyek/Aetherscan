@@ -31,6 +31,34 @@ def _make_data(n: int) -> np.ndarray:
     )
 
 
+class TestDeriveEncodeModel:
+    """#301 E6 + #305 pass-2: the encode-only submodel drops the discarded Sampling head;
+    the head-count guard checks the SOURCE encoder (3 heads) and falls back to the full
+    encoder for any other count, instead of the [:2] slice silently taking the wrong two."""
+
+    def _fake_encoder(self, n_outputs: int):
+        inp = tf.keras.Input(shape=(4,))
+        outs = [tf.keras.layers.Dense(2, name=f"h{i}")(inp) for i in range(n_outputs)]
+        return tf.keras.Model(inp, outs if n_outputs != 1 else outs[0])
+
+    def test_three_head_encoder_yields_two_output_submodel(self):
+        from aetherscan.inference import _derive_encode_model  # noqa: PLC0415
+
+        enc = self._fake_encoder(3)  # [z_mean, z_log_var, z]
+        sub = _derive_encode_model(enc)
+        assert sub is not enc
+        assert len(sub.outputs) == 2  # sampling head dropped
+
+    @pytest.mark.parametrize("n_outputs", [2, 4])
+    def test_wrong_head_count_falls_back_to_full_encoder(self, n_outputs):
+        # A 2-head OR a 4-head encoder must fall back loudly (not mis-slice): the guard the
+        # first attempt checked on the DERIVED model missed the 4-head add-a-head case.
+        from aetherscan.inference import _derive_encode_model  # noqa: PLC0415
+
+        enc = self._fake_encoder(n_outputs)
+        assert _derive_encode_model(enc) is enc
+
+
 class TestEncodeBucket:
     """#298 I2+I4: the final-partial-step bucket must cover the remainder, stay a power of
     two in [_MIN_ENCODE_BUCKET, max_bucket], and bound padding waste."""

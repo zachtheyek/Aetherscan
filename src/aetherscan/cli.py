@@ -11,11 +11,16 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, field, is_dataclass
+from dataclasses import fields as dataclass_fields
 from datetime import datetime
 from math import gcd, lcm
 from typing import Any
 
-from aetherscan.config import get_config
+from aetherscan.config import InferenceConfig, get_config
+from aetherscan.run_state import (
+    _INFERENCE_FINGERPRINT_DATA_KEYS,
+    _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,14 +266,28 @@ def _add_reproducibility_flags_to(parser):
     )
 
 
+def _add_runtime_flags_to(parser):
+    """
+    Add the shared host-runtime flags — registered on BOTH subparsers via one helper so
+    the train and inference surfaces cannot drift (#303).
+    """
+    parser.add_argument(
+        "--n-processes",
+        type=int,
+        default=None,
+        help="Worker-process count for the multiprocessing pools (energy detection + stamp extraction at inference; data generation at training). Default: all cores. Host tuning: never layered from a saved --config-path, so a config recorded on a bigger host cannot oversubscribe this one (must be >= 1)",
+    )
+
+
 def _add_train_flags_to(parser):
     """
     Add all training-mode CLI flags to `parser`. Defined separately from the subparser wrapper
     so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
     surface without re-declaring every argument.
     """
-    # Shared reproducibility flags (#279) — one helper, both subparsers
+    # Shared reproducibility + host-runtime flags — one helper each, both subparsers
     _add_reproducibility_flags_to(parser)
+    _add_runtime_flags_to(parser)
 
     # Path arguments (overrides environment variables)
     parser.add_argument(
@@ -764,8 +783,9 @@ def _add_inference_flags_to(parser):
     so that utility scripts (e.g. utils/find_optimal_configs.py) can expose the same flag
     surface without re-declaring every argument.
     """
-    # Shared reproducibility flags (#279) — one helper, both subparsers
+    # Shared reproducibility + host-runtime flags — one helper each, both subparsers
     _add_reproducibility_flags_to(parser)
+    _add_runtime_flags_to(parser)
 
     # Path arguments
     parser.add_argument(
@@ -894,7 +914,7 @@ def _add_inference_flags_to(parser):
         "--prefetch-depth",
         type=int,
         default=None,
-        help="Cadences preprocessed+loaded ahead of the GPU stage in the streaming loop (>= 1). Depth 2 overlaps one cadence's energy-detection reads with the previous one's stamp extraction, costing one extra in-flight cadence of RAM; outputs are identical at any depth",
+        help="Cadences preprocessed+loaded ahead of the GPU stage in the streaming loop (>= 1). Each unit of depth overlaps energy-detection reads with stamp extraction and the serial per-cadence sections, costing one in-flight cadence of RAM (up to ~65 GB for RFI-dense C-band cadences); outputs are identical at any depth (default: 3 per the on-cluster A/B)",
     )
 
     # Energy detection preprocessing
@@ -927,7 +947,7 @@ def _add_inference_flags_to(parser):
         "--coarse-channel-log-interval",
         type=int,
         default=None,
-        help="Progress-logging chunk size for energy detection, in coarse channels per log line (default: the number of worker processes). Parallelism itself comes from the persistent worker pool, not this knob.",
+        help="Progress-logging cadence for energy detection, in coarse channels per log line. Default: ~25%% milestone lines per ON file (the per-channel lines were 62%% of a run's Slack-bound log volume); pass an explicit N to restore every-N-channels lines. Parallelism itself comes from the persistent worker pool, not this knob.",
     )
     parser.add_argument(
         "--bandpass-method",
@@ -1002,12 +1022,26 @@ def _add_inference_flags_to(parser):
         help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV directory {data_path}/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on the energy-detection config fingerprint — runs sharing an ED config reuse each other's stamps automatically, and any ED-config change resolves to a fresh directory. Pass a directory explicitly to pin/share one location (reuse is still guarded by the sidecar's recorded h5 paths and ED fingerprint)",
     )
 
+    parser.add_argument(
+        "--prune-stamps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Without pruning a full catalog writes ~30-90 TB of stamps. Default: AUTO — enabled for the fingerprint-scoped default cache directory, disabled when --preprocess-output-dir is set explicitly. Pass --no-prune-stamps to keep every stamp (slice-scale runs wanting the cross-run rerun cache).",
+    )
+
     # Visualization suite
     parser.add_argument(
         "--inference-viz",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Render the inference visualization suite (energy detection distributions, hit spectrum, bandpass overlay, stamp/candidate galleries, confidence distribution, latent projection, summary card) at the end of a CSV inference run, saved under plots/inference/{save_tag}/ and uploaded to Slack (default: enabled). Pass --no-inference-viz to disable.",
+    )
+    parser.add_argument(
+        "--inference-viz-scope",
+        type=str,
+        choices=["full", "new"],
+        default=None,
+        help="Which cadences the metadata-driven viz figures cover: 'full' (default) renders the whole accumulated tag every successful pass; 'new' renders only cadences inferred this pass — recommended for resumed multi-pass catalog campaigns, where 'full' re-pays the entire catalog's viz tail on every pass. DB-sourced candidate figures always cover the full tag either way.",
     )
     parser.add_argument(
         "--stamp-gallery-top-k",
@@ -1063,20 +1097,38 @@ def _add_inference_flags_to(parser):
     )
 
 
-# NOTE: come back to this later
-# Per-section fields apply_saved_config never layers from a saved config (#298): these are
-# RUN-SCOPED knobs, not model provenance — a config saved by an older training run would
-# otherwise silently re-impose its values on every future inference run.
-# - inference batching/prefetch are host tuning (a pre-#298 config would re-impose
-#   per_replica_batch_size 2048 over the corrected 256 default); both are provably
-#   result-invariant (they sit in run_state's inference-fingerprint denylist).
-# - reproducibility is the RUN'S OWN contract: determinism defaults ON and opting out must
-#   be an explicit CLI act (--no-tf-deterministic-ops / --unseeded), never a side effect of
-#   loading a training config recorded before the default flipped.
-# Current defaults + CLI flags stay authoritative for all of these.
-_SAVED_CONFIG_SKIP_FIELDS: dict[str, frozenset[str]] = {
-    "inference": frozenset({"per_replica_batch_size", "prefetch_depth"}),
-    "reproducibility": frozenset({"seed", "tf_deterministic_ops"}),
+# Saved-config ALLOWLIST (#303): apply_saved_config layers ONLY these fields from a saved
+# training config; everything else always comes from env + defaults + CLI. The old design
+# was the inverse — apply everything minus a skip-list — which left every host-scoped
+# field unsafe by default and needed a new amendment each time one bit (checkpoint, then
+# inference batching/prefetch, then reproducibility). The live footgun: a config saved on
+# 96-core bla0 carries manager.n_processes=96 and silently 3x-oversubscribed 32-core
+# blpc3's ED pool, with no CLI rescue before --n-processes existed.
+#
+# The allowlist is DERIVED from run_state.py's result-fingerprint key sets so the two can
+# never drift (test-pinned): every field the fingerprints treat as result-affecting keeps
+# layering — de-layering one would silently change science relative to the artifact's
+# validation, and would also stale the resume fingerprints — while host/runtime fields
+# (gpu, manager, db, logger, monitor, paths, hf, training, checkpoint, reproducibility)
+# never layer. An allowlist can only under-layer (visible in the startup diff log below,
+# fixable via CLI); the old shape could silently import a foreign host's tuning.
+# - beta_vae: whole section — model contract (latent_dim drives the scoring feature
+#   layout; dense_layer_size/kernel_size feed shape validation; loss/precision fields are
+#   inert at inference because the encoder is loaded whole from the .keras file).
+# - rf: the deployed-representation contract only — NOT n_jobs (host tuning, re-pinned
+#   from the runtime config at load) and NOT seeds (run-scoped, #279).
+# - inference: exactly the fields inference_config_fingerprint hashes (thresholds,
+#   mc_draws, ED params — training certifies the threshold cascade against this specific
+#   model, so the artifact carrying its own science params is correct provenance) minus
+#   the artifact paths (host-local; CLI/HF-resolved).
+# - data: the stamp/encoder geometry keys the fingerprints use.
+_SAVED_CONFIG_SECTION_ALLOWLIST = frozenset({"beta_vae"})
+_SAVED_CONFIG_FIELD_ALLOWLIST: dict[str, frozenset[str]] = {
+    "data": frozenset(_INFERENCE_FINGERPRINT_DATA_KEYS),
+    "inference": frozenset(f.name for f in dataclass_fields(InferenceConfig))
+    - _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS
+    - frozenset({"encoder_path", "rf_path", "config_path"}),
+    "rf": frozenset({"latent_variant", "active_dims", "calibration_active", "calibration_method"}),
 }
 
 
@@ -1088,21 +1140,18 @@ def apply_saved_config(config_path: str) -> None:
     `_resolve`, and any CLI flags the user also passes will override them in the
     subsequent `apply_args_to_config` call.
 
-    Priority order ends up as:
+    Priority order for ALLOWLISTED fields ends up as:
 
         defaults  <  saved config  <  CLI args
 
-    For each top-level key in the JSON the corresponding sub-dataclass on the
-    singleton is located by name (`data`, `inference`, `gpu`, ...) and the saved
-    fields are written via setattr. Unknown keys/fields are skipped to stay
-    forward-compat with newer/older saved configs. Top-level scalar entries
-    (`data_path`, `model_path`, `output_path`) are applied directly.
-
-    The `checkpoint` section is skipped entirely: a saved *training* config's
-    checkpoint fields (most damagingly `save_tag`) are never what an inference run
-    wants — layering them would make this run masquerade under the training run's
-    tag, corrupting DB provenance and output paths. This run's resolved save_tag
-    (set once in main() by resolve_save_tag) stays authoritative.
+    Only the model-contract / result-affecting fields in _SAVED_CONFIG_FIELD_ALLOWLIST /
+    _SAVED_CONFIG_SECTION_ALLOWLIST layer (#303); every other saved field — paths, gpu,
+    manager, db/logger/monitor, hf, training, checkpoint (most damagingly save_tag, which
+    would make this run masquerade under the training run's tag), reproducibility (the
+    run's own contract: opting out of determinism is an explicit CLI act) — is ignored,
+    with every ignored field whose saved value differs from the resolved one logged as a
+    startup diff line so nothing disappears silently. Unknown keys/fields are skipped to
+    stay forward-compat with newer/older saved configs.
 
     Raises `ValueError` if the file is missing or malformed — caught by main.py's
     wrapper alongside `validate_args` failures.
@@ -1119,22 +1168,38 @@ def apply_saved_config(config_path: str) -> None:
     if config is None:
         raise ValueError("get_config() returned None")
 
+    ignored_diffs: list[str] = []
     for key, value in saved.items():
-        if key == "checkpoint":
-            # Never layer a saved training run's checkpoint section (save_tag/load_tag/
-            # load_dir/start_round) under CLI flags — see docstring.
-            continue
         target = getattr(config, key, None)
-        if target is None:
+        if not (is_dataclass(target) and isinstance(value, dict)):
+            # Top-level scalars (a legacy flat config's data_path/model_path/...) and
+            # unknown sections never layer: paths and host layout always come from
+            # env + defaults + CLI (#303; current-format configs nest paths under a
+            # "paths" key that was never applied anyway — this formalizes that).
+            if not isinstance(value, dict) and value != target:
+                ignored_diffs.append(f"{key}: saved={value!r} ignored")
             continue
-        if is_dataclass(target) and isinstance(value, dict):
-            skipped = _SAVED_CONFIG_SKIP_FIELDS.get(key, frozenset())
-            for sub_key, sub_val in value.items():
-                if sub_key not in skipped and hasattr(target, sub_key):
-                    setattr(target, sub_key, sub_val)
+        if key in _SAVED_CONFIG_SECTION_ALLOWLIST:
+            allowed = {f.name for f in dataclass_fields(target)}
         else:
-            # Top-level scalar (data_path, model_path, output_path, ...).
-            setattr(config, key, value)
+            allowed = _SAVED_CONFIG_FIELD_ALLOWLIST.get(key, frozenset())
+        for sub_key, sub_val in value.items():
+            if not hasattr(target, sub_key):
+                continue
+            if sub_key in allowed:
+                setattr(target, sub_key, sub_val)
+            else:
+                current = getattr(target, sub_key)
+                if current != sub_val:
+                    ignored_diffs.append(
+                        f"{key}.{sub_key}: saved={sub_val!r} ignored, using {current!r}"
+                    )
+    if ignored_diffs:
+        logger.info(
+            f"Saved-config fields NOT layered ({len(ignored_diffs)} host/run-scoped "
+            f"difference(s); the #303 allowlist keeps paths and host tuning with "
+            f"env+defaults+CLI): {'; '.join(ignored_diffs)}"
+        )
 
 
 def apply_args_to_config(args: argparse.Namespace) -> None:
@@ -1144,6 +1209,11 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     config = get_config()
     if config is None:
         raise ValueError("get_config() returned None")
+
+    # Host-runtime overrides (#303): the only way to size the worker pools besides the
+    # cpu_count() default — never layered from a saved config
+    if hasattr(args, "n_processes") and args.n_processes is not None:
+        config.manager.n_processes = args.n_processes
 
     # Path overrides (must be done first as they affect file loading)
     if hasattr(args, "data_path") and args.data_path is not None:
@@ -1464,8 +1534,15 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # inference_viz uses argparse.BooleanOptionalAction with default=None so that the CLI
     # can express "leave the config default" (omit), "force on" (--inference-viz), and
     # "force off" (--no-inference-viz)
+    # prune_stamps uses BooleanOptionalAction with default=None, where None means AUTO
+    # (on for the fingerprint-default cache dir, off for an explicit one) — resolved at
+    # run time by main._resolve_prune_stamps, so only explicit flags land here
+    if hasattr(args, "prune_stamps") and args.prune_stamps is not None:
+        config.inference.prune_stamps = args.prune_stamps
     if hasattr(args, "inference_viz") and args.inference_viz is not None:
         config.inference.inference_viz_enabled = args.inference_viz
+    if hasattr(args, "inference_viz_scope") and args.inference_viz_scope is not None:
+        config.inference.inference_viz_scope = args.inference_viz_scope
     if hasattr(args, "stamp_gallery_top_k") and args.stamp_gallery_top_k is not None:
         config.inference.stamp_gallery_top_k = args.stamp_gallery_top_k
     if hasattr(args, "max_candidate_plots") and args.max_candidate_plots is not None:
@@ -1501,6 +1578,19 @@ def collect_validation_errors(
 
     cmd = getattr(args, "command", None)
     errors: list[ValidationError] = []
+
+    # Shared host-runtime flags (#303) — both subcommands
+    nproc = _resolve(args, "n_processes", config.manager.n_processes)
+    if nproc is not None and nproc < 1:
+        errors.append(
+            ValidationError(
+                field="manager.n_processes",
+                current=nproc,
+                message=f"--n-processes must be >= 1, got {nproc}",
+                fix_kind="clamp_low",
+                min_val=1,
+            )
+        )
 
     # --num-replicas validation (>= 1 and <= available GPUs) is performed upstream
     # by _resolve_num_replicas(), which validate_args() calls before
@@ -2069,6 +2159,27 @@ def collect_validation_errors(
                             fix_kind="cross_param",
                         )
                     )
+                # The RF's TRAIN split is trimmed to a multiple of effective_batch_size at
+                # runtime (create_train_val_split); below one full batch it trims to ZERO
+                # and the run dies at rf_train with "train_steps < 1" — after the beta-VAE
+                # rounds already trained (#297). Divisibility is deliberately NOT required:
+                # the defaults themselves rely on the trim (79,872 % 7,680 != 0); only the
+                # >= one-effective-batch floor is a hard constraint. int(), not round():
+                # the runtime split truncates PER LABEL (sum of int(count_l * tvs)), so
+                # round()'s upward half could pass a config the runtime kills. Truncating
+                # the total still over-estimates the per-label sum by at most
+                # (n_labels - 1) samples — negligible against a multi-thousand-row batch
+                # and covered by the runtime backstop for exact-floor pathologies.
+                rf_train_samples = int(nsr * tvs)
+                if eb > rf_train_samples:
+                    errors.append(
+                        ValidationError(
+                            field="training.num_samples_rf",
+                            current=nsr,
+                            message=f"num_samples_rf * train_val_split ({nsr} * {tvs:.4f} = {rf_train_samples}) must be >= --effective-batch-size ({eb}) — the RF train split trims to a multiple of the effective batch, so below one batch it trims to zero and rf_train fails at runtime",
+                            fix_kind="cross_param",
+                        )
+                    )
                 if latent_total > val_samples:
                     errors.append(
                         ValidationError(
@@ -2341,6 +2452,20 @@ def collect_validation_errors(
                     message=f"--prefetch-depth must be a positive integer, got {prefetch_depth}",
                     fix_kind="clamp_low",
                     min_val=1,
+                )
+            )
+
+        # The CLI enforces choices=["full", "new"], but the config field can be set
+        # programmatically (or by a hand-edited config file passed through a future
+        # surface) — a typo would otherwise silently render full-scope (#301 review note)
+        viz_scope = _resolve(args, "inference_viz_scope", config.inference.inference_viz_scope)
+        if viz_scope not in (None, "full", "new"):
+            errors.append(
+                ValidationError(
+                    field="inference.inference_viz_scope",
+                    current=viz_scope,
+                    message=f"--inference-viz-scope must be 'full' or 'new', got {viz_scope!r}",
+                    fix_kind="format",
                 )
             )
 
@@ -2675,6 +2800,12 @@ def _check_cross_constraints(
         if gval > num_samples_beta_vae * (1 - train_val_split):
             return False
         if gval > num_samples_rf:
+            return False
+        # RF train-split floor (#297): mirrors collect_validation_errors — the RF stage
+        # trims its train split to a multiple of the effective batch, so it needs at
+        # least one full effective batch after the split. int() matches the validator
+        # (the runtime truncates per label; see the comment there).
+        if effective_batch_size > int(num_samples_rf * train_val_split):
             return False
         if effective_batch_size % gtrain != 0:
             return False

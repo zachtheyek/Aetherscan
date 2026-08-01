@@ -487,15 +487,18 @@ class InferenceConfig:
     # disables the cloud (and the plot's background).
     reference_cloud_size: int = 10000
     # Streaming-loop prefetch depth (#298 N2): cadences preprocessed+loaded concurrently
-    # ahead of the GPU stage. Depth 2 overlaps one cadence's disk-bound energy detection
-    # with the previous one's decompression-bound extraction and fills the worker pool
-    # during per-cadence serial sections, at the cost of one extra in-flight cadence of
-    # RAM (stamps + loaded array, up to ~10-20 GB each). Default 2 per the on-cluster A/B
-    # (8 fresh /datag cadences: ~16% lower end-to-end wall vs depth 1, identical
-    # candidates). Per-cadence outputs are identical at any depth (results are consumed
-    # in catalog order and seeding keys on the catalog index); depth 1 restores the
-    # historical serial behavior.
-    prefetch_depth: int = 2
+    # ahead of the GPU stage, overlapping disk-bound energy detection with
+    # decompression-bound extraction and the per-cadence serial sections, at the cost of
+    # one in-flight cadence of RAM per unit of depth (stamps + loaded array — up to
+    # ~65 GB each for RFI-dense C-band cadences, so depth 3 budgets ~4 in-flight worst
+    # case ≈ 260 GB on a 503 GB host). Default 3 per the #301 on-cluster A/B (the same 8
+    # fresh /datag cadences as the #298 depth-1→2 A/B: depth 3 = 4,071 s vs depth 2 =
+    # 5,118 s wall, ~-20%, identical candidates with 0.0 score deltas; caveat: the
+    # depth-3 leg ran last and warmest, so treat the honest win as ~10-20% — same
+    # confound structure the 1→2 flip carried). Per-cadence outputs are identical at any
+    # depth (results are consumed in catalog order and seeding keys on the catalog
+    # index); depth 1 restores the historical serial behavior.
+    prefetch_depth: int = 3
 
     # NOTE: come back to this later (is this the optimal grouping?)
     # Energy detection preprocessing
@@ -507,9 +510,11 @@ class InferenceConfig:
 
     # NOTE: come back to this later (are these params correct?)
     coarse_channel_width: int = 1048576
-    # Progress-logging chunk size for energy detection (coarse channels per log line).
-    # None -> use manager.n_processes. Parallelism itself comes from the persistent worker
-    # pool (one fused task per coarse channel), not from this knob.
+    # Progress-logging cadence for energy detection. None (default) logs ~25% milestones
+    # per ON file (#301 — the per-channel lines were 62% of a run's log volume, all
+    # Slack-bound); an explicit N restores the historical every-N-channels lines.
+    # Parallelism itself comes from the persistent worker pool (one fused task per coarse
+    # channel), not from this knob.
     coarse_channel_log_interval: int | None = None
     # Bandpass flattening method for energy detection: "pfb" divides each coarse channel by
     # the instrument's static polyphase-filterbank response (computed once per run); "spline"
@@ -549,12 +554,36 @@ class InferenceConfig:
     # to pin one directory across runs and CSVs (the resume guard still verifies each
     # sidecar's h5_paths and recorded fingerprint before reuse).
     preprocess_output_dir: str | None = None
+    # Stamp-cache pruning (#302): delete a cadence's stamp .npy right after its 'inferred'
+    # manifest row lands (metadata .json always kept; resume rides the DB row; each
+    # candidate's snippet is snapshotted into a ~196 KB .candidates.npz sidecar so the
+    # candidate figures survive, and a bounded top-K pixel pool — persisted across the
+    # in-process retry attempts, #305 — keeps the stamp gallery whole within one run).
+    # Without pruning a full catalog writes ~30-90 TB of stamps vs ~2.7 TB free on /datax —
+    # the run dies on disk after a few hundred cadences. None (default) = AUTO: ON for the
+    # fingerprint-scoped default cache dir, OFF when preprocess_output_dir is explicitly set
+    # (an operator-curated cache is never destroyed implicitly). Only stamps THIS run
+    # extracted are pruned (a resumed run never deletes a handed cache; a failed-then-retried
+    # cadence of the same run IS pruned). Same-run resume/retry is science-unaffected.
+    # Known limitations (viz-only, graceful): a cross-PROCESS relaunch cannot recover an
+    # earlier process's pruned pixels, so its stamp gallery may show blank columns for
+    # earlier-run cadences; and concurrent runs sharing the default cache dir with pruning
+    # ON can race (one deletes/overwrites a .npy or .candidates.npz another is mid-read of —
+    # self-heals via retry). Use a per-run --preprocess-output-dir or --no-prune-stamps to
+    # run concurrently in one dir. Trade: pruning forfeits the cross-run stamp-reuse rerun
+    # win for pruned cadences (re-extraction ~5-15 min each).
+    prune_stamps: bool | None = None
 
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming
     # CSV inference run, saved under {output_path}/plots/inference/{save_tag}/ and uploaded
     # to Slack. Every figure is individually exception-guarded — a plot bug can never kill
     # a science run.
     inference_viz_enabled: bool = True
+    # Which cadences the metadata-driven figures cover: "full" (default) renders the whole
+    # accumulated tag every successful pass; "new" renders only cadences inferred THIS
+    # pass (#301 — a resumed catalog campaign re-paid the full O(catalog) viz tail on
+    # every pass). DB-sourced candidate figures always cover the full tag either way.
+    inference_viz_scope: str = "full"
     # Number of top-statistic stamps shown in the stamp gallery (6-obs waterfall grids).
     stamp_gallery_top_k: int = 12
     # Cap on per-candidate figures (candidate_{i}_{tag}.png), highest confidence first.
@@ -930,7 +959,12 @@ class Config:
                 "discard_side_channels": self.inference.discard_side_channels,
                 "side_channel_count": self.inference.side_channel_count,
                 "preprocess_output_dir": self.inference.preprocess_output_dir,
+                # NOTE: any key added here also enters BOTH inference fingerprints unless
+                # it joins the run_state.py denylists — prune_stamps and
+                # inference_viz_scope are excluded there (#301/#302: retention/viz only)
+                "prune_stamps": self.inference.prune_stamps,
                 "inference_viz_enabled": self.inference.inference_viz_enabled,
+                "inference_viz_scope": self.inference.inference_viz_scope,
                 "stamp_gallery_top_k": self.inference.stamp_gallery_top_k,
                 "max_candidate_plots": self.inference.max_candidate_plots,
                 "max_retries": self.inference.max_retries,

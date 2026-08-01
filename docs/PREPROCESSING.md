@@ -30,10 +30,15 @@ aggregate hits → deduplicate → build stamp centers (± overlap offsets)
 
 One **persistent worker pool** (started once per run by `start_energy_detection_pool()`)
 serves every channel of every file of every cadence, and the extraction stage reuses it. Each
-task returns only a small hit list plus a fixed-size statistic histogram — the bulky
+task returns only a small hit list plus a fixed-size statistic histogram — and, for the few
+sampled channels of the primary ON file, the despiked channel's time-integrated spectrum
+(the `want_spectrum` task flag, #301: the parent turns those into the persisted bandpass
+envelopes below at zero extra `.h5` reads) — the bulky
 `(time_bins, coarse_channel_width)` intermediates never leave the worker, so there is no
 shared memory and no block-sized array in the parent at all
-(`_energy_detect_channel_worker`).
+(`_energy_detect_channel_worker`). Progress logs default to ~25 % milestones per ON file
+(#301 — the per-channel lines measured 62 % of a run's total, Slack-bound, log volume); an
+explicit `--coarse-channel-log-interval N` restores the historical every-N-channels lines.
 
 ### Coarse channels and the DC spike
 
@@ -198,7 +203,10 @@ opened with an HDF5 chunk cache **sized from the file's actual chunk layout** (#
 `_chunk_cache_kwargs` — h5py's 1 MiB default cannot hold one decompressed BL-scale
 bitshuffle chunk, so every stamp used to re-decompress its full ~16-chunk stripe; with the
 sized cache, sequential start order makes each chunk decompress once per task, the reuse
-the sort was always meant to buy).
+the sort was always meant to buy). The sizing is computed **once per obs file in the
+parent** and shipped in the task args (#301 — each task used to re-open the file just to
+inspect its chunk layout, ~2 redundant network-FS open/inspect cycles × ~132 tasks per
+cadence; the same hoist the PFB-check tasks already used).
 
 ### Stamp extraction and storage math
 
@@ -210,6 +218,16 @@ oversubscription keeps the stage's final wave to a fraction of one task, drained
 per-run-unique `.tmp` → `os.replace` atomicity — the resume path treats the `.npy`'s
 existence as proof of a complete write, and abandoned tmps are age-swept (see the guarded
 cross-run stamp cache in [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)).
+
+Within a task, overlapping or abutting stamp windows (the overlap_search triplets abut at
+`stamp_width // 2`) are **coalesced into one wide h5 read** and sliced per stamp
+(`_coalesce_stamp_groups`, #301) — byte-identical values, ~one read instead of three across
+an RFI comb, the wide buffer bounded by `_COALESCE_MAX_BINS` (~64 MiB per worker); disjoint
+windows stay singleton groups, i.e. exactly the historical per-stamp read pattern. The
+per-task memmap `flush()` is also gone (#301): `flush()` `msync(MS_SYNC)`s the *entire*
+multi-GB mapping once per task, serializing writeback into worker time — read coherence is
+the unified page cache either way, and crash durability is unchanged (the `os.replace`
+publication never fsynced data pages; an unpublished tmp re-extracts by design).
 
 **Downsample-at-extraction** (`store_downsampled_stamps`, default on): each stamp is reduced
 along frequency with `skimage.transform.downscale_local_mean(stamp, (1, downsample_factor))`
@@ -228,11 +246,22 @@ self-describes, and the loader handles both layouts (below). Disable to archive 
 stamps.
 
 The metadata JSON also carries the full ED provenance for the visualization suite —
-per-stamp starts/frequencies/statistics/p-values, raw and merged hit frequency lists, the
-per-ON-file statistic histograms, and the `.h5` header — plus the `ed_config_fingerprint`
-the stamp-cache resume guard verifies (#298). It is written with compact separators (the
-old `indent=2` pretty-printing cost ~0.5–1.5 s per RFI-dense cadence on the prefetch
-critical path).
+per-stamp starts/frequencies/statistics/p-values, the per-ON-file statistic histograms, and
+the `.h5` header — plus the `ed_config_fingerprint` the stamp-cache resume guard verifies
+(#298). Hit frequencies are stored **pre-binned** since #301: `hit_spectrum_hist` (8,192
+bins spanning the file band — `freq_lo`/`freq_hi`/`n_bins`, raw + merged counts, and the
+exact raw-hit min/max so the figure reproduces the historical axis bounds) replaces the raw
+per-hit frequency list, which ran ~19 MB of JSON on an RFI-dense cadence and had exactly
+one consumer — the hit-spectrum figure, which now rebins the histogram instead; the small
+post-dedup `merged_hit_frequencies_mhz` list stays. The sidecar also persists
+`bandpass_envelopes` (#301): per sampled coarse channel of the primary ON file, decimated
+raw / flattened / overlay integrated-spectrum lines (`{idx, values}` each, plus the channel
+and overlay label) — computed in the parent from the despiked spectra the ED workers return,
+exact w.r.t. the figure's own math (the PFB divide and the spline subtraction both commute
+with the time mean) — so the bandpass-flattening figure renders from ~KB of stored points
+instead of re-reading cold coarse channels at viz time. The JSON is written with compact
+separators (the old `indent=2` pretty-printing cost ~0.5–1.5 s per RFI-dense cadence on the
+prefetch critical path).
 
 ## Loading paths
 
@@ -251,10 +280,15 @@ the stored width: files already at `width_bin // downsample_factor` (512 — wri
 downsample-at-extraction) need only per-cadence log-norm, run vectorized in the workers
 (`_lognorm_worker`); legacy full-width files (4096) keep the historical
 downsample-then-log-norm path. Any other width is an error (skipped with a log). The loaded
-array must survive strict [0, 1] / NaN / Inf checks before inference proceeds.
+array must survive strict [0, 1] / NaN / Inf checks before inference proceeds (leaner since
+#301: NaN detection rides the min reduction — NaN propagates — with branch outcomes and
+messages unchanged for every input, and the two full-array boolean passes gone).
 `parallel=False` forces the sequential in-process branch (no chunk pool / SHM) — the
 streaming per-cadence path uses it so the loader never competes with the persistent
-energy-detection pool for cores.
+energy-detection pool for cores. On that branch an already-downsampled file loads as **one
+chunk** (#301): the chunking bounds the SHM block on the pooled path and RAM on legacy
+full-width loads, but here it only split one cadence's stamps into blocks that then paid a
+full-array `np.concatenate` re-copy — peak transient is ~2× the array either way.
 
 **Log-normalization** (`data_generation.log_norm`): `y = log(x + 10⁻¹⁰)` shifted by its
 minimum and scaled by its range into [0, 1], per observation. With `return_params=True` it

@@ -637,10 +637,14 @@ class ResourceMonitor:
         if self.db is None:
             raise RuntimeError("No database instance detected - cannot generate resource plot")
 
-        all_resources = self.db.query_system_resource(
+        # Decimated per series (#301): a multi-week run holds tens of millions of rows;
+        # the plot renders ~2k px wide, so >4k points/line is invisible and the full
+        # materialization cost a multi-GB teardown RAM spike.
+        all_resources = self.db.query_system_resource_decimated(
             tag=self.tag,
             start_time=self.start_time,
             end_time=current_time,
+            max_points_per_series=4096,
         )
 
         if not all_resources:

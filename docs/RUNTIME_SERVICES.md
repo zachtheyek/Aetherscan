@@ -183,7 +183,11 @@ core count, so 100 % means "all cores busy".
 
 ### The shutdown plot
 
-When the monitor stops (during cleanup), `_save_plot()` queries the run's samples and renders
+When the monitor stops (during cleanup), `_save_plot()` queries the run's samples —
+decimated per series since #301 (`db.query_system_resource_decimated`, ≤ 4,096
+uniformly-strided points per `(resource_type, resource_name)` line: a multi-week run holds
+tens of millions of rows while the plot renders ~2 k px wide, and materializing them all
+cost a multi-GB teardown RAM spike; see [`DATABASE.md`](DATABASE.md)) — and renders
 `plots/resource_utilization_{tag}.png` — three stacked, time-aligned panels:
 
 1. **CPU** — Aetherscan process tree (filled) vs system total.

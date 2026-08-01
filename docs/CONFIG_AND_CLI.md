@@ -37,7 +37,9 @@ parse_args()                       ── argparse picks the specified subparser
    ▼
 apply_saved_config(config_path)    ── only runs on args.command == inference and args.config_path
    │                                  is not None:
-   │                                  overrides the singleton defaults at runtime with a saved JSON
+   │                                  layers the saved JSON's allowlisted model-contract fields
+   │                                  onto the singleton defaults (#303); every other saved field
+   │                                  is ignored (logged when it differs from the resolved value)
    │
    ▼
 validate_args(args)                ── raises ValueError on any failure (no mutation)
@@ -53,11 +55,34 @@ apply_args_to_config(args)         ── writes non-None args onto the Config s
 train_command() / inference_command()
 ```
 
-Priority order:
+Priority order, for the fields a saved config is allowed to layer:
 
 ```
 runtime defaults  <  loaded config  <  CLI args
 ```
+
+`apply_saved_config` is **allowlist-only** (#303): a saved training config layers exactly
+the model-contract / result-affecting fields — the whole `beta_vae` section, the RF's
+deployed-representation contract (`latent_variant` / `active_dims` / `calibration_active` /
+`calibration_method` — not `n_jobs`, not seeds), the data geometry keys, and precisely the
+inference fields the resume fingerprints hash minus the artifact paths. Everything else —
+paths (in nested or legacy flat form), `gpu`, `manager`, `db` / `logger` / `monitor`, `hf`,
+`training`, `checkpoint`, and `reproducibility` — always comes from env + defaults + CLI,
+and every ignored saved field whose value differs from the resolved one is logged as a
+startup diff line, so nothing disappears silently. The old inverse design (apply everything
+minus a skip-list) left every host-scoped field unsafe by default — the live footgun being
+`manager.n_processes`: a config saved on a 96-core host silently 3×-oversubscribed a
+32-core host's worker pool, with no CLI rescue before `--n-processes` existed. The
+inference and data sub-allowlists are **derived from `run_state.py`'s fingerprint key
+sets** and pinned by a drift test, so `cli.py` and `run_state.py` can never silently
+disagree about which inference/data fields are result-affecting; the `rf` field allowlist
+and the `beta_vae` section allowlist are literal (`rf` is in no fingerprint) and pinned by
+their own equality test. One trap this design does **not** remove: a *new* field added to
+`InferenceConfig` defaults **into** the allowlist (it is `fields(InferenceConfig)` minus the
+exclude set) and — once mirrored into `to_dict` — into both fingerprints, so a new
+host-tuning knob on `InferenceConfig` must be added to the run_state denylists explicitly,
+exactly as `prune_stamps`/`inference_viz_scope` were. Only a field added to a
+non-allowlisted section (`manager`, `gpu`, `db`, …) is ignored by default.
 
 ## The configuration singleton
 
@@ -144,9 +169,9 @@ The `_add_*_flags_to(parser)` indirection exists so utility scripts (e.g.
 `utils/find_optimal_configs.py`) can expose the exact same flag surface against an
 arbitrary parser — they import the helper and call it on their own parser without
 re-declaring every argument. Both helpers additionally call
-`_add_reproducibility_flags_to(parser)` first, registering the shared `--seed` /
-`--tf-deterministic-ops` flags (#279) through one function so the train and inference
-surfaces cannot drift.
+`_add_reproducibility_flags_to(parser)` and `_add_runtime_flags_to(parser)` first,
+registering the shared `--seed` / `--tf-deterministic-ops` (#279) and `--n-processes`
+(#303) flags through one function each so the train and inference surfaces cannot drift.
 
 ### Flag categories
 
@@ -167,7 +192,8 @@ if hasattr(args, "num_samples_beta_vae") and args.num_samples_beta_vae is not No
 ```
 
 Examples: most flags (`--num-samples-beta-vae`, `--curriculum-schedule`,
-`--encoder-path`, `--screening-threshold`, `--mc-draws`, `--overlap-fraction`, ...). The
+`--encoder-path`, `--screening-threshold`, `--mc-draws`, `--overlap-fraction`,
+`--prune-stamps`, `--inference-viz-scope`, ...). The
 `hasattr` check is what gives the
 guarantee — argparse simply doesn't add inference-only attributes to a train namespace
 (and vice versa), so `hasattr` is False for any other mode.
@@ -203,6 +229,7 @@ Current Pattern B flags:
 - `--benchmark-report` / `--no-benchmark-report` (`BooleanOptionalAction`) → `config.monitor.benchmark_report_enabled`
 - `--seed` / `--unseeded` → `config.reproducibility.seed` (registered via `_add_reproducibility_flags_to`; `--unseeded` sets it to None, mutually exclusive with `--seed`)
 - `--tf-deterministic-ops` (`BooleanOptionalAction`) → `config.reproducibility.tf_deterministic_ops` (same helper)
+- `--n-processes` → `config.manager.n_processes` (registered via the shared `_add_runtime_flags_to` helper, #303; validated `>= 1` — the operator override for worker-pool sizing, which is never layered from a saved `--config-path`)
 
 #### Pattern C — shared flag, divergent destination
 
@@ -261,7 +288,8 @@ effective value the pipeline would use even when a flag is omitted.
 In `inference` mode, `apply_saved_config(args.config_path)` runs immediately
 after `parse_args` and before `validate_args` — so by the time validation kicks in,
 the singleton's defaults at runtime have already been overridden by the saved JSON's
-fields, allowing `_resolve` to return the correct value.
+allowlisted fields (#303 — see the layering rules above), allowing `_resolve` to return
+the correct value.
 
 Three things to know:
 
@@ -272,7 +300,14 @@ Three things to know:
    `_solve_cross_param_constraints`, `_check_cross_constraints`) to append a
    `Suggested fixes:` block to the error message. The standalone
    [`utils/find_optimal_configs.py`](#diagnosing-config-issues-with-find_optimal_configspy) script exercises the same proposer for ad-hoc
-   "what config would work on N GPUs?" queries.
+   "what config would work on N GPUs?" queries. The cross-parameter checks include, since
+   #297, the RF train-split floor —
+   `num_samples_rf * train_val_split >= effective_batch_size`, a `>=` floor only
+   (deliberately not divisibility: the runtime split trims to a multiple of the effective
+   batch, and the defaults rely on the trim) — because below one full batch the split
+   trims to zero and the run dies at `rf_train` *after* the beta-VAE rounds already
+   trained; the same floor is mirrored in `_check_cross_constraints` so the suggested-fix
+   solver can never propose a config that dies there.
 
 2. **`num_replicas` is resolved ahead of time** by `_resolve_num_replicas(args)`, in
    priority order: `args.num_replicas` if the user passed `--num-replicas`, else
@@ -415,7 +450,8 @@ mode && /^ *"--/{
 The second command lists every shared flag (those appearing in both subparsers); each
 should match either a single Pattern B `apply_args` block or a pair of Pattern C blocks
 with a `command` discriminator. Note the awk only sees flags registered lexically inside
-the two `_add_*_flags_to` bodies — `--seed` / `--tf-deterministic-ops` live in the shared
-`_add_reproducibility_flags_to` helper (called by both) and must be counted by hand. As of
-this writing the command yields 15 flags; with the two helper-registered ones the shared
-surface is 17 — 14 Pattern B + 3 Pattern C.
+the two `_add_*_flags_to` bodies — `--seed` / `--tf-deterministic-ops` / `--n-processes`
+live in the shared `_add_reproducibility_flags_to` / `_add_runtime_flags_to` helpers
+(called by both) and must be counted by hand. As of this writing the command yields 15
+flags; with the three helper-registered ones the shared surface is 18 — 15 Pattern B +
+3 Pattern C.

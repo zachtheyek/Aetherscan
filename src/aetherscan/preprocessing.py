@@ -95,6 +95,22 @@ _EXTRACT_TASKS_PER_WORKER = 4
 # is considered abandoned and removed. Live writes are minutes-scale; a day of margin means
 # a concurrent run's in-progress tmp can never be mistaken for a dead one.
 _STALE_TMP_MAX_AGE_S = 24 * 3600
+# Cap on one coalesced extraction read (#301): overlapping/abutting stamp windows (the
+# overlap_search triplets abut at offset stamp_width // 2) are fetched as ONE wide h5
+# read and sliced, instead of re-reading the shared span per stamp. 2**20 bins bounds the
+# wide float32 buffer at ~64 MiB per worker (16 time rows) even across an RFI comb whose
+# windows chain for a whole coarse channel.
+_COALESCE_MAX_BINS = 2**20
+# Fixed per-cadence bin count for the pre-binned hit-frequency histograms stored in the
+# metadata sidecar (#301): the raw per-hit frequency lists ran ~19 MB of JSON on an
+# RFI-dense cadence (~117 GB over the full catalog) and forced the viz suite to hold every
+# cadence's floats in RAM. 8192 bins over the file band keeps the rebinned hit-spectrum
+# figure visually identical (fine-bin width ≪ the figure's global bin width) at ~20-50 KB.
+_HIT_HIST_BINS = 8192
+# Decimation budget for the bandpass envelopes persisted per cadence (#301): the viz
+# figure renders ~2,100 px wide, so 1,024 min/max pairs per line lose nothing visually,
+# and the stored envelopes spare the figure its ~114 s of cold /datag channel re-reads.
+_ENVELOPE_MAX_POINTS = 1024
 
 
 def _chunk_cache_kwargs(h5_path: str, time_bins: int) -> dict:
@@ -657,21 +673,24 @@ def _cached_h5_file(h5_path: str):
     return handle
 
 
-def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]:
+def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray, np.ndarray | None]:
     """
     Fused worker: run the complete energy-detection chain for one coarse channel — read the
     channel's h5 slice, remove the DC spike, flatten the bandpass, and threshold the vectorized
-    normality statistic. Returns (hits, stat_hist): hits is a small list of
+    normality statistic. Returns (hits, stat_hist, integrated): hits is a small list of
     (absolute_fine_channel_index, statistic, pvalue) tuples; stat_hist is the histogram of
     *all* finite window statistics (not just hits) over the fixed ED_STAT_HIST_EDGES bins, so
     the parent can cheaply accumulate the full per-file statistic distribution for the
-    visualization suite. The bulky (time_bins, coarse_channel_width) intermediates never leave
+    visualization suite; integrated is the despiked channel's time-integrated spectrum
+    (float64, only when want_spectrum — the parent turns the few sampled channels' spectra
+    into the persisted bandpass envelopes, #301, sparing the viz suite its cold h5 re-reads).
+    The bulky (time_bins, coarse_channel_width) intermediates never leave
     the worker, so no shared memory or per-block parent arrays are needed.
 
     args is (h5_path, channel_index, coarse_channel_width, time_bins, bandpass_flatten,
-    window_size, step_size, stat_threshold). bandpass_flatten is a picklable callable
-    (channel) -> residuals (see _spline_flatten_bandpass). Each worker opens its own h5py.File
-    since h5py file handles are fork-unsafe to share.
+    window_size, step_size, stat_threshold, want_spectrum). bandpass_flatten is a picklable
+    callable (channel) -> residuals (see _spline_flatten_bandpass). Each worker opens its own
+    h5py.File since h5py file handles are fork-unsafe to share.
     """
     (
         h5_path,
@@ -682,6 +701,7 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
         window_size,
         step_size,
         stat_threshold,
+        want_spectrum,
     ) = args
 
     start = channel_index * coarse_channel_width
@@ -700,6 +720,10 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
     # offsets can never cross a coarse-channel boundary.
     _remove_dc_spike(channel, coarse_channel_width, 1)
 
+    # float64 accumulation matches the viz path this replaces (_read_despiked_channel
+    # casts to float64 before integrating); one mean over the already-resident channel.
+    integrated = channel.mean(axis=0, dtype=np.float64) if want_spectrum else None
+
     residuals = bandpass_flatten(channel)
 
     k2 = _sliding_normality_k2(residuals, window_size, step_size)
@@ -714,7 +738,7 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
 
     hit_windows = np.nonzero(k2 > stat_threshold)[0]
     if hit_windows.size == 0:
-        return [], stat_hist
+        return [], stat_hist, integrated
 
     # p-values are only stored in metadata, so chi2.sf runs on the (small) hit subset only
     pvalues = stats.chi2.sf(k2[hit_windows], 2)
@@ -722,7 +746,29 @@ def _energy_detect_channel_worker(args: tuple) -> tuple[list[tuple], np.ndarray]
         (start + int(j) * step_size, float(k2[j]), float(p))
         for j, p in zip(hit_windows, pvalues, strict=True)
     ]
-    return hits, stat_hist
+    return hits, stat_hist, integrated
+
+
+def _coalesce_stamp_groups(stamp_starts, stamp_width: int) -> list[list[int]]:
+    """Group indices of start-sorted stamps whose read windows overlap or abut, so each
+    group pays one wide h5 read (#301). A group is capped at _COALESCE_MAX_BINS total
+    span to bound the wide buffer. Disjoint windows stay singleton groups — the read
+    pattern is then exactly the historical per-stamp one."""
+    if not len(stamp_starts):
+        # Unreachable from the extract-task construction (chunks are never empty), but a
+        # bare [0] seed group would index-error on any future empty caller
+        return []
+    groups: list[list[int]] = []
+    current = [0]
+    for i in range(1, len(stamp_starts)):
+        fits = stamp_starts[i] + stamp_width - stamp_starts[current[0]] <= _COALESCE_MAX_BINS
+        if stamp_starts[i] <= stamp_starts[current[-1]] + stamp_width and fits:
+            current.append(i)
+        else:
+            groups.append(current)
+            current = [i]
+    groups.append(current)
+    return groups
 
 
 def _extract_stamps_worker(args: tuple) -> None:
@@ -730,14 +776,26 @@ def _extract_stamps_worker(args: tuple) -> None:
 
     Each worker opens its own hdf5 handle and its own r+ view of the shared .npy, then
     copies a stamp_width-wide window (over the first `time_bins` rows, polarization 0) around
-    each hit. When downsample_factor > 1 the stamp is downsampled along frequency with
+    each hit. Overlapping/abutting windows (the overlap_search triplets abut at offset
+    stamp_width // 2) are fetched as one coalesced wide read and sliced per stamp —
+    byte-identical values, ~one read instead of three over an RFI comb (#301). When
+    downsample_factor > 1 each stamp is downsampled along frequency with
     downscale_local_mean before writing, so the memmap stores width
     stamp_width // downsample_factor — this is the same operation load_inference_data used to
     apply after the fact, moved to extraction time to cut storage by the same factor. Tasks
     address disjoint output regions — distinct obs_idx and/or non-overlapping stamp indices —
     so concurrent writes from the pool never collide. `stamp_starts` is the contiguous,
     start-sorted slice for this task; `base_idx` is its offset into the full stamp list so the
-    worker writes to the correct absolute rows.
+    worker writes to the correct absolute rows. `open_kwargs` is the chunk-cache sizing
+    computed ONCE per obs file in the parent (#301 — each task used to re-open the file just
+    to inspect its chunk layout; same hoist as the PFB-check tasks).
+
+    NOTE: no out.flush() before the memmap closes (#301). flush() msync(MS_SYNC)s the ENTIRE
+    multi-GB mapping once per task (~132 tasks/cadence), serializing writeback into worker
+    time; closing the mapping leaves the dirty pages to the kernel's async writeback with
+    identical read coherence (unified page cache). Crash durability is unchanged — the
+    os.replace publication never fsynced the data pages anyway, and an unpublished tmp is
+    re-extracted by design.
     """
     (
         npy_path,
@@ -748,6 +806,7 @@ def _extract_stamps_worker(args: tuple) -> None:
         time_bins,
         stamp_width,
         downsample_factor,
+        open_kwargs,
     ) = args
     out = np.lib.format.open_memmap(npy_path, mode="r+")
     try:
@@ -755,14 +814,20 @@ def _extract_stamps_worker(args: tuple) -> None:
         # with the h5py default (1 MiB) a BL-scale bitshuffle chunk never fits, so every
         # stamp re-decompresses its full chunk stripe; sized from the actual layout, each
         # chunk decompresses once per task (see _chunk_cache_kwargs).
-        with h5py.File(obs_h5, "r", **_chunk_cache_kwargs(obs_h5, time_bins)) as hf:
+        with h5py.File(obs_h5, "r", **(open_kwargs or {})) as hf:
             dset = hf["data"]
-            for local_i, start in enumerate(stamp_starts):
-                stamp = dset[:time_bins, 0, start : start + stamp_width]
-                if downsample_factor > 1:
-                    stamp = downscale_local_mean(stamp, (1, downsample_factor)).astype(np.float32)
-                out[base_idx + local_i, obs_idx] = stamp
-        out.flush()
+            for group in _coalesce_stamp_groups(stamp_starts, stamp_width):
+                group_start = stamp_starts[group[0]]
+                group_end = stamp_starts[group[-1]] + stamp_width
+                wide = dset[:time_bins, 0, group_start:group_end]
+                for local_i in group:
+                    offset = stamp_starts[local_i] - group_start
+                    stamp = wide[:, offset : offset + stamp_width]
+                    if downsample_factor > 1:
+                        stamp = downscale_local_mean(stamp, (1, downsample_factor)).astype(
+                            np.float32
+                        )
+                    out[base_idx + local_i, obs_idx] = stamp
     finally:
         del out
 
@@ -800,6 +865,10 @@ class CadenceResult:
     # is NOT the raw energy-detection hit count (metadata's n_raw_hits carries that).
     n_hits: int
     metadata_path: str  # Sibling .json with hit details
+    # True iff THIS run's _process_cadence wrote the .npy (False on the resume path).
+    # Stamp-cache pruning (#302) only ever deletes freshly-extracted stamps, so a run
+    # resumed over a handed-over cache can never destroy it.
+    freshly_extracted: bool = False
 
 
 # NOTE: come back to this later
@@ -973,6 +1042,13 @@ class DataPreprocessor:
         # Persistent worker pool for energy detection + stamp extraction, shared across all
         # cadences of a run (see start/stop_energy_detection_pool)
         self._ed_pool: Pool | None = None
+
+        # npy_paths THIS process freshly extracted (#302 disk-leak fix): survives the
+        # in-process retry loop because the preprocessor outlives it. A cadence this run
+        # extracted then resumes on a later attempt (its stamps were kept because its
+        # inference stage failed) is still prunable — unlike a genuinely handed cache,
+        # which this process never extracted and so is absent from the set.
+        self._extracted_this_run: set[str] = set()
 
     # NOTE: come back to this later
     def close(self):
@@ -1315,13 +1391,21 @@ class DataPreprocessor:
 
             # Divide background into equal chunks, then cutoff if exceeds max_chunks
             n_cadences_total = raw_data.shape[0]
-            n_chunks = (n_cadences_total + chunk_size - 1) // chunk_size
+            # One chunk per already-downsampled file on the sequential path (#301): the
+            # chunking bounds the SHM block on the pooled path and RAM on legacy
+            # full-width loads, but here it only split one cadence's stamps into blocks
+            # that then paid a full-array np.concatenate re-copy at the end — peak
+            # transient is ~2x the array either way.
+            effective_chunk_size = chunk_size
+            if already_downsampled and not parallel:
+                effective_chunk_size = max(chunk_size, n_cadences_total)
+            n_chunks = (n_cadences_total + effective_chunk_size - 1) // effective_chunk_size
 
             for chunk_idx in range(n_chunks):
                 logger.info(f"Processing {filename}: chunk {chunk_idx + 1}/{n_chunks}")
 
-                chunk_start = chunk_idx * chunk_size
-                chunk_end = min((chunk_idx + 1) * chunk_size, n_cadences_total)
+                chunk_start = chunk_idx * effective_chunk_size
+                chunk_end = min((chunk_idx + 1) * effective_chunk_size, n_cadences_total)
 
                 # Load chunk into memory
                 chunk_data = np.array(raw_data[chunk_start:chunk_end])
@@ -1460,7 +1544,13 @@ class DataPreprocessor:
         # Clear all_blocks reference
         del all_blocks
 
-        # Sanity check: print descriptive stats
+        # Sanity check: print descriptive stats. NaN detection rides the min reduction
+        # (NaN propagates through np.min, and NaN > 1.0 / NaN < 0.0 are both False, so a
+        # NaN array reaches that branch exactly as it did via the old full-array
+        # .any() pass); the two extra full-array validity passes and their full-size
+        # bool temporaries are gone (#301). The old isinf branch was unreachable: +inf
+        # always tripped the max check first, -inf the min check, and NaN the isnan
+        # branch — outcomes and messages are unchanged for every input.
         min_val = np.min(cadence_array)
         max_val = np.max(cadence_array)
         mean_val = np.mean(cadence_array)
@@ -1471,11 +1561,8 @@ class DataPreprocessor:
         elif min_val < 0.0:
             logger.error(f"Cadence array values too small! Min: {min_val}")
             raise ValueError("Preprocessing normalization check failed")
-        elif np.isnan(cadence_array).any():
+        elif np.isnan(min_val):
             logger.error("Cadence array contains NaN values!")
-            raise ValueError("Preprocessing normalization check failed")
-        elif np.isinf(cadence_array).any():
-            logger.error("Cadence array contains Inf values!")
             raise ValueError("Preprocessing normalization check failed")
         else:
             logger.info("Cadence array properly normalized")
@@ -1642,6 +1729,9 @@ class DataPreprocessor:
                         key=group.key,
                         n_hits=n_hits,
                         metadata_path=metadata_path,
+                        # Prunable iff THIS process extracted it (a failed-then-retried
+                        # cadence of this run), not if it is a handed cache (#302 leak fix)
+                        freshly_extracted=npy_path in self._extracted_this_run,
                     )
                 # Guard failed: fall through and reprocess (the atomic tmp -> os.replace
                 # publication overwrites the mismatched artifact)
@@ -1800,7 +1890,6 @@ class DataPreprocessor:
         downsample_factor = self.config.data.downsample_factor if store_downsampled else 1
         time_bins = self.config.data.time_bins
         n_processes = self.config.manager.n_processes
-        progress_chunk = max(1, log_interval if log_interval is not None else n_processes)
 
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
@@ -1905,6 +1994,16 @@ class DataPreprocessor:
             f"Cadence {group.key}: running energy detection on "
             f"{len(on_source_paths)} ON-source files x {n_coarse_total} coarse channels"
         )
+        # Progress-log points per ON file (#301): an explicit coarse_channel_log_interval
+        # keeps the historical every-N-channels cadence; the None default logs at ~25%
+        # milestones instead of every n_processes channels — the per-channel progress
+        # lines were a measured 62% of a run's total log volume, all Slack-bound
+        # (~594k lines over a full catalog).
+        if log_interval is not None:
+            step = max(1, log_interval)
+            progress_points = set(range(step, n_coarse_total + 1, step)) | {n_coarse_total}
+        else:
+            progress_points = {max(1, (n_coarse_total * q) // 4) for q in (1, 2, 3, 4)}
         with stage_timer("read_ed"):
             # Residual-flatness sanity check — primary ON file only (the static response is
             # a property of the backend, shared by every file). Runs ON THE POOL alongside
@@ -1917,6 +2016,11 @@ class DataPreprocessor:
                 else None
             )
 
+            # The few channels whose despiked integrated spectra feed the persisted
+            # bandpass envelopes (#301) — primary ON file only, same sampling as the
+            # figure this replaces; the spectra ride back with the ED results, so no
+            # extra h5 reads happen at all
+            envelope_channels = set(self._sample_channel_indices(n_coarse_total))
             tasks = [
                 (
                     on_h5,
@@ -1927,6 +2031,7 @@ class DataPreprocessor:
                     window_size,
                     step_size,
                     stat_threshold,
+                    on_h5 == primary_h5 and ch in envelope_channels,
                 )
                 for on_h5 in on_source_paths
                 for ch in range(n_coarse_total)
@@ -1944,12 +2049,15 @@ class DataPreprocessor:
                     )
                 channel_hits_iter = map(_energy_detect_channel_worker, tasks)
 
-            for done, (channel_hits, channel_hist) in enumerate(channel_hits_iter):
+            integrated_by_channel: dict[int, np.ndarray] = {}
+            for done, (channel_hits, channel_hist, integrated) in enumerate(channel_hits_iter):
                 on_source_idx = done // n_coarse_total
                 file_done = done % n_coarse_total + 1
                 all_hits.extend(channel_hits)
                 stat_hists[on_source_idx] += channel_hist
-                if file_done % progress_chunk == 0 or file_done == n_coarse_total:
+                if integrated is not None:
+                    integrated_by_channel[done % n_coarse_total] = integrated
+                if file_done in progress_points:
                     logger.info(
                         f"  Coarse channel {file_done}/{n_coarse_total} of ON-source "
                         f"{on_source_idx + 1}/{len(on_source_paths)}"
@@ -1957,6 +2065,17 @@ class DataPreprocessor:
 
             if pfb_check is not None:
                 self._finish_pfb_response_check(pfb_check, primary_h5)
+
+        # Persisted bandpass envelopes (#301): decimated raw/flattened/overlay lines per
+        # sampled channel, computed from the spectra that rode back with ED. Viz-only —
+        # a failure degrades one figure, never the cadence.
+        bandpass_envelopes = None
+        try:
+            bandpass_envelopes = self._build_bandpass_envelopes(
+                integrated_by_channel, bandpass_flatten, pfb_active
+            )
+        except Exception as e:
+            logger.warning(f"Cadence {group.key}: bandpass envelope computation failed ({e})")
 
         logger.info(f"Cadence {group.key}: {len(all_hits)} raw hits across ON-source files")
 
@@ -2024,14 +2143,24 @@ class DataPreprocessor:
         # deterministic given the ED config, so whichever writer publishes last is
         # harmless; os.replace stays atomic.
         tmp_npy_path = f"{os.path.splitext(npy_path)[0]}.{os.getpid()}.{uuid.uuid4().hex}.tmp.npy"
-        # A leftover *.tmp.npy means an attempt died (e.g. SIGKILL) between memmap creation
-        # and os.replace; it was never promoted to npy_path, so it is safe to drop once
-        # clearly abandoned. Only age-expired tmps are removed — a fresh one may be a live
-        # concurrent run's in-progress write. The fixed pre-#298 "<stem>.tmp.npy" name is
-        # swept too (legacy leftovers in explicitly shared directories).
+        # A leftover per-cadence tmp means an attempt died (e.g. SIGKILL) between creation
+        # and os.replace; it was never promoted, so it is safe to drop once clearly
+        # abandoned. Only age-expired tmps are removed — a fresh one may be a live
+        # concurrent run's in-progress write. The glob "<stem>.*.tmp" sweeps every
+        # per-cadence tmp uniformly: the stamp memmap "<stem>.<pid>.<hex>.tmp.npy", the
+        # metadata "<stem>.json.<pid>.<hex>.tmp", and the #302 candidate sidecar
+        # "<stem>.candidates.npz.<pid>.<hex>.tmp" (the latter two ended in ".tmp" but not
+        # ".tmp.npy", so the old ".*.tmp.npy" glob leaked them). The fixed pre-#298
+        # "<stem>.tmp.npy" legacy name is swept too.
         stale_cutoff = time.time() - _STALE_TMP_MAX_AGE_S
         stem = os.path.splitext(npy_path)[0]
-        for stale in glob.glob(f"{glob.escape(stem)}.*.tmp.npy") + [f"{stem}.tmp.npy"]:
+        escaped = glob.escape(stem)
+        stale_tmps = (
+            glob.glob(f"{escaped}.*.tmp.npy")  # stamp memmap tmps
+            + glob.glob(f"{escaped}.*.tmp")  # metadata + candidate-sidecar tmps
+            + [f"{stem}.tmp.npy"]  # fixed pre-#298 legacy name
+        )
+        for stale in stale_tmps:
             with contextlib.suppress(OSError):
                 if os.path.getmtime(stale) < stale_cutoff:
                     logger.warning(
@@ -2060,6 +2189,11 @@ class DataPreprocessor:
             1, -(-(_EXTRACT_TASKS_PER_WORKER * n_processes) // len(group.h5_paths))
         )  # ceil div
         chunk_size = max(1, -(-n_stamps // chunks_per_file))  # ceil div
+        # Chunk-cache kwargs are a pure function of each file's layout — computed once per
+        # obs file here instead of once per task in the workers (#301: ~2 redundant
+        # network-FS open/inspect cycles x ~132 tasks per cadence; the same hoist the
+        # PFB-check tasks already used)
+        cache_kwargs = {obs_h5: _chunk_cache_kwargs(obs_h5, time_bins) for obs_h5 in group.h5_paths}
         tasks = [
             (
                 tmp_npy_path,
@@ -2070,6 +2204,7 @@ class DataPreprocessor:
                 time_bins,
                 stamp_width,
                 downsample_factor,
+                cache_kwargs[obs_h5],
             )
             for obs_idx, obs_h5 in enumerate(group.h5_paths)
             for base in range(0, n_stamps, chunk_size)
@@ -2095,6 +2230,26 @@ class DataPreprocessor:
         stamp_stats = [float(s) for _, s, _ in stamp_centers]
         stamp_pvals = [float(p) for _, _, p in stamp_centers]
 
+        # Pre-binned hit-frequency histograms (#301): a fixed per-cadence grid spanning
+        # the file band, fine enough (_HIT_HIST_BINS) that the viz suite's rebinning onto
+        # its global axis is visually exact. The exact raw-hit min/max ride along so the
+        # figure reproduces the historical axis bounds. merged_hits is non-empty here and
+        # all_hits ⊇ merged_hits, so the min/max are well-defined.
+        raw_freq_values = np.array([fch1 + foff * idx for idx, _, _ in all_hits])
+        merged_freq_values = np.array([fch1 + foff * idx for idx, _, _ in merged_hits])
+        band_lo = min(fch1, fch1 + foff * n_chans)
+        band_hi = max(fch1, fch1 + foff * n_chans)
+        band_edges = np.linspace(band_lo, band_hi, _HIT_HIST_BINS + 1)
+        hit_spectrum_hist = {
+            "freq_lo": float(band_lo),
+            "freq_hi": float(band_hi),
+            "n_bins": _HIT_HIST_BINS,
+            "raw_counts": np.histogram(raw_freq_values, bins=band_edges)[0].tolist(),
+            "merged_counts": np.histogram(merged_freq_values, bins=band_edges)[0].tolist(),
+            "raw_freq_min": float(raw_freq_values.min()),
+            "raw_freq_max": float(raw_freq_values.max()),
+        }
+
         metadata = {
             "key": group.key,
             "csv_path": group.csv_path,
@@ -2110,20 +2265,23 @@ class DataPreprocessor:
             "overlap_search": overlap_search,
             "overlap_fraction": overlap_fraction if overlap_search else None,
             # Energy-detection provenance for the visualization suite: the all-window
-            # statistic histograms (per ON file, fixed log-spaced bins) and the hit
-            # frequencies before/after deduplication (hit spectrum + funnel figures).
-            # NOTE: the frequency lists are stored raw (unlike the pre-binned stat
-            # histograms — an asymmetry): tens of thousands of floats per RFI-dense
-            # cadence, bounded at current catalog scale. If metadata JSONs grow unwieldy,
-            # pre-bin these onto a fixed frequency grid the way ed_stat_hist does.
+            # statistic histograms (per ON file, fixed log-spaced bins) and the pre-binned
+            # hit-frequency histograms (hit spectrum + funnel figures). Raw per-hit
+            # frequency lists are no longer stored (#301 — this discharges the old
+            # pre-binning NOTE): they ran ~19 MB of JSON on an RFI-dense cadence and had
+            # exactly one consumer, the hit-spectrum figure, which now rebins
+            # hit_spectrum_hist instead. The post-dedup merged list stays (small, the
+            # scientifically meaningful set); raw counts survive in n_raw_hits + the
+            # histogram.
             "ed_stat_hist": {
                 "bin_edges": [float(e) for e in ED_STAT_HIST_EDGES],
                 "counts_per_on_file": stat_hists.tolist(),
             },
             "n_raw_hits": len(all_hits),
             "n_merged_hits": len(merged_hits),
-            "raw_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in all_hits],
+            "hit_spectrum_hist": hit_spectrum_hist,
             "merged_hit_frequencies_mhz": [float(fch1 + foff * idx) for idx, _, _ in merged_hits],
+            "bandpass_envelopes": bandpass_envelopes,
             # The ED config these stamps were produced under (#298 I3) — checked by the
             # resume guard before an existing .npy is reused
             "ed_config_fingerprint": preprocessing_config_fingerprint(self.config.to_dict()),
@@ -2160,12 +2318,16 @@ class DataPreprocessor:
             f"{npy_path} (metadata: {metadata_path})"
         )
 
+        # Record for the disk-leak guard: a later retry attempt that resumes this .npy
+        # (kept because this attempt's inference failed) is still this run's work to prune
+        self._extracted_this_run.add(npy_path)
         return CadenceResult(
             npy_path=npy_path,
             h5_paths=group.h5_paths,
             key=group.key,
             n_hits=n_stamps,
             metadata_path=metadata_path,
+            freshly_extracted=True,
         )
 
     def _get_bandpass_flattener(
@@ -2288,6 +2450,42 @@ class DataPreprocessor:
             self.config.data.time_bins,
             open_kwargs,
         )
+
+    def _build_bandpass_envelopes(
+        self,
+        integrated_by_channel: dict[int, np.ndarray],
+        bandpass_flatten: functools.partial,
+        pfb_active: bool,
+    ) -> list[dict] | None:
+        """Decimated raw/flattened/overlay integrated-spectrum lines for the sampled coarse
+        channels, persisted in the metadata sidecar (#301) so the bandpass-flattening viz
+        figure renders from ~KB of stored points instead of re-reading (cold) coarse
+        channels from the .h5 at viz time (measured 114 s = 74% of a cached rerun's viz
+        span). Exact w.r.t. the figure's own math: the PFB divide and the spline
+        subtraction both commute with the time mean, and the workers integrate in float64
+        over the same despiked channel the figure would read."""
+        if not integrated_by_channel:
+            return None
+        envelopes: list[dict] = []
+        for ch in sorted(integrated_by_channel):
+            raw_int = np.asarray(integrated_by_channel[ch], dtype=np.float64)
+            if pfb_active:
+                response = _load_pfb_response(bandpass_flatten.keywords["response_path"])
+                flat_int = raw_int / np.maximum(response, 1e-10)
+                overlay = response * (float(raw_int @ response) / float(response @ response))
+                overlay_label = "scaled PFB response H"
+            else:
+                overlay = _fit_channel_bandpass(
+                    raw_int, raw_int.shape[0], self.config.inference.spline_order
+                )
+                flat_int = raw_int - overlay
+                overlay_label = "spline fit"
+            entry: dict = {"channel": int(ch), "overlay_label": overlay_label}
+            for name, line in (("raw", raw_int), ("flat", flat_int), ("overlay", overlay)):
+                idx, values = _decimate_for_plot(np.asarray(line), _ENVELOPE_MAX_POINTS)
+                entry[name] = {"idx": [int(i) for i in idx], "values": [float(v) for v in values]}
+            envelopes.append(entry)
+        return envelopes
 
     def _warn_on_pfb_response_mismatch(self, h5_path: str, n_coarse_total: int) -> None:
         """

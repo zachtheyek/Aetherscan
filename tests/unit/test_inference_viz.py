@@ -16,6 +16,7 @@ from aetherscan.config import get_config
 from aetherscan.inference_viz import (
     CONFIDENCE_HIST_EDGES,
     InferenceVizCollector,
+    _build_summaries,
     plot_bandpass_flattening,
     plot_candidate,
     plot_candidate_gallery,
@@ -127,12 +128,12 @@ def collector(tmp_path):
 
 
 @pytest.fixture
-def metadatas(collector):
-    result = {}
-    for record in collector.records:
-        with open(record.metadata_path) as f:
-            result[record.npy_path] = json.load(f)
-    return result
+def summaries(collector):
+    """Bounded per-cadence summaries reduced from the on-disk sidecars (#301) — the shape
+    every metadata-driven figure consumes now. The fixture's legacy-form metadata (raw
+    hit-frequency lists, no pre-binned hists or envelopes) exercises the back-compat
+    reduction path."""
+    return _build_summaries(collector.records, get_config().inference.stamp_gallery_top_k)
 
 
 def _assert_figure(path):
@@ -173,6 +174,71 @@ class TestCollector:
         assert record.n_stamps == 9
         assert record.confidence_hist is None
 
+    def test_budget_fill_values_match_shared_helper(self):
+        """#301 builds pool rows via a direct float32 reshape instead of the full-cadence
+        float64 feature matrix it used to construct (and mostly discard). The kept rows
+        must stay value-identical to the shared-helper path."""
+        from aetherscan.models import prepare_latent_features  # noqa: PLC0415
+
+        rng = np.random.default_rng(3)
+        latents = rng.standard_normal((5 * 6, 8)).astype(np.float32)
+        is_candidate = np.array([True, False, False, True, False])
+        coll = InferenceVizCollector(max_latent_points=3)
+        coll._budget_fill_add(latents, is_candidate)
+        features, kept_mask = coll.latent_pool()
+
+        assert features.dtype == np.float32
+        assert int(kept_mask.sum()) == 2  # both candidates kept
+        expected_full = prepare_latent_features(latents, 6).astype(np.float32)
+        for row in features:
+            assert any(np.array_equal(row, expected) for expected in expected_full)
+
+    def test_gallery_pixel_pool_bounded_and_feeds_gallery(self, collector):
+        """#302: the pool captures per-cadence top-K pixels before pruning deletes the
+        .npy; the stamp gallery then renders from the pool instead of blank columns."""
+        summaries = _build_summaries(collector.records, get_config().inference.stamp_gallery_top_k)
+        for record in collector.records:
+            collector.pool_gallery_pixels(record.metadata_path, record.npy_path)
+        pool = collector.gallery_pixels()
+        # 2 cadences x N_STAMPS distinct-stat reps, truncated at the global top-K bound
+        assert len(pool) == min(2 * N_STAMPS, get_config().inference.stamp_gallery_top_k)
+
+        for record in collector.records:
+            os.remove(record.npy_path)  # the prune
+        _assert_figure(plot_stamp_gallery(collector.records, summaries, pool))
+
+    def test_shared_gallery_pool_persists_across_attempts(self, tmp_path):
+        """#305: passing a caller-owned list makes the pixel pool survive an in-process
+        retry — a cadence pruned by attempt 1 must still render in attempt 2's gallery,
+        whose fresh collector shares the same list."""
+        get_config().checkpoint.save_tag = TAG
+        shared: list = []
+        npy_a, meta_a, _ = _write_cadence_artifacts(tmp_path, "att1", ("A",))
+
+        # Attempt 1: a fresh collector on the shared pool captures cad A's pixels, then A
+        # is pruned (its .npy deleted)
+        coll1 = InferenceVizCollector(gallery_pool=shared)
+        coll1.record_processed(("A",), npy_a, meta_a, {}, _fake_results(), 1.0)
+        coll1.pool_gallery_pixels(meta_a, npy_a)
+        assert len(shared) > 0
+        os.remove(npy_a)
+
+        # Attempt 2: a NEW collector on the SAME shared list still holds A's pooled pixels
+        coll2 = InferenceVizCollector(gallery_pool=shared)
+        assert coll2.gallery_pixels() == coll1.gallery_pixels()
+        assert any(path == npy_a for (path, _idx) in coll2.gallery_pixels())
+
+    def test_budget_exhausted_appends_nothing(self):
+        """The spent-budget early return (#301): once no rows can be kept, the method may
+        not build anything — this is every non-candidate cadence after the first one or
+        two of a catalog."""
+        coll = InferenceVizCollector(max_latent_points=0)
+        coll._budget_fill_add(np.zeros((4 * 6, 8), np.float32), np.zeros(4, dtype=bool))
+        features, kept_mask = coll.latent_pool()
+        assert features.size == 0
+        assert kept_mask.size == 0
+        assert coll._latent_chunks == []
+
 
 class TestSelectTopStamps:
     def test_overlap_offset_duplicates_are_skipped(self, tmp_path):
@@ -193,20 +259,20 @@ class TestSelectTopStamps:
 
         coll = InferenceVizCollector()
         coll.record_processed(("O",), npy_path, metadata_path, {}, _fake_results(n=4), 1.0)
-        metadatas = {npy_path: metadata}
+        summaries = _build_summaries(coll.records, gallery_top_k=4)
 
-        selected = _select_top_stamps(coll.records, metadatas, top_k=4)
-        starts = [metadata["stamp_starts"][idx] for _, idx, _, _ in selected]
+        selected = _select_top_stamps(coll.records, summaries, top_k=4)
+        starts = [metadata["stamp_starts"][idx] for _, idx, _, _, _ in selected]
         assert len([s for s in starts if s in (872, 1000, 1128)]) == 1
         assert 5000 in starts
 
 
 class TestFigureSmoke:
-    def test_ed_stat_distributions(self, collector, metadatas):
-        _assert_figure(plot_ed_stat_distributions(collector.records, metadatas))
+    def test_ed_stat_distributions(self, collector, summaries):
+        _assert_figure(plot_ed_stat_distributions(collector.records, summaries))
 
     def test_ed_stat_distributions_drops_mismatched_bins_consistently(
-        self, tmp_path, collector, metadatas, monkeypatch
+        self, tmp_path, collector, monkeypatch
     ):
         """A cadence dropped for mismatched ED-hist bins must be excluded from the title's
         above-threshold and cadence counts too — otherwise the above/total pair mixes
@@ -219,7 +285,7 @@ class TestFigureSmoke:
         with open(metadata_path, "w") as f:
             json.dump(metadata, f)
         collector.record_processed(("C",), npy_path, metadata_path, {}, _fake_results(), 1.0)
-        metadatas[npy_path] = metadata
+        summaries = _build_summaries(collector.records, gallery_top_k=12)
 
         captured: dict[str, str] = {}
 
@@ -228,7 +294,7 @@ class TestFigureSmoke:
             return filename
 
         monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
-        assert plot_ed_stat_distributions(collector.records, metadatas) is not None
+        assert plot_ed_stat_distributions(collector.records, summaries) is not None
 
         title = captured["title"]
         # Only the two good cadences contribute: 3 * N_STAMPS raw hits each
@@ -236,14 +302,148 @@ class TestFigureSmoke:
         assert "(2 cadence(s))" in title
         assert "finite windows" in title
 
-    def test_ed_hit_spectrum(self, collector, metadatas):
-        _assert_figure(plot_ed_hit_spectrum(collector.records, metadatas))
+    def test_ed_hit_spectrum(self, collector, summaries):
+        _assert_figure(plot_ed_hit_spectrum(collector.records, summaries))
 
-    def test_stamp_gallery(self, collector, metadatas):
-        _assert_figure(plot_stamp_gallery(collector.records, metadatas))
+    def test_storage_size_from_geometry_when_pruned(self, tmp_path):
+        """#305: with default pruning the .npy is gone by render time, so _reduce_metadata
+        reconstructs the transiently-held storage from the stored geometry instead of
+        leaving nan (which collapsed the funnel/summary storage totals to ~0)."""
+        get_config().checkpoint.save_tag = TAG
+        get_config().data.time_bins = 16  # matches _write_cadence_artifacts' (…,6,16,W)
+        npy, meta_path, metadata = _write_cadence_artifacts(tmp_path, "sized", ("S",))
+        real_size = os.path.getsize(npy)
+        coll = InferenceVizCollector()
+        coll.record_processed(("S",), npy, meta_path, {}, _fake_results(), 1.0)
 
-    def test_preproc_funnel(self, collector, metadatas):
-        _assert_figure(plot_preproc_funnel(collector.records, metadatas))
+        # Present file: exact stat
+        summaries = _build_summaries(coll.records, 12)
+        assert summaries[npy].npy_size_bytes == float(real_size)
+
+        # Pruned file: geometry estimate, close to the real size and NOT nan
+        os.remove(npy)
+        summaries = _build_summaries(coll.records, 12)
+        est = summaries[npy].npy_size_bytes
+        assert not np.isnan(est)
+        # n_stamps * 6 * time_bins * stored_width * 4 (+128 header) — within the header slack
+        assert abs(est - real_size) <= 256
+
+    def test_hit_spectrum_bin_clamp(self):
+        """#305: figure bins must never be finer than the stored fine grid, else the
+        narrow-span rebin aliases into a picket-fence. Wide span keeps the full 200 bins;
+        a span at ~fine-grid resolution collapses toward 1."""
+        from aetherscan.inference_viz import _clamp_hit_spectrum_bins  # noqa: PLC0415
+
+        # Wide span (fine width tiny vs span): full resolution
+        assert _clamp_hit_spectrum_bins(1000.0, 1200.0, 0.01, 200) == 200
+        # Narrow span: 2 MHz span, fine bins ~22.9 kHz (187.5 MHz band / 8192) -> ~87 bins
+        assert _clamp_hit_spectrum_bins(1000.0, 1002.0, 187.5 / 8192, 200) < 200
+        assert _clamp_hit_spectrum_bins(1000.0, 1002.0, 187.5 / 8192, 200) >= 1
+        # Degenerate / zero-width fine grid: fall back to the cap, never 0 or negative
+        assert _clamp_hit_spectrum_bins(1000.0, 1000.0, 0.01, 200) == 200
+        assert _clamp_hit_spectrum_bins(1000.0, 1200.0, 0.0, 200) == 200
+
+    def test_ed_hit_spectrum_narrow_span_renders_without_aliasing(self, tmp_path, monkeypatch):
+        """A new-style sidecar whose hits occupy a narrow sub-band must render with clamped
+        (not 200) bins so no empty picket-fence bins appear between populated ones."""
+        get_config().checkpoint.save_tag = TAG
+        npy, meta_path, metadata = _write_cadence_artifacts(tmp_path, "narrow", ("N",))
+        # Full band 1000..1187.5 MHz, but all hits in a 2 MHz sub-band
+        n_fine = 8192
+        edges = np.linspace(1000.0, 1187.5, n_fine + 1)
+        raw = np.zeros(n_fine, dtype=int)
+        in_band = (edges[:-1] >= 1000.0) & (edges[:-1] < 1002.0)
+        raw[in_band] = 5  # every fine bin in the sub-band populated -> would alias at 200
+        metadata["hit_spectrum_hist"] = {
+            "freq_lo": 1000.0,
+            "freq_hi": 1187.5,
+            "n_bins": n_fine,
+            "raw_counts": raw.tolist(),
+            "merged_counts": raw.tolist(),
+            "raw_freq_min": 1000.0,
+            "raw_freq_max": 1002.0,
+        }
+        metadata.pop("raw_hit_frequencies_mhz", None)
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f)
+        coll = InferenceVizCollector()
+        coll.record_processed(("N",), npy, meta_path, {}, _fake_results(), 1.0)
+        summaries = _build_summaries(coll.records, 12)
+
+        captured: dict = {}
+
+        def _capture(fig, filename, slack_title):
+            ax = fig.axes[0]
+            # stairs() adds a StepPatch; count its populated-vs-empty structure indirectly
+            # by the x-data resolution — assert the axis used clamped bins, not 200
+            captured["xlim_span"] = ax.get_xlim()
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_ed_hit_spectrum(coll.records, summaries) is not None
+        # The clamp keeps figure bins >= fine width; with fine width ~22.9 kHz over a 2 MHz
+        # span the clamp yields ~87 bins, all populated (no picket-fence gaps)
+        span = captured["xlim_span"][1] - captured["xlim_span"][0]
+        assert span > 0
+
+    def test_ed_hit_spectrum_prebinned_matches_legacy_totals(self, collector, monkeypatch):
+        """New sidecars carry hit_spectrum_hist pre-binned by preprocessing; legacy
+        sidecars reduce their raw float lists at load (#301). Both routes must report the
+        same hit totals for the same underlying hits."""
+        legacy = _build_summaries(collector.records, gallery_top_k=12)
+
+        # Rewrite each sidecar into the NEW pre-binned form (drop the raw list)
+        for record in collector.records:
+            with open(record.metadata_path) as f:
+                metadata = json.load(f)
+            raw = metadata.pop("raw_hit_frequencies_mhz")
+            merged = metadata["merged_hit_frequencies_mhz"]
+            edges = np.linspace(1400.0, 1411.0, 8193)
+            metadata["hit_spectrum_hist"] = {
+                "freq_lo": 1400.0,
+                "freq_hi": 1411.0,
+                "n_bins": 8192,
+                "raw_counts": np.histogram(raw, bins=edges)[0].tolist(),
+                "merged_counts": np.histogram(merged, bins=edges)[0].tolist(),
+                "raw_freq_min": float(np.min(raw)),
+                "raw_freq_max": float(np.max(raw)),
+            }
+            with open(record.metadata_path, "w") as f:
+                json.dump(metadata, f)
+        prebinned = _build_summaries(collector.records, gallery_top_k=12)
+
+        titles: list[str] = []
+
+        def _capture(fig, filename, slack_title):
+            titles.append(fig.axes[0].get_title())
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_ed_hit_spectrum(collector.records, legacy) is not None
+        assert plot_ed_hit_spectrum(collector.records, prebinned) is not None
+        assert titles[0] == titles[1]  # same raw/merged totals either route
+
+    def test_stamp_gallery(self, collector, summaries):
+        _assert_figure(plot_stamp_gallery(collector.records, summaries))
+
+    def test_preproc_funnel(self, collector, summaries):
+        _assert_figure(plot_preproc_funnel(collector.records, summaries))
+
+    def test_preproc_funnel_aggregates_past_cap(self, collector, summaries, monkeypatch):
+        """#301: past _FUNNEL_MAX_CADENCES the figure must aggregate the remainder into
+        one bar instead of growing past Agg's 2^16-px canvas limit and silently failing."""
+        monkeypatch.setattr("aetherscan.inference_viz._FUNNEL_MAX_CADENCES", 1)
+        captured: dict[str, str] = {}
+
+        def _capture(fig, filename, slack_title):
+            captured["title"] = fig.axes[0].get_title()
+            captured["n_bars"] = len(fig.axes[0].get_xticklabels())
+            return filename
+
+        monkeypatch.setattr("aetherscan.inference_viz._save_and_upload", _capture)
+        assert plot_preproc_funnel(collector.records, summaries) is not None
+        assert "aggregated" in captured["title"]
+        assert captured["n_bars"] == 2  # 1 individual + the aggregate bar
 
     def test_confidence_distribution(self, collector):
         _assert_figure(plot_confidence_distribution(collector.records))
@@ -262,9 +462,8 @@ class TestFigureSmoke:
         )
         coll = InferenceVizCollector()
         coll.record_processed(("H",), npy_path, metadata_path, {}, _fake_results(), 1.0)
-        with open(metadata_path) as f:
-            metas = {npy_path: json.load(f)}
-        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, metas))
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
 
     def test_bandpass_flattening_header_without_nchans(
         self, tmp_path, initialized_runtime, collector, make_h5_observation
@@ -285,8 +484,31 @@ class TestFigureSmoke:
             json.dump(metadata, f)
         coll = InferenceVizCollector()
         coll.record_processed(("H2",), npy_path, metadata_path, {}, _fake_results(), 1.0)
-        metas = {npy_path: metadata}
-        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, metas))
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
+
+    def test_bandpass_flattening_from_stored_envelopes(self, tmp_path, initialized_runtime):
+        """A sidecar carrying bandpass_envelopes (#301) must render WITHOUT touching any
+        .h5 — the h5 paths here don't exist, which is exactly the point (the live-read
+        fallback would fail on them)."""
+        get_config().checkpoint.save_tag = TAG  # figures save under plots/inference/{tag}/
+        npy_path, metadata_path, metadata = _write_cadence_artifacts(tmp_path, "cad_env", ("E",))
+        assert not os.path.exists(metadata["h5_paths"][0])
+        metadata["bandpass_envelopes"] = [
+            {
+                "channel": 3,
+                "overlay_label": "scaled PFB response H",
+                "raw": {"idx": [0, 1, 2, 3], "values": [1.0, 2.0, 2.0, 1.0]},
+                "flat": {"idx": [0, 1, 2, 3], "values": [1.0, 1.0, 1.0, 1.0]},
+                "overlay": {"idx": [0, 1, 2, 3], "values": [1.0, 2.0, 2.0, 1.0]},
+            }
+        ]
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+        coll = InferenceVizCollector()
+        coll.record_processed(("E",), npy_path, metadata_path, {}, _fake_results(), 1.0)
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
 
     def test_candidate_gallery_and_per_candidate(self, initialized_runtime, collector):
         db = initialized_runtime
@@ -361,7 +583,7 @@ class TestFigureSmoke:
         config.inference.config_path = str(config_json)
         assert plot_inference_latent_projection(collector) is None
 
-    def test_inference_summary(self, initialized_runtime, collector, metadatas):
+    def test_inference_summary(self, initialized_runtime, collector, summaries):
         db = initialized_runtime
         db.write_inference_cadence(
             npy_path=collector.records[0].npy_path,
@@ -385,10 +607,10 @@ class TestFigureSmoke:
             "n_cadences": 2,
             "n_skipped": 0,
         }
-        _assert_figure(plot_inference_summary(collector.records, metadatas, totals))
+        _assert_figure(plot_inference_summary(collector.records, summaries, totals))
 
     def test_inference_summary_counts_superseded_preprocessing(
-        self, initialized_runtime, collector, metadatas, monkeypatch
+        self, initialized_runtime, collector, summaries, monkeypatch
     ):
         """Regression: _infer_cadence supersedes each cadence's 'preprocessed' row just before
         writing its live 'inferred' row, so on a fully successful run every 'preprocessed' row
@@ -431,7 +653,7 @@ class TestFigureSmoke:
             "n_cadences": 1,
             "n_skipped": 0,
         }
-        plot_inference_summary(collector.records, metadatas, totals)
+        plot_inference_summary(collector.records, summaries, totals)
 
         lines = captured["text"].splitlines()
         preproc_line = next(line for line in lines if line.startswith("preprocessing time"))
@@ -472,3 +694,15 @@ class TestSuiteEntryPoint:
         render_inference_visualizations(
             coll, DataPreprocessor(), {"n_cadence_snippets": 1, "n_cadences": 1}
         )
+
+    def test_scope_new_excludes_resumed_cadences(self, initialized_runtime, collector):
+        """--inference-viz-scope new (#301): resumed cadences drop out of the
+        metadata-driven figures, so a multi-pass campaign stops re-paying the whole
+        catalog's viz tail every pass."""
+        get_config().inference.inference_viz_scope = "new"
+        collector.record_skipped(("R",), "/nope/resumed.npy", "/nope/resumed.json", {})
+        totals = {"n_cadence_snippets": 10, "n_cadences": 3, "n_skipped": 1}
+        render_inference_visualizations(collector, DataPreprocessor(), totals)
+        # The resumed record's missing sidecar would have warned; the two live ones render
+        tag_dir = os.path.join(get_config().output_path, "plots", "inference", TAG)
+        assert f"ed_stat_distributions_{TAG}.png" in os.listdir(tag_dir)

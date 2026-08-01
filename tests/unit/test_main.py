@@ -133,6 +133,8 @@ class _StubPreprocessor:
             key=unit.group.key,
             n_hits=self.n_stamps,
             metadata_path=metadata_path,
+            # Mirrors the real _process_cadence: a freshly written .npy is prunable (#302)
+            freshly_extracted=True,
         )
 
     def load_inference_data(self, override_filepaths=None, parallel=True):
@@ -302,6 +304,99 @@ class TestStreamingResumeStateMachine:
         assert db.flush(timeout=10) is True
         b_rows = db.query_inference_cadences(tag="test_v1", npy_path=fail_path)
         assert [r["status"] for r in b_rows] == ["inferred"]
+
+    def test_prune_on_by_default_deletes_npy_keeps_metadata_and_sidecar(self, stubbed_streaming):
+        """#302: with the fingerprint-default cache dir, pruning resolves ON — after a
+        successful pass every freshly-extracted stamp .npy is gone, the metadata .json
+        stays, each candidate's snippet is sidecarred, and the manifest-driven resume
+        still skips everything on the next pass without touching the missing .npy."""
+        from aetherscan.candidate_figures import candidate_sidecar_path  # noqa: PLC0415
+
+        db, make_preprocessor = stubbed_streaming
+        assert get_config().inference.prune_stamps is None  # AUTO
+        preprocessor = make_preprocessor()
+
+        _run_streaming_csv_inference(preprocessor, strategy=None)
+
+        for unit in preprocessor.units:
+            assert not os.path.exists(unit.npy_path)  # pruned
+            assert os.path.exists(DataPreprocessor.cadence_metadata_path(unit.npy_path))
+            # The stub scores exactly one candidate per cadence (proba > 0.9)
+            sidecar = candidate_sidecar_path(unit.npy_path)
+            assert os.path.exists(sidecar)
+            with np.load(sidecar) as loaded:
+                assert loaded["snippet_indices"].tolist() == [3]
+                assert loaded["stamps"].shape == (1, 6, 16, 8)
+
+        # Resume rides the DB row, never the pruned .npy
+        second = make_preprocessor()
+        totals = _run_streaming_csv_inference(second, strategy=None)
+        assert totals["n_skipped"] == 2
+        assert second.processed_keys == []
+
+    def test_no_prune_flag_keeps_all_stamps(self, stubbed_streaming):
+        db, make_preprocessor = stubbed_streaming
+        get_config().inference.prune_stamps = False
+        preprocessor = make_preprocessor()
+        _run_streaming_csv_inference(preprocessor, strategy=None)
+        for unit in preprocessor.units:
+            assert os.path.exists(unit.npy_path)
+
+    def test_explicit_output_dir_defaults_prune_off(self, stubbed_streaming, tmp_path):
+        """AUTO mode: an operator-curated --preprocess-output-dir is never destroyed
+        implicitly — pruning resolves OFF unless --prune-stamps is passed explicitly."""
+        db, make_preprocessor = stubbed_streaming
+        get_config().inference.preprocess_output_dir = str(tmp_path)
+        preprocessor = make_preprocessor()
+        _run_streaming_csv_inference(preprocessor, strategy=None)
+        for unit in preprocessor.units:
+            assert os.path.exists(unit.npy_path)
+
+    def test_handed_cache_never_pruned(self, stubbed_streaming, monkeypatch):
+        """Only freshly-extracted stamps are prunable: a cadence resumed from a
+        pre-existing .npy (freshly_extracted=False) keeps its stamps even with pruning
+        ON."""
+        db, make_preprocessor = stubbed_streaming
+        preprocessor = make_preprocessor()
+        original = preprocessor.process_pending_cadence
+
+        def resume_like(unit):
+            result = original(unit)
+            result.freshly_extracted = False
+            return result
+
+        monkeypatch.setattr(preprocessor, "process_pending_cadence", resume_like)
+        _run_streaming_csv_inference(preprocessor, strategy=None)
+        for unit in preprocessor.units:
+            assert os.path.exists(unit.npy_path)
+
+    def test_resolve_prune_stamps_matrix(self):
+        config = get_config()
+        config.inference.prune_stamps = None
+        config.inference.preprocess_output_dir = None
+        assert main._resolve_prune_stamps(config) is True
+        config.inference.preprocess_output_dir = "/some/dir"
+        assert main._resolve_prune_stamps(config) is False
+        config.inference.prune_stamps = True
+        assert main._resolve_prune_stamps(config) is True  # explicit ON beats explicit dir
+        config.inference.prune_stamps = False
+        config.inference.preprocess_output_dir = None
+        assert main._resolve_prune_stamps(config) is False  # explicit OFF beats default dir
+
+    def test_prune_failure_keeps_stamps_and_run_continues(self, stubbed_streaming, monkeypatch):
+        """Pruning is best-effort: a sidecar-write failure must keep the stamps and never
+        fail the cadence or the pass."""
+        db, make_preprocessor = stubbed_streaming
+
+        def boom(npy_path, snippet_indices):
+            raise OSError("simulated sidecar write failure")
+
+        monkeypatch.setattr(main, "write_candidate_snippet_sidecar", boom)
+        preprocessor = make_preprocessor()
+        totals = _run_streaming_csv_inference(preprocessor, strategy=None)
+        assert totals["n_cadences"] == 2
+        for unit in preprocessor.units:
+            assert os.path.exists(unit.npy_path)  # kept on failure
 
     def test_prefetch_depth_2_preserves_catalog_order(self, stubbed_streaming):
         """#298 N2: at depth 2 the futures are consumed strictly in catalog order, so

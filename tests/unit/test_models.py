@@ -41,6 +41,35 @@ class TestPrepareLatentFeatures:
         features = prepare_latent_features(latents, num_observations=6)
         np.testing.assert_array_equal(features, latents.ravel()[None, :])
 
+    def test_reshape_matches_historical_loop_and_keeps_float64(self):
+        """#301 replaced the per-row Python loop with a reshape. It must stay
+        byte-identical to the loop — including the float64 output dtype, which the
+        training-side Active-Units gate depends on (its .var() accumulation differs
+        in threshold-deciding low bits under float32; see #288's margin lesson)."""
+        rng = np.random.default_rng(11)
+        latents = rng.standard_normal((40 * 6, 8)).astype(np.float32)
+
+        # The exact historical implementation
+        expected = np.zeros((40, 6 * 8))
+        for i in range(40):
+            expected[i, :] = latents[i * 6 : (i + 1) * 6, :].ravel()
+
+        features = prepare_latent_features(latents, num_observations=6)
+        assert features.dtype == np.float64
+        np.testing.assert_array_equal(features, expected)
+
+    def test_non_contiguous_input(self):
+        """A strided view (e.g. a column-sliced latent block) must still reshape into the
+        same layout the loop produced — reshape copies when it must, never mis-strides."""
+        base = np.arange(12 * 10, dtype=np.float32).reshape(12, 10)
+        strided = base[:, ::2]  # (12, 5), non-contiguous
+        expected = np.zeros((2, 6 * 5))
+        for i in range(2):
+            expected[i, :] = strided[i * 6 : (i + 1) * 6, :].ravel()
+        np.testing.assert_array_equal(
+            prepare_latent_features(strided, num_observations=6), expected
+        )
+
 
 def _toy_latents(n_per_class=16, latent_dim=8, num_obs=6, seed=0):
     """Separable toy data: class-1 latents cluster at +2, class-0 at -2."""
@@ -115,6 +144,24 @@ class TestRandomForestModel:
         restored.load(path)
         assert restored.is_trained is True
         np.testing.assert_array_equal(restored.predict_proba(latents), model.predict_proba(latents))
+
+    def test_load_repins_n_jobs_from_runtime_config(self, tmp_path):
+        """#301: joblib.load replaces the estimator wholesale, so the training host's
+        pickled n_jobs silently overrode the runtime config on every loaded model. load()
+        must re-pin it — predict-time parallelism is a host knob, not model provenance —
+        without touching the trees."""
+        latents, labels = _toy_latents()
+        model = RandomForestModel()
+        model.train(latents, labels)
+        reference = model.predict_proba(latents)
+        path = str(tmp_path / "rf.joblib")
+        model.save(path)
+
+        get_config().rf.n_jobs = 1
+        restored = RandomForestModel()
+        restored.load(path)
+        assert restored.model.n_jobs == 1
+        np.testing.assert_array_equal(restored.predict_proba(latents), reference)
 
 
 class TestSamplingLayer:
@@ -209,26 +256,46 @@ class TestRegularizationActivation:
     def test_reg_loss_deterministic_across_calls(self):
         import tensorflow as tf  # noqa: PLC0415
 
+        # Private counterparts of the public enable_op_determinism (TF 2.17 exposes no
+        # public getter/disable; TF's own test suite uses these) — needed to capture and
+        # restore the process-global determinism flag around this test.
+        from tensorflow.python.framework import config as tf_framework_config  # noqa: PLC0415
+
         from aetherscan.models import create_beta_vae_model  # noqa: PLC0415
 
         vae = create_beta_vae_model()
         config = get_config()
         dense_size = config.beta_vae.dense_layer_size
-        tf.random.set_seed(11)
-        batch = tf.random.uniform((2, 6, 16, dense_size))
-        # The DECODER's activity penalties depend on the sampled z (Sampling draws epsilon
-        # even at training=False), so reg is deterministic GIVEN THE SEED, not across
-        # unseeded calls — the same contract every seeded run relies on (#279). Re-seed
-        # before each call so the epsilon draws replay identically.
-        tf.random.set_seed(11)
-        first = float(
-            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
-        )
-        tf.random.set_seed(11)
-        second = float(
-            vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
-        )
-        assert first == second
+
+        # On GPU hosts, cuDNN AUTOTUNE may select different (equally valid) convolution
+        # algorithms between two otherwise identical calls in one process, moving the
+        # accumulated loss by low-order bits (observed on blpc3: 284.269287109375 vs
+        # 284.2692565917969) — same-seed exactness across calls is only a real contract
+        # under deterministic ops, which is exactly how production pins it
+        # (tf_deterministic_ops defaults ON, #298). Enable it for the two calls and
+        # restore the prior state after, so this test never leaks determinism into (or
+        # out of) the rest of the suite.
+        was_enabled = tf_framework_config.is_op_determinism_enabled()
+        tf.config.experimental.enable_op_determinism()
+        try:
+            tf.random.set_seed(11)
+            batch = tf.random.uniform((2, 6, 16, dense_size))
+            # The DECODER's activity penalties depend on the sampled z (Sampling draws
+            # epsilon even at training=False), so reg is deterministic GIVEN THE SEED, not
+            # across unseeded calls — the same contract every seeded run relies on (#279).
+            # Re-seed before each call so the epsilon draws replay identically.
+            tf.random.set_seed(11)
+            first = float(
+                vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+            )
+            tf.random.set_seed(11)
+            second = float(
+                vae.compute_total_loss(batch, batch, batch, batch, training=False)["reg_loss"]
+            )
+            assert first == second
+        finally:
+            if not was_enabled:
+                tf_framework_config.disable_op_determinism()
 
 
 @pytest.mark.slow

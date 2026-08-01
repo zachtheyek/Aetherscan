@@ -14,7 +14,7 @@ high-volume injection-stat chunks (#277) — drained by **one background writer 
 batches rows and commits with `executemany()`; reads open short-lived connections directly.
 Failed-attempt rows are never deleted — they're flagged `superseded = 1`, and every query
 filters them out by default. Schema evolution is a minimal `PRAGMA user_version` gate
-(currently version 7).
+(currently version 8).
 
 > [!IMPORTANT]
 > The write queue is a **thread** queue, not process-safe. Worker *processes* must never call
@@ -258,7 +258,12 @@ per-cadence aggregates that summaries need live in the manifest table instead.
 | `screening_proba` | REAL | Deterministic pass-1 score of the #282 two-pass cascade (v5) |
 | `mc_mean`, `mc_std` | REAL | Seeded MC mean/spread for pass-2 survivors — the mean carries the science threshold; NULL for snippets that never reached pass 2 (v5) |
 
-Index: `(tag, timestamp, confidence, prediction)`.
+Indexes: `(tag, timestamp, confidence, prediction)` plus, since v8, the partial
+`idx_inference_results_supersede` on `(tag, npy_path) WHERE superseded = 0` — matching
+`_execute_mark_superseded`'s exact predicate. The once-per-cadence supersede UPDATE blocks
+the inference thread via the writer-queue sentinel, and the timestamp-led index only
+narrowed it to the tag partition — a quadratic-in-catalog term on RFI-dense 6k-cadence
+runs (#301).
 
 ### `inference_cadences` (run manifest, schema v2)
 
@@ -300,7 +305,7 @@ attempt, each with its own span.
 ## Schema migration
 
 `_migrate_schema()` runs on every startup, gated on `PRAGMA user_version`
-(`_SCHEMA_VERSION = 7`). The stamp maps to schema features as:
+(`_SCHEMA_VERSION = 8`). The stamp maps to schema features as:
 
 | `user_version` | What it added | Migration work |
 | --- | --- | --- |
@@ -312,6 +317,7 @@ attempt, each with its own span.
 | v5 | `screening_proba` / `mc_mean` / `mc_std` on `inference_results` (#282 two-pass inference) | additive `ALTER TABLE ... ADD COLUMN` |
 | v6 | `is_finite INTEGER DEFAULT 1` on `training_stats` (#289 NaN-write hardening) | additive `ALTER TABLE ... ADD COLUMN` |
 | v7 | the index sweep: the `idx_injection_stats_by_stat` secondary index on `injection_stats`; `latent_snapshots`' index reshaped to `idx_latent_snapshots_by_key` | `DROP INDEX IF EXISTS idx_latent_snapshots_filter` in the migration block; the CREATEs run in `_init_database()` and are re-executed there |
+| v8 | the `idx_inference_results_supersede` partial index on `inference_results` (`(tag, npy_path) WHERE superseded = 0`, #301) | the `if version < 8` block creates it — deliberately NOT `_init_database()`: the partial predicate needs the `superseded` column the v1 ALTER adds, so an init-time CREATE would fail on a pre-v1 file. Fresh databases reach the block too (version 0 → current) |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -355,8 +361,16 @@ attempt, each with its own span.
   Like v2/v4, `_init_database()` does the CREATE work — `CREATE INDEX IF NOT EXISTS` runs
   for old and new databases alike before migration; the `if version < 7` block re-executes
   the (themselves idempotent) statements, performs the DROP, and advances the stamp.
+- **v7 → v8** (`idx_inference_results_supersede`, #301): the supersede partial index on
+  `inference_results` — see [that table's index note](#inference_results). Unlike v7, the
+  `CREATE INDEX IF NOT EXISTS` lives **only** in the `if version < 8` block, never in
+  `_init_database()`: its `WHERE superseded = 0` predicate needs the column the v1 ALTER
+  adds, so an init-time CREATE would precede the ALTER and fail on a pre-v1 file. Fresh
+  databases reach the block too (version 0 → current), so both paths land the same final
+  index set.
 
-Fresh databases get the full current schema from the CREATE statements and are just stamped.
+Fresh databases get the full current schema from the CREATE statements and are just stamped
+(the one v8 exception above lands via the migration block either way).
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
 `if version < N:` block with additive, idempotent statements, and rely on
 `CREATE TABLE IF NOT EXISTS` for whole new tables.
@@ -364,10 +378,10 @@ The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
 ## Query API
 
 Each table has a `query_*` method returning `list[dict]`
-(`query_system_resource`, `query_injection_stat`, `query_injection_stat_stability`,
-`query_training_stat`, `query_latent_snapshots`, `query_latent_snapshot_keys`,
-`query_inference_result`, `query_inference_cadences`, `query_pipeline_stages`). Shared
-conventions:
+(`query_system_resource`, `query_system_resource_decimated`, `query_injection_stat`,
+`query_injection_stat_stability`, `query_training_stat`, `query_latent_snapshots`,
+`query_latent_snapshot_keys`, `query_inference_result`, `query_inference_cadences`,
+`query_pipeline_stages`). Shared conventions:
 
 - **String filters** (`tag`, `stat_name`, `status`, ...) accept a single value (`=`) or a
   list (`IN`); **range filters** come as `start_*`/`end_*` pairs (inclusive);
@@ -396,8 +410,22 @@ quadratic over a campaign as history accumulates) — `plot_injection_stats` iss
 queries per call and now pays this one aggregate up front, tightening every window to the
 plotted rounds' actual span (±1 s).
 
+**`query_system_resource_decimated(tag, start_time, end_time, max_points_per_series)`**
+(#301) returns a per-series uniformly-strided subset of `system_resources` rows (same dict
+shape as `query_system_resource`): a
+`ROW_NUMBER() OVER (PARTITION BY resource_type, resource_name ORDER BY timestamp)` window
+keeps at most `max_points_per_series` uniformly-spaced points per
+`(resource_type, resource_name)` line, with the stride computed from the largest series
+(stride 1 degenerates to the plain query). It exists for the monitor's teardown resource
+plot ([`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md)): a multi-week catalog run accumulates
+tens of millions of samples while the plot renders ~2 k px wide, so materializing every row
+cost a multi-GB teardown RAM spike for invisible detail.
+
 `get_db_stats()` returns row counts per table, the covered time range, and the database file
-size — logged at startup.
+size — **on-demand diagnostics only** since #301: its per-table `COUNT(*)` full scans
+measured ~13 min per cold-cache launch on the 80 GB production DB (re-paid on every
+retry-loop relaunch), so `Database.__init__` no longer calls it and startup logs only the
+O(1) `db_size_bytes` pragma.
 
 ## Growth expectations
 

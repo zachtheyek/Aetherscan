@@ -308,12 +308,33 @@ class TestInferenceConfigFingerprint:
             # prefetch_depth is scheduling only (#298 N2): per-cadence results are
             # depth-invariant, so changing it must not force a re-inference on resume.
             ("prefetch_depth", 2),
+            # #302/#301: retention + viz-scope knobs are result-invariant; they MUST be
+            # denylisted or every 'inferred' resume row stales on upgrade.
+            ("prune_stamps", False),
+            ("inference_viz_scope", "new"),
         ],
     )
     def test_inert_inference_change_keeps_fingerprint(self, key, value):
         d = copy.deepcopy(self.BASE)
         d["inference"][key] = value
         assert inference_config_fingerprint(d) == inference_config_fingerprint(self.BASE)
+
+    def test_new_keys_absent_hashes_like_present(self):
+        """The load-bearing #301/#302 upgrade property the PR claims: a to_dict() that
+        GAINS prune_stamps + inference_viz_scope must hash identically to a master-shaped
+        dict WITHOUT them, for BOTH inference and preprocessing fingerprints — else the
+        upgrade stales every 'inferred' resume row and renames every ED cache dir. This
+        pins the claim (previously only asserted live)."""
+        master_shaped = copy.deepcopy(self.BASE)  # no prune_stamps / inference_viz_scope
+        branch_shaped = copy.deepcopy(self.BASE)
+        branch_shaped["inference"]["prune_stamps"] = True
+        branch_shaped["inference"]["inference_viz_scope"] = "full"
+        assert inference_config_fingerprint(branch_shaped) == inference_config_fingerprint(
+            master_shaped
+        )
+        assert preprocessing_config_fingerprint(branch_shaped) == preprocessing_config_fingerprint(
+            master_shaped
+        )
 
 
 class TestPreprocessingConfigFingerprint:

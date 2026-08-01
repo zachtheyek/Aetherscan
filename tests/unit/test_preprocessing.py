@@ -428,23 +428,40 @@ class TestChunkCacheKwargs:
 
 
 class TestExtractStampsWorkerDownsample:
-    def _run_worker(self, tmp_path, make_h5_observation, downsample_factor, **h5_kwargs):
+    def _run_worker(
+        self, tmp_path, make_h5_observation, downsample_factor, stamp_starts=None, **h5_kwargs
+    ):
         import h5py  # noqa: PLC0415
 
         time_bins, stamp_width = 16, 64
         stored_width = stamp_width // downsample_factor
-        stamp_starts = [0, 512, 1000]
+        stamp_starts = stamp_starts if stamp_starts is not None else [0, 512, 1000]
         h5_path = make_h5_observation("obs.h5", n_chans=2048, **h5_kwargs)
         npy_path = str(tmp_path / f"stamps_x{downsample_factor}.npy")
 
         out = np.lib.format.open_memmap(
-            npy_path, mode="w+", dtype=np.float32, shape=(3, 6, time_bins, stored_width)
+            npy_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(len(stamp_starts), 6, time_bins, stored_width),
         )
         out.flush()
         del out
 
+        # open_kwargs is computed once per obs file by the parent and shipped in the task
+        # args (#301) — mirror that here
         _extract_stamps_worker(
-            (npy_path, 1, str(h5_path), stamp_starts, 0, time_bins, stamp_width, downsample_factor)
+            (
+                npy_path,
+                1,
+                str(h5_path),
+                stamp_starts,
+                0,
+                time_bins,
+                stamp_width,
+                downsample_factor,
+                _chunk_cache_kwargs(str(h5_path), time_bins),
+            )
         )
 
         written = np.load(npy_path)
@@ -475,6 +492,85 @@ class TestExtractStampsWorkerDownsample:
         for i, stamp in enumerate(raw):
             expected = downscale_local_mean(stamp, (1, 8)).astype(np.float32)
             np.testing.assert_array_equal(written[i, 1], expected)
+
+    def test_overlapping_windows_coalesce_byte_identical(self, tmp_path, make_h5_observation):
+        """#301 fetches overlapping/abutting windows (the overlap_search triplet shape:
+        gaps of stamp_width // 2) as one wide read sliced per stamp — the written stamps
+        must be byte-identical to independent per-stamp reads, for both raw and
+        downsampled storage."""
+        overlapping = [0, 32, 64, 512, 544, 1000]  # two triplet-shaped chains + a loner
+        for factor in (1, 8):
+            written, raw = self._run_worker(
+                tmp_path, make_h5_observation, factor, stamp_starts=overlapping
+            )
+            for i, stamp in enumerate(raw):
+                expected = (
+                    stamp
+                    if factor == 1
+                    else downscale_local_mean(stamp, (1, factor)).astype(np.float32)
+                )
+                np.testing.assert_array_equal(written[i, 1], expected)
+
+    def test_stale_tmp_sweep_covers_all_tmp_suffixes(self, tmp_path, monkeypatch):
+        """#305: the age-gated sweep must catch the metadata '.json.<pid>.<hex>.tmp' and
+        candidate-sidecar '.candidates.npz.<pid>.<hex>.tmp' orphans, not just the stamp
+        '.tmp.npy' — a crash between np.savez/json.dump and os.replace otherwise leaks them
+        forever in the shared cache dir."""
+        import glob as _glob  # noqa: PLC0415
+        import time as _time  # noqa: PLC0415
+
+        from aetherscan.preprocessing import _STALE_TMP_MAX_AGE_S  # noqa: PLC0415
+
+        stem = str(tmp_path / "cad")
+        old = _time.time() - _STALE_TMP_MAX_AGE_S - 100
+        fresh = _time.time()
+        tmps = {
+            f"{stem}.12345.abcdef.tmp.npy": old,  # stamp memmap tmp (already swept)
+            f"{stem}.json.12345.abcdef.tmp": old,  # metadata tmp (was leaked)
+            f"{stem}.candidates.npz.12345.abcdef.tmp": old,  # #302 sidecar tmp (was leaked)
+            f"{stem}.99999.fedcba.tmp": fresh,  # a live concurrent run's tmp — must survive
+        }
+        for path, mtime in tmps.items():
+            open(path, "wb").close()
+            os.utime(path, (mtime, mtime))
+
+        # Exercise the exact sweep expression from _process_cadence
+        stale_cutoff = _time.time() - _STALE_TMP_MAX_AGE_S
+        escaped = _glob.escape(stem)
+        swept = (
+            _glob.glob(f"{escaped}.*.tmp.npy")
+            + _glob.glob(f"{escaped}.*.tmp")
+            + [f"{stem}.tmp.npy"]
+        )
+        for stale in swept:
+            if os.path.exists(stale) and os.path.getmtime(stale) < stale_cutoff:
+                os.remove(stale)
+
+        assert not os.path.exists(f"{stem}.json.12345.abcdef.tmp")
+        assert not os.path.exists(f"{stem}.candidates.npz.12345.abcdef.tmp")
+        assert not os.path.exists(f"{stem}.12345.abcdef.tmp.npy")
+        assert os.path.exists(f"{stem}.99999.fedcba.tmp")  # fresh tmp untouched
+
+    def test_coalesce_grouping_rules(self):
+        from aetherscan.preprocessing import (  # noqa: PLC0415
+            _COALESCE_MAX_BINS,
+            _coalesce_stamp_groups,
+        )
+
+        # Empty input hardening (review note on #305): no [[0]] seed group
+        assert _coalesce_stamp_groups([], 64) == []
+        # Overlap/abut chains group; disjoint windows stay singletons
+        assert _coalesce_stamp_groups([0, 32, 64, 512], 64) == [[0, 1, 2], [3]]
+        # Abutting exactly (next start == previous end) still groups
+        assert _coalesce_stamp_groups([0, 64, 128], 64) == [[0, 1, 2]]
+        # A gap of one bin splits
+        assert _coalesce_stamp_groups([0, 65], 64) == [[0], [1]]
+        # The span cap breaks an otherwise-endless chain
+        starts = list(range(0, _COALESCE_MAX_BINS + 4096, 32))
+        groups = _coalesce_stamp_groups(starts, 64)
+        assert len(groups) > 1
+        for group in groups:
+            assert starts[group[-1]] + 64 - starts[group[0]] <= _COALESCE_MAX_BINS
 
 
 @pytest.fixture
@@ -603,14 +699,26 @@ class TestProcessCadenceEndToEnd:
         assert len(metadata["stamp_starts"]) == result.n_hits
 
         # Viz-suite provenance: per-ON-file all-window statistic histograms on the shared
-        # bins, plus pre-/post-dedup hit frequency lists
+        # bins, the pre-binned hit-frequency histograms (#301 — the raw per-hit list is no
+        # longer stored), the post-dedup merged list, and the bandpass envelopes
         ed_hist = metadata["ed_stat_hist"]
         assert ed_hist["bin_edges"] == pytest.approx(list(ED_STAT_HIST_EDGES))
         assert len(ed_hist["counts_per_on_file"]) == 3  # one histogram per ON file
         assert all(sum(counts) > 0 for counts in ed_hist["counts_per_on_file"])
         assert metadata["n_raw_hits"] >= metadata["n_merged_hits"] > 0
-        assert len(metadata["raw_hit_frequencies_mhz"]) == metadata["n_raw_hits"]
+        assert "raw_hit_frequencies_mhz" not in metadata
+        hit_hist = metadata["hit_spectrum_hist"]
+        assert sum(hit_hist["raw_counts"]) == metadata["n_raw_hits"]
+        assert sum(hit_hist["merged_counts"]) == metadata["n_merged_hits"]
+        assert hit_hist["freq_lo"] <= hit_hist["raw_freq_min"] <= hit_hist["raw_freq_max"]
         assert len(metadata["merged_hit_frequencies_mhz"]) == metadata["n_merged_hits"]
+        # Envelopes: one entry per sampled channel, three decimated lines each, exact
+        # per the commuting-mean argument (raw/H for pfb, raw - fit for spline)
+        envelopes = metadata["bandpass_envelopes"]
+        assert envelopes and all(
+            set(entry) >= {"channel", "overlay_label", "raw", "flat", "overlay"}
+            for entry in envelopes
+        )
 
         # Preprocessing completion is recorded in the inference_cadences run manifest
         db = initialized_runtime
@@ -622,12 +730,24 @@ class TestProcessCadenceEndToEnd:
         assert json.loads(manifest[0]["cadence_key"]) == ["T1", "S1", "L", "7", "2251"]
         assert manifest[0]["duration_s"] > 0
 
+        # Fresh extraction is flagged prunable (#302)
+        assert result.freshly_extracted is True
+
         # Resume path: a second call must skip reprocessing and report the same hit count,
-        # without duplicating the manifest row
+        # without duplicating the manifest row. Because THIS preprocessor extracted the
+        # .npy, its resume is still prunable (#305 disk-leak fix: a failed-then-retried
+        # cadence of the same run must not escape pruning forever).
         resumed = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
         assert resumed is not None
         assert resumed.n_hits == result.n_hits
         assert resumed.npy_path == npy_path
+        assert resumed.freshly_extracted is True
+
+        # A DIFFERENT preprocessor (a genuinely handed cache — separate process/operator)
+        # resuming the same .npy must NOT be prunable: its extracted-set is empty.
+        handed = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert handed is not None
+        assert handed.freshly_extracted is False
         assert db.flush(timeout=10) is True
         manifest = db.query_inference_cadences(tag=config.checkpoint.save_tag, npy_path=npy_path)
         assert len(manifest) == 1
@@ -1585,7 +1705,7 @@ class TestEnergyDetectChannelWorker:
         h5_path = make_h5_observation("obs.h5", n_chans=n_chans)
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=spl_order)
 
-        hits, stat_hist = _energy_detect_channel_worker(
+        hits, stat_hist, integrated = _energy_detect_channel_worker(
             (
                 str(h5_path),
                 channel_index,
@@ -1595,6 +1715,7 @@ class TestEnergyDetectChannelWorker:
                 window_size,
                 step_size,
                 stat_threshold,
+                True,  # want_spectrum (#301): the despiked integrated spectrum rides along
             )
         )
 
@@ -1618,6 +1739,10 @@ class TestEnergyDetectChannelWorker:
             np.testing.assert_allclose(stat_val, expected[idx], rtol=1e-9)
             np.testing.assert_allclose(pval, stats.chi2.sf(stat_val, 2), rtol=1e-9)
 
+        # want_spectrum: the integrated spectrum is the despiked channel's float64 time
+        # mean — the exact quantity the persisted bandpass envelopes are built from (#301)
+        np.testing.assert_array_equal(integrated, channel.astype(np.float64).mean(axis=0))
+
         # The summary histogram covers every finite window statistic, not just hits, on the
         # fixed shared bins — one count per window
         assert stat_hist.shape == (len(ED_STAT_HIST_EDGES) - 1,)
@@ -1631,9 +1756,20 @@ class TestEnergyDetectChannelWorker:
         coarse_width = 512
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=4)
         for channel_index in (0, 3):
-            hits, _ = _energy_detect_channel_worker(
-                (str(h5_path), channel_index, coarse_width, 16, bandpass_flatten, 64, 32, 0.0)
+            hits, _, integrated = _energy_detect_channel_worker(
+                (
+                    str(h5_path),
+                    channel_index,
+                    coarse_width,
+                    16,
+                    bandpass_flatten,
+                    64,
+                    32,
+                    0.0,
+                    False,
+                )
             )
+            assert integrated is None  # want_spectrum=False returns no spectrum
             starts = [idx for idx, _, _ in hits]
             assert len(starts) > 0  # threshold 0.0 must produce hits; else all(...) is vacuous
             assert all(
@@ -1646,8 +1782,8 @@ class TestEnergyDetectChannelWorker:
         histogram must still be populated (it feeds the viz suite regardless of hits)."""
         h5_path = make_h5_observation("obs.h5", n_chans=2048)
         bandpass_flatten = functools.partial(_spline_flatten_bandpass, spl_order=4)
-        hits, stat_hist = _energy_detect_channel_worker(
-            (str(h5_path), 0, 512, 16, bandpass_flatten, 64, 32, 1e12)
+        hits, stat_hist, _ = _energy_detect_channel_worker(
+            (str(h5_path), 0, 512, 16, bandpass_flatten, 64, 32, 1e12, False)
         )
         assert hits == []
         assert stat_hist.sum() > 0

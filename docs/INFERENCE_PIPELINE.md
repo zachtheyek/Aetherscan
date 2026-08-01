@@ -139,10 +139,21 @@ paths:
 - `--config-path` → the training run's `config_{tag}.json`, layered onto the singleton by
   `cli.apply_saved_config()` **before validation** so shape-critical fields
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
-  was trained with. The saved `checkpoint` section is deliberately skipped — most damagingly
-  `save_tag`: without the skip, an inference run would masquerade under the training run's
-  tag, corrupting DB provenance and output paths. This run's resolved save_tag (the
-  `{command}_{datetime}` tag set once in `main()`) stays authoritative.
+  was trained with. Layering is **allowlist-only** (#303): exactly the
+  model-contract / result-affecting fields layer — the whole `beta_vae` section, the RF's
+  deployed-representation contract (`latent_variant` / `active_dims` / `calibration_active`
+  / `calibration_method`), the data geometry keys, and precisely the inference fields the
+  resume fingerprints hash (thresholds, `mc_draws`, ED params) minus the artifact paths.
+  Everything else — paths, `gpu`, `manager`, `db`/`logger`/`monitor`, `hf`, `training`,
+  `reproducibility`, and `checkpoint` (most damagingly `save_tag`: layering it would make an
+  inference run masquerade under the training run's tag, corrupting DB provenance and
+  output paths) — never layers, so a config saved on a bigger host can no longer import its
+  pool sizing or batching; every ignored saved field whose value differs from the resolved
+  one is logged as a startup diff line. The allowlist is derived from `run_state.py`'s
+  fingerprint key sets and test-pinned, so `cli.py` and `run_state.py` can never silently
+  disagree about what is result-affecting (see [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md)).
+  This run's resolved save_tag (the `{command}_{datetime}` tag set once in `main()`) stays
+  authoritative.
 
 `collect_validation_errors` enforces the trio all-or-none (a partial set is the error above);
 every path that *is* set must exist on disk. The three artifacts should carry the same training
@@ -192,15 +203,18 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
    under the first cadence's energy detection. The distributed encode step is a
    lazily-built, cached `tf.function` — repeated `run_inference` calls reuse a bounded set
    of traces (one per batch-shape bucket) instead of retracing per cadence.
-4. **Prefetch depth = `inference.prefetch_depth`** (#298, default 2 — measured ~16%
-   lower end-to-end wall vs depth 1 on fresh /datag cadences, identical candidates). A
+4. **Prefetch depth = `inference.prefetch_depth`** (default 3 — the #301 A/B on the same
+   8 fresh /datag cadences as #298's depth-1→2 measurement: depth 3 = 4,071 s vs depth 2
+   = 5,118 s wall, ~10–20% honest win after the run-order warmth caveat, identical
+   candidates with 0.0 score deltas). A
    `ThreadPoolExecutor` keeps that many `_prefetch_cadence` futures in flight — each
    preprocesses AND loads/log-norms its cadence (`load_inference_data(parallel=False)`:
    the sequential vectorized branch, since the persistent energy-detection pool already
    owns the CPU) — consumed strictly in catalog order, so results, manifest ordering, and
-   per-cadence seeding are identical at any depth. Depth 2 overlaps one cadence's
-   disk-bound energy detection with the previous one's decompression-bound extraction, at
-   the cost of one extra in-flight cadence of RAM. A prefetch-side load failure degrades to
+   per-cadence seeding are identical at any depth. Each unit of depth overlaps disk-bound
+   energy detection with decompression-bound extraction and the serial per-cadence
+   sections, at the cost of one in-flight cadence of RAM (up to ~65 GB for RFI-dense
+   C-band cadences). A prefetch-side load failure degrades to
    loading on the inference thread under the per-cadence containment below.
 5. **Per-cadence inference** (`main.py:_infer_cadence`):
    - provenance derived from the group key + metadata JSON
@@ -212,13 +226,40 @@ training tags and, under `--hf-upload`, checks the Hub for the tag at startup ra
      dead attempt are retired *before* fresh rows land;
    - `run_inference()` (below), then a superseding `inference_cadences` row with
      `status='inferred'` carrying the aggregate stats.
-6. **Failure containment.** A cadence whose inference stage throws is logged, recorded as
+6. **Stamp-cache pruning (#302).** With `inference.prune_stamps` resolved ON (the `None`
+   default is AUTO: ON for the fingerprint-scoped default cache directory, OFF when
+   `--preprocess-output-dir` pins an operator-curated one; `--prune-stamps` /
+   `--no-prune-stamps` override), each cadence's multi-GB stamp `.npy` is deleted right
+   after its `'inferred'` manifest row lands and viz collection ran — without pruning a
+   full catalog writes ~30–90 TB of stamps. The metadata `.json` always stays (provenance,
+   viz, resume guard), resume rides the DB row, and only stamps **this run extracted** are
+   ever pruned — tracked by an in-process set on the preprocessor, so a genuinely handed
+   cache (extracted by another process/operator) is never deleted, while a cadence *this*
+   run extracted then failed-and-retried IS pruned on success (a per-attempt
+   `freshly_extracted` flag alone would leak it forever, #305). Before deletion each
+   candidate's snippet (~196 KB) is snapshotted into an atomic `.candidates.npz` sidecar and
+   the viz collector pools the global top-K stamp pixels (~2.4 MB, persisted across the
+   in-process retry attempts), so candidate figures and the stamp gallery survive pruning;
+   `'failed'` cadences keep their stamps until they succeed. Best-effort: any pruning
+   failure keeps the stamps and the run continues. Both `prune_stamps` and
+   `inference_viz_scope` sit in `run_state.py`'s fingerprint denylists, so fingerprints —
+   and hence resume rows and cache directories — are unchanged. The trade: cross-run
+   re-scoring under a new tag re-pays extraction for pruned cadences; same-run resume/retry
+   is science-unaffected. **Limitations** (viz-only, graceful): a cross-*process* relaunch
+   can't recover an earlier process's pruned pixels, so the stamp gallery may show blank
+   columns for earlier-run cadences; and two runs sharing the default cache dir with pruning
+   ON can race (one deletes/overwrites a `.npy` or `.candidates.npz` another is mid-read of —
+   contained, self-heals via retry). Run concurrently in one dir only with a per-run
+   `--preprocess-output-dir` or `--no-prune-stamps` (a deliberate design choice — cross-
+   process file locking was deferred as disproportionate for a self-healing, science-neutral
+   race).
+7. **Failure containment.** A cadence whose inference stage throws is logged, recorded as
    `status='failed'` in the manifest, and the loop moves on — one bad cadence never aborts
    the catalog. After the loop, the pass raises so the retry loop re-attempts, and the
    manifest skip means **only the failed cadences re-run**. Permanent conditions (no work
    units from the CSVs, no cadence produced stamps) raise `NonRetryableInferenceError`, which
    fails fast instead of burning retries.
-7. **Finalization.** On a fully successful pass, the reference cloud is MC-scored and
+8. **Finalization.** On a fully successful pass, the reference cloud is MC-scored and
    persisted (`finalize_reference_cloud()`, best-effort — see below), then (with
    `inference.inference_viz_enabled`) `render_inference_visualizations()` draws the whole
    suite, every figure individually exception-guarded.
@@ -243,11 +284,20 @@ For one cadence's snippet array `(n, 6, 16, 512)`:
    from the cadence front so the remainder is **encoded rather than silently dropped**, and
    the padded outputs never leave the encode (only real rows are written out). Order is
    preserved (no shuffle), and the traced-shape count is bounded by the bucket ladder for
-   any catalog.
+   any catalog. The loop is a **one-step-deep software pipeline** (#301): step k+1 is
+   dispatched (eager TF enqueues its h2d + kernels asynchronously) *before* step k's
+   results are harvested, so the host-side d2h + numpy writes overlap the next step's
+   device work instead of serializing against it — same tensors, same step geometry, same
+   write order; peak memory grows by one step of latent outputs.
 2. Each snippet's 6 observations go through the encoder as independent `(16, 512, 1)`
    inputs and come back as the **deterministic posterior parameters** `z_mean` /
    `z_log_var` (#282 — no stochastic `z` ever crosses the GPU boundary; the MC draws below
-   are reparameterized in NumPy from these, seeded per cadence). Per-replica results are
+   are reparameterized in NumPy from these, seeded per cadence). The step runs an
+   **encode-only submodel** `init_models` slices from the loaded encoder's first two
+   outputs (#301): the discarded `Sampling` draw is a stateful op graph pruning must
+   retain, so it used to execute per step per replica for nothing — excluding the sampling
+   branch from the traced graph leaves `z_mean` / `z_log_var` as the very same graph nodes
+   (a non-functional encoder falls back to the full model). Per-replica results are
    gathered with `experimental_local_results` + `np.concatenate` (cheaper than an NCCL
    gather for the tiny latent payload).
 3. **Two-pass cascade** (#282). Features are rebuilt per the saved config's winning
@@ -354,7 +404,8 @@ flagged while later writes stay live (`Database.mark_superseded`).
 
 | Artifact | Where | Notes |
 | --- | --- | --- |
-| Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/*.npy` + `.json` | Shared across runs with the same ED config (#298). The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, raw/merged hit lists, the `.h5` header, and the `ed_config_fingerprint` the resume guard checks. |
+| Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/*.npy` + `.json` | Shared across runs with the same ED config (#298) — though with pruning ON (#302, the default for this directory) each `.npy` is deleted once its cadence is scored, leaving the `.json`. The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, the pre-binned `hit_spectrum_hist` + merged hit list and stored `bandpass_envelopes` (#301 — the raw per-hit frequency list is no longer stored; see [`PREPROCESSING.md`](PREPROCESSING.md)), the `.h5` header, and the `ed_config_fingerprint` the resume guard checks. |
+| Candidate snippet sidecars | same directory, `*.candidates.npz` | Written by the pruning step (#302): each pruned cadence's candidate snippets (~196 KB each), atomically published; `load_display_cadence` falls back to it when the stamp `.npy` is gone, so candidate figures and galleries survive pruning. |
 | Candidate rows | `inference_results` table | Positives only, with latents + provenance + the two-pass scores (`screening_proba`/`mc_mean`/`mc_std`, schema v5). |
 | Run manifest | `inference_cadences` table | Per-cadence stages, aggregates, durations. |
 | Reference cloud | `{output_path}/inference_reference_cloud_{tag}.npz` | MC scores for the seeded uniform reservoir of pass-1 rejects — the survey background of the candidate uncertainty figure (regenerable without re-running inference). |
@@ -393,23 +444,38 @@ coarse, `C` = coarse-channel count, `T` = `pfb_taps_per_channel`.
 
 [`inference_viz.py`](../src/aetherscan/inference_viz.py) renders at end of run from three
 sources: the bounded in-memory `InferenceVizCollector` (per-cadence aggregates + a
-reservoir-sampled latent pool, memory O(#cadences), candidates always kept), the durable
-per-cadence metadata JSONs, and the DB tables — so figures also cover cadences that were
-skipped by the resume. Every figure is wrapped in `_viz_safe` (log-and-swallow): a plot bug
-can never kill a science run. Slack uploads go through a single-worker FIFO background
+reservoir-sampled latent pool, memory O(#cadences), candidates always kept — plus, under
+pruning, the bounded top-K stamp-pixel pool, #302), the durable per-cadence metadata JSONs,
+and the DB tables — so figures also cover cadences that were skipped by the resume. The
+sidecars are **stream-reduced** (#301): each JSON is parsed once, reduced to a bounded ~KB
+`CadenceVizSummary` (hit counts, pre-binned histograms, stored bandpass envelopes,
+per-cadence top-K stamp representatives), and dropped — the suite used to hold every
+cadence's fully parsed JSON (up to ~19 MB each on RFI-dense cadences) for the whole render,
+an OOM-class heap at catalog scale; legacy sidecars' raw hit lists are binned at load, so
+RAM stays bounded for old catalogs too. `inference.inference_viz_scope`
+(`--inference-viz-scope`, default `full`) controls coverage: `new` renders the
+metadata-driven figures only for cadences inferred **this pass** — recommended for resumed
+multi-pass catalog campaigns, where `full` re-pays the entire catalog's viz tail on every
+pass; the DB-sourced candidate figures always cover the whole tag either way. Every figure
+is wrapped in `_viz_safe` (log-and-swallow): a plot bug can never kill a science run — and
+each figure records its own `pipeline_stages` sub-span, alongside `load_metadata` and
+`upload_drain` spans (#301), so the suite's wall is attributable instead of one opaque
+`inference.viz` span. Slack uploads go through a single-worker FIFO background
 uploader (#298 — figure ordering and API rate unchanged; drained before teardown), and the
 per-candidate figures render across a forkserver process pool in the TF-free
 [`candidate_figures.py`](../src/aetherscan/candidate_figures.py) (empty preload — the
 `shap_parallel`/`latent_gif` isolation pattern; per-figure failures degrade the suite
-exactly like `_viz_safe`).
+exactly like `_viz_safe`; its metadata-sidecar reads are memoized through a small
+`lru_cache`, #301 — sidecars are immutable once published, and candidates cluster on few
+cadences).
 
 | File | Contents | What to look for |
 | --- | --- | --- |
 | `ed_stat_distributions_{tag}.png` | Log-log histogram of the D'Agostino–Pearson k² statistic over **all** windows (not just hits), per-ON-file overlay + total, threshold line. | The bulk should be a compact low-k² mass (noise ≈ χ², df=2) with a long RFI tail. The threshold should sit far into the tail: if the noise bulk crosses it, the stamp count explodes; if one ON file's curve is shifted, that file has a bandpass/level problem. |
-| `ed_hit_spectrum_{tag}.png` | Hit density vs frequency (MHz), pre- vs post-deduplication. | Instantly shows RFI comb structure (regular spikes) and band edges. Dedup should collapse combs dramatically; a band where post-dedup density is still high dominates your stamp budget. |
-| `bandpass_flattening_{tag}.png` | Raw vs flattened integrated spectrum for a few sampled coarse channels, with the removed model (scaled PFB response H or spline fit) overlaid. | The flattened spectrum should be level across the channel. Residual scalloping under PFB means the static response doesn't match the recording — check `--pfb-taps-per-channel` or fall back to `--bandpass-method spline` (the log's edge/mid-ratio warning fires on the same condition). |
-| `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
-| `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
+| `ed_hit_spectrum_{tag}.png` | Hit density vs frequency (MHz), pre- vs post-deduplication — rendered by rebinning each cadence's fine pre-binned `hit_spectrum_hist` (≥ 40× finer than the figure's bins) onto one global axis (#301): visually identical to histogramming the raw hit lists, which the sidecars no longer store. | Instantly shows RFI comb structure (regular spikes) and band edges. Dedup should collapse combs dramatically; a band where post-dedup density is still high dominates your stamp budget. |
+| `bandpass_flattening_{tag}.png` | Raw vs flattened integrated spectrum for a few sampled coarse channels, with the removed model (scaled PFB response H or spline fit) overlaid. Rendered from the sidecar's stored `bandpass_envelopes` when present (#301 — zero `.h5` reads at viz time); legacy sidecars keep the live-read path. | The flattened spectrum should be level across the channel. Residual scalloping under PFB means the static response doesn't match the recording — check `--pfb-taps-per-channel` or fall back to `--bandpass-method spline` (the log's edge/mid-ratio warning fires on the same condition). |
+| `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. Cadences pruned in this run (incl. across its in-process retries) render from the collector's pooled pixels (#302); cadences pruned by an earlier *process* (a relaunch-resume) degrade to blank columns. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
+| `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. Past 120 cadences the strongest (by raw hits) keep individual bars and the rest aggregate into one summary bar (#301 — the unbounded figure exceeded Agg's 2¹⁶-px canvas limit past 242 cadences and was silently lost). | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
 | `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
 | `candidate_uncertainty_{tag}.png` | Each candidate (red star) at x = final RF probability (MC mean), y = MC spread, over a hexbin density background of the reference cloud (the survey's pass-1 rejects), with the science threshold as a vertical line. | Population context is the whole point: "p = 0.97, spread = 0.05" is only interpretable against where the survey sits. The dangerous quadrant is **high p + high spread** — a mean that looks confident while draws swing — exactly what `p` alone cannot flag (see the interpretation table above). Candidates hugging the survey cloud are threshold noise. |
@@ -437,6 +503,6 @@ Inference-specific fields live on `InferenceConfig`
 | Streaming | `prefetch_depth` |
 | Cadence grouping | `cadence_group_by_cols`, `cadence_h5_path_col`, `cadence_expected_obs` |
 | Energy detection | `coarse_channel_width`, `coarse_channel_log_interval`, `bandpass_method`, `pfb_taps_per_channel`, `bandpass_debug_plot`, `spline_order`, `detection_window_size`, `detection_step_size`, `stat_threshold` |
-| Stamps | `stamp_width`, `store_downsampled_stamps`, `overlap_search`, `overlap_fraction`, `preprocess_output_dir` |
-| Visualization | `inference_viz_enabled`, `stamp_gallery_top_k`, `max_candidate_plots` |
+| Stamps | `stamp_width`, `store_downsampled_stamps`, `overlap_search`, `overlap_fraction`, `preprocess_output_dir`, `prune_stamps` |
+| Visualization | `inference_viz_enabled`, `inference_viz_scope`, `stamp_gallery_top_k`, `max_candidate_plots` |
 | Fault tolerance | `max_retries`, `retry_delay` |

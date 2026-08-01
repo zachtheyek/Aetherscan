@@ -24,7 +24,6 @@ background threads, and pyplot's global figure registry is not thread-safe.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -40,6 +39,7 @@ import h5py
 import numpy as np
 from matplotlib.figure import Figure
 
+from aetherscan.benchmark import stage_timer
 from aetherscan.candidate_figures import (
     OBS_ROW_LABELS,
     candidate_frequency_range_mhz,
@@ -50,9 +50,9 @@ from aetherscan.candidate_figures import (
     stamp_frequency_range_mhz,
 )
 from aetherscan.config import get_config
+from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db
 from aetherscan.logger import get_logger
-from aetherscan.models import prepare_latent_features
 from aetherscan.pfb import gen_coarse_channel_response
 from aetherscan.seeding import STREAM_INFERENCE_VIZ, derive_rng
 
@@ -69,6 +69,18 @@ _MAX_LATENT_POINTS = 20_000
 
 # Frequency-axis bins for the hit spectrum figure.
 _HIT_SPECTRUM_BINS = 200
+
+# Fine-grid bin count used when a LEGACY sidecar's raw hit-frequency lists are reduced to
+# a bounded per-cadence histogram at metadata-load time (#301) — new sidecars arrive
+# pre-binned by preprocessing (_HIT_HIST_BINS, same value).
+_LEGACY_HIT_HIST_BINS = 8192
+
+# Cap on individually-drawn cadences in the preprocessing funnel (#301): at 270 px per
+# cadence (1.8 in x 150 dpi) the figure exceeds Agg's hard 2^16-px canvas limit past 242
+# cadences — the render then raises and _viz_safe swallowed it, so every catalog-scale
+# pass silently LOST the funnel. Beyond the cap, the highest-raw-hit cadences are drawn
+# individually and the remainder is aggregated into one summary bar.
+_FUNNEL_MAX_CADENCES = 120
 
 # Candidate gallery shows at most this many top-confidence candidates (per-candidate figures
 # are governed separately by config.inference.max_candidate_plots).
@@ -171,7 +183,11 @@ class InferenceVizCollector:
     subsampled against a global budget (candidates always kept).
     """
 
-    def __init__(self, max_latent_points: int = _MAX_LATENT_POINTS):
+    def __init__(
+        self,
+        max_latent_points: int = _MAX_LATENT_POINTS,
+        gallery_pool: list | None = None,
+    ):
         self.records: list[CadenceVizRecord] = []
         self._max_latent_points = max_latent_points
         self._latent_chunks: list[np.ndarray] = []  # (k, num_obs * latent_dim) each
@@ -180,6 +196,18 @@ class InferenceVizCollector:
         config = get_config()
         root_seed = config.reproducibility.seed if config is not None else None
         self._rng = derive_rng(root_seed, STREAM_INFERENCE_VIZ)
+        # Bounded top-K stamp-pixel pool (#302): raw pixels of the strongest stamps seen
+        # so far, captured just before pruning deletes a cadence's .npy, so the stamp
+        # gallery stays whole (~196 KB x top_k ≈ 2.4 MB at defaults). A caller-supplied
+        # list persists it ACROSS the in-process retry attempts (#305 fix): each attempt
+        # builds a fresh collector, but a cadence pruned in an earlier attempt is
+        # resume-skipped (never re-pooled) in later ones, so a per-attempt pool would blank
+        # its gallery column on the retry render. Cross-PROCESS relaunch still can't recover
+        # those pixels (documented) — but a full-catalog run rarely relaunches.
+        self._gallery_top_k = config.inference.stamp_gallery_top_k if config is not None else 12
+        self._gallery_pixel_pool: list[tuple[float, str, int, np.ndarray]] = (
+            gallery_pool if gallery_pool is not None else []
+        )
 
     def record_skipped(
         self, key: tuple, npy_path: str, metadata_path: str, manifest_row: dict
@@ -234,11 +262,6 @@ class InferenceVizCollector:
         concatenated), candidates always kept; non-candidates fill whatever global budget
         remains, uniformly subsampled WITHIN this cadence when they'd overflow it (later
         cadences get nothing once the budget is spent)."""
-        config = get_config()
-        features = prepare_latent_features(
-            np.asarray(latents), config.data.num_observations
-        ).astype(np.float32)
-
         keep = np.nonzero(is_candidate)[0]
         budget = self._max_latent_points - self._latent_count - keep.size
         non_candidates = np.nonzero(~is_candidate)[0]
@@ -248,8 +271,18 @@ class InferenceVizCollector:
             keep = np.concatenate([keep, non_candidates])
 
         if keep.size == 0:
+            # Once the global budget is spent (a cadence or two into the catalog), every
+            # non-candidate cadence lands here — so nothing may be built before this
+            # return. The full-cadence feature matrix this method used to construct first
+            # (~190 MB float64 for a 330k-stamp cadence) was thrown away each time (#301).
             return
-        self._latent_chunks.append(features[keep])
+        # Cadence-level rows for the kept indices only. Value-identical to
+        # prepare_latent_features(latents)[keep].astype(np.float32): the helper's
+        # float32 -> float64 -> float32 round trip is exact, and the row-major
+        # reshape is the helper's own documented layout (fancy indexing yields a
+        # fresh array, so the chunk owns its memory).
+        features = np.asarray(latents, dtype=np.float32).reshape(len(is_candidate), -1)[keep]
+        self._latent_chunks.append(features)
         self._candidate_chunks.append(is_candidate[keep])
         self._latent_count += keep.size
 
@@ -260,6 +293,36 @@ class InferenceVizCollector:
             return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=bool)
         return np.concatenate(self._latent_chunks), np.concatenate(self._candidate_chunks)
 
+    def pool_gallery_pixels(self, metadata_path: str, npy_path: str) -> None:
+        """Capture this cadence's top-K stamp pixels into the bounded global pool (#302):
+        called by the pruning step just before it deletes the stamp .npy. The global
+        top-K is a subset of the per-cadence top-Ks, so pooling per-cadence top-K and
+        truncating globally preserves exactly the stamps plot_stamp_gallery will select.
+        Best-effort — a failure degrades the gallery, never the run."""
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            representatives = _cadence_top_stamps(metadata, self._gallery_top_k)
+            if not representatives:
+                return
+            stamps = np.load(npy_path, mmap_mode="r")
+            for stat, idx, _freq, _freq_range in representatives:
+                self._gallery_pixel_pool.append(
+                    (stat, npy_path, int(idx), np.array(stamps[int(idx)], dtype=np.float32))
+                )
+            del stamps
+            self._gallery_pixel_pool.sort(key=lambda entry: entry[0], reverse=True)
+            del self._gallery_pixel_pool[self._gallery_top_k :]
+        except Exception as e:
+            logger.warning(
+                f"Gallery pixel pooling failed for {npy_path} ({e}); the stamp gallery "
+                f"may show blank columns for this cadence"
+            )
+
+    def gallery_pixels(self) -> dict[tuple[str, int], np.ndarray]:
+        """(npy_path, snippet_index) -> raw stamp pixels for the pooled top-K stamps."""
+        return {(path, idx): pixels for _, path, idx, pixels in self._gallery_pixel_pool}
+
 
 # ---------------------------------------------------------------------------
 # Shared plumbing
@@ -268,9 +331,12 @@ class InferenceVizCollector:
 
 def _viz_safe(name: str, fn: Callable, *args, **kwargs):
     """Run one figure function, log-and-swallow any exception: a plot bug must never kill a
-    science run (mirrors train.py's _safe_call, with viz-specific logging)."""
+    science run (mirrors train.py's _safe_call, with viz-specific logging). Each figure
+    records its own pipeline_stages sub-span (#301) — the suite used to be one opaque
+    'inference.viz' span covering 73% of a cached rerun's wall."""
     try:
-        return fn(*args, **kwargs)
+        with stage_timer(name):
+            return fn(*args, **kwargs)
     except Exception as e:
         logger.error(f"Inference viz '{name}' failed (run continues without it): {e}")
         return None
@@ -310,6 +376,142 @@ def _load_metadata(record: CadenceVizRecord) -> dict | None:
         return None
 
 
+@dataclass
+class CadenceVizSummary:
+    """Bounded per-cadence reduction of the metadata sidecar (#301). The suite used to
+    hold every cadence's fully parsed JSON (up to ~19 MB each on RFI-dense cadences —
+    an OOM-class hundreds of GB at 6,093-cadence catalog scale) for the whole render;
+    each figure now reads these ~KB summaries and the parsed dict is dropped as soon as
+    its cadence is reduced."""
+
+    n_raw_hits: int = 0
+    n_merged_hits: int = 0
+    n_stamp_rows: int = 0
+    npy_size_bytes: float = float("nan")
+    ed_hist_edges: np.ndarray | None = None
+    ed_hist_counts: np.ndarray | None = None  # (n_on_files, n_bins) int64
+    # {raw_counts, merged_counts, freq_lo, freq_hi, raw_freq_min, raw_freq_max} — fine
+    # per-cadence histograms rebinned onto the figure's global axis at render time
+    hit_hist: dict | None = None
+    h5_path: str | None = None
+    nchans: int = 0
+    bandpass_envelopes: list | None = None
+    # Per-cadence top-K stamp representatives: (statistic, snippet_idx, freq, freq_range)
+    gallery_reps: list = field(default_factory=list)
+
+
+def _reduce_hit_hist(metadata: dict) -> dict | None:
+    """Normalize a cadence's hit-frequency data to a bounded fine histogram: new sidecars
+    carry hit_spectrum_hist pre-binned by preprocessing; legacy sidecars' raw float lists
+    are binned HERE, once, on their own span — so RAM stays bounded for old and new
+    catalogs alike (#301)."""
+    hist = metadata.get("hit_spectrum_hist")
+    if hist:
+        return {
+            "raw_counts": np.asarray(hist["raw_counts"], dtype=np.int64),
+            "merged_counts": np.asarray(hist["merged_counts"], dtype=np.int64),
+            "freq_lo": float(hist["freq_lo"]),
+            "freq_hi": float(hist["freq_hi"]),
+            "raw_freq_min": float(hist["raw_freq_min"]),
+            "raw_freq_max": float(hist["raw_freq_max"]),
+        }
+    raw = metadata.get("raw_hit_frequencies_mhz") or []
+    if not raw:
+        return None
+    merged = metadata.get("merged_hit_frequencies_mhz") or []
+    lo, hi = float(np.min(raw)), float(np.max(raw))
+    span_lo, span_hi = (lo, hi) if lo < hi else (lo - 0.5, hi + 0.5)
+    edges = np.linspace(span_lo, span_hi, _LEGACY_HIT_HIST_BINS + 1)
+    return {
+        "raw_counts": np.histogram(raw, bins=edges)[0],
+        "merged_counts": np.histogram(merged, bins=edges)[0],
+        "freq_lo": span_lo,
+        "freq_hi": span_hi,
+        "raw_freq_min": lo,
+        "raw_freq_max": hi,
+    }
+
+
+def _cadence_top_stamps(metadata: dict, top_k: int) -> list[tuple[float, int, float, tuple | None]]:
+    """This cadence's top-K stamp representatives by detection statistic, overlap-offset
+    copies collapsed first (the per-cadence half of the old _select_top_stamps): stamps
+    sharing one exact statistic are one hit's offset copies — represented by the
+    median-start stamp (the offset-0 center for a full triplet). Keeping only the
+    per-cadence top-K preserves the global top-K exactly (each cadence can contribute at
+    most K entries to it) while bounding the reduction (#301)."""
+    stats_list = metadata.get("stamp_statistics") or []
+    freqs = metadata.get("stamp_frequencies_mhz") or []
+    starts = metadata.get("stamp_starts") or []
+
+    by_stat: dict[float, list[tuple[int, int]]] = {}
+    for idx, stat in enumerate(stats_list):
+        start = int(starts[idx]) if idx < len(starts) else 0
+        by_stat.setdefault(float(stat), []).append((start, idx))
+
+    representatives: list[tuple[float, int, float, tuple | None]] = []
+    for stat, members in by_stat.items():
+        members.sort()  # by start; median = offset-0 center for a full triplet
+        _, idx = members[len(members) // 2]
+        freq = float(freqs[idx]) if idx < len(freqs) else float("nan")
+        representatives.append((stat, idx, freq, stamp_frequency_range_mhz(metadata, idx)))
+
+    # Distinct stats per cadence (offset copies collapsed), so this sort has no ties and
+    # cross-cadence tie order stays the stable record order the old global sort had
+    representatives.sort(key=lambda r: r[0], reverse=True)
+    return representatives[:top_k]
+
+
+def _reduce_metadata(
+    record: CadenceVizRecord, metadata: dict, gallery_top_k: int
+) -> CadenceVizSummary:
+    """Reduce one cadence's parsed metadata to the bounded summary the figures consume."""
+    summary = CadenceVizSummary()
+    summary.n_raw_hits = int(metadata.get("n_raw_hits") or 0)
+    summary.n_merged_hits = int(metadata.get("n_merged_hits") or 0)
+    summary.n_stamp_rows = len(metadata.get("stamp_starts") or []) or record.n_stamps
+    try:
+        summary.npy_size_bytes = float(os.path.getsize(record.npy_path))
+    except OSError:
+        # The .npy was pruned after scoring (#302 default) — reconstruct the size the run
+        # transiently held from the stored geometry so the funnel/summary storage figures
+        # don't silently collapse to nan/0 on every default run. The .npy shape is
+        # (n_stamps, n_obs, time_bins, stored_width) float32 + a ~128-byte header.
+        config = get_config()
+        stored_width = metadata.get("stored_width")
+        time_bins = config.data.time_bins if config is not None else None
+        n_obs = len(metadata.get("h5_paths") or []) or 6
+        if stored_width and time_bins:
+            summary.npy_size_bytes = float(
+                summary.n_stamp_rows * n_obs * int(time_bins) * int(stored_width) * 4 + 128
+            )
+    ed_hist = metadata.get("ed_stat_hist")
+    if ed_hist:
+        summary.ed_hist_edges = np.asarray(ed_hist["bin_edges"], dtype=np.float64)
+        summary.ed_hist_counts = np.asarray(ed_hist["counts_per_on_file"], dtype=np.int64)
+    summary.hit_hist = _reduce_hit_hist(metadata)
+    h5_paths = metadata.get("h5_paths") or []
+    if h5_paths:
+        summary.h5_path = h5_paths[0]
+        summary.nchans = int((metadata.get("header") or {}).get("nchans", 0) or 0)
+    summary.bandpass_envelopes = metadata.get("bandpass_envelopes") or None
+    summary.gallery_reps = _cadence_top_stamps(metadata, gallery_top_k)
+    return summary
+
+
+def _build_summaries(
+    records: list[CadenceVizRecord], gallery_top_k: int
+) -> dict[str, CadenceVizSummary]:
+    """One pass over the records' metadata sidecars: parse, reduce, drop — the only place
+    the suite touches the raw JSONs (#301)."""
+    summaries: dict[str, CadenceVizSummary] = {}
+    for record in records:
+        metadata = _load_metadata(record)
+        if metadata is not None:
+            summaries[record.npy_path] = _reduce_metadata(record, metadata, gallery_top_k)
+        del metadata
+    return summaries
+
+
 # _load_display_cadence and _draw_cadence_strip moved to the TF-free candidate_figures
 # module (#298 I9) so forkserver render workers can import them without pulling TF;
 # the suite uses them via the load_display_cadence / draw_cadence_strip imports above.
@@ -326,7 +528,7 @@ def _key_label(key: tuple, max_len: int = 28) -> str:
 
 
 def plot_ed_stat_distributions(
-    records: list[CadenceVizRecord], metadatas: dict[str, dict]
+    records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary]
 ) -> str | None:
     """Histogram of the D'Agostino-Pearson k2 statistic over all finite windows (not just
     hits — the ED workers histogram only finite k2 values), log-log, per-ON-file overlay +
@@ -340,12 +542,11 @@ def plot_ed_stat_distributions(
     per_on_totals: np.ndarray | None = None
     contributing: set[str] = set()  # npy_paths whose histograms actually landed in the totals
     for record in records:
-        metadata = metadatas.get(record.npy_path)
-        ed_hist = (metadata or {}).get("ed_stat_hist")
-        if not ed_hist:
+        summary = summaries.get(record.npy_path)
+        if summary is None or summary.ed_hist_edges is None:
             continue
-        cadence_edges = np.asarray(ed_hist["bin_edges"], dtype=np.float64)
-        counts = np.asarray(ed_hist["counts_per_on_file"], dtype=np.int64)
+        cadence_edges = summary.ed_hist_edges
+        counts = summary.ed_hist_counts
         if edges is None:
             edges = cadence_edges
             per_on_totals = np.zeros_like(counts)
@@ -384,7 +585,7 @@ def plot_ed_stat_distributions(
     # so the threshold generally falls inside a bin — summing bins would be approximate).
     # Summed over the SAME cadence subset that built the histogram, so the above/total pair
     # stays consistent when a mismatched-bins/shape cadence was dropped above.
-    above = sum(int(metadatas[p].get("n_raw_hits") or 0) for p in contributing)
+    above = sum(summaries[p].n_raw_hits for p in contributing)
     total = int(per_on_totals.sum())
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -401,42 +602,78 @@ def plot_ed_stat_distributions(
     return _save_and_upload(fig, f"ed_stat_distributions_{tag}.png", "ED Statistic Distribution")
 
 
-def plot_ed_hit_spectrum(records: list[CadenceVizRecord], metadatas: dict[str, dict]) -> str | None:
+def _clamp_hit_spectrum_bins(
+    lo: float, hi: float, coarsest_fine_width: float, max_bins: int
+) -> int:
+    """Number of hit-spectrum figure bins over [lo, hi] that keeps each figure bin no finer
+    than the coarsest stored fine grid (>= one fine bin per figure bin), so the rebin can't
+    alias into a picket-fence (#305). Returns max_bins when the span is wide (the common
+    case) and fewer as the span narrows toward the fine-grid resolution."""
+    if coarsest_fine_width <= 0 or hi <= lo:
+        return max_bins
+    return max(1, min(max_bins, int((hi - lo) / coarsest_fine_width)))
+
+
+def plot_ed_hit_spectrum(
+    records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary]
+) -> str | None:
     """Hit density vs frequency (MHz) across the band, pre- vs post-deduplication — RFI comb
-    structure shows up immediately as spikes/picket-fences."""
+    structure shows up immediately as spikes/picket-fences. Rendered by rebinning each
+    cadence's bounded fine histogram (pre-binned by preprocessing, or reduced from a legacy
+    sidecar's raw lists at load — #301) onto one global axis whose bin count is clamped so
+    the figure bins are never finer than the stored fine grid — so the result is visually
+    faithful to histogramming the raw floats (identical for the wide-span common case)
+    while never holding the catalog's hit lists in RAM."""
     tag = get_config().checkpoint.save_tag
 
-    # NOTE: unlike the pre-binned ED stat histograms, hit frequencies are accumulated raw
-    # across every cadence before the histogram call — an asymmetry that is bounded at
-    # current catalog scale (~1e5-1e6 floats) but would warrant pre-binning in the
-    # metadata (fixed frequency grid, like ed_stat_hist) if catalogs grow to hundreds of
-    # RFI-dense cadences.
-    raw_freqs: list[float] = []
-    merged_freqs: list[float] = []
-    for record in records:
-        metadata = metadatas.get(record.npy_path) or {}
-        raw_freqs.extend(metadata.get("raw_hit_frequencies_mhz") or [])
-        merged_freqs.extend(metadata.get("merged_hit_frequencies_mhz") or [])
-
-    if not raw_freqs:
+    with_hits = [
+        summaries[record.npy_path]
+        for record in records
+        if summaries.get(record.npy_path) and summaries[record.npy_path].hit_hist
+    ]
+    if not with_hits:
         logger.info("Viz: no hit frequencies available; skipping ed_hit_spectrum")
         return None
 
-    lo, hi = float(np.min(raw_freqs)), float(np.max(raw_freqs))
+    lo = min(s.hit_hist["raw_freq_min"] for s in with_hits)
+    hi = max(s.hit_hist["raw_freq_max"] for s in with_hits)
     if lo == hi:  # single-frequency degenerate range: give the histogram some width
         lo, hi = lo - 0.5, hi + 0.5
-    bins = np.linspace(lo, hi, _HIT_SPECTRUM_BINS + 1)
+
+    # Clamp the figure's bin count so its bins are never FINER than the stored fine grid
+    # over this span (#305 review): new sidecars pre-bin over the whole file band, so when
+    # the catalog-wide hit span is narrow (< ~band/41) the 200-bin figure axis would be
+    # finer than the fine bins and the center-weighted rebin below would draw a spurious
+    # picket-fence (empty bins between populated ones) not present in the data.
+    coarsest_fine_width = max(
+        (s.hit_hist["freq_hi"] - s.hit_hist["freq_lo"]) / max(1, len(s.hit_hist["raw_counts"]))
+        for s in with_hits
+    )
+    n_fig_bins = _clamp_hit_spectrum_bins(lo, hi, coarsest_fine_width, _HIT_SPECTRUM_BINS)
+    bins = np.linspace(lo, hi, n_fig_bins + 1)
+
+    raw_total = np.zeros(n_fig_bins, dtype=np.float64)
+    merged_total = np.zeros(n_fig_bins, dtype=np.float64)
+    for s in with_hits:
+        h = s.hit_hist
+        fine_edges = np.linspace(h["freq_lo"], h["freq_hi"], len(h["raw_counts"]) + 1)
+        # Clip centers into the global range: a boundary hit's fine bin can center just
+        # outside [lo, hi] — its count belongs in the edge bin, exactly where the raw
+        # float would have landed
+        centers = np.clip((fine_edges[:-1] + fine_edges[1:]) / 2, lo, hi)
+        raw_total += np.histogram(centers, bins=bins, weights=h["raw_counts"])[0]
+        merged_total += np.histogram(centers, bins=bins, weights=h["merged_counts"])[0]
 
     fig = Figure(figsize=(12, 5))
     ax = fig.subplots()
-    ax.hist(raw_freqs, bins=bins, histtype="stepfilled", alpha=0.35, label="raw hits (pre-dedup)")
-    ax.hist(merged_freqs, bins=bins, histtype="step", lw=1.4, color="crimson", label="merged hits")
+    ax.stairs(raw_total, bins, fill=True, alpha=0.35, label="raw hits (pre-dedup)")
+    ax.stairs(merged_total, bins, lw=1.4, color="crimson", label="merged hits")
     ax.set_yscale("log")
     ax.set_xlabel("frequency (MHz)")
     ax.set_ylabel("hit count")
     ax.set_title(
         f"Energy-detection hit spectrum ({tag})\n"
-        f"{len(raw_freqs):,} raw → {len(merged_freqs):,} merged hits"
+        f"{int(raw_total.sum()):,} raw → {int(merged_total.sum()):,} merged hits"
     )
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.2)
@@ -444,13 +681,65 @@ def plot_ed_hit_spectrum(records: list[CadenceVizRecord], metadatas: dict[str, d
     return _save_and_upload(fig, f"ed_hit_spectrum_{tag}.png", "ED Hit Spectrum")
 
 
+def _plot_bandpass_from_envelopes(
+    envelopes: list[dict], h5_path: str | None, tag: str
+) -> str | None:
+    """Render the bandpass-flattening figure from the decimated envelope lines persisted
+    in a cadence's metadata sidecar (#301): the same three lines per sampled channel the
+    live path draws, computed by preprocessing while the channels were resident — no h5
+    reads at viz time (they measured 114 s of cold /datag reads = 74% of a cached rerun's
+    viz span)."""
+    fig = Figure(figsize=(14, 3.2 * len(envelopes)))
+    axes = fig.subplots(len(envelopes), 2, squeeze=False)
+    overlay_label = "removed model"
+    for row, entry in enumerate(envelopes):
+        ax_raw, ax_flat = axes[row]
+        overlay_label = entry.get("overlay_label") or overlay_label
+        ax_raw.plot(
+            entry["raw"]["idx"],
+            entry["raw"]["values"],
+            lw=0.6,
+            color="tab:blue",
+            label="raw integrated spectrum",
+        )
+        ax_raw.plot(
+            entry["overlay"]["idx"],
+            entry["overlay"]["values"],
+            lw=1.2,
+            ls="--",
+            color="tab:orange",
+            label=overlay_label,
+        )
+        ax_raw.set_ylabel(f"coarse channel {entry.get('channel', '?')}\nintegrated power")
+        ax_flat.plot(
+            entry["flat"]["idx"],
+            entry["flat"]["values"],
+            lw=0.6,
+            color="tab:green",
+            label="flattened integrated spectrum",
+        )
+        if row == 0:
+            ax_raw.legend(loc="upper right", fontsize=8)
+            ax_flat.legend(loc="upper right", fontsize=8)
+        if row == len(envelopes) - 1:
+            ax_raw.set_xlabel("fine channel (within coarse channel)")
+            ax_flat.set_xlabel("fine channel (within coarse channel)")
+
+    method = "pfb" if "PFB" in overlay_label else "spline"
+    source = os.path.basename(h5_path) if h5_path else "stored envelopes"
+    fig.suptitle(f"Bandpass flattening ({method}, {tag}): {source}")
+    fig.tight_layout()
+    return _save_and_upload(fig, f"bandpass_flattening_{tag}.png", "Bandpass Flattening")
+
+
 def plot_bandpass_flattening(
-    preprocessor, records: list[CadenceVizRecord], metadatas: dict[str, dict]
+    preprocessor, records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary]
 ) -> str | None:
     """Integrated spectrum raw vs flattened for a few coarse channels sampled across the
     band of the first cadence's primary ON file, with the removed model (scaled PFB response
     H or spline fit) overlaid — formalizes PR-07's opt-in debug artifact as a standard
-    per-run figure."""
+    per-run figure. Rendered from the envelopes persisted at preprocess time when a sidecar
+    carries them (#301); legacy sidecars keep the historical live-read path below."""
     # NOTE: reaches into DataPreprocessor's private helpers on purpose — they are the
     # single source of truth for how a channel is read/despiked/flattened, and duplicating
     # that here would let the figure drift from what detection actually does.
@@ -464,13 +753,18 @@ def plot_bandpass_flattening(
     tag = config.checkpoint.save_tag
     width = config.inference.coarse_channel_width
 
-    h5_path = None
     for record in records:
-        metadata = metadatas.get(record.npy_path) or {}
-        h5_paths = metadata.get("h5_paths") or []
-        if h5_paths and os.path.exists(h5_paths[0]):
-            h5_path = h5_paths[0]
-            n_chans = int((metadata.get("header") or {}).get("nchans", 0))
+        summary = summaries.get(record.npy_path)
+        if summary is not None and summary.bandpass_envelopes:
+            return _plot_bandpass_from_envelopes(summary.bandpass_envelopes, summary.h5_path, tag)
+
+    h5_path = None
+    n_chans = 0
+    for record in records:
+        summary = summaries.get(record.npy_path)
+        if summary is not None and summary.h5_path and os.path.exists(summary.h5_path):
+            h5_path = summary.h5_path
+            n_chans = summary.nchans
             break
     if h5_path is None:
         logger.info("Viz: no readable ON-source .h5 available; skipping bandpass_flattening")
@@ -548,48 +842,43 @@ def plot_bandpass_flattening(
 
 
 def _select_top_stamps(
-    records: list[CadenceVizRecord], metadatas: dict[str, dict], top_k: int
-) -> list[tuple[CadenceVizRecord, int, float, float]]:
-    """Pick the top_k stamps by detection statistic across all cadences, collapsing
-    overlap-search offset copies first: with overlap_search each hit yields up to three
-    stamps (at -offset/0/+offset) that all carry the hit's statistic, so a plain top-K
-    would show the same hit up to three times. Copies are grouped by their (exact) shared
-    statistic per cadence and represented by the median-start stamp — the offset-0 center
-    for a full triplet. Returns (record, snippet_index, statistic, frequency_mhz) tuples,
-    strongest first."""
-    representatives: list[tuple[float, CadenceVizRecord, int, float]] = []
+    records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary], top_k: int
+) -> list[tuple[CadenceVizRecord, int, float, float, tuple | None]]:
+    """Pick the top_k stamps by detection statistic across all cadences, from the
+    per-cadence top-K representatives the reduce pass computed (_cadence_top_stamps —
+    overlap-offset copies already collapsed there). Selecting the global top-K from the
+    per-cadence top-Ks is exact: each cadence can contribute at most K entries. Returns
+    (record, snippet_index, statistic, frequency_mhz, freq_range) tuples, strongest
+    first."""
+    representatives: list[tuple[float, CadenceVizRecord, int, float, tuple | None]] = []
     for record in records:
-        metadata = metadatas.get(record.npy_path) or {}
-        stats_list = metadata.get("stamp_statistics") or []
-        freqs = metadata.get("stamp_frequencies_mhz") or []
-        starts = metadata.get("stamp_starts") or []
-
-        # Group this cadence's stamps by exact statistic value (offset copies of one hit
-        # share the same float64 statistic; distinct hits colliding on the exact value is
-        # vanishingly unlikely, and for a gallery a collision merely hides a duplicate look)
-        by_stat: dict[float, list[tuple[int, int]]] = {}
-        for idx, stat in enumerate(stats_list):
-            start = int(starts[idx]) if idx < len(starts) else 0
-            by_stat.setdefault(float(stat), []).append((start, idx))
-
-        for stat, members in by_stat.items():
-            members.sort()  # by start; median = offset-0 center for a full triplet
-            _, idx = members[len(members) // 2]
-            freq = float(freqs[idx]) if idx < len(freqs) else float("nan")
-            representatives.append((stat, record, idx, freq))
+        summary = summaries.get(record.npy_path)
+        if summary is None:
+            continue
+        for stat, idx, freq, freq_range in summary.gallery_reps:
+            representatives.append((stat, record, idx, freq, freq_range))
 
     representatives.sort(key=lambda c: c[0], reverse=True)
-    return [(record, idx, stat, freq) for stat, record, idx, freq in representatives[:top_k]]
+    return [
+        (record, idx, stat, freq, freq_range)
+        for stat, record, idx, freq, freq_range in representatives[:top_k]
+    ]
 
 
-def plot_stamp_gallery(records: list[CadenceVizRecord], metadatas: dict[str, dict]) -> str | None:
+def plot_stamp_gallery(
+    records: list[CadenceVizRecord],
+    summaries: dict[str, CadenceVizSummary],
+    pixel_pool: dict[tuple[str, int], np.ndarray] | None = None,
+) -> str | None:
     """Top-K stamps by detection statistic, each rendered as the 6-observation cadence
-    waterfall grid scientists actually inspect (ON/OFF rows, one stamp per column)."""
+    waterfall grid scientists actually inspect (ON/OFF rows, one stamp per column).
+    pixel_pool carries raw pixels the collector captured before pruning deleted their
+    .npy (#302) — the fallback when the direct load fails."""
     config = get_config()
     tag = config.checkpoint.save_tag
     top_k = config.inference.stamp_gallery_top_k
 
-    selected = _select_top_stamps(records, metadatas, top_k)
+    selected = _select_top_stamps(records, summaries, top_k)
     if not selected:
         logger.info("Viz: no stamps available; skipping stamp_gallery")
         return None
@@ -599,19 +888,23 @@ def plot_stamp_gallery(records: list[CadenceVizRecord], metadatas: dict[str, dic
     fig = Figure(figsize=(1.9 * n_cols + 1.2, 1.1 * n_rows + 1.6))
     axes = fig.subplots(n_rows, n_cols, squeeze=False)
 
-    for col, (record, idx, stat, freq) in enumerate(selected):
+    for col, (record, idx, stat, freq, freq_range) in enumerate(selected):
         try:
             snippet = load_display_cadence(record.npy_path, idx)
         except Exception as e:
-            logger.warning(f"Viz: failed to load stamp {idx} from {record.npy_path}: {e}")
-            for row in range(n_rows):
-                axes[row][col].set_axis_off()
-            continue
+            pooled = (pixel_pool or {}).get((record.npy_path, idx))
+            if pooled is None:
+                logger.warning(f"Viz: failed to load stamp {idx} from {record.npy_path}: {e}")
+                for row in range(n_rows):
+                    axes[row][col].set_axis_off()
+                continue
+            # Same display transform load_display_cadence applies to the raw stamp
+            snippet = log_norm(np.array(pooled, dtype=np.float32))
         draw_cadence_strip(
             [axes[row][col] for row in range(n_rows)],
             snippet,
             label_rows=col == 0,
-            freq_range_mhz=stamp_frequency_range_mhz(metadatas.get(record.npy_path) or {}, idx),
+            freq_range_mhz=freq_range,
         )
         axes[0][col].set_title(
             f"$k^2$={stat:.3g}\n{freq:.4f} MHz\n{_key_label(record.key, 20)}", fontsize=7
@@ -622,29 +915,47 @@ def plot_stamp_gallery(records: list[CadenceVizRecord], metadatas: dict[str, dic
     return _save_and_upload(fig, f"stamp_gallery_{tag}.png", "Stamp Gallery")
 
 
-def plot_preproc_funnel(records: list[CadenceVizRecord], metadatas: dict[str, dict]) -> str | None:
+def plot_preproc_funnel(
+    records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary]
+) -> str | None:
     """Per-cadence preprocessing funnel: raw hits → merged hits → stamps (incl. overlap
-    offsets) → snippets inferred, plus per-cadence stamp storage annotated on top."""
+    offsets) → snippets inferred, plus per-cadence stamp storage annotated on top. Past
+    _FUNNEL_MAX_CADENCES the strongest cadences (by raw hits) keep individual bars and
+    the rest aggregate into one summary bar (#301 — at 270 px/cadence the unbounded
+    figure exceeded Agg's 2^16-px canvas limit past 242 cadences, so every catalog-scale
+    render burned the artist work and then silently lost the figure)."""
     tag = get_config().checkpoint.save_tag
 
     labels: list[str] = []
     stage_counts: list[tuple[int, int, int, int]] = []
     storage_gb: list[float] = []
     for record in records:
-        metadata = metadatas.get(record.npy_path) or {}
-        n_raw = int(metadata.get("n_raw_hits") or 0)
-        n_merged = int(metadata.get("n_merged_hits") or 0)
-        n_stamps = len(metadata.get("stamp_starts") or []) or record.n_stamps
+        summary = summaries.get(record.npy_path)
+        n_raw = summary.n_raw_hits if summary else 0
+        n_merged = summary.n_merged_hits if summary else 0
+        n_stamps = (summary.n_stamp_rows if summary else 0) or record.n_stamps
         labels.append(_key_label(record.key))
         stage_counts.append((n_raw, n_merged, n_stamps, record.n_stamps))
-        try:
-            storage_gb.append(os.path.getsize(record.npy_path) / 1e9)
-        except OSError:
-            storage_gb.append(float("nan"))
+        size = summary.npy_size_bytes if summary else float("nan")
+        storage_gb.append(size / 1e9 if np.isfinite(size) else float("nan"))
 
     if not stage_counts:
         logger.info("Viz: no cadences recorded; skipping preproc_funnel")
         return None
+
+    aggregated_note = ""
+    if len(stage_counts) > _FUNNEL_MAX_CADENCES:
+        order = np.argsort([c[0] for c in stage_counts])[::-1]
+        keep = set(order[:_FUNNEL_MAX_CADENCES].tolist())
+        rest = [i for i in range(len(stage_counts)) if i not in keep]
+        agg_counts = tuple(int(sum(stage_counts[i][j] for i in rest)) for j in range(4))
+        agg_storage = float(np.nansum([storage_gb[i] for i in rest]))
+        # Kept cadences stay in catalog order; the aggregate bar closes the figure
+        kept = sorted(keep)
+        labels = [labels[i] for i in kept] + [f"+{len(rest)} more (aggregated)"]
+        stage_counts = [stage_counts[i] for i in kept] + [agg_counts]
+        storage_gb = [storage_gb[i] for i in kept] + [agg_storage]
+        aggregated_note = f" — top {_FUNNEL_MAX_CADENCES} by raw hits, {len(rest)} aggregated"
 
     stages = ("raw hits", "merged hits", "stamps (+overlap)", "snippets inferred")
     counts = np.asarray(stage_counts, dtype=np.float64)  # (n_cadences, 4)
@@ -675,7 +986,9 @@ def plot_preproc_funnel(records: list[CadenceVizRecord], metadatas: dict[str, di
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
     ax.set_ylabel("count")
-    ax.set_title(f"Preprocessing funnel per cadence ({tag}) — stamp storage annotated")
+    ax.set_title(
+        f"Preprocessing funnel per cadence ({tag}) — stamp storage annotated{aggregated_note}"
+    )
     ax.legend(fontsize=8)
     ax.grid(True, axis="y", alpha=0.2)
 
@@ -1025,7 +1338,7 @@ def plot_inference_latent_projection(collector: InferenceVizCollector) -> str | 
 
 
 def plot_inference_summary(
-    records: list[CadenceVizRecord], metadatas: dict[str, dict], totals: dict
+    records: list[CadenceVizRecord], summaries: dict[str, CadenceVizSummary], totals: dict
 ) -> str | None:
     """Table-style run summary card: cadence/snippet/candidate counts, per-stage durations
     and throughput from the inference_cadences manifest, and per-target/band candidate
@@ -1051,12 +1364,12 @@ def plot_inference_summary(
                 inference_duration += duration
 
     n_snippets = int(totals.get("n_cadence_snippets", 0))
-    n_raw_hits = sum(int((m or {}).get("n_raw_hits") or 0) for m in metadatas.values())
-    n_merged_hits = sum(int((m or {}).get("n_merged_hits") or 0) for m in metadatas.values())
-    storage_gb = 0.0
-    for record in records:
-        with contextlib.suppress(OSError):
-            storage_gb += os.path.getsize(record.npy_path) / 1e9
+    n_raw_hits = sum(s.n_raw_hits for s in summaries.values())
+    n_merged_hits = sum(s.n_merged_hits for s in summaries.values())
+    # File sizes were stat()ed once by the reduce pass — no second walk over the catalog
+    storage_gb = float(
+        np.nansum([s.npy_size_bytes for s in summaries.values()]) / 1e9 if summaries else 0.0
+    )
 
     summary_rows = [
         ("run tag", tag),
@@ -1129,27 +1442,39 @@ def render_inference_visualizations(
     logger.info(f"Rendering inference visualization suite under plots/inference/{tag}/")
 
     records = collector.records
-    metadatas: dict[str, dict] = {}
-    for record in records:
-        metadata = _load_metadata(record)
-        if metadata is not None:
-            metadatas[record.npy_path] = metadata
+    if config.inference.inference_viz_scope == "new":
+        # Scope 'new' (#301): resumed passes on an accumulating tag re-rendered the FULL
+        # catalog's figures every pass. This renders only cadences inferred THIS pass;
+        # the DB-sourced candidate figures below still cover the whole tag, and the final
+        # pass can render everything with the 'full' default.
+        n_before = len(records)
+        records = [record for record in records if not record.skipped]
+        logger.info(
+            f"Viz scope 'new': rendering {len(records)} of {n_before} recorded cadence(s) "
+            f"(resumed cadences excluded; candidate figures still cover the full tag)"
+        )
+
+    with stage_timer("load_metadata"):
+        summaries = _build_summaries(records, config.inference.stamp_gallery_top_k)
 
     try:
-        _viz_safe("ed_stat_distributions", plot_ed_stat_distributions, records, metadatas)
-        _viz_safe("ed_hit_spectrum", plot_ed_hit_spectrum, records, metadatas)
-        _viz_safe("bandpass_flattening", plot_bandpass_flattening, preprocessor, records, metadatas)
-        _viz_safe("stamp_gallery", plot_stamp_gallery, records, metadatas)
-        _viz_safe("preproc_funnel", plot_preproc_funnel, records, metadatas)
+        _viz_safe("ed_stat_distributions", plot_ed_stat_distributions, records, summaries)
+        _viz_safe("ed_hit_spectrum", plot_ed_hit_spectrum, records, summaries)
+        _viz_safe("bandpass_flattening", plot_bandpass_flattening, preprocessor, records, summaries)
+        _viz_safe(
+            "stamp_gallery", plot_stamp_gallery, records, summaries, collector.gallery_pixels()
+        )
+        _viz_safe("preproc_funnel", plot_preproc_funnel, records, summaries)
         _viz_safe("confidence_distribution", plot_confidence_distribution, records)
         _viz_safe("candidate_gallery", plot_candidate_gallery)
         _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
         _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
-        _viz_safe("inference_summary", plot_inference_summary, records, metadatas, totals)
+        _viz_safe("inference_summary", plot_inference_summary, records, summaries, totals)
     finally:
         # The async uploader must be empty before the caller reaches logger teardown
         # (#298 I9) — uploads queued by any figure above are flushed here even when a
         # figure raised through _viz_safe's own guard
-        _uploader.drain()
+        with stage_timer("upload_drain"):
+            _uploader.drain()
 
     logger.info("Inference visualization suite complete")

@@ -11,9 +11,12 @@ import pytest
 
 from aetherscan.candidate_figures import (
     candidate_frequency_range_mhz,
+    candidate_sidecar_path,
+    load_display_cadence,
     render_candidate_figure,
     render_candidate_figures,
     stamp_frequency_range_mhz,
+    write_candidate_snippet_sidecar,
 )
 
 
@@ -80,6 +83,41 @@ class TestStampFrequencyRange:
     def test_candidate_range_missing_sidecar_is_none(self, tmp_path):
         row = {"npy_path": str(tmp_path / "nope.npy"), "snippet_index": 0}
         assert candidate_frequency_range_mhz(row) is None
+
+
+class TestCandidateSnippetSidecar:
+    """#302: stamp-cache pruning deletes the .npy after scoring; candidate snippets are
+    snapshotted into a .candidates.npz sidecar and load_display_cadence falls back to it."""
+
+    def test_round_trip_after_pruning(self, tmp_path):
+        rng = np.random.default_rng(29)
+        stamps = rng.chisquare(df=4, size=(6, 6, 4, 16)).astype(np.float32)
+        npy_path = str(tmp_path / "cadence.npy")
+        np.save(npy_path, stamps)
+
+        # Pre-prune display values are the reference; indices deliberately unsorted + dup
+        reference = {idx: load_display_cadence(npy_path, idx) for idx in (4, 1)}
+        sidecar = write_candidate_snippet_sidecar(npy_path, [4, 1, 4])
+        assert sidecar == candidate_sidecar_path(npy_path)
+        os.remove(npy_path)  # the prune
+
+        for idx, expected in reference.items():
+            np.testing.assert_array_equal(load_display_cadence(npy_path, idx), expected)
+
+    def test_non_candidate_snippet_raises_after_pruning(self, tmp_path):
+        stamps = np.random.default_rng(31).random((3, 6, 4, 16)).astype(np.float32)
+        npy_path = str(tmp_path / "cadence2.npy")
+        np.save(npy_path, stamps)
+        write_candidate_snippet_sidecar(npy_path, [0])
+        os.remove(npy_path)
+
+        load_display_cadence(npy_path, 0)  # the candidate survives
+        with pytest.raises(KeyError, match="not in the candidate sidecar"):
+            load_display_cadence(npy_path, 2)  # a non-candidate's pixels are gone by design
+
+    def test_missing_npy_and_sidecar_raises_oserror(self, tmp_path):
+        with pytest.raises((OSError, FileNotFoundError)):
+            load_display_cadence(str(tmp_path / "gone.npy"), 0)
 
 
 class TestRenderCandidateFigure:
