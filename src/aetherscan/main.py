@@ -12,6 +12,7 @@ import importlib.util
 import json
 import logging
 import os
+import socket
 import sys
 import time
 from collections import deque
@@ -316,6 +317,74 @@ def _post_benchmark_report(tag: str) -> None:
         # TODO: if utils/benchmark_report.py's load_rows ever stops raising SystemExit for
         # a pre-benchmarking-schema DB, narrow this back to `except Exception`.
         logger.error(f"Benchmark report generation failed: {e}")
+
+
+def _post_perband_report(tag: str) -> None:
+    """
+    Render the per-band inference-performance plot (utils/perband_report.py) and post it to
+    Slack, at the tail of an inference run alongside _post_benchmark_report.
+
+    Groups per-cadence energy-detection preprocessing wall-clock by band (L/S/C/X) and by
+    frequency, joining the pipeline_stages umbrella spans to the run's inference catalog CSV(s)
+    via the plan-index reconstruction. Gated by the same monitor.benchmark_report_enabled flag,
+    and fully guarded: any failure logs an error and never fails the run. Skips quietly when the
+    run has no inference catalog (the legacy --test-files path), when the join assumption doesn't
+    hold, or when the report tool file isn't alongside the package (mirrors _post_benchmark_report).
+    """
+    try:
+        config = get_config()
+        if config is None:
+            raise ValueError("get_config() returned None")
+        if not config.monitor.benchmark_report_enabled:
+            return  # _post_benchmark_report already logged the disabled notice
+
+        # The per-band join needs the run's inference catalog CSV(s). The legacy --test-files
+        # path has no catalog (it loads a pre-built .npy), so there is nothing to group by band.
+        if not config.data.inference_files:
+            logger.info(
+                "Per-band inference plot skipped: no inference catalog CSV (--test-files run)"
+            )
+            return
+        catalog_paths = [config.get_inference_file_path(f) for f in config.data.inference_files]
+
+        db = get_db()
+        if db is None:
+            raise ValueError("get_db() returned None")
+        db.flush(timeout=config.db.flush_timeout)
+
+        # Load the tool by file path, preserving its no-aetherscan-imports contract (same
+        # pattern as _post_benchmark_report / tests/unit/test_benchmark.py).
+        report_path = Path(__file__).resolve().parents[2] / "utils" / "perband_report.py"
+        if not report_path.exists():
+            logger.warning(f"Per-band inference plot skipped: {report_path} does not exist")
+            return
+        spec = importlib.util.spec_from_file_location("perband_report", report_path)
+        perband_report = importlib.util.module_from_spec(spec)
+        sys.modules["perband_report"] = perband_report
+        spec.loader.exec_module(perband_report)
+
+        hostname = socket.gethostname()
+        png_path = os.path.join(config.output_path, "plots", f"perband_inference_perf_{tag}.png")
+        result = perband_report.render_perband_report(
+            db.db_path, tag, catalog_paths, png_path, hostname
+        )
+        if result is None:
+            return  # render_perband_report already logged why it skipped
+        logger.info(f"Per-band inference plot saved to {png_path}")
+
+        logger_instance = get_logger()
+        if logger_instance is None:
+            raise ValueError("get_logger() returned None")
+        if not logger_instance.upload_image_to_slack(
+            png_path, title=f"Inference performance by band - ({tag}, {hostname})"
+        ):
+            logger.warning(
+                "Per-band inference plot rendered but Slack upload was skipped or failed"
+            )
+
+    except Exception as e:
+        # Observability must never fail an otherwise-finished run (matches _post_benchmark_report)
+        logger.error(f"Per-band inference plot generation failed: {e}")
 
 
 def train_command():
@@ -1064,6 +1133,7 @@ def inference_command():
     logger.info("=" * 60)
 
     _post_benchmark_report(config.checkpoint.save_tag)
+    _post_perband_report(config.checkpoint.save_tag)
 
 
 def main():
