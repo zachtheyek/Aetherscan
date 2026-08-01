@@ -1909,12 +1909,18 @@ class DataPreprocessor:
         # ValueError mid-extraction when the short stamp is assigned into its fixed
         # (n_stamps, 6, time_bins, stored_width) memmap slot — a short ON file additionally
         # degrades the k2 statistic silently first, since _sliding_normality_k2 derives its
-        # sample count from the rows it receives. The whole cadence is skipped rather than
+        # sample count from the rows it receives. Frequency WIDTH is validated for the same
+        # reason: extraction reads the SAME primary-derived channel window [0:n_chans] from
+        # every file, so a file narrower than the primary truncates into a short stamp (the
+        # same broadcast ValueError), and any width mismatch violates the single-shared-grid
+        # assumption the cadence rests on. The whole cadence is skipped rather than
         # just the offending file: the 6-observation stamp tensor and the num_observations
         # contract downstream (encoder reshape, RF features, ABACAD viz) have no
         # representation for a 5-observation cadence.
         rank_problems: list[str] = []
         short_problems: list[str] = []
+        width_problems: list[str] = []
+        primary_width = int(data_shape[-1])
         for idx, obs_h5 in enumerate(group.h5_paths):
             if idx == 0:
                 # group.h5_paths[0] == primary_h5, already opened above for header/data_shape —
@@ -1927,8 +1933,13 @@ class DataPreprocessor:
                 rank_problems.append(
                     f"{obs_h5} has 'data' of rank {len(obs_shape)} (shape {obs_shape})"
                 )
-            elif int(obs_shape[0]) < time_bins:
+                continue
+            if int(obs_shape[0]) < time_bins:
                 short_problems.append(f"{obs_h5} has only {int(obs_shape[0])} time bins")
+            if int(obs_shape[-1]) != primary_width:
+                width_problems.append(
+                    f"{obs_h5} has frequency width {int(obs_shape[-1])} (primary {primary_width})"
+                )
         if rank_problems:
             # The caller (process_pending_cadence) turns this ValueError into a logged skip,
             # so the skip-and-continue policy across a large catalog is preserved.
@@ -1942,6 +1953,14 @@ class DataPreprocessor:
                 f"Cadence {group.key}: every observation file needs >= {time_bins} time "
                 f"bins; skipping whole cadence — offending file(s): "
                 f"{'; '.join(short_problems)}"
+            )
+            return None
+        if width_problems:
+            logger.warning(
+                f"Cadence {group.key}: every observation file must share the primary's "
+                f"frequency width ({primary_width}) — the same channel window is read from "
+                f"all 6 files; skipping whole cadence — offending file(s): "
+                f"{'; '.join(width_problems)}"
             )
             return None
 

@@ -906,6 +906,50 @@ class TestProcessCadenceEndToEnd:
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(short_path in m and "time bins" in m for m in warnings)
 
+    @pytest.mark.parametrize("width_delta", [-64, 64])
+    def test_frequency_width_mismatch_in_any_file_skips_whole_cadence(
+        self, tmp_path, initialized_runtime, caplog, width_delta
+    ):
+        """One observation file whose frequency width differs from the primary — narrower
+        (extraction would truncate into a short stamp, a broadcast ValueError deep in a worker)
+        or wider (violates the single-shared-frequency-grid assumption) — skips the whole
+        cadence up front with a warning naming the file. Equal width (the real-data norm) is a
+        no-op, so well-formed cadences are unaffected."""
+        import h5py  # noqa: PLC0415
+
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure()
+        h5_paths = self._make_cadence(tmp_path)
+        off_path = h5_paths[1]
+        with h5py.File(off_path, "r+") as hf:
+            attrs = dict(hf["data"].attrs)
+            t, p, w = hf["data"].shape
+            del hf["data"]
+            dset = hf.create_dataset(
+                "data", data=np.ones((t, p, w + width_delta), dtype=np.float32)
+            )
+            for k, v in attrs.items():
+                dset.attrs[k] = v
+        group = CadenceGroup(
+            key=("T8", "S1", "L", "14", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cad_bad_width.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
+            result = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+
+        assert result is None
+        assert not os.path.exists(npy_path)
+        assert not os.path.exists(os.path.splitext(npy_path)[0] + ".tmp.npy")
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(off_path in m and "frequency width" in m for m in warnings)
+
     def test_wrong_rank_data_is_skipped_not_fatal(self, tmp_path, initialized_runtime):
         """process_pending_cadence swallows the rank ValueError into a logged skip (returns
         None, no .npy written), so one malformed cadence can't abort a large-catalog run."""
