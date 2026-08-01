@@ -558,6 +558,51 @@ class TestComputeIntensityStats:
         assert math.isnan(stats["global_kurtosis"])
 
 
+class TestStageAStatsMemo:
+    """_stage_a_stats memoizes raw-background stats per index ONLY on the worker path (where the
+    plate IS the immutable shared block _GLOBAL_BACKGROUNDS), and must stay byte-identical to a
+    direct _compute_intensity_stats everywhere with zero cross-plate contamination."""
+
+    def test_direct_path_is_byte_identical_when_not_the_worker_block(self, monkeypatch):
+        rng = np.random.default_rng(0)
+        plate = rng.chisquare(df=4, size=(3, 6, 16, 8)).astype(np.float32)
+        monkeypatch.setattr(data_generation, "_GLOBAL_BACKGROUNDS", None)
+        data_generation._STAGE_A_STATS_CACHE.clear()
+        for idx in range(plate.shape[0]):
+            assert data_generation._stage_a_stats(
+                plate, idx, plate[idx]
+            ) == _compute_intensity_stats(plate[idx])
+        assert not data_generation._STAGE_A_STATS_CACHE  # never cached off the worker block
+
+    def test_worker_path_caches_but_stays_byte_identical(self, monkeypatch):
+        rng = np.random.default_rng(1)
+        plate = rng.chisquare(df=4, size=(3, 6, 16, 8)).astype(np.float32)
+        monkeypatch.setattr(data_generation, "_GLOBAL_BACKGROUNDS", plate)
+        data_generation._STAGE_A_STATS_CACHE.clear()
+
+        first = data_generation._stage_a_stats(plate, 1, plate[1])
+        second = data_generation._stage_a_stats(plate, 1, plate[1])
+        assert first == second == _compute_intensity_stats(plate[1])
+        assert 1 in data_generation._STAGE_A_STATS_CACHE
+        # A fresh dict every call so a caller can never mutate the cached entry.
+        assert first is not second
+        data_generation._STAGE_A_STATS_CACHE.clear()
+
+    def test_no_cross_plate_contamination(self, monkeypatch):
+        rng = np.random.default_rng(2)
+        plate_a = rng.chisquare(df=4, size=(3, 6, 16, 8)).astype(np.float32)
+        plate_b = rng.chisquare(df=4, size=(3, 6, 16, 8)).astype(np.float32)
+        monkeypatch.setattr(data_generation, "_GLOBAL_BACKGROUNDS", plate_a)
+        data_generation._STAGE_A_STATS_CACHE.clear()
+
+        a_stats = data_generation._stage_a_stats(plate_a, 1, plate_a[1])  # cached (worker block)
+        # plate_b is NOT the worker block -> computed directly, plate_a's cache cannot leak.
+        b_stats = data_generation._stage_a_stats(plate_b, 1, plate_b[1])
+        assert b_stats == _compute_intensity_stats(plate_b[1])
+        assert b_stats != a_stats
+        data_generation._STAGE_A_STATS_CACHE.clear()
+
+
 class _RecordingDB:
     """Minimal stand-in for the DB singleton: records injection-stat rows. Since #277
     write_segment_stats batches everything through write_injection_stats_bulk; each row dict

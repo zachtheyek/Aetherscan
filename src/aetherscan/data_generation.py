@@ -45,6 +45,12 @@ _GLOBAL_BACKGROUNDS = None
 _GLOBAL_SHAPE = None
 _GLOBAL_DTYPE = None
 
+# Per-process memo of Stage-A (raw-background) intensity stats, keyed by background_index.
+# Only consulted on the worker path, where the plate handed to create_* IS this immutable
+# shared-memory block — see _stage_a_stats. Cleared whenever a worker (re)attaches its
+# backgrounds so a recycled process can never serve a previous block's stats.
+_STAGE_A_STATS_CACHE: dict[int, dict[str, float]] = {}
+
 
 def _init_worker(shm_name, shape, dtype, log_queue=None):
     """
@@ -76,6 +82,9 @@ def _init_worker(shm_name, shape, dtype, log_queue=None):
     _GLOBAL_BACKGROUNDS = np.ndarray(shape, dtype=dtype, buffer=_GLOBAL_SHM.buf)
     _GLOBAL_SHAPE = shape
     _GLOBAL_DTYPE = dtype
+
+    # Fresh backgrounds -> drop any Stage-A stats memoized against a prior attachment.
+    _STAGE_A_STATS_CACHE.clear()
 
     # Ignore SIGINT (Ctrl+C) in workers - let manager from parent handle cleanup coordination
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -365,8 +374,11 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
             float("nan"),
         )
 
-    # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for pre-normalization stats)
-    flat = data.ravel().astype(np.float64)
+    # Temporarily promote to float64 to prevent overflow in higher-order moments (especially for
+    # pre-normalization stats). copy=False avoids a redundant copy when `data` is already float64
+    # (Stage B/C inputs) — `flat` is only ever read here (median/mean/std/abs/skew/kurtosis all
+    # produce new arrays), so aliasing `data` is safe.
+    flat = data.ravel().astype(np.float64, copy=False)
     median_val = np.median(flat)
 
     stats = {
@@ -379,6 +391,27 @@ def _compute_intensity_stats(data: np.ndarray) -> dict[str, float]:
     }
 
     return stats
+
+
+def _stage_a_stats(plate: np.ndarray, background_index: int, base: np.ndarray) -> dict[str, float]:
+    """Stage-A (raw-background) intensity stats, memoized per background_index on the worker path.
+
+    Stage A is a pure function of the raw background, but each background is drawn ~n_samples /
+    n_backgrounds times per round (~33x at production defaults), so recomputing its two median
+    sorts + skew/kurtosis every draw is pure redundancy. In a pool worker the `plate` handed to
+    create_* IS `_GLOBAL_BACKGROUNDS` — a single block loaded once and never mutated for the
+    process's life — so caching by index there is byte-identical and safe. Every other caller
+    (the in-process RF-dataset path, tests) passes a different array and is NOT cached, so no
+    stale/foreign plate's stats can ever leak. A fresh dict is returned each call (callers store
+    or .copy() it) so the cached entry is never mutated in place.
+    """
+    if _GLOBAL_BACKGROUNDS is not None and plate is _GLOBAL_BACKGROUNDS:
+        cached = _STAGE_A_STATS_CACHE.get(background_index)
+        if cached is None:
+            cached = _compute_intensity_stats(base)
+            _STAGE_A_STATS_CACHE[background_index] = cached
+        return dict(cached)
+    return _compute_intensity_stats(base)
 
 
 def create_false(
@@ -409,8 +442,9 @@ def create_false(
     n_time = plate.shape[2]
     final = np.zeros((n_obs, n_time, width_bin))
 
-    # STAGE A: Pre-injection, pre-normalization (raw background)
-    stats_a = _compute_intensity_stats(base)
+    # STAGE A: Pre-injection, pre-normalization (raw background). Memoized per background on
+    # the worker path (see _stage_a_stats) — same background, same stats, computed once.
+    stats_a = _stage_a_stats(plate, background_index, base)
 
     # Initialize signal info (will be populated if inject=True)
     signal_info = {}
@@ -423,11 +457,10 @@ def create_false(
     slope_was_clamped = False
     if inject:
         # Prepare data for signal injection by stacking all 6 observations vertically
-        # (6, 16, 512) -> (96, 512)
-        # Obs 0: rows 0-15, Obs 1: rows 16-31, Obs 2: rows 32-47, ...
-        data = np.zeros((n_obs * n_time, width_bin))
-        for i in range(n_obs):
-            data[i * n_time : (i + 1) * n_time, :] = base[i, :, :]
+        # (6, 16, 512) -> (96, 512). base is C-contiguous, so the row-major reshape IS that
+        # obs-major stack (row i*n_time+t = base[i, t]); .astype(float64) yields the fresh,
+        # independent float64 buffer setigen injection then mutates in place (must be a copy).
+        data = base.reshape(n_obs * n_time, width_bin).astype(np.float64)
 
         # Select a random SNR from the given range & inject RFI into all 6 observations
         snr = random.random() * snr_range + snr_base
@@ -495,15 +528,15 @@ def create_true_single(
     n_time = plate.shape[2]
     final = np.zeros((n_obs, n_time, width_bin))
 
-    # STAGE A: Pre-injection, pre-normalization (raw background)
-    stats_a = _compute_intensity_stats(base)
+    # STAGE A: Pre-injection, pre-normalization (raw background). Memoized per background on
+    # the worker path (see _stage_a_stats) — same background, same stats, computed once.
+    stats_a = _stage_a_stats(plate, background_index, base)
 
     # Prepare data for signal injection by stacking all 6 observations vertically
-    # (6, 16, 512) -> (96, 512)
-    # Obs 0: rows 0-15, Obs 1: rows 16-31, Obs 2: rows 32-47, ...
-    data = np.zeros((n_obs * n_time, width_bin))
-    for i in range(n_obs):
-        data[i * n_time : (i + 1) * n_time, :] = base[i, :, :]
+    # (6, 16, 512) -> (96, 512). base is C-contiguous, so the row-major reshape IS that
+    # obs-major stack (row i*n_time+t = base[i, t]); .astype(float64) yields the fresh,
+    # independent float64 buffer setigen injection then mutates in place (must be a copy).
+    data = base.reshape(n_obs * n_time, width_bin).astype(np.float64)
 
     # Select a random SNR from the given range & inject ETI
     snr = random.random() * snr_range + snr_base
@@ -578,15 +611,15 @@ def create_true_double(
     n_time = plate.shape[2]
     final = np.zeros((n_obs, n_time, width_bin))
 
-    # STAGE A: Pre-injection, pre-normalization (raw background)
-    stats_a = _compute_intensity_stats(base)
+    # STAGE A: Pre-injection, pre-normalization (raw background). Memoized per background on
+    # the worker path (see _stage_a_stats) — same background, same stats, computed once.
+    stats_a = _stage_a_stats(plate, background_index, base)
 
     # Prepare data for signal injection by stacking all 6 observations vertically
-    # (6, 16, 512) -> (96, 512)
-    # Obs 0: rows 0-15, Obs 1: rows 16-31, Obs 2: rows 32-47, ...
-    data = np.zeros((n_obs * n_time, width_bin))
-    for i in range(n_obs):
-        data[i * n_time : (i + 1) * n_time, :] = base[i, :, :]
+    # (6, 16, 512) -> (96, 512). base is C-contiguous, so the row-major reshape IS that
+    # obs-major stack (row i*n_time+t = base[i, t]); .astype(float64) yields the fresh,
+    # independent float64 buffer setigen injection then mutates in place (must be a copy).
+    data = base.reshape(n_obs * n_time, width_bin).astype(np.float64)
 
     # Select a random SNR from the given range
     snr = random.random() * snr_range + snr_base
