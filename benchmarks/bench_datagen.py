@@ -13,7 +13,7 @@ byte-compatibility gate for any generation-path optimization, alongside the wall
     # arm A (checkout master), then arm B (checkout branch), same args:
     ./utils/run_container.sh python benchmarks/bench_datagen.py \
         --n-samples 8192 --workers 32 --seed 11 \
-        --data-dir /datax/scratch/$USER/bench_datagen --output /tmp/arm_a.json
+        --data-dir /datax/scratch/$USER/data/aetherscan/bench/datagen --output /tmp/arm_a.json
 
 Compare: python -c "import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:3]); \
     print('IDENTICAL' if a['checksums']==b['checksums'] else 'MISMATCH')" /tmp/arm_a.json /tmp/arm_b.json
@@ -47,6 +47,18 @@ FREQ_RESOLUTION = 2.7939677238464355  # Hz
 TIME_RESOLUTION = 18.25361108  # seconds
 
 
+def _default_data_dir(sub: str) -> str:
+    """Default bench-data location: {AETHERSCAN_DATA_PATH}/bench/{sub}. Reads the same env var
+    config.data_path honors (with config.py's literal default as the fallback, so the two agree)
+    without importing config — keeps this script framework-light. Benchmark data lands
+    per-user/host under the pipeline's data root instead of scattering across /tmp or CWD."""
+    return os.path.join(
+        os.environ.get("AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan"),
+        "bench",
+        sub,
+    )
+
+
 def _sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -69,7 +81,13 @@ def main() -> None:
     )
     parser.add_argument("--snr-base", type=float, default=10.0)
     parser.add_argument("--snr-range", type=float, default=40.0)
-    parser.add_argument("--data-dir", required=True, help="Scratch dir for the generated round")
+    parser.add_argument(
+        "--data-dir",
+        default=_default_data_dir("datagen"),
+        help="Scratch dir for the generated round (default: {AETHERSCAN_DATA_PATH}/bench/"
+        "datagen). Deleted on exit unless --keep is passed — pass --keep to persist the round "
+        "under the bench dir.",
+    )
     parser.add_argument("--keep", action="store_true", help="Keep the round dir (default: delete)")
     parser.add_argument(
         "--preload-tf",

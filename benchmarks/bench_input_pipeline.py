@@ -35,13 +35,13 @@ Contention/determinism knobs for the #276 audit:
 Cluster usage (the synthetic round defaults to ~12 GB on disk — point --data-dir at scratch):
 
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode gather \
-        --data-dir /datax/scratch/$USER/bench_input
+        --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode iterate \
-        --variant legacy --data-dir /datax/scratch/$USER/bench_input
+        --variant legacy --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode iterate \
-        --variant current --data-dir /datax/scratch/$USER/bench_input
+        --variant current --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode step \
-        --variant current --num-gpus 5 --data-dir /datax/scratch/$USER/bench_input
+        --variant current --num-gpus 5 --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
 
 The synthetic arrays are written once and reused across invocations (delete with --regen or by
 removing --data-dir). After the first write the pages are OS-page-cache resident, matching the
@@ -66,6 +66,19 @@ _CADENCE_SHAPE = (6, 16, 512)
 _SAMPLE_BYTES = int(np.prod(_CADENCE_SHAPE)) * 4  # float32
 _SIGNAL_TYPES = ("false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi")
 _CLIP_NORM = 1.0  # matches train.py `_GRADIENT_CLIP_NORM` (used in `_build_accumulated_train_step`)
+
+
+def _default_data_dir(sub: str) -> str:
+    """Default bench-data location: {AETHERSCAN_DATA_PATH}/bench/{sub}. Reads the same env var
+    config.data_path honors (with config.py's literal default as the fallback, so the two agree)
+    without depending on the config singleton — gather mode never calls init_config(), so the
+    default must resolve from the env var alone. Benchmark data lands per-user/host under the
+    pipeline's data root instead of scattering across /tmp."""
+    return os.path.join(
+        os.environ.get("AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan"),
+        "bench",
+        sub,
+    )
 
 
 def _positive_int(value: str) -> int:
@@ -467,8 +480,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--data-dir",
-        default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "bench_input_pipeline"),
-        help="Where the synthetic round memmaps live (~12 GB at the default --n-samples).",
+        default=_default_data_dir("input"),
+        help="Where the synthetic round memmaps live (~12 GB at the default --n-samples); "
+        "defaults under {AETHERSCAN_DATA_PATH}/bench/input.",
     )
     parser.add_argument("--n-samples", type=_positive_int, default=20_000)
     parser.add_argument("--regen", action="store_true", help="Rewrite the synthetic round.")

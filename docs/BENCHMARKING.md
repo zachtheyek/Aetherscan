@@ -187,7 +187,7 @@ python benchmarks/bench_rf.py                   # Random Forest stage: latent pr
 # step mode needs GPUs):
 # ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode step --variant current --num-gpus 5
 # ./utils/run_container.sh python benchmarks/bench_latent_gif.py --mode all
-# ./utils/run_container.sh python benchmarks/bench_datagen.py --preload-tf --data-dir /datax/scratch/$USER/bench_datagen
+# ./utils/run_container.sh python benchmarks/bench_datagen.py --preload-tf --data-dir /datax/scratch/$USER/data/aetherscan/bench/datagen
 # On the clusters, through the container:
 ./utils/run_container.sh python benchmarks/bench_normality.py
 # GPU-only, container required — real Beta-VAE profiler on a cluster GPU:
