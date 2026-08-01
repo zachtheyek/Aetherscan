@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from .db import (
     get_db,
+    get_machine_name,
     get_system_metadata,
     init_db,
     merge_db,
@@ -14,6 +15,7 @@ from .db import (
 
 __all__ = [
     "get_db",
+    "get_machine_name",
     "get_system_metadata",
     "init_db",
     "merge_db",

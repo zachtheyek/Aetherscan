@@ -28,7 +28,6 @@ import json
 import logging
 import os
 import queue
-import socket
 import threading
 import time
 from collections import Counter
@@ -51,7 +50,8 @@ from aetherscan.candidate_figures import (
 )
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
-from aetherscan.db import get_db
+from aetherscan.db import get_db, get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.logger import get_logger
 from aetherscan.pfb import gen_coarse_channel_response
 from aetherscan.seeding import STREAM_INFERENCE_VIZ, derive_rng
@@ -343,7 +343,9 @@ def _viz_safe(name: str, fn: Callable, *args, **kwargs):
 
 
 def _plots_dir(tag: str) -> str:
-    path = os.path.join(get_config().output_path, "plots", "inference", tag)
+    path = os.path.join(
+        get_config().output_path, "plots", "inference", display_tag(tag, get_machine_name())
+    )
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -362,7 +364,7 @@ def _save_and_upload(fig: Figure, filename: str, slack_title: str) -> str:
     fig.clear()
     logger.info(f"Inference viz saved: {save_path}")
 
-    _uploader.submit(save_path, f"{slack_title} - ({tag}, {socket.gethostname()})")
+    _uploader.submit(save_path, f"{slack_title} - ({display_tag(tag, get_machine_name())})")
     return save_path
 
 
@@ -606,14 +608,18 @@ def plot_ed_stat_distributions(
     ax.set_xlabel("D'Agostino-Pearson $k^2$ statistic")
     ax.set_ylabel("window count")
     ax.set_title(
-        f"Energy-detection statistic distribution ({tag})\n"
+        f"Energy-detection statistic distribution ({display_tag(tag, get_machine_name())})\n"
         f"{total:,} finite windows, {above:,} above threshold "
         f"({len(contributing)} cadence(s))"
     )
     ax.legend(fontsize=8)
     ax.grid(True, which="both", alpha=0.2)
 
-    return _save_and_upload(fig, f"ed_stat_distributions_{tag}.png", "ED Statistic Distribution")
+    return _save_and_upload(
+        fig,
+        f"ed_stat_distributions_{display_tag(tag, get_machine_name())}.png",
+        "ED Statistic Distribution",
+    )
 
 
 def _clamp_hit_spectrum_bins(
@@ -686,13 +692,15 @@ def plot_ed_hit_spectrum(
     ax.set_xlabel("frequency (MHz)")
     ax.set_ylabel("hit count")
     ax.set_title(
-        f"Energy-detection hit spectrum ({tag})\n"
+        f"Energy-detection hit spectrum ({display_tag(tag, get_machine_name())})\n"
         f"{int(raw_total.sum()):,} raw → {int(merged_total.sum()):,} merged hits"
     )
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.2)
 
-    return _save_and_upload(fig, f"ed_hit_spectrum_{tag}.png", "ED Hit Spectrum")
+    return _save_and_upload(
+        fig, f"ed_hit_spectrum_{display_tag(tag, get_machine_name())}.png", "ED Hit Spectrum"
+    )
 
 
 def _plot_bandpass_from_envelopes(
@@ -741,9 +749,15 @@ def _plot_bandpass_from_envelopes(
 
     method = "pfb" if "PFB" in overlay_label else "spline"
     source = os.path.basename(h5_path) if h5_path else "stored envelopes"
-    fig.suptitle(f"Bandpass flattening ({method}, {tag}): {source}")
+    fig.suptitle(
+        f"Bandpass flattening ({method}, {display_tag(tag, get_machine_name())}): {source}"
+    )
     fig.tight_layout()
-    return _save_and_upload(fig, f"bandpass_flattening_{tag}.png", "Bandpass Flattening")
+    return _save_and_upload(
+        fig,
+        f"bandpass_flattening_{display_tag(tag, get_machine_name())}.png",
+        "Bandpass Flattening",
+    )
 
 
 def plot_bandpass_flattening(
@@ -849,10 +863,16 @@ def plot_bandpass_flattening(
             ax_flat.set_xlabel("fine channel (within coarse channel)")
 
     method = "pfb" if pfb_active else "spline"
-    fig.suptitle(f"Bandpass flattening ({method}, {tag}): {os.path.basename(h5_path)}")
+    fig.suptitle(
+        f"Bandpass flattening ({method}, {display_tag(tag, get_machine_name())}): {os.path.basename(h5_path)}"
+    )
     fig.tight_layout()
 
-    return _save_and_upload(fig, f"bandpass_flattening_{tag}.png", "Bandpass Flattening")
+    return _save_and_upload(
+        fig,
+        f"bandpass_flattening_{display_tag(tag, get_machine_name())}.png",
+        "Bandpass Flattening",
+    )
 
 
 def _select_top_stamps(
@@ -924,9 +944,13 @@ def plot_stamp_gallery(
             f"$k^2$={stat:.3g}\n{freq:.4f} MHz\n{_key_label(record.key, 20)}", fontsize=7
         )
 
-    fig.suptitle(f"Top-{n_cols} energy-detection stamps by statistic ({tag})")
+    fig.suptitle(
+        f"Top-{n_cols} energy-detection stamps by statistic ({display_tag(tag, get_machine_name())})"
+    )
 
-    return _save_and_upload(fig, f"stamp_gallery_{tag}.png", "Stamp Gallery")
+    return _save_and_upload(
+        fig, f"stamp_gallery_{display_tag(tag, get_machine_name())}.png", "Stamp Gallery"
+    )
 
 
 def plot_preproc_funnel(
@@ -1001,12 +1025,14 @@ def plot_preproc_funnel(
     ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
     ax.set_ylabel("count")
     ax.set_title(
-        f"Preprocessing funnel per cadence ({tag}) — stamp storage annotated{aggregated_note}"
+        f"Preprocessing funnel per cadence ({display_tag(tag, get_machine_name())}) — stamp storage annotated{aggregated_note}"
     )
     ax.legend(fontsize=8)
     ax.grid(True, axis="y", alpha=0.2)
 
-    return _save_and_upload(fig, f"preproc_funnel_{tag}.png", "Preprocessing Funnel")
+    return _save_and_upload(
+        fig, f"preproc_funnel_{display_tag(tag, get_machine_name())}.png", "Preprocessing Funnel"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1051,11 +1077,17 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     subtitle = f"{int(total.sum()):,} snippets over {len(with_hist)} cadence(s)"
     if n_skipped:
         subtitle += f" ({n_skipped} cadence(s) resumed earlier, not shown)"
-    ax.set_title(f"Snippet confidence distribution ({tag})\n{subtitle}")
+    ax.set_title(
+        f"Snippet confidence distribution ({display_tag(tag, get_machine_name())})\n{subtitle}"
+    )
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.2)
 
-    return _save_and_upload(fig, f"confidence_distribution_{tag}.png", "Confidence Distribution")
+    return _save_and_upload(
+        fig,
+        f"confidence_distribution_{display_tag(tag, get_machine_name())}.png",
+        "Confidence Distribution",
+    )
 
 
 def plot_candidate(row: dict, index: int) -> str | None:
@@ -1065,11 +1097,12 @@ def plot_candidate(row: dict, index: int) -> str | None:
     over the TF-free candidate_figures.render_candidate_figure (#298 I9 — the gallery path
     renders these across a forkserver pool; this in-process form serves direct callers)."""
     tag = get_config().checkpoint.save_tag
+    dtag = display_tag(tag, get_machine_name())
     save_path = render_candidate_figure(
-        row, index, tag, _plots_dir(tag), candidate_frequency_range_mhz(row)
+        row, index, dtag, _plots_dir(tag), candidate_frequency_range_mhz(row)
     )
     logger.info(f"Inference viz saved: {save_path}")
-    _uploader.submit(save_path, f"Candidate {index} - ({tag}, {socket.gethostname()})")
+    _uploader.submit(save_path, f"Candidate {index} - ({dtag})")
     return save_path
 
 
@@ -1079,6 +1112,7 @@ def plot_candidate_gallery() -> str | None:
     cadences the resume skipped this pass."""
     config = get_config()
     tag = config.checkpoint.save_tag
+    dtag = display_tag(tag, get_machine_name())
     max_candidate_plots = config.inference.max_candidate_plots
 
     db = get_db()
@@ -1097,13 +1131,12 @@ def plot_candidate_gallery() -> str | None:
     # failures return None and degrade the suite exactly like _viz_safe), then uploaded in
     # index order through the async FIFO uploader.
     top_rows = rows[:max_candidate_plots]
-    rendered = render_candidate_figures(top_rows, tag, _plots_dir(tag))
-    hostname = socket.gethostname()
+    rendered = render_candidate_figures(top_rows, dtag, _plots_dir(tag))
     for index, save_path in rendered:
         if save_path is None:
             continue
         logger.info(f"Inference viz saved: {save_path}")
-        _uploader.submit(save_path, f"Candidate {index} - ({tag}, {hostname})")
+        _uploader.submit(save_path, f"Candidate {index} - ({dtag})")
     if len(rows) > max_candidate_plots:
         logger.info(
             f"Viz: rendered {max_candidate_plots} of {len(rows)} candidate figures "
@@ -1135,9 +1168,13 @@ def plot_candidate_gallery() -> str | None:
             f"P={row.get('confidence', 0):.3f}\n{freq_label}\n{row.get('target') or ''}",
             fontsize=7,
         )
-    fig.suptitle(f"Candidate gallery ({tag}): top {n_cols} of {len(rows)} by confidence")
+    fig.suptitle(
+        f"Candidate gallery ({display_tag(tag, get_machine_name())}): top {n_cols} of {len(rows)} by confidence"
+    )
 
-    return _save_and_upload(fig, f"candidate_gallery_{tag}.png", "Candidate Gallery")
+    return _save_and_upload(
+        fig, f"candidate_gallery_{display_tag(tag, get_machine_name())}.png", "Candidate Gallery"
+    )
 
 
 def plot_candidate_uncertainty() -> str | None:
@@ -1163,7 +1200,9 @@ def plot_candidate_uncertainty() -> str | None:
     )
     rows = [r for r in rows if r.get("mc_mean") is not None and r.get("mc_std") is not None]
 
-    cloud_path = os.path.join(config.output_path, f"inference_reference_cloud_{tag}.npz")
+    cloud_path = os.path.join(
+        config.output_path, f"inference_reference_cloud_{display_tag(tag, get_machine_name())}.npz"
+    )
     cloud = None
     if os.path.exists(cloud_path):
         # Materialize the arrays and close the archive immediately — an NpzFile keeps its
@@ -1228,12 +1267,17 @@ def plot_candidate_uncertainty() -> str | None:
             f" — cloud: {int(cloud['subsample_size'])} of {int(cloud['rejects_seen'])} "
             f"rejects, {int(cloud['mc_draws'])} draws"
         )
-    ax.set_title(f"Candidate uncertainty vs survey population ({tag}){cloud_note}", fontsize=11)
+    ax.set_title(
+        f"Candidate uncertainty vs survey population ({display_tag(tag, get_machine_name())}){cloud_note}",
+        fontsize=11,
+    )
     if rows:
         ax.legend(loc="upper left", fontsize=8)
 
     return _save_and_upload(
-        fig, f"candidate_uncertainty_{tag}.png", "Candidate Uncertainty vs Survey"
+        fig,
+        f"candidate_uncertainty_{display_tag(tag, get_machine_name())}.png",
+        "Candidate Uncertainty vs Survey",
     )
 
 
@@ -1341,13 +1385,15 @@ def plot_inference_latent_projection(collector: InferenceVizCollector) -> str | 
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
     ax.set_title(
-        f"Inference latents through training cadence-level UMAP ({tag})\n"
+        f"Inference latents through training cadence-level UMAP ({display_tag(tag, get_machine_name())})\n"
         f"nn={nn}, md={md}, training tag {train_tag}"
     )
     ax.legend(fontsize=8, loc="best")
 
     return _save_and_upload(
-        fig, f"inference_latent_projection_{tag}.png", "Inference Latent Projection"
+        fig,
+        f"inference_latent_projection_{display_tag(tag, get_machine_name())}.png",
+        "Inference Latent Projection",
     )
 
 
@@ -1433,9 +1479,13 @@ def plot_inference_summary(
         family="monospace",
         transform=ax.transAxes,
     )
-    ax.set_title(f"Inference run summary ({tag})", fontsize=13, pad=14)
+    ax.set_title(
+        f"Inference run summary ({display_tag(tag, get_machine_name())})", fontsize=13, pad=14
+    )
 
-    return _save_and_upload(fig, f"inference_summary_{tag}.png", "Inference Summary")
+    return _save_and_upload(
+        fig, f"inference_summary_{display_tag(tag, get_machine_name())}.png", "Inference Summary"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1453,7 +1503,9 @@ def render_inference_visualizations(
     if config is None:
         raise ValueError("get_config() returned None")
     tag = config.checkpoint.save_tag
-    logger.info(f"Rendering inference visualization suite under plots/inference/{tag}/")
+    logger.info(
+        f"Rendering inference visualization suite under plots/inference/{display_tag(tag, get_machine_name())}/"
+    )
 
     records = collector.records
     if config.inference.inference_viz_scope == "new":

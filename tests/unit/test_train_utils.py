@@ -18,6 +18,8 @@ import numpy as np
 import pytest
 
 from aetherscan.config import get_config
+from aetherscan.db import get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.round_data import RoundDataPaths
 from aetherscan.run_state import (
     STAGE_FINAL_SAVE,
@@ -47,10 +49,14 @@ from aetherscan.train import (
 
 
 def _touch_pair(checkpoints_dir, tag):
-    """Create a matching encoder/decoder checkpoint pair for `tag`."""
+    """Create a matching encoder/decoder checkpoint pair for `tag`, named exactly as save_models
+    lands them on disk: the display tag ({command}_{machine}_{datetime}) for a resolved run tag,
+    else `tag` unchanged (round_XX / final / non-run-tags pass through). _resolve_load_tag /
+    _model_pair_exists reconstruct the same name from the plain tag on this host."""
     os.makedirs(checkpoints_dir, exist_ok=True)
+    fname_tag = display_tag(tag, get_machine_name())
     for prefix in ("vae_encoder", "vae_decoder"):
-        with open(os.path.join(checkpoints_dir, f"{prefix}_{tag}.keras"), "w") as f:
+        with open(os.path.join(checkpoints_dir, f"{prefix}_{fname_tag}.keras"), "w") as f:
             f.write("stub")
 
 
@@ -100,6 +106,37 @@ class TestResolveLoadTag:
             _resolve_load_tag(str(tmp_path), None)
 
 
+class TestDisplayTagFilenameInvariant:
+    """The join-key guarantee behind the display-tag refactor: save_models writes the model pair
+    under the DISPLAY-tagged filename ({command}_{machine}_{datetime}), and the resume/load path
+    (_model_pair_exists -> _resolve_load_tag) reconstructs that same name from the plain DB tag +
+    this host. So a resume on the writing host locates its own artifacts, while the plain-tagged
+    name another host would leave is deliberately NOT accepted (the display tag is f(DB tag,
+    local machine); the DB tag alone no longer locates the file)."""
+
+    def test_reader_reconstructs_the_writers_display_name(self, tmp_path):
+        tag = "train_20260731_182011"  # a real {command}_{datetime} run tag
+        # Writer side: exactly what save_models(tag) lands on disk this host.
+        _touch_pair(str(tmp_path), tag)
+        expected = os.path.join(
+            str(tmp_path), f"vae_encoder_{display_tag(tag, get_machine_name())}.keras"
+        )
+        assert os.path.exists(expected)
+        assert get_machine_name() in os.path.basename(expected)  # the machine token is present
+        # Reader side: derives the same display name, then adopts the plain DB tag for identity.
+        assert _resolve_load_tag(str(tmp_path), tag) == tag
+
+    def test_plain_tagged_pair_is_not_accepted_for_a_run_tag(self, tmp_path):
+        # A plain {command}_{datetime} pair (no machine token — e.g. copied from another host, or
+        # a pre-refactor write) must NOT satisfy the display-tag reader on this host.
+        tag = "train_20260731_182011"
+        for prefix in ("vae_encoder", "vae_decoder"):
+            with open(os.path.join(str(tmp_path), f"{prefix}_{tag}.keras"), "w") as f:
+                f.write("stub")
+        with pytest.raises(FileNotFoundError):
+            _resolve_load_tag(str(tmp_path), tag)
+
+
 class TestTrainingPlotsDir:
     """_training_plots_dir centralizes this run's plots base:
     {output_path}/plots/training/{save_tag}[/subdir]."""
@@ -145,7 +182,8 @@ class TestResumeInPlace:
             config_fingerprint=config_fingerprint(config.to_dict()),
             completed_rounds=[1, 2, 3],
         )
-        save_run_state(state, run_state_path(str(tmp_path), tag))
+        # Manifest FILENAME is display-tagged (mirrors _init_run_state); its stored `tag` stays plain.
+        save_run_state(state, run_state_path(str(tmp_path), display_tag(tag, get_machine_name())))
 
         pipeline = TrainingPipeline.__new__(TrainingPipeline)
         pipeline.config = config

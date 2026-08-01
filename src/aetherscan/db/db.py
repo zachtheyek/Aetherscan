@@ -144,6 +144,19 @@ def get_system_metadata() -> str:
     return _SYSTEM_METADATA_CACHE
 
 
+def get_machine_name() -> str:
+    """This host's machine name (``socket.gethostname()``), read from the cached system metadata.
+
+    The single accessor for the machine name: it unifies the two divergent sources that used to
+    coexist — ``json.loads(get_system_metadata())["machine_name"]`` (training plots + monitor) and
+    a raw ``socket.gethostname()`` (inference-viz, Slack banner) — so every filename / plot title /
+    Slack message derives the identical string. A cached-metadata read, so it is cheap to call at
+    each site (no per-call socket work). See ``aetherscan.display_tag.display_tag``, which composes
+    this into the presentation/filename "display tag".
+    """
+    return json.loads(get_system_metadata())["machine_name"]
+
+
 class Database:
     """
     Thread-safe SQLite database with asynchronous queue-based writes.

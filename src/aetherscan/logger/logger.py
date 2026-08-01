@@ -179,12 +179,20 @@ class Logger:
         if self.config is None:
             raise ValueError("get_config() returned None")
 
-        # Per-run, tag-scoped log file: each run writes aetherscan_{tag}.log, so a new run no
-        # longer overwrites the previous run's log. main.py resolves the run's {command}_{datetime}
-        # tag onto config.checkpoint.save_tag before calling init_logger and passes it in here; the
-        # config value is the fallback for any other caller.
+        # Per-run, tag-scoped log file: each run writes aetherscan_{display_tag}.log, so a new run
+        # no longer overwrites the previous run's log. main.py resolves the run's
+        # {command}_{datetime} tag onto config.checkpoint.save_tag before calling init_logger and
+        # passes it in here; the config value is the fallback for any other caller. The FILENAME
+        # carries the display tag ({command}_{machine}_{datetime}); the DB tag is unchanged.
         tag = save_tag if save_tag is not None else self.config.checkpoint.save_tag
-        self.log_path = log_path_for_tag(self.config.output_path, tag)
+        # Deferred import: logger is initialized early and importing db (which pulls in manager) at
+        # module top could cycle — mirror monitor.py's late get_system_metadata import.
+        from aetherscan.db import get_machine_name  # noqa: PLC0415
+        from aetherscan.display_tag import display_tag  # noqa: PLC0415
+
+        self.log_path = log_path_for_tag(
+            self.config.output_path, display_tag(tag, get_machine_name())
+        )
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)  # Create dir if it doesn't exist
 
         # Create queue for worker processes (no size limit)

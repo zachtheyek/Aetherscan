@@ -42,6 +42,8 @@ import tempfile
 from typing import Any
 
 from aetherscan.config import get_config
+from aetherscan.db import get_machine_name
+from aetherscan.display_tag import display_tag
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +300,9 @@ def compute_rf_metrics(model_path: str, tag: str) -> dict[str, Any] | None:
     (rf_eval_artifacts_{tag}.joblib, written by train_random_forest). Returns None when the
     artifact is missing or unreadable — the card simply omits its metrics section.
     """
-    artifact_path = os.path.join(model_path, f"rf_eval_artifacts_{tag}.joblib")
+    artifact_path = os.path.join(
+        model_path, f"rf_eval_artifacts_{display_tag(tag, get_machine_name())}.joblib"
+    )
     if not os.path.exists(artifact_path):
         logger.info(f"No RF eval artifacts at {artifact_path} — model card omits metrics")
         return None
@@ -474,11 +478,16 @@ def upload_run_to_hf(
     Raises on any failure — the caller (the hf_upload training stage) records it in the run
     manifest without failing the run.
     """
+    # LOCAL artifacts on the training host are display-tagged ({command}_{machine}_{datetime});
+    # this runs on that same host, so the display tag reproduces exactly what training wrote. The
+    # staged Hub names stay the fixed HF_*_FILENAME constants, and the commit message / git tag
+    # below stay the plain DB `tag` (the run's canonical identity).
+    local_tag = display_tag(tag, get_machine_name())
     sources = {
-        HF_ENCODER_FILENAME: os.path.join(model_path, f"vae_encoder_{tag}.keras"),
-        HF_DECODER_FILENAME: os.path.join(model_path, f"vae_decoder_{tag}.keras"),
-        HF_RF_FILENAME: os.path.join(model_path, f"random_forest_{tag}.joblib"),
-        HF_CONFIG_FILENAME: os.path.join(output_path, f"config_{tag}.json"),
+        HF_ENCODER_FILENAME: os.path.join(model_path, f"vae_encoder_{local_tag}.keras"),
+        HF_DECODER_FILENAME: os.path.join(model_path, f"vae_decoder_{local_tag}.keras"),
+        HF_RF_FILENAME: os.path.join(model_path, f"random_forest_{local_tag}.joblib"),
+        HF_CONFIG_FILENAME: os.path.join(output_path, f"config_{local_tag}.json"),
     }
     missing = [path for path in sources.values() if not os.path.exists(path)]
     if missing:
@@ -488,7 +497,7 @@ def upload_run_to_hf(
 
     # Optional fifth artifact (#282): the probability calibrator, present only when training
     # fitted-and-kept one (config.json's rf.calibration_active records which)
-    calibrator_source = os.path.join(model_path, f"rf_calibrator_{tag}.joblib")
+    calibrator_source = os.path.join(model_path, f"rf_calibrator_{local_tag}.joblib")
     if os.path.exists(calibrator_source):
         sources[HF_CALIBRATOR_FILENAME] = calibrator_source
 

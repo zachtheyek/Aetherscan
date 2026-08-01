@@ -21,6 +21,8 @@ from skimage.transform import downscale_local_mean
 
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
+from aetherscan.db import get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.pfb import edge_mid_power_ratio, equalize_passband, gen_coarse_channel_response
 from aetherscan.preprocessing import (
     ED_STAT_HIST_EDGES,
@@ -1028,12 +1030,16 @@ class TestProcessCadenceEndToEnd:
         result = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
 
         assert result is not None
+        # The debug overlay is display-tagged ({command}_{machine}_{datetime}), matching the
+        # inference-viz plot dir; save_tag ("inf_20260101_120000") is a real run tag, so the
+        # machine token is inserted.
+        dtag = display_tag(config.checkpoint.save_tag, get_machine_name())
         plot_path = os.path.join(
             config.output_path,
             "plots",
             "inference",
-            config.checkpoint.save_tag,
-            f"bandpass_overlay_cadence_dbg_{config.checkpoint.save_tag}.png",
+            dtag,
+            f"bandpass_overlay_cadence_dbg_{dtag}.png",
         )
         assert os.path.exists(plot_path)
         assert os.path.getsize(plot_path) > 0
