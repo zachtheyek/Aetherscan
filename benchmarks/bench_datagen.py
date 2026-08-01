@@ -34,7 +34,7 @@ from multiprocessing import Pool
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
-from _common import write_result
+from _common import default_bench_data_dir, write_result
 
 from aetherscan.data_generation import _init_worker, generate_round_to_memmap
 from aetherscan.round_data import RoundDataPaths
@@ -45,18 +45,6 @@ TIME_BINS = 16
 WIDTH_BIN = 512
 FREQ_RESOLUTION = 2.7939677238464355  # Hz
 TIME_RESOLUTION = 18.25361108  # seconds
-
-
-def _default_data_dir(sub: str) -> str:
-    """Default bench-data location: {AETHERSCAN_DATA_PATH}/bench/{sub}. Reads the same env var
-    config.data_path honors (with config.py's literal default as the fallback, so the two agree)
-    without importing config — keeps this script framework-light. Benchmark data lands
-    per-user/host under the pipeline's data root instead of scattering across /tmp or CWD."""
-    return os.path.join(
-        os.environ.get("AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan"),
-        "bench",
-        sub,
-    )
 
 
 def _sha256(path: str) -> str:
@@ -83,7 +71,7 @@ def main() -> None:
     parser.add_argument("--snr-range", type=float, default=40.0)
     parser.add_argument(
         "--data-dir",
-        default=_default_data_dir("datagen"),
+        default=default_bench_data_dir("datagen"),
         help="Scratch dir for the generated round (default: {AETHERSCAN_DATA_PATH}/bench/"
         "datagen). Deleted on exit unless --keep is passed — pass --keep to persist the round "
         "under the bench dir.",

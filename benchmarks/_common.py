@@ -26,6 +26,18 @@ if _SRC_DIR not in sys.path:
 RESULTS_DIR = os.path.join(_BENCH_DIR, "results")
 
 
+def default_bench_data_dir(sub: str) -> str:
+    """Default bench-data location: {AETHERSCAN_DATA_PATH}/bench/{sub}. Reads the same env var
+    config.data_path honors (with config.py's literal default as the fallback, so the two agree)
+    without importing the config singleton — keeps the bench scripts framework-light and lets one
+    test cover both callers."""
+    return os.path.join(
+        os.environ.get("AETHERSCAN_DATA_PATH", "/datax/scratch/zachy/data/aetherscan"),
+        "bench",
+        sub,
+    )
+
+
 def machine_info() -> dict:
     """Hostname / platform / CPU info stamped into every result JSON."""
     return {
