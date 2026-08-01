@@ -707,6 +707,7 @@ def prepare_distributed_train_dataset(
     strategy: tf.distribute.Strategy,
     shuffle: bool = True,
     rng: np.random.Generator | None = None,
+    concat_only: bool = False,
 ) -> dict:
     """
     Build distributed training and validation datasets from the `data` dict, returning a dict
@@ -716,6 +717,13 @@ def prepare_distributed_train_dataset(
     `rng` supplies all randomness (stratified split, trim subsampling, per-epoch shuffles):
     callers pass a Generator derived from the pipeline root seed for reproducible runs (see
     aetherscan.seeding.derive_rng); None falls back to OS entropy (the historical behavior).
+
+    `concat_only=True` builds a leaner dataset that gathers ONLY the 'concatenated' block per
+    batch, skipping the 'true'/'false' gathers and their host->device transfer: the RF-feature
+    encode (train_random_forest) consumes only concat, so this cuts that pass's gather+transfer
+    ~3x -> 1x. Batch order and the returned train/val indices are unchanged, so the RF label
+    alignment is byte-identical; the per-replica element is then a single tensor (not the
+    ((concat, true, false), concat) tuple), which the RF encode_fn destructures accordingly.
 
     `data` must contain 'concatenated', 'true', 'false', and 'labels' — typically the
     copy-on-write memmaps returned by round_data.load_round_arrays(), though plain in-RAM
@@ -890,6 +898,12 @@ def prepare_distributed_train_dataset(
         # the training graph sees float32 either way).
         with tf.device("/CPU:0"):
             concat_batch = tf.cast(tf.gather(concat_t, batch_indices), tf.float32)
+            if concat_only:
+                # RF encode consumes ONLY the concat block (its encode_fn discards true/false),
+                # so skip those two gathers and their host->device transfer entirely (~3x -> 1x
+                # gather/transfer volume). The concat gather and the index stream are unchanged,
+                # so batch order and the train_indices/val_indices label alignment stay identical.
+                return concat_batch
             true_batch = tf.cast(tf.gather(true_t, batch_indices), tf.float32)
             false_batch = tf.cast(tf.gather(false_t, batch_indices), tf.float32)
         return (concat_batch, true_batch, false_batch), concat_batch
@@ -2865,6 +2879,10 @@ class TrainingPipeline:
             num_replicas=self.strategy.num_replicas_in_sync,
             strategy=self.strategy,
             shuffle=False,
+            # RF encode reads only the concat block, so gather concat alone and skip the
+            # true/false gather + host->device transfer (~59 GB -> ~19.6 GB one-time). Batch
+            # order + the returned train/val indices are unchanged, so label alignment holds.
+            concat_only=True,
             # RF dataset uses the round-0 STREAM_DATASET key (beta-VAE rounds are 1-based,
             # so no collision). Its DATA GENERATION uses the num_training_rounds+1 sentinel
             # on STREAM_DATA_GEN (see the round_num comment above) — different stream ids,
@@ -2907,7 +2925,9 @@ class TrainingPipeline:
 
             def encode_fn(data):
                 """Per-replica encoding step"""
-                (concat_data, _, _), _ = data
+                # The concat_only dataset yields the concat block directly (not the
+                # ((concat, true, false), concat) training tuple) — see prepare_distributed_train_dataset.
+                concat_data = data
 
                 # Reshape for encoder: (batch, 6, 16, 512) -> (batch * 6, 16, 512, 1)
                 concat_reshaped = tf.reshape(concat_data, [-1, time_bins, width_bin, 1])

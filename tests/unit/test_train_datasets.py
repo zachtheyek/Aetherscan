@@ -36,7 +36,7 @@ def _make_data(n_samples=40):
     }
 
 
-def _build(data, shuffle, train_val_split=0.8, prb=4, eb=8, prvb=4, rng=None):
+def _build(data, shuffle, train_val_split=0.8, prb=4, eb=8, prvb=4, rng=None, concat_only=False):
     return prepare_distributed_train_dataset(
         data=data,
         train_val_split=train_val_split,
@@ -47,6 +47,7 @@ def _build(data, shuffle, train_val_split=0.8, prb=4, eb=8, prvb=4, rng=None):
         strategy=tf.distribute.get_strategy(),
         shuffle=shuffle,
         rng=rng,
+        concat_only=concat_only,
     )
 
 
@@ -120,6 +121,36 @@ class TestPrepareDistributedTrainDataset:
             second.extend(_batch_row_ids(next(iterator)).tolist())
         assert second == seen
         results["_train_holder"].clear()
+
+    def test_concat_only_yields_concat_block_in_identical_order(self):
+        """#10: concat_only=True yields ONLY the concat block (a single tensor per step, not the
+        ((concat, true, false), concat) tuple), in the EXACT same order as the full dataset's
+        concat — so the RF encode reads identical cadences with byte-identical train_indices
+        alignment while skipping the true/false gather + host->device transfer."""
+        data = _make_data()
+        full = _build(data, shuffle=False)
+        lean = _build(data, shuffle=False, concat_only=True)
+        assert lean["train_indices"].tolist() == full["train_indices"].tolist()
+        n_batches = full["train_steps"] * full["accumulation_steps"]
+
+        full_it = iter(full["train_dataset"])
+        lean_it = iter(lean["train_dataset"])
+        full_ids, lean_ids = [], []
+        for _ in range(n_batches):
+            full_ids.extend(_batch_row_ids(next(full_it)).tolist())
+            lean_batch = next(lean_it)
+            # concat_only element is the concat tensor directly (no unpacking).
+            assert lean_batch.shape == (4, *_SAMPLE_SHAPE)
+            lean_ids.extend(lean_batch.numpy()[:, 0, 0, 0].astype(np.int64).tolist())
+        assert lean_ids == full_ids == full["train_indices"].tolist()
+        # val path is concat-only too.
+        lean_val = iter(lean["val_dataset"])
+        val_ids = []
+        for _ in range(lean["val_steps"]):
+            val_ids.extend(next(lean_val).numpy()[:, 0, 0, 0].astype(np.int64).tolist())
+        assert val_ids == lean["val_indices"].tolist()
+        full["_train_holder"].clear()
+        lean["_train_holder"].clear()
 
     def test_val_yields_val_indices_order(self):
         results = _build(_make_data(), shuffle=True)
