@@ -3160,6 +3160,13 @@ class TrainingPipeline:
             self.config.rf.latent_variant = winner
             self.config.rf.active_dims = active_dims
 
+            # Surface the selection visually (winner + the tie-break story) straight from the
+            # in-memory sweep metrics. Best-effort: a plot failure must never fail the run.
+            try:
+                self.plot_rf_latent_variant_selection(variant_metrics, winner)
+            except Exception as e:
+                logger.warning(f"Failed to plot latent-variant selection: {e}")
+
             val_probas = variant_val_probas[winner]
             val_features = build_variant_features(
                 winner, val_mean_flat, val_logvar_flat, num_observations, latent_dim, active_dims
@@ -5883,6 +5890,166 @@ class TrainingPipeline:
             dir,
             slack_title=f"Latent Traversal Spectra ({display_name}) - ({tag}, {machine_name})",
         )
+
+    def plot_rf_latent_variant_selection(
+        self,
+        variant_metrics: dict[str, dict[str, float]],
+        winner: str,
+        tag: str | None = None,
+        dir: str | None = None,
+    ) -> None:
+        """
+        Make the #282 latent-variant SELECTION legible in a single figure. The winner is
+        otherwise surfaced only as a log line + DB scalars; here all 8 swept variants are
+        compared on the selection split. The primary panel is a horizontal recall@FPR bar chart
+        ordered simple->complex (VARIANT_ORDER, simplest on top): the winner bar is highlighted
+        with a "★ winner" tag, and when the minimum-margin tie-break passed over a HIGHER-recall
+        variant a shaded band spans from the winner's recall up to that best recall — the recall
+        the pipeline deliberately traded away because the two are statistically indistinguishable
+        (bootstrap margin) and the winner is the simpler / cheaper representation. Companion
+        panels compare ROC-AUC, Brier, ECE, and feature count (the complexity axis the tie-break
+        trades against) per variant.
+
+        Reads the in-memory metrics the sweep already computed (variant_metrics) plus the winner
+        name — no DB round-trip — so it is called inline right after selection. Purely additive:
+        it never touches the selection numerics.
+        """
+        if tag is None:
+            tag = self.config.checkpoint.save_tag
+
+        metadata_json = get_system_metadata()
+        machine_name = json.loads(metadata_json).get("machine_name")
+
+        max_fpr = self.config.rf.selection_max_fpr
+
+        # Order simple->complex per the selection contract; keep only variants actually swept.
+        variants = [v for v in VARIANT_ORDER if v in variant_metrics]
+        recalls = [float(variant_metrics[v]["recall_at_fpr"]) for v in variants]
+        # Replicate select_winner's "best": max recall, ties broken toward the simpler (earlier)
+        # variant. The tie-break may still land on a simpler winner sitting BELOW this best.
+        best = max(
+            variants,
+            key=lambda v: (variant_metrics[v]["recall_at_fpr"], -variants.index(v)),
+        )
+        winner_recall = float(variant_metrics[winner]["recall_at_fpr"])
+        best_recall = float(variant_metrics[best]["recall_at_fpr"])
+
+        winner_color = "#2ca02c"
+        other_color = "#a6bddb"
+        tie_color = "#ff7f0e"
+        n = len(variants)
+        y = np.arange(n)
+        bar_colors = [winner_color if v == winner else other_color for v in variants]
+
+        fig = plt.figure(figsize=(13, 10))
+        fig.suptitle(
+            f"RF Latent-Variant Selection ({tag}, {machine_name})",
+            fontsize=16,
+            fontweight="bold",
+        )
+        gs = fig.add_gridspec(2, 4, height_ratios=[2.3, 1.3], hspace=0.32, wspace=0.28)
+
+        # -------------------------------------------------- primary: recall@FPR per variant
+        ax = fig.add_subplot(gs[0, :])
+        ax.barh(y, recalls, color=bar_colors, edgecolor="gray", linewidth=0.6)
+        ax.set_yticks(y)
+        ax.set_yticklabels(variants, fontsize=11)
+        ax.invert_yaxis()  # simplest (VARIANT_ORDER[0]) on top
+        ax.set_xlabel(f"Recall @ {max_fpr:g} FPR (selection split)", fontsize=12)
+        ax.set_title(
+            "Primary metric: recall @ fixed FPR; recall ties (bootstrap margin) break toward "
+            "the simpler variant",
+            fontsize=11,
+        )
+        ax.grid(True, axis="x", alpha=0.3)
+
+        # Zoom the x-axis to resolve near-ceiling differences: recalls cluster just under 1.0, so
+        # a 0-based axis would hide the very gap the tie-break turns on.
+        finite = [r for r in recalls if np.isfinite(r)]
+        lo, hi = (min(finite), max(finite)) if finite else (0.0, 1.0)
+        margin = (hi - lo) * 0.35 + 0.002
+        ax.set_xlim(max(0.0, lo - margin), min(1.0005, hi + margin))
+
+        # Tie band: from the winner's recall up to the (higher) best recall — the recall traded
+        # away for the simpler representation. Drawn only when the winner is not itself the best.
+        if best != winner and best_recall > winner_recall:
+            ax.axvspan(winner_recall, best_recall, color=tie_color, alpha=0.15, zorder=0)
+            ax.axvline(best_recall, color=tie_color, linestyle="--", linewidth=1.5)
+            ax.annotate(
+                f"highest recall: '{best}' ({best_recall:.4f})",
+                xy=(best_recall, y[variants.index(best)]),
+                xytext=(4, -14),
+                textcoords="offset points",
+                fontsize=9,
+                color=tie_color,
+                fontweight="bold",
+            )
+
+        # Per-bar recall value; the winner additionally carries the ★ tag.
+        for yi, v, r in zip(y, variants, recalls, strict=True):
+            if not np.isfinite(r):
+                continue
+            label = f"  {r:.4f}  ★ winner" if v == winner else f"  {r:.4f}"
+            ax.text(
+                r,
+                yi,
+                label,
+                va="center",
+                ha="left",
+                fontsize=10,
+                fontweight="bold" if v == winner else "normal",
+                color=winner_color if v == winner else "black",
+            )
+
+        legend_handles = [
+            mpatches.Patch(color=winner_color, label="selected winner (simplest tied variant)"),
+            mpatches.Patch(color=other_color, label="other variants"),
+            mpatches.Patch(
+                color=tie_color, alpha=0.3, label="statistical tie band (recall traded away)"
+            ),
+        ]
+        ax.legend(handles=legend_handles, loc="lower left", fontsize=9, framealpha=0.95)
+
+        # -------------------------------------------------- companions: AUC / Brier / ECE / F
+        aucs = [float(variant_metrics[v]["roc_auc"]) for v in variants]
+        briers = [float(variant_metrics[v]["brier"]) for v in variants]
+        eces = [float(variant_metrics[v]["ece"]) for v in variants]
+        feats = [float(variant_metrics[v]["n_features"]) for v in variants]
+        secondary = [
+            ("ROC-AUC  (↑ better)", aucs, "{:.4f}"),
+            ("Brier  (↓ better)", briers, "{:.4f}"),
+            ("ECE  (↓ better)", eces, "{:.4f}"),
+            ("Feature count F  (↓ simpler)", feats, "{:.0f}"),
+        ]
+        for col, (title, values, fmt) in enumerate(secondary):
+            sub = fig.add_subplot(gs[1, col])
+            sub.barh(y, values, color=bar_colors, edgecolor="gray", linewidth=0.5)
+            sub.set_yticks(y)
+            sub.set_yticklabels(variants if col == 0 else [], fontsize=8)
+            sub.invert_yaxis()
+            sub.set_title(title, fontsize=10, fontweight="bold")
+            sub.grid(True, axis="x", alpha=0.3)
+            vmax = max(values) if max(values) > 0 else 1.0
+            for yi, val in zip(y, values, strict=True):
+                sub.text(val + vmax * 0.02, yi, fmt.format(val), va="center", ha="left", fontsize=7)
+            sub.set_xlim(0, vmax * 1.28)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        save_path = os.path.join(
+            self._training_plots_dir(dir), f"latent_variant_selection_{tag}.png"
+        )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"RF latent-variant selection plot saved to: {save_path}")
+
+        logger_instance = get_logger()
+        if logger_instance:
+            logger_instance.upload_image_to_slack(
+                save_path,
+                title=f"RF Latent-Variant Selection - ({tag}, {machine_name})",
+            )
 
     # TODO: implement plot_rf_snr_sensitivity_curve()
     def plot_rf_confusion_matrices(self, tag: str | None = None, dir: str | None = None):

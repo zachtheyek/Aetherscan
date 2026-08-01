@@ -1095,3 +1095,68 @@ class TestCheckScreeningThreshold:
         assert stats["screen_recall_cascade"] == pytest.approx(0.5)
         assert stats["screen_max_safe_threshold"] == pytest.approx(0.3)
         assert any("SCREENING THRESHOLD UNSAFE" in r.message for r in caplog.records)
+
+
+class TestLatentVariantSelectionPlot:
+    """plot_rf_latent_variant_selection renders the #282 variant-selection figure straight from
+    the in-memory metrics dict + winner name (no DB, no TF): the recall bar chart with the winner
+    highlighted and — when the tie-break passed over a higher-recall variant — the tie band, plus
+    the AUC/Brier/ECE/feature-count companions. Driven off a bare __new__ instance."""
+
+    def _pipeline(self, tag):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline.config.checkpoint.save_tag = tag
+        return pipeline
+
+    def _variant_metrics(self):
+        # Realistic #282 shape: the simplest variant (z_mean) sits a hair BELOW the top recall
+        # (z / z_aug), so the tie-break can pick it and the plot's band spans the traded recall.
+        recalls = {
+            "z_mean": 0.9994,
+            "z": 0.9996,
+            "z_aug": 0.9996,
+            "z_mean_total_kl": 0.9990,
+            "z_mean_obs_logvar": 0.9992,
+            "z_mean_dim_logvar": 0.9988,
+            "z_mean_logvar_active": 0.9985,
+            "z_mean_logvar": 0.9989,
+        }
+        feats = {
+            "z_mean": 48,
+            "z": 48,
+            "z_aug": 48,
+            "z_mean_total_kl": 49,
+            "z_mean_obs_logvar": 54,
+            "z_mean_dim_logvar": 56,
+            "z_mean_logvar_active": 72,
+            "z_mean_logvar": 96,
+        }
+        return {
+            name: {
+                "recall_at_fpr": recalls[name],
+                "roc_auc": 0.990 + 0.001 * i,
+                "brier": 0.010 + 0.001 * i,
+                "ece": 0.020 + 0.001 * i,
+                "n_features": feats[name],
+            }
+            for i, name in enumerate(recalls)
+        }
+
+    def test_writes_nonempty_png_with_tiebreak_winner(self):
+        # winner (z_mean) has LOWER recall than the best (z): exercises the tie-band path.
+        pipeline = self._pipeline("sel_tiebreak")
+        pipeline.plot_rf_latent_variant_selection(self._variant_metrics(), "z_mean")
+        path = os.path.join(
+            pipeline._training_plots_dir(), "latent_variant_selection_sel_tiebreak.png"
+        )
+        assert os.path.exists(path)
+        assert os.path.getsize(path) > 0
+
+    def test_writes_nonempty_png_when_winner_is_top_recall(self):
+        # winner == best (no tie-break): the band collapses; the figure must still render.
+        pipeline = self._pipeline("sel_top")
+        pipeline.plot_rf_latent_variant_selection(self._variant_metrics(), "z")
+        path = os.path.join(pipeline._training_plots_dir(), "latent_variant_selection_sel_top.png")
+        assert os.path.exists(path)
+        assert os.path.getsize(path) > 0
