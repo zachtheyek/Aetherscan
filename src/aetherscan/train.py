@@ -758,7 +758,8 @@ def prepare_distributed_train_dataset(
     pressure the kernel evicts pages instead of OOM-killing the process, which is exactly the
     failure mode the old in-RAM arrays hit.
 
-    Each logical global batch has the signature ((concat, true, false), concat). Sample
+    Each logical global batch has the signature ((concat, true, false), concat) — or, under
+    concat_only=True (see above), just the bare concat tensor. Sample
     counts are trimmed to the global / effective batch size to keep all replicas evenly fed
     (so every epoch pass yields whole batches exactly); the holder is shared by both index
     generators so neither pays a memory cost beyond index subsets.

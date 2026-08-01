@@ -128,8 +128,12 @@ class TestPrepareDistributedTrainDataset:
         concat — so the RF encode reads identical cadences with byte-identical train_indices
         alignment while skipping the true/false gather + host->device transfer."""
         data = _make_data()
-        full = _build(data, shuffle=False)
-        lean = _build(data, shuffle=False, concat_only=True)
+        # Seed both builds identically so the stratified split (rng-driven) matches — the point
+        # is to compare the GATHER output/order, not the split. Two fresh generators with the same
+        # seed give identical splits; a single shared generator would NOT (the first build would
+        # advance its state before the second reads it).
+        full = _build(data, shuffle=False, rng=np.random.default_rng(0))
+        lean = _build(data, shuffle=False, concat_only=True, rng=np.random.default_rng(0))
         assert lean["train_indices"].tolist() == full["train_indices"].tolist()
         n_batches = full["train_steps"] * full["accumulation_steps"]
 
