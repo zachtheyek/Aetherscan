@@ -510,6 +510,37 @@ class TestFigureSmoke:
         summaries = _build_summaries(coll.records, gallery_top_k=12)
         _assert_figure(plot_bandpass_flattening(DataPreprocessor(), coll.records, summaries))
 
+    def test_build_summaries_retains_bandpass_envelopes_on_first_cadence_only(
+        self, tmp_path, initialized_runtime
+    ):
+        """#301 bound: plot_bandpass_flattening reads envelopes from only the FIRST cadence
+        (records order) that has them, so _build_summaries keeps them on that one and drops
+        the rest — otherwise every cadence's envelopes stay resident (~GB at catalog scale).
+        Figure output is unchanged because the same first cadence is selected."""
+        env = [
+            {
+                "channel": 3,
+                "overlay_label": "scaled PFB response H",
+                "raw": {"idx": [0, 1, 2, 3], "values": [1.0, 2.0, 2.0, 1.0]},
+                "flat": {"idx": [0, 1, 2, 3], "values": [1.0, 1.0, 1.0, 1.0]},
+                "overlay": {"idx": [0, 1, 2, 3], "values": [1.0, 2.0, 2.0, 1.0]},
+            }
+        ]
+        coll = InferenceVizCollector()
+        for name, key in (("cad_e0", ("E0",)), ("cad_e1", ("E1",)), ("cad_e2", ("E2",))):
+            npy_path, metadata_path, metadata = _write_cadence_artifacts(tmp_path, name, key)
+            metadata["bandpass_envelopes"] = env
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f)
+            coll.record_processed(key, npy_path, metadata_path, {}, _fake_results(), 1.0)
+
+        summaries = _build_summaries(coll.records, gallery_top_k=12)
+        retained = [summaries[r.npy_path].bandpass_envelopes is not None for r in coll.records]
+        # Exactly one cadence retains envelopes, and it is the first in records order — the
+        # same one plot_bandpass_flattening would pick.
+        assert retained == [True, False, False]
+        assert summaries[coll.records[0].npy_path].bandpass_envelopes == env
+
     def test_candidate_gallery_and_per_candidate(self, initialized_runtime, collector):
         db = initialized_runtime
         config = get_config()
