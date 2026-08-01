@@ -157,6 +157,10 @@ def draw_cadence_strip(
         bottom.set_xticklabels([f"{left_mhz:.4f}", f"{right_mhz:.4f}"])
         bottom.tick_params(axis="x", length=2, pad=1, labelsize=6)
         bottom.set_xlabel("Frequency (MHz)", fontsize=7)
+    else:
+        # No per-stamp MHz available (legacy sidecar / missing fch1|foff): keep the axis
+        # informative with a generic bin-index title rather than a blank axis.
+        axes_column[-1].set_xlabel("Frequency (bin)", fontsize=7)
 
 
 def candidate_annotation(row: dict) -> str:

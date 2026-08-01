@@ -160,3 +160,14 @@ def test_render_skips_on_count_mismatch(make_inference_csv, tmp_path):
 
     assert result is None
     assert not out_png.exists()
+
+
+def test_map_catalog_cadences_missing_required_column(tmp_path):
+    # A catalog missing a required grouping column (here 'Band') can't reproduce the planner's
+    # cadence grouping, so the map degrades to None (-> the plot is skipped) rather than
+    # silently regrouping on a subset of columns and mis-counting cadences.
+    csv_path = tmp_path / "no_band.csv"
+    csv_path.write_text(
+        "Target,Session,Cadence ID,Frequency,.h5 path\nHIP1,S1,1,1400.0,/data/a.h5\n"
+    )
+    assert perband_report.map_catalog_cadences(str(csv_path)) is None

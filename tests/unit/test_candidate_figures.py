@@ -183,8 +183,9 @@ class TestDrawCadenceStripFreqAxis:
             assert list(ax.get_xticks()) == []
             assert ax.get_xlabel() == ""
 
-    def test_no_freq_range_leaves_axis_blank(self):
+    def test_no_freq_range_uses_bin_fallback(self):
+        # No MHz available (legacy sidecar / missing fch1|foff) -> generic bin-index label, no ticks
         _fig, axes, _snippet = self._strip(None)
         bottom = axes[-1]
         assert list(bottom.get_xticks()) == []
-        assert bottom.get_xlabel() == ""
+        assert bottom.get_xlabel() == "Frequency (bin)"

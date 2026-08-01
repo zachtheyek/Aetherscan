@@ -41,6 +41,7 @@ import contextlib
 import csv
 import logging
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -85,11 +86,16 @@ class CadenceBandRow:
 # ---------------------------------------------------------------------------
 
 
+# Anchored so a hypothetical future child span ending in `_<digits>` can never be misclassified
+# as an umbrella — the pattern is a promise, not a coincidence of the current
+# `.read_ed`/`.dedup`/`.extract` child naming.
+_UMBRELLA_RE = re.compile(r"^inference\.preprocess_cadence_\d+$")
+
+
 def _is_umbrella_stage(stage: str) -> bool:
-    """True iff `stage` is an `inference.preprocess_cadence_<N>` UMBRELLA span (the tail after
-    the last underscore is a pure integer), not one of its `.read_ed`/`.dedup`/`.extract`
-    children (whose tail keeps the `<N>.child` suffix and so is not all-digits)."""
-    return stage.rsplit("_", 1)[-1].isdigit()
+    """True iff `stage` is an `inference.preprocess_cadence_<N>` UMBRELLA span, not one of its
+    `.read_ed`/`.dedup`/`.extract` children."""
+    return _UMBRELLA_RE.match(stage) is not None
 
 
 def load_umbrella_preprocess_durations(db_path: str, tag: str) -> dict[int, float]:
@@ -149,28 +155,30 @@ def _group_catalog_csv(
     mirroring preprocessing.group_observations_from_csv: rows with a missing/empty h5-path cell
     are skipped (so they don't inflate a cadence's obs count). Each group records its member
     count plus the band/frequency of its first row (both are group-by columns, so constant
-    within the group). Returns None when the CSV can't be read or lacks Band/Frequency.
+    within the group). Returns None when the CSV can't be read or is missing ANY required column
+    — 'Band'/'Frequency', any group-by column, or the h5-path column — matching
+    group_observations_from_csv's all-columns-required contract (it degrades to no plot rather
+    than silently regrouping on a subset of columns, which could mis-count cadences).
     """
     try:
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
             header = reader.fieldnames or []
-            if "Band" not in header or "Frequency" not in header:
+            required = ["Band", "Frequency", h5_path_col, *group_by_cols]
+            missing = [c for c in dict.fromkeys(required) if c not in header]
+            if missing:
                 logger.warning(
-                    f"Per-band plot: catalog {csv_path} lacks a 'Band'/'Frequency' column "
-                    f"(have {header}); cannot map cadences to bands"
+                    f"Per-band plot: catalog {csv_path} is missing required column(s) {missing} "
+                    f"(have {header}); cannot reproduce the planner's cadence grouping — skipping"
                 )
                 return None
-            eff_cols = [c for c in group_by_cols if c in header]
-            has_h5 = h5_path_col in header
 
             groups: OrderedDict[tuple, dict] = OrderedDict()
             for row in reader:
-                if has_h5:
-                    h5 = row.get(h5_path_col)
-                    if h5 is None or not str(h5).strip():
-                        continue
-                key = tuple(row.get(c) for c in eff_cols)
+                h5 = row.get(h5_path_col)
+                if h5 is None or not str(h5).strip():
+                    continue
+                key = tuple(row.get(c) for c in group_by_cols)
                 if key not in groups:
                     groups[key] = {
                         "count": 0,
