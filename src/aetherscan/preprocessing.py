@@ -1912,16 +1912,15 @@ class DataPreprocessor:
         # sample count from the rows it receives. Frequency WIDTH is validated for the same
         # reason: extraction reads the SAME [0:n_chans] channel window from every file, so a
         # file with FEWER than n_chans channels truncates into a short stamp (the same broadcast
-        # ValueError deep in a worker). The check is `< n_chans` (not strict equality): a file
-        # at least n_chans wide reads cleanly and processed fine on master, so it is left alone —
-        # this only converts the crash case into a clean up-front skip. The whole cadence is
-        # skipped rather than
-        # just the offending file: the 6-observation stamp tensor and the num_observations
-        # contract downstream (encoder reshape, RF features, ABACAD viz) have no
+        # ValueError deep in a worker). The check is `< n_chans` (not strict equality): a file at
+        # least n_chans wide reads cleanly and processed fine on master, so it is left alone —
+        # this converts only the crash case into a clean up-front skip. The whole cadence is
+        # skipped rather than just the offending file: the 6-observation stamp tensor and the
+        # num_observations contract downstream (encoder reshape, RF features, ABACAD viz) have no
         # representation for a 5-observation cadence.
-        # n_chans (header channel count, falling back to the data width) is the [0:n_chans]
-        # window read from EVERY file, so it is the reference for the width check below.
-        # Computed here, before the loop, so the geometry pass can use it.
+        #
+        # n_chans (header channel count, falling back to the data width) is that read window and
+        # the reference for the check; computed before the loop so the geometry pass can use it.
         n_chans = int(header.get("nchans", data_shape[-1]))
         rank_problems: list[str] = []
         short_problems: list[str] = []

@@ -621,6 +621,10 @@ class TestStageAStatsMemo:
                 data_generation._GLOBAL_SHM.close()  # the view _init_worker attached
             shm.close()
             shm.unlink()
+            # Drop the now-dangling references to the freed block so no later test can index
+            # _GLOBAL_BACKGROUNDS (a view over unlinked shared memory) and segfault.
+            data_generation._GLOBAL_BACKGROUNDS = None
+            data_generation._GLOBAL_SHM = None
 
 
 class _RecordingDB:
