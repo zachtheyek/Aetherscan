@@ -226,6 +226,7 @@ Aetherscan/
 │   ├── run_container.sh             # Apptainer/SingularityCE wrapper
 │   ├── start_tmux_session.sh        # tmux session template helper
 │   └── verify_train_test_files.py   # Data sanity check helper
+├── .agents/                    # Cross-tool agent dir; skills/aetherscan-repo-context/SKILL.md points at .claude/
 ├── .claude/                    # Claude Code config + on-demand skills (skills/aetherscan-repo-context/SKILL.md)
 ├── .github/                    # CI/CD workflows, issue templates, etc.
 ├── .gitignore                  # Local gitignore
@@ -234,7 +235,8 @@ Aetherscan/
 ├── requirements-container.txt  # Pip extras layered into NGC container
 ├── environment.yml             # Conda dependencies
 ├── pyproject.toml              # Package metadata, ruff config
-├── CLAUDE.md                   # Lean always-on agent rules
+├── CLAUDE.md                   # Lean always-on agent rules (canonical, tool-agnostic)
+├── AGENTS.md                   # Pointer to CLAUDE.md for agents that look for this filename
 ├── AI_POLICY.md                # AI usage policy
 ├── CITATION.cff                # Citation metadata
 ├── CODE_OF_CONDUCT.md          # Core values guidelines

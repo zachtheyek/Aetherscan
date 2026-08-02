@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Always-on, bare-essentials rules for any coding agent in this repo. The full deep-dive lives in the on-demand skill at [`.claude/skills/aetherscan-repo-context/SKILL.md`](.claude/skills/aetherscan-repo-context/SKILL.md). Canonical sources: [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [KNOWN_ISSUES.md](KNOWN_ISSUES.md), [docs/](docs/). Read [AI_POLICY.md](AI_POLICY.md) before AI-assisted work.
+Always-on, bare-essentials rules for any coding agent in this repo — this file is the single canonical copy ([`AGENTS.md`](AGENTS.md) points here; don't fork the rules into it). The full deep-dive lives in the on-demand skill at [`.claude/skills/aetherscan-repo-context/SKILL.md`](.claude/skills/aetherscan-repo-context/SKILL.md). Canonical sources: [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [KNOWN_ISSUES.md](KNOWN_ISSUES.md), [docs/](docs/). Read [AI_POLICY.md](AI_POLICY.md) before AI-assisted work.
 
 ## Project
 

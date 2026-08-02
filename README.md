@@ -29,7 +29,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### System Requirements
 
-Aetherscan supports two install paths off the same source tree — the **NGC container** (canonical on both clusters) and a **conda env** (an alternative for those who can't or won't use containers on Ampere) — plus the published **PyPI package** for off-cluster use (see [Install From PyPI (pip)](#install-from-pypi-pip) for that path and its v1.0.0 caveats). The NGC container is the canonical runtime on both clusters; the conda env is kept as an alternative for users who can't or don't want to use containers on Ampere.
+Aetherscan supports three install paths off the same source tree: the **NGC container** (canonical on both clusters), a **conda env** (an alternative for those who can't or won't use containers on Ampere), and the published **PyPI package** for off-cluster use (see [Install From PyPI (pip)](#install-from-pypi-pip) for that path and its v1.0.0 caveats).
 
 **NGC container (canonical, runs on both clusters)**
 
