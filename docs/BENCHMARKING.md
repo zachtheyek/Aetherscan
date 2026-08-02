@@ -184,8 +184,11 @@ systematically slower to preprocess?** It writes
 `{output_path}/plots/perband_inference_perf_{tag}.png` — a two-panel, log-y figure of per-cadence
 energy-detection preprocessing wall-clock: Panel A is a per-band boxplot + jittered strip (bands
 ordered L, S, C, X, each annotated with median/max/n), Panel B scatters the same walls against the
-catalog `Frequency` (MHz), colored by band. The preprocessing wall per cadence is the umbrella
-`inference.preprocess_cadence_<N>` span (its `.read_ed`/`.dedup`/`.extract` children are excluded),
+catalog `Frequency` (MHz), colored by band. On the automatic end-of-run fire that `{tag}` is the
+machine-scoped *display* tag `{cmd}_{machine}_{datetime}` (matching the other auto-fired report
+PNGs); run standalone, it's the plain `--save-tag` you pass. The preprocessing wall per cadence is
+the umbrella `inference.preprocess_cadence_<N>` span (its `.read_ed`/`.dedup`/`.extract` children
+are excluded),
 and the band/frequency come from the run's inference catalog CSV. It fires **automatically at the
 tail of every streaming-CSV `inference` run** right after the benchmark report
 (`_post_perband_report` in [`main.py`](../src/aetherscan/main.py), same

@@ -665,3 +665,12 @@ fields that still exist but are not allowlisted). **No action required** — unl
 seed case, nothing is lost: the flag defaulted to `False`, and the objective now has no
 regularization term at any setting, so loading a pre-#324 config (including the released
 v1.0.0 one) reproduces the same numerics it always did.
+
+The same field removal also shifts the **training-resume** config fingerprint. `config_fingerprint`
+hashes the whole `beta_vae` section, so a run-state manifest persisted **mid-training** under
+v1.0.0 (whose `beta_vae` dict still carried `regularization_active`) hashes differently after the
+#324 upgrade → `config_changed()` returns True, and an in-place `--load-tag` resume is treated as a
+config change and **restarts from round 1** rather than resuming. This is inherent to removing any
+fingerprinted field and is the intended clean-break behavior — the config-drift guard logs the
+mismatch loudly (nothing silent) — and it only bites the narrow window of upgrading the codebase
+mid-v1.0.0-training and relaunching to resume. A fresh (post-#324) training run is unaffected.

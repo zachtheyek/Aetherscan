@@ -7,7 +7,10 @@ exist precisely so that one mode's parameters can't silently contaminate the oth
 For where config initialization sits in the overall startup sequence (and the singleton
 pattern's rules), see [`ARCHITECTURE.md`](ARCHITECTURE.md); for what the individual
 training/inference fields *do*, see [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md) and
-[`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).
+[`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md). The CLI is identical across every install
+path (NGC container, conda env, and the off-cluster PyPI package); for choosing and setting one
+up, see [`GPU_RUNTIME_GUIDE.md`](GPU_RUNTIME_GUIDE.md) and the README's
+[Install From PyPI (pip)](../README.md#install-from-pypi-pip) section.
 
 ## TL;DR
 

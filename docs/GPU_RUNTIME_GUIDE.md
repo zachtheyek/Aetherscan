@@ -1,6 +1,6 @@
 # GPU Runtime Guide
 
-This runbook covers running Aetherscan across GPU architectures — the Blackwell (RTX PRO 6000) workstation and the Ampere (A4000) cluster. The pipeline source tree is identical on both machines, and as of [`aetherscan.def`](../aetherscan.def) the NGC container is the canonical runtime on both clusters — one recipe builds and runs on each. The pre-container conda env is kept as an alternative install path on Ampere. This document is about the *runtime*; for what the pipeline itself does once it's running, start at [`ARCHITECTURE.md`](ARCHITECTURE.md).
+This runbook covers running Aetherscan across GPU architectures — the Blackwell (RTX PRO 6000) workstation and the Ampere (A4000) cluster. The pipeline source tree is identical on both machines, and as of [`aetherscan.def`](../aetherscan.def) the NGC container is the canonical runtime on both clusters — one recipe builds and runs on each. The pre-container conda env is kept as an alternative install path on Ampere. For **off-cluster** use there is also a published PyPI package (`pip install aetherscan`) — see the README's [Install From PyPI (pip)](../README.md#install-from-pypi-pip) section (and its v1.0.0 caveats); the container stays canonical on the clusters and is **mandatory on Blackwell**. This document is about the *runtime*; for what the pipeline itself does once it's running, start at [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## TL;DR
 
