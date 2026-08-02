@@ -598,7 +598,7 @@ pytest tests/unit/test_db.py::TestFlushSentinel -q
 
 ## New Version Releases
 
-Releases are cut through the CD workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)): pushing a signed `v*` tag builds the package, publishes it to PyPI, and creates the GitHub Release. The full contract — the PyPI/HuggingFace version-coupling, the signed-tag / version / weights CD gates, and the step-by-step runbook — lives in [`docs/RELEASE.md`](docs/RELEASE.md). Before tagging, bless the matching trained weights on the HF model repo with [`utils/hf_tag_release.py`](utils/hf_tag_release.py).
+Releases are cut through the CD workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)): pushing a signed `v*` tag builds the package, publishes it to PyPI, and creates the GitHub Release. The full contract — the SemVer versioning policy (which segment to bump, and how a retrain's weights are classified), the PyPI/HuggingFace version-coupling, the signed-tag / version / weights CD gates, and the step-by-step runbook — lives in [`docs/RELEASE.md`](docs/RELEASE.md). Before tagging, bless the matching trained weights on the HF model repo with [`utils/hf_tag_release.py`](utils/hf_tag_release.py).
 
 ---
 
