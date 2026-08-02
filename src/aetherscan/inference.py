@@ -355,7 +355,9 @@ class InferencePipeline:
 
     def _check_rf_feature_layout(self) -> None:
         """#282/#318 hardening: fail loud when the loaded forest disagrees with the latent
-        representation the config declares, via two COMPLEMENTARY checks.
+        representation the config declares, via three checks of increasing specificity. Each
+        no-ops when the signal it needs is absent, so together they get progressively stricter as
+        the forest carries more self-description — never false-tripping on an older artifact.
 
         1. Feature COUNT — ``variant_feature_count(config.rf.latent_variant, …)`` vs the forest's
            ``n_features_in_``. Catches DIFFERENT-width mismatches (e.g. a z_mean=48 config against
@@ -368,12 +370,18 @@ class InferencePipeline:
            make: several variants are the SAME width (z / z_mean / z_aug are all
            num_observations*latent_dim), so a config↔weights mix among them passes both the count
            check above AND sklearn's predict-time check, and inference would silently score the
-           wrong representation. Forests trained before #318 (including the released v1.0.0 weights)
-           carry no stamp, so this check no-ops on them — exactly as the count check no-ops on a
-           forest without ``n_features_in_``.
+           wrong representation. No-ops on a forest with no ``aetherscan_latent_variant_`` stamp
+           (including the released v1.0.0 weights) — exactly as (1) no-ops without ``n_features_in_``.
 
-        The sanctioned HF path always ships the winner RF with its own config, so neither check
-        fires there; both guard --config-path/--rf-path pairings from different runs, or a
+        3. Active-dims IDENTITY — the forest's ``aetherscan_active_dims_`` stamp vs
+           ``config.rf.active_dims``, checked ONLY for ``z_mean_logvar_active`` (the one variant
+           whose feature COLUMNS are selected by active-dim index). Two equal-LENGTH active-dim
+           sets (e.g. ``[0,1,2]`` vs ``[5,6,7]``) pass checks (1) and (2) yet score different
+           log_var columns; this closes that residual hole. No-ops on any other variant and on a
+           forest with no ``aetherscan_active_dims_`` stamp.
+
+        The sanctioned HF path always ships the winner RF with its own config, so none of these
+        fire there; they guard --config-path/--rf-path pairings from different runs, or a
         hand-edited config.
         """
         expected_features = variant_feature_count(
@@ -403,6 +411,22 @@ class InferencePipeline:
                 "num_observations*latent_dim), so the feature-count check above cannot catch this "
                 "— refusing to score the wrong latent representation. The config and RF weights "
                 "are from different runs, or the config was hand-edited."
+            )
+
+        # z_mean_logvar_active selects its log_var COLUMNS by active-dim index, so two equal-length
+        # active-dim sets share a feature count and pass checks 1-2 yet score different columns.
+        recorded_active_dims = getattr(self.rf_model.model, "aetherscan_active_dims_", None)
+        if (
+            recorded_active_dims is not None
+            and declared_variant == "z_mean_logvar_active"
+            and list(recorded_active_dims) != list(self.config.rf.active_dims or [])
+        ):
+            raise ValueError(
+                f"RF active-dims mismatch for latent_variant='z_mean_logvar_active': the loaded "
+                f"forest was trained on active_dims={list(recorded_active_dims)}, but the config "
+                f"declares {list(self.config.rf.active_dims or [])}. This variant selects log_var columns "
+                "by active-dim index, so two equal-length sets pass the feature-count check yet "
+                "score different columns — refusing to score the wrong latent representation."
             )
 
     def run_inference(
