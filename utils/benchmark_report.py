@@ -384,7 +384,7 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
     lane_of = {depth: i for i, depth in enumerate(depths_present)}
     n_lanes = len(depths_present)
     fallback_colors = plt.cm.tab10(np.linspace(0, 1, 10))
-    families = sorted({str(row["stage"]).split(".")[0] for row in rows})
+    families = sorted({str(row["stage"]).split(".", maxsplit=1)[0] for row in rows})
 
     def family_color(stage: str):
         family = stage.split(".", maxsplit=1)[0]

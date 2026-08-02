@@ -354,13 +354,28 @@ class InferencePipeline:
         )
 
     def _check_rf_feature_layout(self) -> None:
-        """#282 hardening: fail loud if the loaded forest's expected feature count doesn't
-        match the variant the config declares. Several variants are the SAME width
-        (z / z_mean / z_aug all = num_observations*latent_dim), so a config↔weights mismatch
-        from mixed or hand-edited artifacts would NOT trip sklearn's own feature-count check —
-        inference would silently score the wrong representation. (The sanctioned HF path always
-        ships the winner RF with its own config, so this never fires there; it guards
-        --config-path/--rf-path pairings from different runs, or a hand-edited config.)"""
+        """#282/#318 hardening: fail loud when the loaded forest disagrees with the latent
+        representation the config declares, via two COMPLEMENTARY checks.
+
+        1. Feature COUNT — ``variant_feature_count(config.rf.latent_variant, …)`` vs the forest's
+           ``n_features_in_``. Catches DIFFERENT-width mismatches (e.g. a z_mean=48 config against
+           a z_mean_logvar=96 forest) at model-load time: a clearer, earlier failure than sklearn's
+           own predict-time count check, and the only signal available for a forest that does not
+           self-describe its variant. No-ops on a forest without ``n_features_in_``.
+
+        2. Variant IDENTITY — the forest's ``aetherscan_latent_variant_`` stamp (written at train
+           time, #318) vs ``config.rf.latent_variant``. This is the check the count test CANNOT
+           make: several variants are the SAME width (z / z_mean / z_aug are all
+           num_observations*latent_dim), so a config↔weights mix among them passes both the count
+           check above AND sklearn's predict-time check, and inference would silently score the
+           wrong representation. Forests trained before #318 (including the released v1.0.0 weights)
+           carry no stamp, so this check no-ops on them — exactly as the count check no-ops on a
+           forest without ``n_features_in_``.
+
+        The sanctioned HF path always ships the winner RF with its own config, so neither check
+        fires there; both guard --config-path/--rf-path pairings from different runs, or a
+        hand-edited config.
+        """
         expected_features = variant_feature_count(
             self.config.rf.latent_variant,
             self.config.data.num_observations,
@@ -376,6 +391,18 @@ class InferencePipeline:
                 f"→ {expected_features} features. The config and RF weights are from different "
                 "runs, or the config was hand-edited — refusing to score the wrong "
                 "latent representation."
+            )
+
+        declared_variant = self.config.rf.latent_variant
+        recorded_variant = getattr(self.rf_model.model, "aetherscan_latent_variant_", None)
+        if recorded_variant is not None and recorded_variant != declared_variant:
+            raise ValueError(
+                f"RF latent-variant mismatch: the loaded forest was trained on latent_variant="
+                f"'{recorded_variant}', but the config declares '{declared_variant}'. These "
+                "variants can share the same feature width (z / z_mean / z_aug are all "
+                "num_observations*latent_dim), so the feature-count check above cannot catch this "
+                "— refusing to score the wrong latent representation. The config and RF weights "
+                "are from different runs, or the config was hand-edited."
             )
 
     def run_inference(

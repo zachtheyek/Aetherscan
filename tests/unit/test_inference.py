@@ -407,7 +407,7 @@ class TestRfFeatureLayoutGuard:
     """#282 hardening: init_models fails loud on a config↔RF feature-count mismatch —
     same-width variants (z/z_mean/z_aug all = num_obs*latent_dim) make it silent otherwise."""
 
-    def _pipeline(self, variant, active_dims, n_features):
+    def _pipeline(self, variant, active_dims, n_features, recorded_variant=None):
         config = get_config()
         config.data.num_observations = 6
         config.beta_vae.latent_dim = 8
@@ -418,6 +418,8 @@ class TestRfFeatureLayoutGuard:
         model = types.SimpleNamespace()
         if n_features is not None:
             model.n_features_in_ = n_features
+        if recorded_variant is not None:
+            model.aetherscan_latent_variant_ = recorded_variant
         pipeline.rf_model = types.SimpleNamespace(model=model)
         return pipeline
 
@@ -434,3 +436,22 @@ class TestRfFeatureLayoutGuard:
     def test_absent_n_features_is_a_noop(self):
         # an unfitted/stub forest without n_features_in_ -> the guard skips silently
         self._pipeline("z_mean", list(range(8)), None)._check_rf_feature_layout()
+
+    def test_matching_variant_stamp_passes(self):
+        # forest stamped with the same variant the config declares -> passes
+        self._pipeline(
+            "z_mean", list(range(8)), 48, recorded_variant="z_mean"
+        )._check_rf_feature_layout()
+
+    def test_mismatched_variant_stamp_raises(self):
+        # SAME width (z and z_mean are both 48) so the count check passes, but the #318 identity
+        # stamp catches the confusion the count check cannot
+        pipeline = self._pipeline("z_mean", list(range(8)), 48, recorded_variant="z")
+        with pytest.raises(ValueError, match="latent-variant mismatch"):
+            pipeline._check_rf_feature_layout()
+
+    def test_absent_variant_stamp_is_a_noop(self):
+        # a forest without the #318 stamp (e.g. the v1.0.0 weights) -> identity check skips
+        self._pipeline(
+            "z_mean", list(range(8)), 48, recorded_variant=None
+        )._check_rf_feature_layout()

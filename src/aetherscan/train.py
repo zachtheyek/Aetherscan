@@ -3171,6 +3171,14 @@ class TrainingPipeline:
             # startup-time save_tag resolution) — not a mid-flight mutation.
             self.config.rf.latent_variant = winner
             self.config.rf.active_dims = active_dims
+            # Stamp the winning variant onto the deployed forest itself (#318) so inference can
+            # verify the config's declared latent_variant against the representation the forest
+            # was actually trained on. The feature-COUNT guard alone cannot tell the same-width
+            # variants (z / z_mean / z_aug are all num_observations*latent_dim) apart. The
+            # attribute rides through joblib.dump/load on every subsequent dump of this forest
+            # (canonical RF, SHAP re-dump, final save); older forests simply lack it and the
+            # inference-side check no-ops on them.
+            self.rf_model.model.aetherscan_latent_variant_ = winner
 
             # Surface the selection visually (winner + the tie-break story) straight from the
             # in-memory sweep metrics. Best-effort: a plot failure must never fail the run.
