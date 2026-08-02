@@ -15,12 +15,13 @@ Aetherscan is Breakthrough Listen's first end-to-end production-grade deep-learn
 
 `src/aetherscan/main.py` is the **primary** designated entry point for the pipeline. Non-development workflows should never call other scripts/modules directly — the one exception is `aetherscan-dashboard`, the console script for manual dashboard runs against a saved DB (see `dashboard_cli.py`). `main.py` dispatches to one of two subcommands via the first positional argument: `train` or `inference`.
 
-There are two install paths off the same source tree:
+There are three install paths — two off the same source tree, plus the published PyPI package for off-cluster use:
 
 | Path                                        | Status                                                     | When                          | Launcher                                                                    |
 | ------------------------------------------- | ---------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------- |
 | **NGC container** (Apptainer/SingularityCE) | Canonical; runs on both clusters; only option on Blackwell | Default                       | `./utils/run_container.sh python -m aetherscan.main {train\|inference} ...` |
 | **Conda env**                               | Alternative; **Ampere only**                               | When containers aren't usable | `PYTHONPATH=src python -m aetherscan.main {train\|inference} ...`           |
+| **PyPI package** (`pip install aetherscan`) | Off-cluster analysis; container still **mandatory on Blackwell** | Local / off-cluster use | `pip install aetherscan` → `python -m aetherscan.main {train\|inference} ...` (v1.0.0 needs the `tf_keras` workaround — see the **Install From PyPI (pip)** section of `README.md`) |
 
 CLI flags are identical between the two paths; only the launcher differs. `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .`; the container sets `PYTHONPATH` automatically.
 

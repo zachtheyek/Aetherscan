@@ -32,6 +32,54 @@ Two invariants to internalize:
 - **Installing `aetherscan==1.0.0` *is* the tagged source** — the sdist/wheel are built from
   the tag by CD. There is nothing further to "sync" between PyPI and GitHub.
 
+## Versioning policy (SemVer)
+
+Aetherscan follows [Semantic Versioning 2.0.0](https://semver.org): every release is
+`MAJOR.MINOR.PATCH` (`vX.Y.Z`). Now that the project is past `1.0.0` the number is a
+**compatibility contract**, not just a date stamp. The public surface the contract covers is:
+
+- the `python -m aetherscan.main {train,inference}` **CLI** — subcommand set, flag names, and the
+  defaults that decide behavior when a flag is omitted;
+- the **saved-artifact + config-JSON formats** and the **model contract** inference reads from them
+  (`latent_dim`, the RF feature layout / `latent_variant`, the `.keras`/`.joblib` formats, the HF
+  repo layout and weight-resolution rules);
+- the **supported runtimes** (NGC container / conda env / PyPI package) and their documented floors.
+
+Internal implementation details, private helpers, log wording, and plot cosmetics are **not** part
+of the contract. Bump the leftmost segment that applies:
+
+- **MAJOR (`X`) — incompatible changes** that force a user to change how they invoke, configure, or
+  consume the pipeline, or that make an existing released artifact unusable with the new code.
+  Examples: removing or renaming a CLI flag/subcommand without a compatibility alias; a config-schema
+  or artifact-format change a prior release's saved config/weights can no longer load; changing the
+  model contract so an old artifact is silently reinterpreted; raising the Python/CUDA/TF floor so a
+  previously-supported runtime stops working; a backward-incompatible DB-schema change. A retrain
+  whose weights need new code to load is a MAJOR change **to the weights**.
+- **MINOR (`Y`) — backward-compatible additions**: anything a user could ignore and keep working
+  exactly as before. Examples: a new CLI flag whose default preserves prior behavior; a new optional
+  config field; new observability/plots; a new latent-variant; a performance change with identical
+  outputs; or **new blessed weights from a retrain whose artifact + config + model contract are
+  unchanged** (same `latent_dim`, feature layout, and file formats — old configs still load and new
+  code loads old weights). The weights are the product, so re-blessing on the same contract is a
+  user-facing feature → at least a MINOR bump.
+- **PATCH (`Z`) — backward-compatible fixes**: no new capability, no contract change. Examples: a bug
+  fix (e.g. #340's off-cluster `tf_keras` weight-load fix); a dependency security bump inside the
+  documented version ranges; a docs-only correction; a packaging fix. If a user would see no
+  behavioral difference except that something broken now works, it's a PATCH.
+
+Two rules make bundled releases unambiguous:
+
+1. **Highest bump wins.** A release takes the largest bump any single change in it requires — one
+   breaking change makes the whole release MAJOR no matter how many MINOR/PATCH changes ride along.
+2. **Code and weights share the one version string** (see the coupling contract above): if *either*
+   the code or the weights warrant a given bump, the release takes at least that bump. (So the next
+   release after `1.0.0` bundling new features, the `tf_keras` PATCH fix, and a same-contract retrain
+   is a **MINOR** → `v1.1.0`.)
+
+Between releases `master` carries a `.devN` pre-release version (e.g. `1.0.1.dev0`) so it never
+advertises itself as a shipped stable version — see the dev-version reset in the runbook below. The
+pre-`1.0.0` `0.y.z` line made no compatibility promises; from `1.0.0` onward, these rules hold.
+
 ## Packaging
 
 - **Build system**: hatchling (`[build-system] requires = ["hatchling"]` in

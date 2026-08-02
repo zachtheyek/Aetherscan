@@ -181,7 +181,9 @@ hardware.
 A sibling tool (same stdlib `sqlite3` + `csv` + numpy + matplotlib, no `aetherscan` imports) that
 answers a question the flame timeline can't: **is a whole observing band or frequency region
 systematically slower to preprocess?** It writes
-`{output_path}/plots/perband_inference_perf_{tag}.png` — a two-panel, log-y figure of per-cadence
+`{output_path}/plots/perband_inference_perf_{tag}.png` (auto-fired at an inference tail, `{tag}` is
+the machine-scoped *display* tag `{cmd}_{machine}_{datetime}`, matching the other auto-fired report
+PNGs; run standalone, it's the plain `--save-tag` you pass) — a two-panel, log-y figure of per-cadence
 energy-detection preprocessing wall-clock: Panel A is a per-band boxplot + jittered strip (bands
 ordered L, S, C, X, each annotated with median/max/n), Panel B scatters the same walls against the
 catalog `Frequency` (MHz), colored by band. The preprocessing wall per cadence is the umbrella
