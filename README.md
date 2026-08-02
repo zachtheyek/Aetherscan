@@ -66,7 +66,8 @@ pip install aetherscan==1.0.0
 pip install "tf_keras~=2.17.0"        # REQUIRED for v1.0.0: the released weights are Keras-2 format
 export TF_USE_LEGACY_KERAS=1           # so `from tensorflow import keras` resolves to tf_keras
 
-# The three data roots are mandatory off-cluster (they must already exist):
+# Data roots (default to /datax/scratch/zachy/... on-cluster). Off-cluster, set them to writable
+# paths — AETHERSCAN_DATA_PATH must hold your catalog + inputs; the model/output roots are made on demand:
 export AETHERSCAN_DATA_PATH=...  AETHERSCAN_MODEL_PATH=...  AETHERSCAN_OUTPUT_PATH=...
 
 # Bare inference (no --encoder-path/--rf-path/--config-path) resolves + downloads the v1.0.0 HF weights:
@@ -77,6 +78,7 @@ python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 
 - **Blackwell (sm_120) needs the NGC container, not pip.** pip's `tensorflow[and-cuda]` ships CUDA-12.3 kernels with no sm_120 support, so a Blackwell GPU raises `CUDA_ERROR_INVALID_PTX`. Ampere works on the pip path.
 - **No CPU mode.** Both `train` and `inference` hard-exit when no GPU is visible (`"… requires GPU"`).
+- **The two end-of-run report PNGs do not render on a pip install.** The wheel ships only `src/aetherscan` (not `utils/`), so `benchmark_report.py` / `perband_report.py` aren't found — those two plots log a warning and skip; the inference viz suite, DB, and results are unaffected. Use the container or source tree if you need them.
 - The live dashboard needs the extra: `pip install 'aetherscan[dashboard]'`.
 - The `tf_keras` + `TF_USE_LEGACY_KERAS` steps are the **v1.0.0** workaround only ([#323](https://github.com/zachtheyek/Aetherscan/issues/323) — the released `.keras` weights are Keras-2 while pip pulls Keras 3). Once **v1.0.1** ships they become unnecessary and the install collapses to `pip install aetherscan`; this section will be updated at that point.
 
