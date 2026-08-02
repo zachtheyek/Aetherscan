@@ -31,7 +31,8 @@ import os
 import sys
 
 from aetherscan.config import get_config
-from aetherscan.db import get_db
+from aetherscan.db import get_db, get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.run_state import STAGE_FINAL_SAVE, load_run_state, run_state_path
 
 logger = logging.getLogger(__name__)
@@ -49,11 +50,15 @@ def find_train_tag_collisions(tag: str) -> list[str]:
     db = get_db()
     collisions: list[str] = []
 
-    encoder_path = os.path.join(config.model_path, f"vae_encoder_{tag}.keras")
+    encoder_path = os.path.join(
+        config.model_path, f"vae_encoder_{display_tag(tag, get_machine_name())}.keras"
+    )
     if os.path.exists(encoder_path):
         collisions.append(f"model artifact exists: {encoder_path}")
 
-    config_path = os.path.join(config.output_path, f"config_{tag}.json")
+    config_path = os.path.join(
+        config.output_path, f"config_{display_tag(tag, get_machine_name())}.json"
+    )
     if os.path.exists(config_path):
         collisions.append(f"saved run config exists: {config_path}")
 
@@ -81,7 +86,9 @@ def find_inference_tag_collisions(tag: str) -> list[str]:
     db = get_db()
     collisions: list[str] = []
 
-    config_path = os.path.join(config.output_path, f"config_{tag}.json")
+    config_path = os.path.join(
+        config.output_path, f"config_{display_tag(tag, get_machine_name())}.json"
+    )
     if os.path.exists(config_path):
         collisions.append(f"saved run config exists (completed run marker): {config_path}")
 
@@ -159,7 +166,7 @@ def enforce_tag_guards(args: argparse.Namespace) -> None:
 
     if command == "train":
         if explicit:
-            manifest_path = run_state_path(config.output_path, tag)
+            manifest_path = run_state_path(config.output_path, display_tag(tag, get_machine_name()))
             # Only an UNFINISHED run's manifest exempts the collision guard. The manifest
             # persists on success, so a completed run's manifest must NOT keep disabling dedup
             # for that tag — otherwise a reused --save-tag would silently overwrite a finished

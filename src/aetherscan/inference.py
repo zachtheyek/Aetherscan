@@ -18,7 +18,8 @@ import tensorflow as tf
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
-from aetherscan.db import get_db
+from aetherscan.db import get_db, get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.latent_variants import (
     apply_probability_calibrator,
     build_variant_features,
@@ -850,7 +851,10 @@ class InferencePipeline:
         )
 
         tag = self.config.checkpoint.save_tag
-        cloud_path = os.path.join(self.config.output_path, f"inference_reference_cloud_{tag}.npz")
+        cloud_path = os.path.join(
+            self.config.output_path,
+            f"inference_reference_cloud_{display_tag(tag, get_machine_name())}.npz",
+        )
         os.makedirs(os.path.dirname(cloud_path), exist_ok=True)
         np.savez_compressed(
             cloud_path,

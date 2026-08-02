@@ -281,15 +281,16 @@ def format_summary_table(agg: OrderedDict[str, dict]) -> str:
 def _render_figure(
     rows: list[CadenceBandRow],
     agg: OrderedDict[str, dict],
-    tag: str,
-    hostname: str,
+    title_tag: str,
     output_path: str,
 ) -> None:
-    """Write the 2-panel figure: per-band distribution (Panel A) + wall-vs-frequency (Panel B)."""
+    """Write the 2-panel figure: per-band distribution (Panel A) + wall-vs-frequency (Panel B).
+
+    ``title_tag`` is the already-composed suptitle identifier (the machine-scoped display tag when
+    the caller has one, else ``"{tag}, {hostname}"``).
+    """
     fig = Figure(figsize=(15, 6))
-    fig.suptitle(
-        f"Inference performance by band ({tag}, {hostname})", fontsize=15, fontweight="bold"
-    )
+    fig.suptitle(f"Inference performance by band ({title_tag})", fontsize=15, fontweight="bold")
     ax_a, ax_b = fig.subplots(1, 2)
 
     # --- Panel A: per-band boxplot (no fliers) + jittered strip, x ordered [L, S, C, X] ---
@@ -375,6 +376,7 @@ def render_perband_report(
     catalog_csv_path,
     output_path: str,
     hostname: str,
+    display_tag: str | None = None,
 ) -> str | None:
     """
     Join per-cadence preprocessing walls (pipeline_stages umbrella spans) to catalog band /
@@ -385,6 +387,11 @@ def render_perband_report(
     mismatch between the mapped catalog-cadence count and the umbrella-span count (the
     plan-index assumption not holding, e.g. a resumed run or non-default cadence_group_by_cols).
     `catalog_csv_path` may be a single path or a list of paths (processed in planner order).
+
+    `tag` is always the plain DB tag: it keys the `pipeline_stages` query below and must not carry
+    the machine name. `display_tag` is the presentation-only machine-scoped tag
+    (`{cmd}_{machine}_{datetime}`) the caller derives; when given it labels the on-figure title
+    (matching every other plot), else the title falls back to `"{tag}, {hostname}"`.
     """
     durations = load_umbrella_preprocess_durations(db_path, tag)
     if not durations:
@@ -420,9 +427,10 @@ def render_perband_report(
             return None
         rows.append(CadenceBandRow(n=n, band=band, frequency_mhz=freq, preprocess_s=durations[n]))
 
+    title_tag = display_tag if display_tag else f"{tag}, {hostname}"
     agg = aggregate_by_band(rows)
-    logger.info(f"Per-band preprocessing summary ({tag}):\n{format_summary_table(agg)}")
-    _render_figure(rows, agg, tag, hostname, output_path)
+    logger.info(f"Per-band preprocessing summary ({title_tag}):\n{format_summary_table(agg)}")
+    _render_figure(rows, agg, title_tag, output_path)
     return output_path
 
 

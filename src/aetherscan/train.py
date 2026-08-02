@@ -48,7 +48,8 @@ from tensorflow.keras.layers import Conv2D, Dense
 from aetherscan.benchmark import round_stage_name, stage_timer
 from aetherscan.config import get_config
 from aetherscan.data_generation import DataGenerator
-from aetherscan.db import get_db, get_system_metadata
+from aetherscan.db import get_db, get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.hf_hub import upload_run_to_hf
 from aetherscan.latent_gif import run_umap_gif_sweep
 from aetherscan.latent_variants import (
@@ -252,8 +253,10 @@ def archive_directory(base_dir: str, target_dirs: list[str] | None = None, round
 
 def _model_pair_exists(base_dir: str, tag: str) -> bool:
     """True when the encoder/decoder pair for `tag` both exist in base_dir."""
-    return os.path.exists(os.path.join(base_dir, f"vae_encoder_{tag}.keras")) and os.path.exists(
-        os.path.join(base_dir, f"vae_decoder_{tag}.keras")
+    return os.path.exists(
+        os.path.join(base_dir, f"vae_encoder_{display_tag(tag, get_machine_name())}.keras")
+    ) and os.path.exists(
+        os.path.join(base_dir, f"vae_decoder_{display_tag(tag, get_machine_name())}.keras")
     )
 
 
@@ -264,13 +267,20 @@ def _resolve_load_tag(base_dir: str, tag: str | None) -> str:
     An explicitly requested tag must exist on disk — we never fall back to "the latest" tag,
     which could silently resume from a stale, unrelated model while reporting success (issue
     #142). The tag=None default loads the conventional "final" model, or fails loudly.
+
+    NOTE: existence is checked against this host's machine-scoped display tag (via
+    _model_pair_exists), so a model pair copied from another host is not resolvable via --load-tag.
     """
     if tag is not None:
         if _model_pair_exists(base_dir, tag):
             return tag
         msg = (
             f"No models tagged '{tag}' in {base_dir} — refusing to fall back to the latest tag "
-            f"for an explicitly requested tag."
+            f"for an explicitly requested tag. On-disk model filenames are machine-scoped "
+            f"(vae_encoder_{{command}}_{{machine}}_{{datetime}}.keras) and this looked for the "
+            f"local machine's display tag, so a run's artifacts copied from another host won't be "
+            f"found by --load-tag; for cross-host inference use explicit "
+            f"--encoder-path/--rf-path/--config-path, or the HuggingFace path (fixed filenames)."
         )
         # The per-round-checkpoint hint only helps for a round_XX tag; for any other explicit
         # tag (e.g. a typo'd full run tag) it's a red herring, so only append it for round tags.
@@ -381,7 +391,7 @@ def check_val_auc_floor(
         logger.warning(
             f"MODEL QUALITY GATE UNMET: validation ROC-AUC {val_auc:.4f} is below the "
             f"configured floor training.min_val_auc={min_val_auc} for tag '{tag}'. The "
-            f"trained model may be degenerate — inspect rf_eval_artifacts_{tag}.joblib "
+            f"trained model may be degenerate — inspect rf_eval_artifacts_{display_tag(tag, get_machine_name())}.joblib "
             f"before promoting this model."
         )
     else:
@@ -1330,7 +1340,12 @@ class TrainingPipeline:
           epochs corrupt the loss-curve plots (which sort by (round, epoch)).
         """
         tag = self.config.checkpoint.save_tag
-        self._run_state_path = run_state_path(self.config.output_path, tag)
+        # Manifest FILENAME carries the display tag (this host); its stored `tag` field below stays
+        # the plain DB tag (identity / DB supersede). Resume derives the same display tag on the
+        # same host, so it locates the manifest a prior attempt wrote.
+        self._run_state_path = run_state_path(
+            self.config.output_path, display_tag(tag, get_machine_name())
+        )
 
         state = load_run_state(self._run_state_path)
 
@@ -1497,7 +1512,9 @@ class TrainingPipeline:
         round_data_root = self.config.training.round_data_dir or self.config.get_training_file_path(
             "round_data"
         )
-        self._round_data_base_dir = os.path.join(round_data_root, self.config.checkpoint.save_tag)
+        self._round_data_base_dir = os.path.join(
+            round_data_root, display_tag(self.config.checkpoint.save_tag, get_machine_name())
+        )
         prepare_round_data_dir(
             self._round_data_base_dir,
             start_round,
@@ -3103,7 +3120,8 @@ class TrainingPipeline:
                         f"Brier={metrics['brier']:.4f}, ECE={metrics['ece']:.4f}"
                     )
                     variant_path = os.path.join(
-                        self.config.model_path, f"random_forest_{tag}_{variant}.joblib"
+                        self.config.model_path,
+                        f"random_forest_{display_tag(tag, get_machine_name())}_{variant}.joblib",
                     )
                     os.makedirs(os.path.dirname(variant_path), exist_ok=True)
                     joblib.dump(clf, variant_path)
@@ -3222,7 +3240,8 @@ class TrainingPipeline:
             self.config.rf.calibration_method = calibrator["method"] if calibrator else None
             if calibrator is not None:
                 calibrator_path = os.path.join(
-                    self.config.model_path, f"rf_calibrator_{tag}.joblib"
+                    self.config.model_path,
+                    f"rf_calibrator_{display_tag(tag, get_machine_name())}.joblib",
                 )
                 joblib.dump(calibrator, calibrator_path)
                 logger.info(f"Saved probability calibrator to {calibrator_path}")
@@ -3310,7 +3329,10 @@ class TrainingPipeline:
                     "test_idx": test_idx,
                 },
             }
-            artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
+            artifact_path = os.path.join(
+                self.config.model_path,
+                f"rf_eval_artifacts_{display_tag(tag, get_machine_name())}.joblib",
+            )
             os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
             joblib.dump(artifacts, artifact_path)
             logger.info(f"Saved RF eval artifacts to {artifact_path}")
@@ -3327,7 +3349,10 @@ class TrainingPipeline:
             # Persist the trained RF immediately (final_save re-saves it later): a retry that
             # resumes into rf_plots/final_save can then reload the model without regenerating
             # data — see try_load_rf_for_resume()
-            rf_model_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+            rf_model_path = os.path.join(
+                self.config.model_path,
+                f"random_forest_{display_tag(tag, get_machine_name())}.joblib",
+            )
             self.rf_model.save(rf_model_path)
             logger.info(f"Saved Random Forest to {rf_model_path}")
 
@@ -3436,8 +3461,13 @@ class TrainingPipeline:
         and ready; False falls back to full RF training.
         """
         tag = self.config.checkpoint.save_tag
-        rf_model_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
-        artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
+        rf_model_path = os.path.join(
+            self.config.model_path, f"random_forest_{display_tag(tag, get_machine_name())}.joblib"
+        )
+        artifact_path = os.path.join(
+            self.config.model_path,
+            f"rf_eval_artifacts_{display_tag(tag, get_machine_name())}.joblib",
+        )
 
         if not (os.path.exists(rf_model_path) and os.path.exists(artifact_path)):
             return False
@@ -3480,7 +3510,10 @@ class TrainingPipeline:
         if tag in self._rf_artifacts_cache:
             return self._rf_artifacts_cache[tag]
 
-        artifact_path = os.path.join(self.config.model_path, f"rf_eval_artifacts_{tag}.joblib")
+        artifact_path = os.path.join(
+            self.config.model_path,
+            f"rf_eval_artifacts_{display_tag(tag, get_machine_name())}.joblib",
+        )
         if not os.path.exists(artifact_path):
             raise FileNotFoundError(
                 f"RF eval artifacts not found at {artifact_path}. "
@@ -3522,7 +3555,9 @@ class TrainingPipeline:
         if tag in self._rf_shap_cache:
             return self._rf_shap_cache[tag]
 
-        shap_path = os.path.join(self.config.model_path, f"rf_shap_values_{tag}.joblib")
+        shap_path = os.path.join(
+            self.config.model_path, f"rf_shap_values_{display_tag(tag, get_machine_name())}.joblib"
+        )
 
         if os.path.exists(shap_path):
             logger.info(f"Loading cached SHAP values from {shap_path}")
@@ -3551,7 +3586,9 @@ class TrainingPipeline:
         # shap's TreeSHAP C extension is single-threaded, so we chunk the samples across processes
         # (aetherscan.shap_parallel), each rebuilding a stock TreeExplainer — byte-identical to the
         # serial result. Workers load the RF from its persisted joblib, so make sure it is on disk.
-        rf_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+        rf_path = os.path.join(
+            self.config.model_path, f"random_forest_{display_tag(tag, get_machine_name())}.joblib"
+        )
         # Always (re)dump so the workers load exactly the in-process model — a stale on-disk RF under
         # a reused tag would otherwise silently diverge from the expected_value computed below.
         joblib.dump(self.rf_model.model, rf_path)
@@ -3640,7 +3677,10 @@ class TrainingPipeline:
     def _training_plots_dir(self, subdir: str | None = None) -> str:
         """This run's training-plots base: ``{output_path}/plots/training/{save_tag}[/subdir]``."""
         base = os.path.join(
-            self.config.output_path, "plots", "training", self.config.checkpoint.save_tag
+            self.config.output_path,
+            "plots",
+            "training",
+            display_tag(self.config.checkpoint.save_tag, get_machine_name()),
         )
         return os.path.join(base, subdir) if subdir else base
 
@@ -3649,8 +3689,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         current_time = time.time()
 
@@ -3713,7 +3752,9 @@ class TrainingPipeline:
         ax_false = fig.add_subplot(gs[1, 3])
 
         fig.suptitle(
-            f"Beta-VAE Loss Curves ({tag}, {machine_name})", fontsize=18, fontweight="bold"
+            f"Beta-VAE Loss Curves ({display_tag(tag, machine_name)})",
+            fontsize=18,
+            fontweight="bold",
         )
 
         # Top subplot gets shading + text annotations, bottom subplots get shading only
@@ -3789,7 +3830,10 @@ class TrainingPipeline:
         plt.tight_layout()
 
         # Save plot
-        save_path = os.path.join(self._training_plots_dir(dir), f"beta_vae_loss_curves_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"beta_vae_loss_curves_{display_tag(tag, machine_name)}.png",
+        )
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)  # Create dir if it doesn't exist
 
@@ -3804,7 +3848,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Beta-VAE Loss Curves - ({tag}, {machine_name})",
+                title=f"Beta-VAE Loss Curves - ({display_tag(tag, machine_name)})",
             )
 
         # NOTE:
@@ -3834,8 +3878,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         current_time = time.time()
 
@@ -3899,7 +3942,9 @@ class TrainingPipeline:
         ax_max = fig.add_subplot(gs[1, 2])
 
         fig.suptitle(
-            f"Beta-VAE Training Stability ({tag}, {machine_name})", fontsize=18, fontweight="bold"
+            f"Beta-VAE Training Stability ({display_tag(tag, machine_name)})",
+            fontsize=18,
+            fontweight="bold",
         )
 
         # Top subplot gets shading + text annotations, bottom subplots get shading only
@@ -4013,7 +4058,8 @@ class TrainingPipeline:
 
         # Save plot
         save_path = os.path.join(
-            self._training_plots_dir(dir), f"beta_vae_training_stability_{tag}.png"
+            self._training_plots_dir(dir),
+            f"beta_vae_training_stability_{display_tag(tag, machine_name)}.png",
         )
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -4028,7 +4074,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Beta-VAE Training Stability - ({tag}, {machine_name})",
+                title=f"Beta-VAE Training Stability - ({display_tag(tag, machine_name)})",
             )
 
         del history, snr_by_round, epochs
@@ -4233,7 +4279,10 @@ class TrainingPipeline:
         ax_active.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        save_path = os.path.join(self._training_plots_dir(dir), f"posterior_collapse_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"posterior_collapse_{display_tag(tag, get_machine_name())}.png",
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
         plt.close()
@@ -4242,7 +4291,8 @@ class TrainingPipeline:
         logger_instance = get_logger()
         if logger_instance:
             logger_instance.upload_image_to_slack(
-                save_path, title=f"Posterior Collapse Diagnostics - ({tag})"
+                save_path,
+                title=f"Posterior Collapse Diagnostics - ({display_tag(tag, get_machine_name())})",
             )
 
     # TODO: reorder plot methods (def & call sites): train -> latent -> injection
@@ -4269,8 +4319,7 @@ class TrainingPipeline:
         save_dir = self._training_plots_dir(dir)
         os.makedirs(save_dir, exist_ok=True)
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         current_time = time.time()
 
@@ -4400,7 +4449,9 @@ class TrainingPipeline:
         ]
         del results
 
-        save_path = os.path.join(save_dir, f"injected_signal_characteristics_{tag}.png")
+        save_path = os.path.join(
+            save_dir, f"injected_signal_characteristics_{display_tag(tag, machine_name)}.png"
+        )
         self._plot_injected_signal_characteristics(
             eti_stats,
             rfi_stats,
@@ -4465,7 +4516,9 @@ class TrainingPipeline:
                 clamping_rates_by_round[round_num] = clamped / total if total > 0 else 0.0
         del clamping_results
 
-        save_path = os.path.join(save_dir, f"injection_stability_{tag}.png")
+        save_path = os.path.join(
+            save_dir, f"injection_stability_{display_tag(tag, machine_name)}.png"
+        )
         self._plot_injection_stability(
             sanitization_rates_by_stat,
             clamping_rates_by_round,
@@ -4510,7 +4563,8 @@ class TrainingPipeline:
 
             # Generate plot for this signal_type
             save_path = os.path.join(
-                save_dir, f"{signal_type}_global_intensity_distributions_{tag}.png"
+                save_dir,
+                f"{signal_type}_global_intensity_distributions_{display_tag(tag, machine_name)}.png",
             )
             self._plot_global_intensity_distributions(
                 stats_by_stage, signal_type, tag, machine_name, save_path
@@ -4556,7 +4610,9 @@ class TrainingPipeline:
 
                 transitions[stat_name][signal_type] = (values_a, values_b)
 
-        save_path = os.path.join(save_dir, f"a_b_global_intensity_biases_{tag}.png")
+        save_path = os.path.join(
+            save_dir, f"a_b_global_intensity_biases_{display_tag(tag, machine_name)}.png"
+        )
         self._plot_injection_intensity_biases(transitions, tag, machine_name, save_path)
 
         del transitions
@@ -4581,7 +4637,9 @@ class TrainingPipeline:
                 stats_by_type[signal_type][stat_name] = [r["value"] for r in results]
                 del results
 
-        save_path = os.path.join(save_dir, f"final_global_intensity_biases_{tag}.png")
+        save_path = os.path.join(
+            save_dir, f"final_global_intensity_biases_{display_tag(tag, machine_name)}.png"
+        )
         self._plot_final_intensity_biases(stats_by_type, tag, machine_name, save_path)
 
         del stats_by_type
@@ -4624,7 +4682,7 @@ class TrainingPipeline:
         gs = fig.add_gridspec(3, 3, height_ratios=[1, 1, 1], hspace=0.3, wspace=0.3)
 
         fig.suptitle(
-            f"Injected Signal Characteristics ({tag}, {machine_name})",
+            f"Injected Signal Characteristics ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -4730,7 +4788,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Injected signal characteristics - ({tag}, {machine_name})",
+                title=f"Injected signal characteristics - ({display_tag(tag, machine_name)})",
             )
 
     def _plot_injection_stability(
@@ -4785,7 +4843,7 @@ class TrainingPipeline:
         ax_clamping = fig.add_subplot(gs[1])
 
         fig.suptitle(
-            f"Injection Stability ({tag}, {machine_name})",
+            f"Injection Stability ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -4878,7 +4936,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Injection stability - ({tag}, {machine_name})",
+                title=f"Injection stability - ({display_tag(tag, machine_name)})",
             )
 
         del snr_by_round
@@ -4912,7 +4970,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"{signal_type} Global Intensities ({tag}, {machine_name})",
+            f"{signal_type} Global Intensities ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -4992,7 +5050,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"{signal_type} global intensity distributions - ({tag}, {machine_name})",
+                title=f"{signal_type} global intensity distributions - ({display_tag(tag, machine_name)})",
             )
 
     def _plot_injection_intensity_biases(
@@ -5046,7 +5104,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"A→B Global Intensity Biases — Subsampled {max_points} pts, {outlier_pct} pct ({tag}, {machine_name})",
+            f"A→B Global Intensity Biases — Subsampled {max_points} pts, {outlier_pct} pct ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -5148,7 +5206,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"A→B global intensity biases - ({tag}, {machine_name})",
+                title=f"A→B global intensity biases - ({display_tag(tag, machine_name)})",
             )
 
     def _plot_final_intensity_biases(
@@ -5191,7 +5249,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle(
-            f"Final Global Intensity Biases ({tag}, {machine_name})",
+            f"Final Global Intensity Biases ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -5249,7 +5307,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"Final global intensity biases - ({tag}, {machine_name})",
+                title=f"Final global intensity biases - ({display_tag(tag, machine_name)})",
             )
 
     # NOTE: come back to this later (verify what happens when self._latent_viz_batch and/or self._latent_viz_labels is None)
@@ -5538,7 +5596,8 @@ class TrainingPipeline:
                             "bundle_path": bundle_path,
                             "frames_dir": temp_dir,
                             "gif_path": os.path.join(
-                                save_dir, f"latent_space_{method_name}_{tag}.gif"
+                                save_dir,
+                                f"latent_space_{method_name}_{display_tag(tag, get_machine_name())}.gif",
                             ),
                             "umap_path": os.path.join(
                                 self.config.model_path,
@@ -5577,7 +5636,7 @@ class TrainingPipeline:
                 if logger_instance:
                     logger_instance.upload_image_to_slack(
                         result["gif_path"],
-                        title=f"Latent Space {result['display_method']} - ({tag})",
+                        title=f"Latent Space {result['display_method']} - ({display_tag(tag, get_machine_name())})",
                     )
 
         # Cleanup (frame PNGs + the sweep input bundle)
@@ -5616,8 +5675,7 @@ class TrainingPipeline:
             )
             return
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         num_steps = self.config.training.latent_traversal_num_steps
         max_sigma = self.config.training.latent_traversal_max_sigma
@@ -5762,7 +5820,7 @@ class TrainingPipeline:
             squeeze=False,
         )
         fig.suptitle(
-            f"Latent Traversal — {display_name} ({tag}, {machine_name})",
+            f"Latent Traversal — {display_name} ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -5801,9 +5859,9 @@ class TrainingPipeline:
 
         self._save_traversal_figure(
             fig,
-            f"latent_traversal_{signal_type}_{tag}.png",
+            f"latent_traversal_{signal_type}_{display_tag(tag, machine_name)}.png",
             dir,
-            slack_title=f"Latent Traversal ({display_name}) - ({tag}, {machine_name})",
+            slack_title=f"Latent Traversal ({display_name}) - ({display_tag(tag, machine_name)})",
         )
 
     def _render_traversal_spectra(
@@ -5830,7 +5888,7 @@ class TrainingPipeline:
             nrows, ncols, figsize=(4.5 * ncols, 3.2 * nrows + 1.0), squeeze=False
         )
         fig.suptitle(
-            f"Latent Traversal Spectra — {display_name} ({tag}, {machine_name})",
+            f"Latent Traversal Spectra — {display_name} ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -5877,9 +5935,9 @@ class TrainingPipeline:
 
         self._save_traversal_figure(
             fig,
-            f"latent_traversal_spectra_{signal_type}_{tag}.png",
+            f"latent_traversal_spectra_{signal_type}_{display_tag(tag, machine_name)}.png",
             dir,
-            slack_title=f"Latent Traversal Spectra ({display_name}) - ({tag}, {machine_name})",
+            slack_title=f"Latent Traversal Spectra ({display_name}) - ({display_tag(tag, machine_name)})",
         )
 
     def plot_rf_latent_variant_selection(
@@ -5908,8 +5966,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         max_fpr = self.config.rf.selection_max_fpr
 
@@ -5934,7 +5991,7 @@ class TrainingPipeline:
 
         fig = plt.figure(figsize=(13, 10))
         fig.suptitle(
-            f"RF Latent-Variant Selection ({tag}, {machine_name})",
+            f"RF Latent-Variant Selection ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -6028,7 +6085,8 @@ class TrainingPipeline:
         plt.tight_layout(rect=[0, 0, 1, 0.96])
 
         save_path = os.path.join(
-            self._training_plots_dir(dir), f"latent_variant_selection_{tag}.png"
+            self._training_plots_dir(dir),
+            f"latent_variant_selection_{display_tag(tag, machine_name)}.png",
         )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -6039,7 +6097,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF Latent-Variant Selection - ({tag}, {machine_name})",
+                title=f"RF Latent-Variant Selection - ({display_tag(tag, machine_name)})",
             )
 
     # TODO: implement plot_rf_snr_sensitivity_curve()
@@ -6052,8 +6110,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         val_binary = artifacts["val_binary_labels"]
@@ -6102,7 +6159,7 @@ class TrainingPipeline:
         ax_subtype = fig.add_subplot(gs[0, 1])
 
         fig.suptitle(
-            f"Random Forest Confusion Matrices (t={classification_threshold:.2f}, {tag}, {machine_name})",
+            f"Random Forest Confusion Matrices (t={classification_threshold:.2f}, {display_tag(tag, machine_name)})",
             fontsize=15,
             fontweight="bold",
         )
@@ -6151,7 +6208,10 @@ class TrainingPipeline:
 
         plt.tight_layout()
 
-        save_path = os.path.join(self._training_plots_dir(dir), f"rf_confusion_matrices_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"rf_confusion_matrices_{display_tag(tag, machine_name)}.png",
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -6161,7 +6221,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF Confusion Matrices - ({tag}, {machine_name})",
+                title=f"RF Confusion Matrices - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, cm_binary, cm_binary_norm, cm_subtype, cm_subtype_norm
@@ -6176,8 +6236,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         val_binary = artifacts["val_binary_labels"]
@@ -6205,7 +6264,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 12))
         fig.suptitle(
-            f"Random Forest Classification Curves ({tag}, {machine_name})",
+            f"Random Forest Classification Curves ({display_tag(tag, machine_name)})",
             fontsize=15,
             fontweight="bold",
         )
@@ -6324,7 +6383,8 @@ class TrainingPipeline:
         plt.tight_layout()
 
         save_path = os.path.join(
-            self._training_plots_dir(dir), f"rf_classification_curves_{tag}.png"
+            self._training_plots_dir(dir),
+            f"rf_classification_curves_{display_tag(tag, machine_name)}.png",
         )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -6335,7 +6395,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF Classification Curves - ({tag}, {machine_name})",
+                title=f"RF Classification Curves - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, fpr, tpr, roc_thresholds, precision, recall, pr_thresholds
@@ -6365,8 +6425,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         shap_data = self._compute_or_load_shap_values(artifacts)
@@ -6387,13 +6446,15 @@ class TrainingPipeline:
         )
         fig = plt.gcf()
         fig.suptitle(
-            f"Random Forest SHAP Summary ({tag}, {machine_name})",
+            f"Random Forest SHAP Summary ({display_tag(tag, machine_name)})",
             fontsize=14,
             fontweight="bold",
             y=1.02,
         )
 
-        save_path = os.path.join(self._training_plots_dir(dir), f"rf_shap_summary_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir), f"rf_shap_summary_{display_tag(tag, machine_name)}.png"
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -6403,7 +6464,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF SHAP Summary - ({tag}, {machine_name})",
+                title=f"RF SHAP Summary - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, shap_data, shap_values, summary_indices, features_sub
@@ -6418,8 +6479,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         shap_data = self._compute_or_load_shap_values(artifacts)
@@ -6440,7 +6500,7 @@ class TrainingPipeline:
         axes_flat = axes.flatten() if n_rows * n_cols > 1 else [axes]
 
         fig.suptitle(
-            f"Random Forest SHAP Dependence ({tag}, {machine_name})",
+            f"Random Forest SHAP Dependence ({display_tag(tag, machine_name)})",
             fontsize=15,
             fontweight="bold",
         )
@@ -6478,7 +6538,10 @@ class TrainingPipeline:
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-        save_path = os.path.join(self._training_plots_dir(dir), f"rf_shap_dependence_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"rf_shap_dependence_{display_tag(tag, machine_name)}.png",
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -6488,7 +6551,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF SHAP Dependence - ({tag}, {machine_name})",
+                title=f"RF SHAP Dependence - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, shap_data, shap_values, summary_indices, features_sub
@@ -6506,8 +6569,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         shap_data = self._compute_or_load_shap_values(artifacts)
@@ -6542,13 +6604,16 @@ class TrainingPipeline:
 
         fig = plt.gcf()
         fig.suptitle(
-            f"Random Forest SHAP Interactions ({tag}, {machine_name})",
+            f"Random Forest SHAP Interactions ({display_tag(tag, machine_name)})",
             fontsize=14,
             fontweight="bold",
             y=1.02,
         )
 
-        save_path = os.path.join(self._training_plots_dir(dir), f"rf_shap_interactions_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"rf_shap_interactions_{display_tag(tag, machine_name)}.png",
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -6558,7 +6623,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF SHAP Interactions - ({tag}, {machine_name})",
+                title=f"RF SHAP Interactions - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, shap_data, interaction_values, interaction_indices, features_sub
@@ -6576,8 +6641,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         shap_data = self._compute_or_load_shap_values(artifacts)
@@ -6597,7 +6661,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         fig.suptitle(
-            f"Random Forest SHAP Loss Monitoring ({tag}, {machine_name})",
+            f"Random Forest SHAP Loss Monitoring ({display_tag(tag, machine_name)})",
             fontsize=15,
             fontweight="bold",
         )
@@ -6651,7 +6715,8 @@ class TrainingPipeline:
         plt.tight_layout()
 
         save_path = os.path.join(
-            self._training_plots_dir(dir), f"rf_shap_loss_monitoring_{tag}.png"
+            self._training_plots_dir(dir),
+            f"rf_shap_loss_monitoring_{display_tag(tag, machine_name)}.png",
         )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -6662,7 +6727,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF SHAP Loss Monitoring - ({tag}, {machine_name})",
+                title=f"RF SHAP Loss Monitoring - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, shap_data, shap_logloss, per_sample_logloss, mean_logloss_shap
@@ -6680,8 +6745,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         shap_data = self._compute_or_load_shap_values(artifacts)
@@ -6699,7 +6763,10 @@ class TrainingPipeline:
         # layout. Unlike the cadence-level UMAP that plot_latent_space_gif fits
         # on raw latents, this projection is over the (n_summary × 48) SHAP
         # matrix, so it lives in its own joblib.
-        clustering_path = os.path.join(self.config.model_path, f"rf_shap_clustering_{tag}.joblib")
+        clustering_path = os.path.join(
+            self.config.model_path,
+            f"rf_shap_clustering_{display_tag(tag, get_machine_name())}.joblib",
+        )
         if os.path.exists(clustering_path):
             logger.info(f"Loading cached SHAP clustering from {clustering_path}")
             cached = joblib.load(clustering_path)
@@ -6746,7 +6813,7 @@ class TrainingPipeline:
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 9))
         fig.suptitle(
-            f"Random Forest SHAP Explanation Clustering (t={classification_threshold:.2f}, {tag}, {machine_name})",
+            f"Random Forest SHAP Explanation Clustering (t={classification_threshold:.2f}, {display_tag(tag, machine_name)})",
             fontsize=14,
             fontweight="bold",
         )
@@ -6814,7 +6881,8 @@ class TrainingPipeline:
         plt.tight_layout()
 
         save_path = os.path.join(
-            self._training_plots_dir(dir), f"rf_shap_explanation_clustering_{tag}.png"
+            self._training_plots_dir(dir),
+            f"rf_shap_explanation_clustering_{display_tag(tag, machine_name)}.png",
         )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -6825,7 +6893,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF SHAP Explanation Clustering - ({tag}, {machine_name})",
+                title=f"RF SHAP Explanation Clustering - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, shap_data, shap_values, embedding, cluster_labels
@@ -6840,8 +6908,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         val_binary = artifacts["val_binary_labels"]
@@ -6870,7 +6937,7 @@ class TrainingPipeline:
 
         fig, axes = plt.subplots(2, 1, figsize=(9, 11), gridspec_kw={"height_ratios": [2, 1]})
         fig.suptitle(
-            f"Random Forest Calibration Curve ({tag}, {machine_name})",
+            f"Random Forest Calibration Curve ({display_tag(tag, machine_name)})",
             fontsize=15,
             fontweight="bold",
         )
@@ -6922,7 +6989,10 @@ class TrainingPipeline:
 
         plt.tight_layout()
 
-        save_path = os.path.join(self._training_plots_dir(dir), f"rf_calibration_curve_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"rf_calibration_curve_{display_tag(tag, machine_name)}.png",
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -6932,7 +7002,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF Calibration Curve - ({tag}, {machine_name})",
+                title=f"RF Calibration Curve - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, val_binary, val_probas, frac_pos, mean_pred
@@ -6946,8 +7016,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         train_features = artifacts["train_features"]
@@ -7014,7 +7083,7 @@ class TrainingPipeline:
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 6))
         fig.suptitle(
-            f"Random Forest Ensemble Accuracy vs Tree Count ({tag}, {machine_name})",
+            f"Random Forest Ensemble Accuracy vs Tree Count ({display_tag(tag, machine_name)})",
             fontsize=14,
             fontweight="bold",
         )
@@ -7042,7 +7111,10 @@ class TrainingPipeline:
 
         plt.tight_layout()
 
-        save_path = os.path.join(self._training_plots_dir(dir), f"rf_oob_accuracy_curve_{tag}.png")
+        save_path = os.path.join(
+            self._training_plots_dir(dir),
+            f"rf_oob_accuracy_curve_{display_tag(tag, machine_name)}.png",
+        )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -7052,7 +7124,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF Ensemble Accuracy vs Trees - ({tag}, {machine_name})",
+                title=f"RF Ensemble Accuracy vs Trees - ({display_tag(tag, machine_name)})",
             )
 
         del artifacts, val_features, val_binary, train_features, train_binary
@@ -7071,8 +7143,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         artifacts = self._load_rf_eval_artifacts(tag)
         val_features = artifacts["val_features"]
@@ -7176,7 +7247,7 @@ class TrainingPipeline:
                 fig, ax = plt.subplots(1, 1, figsize=(11, 9))
                 fig.suptitle(
                     f"Random Forest Decision Boundary (nn={nn}, md={md}, "
-                    f"t={classification_threshold:.2f}) — ({tag}, {machine_name})",
+                    f"t={classification_threshold:.2f}) — ({display_tag(tag, machine_name)})",
                     fontsize=13,
                     fontweight="bold",
                 )
@@ -7240,7 +7311,7 @@ class TrainingPipeline:
 
                 plt.tight_layout()
 
-                filename = f"rf_latent_decision_boundary_nn{nn}_md{md}_{tag}.png"
+                filename = f"rf_latent_decision_boundary_nn{nn}_md{md}_{display_tag(tag, machine_name)}.png"
                 save_path = os.path.join(self._training_plots_dir(dir), filename)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -7251,7 +7322,7 @@ class TrainingPipeline:
                 if logger_instance:
                     logger_instance.upload_image_to_slack(
                         save_path,
-                        title=f"RF Decision Boundary (nn={nn}, md={md}) - ({tag}, {machine_name})",
+                        title=f"RF Decision Boundary (nn={nn}, md={md}) - ({display_tag(tag, machine_name)})",
                     )
 
                 n_generated += 1
@@ -7454,13 +7525,32 @@ class TrainingPipeline:
             tag = self.config.checkpoint.save_tag
 
         if dir is not None:
-            encoder_path = os.path.join(self.config.model_path, dir, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(self.config.model_path, dir, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(self.config.model_path, dir, f"random_forest_{tag}.joblib")
+            encoder_path = os.path.join(
+                self.config.model_path,
+                dir,
+                f"vae_encoder_{display_tag(tag, get_machine_name())}.keras",
+            )
+            decoder_path = os.path.join(
+                self.config.model_path,
+                dir,
+                f"vae_decoder_{display_tag(tag, get_machine_name())}.keras",
+            )
+            rf_path = os.path.join(
+                self.config.model_path,
+                dir,
+                f"random_forest_{display_tag(tag, get_machine_name())}.joblib",
+            )
         else:
-            encoder_path = os.path.join(self.config.model_path, f"vae_encoder_{tag}.keras")
-            decoder_path = os.path.join(self.config.model_path, f"vae_decoder_{tag}.keras")
-            rf_path = os.path.join(self.config.model_path, f"random_forest_{tag}.joblib")
+            encoder_path = os.path.join(
+                self.config.model_path, f"vae_encoder_{display_tag(tag, get_machine_name())}.keras"
+            )
+            decoder_path = os.path.join(
+                self.config.model_path, f"vae_decoder_{display_tag(tag, get_machine_name())}.keras"
+            )
+            rf_path = os.path.join(
+                self.config.model_path,
+                f"random_forest_{display_tag(tag, get_machine_name())}.joblib",
+            )
 
         os.makedirs(
             os.path.dirname(encoder_path), exist_ok=True
@@ -7494,9 +7584,15 @@ class TrainingPipeline:
         tag = _resolve_load_tag(base_dir, tag)
 
         # Construct filepaths
-        encoder_path = os.path.join(base_dir, f"vae_encoder_{tag}.keras")
-        decoder_path = os.path.join(base_dir, f"vae_decoder_{tag}.keras")
-        rf_path = os.path.join(base_dir, f"random_forest_{tag}.joblib")
+        encoder_path = os.path.join(
+            base_dir, f"vae_encoder_{display_tag(tag, get_machine_name())}.keras"
+        )
+        decoder_path = os.path.join(
+            base_dir, f"vae_decoder_{display_tag(tag, get_machine_name())}.keras"
+        )
+        rf_path = os.path.join(
+            base_dir, f"random_forest_{display_tag(tag, get_machine_name())}.joblib"
+        )
 
         # Load the models
         try:
@@ -7651,7 +7747,8 @@ class TrainingPipeline:
         self.save_models()
 
         config_path = os.path.join(
-            self.config.output_path, f"config_{self.config.checkpoint.save_tag}.json"
+            self.config.output_path,
+            f"config_{display_tag(self.config.checkpoint.save_tag, get_machine_name())}.json",
         )
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w") as f:

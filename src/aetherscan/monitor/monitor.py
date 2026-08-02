@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import gc
-import json
 import logging
 import math
 import os
@@ -706,13 +705,15 @@ class ResourceMonitor:
         fig, axes = plt.subplots(3, 1, figsize=(14, 15), sharex=True)
 
         # Late import to avoid circular dependency (db imports from manager)
-        from aetherscan.db import get_system_metadata  # noqa: PLC0415
+        from aetherscan.db import get_machine_name  # noqa: PLC0415
+        from aetherscan.display_tag import display_tag  # noqa: PLC0415
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        # self.tag stays the plain DB tag (its DB queries above); the display tag scopes the
+        # figure title, filename, and Slack message to this host.
+        dtag = display_tag(self.tag, get_machine_name())
 
         fig.suptitle(
-            f"Aetherscan Pipeline: Resource Utilization ({self.tag}, {machine_name})",
+            f"Aetherscan Pipeline: Resource Utilization ({dtag})",
             fontsize=16,
             fontweight="bold",
         )
@@ -879,7 +880,7 @@ class ResourceMonitor:
 
         # Save plot
         output_path = os.path.join(
-            self.config.output_path, "plots", f"resource_utilization_{self.tag}.png"
+            self.config.output_path, "plots", f"resource_utilization_{dtag}.png"
         )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)  # Create dir if it doesn't exist
 
@@ -894,7 +895,7 @@ class ResourceMonitor:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 output_path,
-                title=f"Resource Utilization - {self.tag}",
+                title=f"Resource Utilization - {dtag}",
             )
 
 

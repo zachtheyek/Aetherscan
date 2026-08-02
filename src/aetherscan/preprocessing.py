@@ -38,7 +38,8 @@ from skimage.transform import downscale_local_mean
 from aetherscan.benchmark import stage_timer
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
-from aetherscan.db import get_db
+from aetherscan.db import get_db, get_machine_name
+from aetherscan.display_tag import display_tag
 from aetherscan.logger import init_worker_logging
 from aetherscan.manager import get_manager
 from aetherscan.pfb import edge_mid_band_slices, equalize_passband, gen_coarse_channel_response
@@ -2683,10 +2684,11 @@ class DataPreprocessor:
         fig.tight_layout()
 
         tag = self.config.checkpoint.save_tag
-        save_dir = os.path.join(self.config.output_path, "plots", "inference", tag)
+        dtag = display_tag(tag, get_machine_name())
+        save_dir = os.path.join(self.config.output_path, "plots", "inference", dtag)
         os.makedirs(save_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(npy_path))[0]
-        out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{tag}.png")
+        out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{dtag}.png")
         # No close/registry bookkeeping needed: an OO-API Figure is garbage-collected
         fig.savefig(out_path, dpi=120)
         logger.info(f"Saved bandpass overlay debug plot: {out_path}")

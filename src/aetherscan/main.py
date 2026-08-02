@@ -34,7 +34,8 @@ from aetherscan.cli import (
 )
 from aetherscan.config import get_config, init_config
 from aetherscan.dashboard_launcher import launch_dashboard
-from aetherscan.db import get_db, init_db
+from aetherscan.db import get_db, get_machine_name, init_db
+from aetherscan.display_tag import display_tag
 from aetherscan.hf_hub import resolve_inference_artifacts
 from aetherscan.inference import InferencePipeline, run_inference_pipeline, summarize_confidences
 from aetherscan.inference_viz import InferenceVizCollector, render_inference_visualizations
@@ -291,8 +292,12 @@ def _post_benchmark_report(tag: str) -> None:
             logger.warning(f"Benchmark report skipped: no pipeline_stages rows for tag {tag!r}")
             return
         root = benchmark_report.build_stage_tree(rows)
-        png_path = os.path.join(config.output_path, "plots", f"benchmark_report_{tag}.png")
-        benchmark_report.render_report_png(root, rows, tag, png_path)
+        # tag stays the plain DB tag for load_rows / build_suggestions; the display tag scopes the
+        # PNG filename, on-figure title, and Slack message to this host. The import-free report tool
+        # uses its tag arg only for the suptitle, so passing the display tag there is safe.
+        dtag = display_tag(tag, get_machine_name())
+        png_path = os.path.join(config.output_path, "plots", f"benchmark_report_{dtag}.png")
+        benchmark_report.render_report_png(root, rows, dtag, png_path)
         logger.info(f"Benchmark report saved to {png_path}")
 
         # Bottleneck suggestions ride along as the upload's comment, landing in the run
@@ -304,7 +309,7 @@ def _post_benchmark_report(tag: str) -> None:
         if logger_instance is None:
             raise ValueError("get_logger() returned None")
         if not logger_instance.upload_image_to_slack(
-            png_path, title=f"Benchmark Report - {tag}", message=message
+            png_path, title=f"Benchmark Report - {dtag}", message=message
         ):
             logger.warning("Benchmark report rendered but Slack upload was skipped or failed")
 
@@ -364,9 +369,13 @@ def _post_perband_report(tag: str) -> None:
         spec.loader.exec_module(perband_report)
 
         hostname = socket.gethostname()
-        png_path = os.path.join(config.output_path, "plots", f"perband_inference_perf_{tag}.png")
+        # tag stays the plain DB tag (it keys the pipeline_stages query inside
+        # render_perband_report); the display tag scopes the PNG filename, on-figure title, and
+        # Slack message to this host so cross-host artifacts don't collide (matches the other plots).
+        dtag = display_tag(tag, get_machine_name())
+        png_path = os.path.join(config.output_path, "plots", f"perband_inference_perf_{dtag}.png")
         result = perband_report.render_perband_report(
-            db.db_path, tag, catalog_paths, png_path, hostname
+            db.db_path, tag, catalog_paths, png_path, hostname, display_tag=dtag
         )
         if result is None:
             return  # render_perband_report already logged why it skipped
@@ -376,7 +385,7 @@ def _post_perband_report(tag: str) -> None:
         if logger_instance is None:
             raise ValueError("get_logger() returned None")
         if not logger_instance.upload_image_to_slack(
-            png_path, title=f"Inference performance by band - ({tag}, {hostname})"
+            png_path, title=f"Inference performance by band - ({dtag})"
         ):
             logger.warning(
                 "Per-band inference plot rendered but Slack upload was skipped or failed"
@@ -1113,7 +1122,10 @@ def inference_command():
 
     # NOTE: come back to this later (should we create dedicated (tagged) directories inside output_path to store inference results (plots, configs, etc.)? note, data still written to db regardless)
     # Save inference configuration
-    config_path = os.path.join(config.output_path, f"config_{config.checkpoint.save_tag}.json")
+    config_path = os.path.join(
+        config.output_path,
+        f"config_{display_tag(config.checkpoint.save_tag, get_machine_name())}.json",
+    )
     os.makedirs(os.path.dirname(config_path), exist_ok=True)  # Create dir if it doesn't exist
 
     with open(config_path, "w") as f:
