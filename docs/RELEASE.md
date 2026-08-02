@@ -42,7 +42,9 @@ Aetherscan follows [Semantic Versioning 2.0.0](https://semver.org): every releas
 - the `python -m aetherscan.main {train,inference}` **CLI** — subcommand set, flag names, and the
   defaults that decide behavior when a flag is omitted;
 - the **saved-artifact + config-JSON formats** and the **model contract** inference reads from them
-  (`latent_dim`, the RF feature layout / `latent_variant`, the `.keras`/`.joblib` formats, the HF
+  (`latent_dim`, the RF feature layout / `latent_variant` — plus the forest's additive,
+  backward-compatible `aetherscan_latent_variant_` / `aetherscan_active_dims_` stamps, which
+  inference's identity checks simply no-op on when absent — the `.keras`/`.joblib` formats, the HF
   repo layout and weight-resolution rules);
 - the **supported runtimes** (NGC container / conda env / PyPI package) and their documented floors.
 
