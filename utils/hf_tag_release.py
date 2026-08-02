@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bless trained weights as a release: create the HF release tag (vX.Y.Z) pointing at a
-training upload's commit (docs/RELEASE.md step 3).
+training upload's commit (docs/RELEASE.md step 5).
 
     python utils/hf_tag_release.py --save-tag train_20260101_120000 --release v1.0.0
 
@@ -39,7 +39,7 @@ _RELEASE_TAG_PATTERN = re.compile(r"^v\d+\.\d+\.\d+$")
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Bless trained weights as a release: create the HF release tag (vX.Y.Z) "
-        "pointing at a training upload's commit (docs/RELEASE.md step 3)."
+        "pointing at a training upload's commit (docs/RELEASE.md step 5)."
     )
     parser.add_argument(
         "--save-tag",
