@@ -99,8 +99,9 @@ _SCHEMA_VERSION = 8
 _SYSTEM_METADATA_CACHE: str | None = None
 # Per-process cache for get_machine_name(): the machine name is a process-constant too, and the
 # display-tag hot sites now call get_machine_name() several times back-to-back (_model_pair_exists
-# twice, save_models/load_models 3x, every `dtag = ...` line). Memoized off the same metadata as
-# _SYSTEM_METADATA_CACHE; neither is reset in-process, so both survive singleton teardown together.
+# twice, save_models/load_models 3x, every `display_tag_value = ...` line). Memoized off the same
+# metadata as _SYSTEM_METADATA_CACHE; neither is reset in-process, so both survive singleton
+# teardown together.
 _MACHINE_NAME_CACHE: str | None = None
 
 

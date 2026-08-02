@@ -2684,11 +2684,11 @@ class DataPreprocessor:
         fig.tight_layout()
 
         tag = self.config.checkpoint.save_tag
-        dtag = display_tag(tag, get_machine_name())
-        save_dir = os.path.join(self.config.output_path, "plots", "inference", dtag)
+        display_tag_value = display_tag(tag, get_machine_name())
+        save_dir = os.path.join(self.config.output_path, "plots", "inference", display_tag_value)
         os.makedirs(save_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(npy_path))[0]
-        out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{dtag}.png")
+        out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{display_tag_value}.png")
         # No close/registry bookkeeping needed: an OO-API Figure is garbage-collected
         fig.savefig(out_path, dpi=120)
         logger.info(f"Saved bandpass overlay debug plot: {out_path}")

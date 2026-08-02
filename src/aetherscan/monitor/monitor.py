@@ -710,10 +710,10 @@ class ResourceMonitor:
 
         # self.tag stays the plain DB tag (its DB queries above); the display tag scopes the
         # figure title, filename, and Slack message to this host.
-        dtag = display_tag(self.tag, get_machine_name())
+        display_tag_value = display_tag(self.tag, get_machine_name())
 
         fig.suptitle(
-            f"Aetherscan Pipeline: Resource Utilization ({dtag})",
+            f"Aetherscan Pipeline: Resource Utilization ({display_tag_value})",
             fontsize=16,
             fontweight="bold",
         )
@@ -880,7 +880,7 @@ class ResourceMonitor:
 
         # Save plot
         output_path = os.path.join(
-            self.config.output_path, "plots", f"resource_utilization_{dtag}.png"
+            self.config.output_path, "plots", f"resource_utilization_{display_tag_value}.png"
         )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)  # Create dir if it doesn't exist
 
@@ -895,7 +895,7 @@ class ResourceMonitor:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 output_path,
-                title=f"Resource Utilization - {dtag}",
+                title=f"Resource Utilization - {display_tag_value}",
             )
 
 

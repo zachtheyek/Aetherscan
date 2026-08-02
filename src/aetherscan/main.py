@@ -295,9 +295,11 @@ def _post_benchmark_report(tag: str) -> None:
         # tag stays the plain DB tag for load_rows / build_suggestions; the display tag scopes the
         # PNG filename, on-figure title, and Slack message to this host. The import-free report tool
         # uses its tag arg only for the suptitle, so passing the display tag there is safe.
-        dtag = display_tag(tag, get_machine_name())
-        png_path = os.path.join(config.output_path, "plots", f"benchmark_report_{dtag}.png")
-        benchmark_report.render_report_png(root, rows, dtag, png_path)
+        display_tag_value = display_tag(tag, get_machine_name())
+        png_path = os.path.join(
+            config.output_path, "plots", f"benchmark_report_{display_tag_value}.png"
+        )
+        benchmark_report.render_report_png(root, rows, display_tag_value, png_path)
         logger.info(f"Benchmark report saved to {png_path}")
 
         # Bottleneck suggestions ride along as the upload's comment, landing in the run
@@ -309,7 +311,7 @@ def _post_benchmark_report(tag: str) -> None:
         if logger_instance is None:
             raise ValueError("get_logger() returned None")
         if not logger_instance.upload_image_to_slack(
-            png_path, title=f"Benchmark Report - {dtag}", message=message
+            png_path, title=f"Benchmark Report - {display_tag_value}", message=message
         ):
             logger.warning("Benchmark report rendered but Slack upload was skipped or failed")
 
@@ -372,10 +374,12 @@ def _post_perband_report(tag: str) -> None:
         # tag stays the plain DB tag (it keys the pipeline_stages query inside
         # render_perband_report); the display tag scopes the PNG filename, on-figure title, and
         # Slack message to this host so cross-host artifacts don't collide (matches the other plots).
-        dtag = display_tag(tag, get_machine_name())
-        png_path = os.path.join(config.output_path, "plots", f"perband_inference_perf_{dtag}.png")
+        display_tag_value = display_tag(tag, get_machine_name())
+        png_path = os.path.join(
+            config.output_path, "plots", f"perband_inference_perf_{display_tag_value}.png"
+        )
         result = perband_report.render_perband_report(
-            db.db_path, tag, catalog_paths, png_path, hostname, display_tag=dtag
+            db.db_path, tag, catalog_paths, png_path, hostname, display_tag=display_tag_value
         )
         if result is None:
             return  # render_perband_report already logged why it skipped
@@ -385,7 +389,7 @@ def _post_perband_report(tag: str) -> None:
         if logger_instance is None:
             raise ValueError("get_logger() returned None")
         if not logger_instance.upload_image_to_slack(
-            png_path, title=f"Inference performance by band - ({dtag})"
+            png_path, title=f"Inference performance by band - ({display_tag_value})"
         ):
             logger.warning(
                 "Per-band inference plot rendered but Slack upload was skipped or failed"
