@@ -248,7 +248,9 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 └── plots/
     ├── resource_utilization_{tag}.png # monitor resource plot (mode-agnostic)
     ├── benchmark_report_{tag}.png      # end-of-run resource report (mode-agnostic)
-    ├── training/{tag}/*.png            # end-of-training diagnostics (incl. posterior_collapse_{tag}.png)
+    ├── perband_inference_perf_{tag}.png # per-band ED wall-clock (inference only; same gate)
+    ├── training/{tag}/*.png            # end-of-training diagnostics (incl. posterior_collapse_{tag}.png
+    │                                   #   and latent_variant_selection_{tag}.png)
     │   └── checkpoints/*_round_XX.png  #   per-round diagnostics (archived like model checkpoints)
     └── inference/{tag}/*.png           # inference viz suite (incl. candidate_uncertainty_{tag}.png)
 ```

@@ -135,7 +135,15 @@ paths:
   directory — and a **missing calibrator artifact is a hard error**: scoring uncalibrated
   when training calibrated would be a silent train/serve mismatch. The saved
   `rf.latent_variant` / `rf.active_dims` drive how features are rebuilt from the encoder
-  outputs (never hardcoded — see the two-pass cascade below).
+  outputs (never hardcoded — see the two-pass cascade below), and `_check_rf_feature_layout()`
+  cross-checks them against the loaded forest's own `n_features_in_`, raising
+  `ValueError("RF feature-count mismatch: ...")` when they disagree. sklearn's built-in check
+  cannot catch this on its own: `z`, `z_mean`, and `z_aug` are all
+  `num_observations × latent_dim` wide, so a config declaring one while the weights were fit on
+  another passes the width test and inference silently scores the **wrong representation**. The
+  guard fires on mixed `--config-path`/`--rf-path` from different runs or a hand-edited config,
+  never on the sanctioned HF path (which ships the winning forest with its own config), and
+  no-ops on a forest that carries no `n_features_in_`.
 - `--config-path` → the training run's `config_{tag}.json`, layered onto the singleton by
   `cli.apply_saved_config()` **before validation** so shape-critical fields
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
@@ -467,7 +475,13 @@ per-candidate figures render across a forkserver process pool in the TF-free
 `shap_parallel`/`latent_gif` isolation pattern; per-figure failures degrade the suite
 exactly like `_viz_safe`; its metadata-sidecar reads are memoized through a small
 `lru_cache`, #301 — sidecars are immutable once published, and candidates cluster on few
-cadences).
+cadences). Every real-MHz waterfall in the suite — the stamp gallery, the candidate gallery,
+and the per-candidate figures — goes through one shared `draw_cadence_strip()` helper in that
+module, so their frequency axes cannot drift apart: the bottom panel of each column carries a
+`Frequency (MHz)` title with the MHz value at the **left and right borders** as its only two
+tick labels. Bin order is preserved rather than sorted, so a negative `foff` prints those
+borders high → low; a stamp with no recoverable `fch1`/`foff` (legacy sidecar) falls back to a
+`Frequency (bin)` title instead of a blank axis.
 
 | File | Contents | What to look for |
 | --- | --- | --- |
@@ -477,10 +491,18 @@ cadences).
 | `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. Cadences pruned in this run (incl. across its in-process retries) render from the collector's pooled pixels (#302); cadences pruned by an earlier *process* (a relaunch-resume) degrade to blank columns. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
 | `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. Past 120 cadences the strongest (by raw hits) keep individual bars and the rest aggregate into one summary bar (#301 — the unbounded figure exceeded Agg's 2¹⁶-px canvas limit past 242 cadences and was silently lost). | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
-| `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
+| `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall, its frequency axis labeled with the MHz value at the left and right borders, annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
 | `candidate_uncertainty_{tag}.png` | Each candidate (red star) at x = final RF probability (MC mean), y = MC spread, over a hexbin density background of the reference cloud (the survey's pass-1 rejects), with the science threshold as a vertical line. | Population context is the whole point: "p = 0.97, spread = 0.05" is only interpretable against where the survey sits. The dangerous quadrant is **high p + high spread** — a mean that looks confident while draws swing — exactly what `p` alone cannot flag (see the interpretation table above). Candidates hugging the survey cloud are threshold noise. |
 | `inference_latent_projection_{tag}.png` | This run's cadence-level latents projected through the **training run's persisted UMAP** (`umap_cadence_nn*_md*_*.joblib`, located via the training config JSON's `model_path` + tag), over the training embedding as backdrop; candidates highlighted. Skips gracefully if the UMAP is absent. | "Where does real data live relative to the synthetic classes?" Real snippets clustering onto the training false-class region = healthy. Candidates far from *any* training class are the interesting anomalies; candidates inside the false-class cloud are threshold noise. |
 | `inference_summary_{tag}.png` | Table-style run card: cadence/snippet/candidate counts, per-stage durations and throughput from the manifest, per-target/band candidate counts. | The one-glance run report — read it before opening anything else. |
+
+Outside the suite, a streaming-CSV run also closes by writing
+`{output_path}/plots/perband_inference_perf_{tag}.png` — per-cadence energy-detection
+wall-clock by observing band and against catalog frequency — right after the end-of-run
+benchmark report, under the same `--no-benchmark-report` gate and with the same Slack upload.
+It is skipped (never fatal) on the legacy `--test-files` path below, which has no catalog CSV
+to join against. See [`BENCHMARKING.md`](BENCHMARKING.md#the-per-band-inference-plot-utilsperband_reportpy)
+for the figure, the join, and its count guard.
 
 ## Legacy `--test-files` path
 

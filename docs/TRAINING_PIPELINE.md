@@ -832,7 +832,8 @@ winner empirically:
    split (AUC averages over operating points the pipeline never uses). The best variant must
    beat every *simpler* (fewer-feature) variant by more than a bootstrap CI of the recall
    difference (`rf.selection_bootstrap_rounds`), else the simpler variant wins the tie —
-   `select_winner()`'s minimum-margin rule.
+   `select_winner()`'s minimum-margin rule. The comparison this rule ran is charted per run
+   in [the variant-selection plot](#the-variant-selection-plot-latent_variant_selection_tagpng).
 5. **The winner becomes THE model** — canonical `random_forest_{tag}.joblib` filename, HF
    upload, and release tagging all pick it up unchanged — and the sweep outcome is recorded
    on the config (`rf.latent_variant`, `rf.active_dims`) so `config_{tag}.json` tells
@@ -868,6 +869,24 @@ curve keeps its pre-existing hard-coded 0.5 threshold (the dashboard shows a cap
 disambiguate it from the deployment-threshold scalar). Metric persistence is best-effort:
 an sklearn edge case (e.g. a single-class val split) logs a warning and never fails the
 training run.
+
+### The variant-selection plot (`latent_variant_selection_{tag}.png`)
+
+The sweep's outcome used to surface only as a log line plus `training_stats` scalars, which
+made "why did the pipeline deploy *this* representation?" an archaeology exercise.
+`plot_rf_latent_variant_selection()` renders it instead, to
+`plots/training/{tag}/latent_variant_selection_{tag}.png`:
+
+| Panel | Contents | What to look for |
+| --- | --- | --- |
+| Recall@`rf.selection_max_fpr` bars | Every swept variant on the selection split, ordered simple → complex down the y-axis (`VARIANT_ORDER`), winner highlighted and tagged `★ winner`, x-axis auto-zoomed to the spread. When the minimum-margin tie-break passed over a *higher*-recall variant, a shaded band spans the winner's recall up to that best recall. | The band is the point: it's the recall the pipeline deliberately traded for a simpler representation because the difference didn't clear bootstrap noise. A wide band on a run where the margin barely failed is the flag to re-check `rf.selection_bootstrap_rounds` or grow the selection split. |
+| ROC-AUC / Brier / ECE / feature count | The same variants on the secondary metrics, feature count being the complexity axis the tie-break trades against. | A winner that's mid-pack on AUC is normal (selection optimizes recall at the deployed FPR, not averaged operating points); a winner with a visibly worse ECE is the one to watch — it raises the odds that step 6's ECE gate fits a calibrator. |
+
+Unlike the ten diagnostics catalogued under [RF diagnostics](#rf-diagnostics-rf_plots-stage-10-pngs),
+this figure is rendered **inline in `rf_train`, not `rf_plots`**: it reads the in-memory `variant_metrics` the sweep just computed, so it needs no
+DB round-trip and no `rf_eval_artifacts_{tag}.joblib`. Rendering is best-effort — a failure
+warns and the run continues — and it never touches the selection numerics. See
+[`MODELS.md`](MODELS.md#latent-representation-variants-282) for the variant catalogue itself.
 
 ## Configuration quick reference
 

@@ -1,10 +1,11 @@
 # Benchmarking
 
 Aetherscan carries always-on stage timing plus a set of offline tools to read it. This
-document covers the four pieces: the `stage_timer` instrumentation
+document covers the six pieces: the `stage_timer` instrumentation
 ([`src/aetherscan/benchmark.py`](../src/aetherscan/benchmark.py)), the `pipeline_stages` DB
 table it writes to, the annotated resource plot the monitor renders, the report tool
-([`utils/benchmark_report.py`](../utils/benchmark_report.py)), and the standalone benchmarks
+([`utils/benchmark_report.py`](../utils/benchmark_report.py)), the per-band inference plot
+([`utils/perband_report.py`](../utils/perband_report.py)), and the standalone benchmarks
 ([`benchmarks/`](../benchmarks/)). It closes with the current baseline numbers and how to
 read the annotated resource plot.
 
@@ -21,6 +22,13 @@ read the annotated resource plot.
   flame-style timeline PNG, and flags likely bottlenecks from `pipeline_stages` joined with
   `system_resources`. The report PNG is also rendered and posted to Slack automatically at
   the end of every `train`/`inference` run (`--no-benchmark-report` opts out).
+- `python utils/perband_report.py --save-tag <tag> --catalog <csv>` writes
+  `plots/perband_inference_perf_{tag}.png` — per-cadence energy-detection wall-clock split by
+  observing band (boxplot + strip) and against catalog frequency — the question the flame
+  timeline can't answer: is a whole band systematically slower? It gets the same
+  auto-render-and-post-to-Slack treatment at the tail of every streaming-CSV `inference` run,
+  under the same opt-out, and skips (never crashes) on the legacy `--test-files` path or when
+  the catalog → cadence join guard trips.
 - The 1 Hz resource plot overlays the top-level stages as `dimgray` vertical boundary lines
   at each span's right edge on all three (CPU/RAM/GPU) panels — labeled once on the CPU panel
   (angled 30°, left of the line) — via `monitor.annotate_stages`, so a CPU plateau reads as

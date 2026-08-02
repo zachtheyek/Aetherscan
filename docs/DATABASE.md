@@ -288,8 +288,10 @@ Index: `(tag, npy_path, status)` — the resume lookup.
 
 One row per timed pipeline-stage span, written by the always-on stage timers in
 [`aetherscan.benchmark`](../src/aetherscan/benchmark.py) (`stage_timer` / `record_stage`) via
-`db.write_pipeline_stage()`. Read back by [`utils/benchmark_report.py`](../utils/benchmark_report.py)
-and the monitor's stage-band overlay. Full context in [`BENCHMARKING.md`](BENCHMARKING.md).
+`db.write_pipeline_stage()`. Read back by [`utils/benchmark_report.py`](../utils/benchmark_report.py),
+[`utils/perband_report.py`](../utils/perband_report.py) (the `inference.preprocess_cadence_<N>`
+umbrella spans only, joined to the run's catalog CSV), and the monitor's stage-band overlay. Full
+context in [`BENCHMARKING.md`](BENCHMARKING.md).
 
 | Column | Type | Notes |
 | --- | --- | --- |

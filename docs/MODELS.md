@@ -197,6 +197,10 @@ The ordering is a tie-break contract: selection walks it simple → complex, so 
 loses to a *more* complex one that beats it beyond bootstrap noise. Variant names are
 persisted in `config_{tag}.json` and artifact filenames — treat them as stable. The
 latent-space *visualizations* always use the deterministic `z_mean` regardless of variant.
+Each run also visualizes its own outcome: `latent_variant_selection_{tag}.png` charts all
+swept variants' recall at the selection FPR, flags the winner, and shades the recall the
+minimum-margin tie-break traded away for a simpler representation (see
+[`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md#the-variant-selection-plot-latent_variant_selection_tagpng)).
 
 ### Classifier and thresholds
 
