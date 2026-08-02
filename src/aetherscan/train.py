@@ -5966,8 +5966,7 @@ class TrainingPipeline:
         if tag is None:
             tag = self.config.checkpoint.save_tag
 
-        metadata_json = get_system_metadata()
-        machine_name = json.loads(metadata_json).get("machine_name")
+        machine_name = get_machine_name()
 
         max_fpr = self.config.rf.selection_max_fpr
 
@@ -5992,7 +5991,7 @@ class TrainingPipeline:
 
         fig = plt.figure(figsize=(13, 10))
         fig.suptitle(
-            f"RF Latent-Variant Selection ({tag}, {machine_name})",
+            f"RF Latent-Variant Selection ({display_tag(tag, machine_name)})",
             fontsize=16,
             fontweight="bold",
         )
@@ -6086,7 +6085,8 @@ class TrainingPipeline:
         plt.tight_layout(rect=[0, 0, 1, 0.96])
 
         save_path = os.path.join(
-            self._training_plots_dir(dir), f"latent_variant_selection_{tag}.png"
+            self._training_plots_dir(dir),
+            f"latent_variant_selection_{display_tag(tag, machine_name)}.png",
         )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -6097,7 +6097,7 @@ class TrainingPipeline:
         if logger_instance:
             logger_instance.upload_image_to_slack(
                 save_path,
-                title=f"RF Latent-Variant Selection - ({tag}, {machine_name})",
+                title=f"RF Latent-Variant Selection - ({display_tag(tag, machine_name)})",
             )
 
     # TODO: implement plot_rf_snr_sensitivity_curve()

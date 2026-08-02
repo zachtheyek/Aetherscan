@@ -369,9 +369,13 @@ def _post_perband_report(tag: str) -> None:
         spec.loader.exec_module(perband_report)
 
         hostname = socket.gethostname()
-        png_path = os.path.join(config.output_path, "plots", f"perband_inference_perf_{tag}.png")
+        # tag stays the plain DB tag (it keys the pipeline_stages query inside
+        # render_perband_report); the display tag scopes the PNG filename, on-figure title, and
+        # Slack message to this host so cross-host artifacts don't collide (matches the other plots).
+        dtag = display_tag(tag, get_machine_name())
+        png_path = os.path.join(config.output_path, "plots", f"perband_inference_perf_{dtag}.png")
         result = perband_report.render_perband_report(
-            db.db_path, tag, catalog_paths, png_path, hostname
+            db.db_path, tag, catalog_paths, png_path, hostname, display_tag=dtag
         )
         if result is None:
             return  # render_perband_report already logged why it skipped
@@ -381,7 +385,7 @@ def _post_perband_report(tag: str) -> None:
         if logger_instance is None:
             raise ValueError("get_logger() returned None")
         if not logger_instance.upload_image_to_slack(
-            png_path, title=f"Inference performance by band - ({tag}, {hostname})"
+            png_path, title=f"Inference performance by band - ({dtag})"
         ):
             logger.warning(
                 "Per-band inference plot rendered but Slack upload was skipped or failed"

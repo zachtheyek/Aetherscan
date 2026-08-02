@@ -146,6 +146,29 @@ def test_render_writes_nonempty_png(make_inference_csv, tmp_path):
     assert out_png.stat().st_size > 0
 
 
+def test_render_accepts_display_tag_without_affecting_db_query(make_inference_csv, tmp_path):
+    # The display tag scopes only the on-figure title; `tag` still keys the pipeline_stages
+    # query. If render mistakenly queried on the display tag it would find no umbrella spans and
+    # return None — so a successful render here proves the two are decoupled.
+    db_path = tmp_path / "aetherscan.db"
+    _make_db(db_path, "test_v1", _UMBRELLA, _CHILDREN)
+    csv_path = _catalog(make_inference_csv, _VALID_GROUPS + [_FLAGGED_GROUP])
+    out_png = tmp_path / "plots" / "perband_inference_perf_inf_testhost_20260101_120000.png"
+
+    result = perband_report.render_perband_report(
+        str(db_path),
+        "test_v1",
+        str(csv_path),
+        str(out_png),
+        "testhost",
+        display_tag="inf_testhost_20260101_120000",
+    )
+
+    assert result == str(out_png)
+    assert out_png.exists()
+    assert out_png.stat().st_size > 0
+
+
 def test_render_skips_on_count_mismatch(make_inference_csv, tmp_path):
     # DB has only three umbrella spans, but the catalog maps four valid cadences: the plan-index
     # guard must skip (return None) rather than render a misleading plot.
