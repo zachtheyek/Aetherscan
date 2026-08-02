@@ -387,7 +387,7 @@ def render_report_png(root: StageNode, rows: list[dict], tag: str, output_path: 
     families = sorted({str(row["stage"]).split(".")[0] for row in rows})
 
     def family_color(stage: str):
-        family = stage.split(".")[0]
+        family = stage.split(".", maxsplit=1)[0]
         if family in _FAMILY_COLORS:
             return _FAMILY_COLORS[family]
         return fallback_colors[families.index(family) % 10]

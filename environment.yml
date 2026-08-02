@@ -47,7 +47,8 @@ dependencies:
   - h5py=3.11.*
   - hdf5plugin
   - psutil=6.0.*
-  - pytest=8.2.*
+  # Security floor: pytest >=9.0.3 fixes GHSA-6w46-j5rx-g56g (tmpdir handling); dev/test-only.
+  - pytest>=9.0.3,<9.1
   - ipykernel
   - pip
   - pip:
@@ -66,9 +67,9 @@ dependencies:
       - python-dotenv>=1.2.2,<2
       # Model weight distribution via the HuggingFace Hub — pin range mirrors
       # requirements-container.txt (see the rationale there).
-      - huggingface_hub>=1.21,<1.22
+      - huggingface_hub>=1.22,<1.23
       # Live monitoring dashboard (aetherscan/dashboard.py). Kept in lockstep with
-      # requirements-container.txt; streamlit 1.39 coexists with TF 2.17 (protobuf 4.x)
+      # requirements-container.txt; streamlit 1.54 coexists with TF 2.17 (protobuf 4.x)
       # and numpy<2. plotly is pure-Python.
-      - streamlit>=1.39,<1.41
+      - streamlit>=1.54.0,<1.55
       - plotly>=5.24,<6

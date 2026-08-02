@@ -23,9 +23,9 @@ slack-sdk>=3.31.0,<4
 # fixed in 1.2.2).
 python-dotenv>=1.2.2,<2
 # Model weight distribution via the HuggingFace Hub (upload after training, download for
-# inference). 1.21 per SECURITY.md's version policy: two minors below the latest stable
-# (1.23) at pin time, newer than the newest >=6-month-old release.
-huggingface_hub>=1.21,<1.22
+# inference). 1.22 per SECURITY.md's version policy: two minors below the latest stable
+# (1.24) at pin time; the client-side upload/download API is unchanged from 1.21.
+huggingface_hub>=1.22,<1.23
 # setuptools provides pkg_resources, which blimpy (transitive via setigen)
 # imports at module load. Recent pip / Python releases dropped setuptools
 # from the bootstrap, so we install it explicitly. Upper-bound at <81 because
@@ -36,10 +36,10 @@ setuptools>=78.1.1,<81
 # Range covers the proven 2.6/2.7 line (2.7.0 in current use) and blocks a future
 # major-version break; keep in lockstep with environment.yml and pyproject.toml.
 setigen>=2.6,<3
-# Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). streamlit 1.39
-# per SECURITY.md's version policy (proven, >=6-month-old); it accepts protobuf>=3.20,<6 and
-# numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin and the numpy<2 ceiling (pyarrow
-# /tornado/altair pulled transitively). plotly is pure-Python (no numpy ABI coupling). pandas
-# is already shipped by the NGC base, so it is not repinned here.
-streamlit>=1.39,<1.41
+# Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). streamlit 1.54
+# fixes GHSA-7p48-42j8-8846 (SSRF, <1.54.0) and GHSA-vqwp-45wm-r9r5 (cache hash collision, <1.53.1);
+# it still accepts protobuf>=3.20,<6 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin
+# and the numpy<2 ceiling (pyarrow/tornado/altair pulled transitively). plotly is pure-Python (no
+# numpy ABI coupling). pandas is already shipped by the NGC base, so it is not repinned here.
+streamlit>=1.54.0,<1.55
 plotly>=5.24,<6

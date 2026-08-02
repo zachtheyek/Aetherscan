@@ -42,7 +42,7 @@ dependencies = [
     "slack-sdk>=3.31.0,<4",
     # Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684; fixed in 1.2.2).
     "python-dotenv>=1.2.2,<2",
-    "huggingface_hub>=1.21,<1.22",
+    "huggingface_hub>=1.22,<1.23",
     # setuptools provides pkg_resources, which blimpy (transitive via setigen) imports at
     # module load; <81 because setuptools 81 removed the vendored pkg_resources.
     # Floor >=78.1.1 per GHSA-5rjg-fvgr-3xxf (CVE-2025-47273; fixed in 78.1.1).
@@ -98,13 +98,13 @@ Issues = "https://github.com/zachtheyek/Aetherscan/issues"
 aetherscan-dashboard = "aetherscan.dashboard_cli:main"
 
 [project.optional-dependencies]
-dev = ["ruff", "pre-commit", "pytest"]
+dev = ["ruff", "pre-commit", "pytest>=9.0.3"]
 # Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). Opt-in extra so a
 # bare `pip install aetherscan` stays lean; `pip install aetherscan[dashboard]` pulls the stack.
-# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.39
+# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.54
 # coexists with TF 2.17's protobuf 4.x and numpy<2, plotly is pure-Python, pandas backs the data
 # layer (the NGC base ships pandas, so requirements-container.txt omits it there).
-dashboard = ["streamlit>=1.39,<1.41", "plotly>=5.24,<6", "pandas>=2.0,<3"]
+dashboard = ["streamlit>=1.54.0,<1.55", "plotly>=5.24,<6", "pandas>=2.0,<3"]
 
 [tool.pytest.ini_options]
 # Make `import aetherscan` work without a PYTHONPATH=src prefix
