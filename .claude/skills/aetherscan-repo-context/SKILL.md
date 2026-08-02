@@ -279,6 +279,6 @@ Paths relative to the repo root:
 - `docs/RUNTIME_SERVICES.md` — logger/Slack, ResourceManager lifecycle, resource monitor
 - `docs/TESTING.md` — suite layout, markers, isolation fixtures, CI, cluster smokes
 - `docs/GITHUB_AUTOMATION.md` — every workflow, dedup guards, assistant-handle rules
-- `docs/RELEASE.md` — version-coupling contract, CD gates, release runbook
+- `docs/RELEASE.md` — the SemVer versioning policy (which segment to bump; a same-contract retrain is at least a MINOR), version-coupling contract, CD gates, release runbook
 - `docs/GPU_RUNTIME_GUIDE.md` — container build/runtime runbook
 - `docs/CONFIG_AND_CLI.md` — config system deep dive
