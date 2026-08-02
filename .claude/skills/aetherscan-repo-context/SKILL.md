@@ -23,7 +23,7 @@ There are three install paths — two off the same source tree, plus the publish
 | **Conda env**                               | Alternative; **Ampere only**                               | When containers aren't usable | `PYTHONPATH=src python -m aetherscan.main {train\|inference} ...`           |
 | **PyPI package** (`pip install aetherscan`) | Off-cluster analysis; container still **mandatory on Blackwell** | Local / off-cluster use | `pip install aetherscan` → `python -m aetherscan.main {train\|inference} ...` (v1.0.0 needs the `tf_keras` workaround — see the **Install From PyPI (pip)** section of `README.md`) |
 
-CLI flags are identical between the two paths; only the launcher differs. `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .`; the container sets `PYTHONPATH` automatically.
+CLI flags are identical across all three install paths; only the launcher differs. For the two source-tree paths, `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` (the container sets `PYTHONPATH` automatically); the installed PyPI wheel needs no `PYTHONPATH`.
 
 - **Container build:** `singularity build aetherscan-ngc25.02.sif aetherscan.def` (or `apptainer build ...`) — same `aetherscan.def` recipe builds with either runtime. Build on the cluster you intend to run on.
 - **Conda env:** `conda env create -f environment.yml && conda activate aetherscan`

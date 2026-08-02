@@ -63,7 +63,7 @@ of the contract. Bump the leftmost segment that applies:
   code loads old weights). The weights are the product, so re-blessing on the same contract is a
   user-facing feature → at least a MINOR bump.
 - **PATCH (`Z`) — backward-compatible fixes**: no new capability, no contract change. Examples: a bug
-  fix (e.g. #340's off-cluster `tf_keras` weight-load fix); a dependency security bump inside the
+  fix (e.g. the off-cluster `tf_keras` weight-load fix for [#323](https://github.com/zachtheyek/Aetherscan/issues/323)); a dependency security bump inside the
   documented version ranges; a docs-only correction; a packaging fix. If a user would see no
   behavioral difference except that something broken now works, it's a PATCH.
 
@@ -77,8 +77,11 @@ Two rules make bundled releases unambiguous:
    is a **MINOR** → `v1.1.0`.)
 
 Between releases `master` carries a `.devN` pre-release version (e.g. `1.0.1.dev0`) so it never
-advertises itself as a shipped stable version — see the dev-version reset in the runbook below. The
-pre-`1.0.0` `0.y.z` line made no compatibility promises; from `1.0.0` onward, these rules hold.
+advertises itself as a shipped stable version — see the dev-version reset in the runbook below. That
+`.devN` number is only a *not-yet-released* placeholder, **not** a commitment to the next version:
+the actual next release number is chosen at release time by the rules above, so `1.0.1.dev0` on
+`master` does not mean the next release is `1.0.1`. The pre-`1.0.0` `0.y.z` line made no
+compatibility promises; from `1.0.0` onward, these rules hold.
 
 ## Packaging
 
