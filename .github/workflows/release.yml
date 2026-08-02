@@ -72,7 +72,7 @@ jobs:
           tag_sha=$(jq -r '.object.sha' <<<"$ref_json")
           if [ "$obj_type" != "tag" ]; then
             echo "::error::Release tag '$REF_NAME' is a lightweight tag. Cut it signed:" \
-                 "git tag -s $REF_NAME (docs/RELEASE.md step 5)."
+                 "git tag -s $REF_NAME (docs/RELEASE.md step 6)."
             exit 1
           fi
           tag_json=$(gh api "repos/$GH_REPO/git/tags/$tag_sha")
@@ -102,7 +102,7 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             if [ "$TEST_PYPI" != "true" ]; then
               echo "::error::Manual runs only support the TestPyPI dry run (test_pypi: true)." \
-                   "Real releases must go through a signed tag push (docs/RELEASE.md step 5)."
+                   "Real releases must go through a signed tag push (docs/RELEASE.md step 6)."
               exit 1
             fi
             echo "dry_run=true" >> "$GITHUB_OUTPUT"
@@ -117,7 +117,7 @@ jobs:
           if [ "$REF_NAME" != "v$VERSION" ]; then
             echo "::error::Tag '$REF_NAME' does not match pyproject.toml version '$VERSION'" \
                  "(expected tag 'v$VERSION'). Land the release PR that bumps the version," \
-                 "then tag its merge commit (docs/RELEASE.md steps 4-5)."
+                 "then tag its merge commit (docs/RELEASE.md steps 3 and 6)."
             exit 1
           fi
           echo "Version guard passed: $REF_NAME == v$VERSION"
@@ -172,7 +172,7 @@ jobs:
               f"weights but never creates them. Bless the trained weights first — "
               f"python utils/hf_tag_release.py --save-tag <final_vN> --release {tag} — "
               f"then re-run this workflow. The git tag is already correct; do not re-push it. "
-              f"See docs/RELEASE.md step 3."
+              f"See docs/RELEASE.md step 5."
           )
           sys.exit(1)
           EOF
@@ -258,7 +258,7 @@ jobs:
 
   # Decorate the tag into a GitHub Release with generated notes and the built artifacts
   # attached. The generated notes are a starting point — curate the body from the per-PR
-  # claude-release-notes comments afterwards (docs/RELEASE.md step 6).
+  # claude-release-notes comments afterwards (docs/RELEASE.md step 7).
   github-release:
     needs: [guard, publish]
     if: needs.guard.outputs.dry_run != 'true'
