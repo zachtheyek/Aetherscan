@@ -1097,12 +1097,12 @@ def plot_candidate(row: dict, index: int) -> str | None:
     over the TF-free candidate_figures.render_candidate_figure (#298 I9 — the gallery path
     renders these across a forkserver pool; this in-process form serves direct callers)."""
     tag = get_config().checkpoint.save_tag
-    dtag = display_tag(tag, get_machine_name())
+    display_tag_value = display_tag(tag, get_machine_name())
     save_path = render_candidate_figure(
-        row, index, dtag, _plots_dir(tag), candidate_frequency_range_mhz(row)
+        row, index, display_tag_value, _plots_dir(tag), candidate_frequency_range_mhz(row)
     )
     logger.info(f"Inference viz saved: {save_path}")
-    _uploader.submit(save_path, f"Candidate {index} - ({dtag})")
+    _uploader.submit(save_path, f"Candidate {index} - ({display_tag_value})")
     return save_path
 
 
@@ -1112,7 +1112,7 @@ def plot_candidate_gallery() -> str | None:
     cadences the resume skipped this pass."""
     config = get_config()
     tag = config.checkpoint.save_tag
-    dtag = display_tag(tag, get_machine_name())
+    display_tag_value = display_tag(tag, get_machine_name())
     max_candidate_plots = config.inference.max_candidate_plots
 
     db = get_db()
@@ -1131,12 +1131,12 @@ def plot_candidate_gallery() -> str | None:
     # failures return None and degrade the suite exactly like _viz_safe), then uploaded in
     # index order through the async FIFO uploader.
     top_rows = rows[:max_candidate_plots]
-    rendered = render_candidate_figures(top_rows, dtag, _plots_dir(tag))
+    rendered = render_candidate_figures(top_rows, display_tag_value, _plots_dir(tag))
     for index, save_path in rendered:
         if save_path is None:
             continue
         logger.info(f"Inference viz saved: {save_path}")
-        _uploader.submit(save_path, f"Candidate {index} - ({dtag})")
+        _uploader.submit(save_path, f"Candidate {index} - ({display_tag_value})")
     if len(rows) > max_candidate_plots:
         logger.info(
             f"Viz: rendered {max_candidate_plots} of {len(rows)} candidate figures "

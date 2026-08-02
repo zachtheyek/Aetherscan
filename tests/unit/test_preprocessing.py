@@ -1033,13 +1033,13 @@ class TestProcessCadenceEndToEnd:
         # The debug overlay is display-tagged ({command}_{machine}_{datetime}), matching the
         # inference-viz plot dir; save_tag ("inf_20260101_120000") is a real run tag, so the
         # machine token is inserted.
-        dtag = display_tag(config.checkpoint.save_tag, get_machine_name())
+        display_tag_value = display_tag(config.checkpoint.save_tag, get_machine_name())
         plot_path = os.path.join(
             config.output_path,
             "plots",
             "inference",
-            dtag,
-            f"bandpass_overlay_cadence_dbg_{dtag}.png",
+            display_tag_value,
+            f"bandpass_overlay_cadence_dbg_{display_tag_value}.png",
         )
         assert os.path.exists(plot_path)
         assert os.path.getsize(plot_path) > 0
