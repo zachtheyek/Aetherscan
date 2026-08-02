@@ -14,7 +14,6 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.initializers import Constant, GlorotNormal, HeNormal, Zeros
-from tensorflow.keras.regularizers import l1, l2
 
 from aetherscan.config import get_config
 
@@ -66,9 +65,7 @@ class BetaVAE(keras.Model):
     Beta-VAE knob trading reconstruction quality for latent disentanglement).
     """
 
-    def __init__(
-        self, encoder, decoder, alpha=10.0, beta=1.5, regularization_active=False, **kwargs
-    ):
+    def __init__(self, encoder, decoder, alpha=10.0, beta=1.5, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
@@ -76,14 +73,6 @@ class BetaVAE(keras.Model):
         # Hyperparameters
         self.alpha = alpha
         self.beta = beta
-        # Whether the layer-declared L1/L2 penalties are ADDED to the objective. Default
-        # False (v1 decision, 2026-07-29): activating them at the declared, never-calibrated
-        # coefficients measurably degraded the model in a 5-seed A/B — recall@0.01FPR
-        # median .984 -> .954 with one seed at .72, and 1-4 latent dims per seed pushed
-        # below the active-units threshold (one seed lost 4/8). reg_loss is still computed
-        # and recorded for observability either way; coefficient calibration is tracked as
-        # a follow-up issue.
-        self.regularization_active = regularization_active
 
     def call(self, inputs, training=None):
         """
@@ -122,15 +111,14 @@ class BetaVAE(keras.Model):
         stability when latents collide) — minimizing this term pushes ON/OFF pairs apart."""
         return tf.reduce_mean(1.0 / (tf.reduce_sum(tf.square(a - b), axis=1) + 1e-8))
 
-    # Deliberately NOT @tf.function (removed with the L1/L2 activation): this runs only
-    # inside compute_total_loss's graph, and giving it its own FuncGraph strands the
-    # encoder's activity-regularizer loss tensors out of scope of the reg_loss add_n —
-    # InaccessibleTensorError, found by the first regularized run. Inlining into the outer
-    # trace keeps every penalty same-graph; standalone (eager) calls just run eagerly.
-    # ⚠ REPRODUCIBILITY: this inlining changed float summation order — same-seed results
-    # from builds before/after it differ slightly. Determinism WITHIN a build (same seed ⇒
-    # byte-identical reruns) is preserved and pinned by the train dataset/accumulation
-    # tests; cross-build comparisons must be distribution-level, never same-seed pairing.
+    # Deliberately NOT @tf.function: this runs only inside compute_total_loss's graph, so it
+    # inlines into the outer trace rather than getting its own FuncGraph; standalone (eager)
+    # calls just run eagerly.
+    # ⚠ REPRODUCIBILITY: this inlining pins a specific float summation order — changing it
+    # (e.g. re-adding @tf.function) shifts same-seed results slightly. Determinism WITHIN a
+    # build (same seed ⇒ byte-identical reruns) is preserved and pinned by the train
+    # dataset/accumulation tests; cross-build comparisons must be distribution-level, never
+    # same-seed pairing.
     def compute_clustering_loss_true(self, true_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for true-class (ETI-bearing) cadences: sum loss_same across all
@@ -187,8 +175,8 @@ class BetaVAE(keras.Model):
         similarity = same + difference
         return similarity
 
-    # Deliberately NOT @tf.function — same FuncGraph-stranding rationale as
-    # compute_clustering_loss_true above.
+    # Deliberately NOT @tf.function — same inline-into-the-outer-trace / summation-order
+    # reproducibility rationale as compute_clustering_loss_true above.
     def compute_clustering_loss_false(self, false_data: tf.Tensor) -> tf.Tensor:
         """
         Clustering loss for false-class (RFI / noise-only) cadences: sum loss_same across all 15
@@ -249,20 +237,11 @@ class BetaVAE(keras.Model):
         """
         Forward-pass main_data through the VAE and return a dict with reconstruction, KL, and
         per-class clustering losses plus their weighted sum:
-            total = reconstruction + beta * kl + alpha * (true_loss + false_loss) + reg
+            total = reconstruction + beta * kl + alpha * (true_loss + false_loss)
 
         Reconstruction uses binary cross-entropy on the [0, 1]-bounded decoder output (sigmoid).
         true_data and false_data are separate cadences fed through the clustering-loss heads —
         they don't share gradients with reconstruction.
-
-        `reg` is the sum of the layer-declared regularization penalties (activated 2026-07 by
-        maintainer decision — the L1/L2 declarations existed since inception but a custom
-        training loop only applies them if it adds model.losses to the objective, so every
-        model trained before this change was effectively unregularized). Stock keras
-        semantics: kernel/bias L2 penalties appear once each; activity-L1 penalties accrue
-        once per regularized-layer forward performed inside this function (the reconstruction
-        pass AND both clustering branches), and keras batch-SUM-scales them, so the effective
-        activity coefficient scales with the per-replica batch size (128 at defaults).
         """
         # Perform forward pass through Beta-VAE
         reconstruction, z_mean, z_log_var, z = self.call(main_data, training=training)
@@ -293,25 +272,10 @@ class BetaVAE(keras.Model):
         false_loss = self.compute_clustering_loss_false(false_data)
         true_loss = self.compute_clustering_loss_true(true_data)
 
-        # Layer-declared regularization penalties (see docstring). Always COMPUTED and
-        # returned for observability (keras materializes the activity penalties in the
-        # forward pass regardless, so this is one add_n), but only ADDED to the objective
-        # when regularization_active — the v1 default is False (see __init__: activation at
-        # the declared coefficients measured harmful). Cast fp32 so the sum is exact under
-        # mixed_bfloat16 (activity penalties ride bf16 activations); the islands keep the
-        # rest of the loss math fp32 already.
-        if self.losses:
-            reg_loss = tf.add_n([tf.cast(loss, tf.float32) for loss in self.losses])
-        else:
-            reg_loss = tf.constant(0.0, dtype=tf.float32)
-
-        # Compute total loss (reg only when active — inactive keeps the objective
-        # byte-identical to the pre-activation pipeline)
+        # Compute total loss
         total_loss = (
             reconstruction_loss + self.beta * kl_loss + self.alpha * (true_loss + false_loss)
         )
-        if self.regularization_active:
-            total_loss = total_loss + reg_loss
 
         return {
             "total_loss": total_loss,
@@ -320,7 +284,6 @@ class BetaVAE(keras.Model):
             "kl_per_dim": kl_per_dim,
             "true_loss": true_loss,
             "false_loss": false_loss,
-            "reg_loss": reg_loss,
         }
 
 
@@ -364,12 +327,9 @@ def build_encoder(
     | 8         | 128     | 1      | (2, 64, 64)      | (2, 64, 128)     |
     | 9         | 256     | 2      | (2, 64, 128)     | (1, 32, 256)     |
 
-    Regularization (all layers):
+    Initialization (all layers):
         - kernel_initializer: HeNormal (conv/dense) or GlorotNormal (latent)
         - bias_initializer: Zeros (except z_log_var uses -3.0 for tighter initial posterior)
-        - activity_regularizer: L1(0.001) - encourages sparse activations
-        - kernel_regularizer: L2(0.01) - prevents large weights
-        - bias_regularizer: L2(0.01) - prevents large biases
 
     The returned keras.Model outputs [z_mean, z_log_var, z]. The decoder (build_decoder) must
     remain an exact mirror of this architecture for VAE symmetry — any layer-structure change
@@ -388,9 +348,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(encoder_inputs)
 
     # Layer 2: (8, 256, 16) → (8, 256, 16) - stride 1 maintains spatial dims
@@ -402,9 +359,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 3: (8, 256, 16) → (4, 128, 32) - stride 2 downsamples
@@ -416,9 +370,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 4: (4, 128, 32) → (4, 128, 32) - stride 1 maintains
@@ -430,9 +381,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 5: (4, 128, 32) → (4, 128, 32) - stride 1 maintains
@@ -444,9 +392,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 6: (4, 128, 32) → (2, 64, 64) - stride 2 downsamples
@@ -458,9 +403,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 7: (2, 64, 64) → (2, 64, 64) - stride 1 maintains
@@ -472,9 +414,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 8: (2, 64, 64) → (2, 64, 128) - stride 1, increase filters
@@ -486,9 +425,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 9: (2, 64, 128) → (1, 32, 256) - stride 2 final downsample
@@ -500,9 +436,6 @@ def build_encoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Dense layers
@@ -516,9 +449,6 @@ def build_encoder(
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Latent space
@@ -532,9 +462,6 @@ def build_encoder(
         dtype="float32",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # z_log_var: (dense_size,) → (latent_dim,) - log-variance of latent distribution
@@ -546,9 +473,6 @@ def build_encoder(
         bias_initializer=Constant(
             -3.0  # Negative bias initialization tightens initial posterior around prior
         ),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Sampling: sample z from N(z_mean, exp(z_log_var)) using reparameterization trick
@@ -607,17 +531,13 @@ def build_decoder(
     | 8         | 16      | 1      | (8, 256, 16)     | (8, 256, 16)     | Enc 2       |
     | 9         | 1       | 2      | (8, 256, 16)     | (16, 512, 1)     | Enc 1       |
 
-    Regularization (all layers including output):
+    Initialization (all layers including output):
         - kernel_initializer: HeNormal (hidden layers) or GlorotNormal (output layer)
         - bias_initializer: Zeros
-        - activity_regularizer: L1(0.001) - encourages sparse activations
-        - kernel_regularizer: L2(0.01) - prevents large weights
-        - bias_regularizer: L2(0.01) - prevents large biases
 
     Output Layer Notes:
         - Uses sigmoid activation (not relu) to bound output to [0, 1] for BCE loss
         - Uses GlorotNormal initialization (matches encoder's latent layer style)
-        - Includes full regularization for symmetry with encoder's first conv layer
 
     The returned keras.Model outputs reconstructed spectrograms of shape (16, 512, 1). This
     architecture is the exact mirror of build_encoder — any layer-structure change there must
@@ -633,9 +553,6 @@ def build_decoder(
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(latent_inputs)
 
     # Dense: (dense_size,) → (8192,) - mirrors encoder's Dense(dense_size) layer
@@ -646,9 +563,6 @@ def build_decoder(
         activation="relu",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Reshape: (8192,) → (1, 32, 256) - mirrors encoder's Flatten layer
@@ -667,9 +581,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 2: (2, 64, 128) → (2, 64, 64) - mirrors encoder layer 8 (128 filters, s=1)
@@ -682,9 +593,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 3: (2, 64, 64) → (2, 64, 64) - mirrors encoder layer 7 (64 filters, s=1)
@@ -697,9 +605,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 4: (2, 64, 64) → (4, 128, 32) - mirrors encoder layer 6 (64 filters, s=2)
@@ -712,9 +617,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 5: (4, 128, 32) → (4, 128, 32) - mirrors encoder layer 5 (32 filters, s=1)
@@ -727,9 +629,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 6: (4, 128, 32) → (4, 128, 32) - mirrors encoder layer 4 (32 filters, s=1)
@@ -742,9 +641,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 7: (4, 128, 32) → (8, 256, 16) - mirrors encoder layer 3 (32 filters, s=2)
@@ -757,9 +653,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Layer 8: (8, 256, 16) → (8, 256, 16) - mirrors encoder layer 2 (16 filters, s=1)
@@ -772,9 +665,6 @@ def build_decoder(
         padding="same",
         kernel_initializer=HeNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     # Output layer
@@ -782,7 +672,6 @@ def build_decoder(
     # Output 1 filter to match encoder input channels ("grayscale" spectrogram)
     # Uses sigmoid activation to bound output to [0, 1] for binary cross-entropy loss
     # Uses GlorotNormal (like encoder's latent layers) as this is the "boundary" layer
-    # Includes full regularization for symmetry with encoder's first conv layer
     # dtype="float32": fp32 island under beta_vae.mixed_precision — the sigmoid output feeds
     # the BCE reconstruction loss, which must compute on fp32 tensors. A no-op under the
     # default fp32 policy (identical graph).
@@ -795,9 +684,6 @@ def build_decoder(
         dtype="float32",
         kernel_initializer=GlorotNormal(),
         bias_initializer=Zeros(),
-        activity_regularizer=l1(0.001),
-        kernel_regularizer=l2(0.01),
-        bias_regularizer=l2(0.01),
     )(x)
 
     decoder = keras.Model(latent_inputs, decoder_outputs, name="decoder")
@@ -831,7 +717,6 @@ def create_beta_vae_model():
         decoder,
         alpha=config.beta_vae.alpha,
         beta=config.beta_vae.beta,
-        regularization_active=config.beta_vae.regularization_active,
     )
 
     beta_vae.compile(
