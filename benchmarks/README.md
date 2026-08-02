@@ -22,7 +22,7 @@ python benchmarks/bench_rf.py                    # Random Forest stage: latent p
 ./utils/run_container.sh python benchmarks/bench_latent_gif.py --mode all
 # Generation-path A/B (real pooled producer path; --preload-tf needs TF, so run containerized):
 ./utils/run_container.sh python benchmarks/bench_datagen.py --preload-tf \
-    --data-dir /datax/scratch/$USER/bench_datagen
+    --data-dir /datax/scratch/$USER/data/aetherscan/bench/datagen
 ```
 
 `bench_gpu.py` is a different animal — it profiles the Beta-VAE on a real GPU (throughput +

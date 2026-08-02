@@ -283,6 +283,17 @@ rm /dev/shm/psm_*
 
 To do it by hand instead: `ps aux | grep aetherscan`, then `kill -9 <pid>`.
 
+A separate, benign class of leftover can also appear: `/dev/shm/sem.loky-*` POSIX
+semaphores. These come from joblib's loky reusable-executor resource-tracker (pulled in
+transitively, e.g. via scikit-learn), not from the pipeline's own shared memory — Aetherscan's
+`SharedMemory` lifecycle is clean (creator-only `unlink()`, `ResourceManager`-registered, and
+verified). Like the blocks above they leak only on a non-clean teardown (SIGKILL / OOM /
+container exit); they are harmless and safe to remove:
+
+```bash
+rm -f /dev/shm/sem.loky-*
+```
+
 ### Status
 
 **Open.** Investigating root cause. May be related to Slack logger connections in child processes.

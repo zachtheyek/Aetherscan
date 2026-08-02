@@ -35,13 +35,13 @@ Contention/determinism knobs for the #276 audit:
 Cluster usage (the synthetic round defaults to ~12 GB on disk — point --data-dir at scratch):
 
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode gather \
-        --data-dir /datax/scratch/$USER/bench_input
+        --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode iterate \
-        --variant legacy --data-dir /datax/scratch/$USER/bench_input
+        --variant legacy --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode iterate \
-        --variant current --data-dir /datax/scratch/$USER/bench_input
+        --variant current --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
     ./utils/run_container.sh python benchmarks/bench_input_pipeline.py --mode step \
-        --variant current --num-gpus 5 --data-dir /datax/scratch/$USER/bench_input
+        --variant current --num-gpus 5 --data-dir /datax/scratch/$USER/data/aetherscan/bench/input
 
 The synthetic arrays are written once and reused across invocations (delete with --regen or by
 removing --data-dir). After the first write the pages are OS-page-cache resident, matching the
@@ -60,7 +60,7 @@ import threading
 import time
 
 import numpy as np
-from _common import machine_info, write_result
+from _common import default_bench_data_dir, machine_info, write_result
 
 _CADENCE_SHAPE = (6, 16, 512)
 _SAMPLE_BYTES = int(np.prod(_CADENCE_SHAPE)) * 4  # float32
@@ -467,8 +467,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--data-dir",
-        default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "bench_input_pipeline"),
-        help="Where the synthetic round memmaps live (~12 GB at the default --n-samples).",
+        default=default_bench_data_dir("input"),
+        help="Where the synthetic round memmaps live (~12 GB at the default --n-samples); "
+        "defaults under {AETHERSCAN_DATA_PATH}/bench/input.",
     )
     parser.add_argument("--n-samples", type=_positive_int, default=20_000)
     parser.add_argument("--regen", action="store_true", help="Rewrite the synthetic round.")

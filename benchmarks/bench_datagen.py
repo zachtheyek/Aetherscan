@@ -13,7 +13,7 @@ byte-compatibility gate for any generation-path optimization, alongside the wall
     # arm A (checkout master), then arm B (checkout branch), same args:
     ./utils/run_container.sh python benchmarks/bench_datagen.py \
         --n-samples 8192 --workers 32 --seed 11 \
-        --data-dir /datax/scratch/$USER/bench_datagen --output /tmp/arm_a.json
+        --data-dir /datax/scratch/$USER/data/aetherscan/bench/datagen --output /tmp/arm_a.json
 
 Compare: python -c "import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:3]); \
     print('IDENTICAL' if a['checksums']==b['checksums'] else 'MISMATCH')" /tmp/arm_a.json /tmp/arm_b.json
@@ -34,7 +34,7 @@ from multiprocessing import Pool
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
-from _common import write_result
+from _common import default_bench_data_dir, write_result
 
 from aetherscan.data_generation import _init_worker, generate_round_to_memmap
 from aetherscan.round_data import RoundDataPaths
@@ -69,7 +69,13 @@ def main() -> None:
     )
     parser.add_argument("--snr-base", type=float, default=10.0)
     parser.add_argument("--snr-range", type=float, default=40.0)
-    parser.add_argument("--data-dir", required=True, help="Scratch dir for the generated round")
+    parser.add_argument(
+        "--data-dir",
+        default=default_bench_data_dir("datagen"),
+        help="Scratch dir for the generated round (default: {AETHERSCAN_DATA_PATH}/bench/"
+        "datagen). Deleted on exit unless --keep is passed — pass --keep to persist the round "
+        "under the bench dir.",
+    )
     parser.add_argument("--keep", action="store_true", help="Keep the round dir (default: delete)")
     parser.add_argument(
         "--preload-tf",
