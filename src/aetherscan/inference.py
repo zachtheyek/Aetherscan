@@ -413,13 +413,16 @@ class InferencePipeline:
                 "are from different runs, or the config was hand-edited."
             )
 
-        # z_mean_logvar_active selects its log_var COLUMNS by active-dim index, so two equal-length
-        # active-dim sets share a feature count and pass checks 1-2 yet score different columns.
+        # z_mean_logvar_active selects its log_var COLUMNS by active-dim index via
+        # _active_logvar_columns, which SORTS — so the columns are a function of the active-dim SET,
+        # not its order. Two equal-length sets share a feature count and pass checks 1-2 yet score
+        # different columns; compare as sets (sorted) so a reordered-but-equivalent config doesn't
+        # false-trip.
         recorded_active_dims = getattr(self.rf_model.model, "aetherscan_active_dims_", None)
         if (
             recorded_active_dims is not None
             and declared_variant == "z_mean_logvar_active"
-            and list(recorded_active_dims) != list(self.config.rf.active_dims or [])
+            and sorted(recorded_active_dims) != sorted(self.config.rf.active_dims or [])
         ):
             raise ValueError(
                 f"RF active-dims mismatch for latent_variant='z_mean_logvar_active': the loaded "

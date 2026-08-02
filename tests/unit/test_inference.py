@@ -479,3 +479,25 @@ class TestRfFeatureLayoutGuard:
         )
         with pytest.raises(ValueError, match="active-dims mismatch"):
             pipeline._check_rf_feature_layout()
+
+    def test_reordered_active_dims_passes(self):
+        # Same SET, different order ([2,0,1] vs [0,1,2]): _active_logvar_columns sorts, so the
+        # columns are identical -> the set-wise (sorted) compare must NOT false-trip
+        self._pipeline(
+            "z_mean_logvar_active",
+            [0, 1, 2],
+            66,
+            recorded_variant="z_mean_logvar_active",
+            recorded_active_dims=[2, 0, 1],
+        )._check_rf_feature_layout()
+
+    def test_active_dims_drift_ignored_for_nonactive_variant(self):
+        # z_mean does NOT use active_dims for its columns, so a stamped/config active-dims drift is
+        # irrelevant and must be ignored (the check is scoped to z_mean_logvar_active). Count = 48.
+        self._pipeline(
+            "z_mean",
+            list(range(8)),
+            48,
+            recorded_variant="z_mean",
+            recorded_active_dims=[5, 6, 7],
+        )._check_rf_feature_layout()
