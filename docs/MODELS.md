@@ -102,7 +102,14 @@ total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(fa
   activated them across a range of penalty strengths (the added penalty spanning ~0.3–1.6% of
   the objective) and found no benefit at this architecture and these data scales:
   recall@0.01FPR, validation AUC, and active-latent-dim count were all statistically
-  indistinguishable from the unregularized model. The declarations were removed.
+  indistinguishable from the unregularized model. The declarations were removed. Existing
+  artifacts are unaffected: a saved `.keras` model rebuilds each layer from its own embedded
+  per-layer config, not from `build_encoder`/`build_decoder`, so an encoder or decoder trained
+  before #324 (including the released v1.0.0 weights) still reloads with the regularizer
+  declarations attached. They remain inert — the penalties only ever surfaced through
+  `model.losses`, which neither the training loop nor the inference path reads — and the
+  trained weights are numerically identical to what they always were, since the objective
+  never included the penalties in the first place.
 - **Reconstruction**: `main` is reshaped to `(B·6, 16, 512, 1)`, encoded, decoded, and scored
   with binary cross-entropy summed over the spectrogram and averaged over the batch
   (`from_logits=False`; the decoder output is already sigmoid-bounded).
