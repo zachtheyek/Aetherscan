@@ -148,10 +148,13 @@ paths:
   otherwise silently score the **wrong representation**. **(3) Active-dims identity** — the forest's
   `aetherscan_active_dims_` stamp vs `rf.active_dims`, checked only for `z_mean_logvar_active`
   (whose `log_var` columns are active-dim-indexed), where two equal-length dim *sets* share a
-  feature count yet select different columns. Forests trained before #318 (including the released
-  v1.0.0 weights) carry no stamps, so checks 2–3 no-op on them. The guard fires on mixed
-  `--config-path`/`--rf-path` from different runs or a hand-edited config, never on the sanctioned
-  HF path (which ships the winning forest with its own config).
+  feature count yet select different columns (compared as sorted sets, so a reordered-but-equivalent
+  `active_dims` doesn't false-trip). Forests trained before #318 (including the released v1.0.0
+  weights) carry no stamps, so checks 2–3 no-op on them. The guard fires on mixed
+  `--config-path`/`--rf-path` from different runs, a hand-edited config, or the likeliest slip —
+  pointing `--rf-path` at a sibling `random_forest_{tag}_{variant}.joblib` sweep artifact in the
+  same directory under the same tag (same run, same tag, wrong representation — the case checks 2–3
+  exist for); never on the sanctioned HF path (which ships the winning forest with its own config).
 - `--config-path` → the training run's `config_{tag}.json`, layered onto the singleton by
   `cli.apply_saved_config()` **before validation** so shape-critical fields
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
