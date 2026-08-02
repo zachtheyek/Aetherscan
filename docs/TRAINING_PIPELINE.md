@@ -830,7 +830,10 @@ winner empirically:
 3. **Every variant is fit and evaluated under its deterministic inference-time form**
    (`z_mean` in the lead feature slot — for the `z`/`z_aug` variants that is deliberately the
    deployed configuration, not the training one) and saved as
-   `random_forest_{tag}_{variant}.joblib`.
+   `random_forest_{tag}_{variant}.joblib`. Since #318 each forest is stamped at the fit site
+   with `aetherscan_latent_variant_` / `aetherscan_active_dims_`, so every per-variant artifact
+   is self-describing — they all share a directory and a tag, and are therefore the likeliest
+   source of a mispairing.
 4. **Selection**: the primary metric is recall at `rf.selection_max_fpr` on the selection
    split (AUC averages over operating points the pipeline never uses). The best variant must
    beat every *simpler* (fewer-feature) variant by more than a bootstrap CI of the recall
@@ -841,7 +844,12 @@ winner empirically:
    upload, and release tagging all pick it up unchanged — and the sweep outcome is recorded
    on the config (`rf.latent_variant`, `rf.active_dims`) so `config_{tag}.json` tells
    inference exactly how to rebuild features (never hardcoded). A resumed attempt restores
-   these fields from the eval artifacts instead of re-sweeping.
+   these fields from the eval artifacts instead of re-sweeping. Because the winner *is*
+   `variant_models[winner]`, it arrives pre-stamped from step 3 — so every dump of it (the
+   canonical RF, the SHAP re-dump, `final_save`) carries the stamps, and inference's
+   `_check_rf_feature_layout()` reads them back to reject a config↔weights variant /
+   active-dims mismatch the feature-count check cannot see (see
+   [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)).
 6. **ECE-gated calibration**: the winner's ECE is measured on the calibration split; only
    when it exceeds `rf.max_ece` is a calibrator fit (isotonic with ≥
    `rf.calibration_min_isotonic` rows, else sigmoid/Platt — isotonic overfits small sets),

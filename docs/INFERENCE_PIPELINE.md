@@ -136,14 +136,33 @@ paths:
   when training calibrated would be a silent train/serve mismatch. The saved
   `rf.latent_variant` / `rf.active_dims` drive how features are rebuilt from the encoder
   outputs (never hardcoded — see the two-pass cascade below), and `_check_rf_feature_layout()`
-  cross-checks them against the loaded forest's own `n_features_in_`, raising
-  `ValueError("RF feature-count mismatch: ...")` when they disagree. sklearn's built-in check
-  cannot catch this on its own: `z`, `z_mean`, and `z_aug` are all
-  `num_observations × latent_dim` wide, so a config declaring one while the weights were fit on
-  another passes the width test and inference silently scores the **wrong representation**. The
-  guard fires on mixed `--config-path`/`--rf-path` from different runs or a hand-edited config,
-  never on the sanctioned HF path (which ships the winning forest with its own config), and
-  no-ops on a forest that carries no `n_features_in_`.
+  cross-checks them against the loaded forest itself, via **three checks of increasing
+  specificity** — each no-opping when the signal it needs is absent, so an older artifact never
+  false-trips:
+
+  1. **Feature count** — `variant_feature_count(rf.latent_variant, ...)` vs the forest's
+     `n_features_in_`, raising `ValueError("RF feature-count mismatch: ...")`. Catches
+     *different*-width mismatches (e.g. a `z_mean`=48 config against a `z_mean_logvar`=96
+     forest) at model-load time rather than at sklearn's own predict-time check. No-ops on a
+     forest with no `n_features_in_`.
+  2. **Variant identity** (#318) — the forest's `aetherscan_latent_variant_` stamp (written at
+     train time) vs `rf.latent_variant`, raising `ValueError("RF latent-variant mismatch: ...")`.
+     This is what the count check *cannot* do: `z`, `z_mean`, and `z_aug` are all
+     `num_observations × latent_dim` wide, so a config↔weights mix among them passes both the
+     count check and sklearn's predict-time check, and inference would silently score the
+     **wrong representation**. No-ops on a forest carrying no stamp — including the released
+     **v1.0.0** weights, so v1.0.0 inference is unaffected.
+  3. **Active-dims identity** (#318) — the forest's `aetherscan_active_dims_` stamp vs
+     `rf.active_dims`, checked **only** for `z_mean_logvar_active` (the one variant whose feature
+     *columns* are chosen by active-dim index), raising
+     `ValueError("RF active-dims mismatch ...")`. Two equal-*length* sets (e.g. `[0,1,2]` vs
+     `[5,6,7]`) pass checks 1–2 yet select different `log_var` columns. The comparison is
+     set-wise (sorted), matching `_active_logvar_columns`, so a merely reordered config does not
+     trip it.
+
+  None of these fire on the sanctioned HF path (which ships the winning forest with its own
+  config); they guard mixed `--config-path`/`--rf-path` pairings from different runs, or a
+  hand-edited config.
 - `--config-path` → the training run's `config_{tag}.json`, layered onto the singleton by
   `cli.apply_saved_config()` **before validation** so shape-critical fields
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
