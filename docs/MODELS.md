@@ -52,9 +52,8 @@ downsampling, five stride-1 feature layers), then dense compression to the laten
 
 Then `Flatten` → `(8192,)` → `Dense(dense_layer_size=512)` → two parallel heads
 `z_mean` and `z_log_var`, each `Dense(latent_dim=8)`, and a `Sampling` layer producing `z`.
-Every layer carries the same regularization stack: HeNormal init (GlorotNormal on the latent
-heads), L1(0.001) activity regularization (sparse activations), L2(0.01) kernel + bias
-regularization. `z_log_var`'s bias initializes at **−3.0**, tightening the initial posterior
+Every layer uses the same initialization: HeNormal (GlorotNormal on the latent heads) with
+zero biases. `z_log_var`'s bias initializes at **−3.0**, tightening the initial posterior
 around the prior so early training isn't swamped by sampling noise.
 
 ### Sampling layer (reparameterization)
@@ -93,23 +92,17 @@ Each training batch is a triplet `(main, true, false)` of cadence batches
 arrays are generated):
 
 ```
-total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(false)) [+ reg]
+total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(false))
 ```
 
-- **Regularization** (`reg`, behind `beta_vae.regularization_active`, **default OFF for
-  v1**): the sum of the layer-declared penalties — L2(0.01) on every conv kernel and bias
-  plus L1(0.001) on conv activations. These declarations existed since inception but were
-  never consumed: a custom training loop only applies them if it adds `model.losses` to the
-  objective, so **every model this pipeline has trained is effectively unregularized**. A
-  2026-07 activation attempt at the declared (never-calibrated) coefficients measurably
-  degraded the model in a 5-seed A/B — recall@0.01FPR median .984 → .954 with a worst seed
-  at .72, and 1–4 latent dims per seed pushed below the active-units threshold — so v1
-  ships with the flag off and the objective byte-identical to the historical pipeline.
-  `reg_loss` is still computed and recorded every run for observability (stock keras
-  semantics: weight penalties once; activity penalties batch-SUM-scaled, once per
-  regularized-layer forward inside the loss), so calibration work has live data; the
-  coefficient-calibration question is a tracked follow-up issue. Flipping the flag changes
-  training numerics — A/B-gate it like the other numerics flags.
+- **Regularization** *(evaluated and removed, #293)*: the conv/dense layers historically
+  declared L1/L2 penalties (`activity_regularizer`, `kernel_regularizer`, `bias_regularizer`)
+  that the custom training loop never added to the objective — dead code since inception, so
+  every model this pipeline trained was effectively unregularized. A calibration sweep (#293)
+  activated them across a range of penalty strengths (the added penalty spanning ~0.3–1.6% of
+  the objective) and found no benefit at this architecture and these data scales:
+  recall@0.01FPR, validation AUC, and active-latent-dim count were all statistically
+  indistinguishable from the unregularized model. The declarations were removed.
 - **Reconstruction**: `main` is reshaped to `(B·6, 16, 512, 1)`, encoded, decoded, and scored
   with binary cross-entropy summed over the spectrogram and averaged over the batch
   (`from_logits=False`; the decoder output is already sigmoid-bounded).

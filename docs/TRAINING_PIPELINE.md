@@ -545,9 +545,7 @@ out.
 ### `beta_vae_loss_curves_{tag}.png`
 
 Total loss (full-width top panel) plus reconstruction / KL / true-clustering /
-false-clustering / regularization components (bottom row; the regularization panel shows the
-recorded-but-inactive-by-default penalties — `beta_vae.regularization_active`, see
-MODELS.md — and is empty for runs predating their recording), train and val overlaid,
+false-clustering components (bottom row), train and val overlaid,
 epochs on the x-axis with per-round SNR-range shading in the background. Since #277 the x-axis is the **real**
 global-epoch position (`(round − 1) · epochs_per_round + epoch`, via `build_epoch_history`):
 epochs with no committed row render as visible NaN gaps instead of silently shifting later

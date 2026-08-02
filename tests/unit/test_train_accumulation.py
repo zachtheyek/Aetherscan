@@ -41,7 +41,6 @@ class _StubModel(tf.Module):
             "kl_loss": 0.25 * total,
             "true_loss": 0.15 * total,
             "false_loss": 0.1 * total,
-            "reg_loss": 0.05 * total,
             "kl_per_dim": tf.fill([_LATENT_DIM], 0.01 * total),
         }
 
@@ -175,7 +174,7 @@ class TestAccumulatedTrainStep:
         val_loop = tp._get_val_loop(3)
         totals = val_loop(iter(_dataset_from(batches))).numpy()
 
-        expected = np.zeros(6)
+        expected = np.zeros(5)
         for (main, true, false), y in batches:
             losses = model.compute_total_loss(main, true, false, y, training=False)
             expected += np.array(
@@ -185,7 +184,6 @@ class TestAccumulatedTrainStep:
                     losses["kl_loss"].numpy(),
                     losses["true_loss"].numpy(),
                     losses["false_loss"].numpy(),
-                    losses["reg_loss"].numpy(),
                 ]
             )
         np.testing.assert_allclose(totals, expected / 3, rtol=1e-5)
