@@ -76,7 +76,8 @@ tests/
 │   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
 │   ├── test_dashboard_cli.py        # aetherscan-dashboard console entry: exec-argv builder + streamlit-missing guard
 │   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths
-│   └── test_logger.py               # StreamToLogger redirect probes + log_path_for_tag / tagged FileHandler
+│   ├── test_logger.py               # StreamToLogger redirect probes + log_path_for_tag / tagged FileHandler
+│   └── test_legacy_keras_env.py     # TF_USE_LEGACY_KERAS default: import sets it, explicit value kept, tf.keras == tf_keras
 └── integration/                 # marked integration+gpu+cluster: needs real GPUs + cluster data
     ├── conftest.py                  # repo-root launcher + cluster path resolution
     ├── test_train_smoke.py          # known-good training smoke config, end to end
@@ -203,7 +204,9 @@ Consequences worth knowing:
 - `MPLBACKEND=Agg`, `TF_CPP_MIN_LOG_LEVEL=2`, and `TF_USE_LEGACY_KERAS=1` are set before any
   aetherscan or TensorFlow import (train.py imports pyplot at module level; CI runners are
   headless; the legacy-Keras default (#323) must land before any test module imports TF, not just
-  the ones that import aetherscan first).
+  the ones that import aetherscan first). If collection fails with `ImportError: Keras cannot be
+  imported`, the env has TensorFlow but not `tf_keras` — `pip install "tf_keras==2.17.*"` (the
+  conda/pip manifests already pull it; this only bites hand-rolled environments).
 - Singleton imports inside the fixture are deferred so **integration runs never import
   TensorFlow into the pytest parent process** — the integration tests exercise the pipeline
   as a subprocess and inherit the real environment instead.
