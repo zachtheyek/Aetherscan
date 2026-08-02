@@ -63,8 +63,9 @@ of the contract. Bump the leftmost segment that applies:
   code loads old weights). The weights are the product, so re-blessing on the same contract is a
   user-facing feature → at least a MINOR bump.
 - **PATCH (`Z`) — backward-compatible fixes**: no new capability, no contract change. Examples: a bug
-  fix (e.g. the off-cluster `tf_keras` weight-load fix for [#323](https://github.com/zachtheyek/Aetherscan/issues/323)); a dependency security bump inside the
-  documented version ranges; a docs-only correction; a packaging fix. If a user would see no
+  fix (e.g. the off-cluster `tf_keras` weight-load fix for
+  [#323](https://github.com/zachtheyek/Aetherscan/issues/323)); a dependency security bump inside
+  the documented version ranges; a docs-only correction; a packaging fix. If a user would see no
   behavioral difference except that something broken now works, it's a PATCH.
 
 Two rules make bundled releases unambiguous:
