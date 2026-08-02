@@ -52,6 +52,9 @@ dependencies = [
     # them); a pip install has no base image to lean on and must declare them. Ranges
     # mirror environment.yml's pins.
     "tensorflow[and-cuda]==2.17.*",
+    # tf_keras backs legacy-Keras mode (TF_USE_LEGACY_KERAS, set in aetherscan/__init__.py):
+    # the v1.0.0 .keras weights are Keras-2 format, so a bare pip install must pull it (#323).
+    "tf_keras~=2.17.0",
     "h5py>=3.11,<3.12",
     "hdf5plugin",
     "psutil>=6.0,<6.1",
