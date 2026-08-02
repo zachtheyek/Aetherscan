@@ -232,7 +232,7 @@ pushes to master, on Python **3.10, 3.11, and 3.12** (the full `requires-python`
 3.10 and 3.12 are the conda and NGC-container runtimes; `fail-fast: false` so all report):
 
 ```
-pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
+pip install "tensorflow-cpu==2.17.*" "tf_keras==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
 pytest -m "not gpu and not cluster and not integration" -q
 ```
 
@@ -242,9 +242,11 @@ fixture) that would otherwise leak into CI without a `gpu` or `cluster`
 co-marker. Today every `integration` test is also `gpu`+`cluster`, so the
 `and not integration` clause is a no-op on the current suite.
 
-`tensorflow-cpu` stands in for the container's GPU TF 2.17 build; `h5py`/`hdf5plugin`/
+`tensorflow-cpu` stands in for the container's GPU TF 2.17 build; `tf_keras`/`h5py`/`hdf5plugin`/
 `pandas`/`psutil` are installed explicitly because the NGC base image ships them (so
-`requirements-container.txt` intentionally omits them). A few tests assert Linux-only
+`requirements-container.txt` intentionally omits them). `tf_keras` in particular is required
+because importing `aetherscan` sets `TF_USE_LEGACY_KERAS=1` (#323), so the suite exercises the
+same legacy-Keras backend the pipeline runs on. A few tests assert Linux-only
 behavior (PSS memory accounting) and self-skip elsewhere — the suite is green on macOS
 locally, with skips. See [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md) for how the test
 workflow feeds the weekly flaky-test tracker.
