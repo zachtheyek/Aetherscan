@@ -13,6 +13,9 @@ Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Bet
 ./utils/run_container.sh python -m aetherscan.main {train|inference} --save-tag train
 # Alternative: conda env (Ampere only) — prefix with PYTHONPATH=src
 PYTHONPATH=src python -m aetherscan.main {train|inference} --save-tag train
+# Off-cluster: PyPI package (Ampere only — pip's CUDA wheels have no sm_120); v1.0.0 also needs
+# `pip install "tf_keras~=2.17.0"` + `export TF_USE_LEGACY_KERAS=1` — see README "Install From PyPI (pip)"
+pip install aetherscan && python -m aetherscan.main {train|inference} --save-tag inf
 # Lint + format (also enforced via pre-commit)
 ruff check src/ && ruff format src/
 ```
