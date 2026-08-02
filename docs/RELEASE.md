@@ -41,8 +41,9 @@ Two invariants to internalize:
   [`requirements-container.txt`](../requirements-container.txt)'s ranges **plus** the
   packages the NGC base image provides implicitly (`tensorflow[and-cuda]==2.17.*`, `h5py`,
   `hdf5plugin`, `psutil`) — a pip install has no base image to lean on.
-  Optional extras: `dev = ["ruff", "pre-commit", "pytest"]` and
-  `dashboard = ["streamlit>=1.39,<1.41", "plotly>=5.24,<6", "pandas>=2.0,<3"]` —
+  Optional extras: `dev = ["ruff", "pre-commit", "pytest>=9.0.3"]` (the `pytest` floor is a
+  security floor — GHSA-6w46-j5rx-g56g, tmpdir handling; dev/test-only) and
+  `dashboard = ["streamlit>=1.54.0,<1.55", "plotly>=5.24,<6", "pandas>=2.0,<3"]` —
   `pip install aetherscan[dashboard]` pulls the stack for the packaged live dashboard
   ([`src/aetherscan/dashboard.py`](../src/aetherscan/dashboard.py)). Dependency *versions* follow
   [`SECURITY.md`](../SECURITY.md)'s selection policy, and the documented ceilings

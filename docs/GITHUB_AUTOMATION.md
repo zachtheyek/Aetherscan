@@ -32,7 +32,7 @@ assistant run and, typically, a follow-up PR.
 - Write the handle **only when you intend to summon the assistant**.
 - To mention it as plain text, write it as `"@ claude"` — a space after the `@`, double
   quotes around it — so the substring can never match. This convention is prescribed in
-  [`CLAUDE.md`](../CLAUDE.md) and [`CONTRIBUTING.md`](../CONTRIBUTING.md); an accidental tag
+  [`CLAUDE.md`](../CLAUDE.md); an accidental tag
   is what spawned the spurious run around issue #83.
 - The workflow also triggers on **assignment** to the `claude` user and on the `claude`
   **label** — treat those as invocations too.
@@ -50,7 +50,8 @@ This is a required check — the same hooks you run locally, so a green local
 
 ### `tests.yml`
 
-**Trigger:** every PR, pushes to master, `workflow_dispatch`.
+**Trigger:** every PR, pushes to master, `workflow_dispatch`, `workflow_call` (reusable —
+invoked by `release.yml`).
 Runs `pytest -m "not gpu and not cluster and not integration" -q` on Python 3.10, 3.11, **and** 3.12 (the full
 `requires-python` range — 3.10 and 3.12 are the conda and NGC container runtimes;
 `fail-fast: false`), with `tensorflow-cpu==2.17.*` standing in for the
@@ -89,7 +90,7 @@ double-post.
 | [`claude-release-notes.yml`](../.github/workflows/claude-release-notes.yml) | PR **merged** to master | Drafts a release-note entry as a PR comment — the curated raw material for release bodies (see [`RELEASE.md`](RELEASE.md)). | `<!-- claude-release-notes -->` first line of the comment |
 | [`claude-style-check.yml`](../.github/workflows/claude-style-check.yml) | PR merged to master | Scans the merged diff's *added* lines against the project style rules ruff can't express (docstring prose style, canonical comment markers, logging idioms); files one consolidated issue when violations exist. | `<!-- aetherscan-style-check pr=<N> -->` |
 | [`claude-update-docs.yml`](../.github/workflows/claude-update-docs.yml) | PR merged to master; `workflow_dispatch` with a `pr_number` (re-scan an old PR with the *current* workflow logic) | Detects doc drift caused by the merge. If `cli.py` changed, a **shell step** regenerates the README CLI Reference blocks with `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13) and embeds the output in the issue, because the follow-up assistant run has no `python` in its tool allowlist. The filed issue contains an intentional handle mention, which triggers `claude.yml` to open the actual docs PR. | `<!-- aetherscan-update-docs pr=<N> -->` |
-| [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
+| [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `pyproject.toml` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
 | [`claude-flaky-test-tracker.yml`](../.github/workflows/claude-flaky-test-tracker.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Reads the week's `tests.yml` runs, identifies flaky/failing tests, diagnoses the worst offender, files a weekly report issue. | `<!-- aetherscan-flaky-test-tracker week=<WEEK> -->` |
 
 > [!NOTE]

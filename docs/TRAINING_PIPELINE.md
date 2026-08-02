@@ -130,8 +130,9 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
   after the first epoch the OS caches the round in otherwise-free RAM, so steady-state reads
   run at RAM speed — but under memory pressure the kernel evicts pages instead of OOM-killing
   the process.
-- **Disk budget.** ~295 GB per round at defaults, ~2 rounds on disk at once with overlap
-  (~590 GB peak). `cli.py:collect_validation_errors` checks free space at startup
+- **Disk budget.** ~147 GB per round at the `float16` default, ~2 rounds on disk at once with
+  overlap (~294 GB peak; the `float32` setting doubles both to ~295 GB / ~590 GB).
+  `cli.py:collect_validation_errors` checks free space at startup
   (`_estimate_round_data_nbytes`: 2.2× one round with overlap, 1.1× without) and hard-fails
   with the computed numbers. Round *k*'s directory is deleted as soon as round *k* finishes
   training (`--keep-round-data` retains it for debugging). During the last round the RF
@@ -141,10 +142,11 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
 > [!TIP]
 > **For official tagged training releases, pass `--keep-round-data`.** By default each round's
 > memmaps are deleted the moment that round finishes training (delete-as-you-go keeps the disk
-> footprint at ~590 GB). `--keep-round-data` retains every round's exact on-disk dataset (plus the
+> footprint at ~294 GB). `--keep-round-data` retains every round's exact on-disk dataset (plus the
 > RF training set) under `{data_path}/training/round_data/{save_tag}/{round_XX,rf}/`, so a release
 > model's training data is reproducible/inspectable after the fact — at the cost of holding the full
-> run on disk (~295 GB × num_training_rounds, e.g. ~6 TB for a 20-round run). Nothing in the pipeline
+> run on disk (~147 GB × num_training_rounds, e.g. ~2.94 TB for a 20-round run; double both under
+> the `float32` setting). Nothing in the pipeline
 > *reads* an earlier round once it has trained, so this flag is purely for post-hoc retention.
 
 ### The producer process
@@ -382,7 +384,10 @@ pathology — see below). `"float32"` / `False` restore the historical numerics 
   existing `tf.cast` becomes the host-side upcast (the viz fancy-index path upcasts
   identically), so the training graph and loss math see float32 unchanged either way. Labels
   and lognorm sidecars stay float32; `.done` manifests record the dtypes and every
-  reuse/resume path gates on them (legacy manifests read as float32).
+  reuse/resume path gates on them (legacy manifests read as float32). This fp16 economy is
+  specific to the log-normed `[0, 1]` round arrays: the inference candidate **stamps** stay
+  float32 (`candidate_figures.py`), since raw energy-detection amplitudes routinely exceed
+  fp16's 65504 ceiling — fp16 was only ever safe for the round arrays, not the stamps.
 - **`beta_vae.mixed_precision`** (`False` default — **kept off after failing the 7-seed
   gate**: six seeds clean, but bf16-seed-13 reproducibly degrades, recall .8432 / val AUC
   .9807 vs the .9449 / .9925 control floor, and was the only configuration to trip the
@@ -830,7 +835,8 @@ winner empirically:
    split (AUC averages over operating points the pipeline never uses). The best variant must
    beat every *simpler* (fewer-feature) variant by more than a bootstrap CI of the recall
    difference (`rf.selection_bootstrap_rounds`), else the simpler variant wins the tie —
-   `select_winner()`'s minimum-margin rule.
+   `select_winner()`'s minimum-margin rule. The comparison this rule ran is charted per run in
+   [the variant-selection plot](#the-variant-selection-plot-latent_variant_selection_tagpng).
 5. **The winner becomes THE model** — canonical `random_forest_{tag}.joblib` filename, HF
    upload, and release tagging all pick it up unchanged — and the sweep outcome is recorded
    on the config (`rf.latent_variant`, `rf.active_dims`) so `config_{tag}.json` tells
@@ -866,6 +872,25 @@ curve keeps its pre-existing hard-coded 0.5 threshold (the dashboard shows a cap
 disambiguate it from the deployment-threshold scalar). Metric persistence is best-effort:
 an sklearn edge case (e.g. a single-class val split) logs a warning and never fails the
 training run.
+
+### The variant-selection plot (`latent_variant_selection_{tag}.png`)
+
+The sweep's outcome used to surface only as a log line plus `training_stats` scalars, which
+made "why did the pipeline deploy *this* representation?" an archaeology exercise.
+`plot_rf_latent_variant_selection()` renders it instead, to
+`plots/training/{tag}/latent_variant_selection_{tag}.png`:
+
+| Panel | Contents | What to look for |
+| --- | --- | --- |
+| Recall@`rf.selection_max_fpr` bars | Every swept variant on the selection split, ordered simple → complex down the y-axis (`VARIANT_ORDER`), winner highlighted and tagged `★ winner`, x-axis auto-zoomed to the spread. When the minimum-margin tie-break passed over a *higher*-recall variant, a shaded band spans the winner's recall up to that best recall. | The band is the point: it's the recall the pipeline deliberately traded for a simpler representation because the difference didn't clear bootstrap noise. A wide band on a run where the margin barely failed is the flag to re-check `rf.selection_bootstrap_rounds` or grow the selection split. |
+| ROC-AUC / Brier / ECE / feature count | The same variants on the secondary metrics, feature count being the complexity axis the tie-break trades against. | A winner that's mid-pack on AUC is normal (selection optimizes recall at the deployed FPR, not averaged operating points); a winner with a visibly worse ECE is the one to watch — it raises the odds that step 6's ECE gate fits a calibrator. |
+
+Unlike the ten diagnostics catalogued under [RF diagnostics](#rf-diagnostics-rf_plots-stage-10-pngs),
+this figure is rendered **inline in `rf_train`, not `rf_plots`**: it reads the in-memory
+`variant_metrics` the sweep just computed, so it needs no DB round-trip and no
+`rf_eval_artifacts_{tag}.joblib`. Rendering is best-effort — a failure warns and the run
+continues — and it never touches the selection numerics. See
+[`MODELS.md`](MODELS.md#latent-representation-variants-282) for the variant catalogue itself.
 
 ## Configuration quick reference
 

@@ -98,11 +98,19 @@ total = reconstruction(main) + β · KL(main) + α · (L_true(true) + L_false(fa
 - **Regularization** *(evaluated and removed, #293)*: the conv/dense layers historically
   declared L1/L2 penalties (`activity_regularizer`, `kernel_regularizer`, `bias_regularizer`)
   that the custom training loop never added to the objective — dead code since inception, so
-  every model this pipeline trained was effectively unregularized. A calibration sweep (#293)
-  activated them across a range of penalty strengths (the added penalty spanning ~0.3–1.6% of
-  the objective) and found no benefit at this architecture and these data scales:
-  recall@0.01FPR, validation AUC, and active-latent-dim count were all statistically
-  indistinguishable from the unregularized model. The declarations were removed.
+  every model this pipeline trained was effectively unregularized. A 12-run calibration sweep
+  (#293 — control plus three penalty strengths × three seeds, the added penalty anchored to
+  span ~0.3–1.6% of the *measured* objective) found no benefit at this architecture and these
+  data scales: recall@0.01FPR, validation AUC, and active-latent-dim count were all
+  statistically indistinguishable from the unregularized model (every arm's recall Δ fell
+  inside the control's own 2σ). The declarations were removed (#324). Existing artifacts are
+  unaffected: a saved `.keras` model rebuilds each layer from its own embedded per-layer
+  config, not from `build_encoder`/`build_decoder`, so an encoder or decoder trained before
+  #324 (including the released v1.0.0 weights) still reloads with the regularizer declarations
+  attached. They remain inert — the penalties only ever surfaced through `model.losses`, which
+  neither the training loop nor the inference path reads — and the trained weights are
+  numerically identical to what they always were, since the objective never included the
+  penalties in the first place.
 - **Reconstruction**: `main` is reshaped to `(B·6, 16, 512, 1)`, encoded, decoded, and scored
   with binary cross-entropy summed over the spectrogram and averaged over the batch
   (`from_logits=False`; the decoder output is already sigmoid-bounded).
@@ -150,14 +158,16 @@ into `(n_cadences, 6 · latent_dim)` rows by concatenating each cadence's six la
 
 ```
 feature index f  =  obs_idx · latent_dim + dim     # obs 0..5 (ABACAD), dim 0..7
-[ obs0_z0 .. obs0_z7 | obs1_z0 .. obs1_z7 | ... | obs5_z0 .. obs5_z7 ]
-   ON            OFF             ON            OFF            ON           OFF
+[ ON-1_dim-0 .. ON-1_dim-7 | OFF-1_dim-0 .. OFF-1_dim-7 | ... | OFF-3_dim-0 .. OFF-3_dim-7 ]
+      obs 0            obs 1                ...                      obs 5
 ```
 
 The caller must keep rows `i·6 .. i·6+5` grouped as cadence *i* — both training
 (`shuffle=False` datasets pin encode order to the index arrays) and inference (snippet-major
-`.npy` order preserved through padding/truncation) uphold this contract. Features are indexed
-`obs{i}_z{d}` in the SHAP plots; even-numbered observations are ON-source.
+`.npy` order preserved through padding/truncation) uphold this contract. These are exactly the
+SHAP feature labels (`latent_variants.variant_feature_names`): `{ON|OFF}-{pair}_dim-{d}`, with
+even observations ON-source and `pair = obs_idx // 2 + 1` (so `ON-1`…`OFF-3`, dim `0..7`). The
+uncertainty variants append their own prefixed extras (`logvar_…`, `total_kl`, `logvar_mean_…`).
 
 ### Latent-representation variants (#282)
 
@@ -190,12 +200,19 @@ The ordering is a tie-break contract: selection walks it simple → complex, so 
 loses to a *more* complex one that beats it beyond bootstrap noise. Variant names are
 persisted in `config_{tag}.json` and artifact filenames — treat them as stable. The
 latent-space *visualizations* always use the deterministic `z_mean` regardless of variant.
+Each run also visualizes its own outcome: `latent_variant_selection_{tag}.png` charts all
+swept variants' recall at the selection FPR, flags the winner, and shades the recall the
+minimum-margin tie-break traded away for a simpler representation (see
+[`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md#the-variant-selection-plot-latent_variant_selection_tagpng)).
 
 ### Classifier and thresholds
 
 `RandomForestClassifier(n_estimators=1000, bootstrap=True, max_features="sqrt",
 random_state=<derived from the root seed>, n_jobs=-1)`, fit on binary labels (`true_*`
-subtypes = 1). `n_jobs` is a predict-time execution knob: `RandomForestModel.load()`
+subtypes = 1). No `max_depth`/`min_samples_leaf` override is set, so trees grow to purity
+(sklearn defaults) — trees routinely deeper than 31 levels, which is what puts a forest past
+GPUTreeShap's warp-lane depth cap and keeps SHAP on the CPU multiprocessing path (see the SHAP
+performance section in [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)). `n_jobs` is a predict-time execution knob: `RandomForestModel.load()`
 re-pins it from the **runtime** config (#301) — the pickled artifact otherwise carried the
 training host's value wholesale. Prediction surfaces:
 
@@ -251,7 +268,7 @@ tell you what it costs in recall.
 
 Interpretation guidance for the SHAP/diagnostic figures lives with the plot catalog in
 [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md). The short version of what the SHAP artifacts
-*mean*: summary values attribute each cadence's `P(true)` to individual `obs{i}_z{d}`
+*mean*: summary values attribute each cadence's `P(true)` to individual `{ON|OFF}-{pair}_dim-{d}`
 features (sign = direction, magnitude = influence); interaction values split attributions
 into per-feature main effects (diagonal) and pure pairwise effects (off-diagonal — the
 ON×OFF blocks are where cadence logic shows); the log-loss decomposition re-attributes *loss*

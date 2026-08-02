@@ -221,6 +221,7 @@ Aetherscan/
 │   ├── get_system_info.sh           # System info helper
 │   ├── hf_tag_release.py            # Bless trained weights as a release tag on HF
 │   ├── kill_pipeline.sh             # Stop a running pipeline (main + workers)
+│   ├── perband_report.py            # Render the per-band inference-performance plot
 │   ├── print_cli_help.py            # CLI reference regen helper
 │   ├── run_container.sh             # Apptainer/SingularityCE wrapper
 │   ├── start_tmux_session.sh        # tmux session template helper

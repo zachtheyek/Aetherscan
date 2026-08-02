@@ -7,7 +7,7 @@ description: Deep-dive context for working inside the Aetherscan repo — Breakt
 
 Aetherscan is Breakthrough Listen's first end-to-end production-grade deep-learning pipeline for SETI at scale. It detects anomalies in radio spectrograms with technosignature-like characteristics by pairing a **beta-VAE** (dimensionality reduction / feature extraction) with a **Random Forest** ensemble (candidate detection). It is based on [Ma et al. 2023](https://arxiv.org/abs/2301.12670) and runs single-node data-parallel distributed training/inference.
 
-> **Scope.** `CLAUDE.md` (repo root) holds the lean, always-on rules; this skill is the on-demand deep-dive — read it when a task needs more than the essentials. The authoritative sources are `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, and `docs/`; when this file disagrees with them, they win and this file should be updated. **All paths below are relative to the repository root** (an agent's working directory).
+> **Scope.** `AGENTS.md` (repo root) holds the lean, always-on rules; this skill is the on-demand deep-dive — read it when a task needs more than the essentials. The authoritative sources are `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, and `docs/`; when this file disagrees with them, they win and this file should be updated. **All paths below are relative to the repository root** (an agent's working directory).
 
 ---
 
@@ -100,7 +100,7 @@ PYTHONPATH=src python utils/print_cli_help.py all
 
 ## Project Structure
 
-The tree below annotates the **source** layout. For the complete repository structure — root-level build/config files (`pyproject.toml`, `environment.yml`, `aetherscan.def`, `requirements-container.txt`, `.pre-commit-config.yaml`), governance docs (`CLAUDE.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, `AI_POLICY.md`), and the `.claude/` and `.github/` directories — see the Project Structure tree in `CONTRIBUTING.md` (the canonical source).
+The tree below annotates the **source** layout. For the complete repository structure — root-level build/config files (`pyproject.toml`, `environment.yml`, `aetherscan.def`, `requirements-container.txt`, `.pre-commit-config.yaml`), governance docs (`AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, `AI_POLICY.md`), and the `.Codex/` and `.github/` directories — see the Project Structure tree in `CONTRIBUTING.md` (the canonical source).
 
 ```
 src/aetherscan/
@@ -112,7 +112,6 @@ src/aetherscan/
 ├── run_state.py         # Persisted training-run manifest (stage-aware resume)
 ├── inference.py         # Inference orchestration, candidate detection
 ├── inference_viz.py     # End-of-run inference visualization suite
-├── candidate_figures.py # Per-candidate figure renderer (TF-free; forkserver pool; called by inference_viz.py)
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
 ├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection — batched memmap workers + background producer
@@ -155,8 +154,8 @@ benchmarks/              # Standalone benchmarks — CPU micro-benchmarks + a GP
 - **Curriculum training** — progressive SNR difficulty with adaptive LR that decays on validation plateaus and resets each round; per-round checkpointing. A persisted run manifest (`run_state_{save_tag}.json`) drives fault-tolerant resume: an explicit stage machine (vae_rounds → vae_plots → rf_train → rf_plots → final_save) skips completed stages, and stale DB rows from failed attempts are marked superseded (never deleted).
 - **Thread-safe singletons** — `Config`, `Database`, `ResourceManager`. Always use the accessors `get_config()`, `get_db()`, `get_manager()`; never instantiate directly.
 - **Shared-memory zero-copy parallelism** — worker pools communicate via shared memory (no serialization). Allocate via `manager.create_shared_memory()`; ResourceManager owns cleanup. Only the **creator** may call `shm.unlink()`, never workers. Training-round datasets are disk-backed memmaps (`round_data.py`): workers write disjoint row ranges in-place, eliminating per-sample IPC; steady-state reads come from page cache.
-- **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) wrap memmap references (or arrays) with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes. (Inference encodes directly from numpy slices since #298 — no holder on that path.)
-- **Background data producer** — `RoundDataProducer` (spawn-started process with its own worker pool) generates round k+1 while round k trains, and pre-generates the RF training dataset while the **last** round trains (queued at the top of the final round; the producer stays alive only until `train_random_forest` consumes it, then winds down). Registered with ResourceManager as a `ManagedProcess`. `CUDA_VISIBLE_DEVICES` is blanked so the producer tree never initializes CUDA; logging crosses the spawn boundary via a `QueueListener` relay.
+- **Data holders** — `TrainDataHolder` / `VizDataHolder` (`train.py`) and `InfDataHolder` (`inference.py`) wrap memmap references (or arrays) with a lock. RF training reuses `TrainDataHolder` via `prepare_distributed_train_dataset`. Call `holder.clear()` after processing completes.
+- **Background data producer** — `RoundDataProducer` (spawn-started process with its own worker pool) generates round k+1 while round k trains; registered with ResourceManager as a `ManagedProcess`. `CUDA_VISIBLE_DEVICES` is blanked so the producer tree never initializes CUDA; logging crosses the spawn boundary via a `QueueListener` relay.
 - **Worker cleanup** — custom SIGTERM handlers free resources on interruption. **Never log inside SIGTERM handlers** (deadlock risk).
 
 ---
@@ -225,15 +224,15 @@ Deep dive: `docs/TESTING.md` covers the full layout, the synthetic data factorie
 > **All issues are actionable, and all PRs must be tied to an existing issue.** Read `AI_POLICY.md` before doing AI-assisted work — the project has strict AI-usage rules.
 
 1. **Discussion first** — check for existing PRs/issues/discussions; otherwise open a [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) or Slack thread. "Drive-by" issues with no prior discussion may be closed.
-2. **Open an issue** via the template; Claude auto-triages and labels it.
-3. **Feature branch** — `category/description` with prefix: `feature/` (new functionality), `hotfix/` (bug fixes), `misc/` (housekeeping), `claude/` (reserved for the Claude assistant).
+2. **Open an issue** via the template; Codex auto-triages and labels it.
+3. **Feature branch** — `category/description` with prefix: `feature/` (new functionality), `hotfix/` (bug fixes), `misc/` (housekeeping), `Codex/` (reserved for the Codex assistant).
 4. **Implement** — focused commits, pass all pre-commit hooks, follow `pyproject.toml` style.
 5. **PR** — rebase (not merge) onto `master`; **all commits need verified GPG signatures**; fill the PR template; link the issue via the Development sidebar or `Closes #N` / `Fixes #N` (enables label sync). PRs not tied to an issue may be closed.
-6. **Review** — needs passing checks, ≥1 maintainer approval, all conversations resolved, branch up to date. Approvals are voided when new commits are pushed. Claude provides an initial review automatically.
+6. **Review** — needs passing checks, ≥1 maintainer approval, all conversations resolved, branch up to date. Approvals are voided when new commits are pushed. Codex provides an initial review automatically.
 
-**Invoking vs. mentioning the assistant.** The assistant workflow (`claude.yml`) triggers whenever the assistant handle — an `@` immediately followed by `claude` — appears in the title/body of a Discussion, issue, or PR (or a comment on one). Write it only when you actually want to summon the assistant (e.g. an auto-filed docs issue asking it to open a PR). To refer to the handle as plain text anywhere else — a PR description, issue body, commit message, review comment — write it as `"@ claude"` (a space after the `@`, double quotes on both sides) so the `contains(…, '@claude')` trigger can't match. Tagging it unintentionally spawns a spurious assistant run and follow-up PR (this is what happened around issue #83).
+**Invoking vs. mentioning the assistant.** The assistant workflow (`Codex.yml`) triggers whenever the assistant handle — an `@` immediately followed by `Codex` — appears in the title/body of a Discussion, issue, or PR (or a comment on one). Write it only when you actually want to summon the assistant (e.g. an auto-filed docs issue asking it to open a PR). To refer to the handle as plain text anywhere else — a PR description, issue body, commit message, review comment — write it as `"@ Codex"` (a space after the `@`, double quotes on both sides) so the `contains(…, '@Codex')` trigger can't match. Tagging it unintentionally spawns a spurious assistant run and follow-up PR (this is what happened around issue #83).
 
-**Responding to the automated review.** Opening (or marking ready) a PR triggers `claude-code-review.yml`, which posts a first-pass review with inline comments (catalogued in `docs/GITHUB_AUTOMATION.md`). Treat it as input, not verdict: wait for the review to land, then work through each comment individually, weighing it against your own understanding of the codebase and the change you actually made — don't assume the reviewer is right. Where a comment exposes a genuine blind spot, fix it in a focused, self-contained commit pushed to the *same* PR; where you're convinced it's wrong, leave the code untouched and be ready to explain concretely why. Then post a single PR comment covering both halves — first the points you addressed (what you changed and the rationale), then the points you think the reviewer got wrong (with your reasoning) — and close that comment by deliberately tagging the assistant handle to kick off a second-pass review. This is precisely the "you actually want to summon it" case from the paragraph above, not a violation of the don't-tag-unintentionally rule. Then repeat the loop — wait, read, validate, address, rebut, comment, re-invoke — until the reviews either come back clean (no further notes / LGTM) or they start drifting out of scope (raising points unrelated to the PR's theme) or turn nonsensical. At that stopping point, post a comment explaining why you're stopping, and do **not** tag the assistant handle again.
+**Responding to the automated review.** Opening (or marking ready) a PR triggers `Codex-review.yml`, which posts a first-pass review with inline comments (catalogued in `docs/GITHUB_AUTOMATION.md`). Treat it as input, not verdict: wait for the review to land, then work through each comment individually, weighing it against your own understanding of the codebase and the change you actually made — don't assume the reviewer is right. Where a comment exposes a genuine blind spot, fix it in a focused, self-contained commit pushed to the *same* PR; where you're convinced it's wrong, leave the code untouched and be ready to explain concretely why. Then post a single PR comment covering both halves — first the points you addressed (what you changed and the rationale), then the points you think the reviewer got wrong (with your reasoning) — and close that comment by deliberately tagging the assistant handle to kick off a second-pass review. This is precisely the "you actually want to summon it" case from the paragraph above, not a violation of the don't-tag-unintentionally rule. Then repeat the loop — wait, read, validate, address, rebut, comment, re-invoke — until the reviews either come back clean (no further notes / LGTM) or they start drifting out of scope (raising points unrelated to the PR's theme) or turn nonsensical. At that stopping point, post a comment explaining why you're stopping, and do **not** tag the assistant handle again.
 
 **Pre-commit hooks** (`pre-commit install` to activate): `ruff` (lint, `--fix`), `ruff-format`, general `pre-commit-hooks` (large files >1 MB, case conflict, merge conflict, YAML/TOML syntax, EOF/trailing-whitespace, private-key detection, `no-commit-to-branch` on master), and `gitleaks` (secret detection). Ruff-format auto-reformats on commit — **re-run `git add` after** it modifies files, then commit again. Bypass only sparingly with `git commit --no-verify`.
 
@@ -262,7 +261,7 @@ pre-commit run ruff --all-files
 
 Paths relative to the repo root:
 
-- `CLAUDE.md` — condensed always-on agent rules (this skill is its deep-dive companion)
+- `AGENTS.md` — condensed always-on agent rules (this skill is its deep-dive companion)
 - `README.md` — overview, install matrix, usage examples, full CLI reference
 - `CONTRIBUTING.md` — workflow, project structure, code style, pre-commit
 - `SECURITY.md` — security policy, secrets management, token rotation
