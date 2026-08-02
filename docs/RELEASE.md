@@ -1,10 +1,11 @@
 # Release Engineering
 
-This document is the release contract for Aetherscan: how one version string couples PyPI,
-GitHub, and HuggingFace; what the release CD does (and refuses to do); the one-time setup a
-maintainer needs; and the step-by-step runbook for cutting a release. The packaging and the
-CD workflow (`.github/workflows/release.yml`) are implemented to satisfy this contract —
-when they and this document disagree, fix whichever is wrong *as a PR that says so*.
+This document is the release contract for Aetherscan: how versions are numbered (SemVer) and
+what each bump promises; how one version string couples PyPI, GitHub, and HuggingFace; what
+the release CD does (and refuses to do); the one-time setup a maintainer needs; and the
+step-by-step runbook for cutting a release. The packaging and the CD workflow
+(`.github/workflows/release.yml`) are implemented to satisfy this contract — when they and
+this document disagree, fix whichever is wrong *as a PR that says so*.
 
 ## TL;DR — the version-coupling contract
 

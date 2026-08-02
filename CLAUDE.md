@@ -51,6 +51,7 @@ ruff lint+format, 100-char lines, Python 3.10 target ([`pyproject.toml`](pyproje
 - **Don't tag the assistant unintentionally.** The assistant handle (an `@` immediately followed by `claude`) in a Discussion/issue/PR title or body triggers the assistant workflow (`claude.yml`) — write it only when you actually want to invoke the assistant. To reference it as plain text, write `"@ claude"` (space after the `@`, double quotes on both sides) so the trigger can't match.
 - If you change `cli.py`, regenerate the README CLI Reference: `PYTHONPATH=src python utils/print_cli_help.py all`.
 - Bumping a dependency? Don't jump to the latest — target a proven version per [SECURITY.md](SECURITY.md) (the newer of ~2 minors back / latest stable ≥6 months old; a known advisory on that target overrides the lag). Never cross a documented ceiling (`numpy<2.0`, …) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `pyproject.toml` in sync.
+- Releases are SemVer (`vX.Y.Z`): the compatibility contract covers the CLI, artifact/config formats + model contract, and supported runtimes; highest bump wins, and code + weights share one version string (a same-contract retrain is at least a MINOR). Full policy: [docs/RELEASE.md](docs/RELEASE.md#versioning-policy-semver).
 - Security: non-critical → GitHub Discussion w/ "security" label; critical → [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack, no public issue. Rotate any leaked token immediately.
 
 ## Code review
