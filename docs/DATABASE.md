@@ -43,7 +43,13 @@ SQL NULL against a NOT NULL column) silently discarded every row in the flush. E
 logged and the loop continues; a failed write never kills the thread. Connections set `PRAGMA synchronous=NORMAL`: under WAL that only skips the
 per-commit WAL fsync (the WAL is still synced at checkpoints) — a crash can lose the newest
 commits but never corrupts the database, ample durability for diagnostic telemetry and the
-removal of the dominant per-transaction fsync stall.
+removal of the dominant per-transaction fsync stall. Connections also set
+`PRAGMA temp_store=MEMORY`, which keeps the large read-side `GROUP BY` / `ORDER BY` / window
+sorts (per-round injection-stat aggregates, the decimated resource-monitor query, whole-tag
+plot scans) in RAM instead of spilling to an on-disk temp b-tree — free for small result
+sets, which never spill. `mmap_size` is deliberately NOT set: its benefit is largely lost to
+this per-query open/close model, and SQLite mmap I/O faults surface as `SIGBUS` on a shared
+node.
 
 ### The bulk lane (#277)
 
@@ -132,10 +138,10 @@ span bounds instead.
 | --- | --- | --- | --- |
 | `system_resources` | 1 Hz monitor samples | no (attempt-agnostic history) | v0 |
 | `injection_stats` | per generated cadence | yes | v0 (+ column v1) |
-| `training_stats` | per training epoch | yes | v0 (+ column v1) |
+| `training_stats` | per training epoch | yes | v0 (+ column v1, + column v6) |
 | `latent_snapshots` | per viz cadence per capture | yes | v0 (+ column v1) |
 | `inference_results` | positives only | yes | v0 (+ column v1, + columns v5) |
-| `inference_cadences` | per-cadence run manifest | yes | v2 |
+| `inference_cadences` | per-cadence run manifest | yes | v2 (+ column v3) |
 | `pipeline_stages` | per timed stage span | no (attempt-agnostic history) | v4 |
 
 The `superseded` column and its default-filtering are what make same-tag retries safe; see
@@ -288,8 +294,10 @@ Index: `(tag, npy_path, status)` — the resume lookup.
 
 One row per timed pipeline-stage span, written by the always-on stage timers in
 [`aetherscan.benchmark`](../src/aetherscan/benchmark.py) (`stage_timer` / `record_stage`) via
-`db.write_pipeline_stage()`. Read back by [`utils/benchmark_report.py`](../utils/benchmark_report.py)
-and the monitor's stage-band overlay. Full context in [`BENCHMARKING.md`](BENCHMARKING.md).
+`db.write_pipeline_stage()`. Read back by [`utils/benchmark_report.py`](../utils/benchmark_report.py),
+[`utils/perband_report.py`](../utils/perband_report.py) (the `inference.preprocess_cadence_<N>`
+umbrella spans only, joined to the run's catalog CSV), and the monitor's stage-band overlay. Full
+context in [`BENCHMARKING.md`](BENCHMARKING.md).
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -453,7 +461,7 @@ Rules of thumb at full-scale defaults (dominant terms only):
   (`latent_viz_num_cadences_per_type=960` × 4 signal types) × one capture every
   `latent_viz_step_interval` steps (plus the final step) × epochs. At full scale
   (130 steps/epoch → 13 captures/epoch): ~100 M rows over 20 × 100 epochs, each carrying a
-  48-float JSON vector. Still the second heaviest table (behind `signal_characteristics`);
+  48-float JSON vector. Still the second heaviest table (behind `injection_stats`);
   `latent_viz_step_interval` and `latent_viz_num_cadences_per_type` are the knobs.
 - **`system_resources`**: (4 + 2 × n_GPUs) rows/second — ~1.2 M rows/day on a 6-GPU node.
 - **`inference_results`**: positives only; at a 0.99 threshold this stays small by

@@ -189,6 +189,21 @@ These targets are additionally bounded by the project's intentional version ceil
 2. **Medium severity**: Update in next minor release
 3. **Low severity**: Update in next major release or when convenient
 
+### HuggingFace Hub artifact scan (ProtectAI)
+
+HuggingFace runs [ProtectAI](https://protectai.com/)'s scanner over uploaded files and flags
+`vae_encoder.keras` as **"unsafe."** This is a **benign** false positive for our use: the flag
+fires because loading the encoder requires deserializing the model's registered custom
+`Sampling` layer (custom-object deserialization the scanner can't prove safe in the general
+case) — it is **not** a pickle-exec or embedded-malware finding. The companion
+`random_forest.joblib` carries only the ordinary sklearn/joblib **"Caution"** notice (the
+generic arbitrary-code risk of the pickle format), not an "unsafe" flag. Both artifacts are
+produced by this pipeline and contain only model weights plus layer config.
+
+**Decision:** accept and document (the current stance). A future hardening option is to
+re-export the encoder in a weights-only format needing no custom-object deserialization, which
+would clear the flag; it is not planned for the v1.0.x line.
+
 ---
 
 ## Data Security

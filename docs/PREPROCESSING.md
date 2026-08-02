@@ -269,6 +269,10 @@ prefetch critical path).
 (`{data_path}/training/*.npy`, raw width 4096) is memory-mapped and processed in chunks of
 `background_load_chunk_size` (15 000 cadences): the chunk is copied into a shared-memory
 block, and a pool downsamples each cadence ×8 per observation (`_downsample_worker`).
+Per-file loading is bounded by `max_chunks_per_file` (default 1) — by default only the first
+`background_load_chunk_size` (15 000) cadences of each file are consumed, so reaching
+`num_target_backgrounds` (45 000) needs enough distinct files (raise `max_chunks_per_file` to
+draw more from one file).
 Cadences containing NaN/Inf or with non-positive max are dropped. **Log-normalization is
 deferred** — training-side log-norm happens per sample *after* signal injection (injection
 must operate on linear intensities). Loading stops at `num_target_backgrounds` (45 000)

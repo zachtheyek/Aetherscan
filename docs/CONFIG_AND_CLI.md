@@ -222,7 +222,6 @@ Current Pattern B flags:
 - `--async-allocator` → `config.gpu.use_async_allocator`
 - `--num-replicas` → `config.gpu.num_replicas`
 - `--hf-repo-id` → `config.hf.repo_id`
-- `--save-tag` → `config.checkpoint.save_tag`
 - `--force-tag` → `config.checkpoint.force_tag`
 - `--dashboard` / `--no-dashboard` (`BooleanOptionalAction`) → `config.monitor.dashboard_enabled`
 - `--dashboard-port` → `config.monitor.dashboard_port`
@@ -230,6 +229,15 @@ Current Pattern B flags:
 - `--seed` / `--unseeded` → `config.reproducibility.seed` (registered via `_add_reproducibility_flags_to`; `--unseeded` sets it to None, mutually exclusive with `--seed`)
 - `--tf-deterministic-ops` (`BooleanOptionalAction`) → `config.reproducibility.tf_deterministic_ops` (same helper)
 - `--n-processes` → `config.manager.n_processes` (registered via the shared `_add_runtime_flags_to` helper, #303; validated `>= 1` — the operator override for worker-pool sizing, which is never layered from a saved `--config-path`)
+
+> [!NOTE]
+> `--save-tag` looks like a Pattern B flag — it's registered in **both** subparsers, so
+> the drift check below counts it as shared — but it is the one shared flag **not** wired
+> through `apply_args_to_config`. Instead of copying `args.save_tag` onto a config field,
+> `main()` resolves it once via `resolve_save_tag` to `{prefix}_{YYYYMMDD_HHMMSS}` (the
+> datetime stamped a single time, before `init_logger`, so the log file, config, and
+> artifacts all share one timestamp). Its neighbor `--force-tag`, by contrast, **is** a
+> genuine Pattern B `apply_args_to_config` block (→ `config.checkpoint.force_tag`).
 
 #### Pattern C — shared flag, divergent destination
 
@@ -449,9 +457,12 @@ mode && /^ *"--/{
 
 The second command lists every shared flag (those appearing in both subparsers); each
 should match either a single Pattern B `apply_args` block or a pair of Pattern C blocks
-with a `command` discriminator. Note the awk only sees flags registered lexically inside
-the two `_add_*_flags_to` bodies — `--seed` / `--tf-deterministic-ops` / `--n-processes`
-live in the shared `_add_reproducibility_flags_to` / `_add_runtime_flags_to` helpers
-(called by both) and must be counted by hand. As of this writing the command yields 15
-flags; with the three helper-registered ones the shared surface is 18 — 15 Pattern B +
-3 Pattern C.
+with a `command` discriminator — with one deliberate exception, `--save-tag`, which is
+registered in both subparsers but is resolved in `main()` via `resolve_save_tag` rather
+than in `apply_args_to_config` (see the Pattern B note above). Note the awk only sees
+flags registered lexically inside the two `_add_*_flags_to` bodies — `--seed` /
+`--tf-deterministic-ops` / `--n-processes` live in the shared
+`_add_reproducibility_flags_to` / `_add_runtime_flags_to` helpers (called by both) and
+must be counted by hand. As of this writing the command yields 15 flags; with the three
+helper-registered ones the shared surface is 18 — 14 Pattern B + 3 Pattern C + `--save-tag`
+(the special case above).

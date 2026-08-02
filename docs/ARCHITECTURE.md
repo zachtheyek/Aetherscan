@@ -94,7 +94,7 @@ flowchart TB
         CSV["CSV catalog(s)<br/>{data_path}/inference/"] --> GROUP["group_observations_from_csv()<br/>rows → 6-obs cadences"]
         H5[".h5 filterbank files"] --> ED
         GROUP --> ED["energy detection per cadence<br/>DC spike → bandpass flatten → k² threshold"]
-        ED --> NPY["per-cadence stamp .npy + metadata .json<br/>preprocessed/&lt;csv_stem&gt;_&lt;tag&gt;/"]
+        ED --> NPY["per-cadence stamp .npy + metadata .json<br/>preprocessed/&lt;csv_stem&gt;_ed&lt;hash12&gt;/"]
         NPY --> ENC["InferencePipeline.run_inference()<br/>encoder → latents → RF P(true)"]
         ART -. "trained models" .-> ENC
         ENC -. "inference_results (positives) + inference_cadences manifest" .-> DB
@@ -192,10 +192,14 @@ spawn); they must never touch the DB singleton and must route logging through
 
 ## Tag conventions
 
-Every run is identified by `config.checkpoint.save_tag` — the **tag** — which stamps every
-artifact filename and every DB row. A tag is `{command}_{YYYYMMDD_HHMMSS}`, resolved once at
-startup by `cli.resolve_save_tag()` (before `init_logger`, so the log / config / artifacts all
-share one datetime):
+Every run is identified by `config.checkpoint.save_tag` — the **tag** — `{command}_{YYYYMMDD_HHMMSS}`,
+resolved once at startup by `cli.resolve_save_tag()` (before `init_logger`, so the log / config /
+artifacts all share one datetime). The tag keys every DB row and is the run's canonical identity;
+on-disk **filenames, plot titles, and Slack messages instead carry the machine-scoped _display tag_**
+`{command}_{machine}_{YYYYMMDD_HHMMSS}` (`aetherscan.display_tag`, host from `db.get_machine_name()`),
+so two hosts that resolve the same command+datetime do not collide when their artifacts land in one
+directory (e.g. weights copied bla0→blpc3). The display tag is presentation-only — nothing that keys
+a DB row, `save_tag` included, changes:
 
 | On the CLI | Resolves to | Use |
 | --- | --- | --- |
@@ -210,7 +214,10 @@ the run's own final weights or, failing that, its last completed round (per the 
 never another run's model; it fails loudly instead. **Retries** are first-class: re-run with
 `--load-tag {full-tag}` and the run-state manifest (training) / `inference_cadences` manifest
 (inference) make it resume in place rather than collide, with stale rows from dead attempts
-flagged `superseded` in the DB ([`DATABASE.md`](DATABASE.md)).
+flagged `superseded` in the DB ([`DATABASE.md`](DATABASE.md)). Because model filenames carry the
+display tag, `--load-tag` resolves against **this host's** display tag — a run's artifacts copied
+from another host are not found by `--load-tag`; load them with explicit
+`--encoder-path`/`--rf-path`/`--config-path`, or via the HuggingFace path (fixed filenames).
 
 ## Directory layout & artifact map
 
@@ -222,7 +229,9 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 ├── training/                          # background plate .npy files (config.data.train_files)
 ├── testing/                           # preprocessed test .npy files (config.data.test_files)
 └── inference/                         # CSV catalogs (config.data.inference_files)
-    └── preprocessed/<csv_stem>_<tag>/ # per-cadence stamp .npy + metadata .json (tag-scoped)
+    └── preprocessed/<csv_stem>_ed<hash12>/ # per-cadence stamp .npy + metadata .json
+                                       #   (ED-config-fingerprint-scoped: runs sharing an
+                                       #    energy-detection config reuse each other's stamps)
 
 {model_path}/
 ├── vae_encoder_{tag}.keras            # final encoder (the inference model)
@@ -248,10 +257,18 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 └── plots/
     ├── resource_utilization_{tag}.png # monitor resource plot (mode-agnostic)
     ├── benchmark_report_{tag}.png      # end-of-run resource report (mode-agnostic)
-    ├── training/{tag}/*.png            # end-of-training diagnostics (incl. posterior_collapse_{tag}.png)
+    ├── perband_inference_perf_{tag}.png # per-band ED wall-clock (inference only; same report gate)
+    ├── training/{tag}/*.png            # end-of-training diagnostics (incl. posterior_collapse_{tag}.png
+    │                                   #   and latent_variant_selection_{tag}.png)
     │   └── checkpoints/*_round_XX.png  #   per-round diagnostics (archived like model checkpoints)
     └── inference/{tag}/*.png           # inference viz suite (incl. candidate_uncertainty_{tag}.png)
 ```
+
+> In the tree above `{tag}` is shorthand: on disk these filenames carry the machine-scoped display
+> tag (`{command}_{machine}_{datetime}`, see [Tag conventions](#tag-conventions)) while DB rows key
+> off the plain tag. The UMAP joblibs (`umap_*_{tag}.joblib`) are the one deliberate exception —
+> they keep the **plain** tag so a cross-host reader (inference on another node) can reconstruct
+> their path from the *training* run's DB tag.
 
 Startup hygiene: `train.py:archive_directory()` moves (fresh run) or copies (resume) existing
 checkpoints/plots into `archive/<timestamp>/` and deletes `round_XX`-stamped files at or above
