@@ -136,14 +136,22 @@ paths:
   when training calibrated would be a silent train/serve mismatch. The saved
   `rf.latent_variant` / `rf.active_dims` drive how features are rebuilt from the encoder
   outputs (never hardcoded — see the two-pass cascade below), and `_check_rf_feature_layout()`
-  cross-checks them against the loaded forest's own `n_features_in_`, raising
-  `ValueError("RF feature-count mismatch: ...")` when they disagree. sklearn's built-in check
-  cannot catch this on its own: `z`, `z_mean`, and `z_aug` are all
-  `num_observations × latent_dim` wide, so a config declaring one while the weights were fit on
-  another passes the width test and inference silently scores the **wrong representation**. The
-  guard fires on mixed `--config-path`/`--rf-path` from different runs or a hand-edited config,
-  never on the sanctioned HF path (which ships the winning forest with its own config), and
-  no-ops on a forest that carries no `n_features_in_`.
+  cross-checks them against the loaded forest via **three complementary checks** (#282/#318),
+  each no-opping when the forest lacks its signal (so they only get stricter as a forest
+  self-describes). **(1) Feature count** — the config variant's expected feature count vs the
+  forest's `n_features_in_`, catching a different-width mismatch (a `z_mean`=48 config against a
+  `z_mean_logvar`=96 forest) at load time; no-ops on a forest with no `n_features_in_`.
+  **(2) Variant identity** — the forest's `aetherscan_latent_variant_` stamp (written at train
+  time) vs `rf.latent_variant`. This catches what the count check cannot: `z`, `z_mean`, and
+  `z_aug` are all `num_observations × latent_dim` wide, so a config declaring one while the weights
+  were fit on another passes the width test *and* sklearn's own check, and inference would
+  otherwise silently score the **wrong representation**. **(3) Active-dims identity** — the forest's
+  `aetherscan_active_dims_` stamp vs `rf.active_dims`, checked only for `z_mean_logvar_active`
+  (whose `log_var` columns are active-dim-indexed), where two equal-length dim *sets* share a
+  feature count yet select different columns. Forests trained before #318 (including the released
+  v1.0.0 weights) carry no stamps, so checks 2–3 no-op on them. The guard fires on mixed
+  `--config-path`/`--rf-path` from different runs or a hand-edited config, never on the sanctioned
+  HF path (which ships the winning forest with its own config).
 - `--config-path` → the training run's `config_{tag}.json`, layered onto the singleton by
   `cli.apply_saved_config()` **before validation** so shape-critical fields
   (`width_bin`, `stamp_width`, `latent_dim`, `dense_layer_size`, ...) match what the encoder
