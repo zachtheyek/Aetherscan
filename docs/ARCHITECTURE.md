@@ -196,9 +196,11 @@ Every run is identified by `config.checkpoint.save_tag` — the **tag** — `{co
 resolved once at startup by `cli.resolve_save_tag()` (before `init_logger`, so the log / config /
 artifacts all share one datetime). The tag keys every DB row and is the run's canonical identity;
 on-disk **filenames, plot titles, and Slack messages instead carry the machine-scoped _display tag_**
-`{command}_{machine}_{YYYYMMDD_HHMMSS}` (`aetherscan.display_tag`, host from `db.get_machine_name()`),
-so two hosts that resolve the same command+datetime do not collide when their artifacts land in one
-directory (e.g. weights copied bla0→blpc3). The display tag is presentation-only — nothing that keys
+`{command}_{machine}_{YYYYMMDD_HHMMSS}` (`aetherscan.display_tag`, host from `db.get_machine_name()`,
+with the spliced machine name sanitized to filename-safe characters — identity on real RFC-1123
+hostnames — so the display tag is safe to embed in a path by construction), so two hosts that resolve
+the same command+datetime do not collide when their artifacts land in one directory (e.g. weights
+copied bla0→blpc3). The display tag is presentation-only — nothing that keys
 a DB row, `save_tag` included, changes:
 
 | On the CLI | Resolves to | Use |

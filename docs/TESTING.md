@@ -57,7 +57,7 @@ tests/
 │   │                                #   counts, batched-transform split preservation
 │   ├── test_models.py               # feature layout, RF train/predict, encoder/decoder symmetry
 │   ├── test_latent_variants.py      # variant feature builders, active-unit detection, recall@FPR/
-│   │                                #   ECE/min-margin selection, probability calibrator (TF-free)
+│   │                                #   ECE/min-margin selection, probability calibrator, variant/active-dims stamp joblib round-trip (TF-free)
 │   ├── test_rf_metrics.py           # pure RF eval-metric helper: AUC/AP/Brier/confusion/quantile hand-computed cases, degenerate single-class split
 │   ├── test_shap_parallel.py        # positive-class shape normalization + MP-vs-single-process byte-identity (all three passes)
 │   ├── test_preprocessing.py        # k² equivalence gates, dedup, grouping, DC spike, spline
