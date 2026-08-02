@@ -40,12 +40,13 @@ tests/
 │   ├── test_cli_validation.py       # tag pattern, divisibility matrix, saved-config precedence
 │   ├── test_cli_help_sync.py        # README CLI Reference vs generated help drift guard
 │   ├── test_tag_guards.py           # save-tag dedup matrix: local/HF collisions, --force-tag
+│   ├── test_display_tag.py          # display-tag derivation: rewrite, round_XX/final passthrough, cross-machine non-collision
 │   ├── test_data_generation.py      # log_norm, create_* shapes/labels, intersection checks,
 │   │                                #   chunk segments / batched task partitioning
 │   ├── test_round_data.py           # paths/manifest protocol, reuse/delete semantics, producer
 │   ├── test_seeding.py              # root-seed stream derivation (reproducible runs)
 │   ├── test_run_state.py            # manifest round-trip, stage machine transitions
-│   ├── test_train_utils.py          # load-tag resolution, curriculum schedules, archiving
+│   ├── test_train_utils.py          # load-tag resolution, curriculum schedules, archiving, display-tag resume invariance
 │   ├── test_train_datasets.py       # batched generators: coverage, stratification, alignment,
 │   │                                #   zero-copy tensor wrapping (alignment gate + fallback)
 │   ├── test_train_accumulation.py   # graph-side accumulated train step vs eager reference,

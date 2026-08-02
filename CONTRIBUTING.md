@@ -184,6 +184,7 @@ Aetherscan/
 │   ├── dashboard_cli.py        # Console entry point for manual dashboard runs (aetherscan-dashboard)
 │   ├── hf_hub.py               # HuggingFace Hub artifact upload/download
 │   ├── tag_guards.py           # Fail-early --save-tag dedup guards
+│   ├── display_tag.py          # Machine-scoped display tag for artifact filenames + plot titles
 │   ├── rf_metrics.py           # Pure RF eval-metric helper (persisted to training_stats via train.py)
 │   ├── shap_parallel.py        # RF SHAP process-pool wrapper (TF-free; called by train.py)
 │   ├── latent_variants.py      # Latent-representation variant catalogue + selection/calibration (TF-free)
@@ -268,6 +269,7 @@ Aetherscan/
 | `dashboard_cli.py`        | `aetherscan-dashboard` console script; re-execs Streamlit for manual DB inspection |
 | `hf_hub.py`               | HuggingFace Hub artifact upload/download, version-coupled revisions    |
 | `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
+| `display_tag.py`          | Machine-scoped display tag `{cmd}_{machine}_{datetime}` for filenames + plot titles |
 | `rf_metrics.py`           | Pure RF eval-metric helper written to `training_stats` (`model_name='rf'`) |
 | `shap_parallel.py`        | Process-pool wrapper for RF SHAP passes (TF-free; forkserver + empty preload; called by `train.py`) |
 | `latent_variants.py`      | Latent-representation variant catalogue, selection metrics, probability calibrator (TF-free; shared by `train.py` and `inference.py`) |

@@ -38,6 +38,7 @@ pytest -m "not gpu and not cluster" -q
 - Use singleton accessors `get_config()` / `get_db()` / `get_manager()` — never instantiate directly; never mutate config post-init in multi-threaded code.
 - Shared memory: only the **creator** calls `shm.unlink()`, never workers. Register pools/SHM with ResourceManager; call `holder.clear()` when done.
 - **Never log inside SIGTERM handlers** (deadlock).
+- Artifact filenames/paths and plot/Slack titles use `display_tag(tag, get_machine_name())` (`{cmd}_{machine}_{datetime}`); the **DB tag / `--save-tag` / `--load-tag` stay plain** `{cmd}_{datetime}`. `round_XX`/`final` pass through unchanged — don't "fix" that. Exception: umap joblibs stay plain-tagged (cross-host reader).
 - Dataclass mutable defaults: always `field(default_factory=...)`, never a bare `[...]`.
 - **Never commit secrets** — use `.env` (gitignored); the `gitleaks` hook backs this up but isn't foolproof.
 

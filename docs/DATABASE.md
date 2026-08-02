@@ -427,6 +427,29 @@ measured ~13 min per cold-cache launch on the 80 GB production DB (re-paid on ev
 retry-loop relaunch), so `Database.__init__` no longer calls it and startup logs only the
 O(1) `db_size_bytes` pragma.
 
+## Module-level accessors
+
+Besides `get_db()` (the singleton accessor — never instantiate `Database` directly),
+[`db/db.py`](../src/aetherscan/db/db.py) exports two cached host-identity helpers, both
+re-exported from `aetherscan.db`:
+
+- **`get_system_metadata()`** — a JSON string of `{machine_name, user_name, ip_address,
+  process_id}`, computed once per process and cached (`_SYSTEM_METADATA_CACHE`). Stamped onto
+  rows as provenance.
+- **`get_machine_name()`** — this host's `socket.gethostname()`, read out of that cached
+  metadata and memoized separately in `_MACHINE_NAME_CACHE`, so repeated calls are a constant
+  lookup. It is the **single** accessor for the machine name: it replaced two divergent sources
+  that used to coexist (`json.loads(get_system_metadata())["machine_name"]` in training plots
+  and the monitor, versus a raw `socket.gethostname()` in inference-viz and the Slack banner),
+  so every filename, plot title, and Slack message now derives the identical string.
+
+`get_machine_name()` feeds `display_tag.display_tag()`, which composes the machine-scoped
+display tag used for artifact filenames and plot titles
+([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)). That is a
+presentation-layer concern only — **nothing that keys a DB row changes**. Rows are still written
+and queried under the plain `{command}_{datetime}` tag, so every `query_*` call above takes the
+plain tag.
+
 ## Growth expectations
 
 Rules of thumb at full-scale defaults (dominant terms only):

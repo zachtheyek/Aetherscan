@@ -238,6 +238,11 @@ tell you what it costs in recall.
 
 ## Persisted model artifacts
 
+> **`{tag}` below is the *display* tag** `{command}_{machine}_{datetime}` (e.g.
+> `train_blpc3_20260731_182011`) — model filenames carry the training host's name; the DB tag and
+> `--save-tag` / `--load-tag` stay plain. The `umap_*` row is the one exception, flagged inline.
+> See [`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles).
+
 | File | Producer | Contents / purpose |
 | --- | --- | --- |
 | `vae_encoder_{tag}.keras` | `save_models` | The inference feature extractor (outputs `z_mean, z_log_var, z`). |
@@ -247,7 +252,7 @@ tell you what it costs in recall.
 | `rf_calibrator_{tag}.joblib` | `train_random_forest` | The kept probability calibrator (`{method, model}` dict); exists only when calibration was fit *and* survived the test-split gate. Required by inference when `rf.calibration_active`. |
 | `rf_eval_artifacts_{tag}.joblib` | `train_random_forest` | Dict of train/val features (winning variant), binary + subtype labels, raw + deployment-scored val probabilities and threshold-consistent predictions, the threshold and SNR range used, plus the sweep record (winner, active dims, per-variant metrics, calibration outcome, val partition) — the single source every RF plot consumes (and what lets a resumed run skip RF retraining and restore the sweep outcome). |
 | `rf_shap_values_{tag}.joblib` | `_compute_or_load_shap_values` | Cached SHAP outputs: positive-class summary values (+ the val row indices they correspond to), pairwise interaction values, and a log-loss decomposition (`model_output="log_loss"`), normalized across shap versions by `_select_positive_class_shap`. Computing these is minutes of work; every SHAP figure reuses the cache. |
-| `umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib` | `plot_latent_space_gif` | Fitted UMAP reducers per (n_neighbors, min_dist): obs-level (8-dim inputs) and cadence-level (48-dim). Reused by the RF decision-boundary plot and by inference's latent-projection figure — which is why deleting them breaks those two figures but nothing else. |
+| `umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib` — **plain tag, the one exception** | `plot_latent_space_gif` | Fitted UMAP reducers per (n_neighbors, min_dist): obs-level (8-dim inputs) and cadence-level (48-dim). Reused by the RF decision-boundary plot and by inference's latent-projection figure — which is why deleting them breaks those two figures but nothing else. `{tag}` here is the **plain** `{command}_{datetime}` DB tag, not the display tag: inference rebuilds this filename from the training run's `save_tag` in `config_{tag}.json`, possibly on a different host, and a machine name it cannot know would not resolve. |
 
 Interpretation guidance for the SHAP/diagnostic figures lives with the plot catalog in
 [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md). The short version of what the SHAP artifacts

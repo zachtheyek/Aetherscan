@@ -132,7 +132,10 @@ paths:
   replicas). The `Sampling` layer is registered serializable, so no `custom_objects` needed.
 - `--rf-path` → `RandomForestModel.load()` (joblib). When the saved config records an active
   calibrator (`rf.calibration_active`), `rf_calibrator_{tag}.joblib` is loaded from the same
-  directory — and a **missing calibrator artifact is a hard error**: scoring uncalibrated
+  directory. The name is derived from the **passed** `--rf-path` basename
+  (`random_forest` → `rf_calibrator`), not rebuilt from a tag, so a display-tagged
+  `random_forest_train_{machine}_{datetime}.joblib` resolves to its sibling calibrator without
+  the caller knowing which host trained it. A **missing calibrator artifact is a hard error**: scoring uncalibrated
   when training calibrated would be a silent train/serve mismatch. The saved
   `rf.latent_variant` / `rf.active_dims` drive how features are rebuilt from the encoder
   outputs (never hardcoded — see the two-pass cascade below).
@@ -152,8 +155,11 @@ paths:
   one is logged as a startup diff line. The allowlist is derived from `run_state.py`'s
   fingerprint key sets and test-pinned, so `cli.py` and `run_state.py` can never silently
   disagree about what is result-affecting (see [`CONFIG_AND_CLI.md`](CONFIG_AND_CLI.md)).
-  This run's resolved save_tag (the `{command}_{datetime}` tag set once in `main()`) stays
-  authoritative.
+  This run's resolved save_tag (the plain `{command}_{datetime}` tag set once in `main()`) stays
+  authoritative — that is the identity written to the DB and to `config_{tag}.json`'s
+  `checkpoint.save_tag`. This run's own *artifacts* are named with its machine-scoped
+  derivative, `{command}_{machine}_{datetime}`
+  ([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)).
 
 `collect_validation_errors` enforces the trio all-or-none (a partial set is the error above);
 every path that *is* set must exist on disk. The three artifacts should carry the same training
@@ -402,6 +408,11 @@ flagged while later writes stay live (`Database.mark_superseded`).
 
 ## Artifacts of an inference run
 
+> **`{tag}` in the paths below is the *display* tag** `{command}_{machine}_{datetime}` — every
+> artifact filename carries the host name. The run's DB tag and the `--save-tag` / `--load-tag`
+> values you type stay plain `{command}_{datetime}`. See
+> [`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles).
+
 | Artifact | Where | Notes |
 | --- | --- | --- |
 | Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/*.npy` + `.json` | Shared across runs with the same ED config (#298) — though with pruning ON (#302, the default for this directory) each `.npy` is deleted once its cadence is scored, leaving the `.json`. The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, the pre-binned `hit_spectrum_hist` + merged hit list and stored `bandpass_envelopes` (#301 — the raw per-hit frequency list is no longer stored; see [`PREPROCESSING.md`](PREPROCESSING.md)), the `.h5` header, and the `ed_config_fingerprint` the resume guard checks. |
@@ -479,7 +490,7 @@ cadences).
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
 | `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
 | `candidate_uncertainty_{tag}.png` | Each candidate (red star) at x = final RF probability (MC mean), y = MC spread, over a hexbin density background of the reference cloud (the survey's pass-1 rejects), with the science threshold as a vertical line. | Population context is the whole point: "p = 0.97, spread = 0.05" is only interpretable against where the survey sits. The dangerous quadrant is **high p + high spread** — a mean that looks confident while draws swing — exactly what `p` alone cannot flag (see the interpretation table above). Candidates hugging the survey cloud are threshold noise. |
-| `inference_latent_projection_{tag}.png` | This run's cadence-level latents projected through the **training run's persisted UMAP** (`umap_cadence_nn*_md*_*.joblib`, located via the training config JSON's `model_path` + tag), over the training embedding as backdrop; candidates highlighted. Skips gracefully if the UMAP is absent. | "Where does real data live relative to the synthetic classes?" Real snippets clustering onto the training false-class region = healthy. Candidates far from *any* training class are the interesting anomalies; candidates inside the false-class cloud are threshold noise. |
+| `inference_latent_projection_{tag}.png` | This run's cadence-level latents projected through the **training run's persisted UMAP** (`umap_cadence_nn*_md*_*.joblib`, located via the training config JSON's `model_path` + tag), over the training embedding as backdrop; candidates highlighted. Skips gracefully if the UMAP is absent. **The UMAP joblibs are the one artifact still named with the *plain* tag** — this lookup reconstructs the name from the training run's DB `save_tag` out of `config_{tag}.json`, and that run may have executed on a different host whose machine name the config never records; a display-tagged name would not resolve cross-host ([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)). The PNG itself is display-tagged. | "Where does real data live relative to the synthetic classes?" Real snippets clustering onto the training false-class region = healthy. Candidates far from *any* training class are the interesting anomalies; candidates inside the false-class cloud are threshold noise. |
 | `inference_summary_{tag}.png` | Table-style run card: cadence/snippet/candidate counts, per-stage durations and throughput from the manifest, per-target/band candidate counts. | The one-glance run report — read it before opening anything else. |
 
 ## Legacy `--test-files` path

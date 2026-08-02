@@ -63,13 +63,14 @@ Physical constants ride along in `DataConfig`: `freq_resolution` ≈ 2.79 Hz/bin
 | [`models/vae.py`](../src/aetherscan/models/vae.py), [`models/random_forest.py`](../src/aetherscan/models/random_forest.py) | Model definitions. See [`MODELS.md`](MODELS.md).                                                                                                                                                                                     |
 | [`rf_metrics.py`](../src/aetherscan/rf_metrics.py)                                                                         | Pure (TF-free) helper `compute_rf_eval_metrics()` — sklearn.metrics-based scalar RF eval metrics that `train.py` persists to `training_stats` (`model_name='rf'`) for the dashboard's RF tab.                                        |
 | [`shap_parallel.py`](../src/aetherscan/shap_parallel.py)                                                                   | TF-free process-pool wrapper (`parallel_shap`) chunking the RF SHAP passes across worker processes, each rebuilding a stock `TreeExplainer`. Called by `train.py`. See [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md).               |
-| [`db/db.py`](../src/aetherscan/db/db.py)                                                                                   | Thread-safe SQLite singleton with a single background writer thread, schema migrations, and supersede semantics. See [`DATABASE.md`](DATABASE.md).                                                                                   |
+| [`db/db.py`](../src/aetherscan/db/db.py)                                                                                   | Thread-safe SQLite singleton with a single background writer thread, schema migrations, and supersede semantics. Also home to `get_machine_name()`, the one memoized accessor for this host's name (feeds `display_tag()`). See [`DATABASE.md`](DATABASE.md).                                                                                   |
 | [`benchmark.py`](../src/aetherscan/benchmark.py)                                                                           | Always-on stage timing (`stage_timer` / `record_stage`) written to the `pipeline_stages` table. See [`BENCHMARKING.md`](BENCHMARKING.md).                                                                                            |
 | [`dashboard.py`](../src/aetherscan/dashboard.py)                                                                           | Standalone Streamlit live-monitoring dashboard read from the run's SQLite DB; ships in-package so any install method can auto-launch it.                                                                                             |
 | [`dashboard_launcher.py`](../src/aetherscan/dashboard_launcher.py)                                                         | `launch_dashboard()` spawns the headless Streamlit subprocess (guarded, detached, atexit / SIGTERM teardown).                                                                                                                        |
 | [`dashboard_cli.py`](../src/aetherscan/dashboard_cli.py)                                                                   | `aetherscan-dashboard` console script — re-execs `python -m streamlit run` on the packaged dashboard for manual DB inspection against a saved run.                                                                                    |
 | [`hf_hub.py`](../src/aetherscan/hf_hub.py)                                                                                 | HuggingFace Hub artifact upload/download with version-coupled revision resolution. See [`RELEASE.md`](RELEASE.md).                                                                                                                   |
 | [`tag_guards.py`](../src/aetherscan/tag_guards.py)                                                                         | Fail-early `--save-tag` dedup guards run before any expensive work.                                                                                                                                                                  |
+| [`display_tag.py`](../src/aetherscan/display_tag.py)                                                                       | Derives the machine-scoped **display tag** `{command}_{machine}_{datetime}` used by every artifact filename/path and plot/Slack title. Stdlib-only (no `aetherscan` imports) so it is import-safe from train/inference/viz/monitor/logger/HF upload; returns `round_XX` / `final` / empty / malformed tags unchanged. See [Tag conventions](#tag-conventions).                                     |
 | [`logger/`](../src/aetherscan/logger), [`manager/`](../src/aetherscan/manager), [`monitor/`](../src/aetherscan/monitor)    | Queue-based logging (+ Slack), resource lifecycle management (pools/SHM/processes/signals), 1 Hz resource monitoring. See [`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md).                                                              |
 
 ## Data flow
@@ -192,10 +193,10 @@ spawn); they must never touch the DB singleton and must route logging through
 
 ## Tag conventions
 
-Every run is identified by `config.checkpoint.save_tag` — the **tag** — which stamps every
-artifact filename and every DB row. A tag is `{command}_{YYYYMMDD_HHMMSS}`, resolved once at
-startup by `cli.resolve_save_tag()` (before `init_logger`, so the log / config / artifacts all
-share one datetime):
+Every run is identified by `config.checkpoint.save_tag` — the **tag** — which stamps every DB
+row and, via the machine-scoped derivative below, every artifact filename. A tag is
+`{command}_{YYYYMMDD_HHMMSS}`, resolved once at startup by `cli.resolve_save_tag()` (before
+`init_logger`, so the log / config / artifacts all share one datetime):
 
 | On the CLI | Resolves to | Use |
 | --- | --- | --- |
@@ -212,17 +213,53 @@ never another run's model; it fails loudly instead. **Retries** are first-class:
 (inference) make it resume in place rather than collide, with stale rows from dead attempts
 flagged `superseded` in the DB ([`DATABASE.md`](DATABASE.md)).
 
+### Display tag (filenames & plot titles)
+
+The tag above is the run's **identity**; it is what the DB stores and what you pass on the CLI.
+Everything *presentational* — every artifact filename/path, every plot title, every Slack
+message — instead uses the **display tag**
+`display_tag(tag, get_machine_name())` → `{command}_{machine}_{YYYYMMDD_HHMMSS}`
+(e.g. `inf_blpc3_20260731_182011`), derived by
+[`display_tag.py`](../src/aetherscan/display_tag.py) from the host name returned by
+`db.get_machine_name()`.
+
+The motivation is collision, not cosmetics: the plain tag has one-second resolution and no host
+component, so two runs of the same command started in the same second on two different machines
+resolve to the *same* tag — and their artifacts overwrite each other the moment they land in one
+directory (as happens when weights are copied `bla0` → `blpc3`). Splicing the machine name into
+the filename makes that impossible.
+
+What stays on the **plain** tag: `config.checkpoint.save_tag` itself, `--save-tag` / `--load-tag`,
+every DB write and query, and the HuggingFace commit + git tag. The display tag is derived,
+presentation-only, and never keys a row.
+
+Two properties worth knowing:
+
+- **Non-run tags pass through unchanged.** `round_XX`, the conventional `final` alias, an empty /
+  as-yet-unresolved tag, and any malformed string are returned as-is. This is load-bearing:
+  splicing a machine name into `round_05` would break the `round_(\d+)` checkpoint-cleanup regex
+  and produce a name no reader reconstructs, and `final` has no datetime to place the machine
+  before. Because the function is the identity on those flavors, filename choke points call it
+  unconditionally rather than branching.
+- **Resume still works**, because nothing persists the display tag: a reader re-derives it from
+  the plain tag plus its own `get_machine_name()`, on the same host that wrote the files.
+
 ## Directory layout & artifact map
 
 Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
-`/datax/scratch/zachy/...`; the container binds them 1:1 so absolute paths stay valid):
+`/datax/scratch/zachy/...`; the container binds them 1:1 so absolute paths stay valid).
+
+**Legend:** `{tag}` below is the **display** tag `{command}_{machine}_{datetime}`
+([above](#display-tag-filenames--plot-titles)), not the plain DB tag — except where flagged as
+the plain-tag exception. `round_XX`-stamped names are per-round checkpoint artifacts and are
+deliberately untouched by display tagging.
 
 ```
 {data_path}/
 ├── training/                          # background plate .npy files (config.data.train_files)
 ├── testing/                           # preprocessed test .npy files (config.data.test_files)
 └── inference/                         # CSV catalogs (config.data.inference_files)
-    └── preprocessed/<csv_stem>_<tag>/ # per-cadence stamp .npy + metadata .json (tag-scoped)
+    └── preprocessed/<csv_stem>_ed<hash12>/ # per-cadence stamp .npy + metadata .json (keyed on the ED-config fingerprint, not a run tag)
 
 {model_path}/
 ├── vae_encoder_{tag}.keras            # final encoder (the inference model)
@@ -232,8 +269,8 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 ├── rf_calibrator_{tag}.joblib         # kept probability calibrator (only calibrated runs)
 ├── rf_eval_artifacts_{tag}.joblib     # val features/labels/probas consumed by all RF plots
 ├── rf_shap_values_{tag}.joblib        # cached SHAP values (summary/interaction/log-loss)
-├── umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib   # persisted UMAP projections
-└── checkpoints/                       # per-round vae_{encoder,decoder}_round_XX.keras
+├── umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib   # persisted UMAP projections — PLAIN tag (see below)
+└── checkpoints/                       # per-round vae_{encoder,decoder}_round_XX.keras (round_XX, not display-tagged)
     └── archive/<timestamp>/           # previous runs' checkpoints, moved aside at startup
 
 {output_path}/
@@ -249,9 +286,16 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
     ├── resource_utilization_{tag}.png # monitor resource plot (mode-agnostic)
     ├── benchmark_report_{tag}.png      # end-of-run resource report (mode-agnostic)
     ├── training/{tag}/*.png            # end-of-training diagnostics (incl. posterior_collapse_{tag}.png)
-    │   └── checkpoints/*_round_XX.png  #   per-round diagnostics (archived like model checkpoints)
+    │   └── checkpoints/*_round_XX.png  #   per-round diagnostics (round_XX files, archived like model checkpoints)
     └── inference/{tag}/*.png           # inference viz suite (incl. candidate_uncertainty_{tag}.png)
 ```
+
+**The UMAP joblibs are the one deliberate plain-tag exception.** Every other artifact is written
+and read back on the same host, so a display tag re-derives cleanly. The UMAP models are not:
+inference reconstructs their filename from the *training* run's `save_tag`, read out of
+`config_{tag}.json` (`inference_viz.py`'s latent projection), and that run may have executed on a
+different machine whose name the config never records. Keeping those names on the plain tag is
+what makes the cross-host lookup resolve.
 
 Startup hygiene: `train.py:archive_directory()` moves (fresh run) or copies (resume) existing
 checkpoints/plots into `archive/<timestamp>/` and deletes `round_XX`-stamped files at or above

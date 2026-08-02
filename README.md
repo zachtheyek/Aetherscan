@@ -325,19 +325,24 @@ PYTHONPATH=src python -m aetherscan.main inference
 # Container
 ./utils/run_container.sh python -m aetherscan.main inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
-    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_20260101_120000.keras \
-    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_20260101_120000.joblib \
-    --config-path /datax/scratch/zachy/models/aetherscan/config_train_20260101_120000.json \
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_blpc3_20260101_120000.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_blpc3_20260101_120000.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_train_blpc3_20260101_120000.json \
     --classification-threshold 0.99
 
 # Source
 PYTHONPATH=src python -m aetherscan.main inference \
     --test-files real_filtered_LARGE_test_HIP15638.npy \
-    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_20260101_120000.keras \
-    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_20260101_120000.joblib \
-    --config-path /datax/scratch/zachy/models/aetherscan/config_train_20260101_120000.json \
+    --encoder-path /datax/scratch/zachy/models/aetherscan/vae_encoder_train_blpc3_20260101_120000.keras \
+    --rf-path /datax/scratch/zachy/models/aetherscan/random_forest_train_blpc3_20260101_120000.joblib \
+    --config-path /datax/scratch/zachy/models/aetherscan/config_train_blpc3_20260101_120000.json \
     --classification-threshold 0.99
 ```
+
+> Note the `blpc3` in those filenames: training writes the **machine name** into every artifact
+> name (`{command}_{machine}_{datetime}`), so substitute the host that produced your models.
+> Tags you *type* — `--save-tag` / `--load-tag` — stay plain `{command}_{datetime}`. See
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#display-tag-filenames--plot-titles).
 
 **Inference from raw `.h5` files (invokes energy detection preprocessing)**
 

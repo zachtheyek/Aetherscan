@@ -22,7 +22,7 @@ record through one consumer instead:
 main process:  logging.* → QueueHandler ─┐
 pool workers:  logging.* → QueueHandler ─┼→ multiprocessing.Queue → QueueListener thread
 producer tree: QueueHandler (own queue,  ─┘        │
-               relayed by RoundDataProducer)       ├→ FileHandler   logs/aetherscan_{tag}.log (mode="w")
+               relayed by RoundDataProducer)       ├→ FileHandler   logs/aetherscan_{display_tag}.log (mode="w")
                                                    ├→ StreamHandler stdout
                                                    └→ SlackHandler  (optional)
 ```
@@ -32,9 +32,13 @@ producer tree: QueueHandler (own queue,  ─┘        │
 thread that drains it into the real handlers, each with its own configured level
 (`logger.{console,file,slack}_level`, all INFO by default). Consequences:
 
-- Each run's log file is **tag-scoped** (`logs/aetherscan_{tag}.log`, named from the effective
-  `--save-tag`); `mode="w"` truncates at startup, so a same-tag rerun overwrites that tag's own
-  log while differently-tagged runs no longer clobber each other.
+- Each run's log file is **tag-scoped** (`logs/aetherscan_{display_tag}.log`); `mode="w"`
+  truncates at startup, so a same-tag rerun overwrites that tag's own log while
+  differently-tagged runs no longer clobber each other. The filename uses the **display** tag —
+  `Logger.__init__` composes `display_tag(tag, get_machine_name())` from the effective
+  `--save-tag`, so two hosts starting the same command in the same second write to distinct
+  files ([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)). The helper
+  `log_path_for_tag()` itself is tag-agnostic: it formats whatever tag it is handed.
 - **Fork-started workers** inherit the queue: `init_worker_logging()` (called from every pool
   initializer) resets the worker's root logger to a single `QueueHandler` — and resets
   `sys.stdout`/`sys.stderr` to the real streams, because the inherited `StreamToLogger`
@@ -188,7 +192,9 @@ decimated per series since #301 (`db.query_system_resource_decimated`, ≤ 4,096
 uniformly-strided points per `(resource_type, resource_name)` line: a multi-week run holds
 tens of millions of rows while the plot renders ~2 k px wide, and materializing them all
 cost a multi-GB teardown RAM spike; see [`DATABASE.md`](DATABASE.md)) — and renders
-`plots/resource_utilization_{tag}.png` — three stacked, time-aligned panels:
+`plots/resource_utilization_{display_tag}.png` — display-tagged like every other artifact
+([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)); three stacked,
+time-aligned panels:
 
 1. **CPU** — Aetherscan process tree (filled) vs system total.
 2. **RAM** — same pair; the gap between them is other users/jobs on the node.

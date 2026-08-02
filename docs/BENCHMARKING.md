@@ -127,11 +127,15 @@ python utils/benchmark_report.py --save-tag train
 python utils/benchmark_report.py --save-tag test --db-path /path/to/aetherscan.db
 ```
 
+Mind the asymmetry: this tool queries the **DB**, so `--save-tag` takes the **plain** tag
+`{command}_{datetime}` — the same string you passed the run. Only the emitted PNG is named with
+the machine-scoped display tag ([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)).
+
 The same report is also generated **automatically at the tail of every `train`/`inference`
 run** (`_post_benchmark_report` in [`main.py`](../src/aetherscan/main.py)): the hook flushes
 the DB write queue (stage spans land through it asynchronously), loads this tool by file path
 (preserving its no-`aetherscan`-imports contract), renders
-`{output_path}/plots/benchmark_report_{tag}.png`, and uploads it to Slack with the
+`{output_path}/plots/benchmark_report_{display_tag}.png`, and uploads it to Slack with the
 suggestions as the image comment. It is gated by `monitor.benchmark_report_enabled`
 (`--no-benchmark-report` to opt out) and fully guarded — any failure logs an error and never
 fails the run.

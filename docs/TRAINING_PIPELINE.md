@@ -98,8 +98,10 @@ A full-scale round is three arrays (`main`, `true`, `false`) of shape
 historical input numerics byte-for-byte; see the
 [performance-engineering section](#performance-engineering-the-276-follow-up-july-2026)).
 Holding that in RAM is what used to OOM-kill 503 GB training nodes; instead each round lives
-on disk under `{round_data_dir}/{save_tag}/round_{k:02d}/` (default root
-`{data_path}/training/round_data`):
+on disk under `{round_data_dir}/{display_tag}/round_{k:02d}/` (default root
+`{data_path}/training/round_data`; the per-run directory is named with the **display** tag
+`{command}_{machine}_{datetime}`, see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)):
 
 ```
 round_02/
@@ -142,7 +144,7 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
 > **For official tagged training releases, pass `--keep-round-data`.** By default each round's
 > memmaps are deleted the moment that round finishes training (delete-as-you-go keeps the disk
 > footprint at ~590 GB). `--keep-round-data` retains every round's exact on-disk dataset (plus the
-> RF training set) under `{data_path}/training/round_data/{save_tag}/{round_XX,rf}/`, so a release
+> RF training set) under `{data_path}/training/round_data/{display_tag}/{round_XX,rf}/`, so a release
 > model's training data is reproducible/inspectable after the fact — at the cost of holding the full
 > run on disk (~295 GB × num_training_rounds, e.g. ~6 TB for a 20-round run). Nothing in the pipeline
 > *reads* an earlier round once it has trained, so this flag is purely for post-hoc retention.
@@ -187,7 +189,8 @@ prefetch/callback threads used to make round-2+ generation far slower than round
   Linux, `prctl(PR_SET_PDEATHSIG, SIGTERM)` provides immediate coverage for
   mid-generation parent death via the existing SIGTERM handler.
 - **Pidfile (`producer.pid`).** `start()` writes
-  `{round_data_root}/{tag}/producer.pid`; `shutdown()` removes it on graceful
+  `{round_data_root}/{display_tag}/producer.pid` (same display-tagged per-run directory as the
+  round memmaps); `shutdown()` removes it on graceful
   exit. The pidfile enables post-mortem discovery by `kill_pipeline.sh` and
   `_reap_stale_producer()`.
 - **Restart-race guard.** `prepare_round_data_dir()` calls
@@ -482,6 +485,11 @@ the [CLI Reference](../README.md#cli-reference) for the exact flag help.
 
 ### What gets saved when
 
+> **`{tag}` in the filenames below is the *display* tag** `{command}_{machine}_{datetime}` —
+> training writes the host name into every artifact name. The run's DB tag and the
+> `--save-tag` / `--load-tag` values you type stay plain `{command}_{datetime}`; `round_XX`
+> names are unaffected. See [`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles).
+
 | Artifact | When | Where |
 | --- | --- | --- |
 | `vae_{encoder,decoder}_round_XX.keras` | End of every round | `{model_path}/checkpoints/` |
@@ -535,8 +543,13 @@ artifacts already exist from a previous attempt, they are loaded instead of rege
 
 ## Training plots — what each one shows
 
-Per-round copies (tagged `round_XX`) land in `{output_path}/plots/training/{save_tag}/checkpoints/`;
-the end-of-training set (tagged with the run tag) in `{output_path}/plots/training/{save_tag}/`. Every
+Per-round copies (tagged `round_XX`) land in `{output_path}/plots/training/{display_tag}/checkpoints/`;
+the end-of-training set (tagged with the run's display tag) in
+`{output_path}/plots/training/{display_tag}/`. The **directory** is display-tagged
+(`{command}_{machine}_{datetime}`) and so are the end-of-training filenames and every plot
+**title**; the per-round *files* inside `checkpoints/` keep their `round_XX` stamp
+([`ARCHITECTURE.md`](ARCHITECTURE.md#display-tag-filenames--plot-titles)). `{tag}` in the
+filenames below means the display tag. Every
 figure is also
 uploaded to the run's Slack thread. All of them query the DB with `start_time =
 run_start_time`, so multi-attempt runs plot complete histories with superseded rows filtered
@@ -825,7 +838,8 @@ winner empirically:
 3. **Every variant is fit and evaluated under its deterministic inference-time form**
    (`z_mean` in the lead feature slot — for the `z`/`z_aug` variants that is deliberately the
    deployed configuration, not the training one) and saved as
-   `random_forest_{tag}_{variant}.joblib`.
+   `random_forest_{tag}_{variant}.joblib` (display tag, as everywhere in this section — the
+   files on disk read `random_forest_train_{machine}_{datetime}_{variant}.joblib`).
 4. **Selection**: the primary metric is recall at `rf.selection_max_fpr` on the selection
    split (AUC averages over operating points the pipeline never uses). The best variant must
    beat every *simpler* (fewer-feature) variant by more than a bootstrap CI of the recall
