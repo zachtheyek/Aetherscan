@@ -1,10 +1,11 @@
 # Benchmarking
 
 Aetherscan carries always-on stage timing plus a set of offline tools to read it. This
-document covers the four pieces: the `stage_timer` instrumentation
+document covers the six pieces: the `stage_timer` instrumentation
 ([`src/aetherscan/benchmark.py`](../src/aetherscan/benchmark.py)), the `pipeline_stages` DB
 table it writes to, the annotated resource plot the monitor renders, the report tool
-([`utils/benchmark_report.py`](../utils/benchmark_report.py)), and the standalone benchmarks
+([`utils/benchmark_report.py`](../utils/benchmark_report.py)), the per-band inference plot
+([`utils/perband_report.py`](../utils/perband_report.py)), and the standalone benchmarks
 ([`benchmarks/`](../benchmarks/)). It closes with the current baseline numbers and how to
 read the annotated resource plot.
 
@@ -21,6 +22,13 @@ read the annotated resource plot.
   flame-style timeline PNG, and flags likely bottlenecks from `pipeline_stages` joined with
   `system_resources`. The report PNG is also rendered and posted to Slack automatically at
   the end of every `train`/`inference` run (`--no-benchmark-report` opts out).
+- `python utils/perband_report.py --save-tag <tag> --catalog <csv>` writes
+  `plots/perband_inference_perf_{tag}.png` — per-cadence energy-detection wall-clock split by
+  observing band (boxplot + strip) and against catalog frequency — the question the flame
+  timeline can't answer: is a whole band systematically slower? It gets the same
+  auto-render-and-post-to-Slack treatment at the tail of every streaming-CSV `inference` run,
+  under the same opt-out, and skips (never crashes) on the legacy `--test-files` path or when
+  the catalog → cadence join guard trips.
 - The 1 Hz resource plot overlays the top-level stages as `dimgray` vertical boundary lines
   at each span's right edge on all three (CPU/RAM/GPU) panels — labeled once on the CPU panel
   (angled 30°, left of the line) — via `monitor.annotate_stages`, so a CPU plateau reads as
@@ -75,7 +83,7 @@ are shown at full depth; the leaf component is what the report tool and resource
 | `train.load_backgrounds` | `main.py` | Background plate load before the round loop |
 | `train.round_{k:02d}` | `train.py` | Umbrella span for one round |
 | `train.round_{k:02d}.data_generation` | `train.py` (in-process) / `round_data.py` (producer) | `metadata.source` = `in-process` or `producer` |
-| `train.round_{k:02d}.epochs` | `train.py` | Round-level epoch span (`record_stage`; per-epoch detail lives in `training_stats`) |
+| `train.round_{k:02d}.epochs` | `train.py` | Round-level epoch span (`stage_timer`, nested under the round; per-epoch detail lives in `training_stats`) |
 | `train.round_{k:02d}.plots` | `train.py` | Per-round plots |
 | `train.round_{k:02d}.checkpoint_save` | `train.py` | `save_models(round_XX)` |
 | `train.vae_plots` | `train.py` | End-of-VAE plot stage |
@@ -83,8 +91,10 @@ are shown at full depth; the leaf component is what the report tool and resource
 | `train.rf_plots` | `train.py` | RF plot stage |
 | `train.final_save` | `train.py` | Final model + config save (+ HF upload) |
 | `inference.infer` | `inference.py` | Legacy single-array `run_inference` span |
-| `inference.preprocess_cadence_{i:03d}` (`.read_ed`, `.dedup`, `.extract`) | `main.py` / `preprocessing.py` | Per-cadence energy detection |
+| `inference.load_lognorm` | `main.py` | Legacy `--test-files` load span (top-level; distinct from the per-cadence `.load_lognorm` child below) |
+| `inference.preprocess_cadence_{i:03d}` (`.read_ed`, `.dedup`, `.extract`) | `preprocessing.py` | Per-cadence energy detection |
 | `inference.infer_cadence_{i:03d}` (`.load_lognorm`, `.encode`, `.rf`, `.db_write`) | `main.py` / `inference.py` | Per-cadence GPU inference + write |
+| `inference.reference_cloud` | `main.py` | #282 MC reference-cloud finalization (best-effort, once per successful pass) |
 | `inference.viz` | `main.py` | Visualization suite |
 
 ## The `pipeline_stages` table (schema v4)
@@ -206,7 +216,10 @@ one can be measured in seconds instead of via a full run. Most are CPU micro-ben
 `bench_rf`) that print ops/s; `bench_gpu` is a real-GPU profiler for the Beta-VAE that reports
 throughput + peak VRAM across a per-replica batch-size sweep (NGC-container-only). **Not**
 collected by pytest (`testpaths = ["tests"]`); run on demand. Each writes a JSON result to
-`benchmarks/results/` (gitignored). See [`benchmarks/README.md`](../benchmarks/README.md) for
+`benchmarks/results/` (gitignored); the two benchmarks that need bulk data on disk
+(`bench_input_pipeline.py`, `bench_datagen.py`) default their `--data-dir` to
+`{AETHERSCAN_DATA_PATH}/bench/{input,datagen}` — the same data root the pipeline uses — and
+accept `--data-dir` to override. See [`benchmarks/README.md`](../benchmarks/README.md) for
 the maintained baseline tables and per-flag detail.
 
 ```bash
@@ -241,6 +254,8 @@ the maintained per-host baseline tables.
 | `bench_input_pipeline.py` | The real memmap → tf.data → distribute → train-step input path, legacy vs current builder (current = the zero-copy pure-TF gather AND the graph-side accumulated step, mirroring train.py as checked out), with a `--gil-load` contention knob and `--profile` TF-profiler hook | The training input pipeline `bench_gpu.py` deliberately excludes — the #276 audit harness. Its profiler traces are what established that the GPUs sit idle >90% of the wall clock while doing exactly the kernel work `bench_gpu` predicts; the follow-up section of `benchmarks/README.md` carries the before/after ladder for the Python-free rewrite |
 | `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / render / assemble) with output-equality gates on every candidate optimization | The `vae_plots` latent-GIF tail — the #278 audit harness (numbers in `benchmarks/README.md`) |
 | `bench_datagen.py` | Seeded round generation through the real pooled `generate_round_to_memmap` path (shared-memory plates, per-task seed derivation, batched memmap tasks), sha256-ing every output array as the byte-compatibility gate for generation-path changes; `--preload-tf` mirrors the producer workers' TF import graph | The producer wall (`train.round_XX.data_generation`) that `bench_injection.py`'s single-process kernel can't reach — the generation-path A/B harness (ladder + mechanisms in `benchmarks/README.md`) |
+| `bench_db_index_shapes.py` | The schema-v7 `training_stats` / `latent_snapshots` index reshapes — old `(tag, timestamp, ...)` filter index vs the equality-first replacement — timed across every production query shape plus each table's real write pattern, no `ANALYZE` (matching `db.py`) | DB read/write cost behind the loss-curve / posterior-collapse / latent-GIF-frame fetches — the schema-v7 DB-index audit (verdict baked into the schema: latent reshape shipped, `training_stats` rejected; numbers in the docstring) |
+| `bench_injection_index.py` | The schema-v7 secondary `injection_stats` index (`idx_injection_stats_by_stat`) vs the original filter index — bulk-insert write cost and the end-of-run plot query shape, benched with and without `ANALYZE` | DB read/write cost behind the injection-stats end-of-run plot pass — the schema-v7 DB-index audit (companion to `bench_db_index_shapes.py`) |
 
 Only the four CPU micro-benchmarks (`bench_normality`, `bench_injection`,
 `bench_lognorm_downsample`, `bench_pfb_vs_spline`) are single-process; the pipeline

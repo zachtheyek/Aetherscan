@@ -25,6 +25,15 @@ python benchmarks/bench_rf.py                    # Random Forest stage: latent p
     --data-dir /datax/scratch/$USER/data/aetherscan/bench/datagen
 ```
 
+Bulk bench data (the synthetic round `bench_input_pipeline.py` writes and the generated round
+`bench_datagen.py` drives) defaults to `{AETHERSCAN_DATA_PATH}/bench/input` and
+`{AETHERSCAN_DATA_PATH}/bench/datagen` respectively — the same data root the pipeline uses
+(falling back to `/datax/scratch/zachy/data/aetherscan` when the env var is unset). Pass
+`--data-dir` to override. Result JSONs are unaffected and still land in `benchmarks/results/`.
+`bench_input_pipeline.py`'s round is ~12 GB at the default `--n-samples` and is reused across
+invocations (`--regen` to rewrite); `bench_datagen.py` deletes its round on exit unless `--keep`
+is passed.
+
 `bench_gpu.py` is a different animal — it profiles the Beta-VAE on a real GPU (throughput +
 peak VRAM, with a batch-size sweep) rather than a CPU kernel, so it only runs inside the
 container on a cluster. See [GPU benchmark](#gpu-benchmark) below.
@@ -47,6 +56,8 @@ comparing against the baselines.
 | `bench_input_pipeline.py` | The REAL memmap → tf.data → distribute → train-step input path (gather / iterate / step modes; legacy vs current builder; `--gil-load` contention knob) — **container-only; step mode needs GPUs** | The training input pipeline `bench_gpu.py` deliberately excludes (`train.prepare_distributed_train_dataset`) — see [#276 audit](#input-pipeline-audit-276) |
 | `bench_latent_gif.py` | Latent-GIF stage decomposition (UMAP fit / transform / frame render / GIF assembly) with output-equality checks on every candidate optimization — **container-only** | The `vae_plots` latent-GIF tail (`train.plot_latent_space_gif`) — see [#278 audit](#latent-gif-audit-278) |
 | `bench_datagen.py` | Seeded round generation through the REAL pooled `generate_round_to_memmap` path (shared-memory plates, `_init_worker`, per-task seed derivation, batched memmap tasks) with per-array sha256 checksums — the byte-compatibility gate for generation-path changes; `--preload-tf` mirrors the producer workers' TF import graph | The producer wall (`train.round_XX.data_generation`) that `bench_injection.py`'s single-process kernel can't reach — see [Producer/data-generation follow-up](#producerdata-generation-follow-up) |
+| `bench_injection_index.py` | The schema-v7 secondary `injection_stats` index (`idx_injection_stats_by_stat` vs the original `idx_injection_stats_filter`): bulk-insert write cost and the end-of-run plot query shape (equality on stat/type/stage + run-wide time bounds), timed with and without `ANALYZE`, with an `EXPLAIN QUERY PLAN` per setup — SQLite, no TF/GPU | The `plot_injection_stats` end-of-run query pass — the ~165-query tag-partition scan the second index targets — see [Producer/data-generation follow-up](#producerdata-generation-follow-up) |
+| `bench_db_index_shapes.py` | The schema-v7 index reshapes on `training_stats` and `latent_snapshots` (old filter index vs the equality-first replacement): every production query shape + insert throughput against production-shaped synthetic DBs, `EXPLAIN QUERY PLAN` per shape (companion to `bench_injection_index.py`) — SQLite, no TF/GPU | The latent-GIF frame fetch (`train.plot_latent_space_gif`) plus the training-stats/dashboard reads — the schema-v7 DB-index audit |
 | `parse_xplane_occupancy.py` | Post-processor, not a benchmark: per-GPU busy time / occupancy from a `--profile` run's XPlane trace (merged event intervals, strict kernel-time measure) | The "GPUs idle >90%" profiler evidence in the [#276 audit](#input-pipeline-audit-276) and its follow-up |
 
 ## Baseline numbers
@@ -121,7 +132,10 @@ drives single observations `(16, 512, 1)` like inference. Peak VRAM is reported 
 replica holds a full copy of the model, so combined VRAM is roughly this figure times the replica
 count. With `--accumulation-steps K`, one optimizer step accumulates the all-reduced grads over K
 micro-batches and applies once (as `_train_epoch`), so peak VRAM then includes the persistent
-accumulator and throughput reflects the once-per-K apply cadence. `--find-max` is capped at
+accumulator and throughput reflects the once-per-K apply cadence. `--mixed-precision` sets the
+keras `mixed_bfloat16` global policy before the model is built (the same policy as the pipeline's
+`beta_vae.mixed_precision`, fp32 islands in `models/vae.py` included); default off = fp32, matching
+the pipeline default. `--find-max` is capped at
 `--max-batch 4096`: a single encoder forward whose conv feature
 maps exceed 2^31 elements (batch ≳ 8192) trips an uncatchable TensorFlow int32 launch-config abort
 rather than a clean OOM, and 4096 already covers the training VRAM ceiling and a generous inference

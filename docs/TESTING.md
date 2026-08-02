@@ -68,7 +68,10 @@ tests/
 │   ├── test_hf_hub.py               # revision resolution, artifact download, upload staging, card
 │   ├── test_db.py                   # writer thread, flush/supersede sentinels, migrations, queries
 │   ├── test_manager.py              # pool/SHM tracking and cleanup idempotence
+│   ├── test_monitor.py              # get_process_tree_stats cache: reuse/eviction/PSS, RAM-only path, outer guard
 │   ├── test_benchmark.py            # stage_timer nesting/failures, report tree math + suggestions
+│   ├── test_perband_report.py       # per-band plot: umbrella-vs-child span isolation, catalog
+│   │                                #   join + count-guard skip, per-band stats, non-empty PNG
 │   ├── test_candidate_figures.py    # TF-free candidate renderer: pool/serial parity, containment
 │   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
 │   ├── test_dashboard_cli.py        # aetherscan-dashboard console entry: exec-argv builder + streamlit-missing guard
@@ -78,7 +81,8 @@ tests/
     ├── conftest.py                  # repo-root launcher + cluster path resolution
     ├── test_train_smoke.py          # known-good training smoke config, end to end
     ├── test_inference_smoke.py      # subset CSV inference against cluster-resident .h5 data
-    └── test_model_behavior.py       # SNR→confidence monotonicity gate vs the persisted VAE+RF
+    ├── test_model_behavior.py       # SNR→confidence monotonicity gate vs the persisted VAE+RF
+    └── test_seeding_determinism.py  # end-to-end determinism smoke: seed + op-determinism → byte-identical weights
 ```
 
 ## Coverage and deliberate gaps

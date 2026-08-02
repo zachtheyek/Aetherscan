@@ -654,3 +654,14 @@ reloading a `config_{tag}.json` written **before** #283 silently ignores the old
 instead. **Workaround:** pass the old value explicitly (`--seed N` / `--tf-deterministic-ops`
 — both flags now exist on `train` *and* `inference`). Same clean-break precedent as the #272
 tag-scheme change.
+
+## Pre-#293 saved configs: `beta_vae.regularization_active` is silently skipped on restore
+
+PR #324 (issue #293) removed the `beta_vae.regularization_active` field along with the L1/L2
+declarations themselves, after the #293 sweep found no benefit at any calibrated strength. A
+`config_{tag}.json` written **before** #324 still carries the key; `apply_saved_config`'s
+`hasattr` guard drops it without even a "fields NOT layered" diff line (that log only covers
+fields that still exist but are not allowlisted). **No action required** — unlike the pre-#283
+seed case, nothing is lost: the flag defaulted to `False`, and the objective now has no
+regularization term at any setting, so loading a pre-#324 config (including the released
+v1.0.0 one) reproduces the same numerics it always did.

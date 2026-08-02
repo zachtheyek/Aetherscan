@@ -29,7 +29,7 @@ The model architecture is based on [Ma et al. 2023](https://arxiv.org/abs/2301.1
 
 ### System Requirements
 
-Aetherscan supports two install paths off the same source tree. The NGC container is the canonical runtime on both clusters; the conda env is kept as an alternative for users who can't or don't want to use containers on Ampere.
+Aetherscan supports two install paths off the same source tree — the **NGC container** (the canonical runtime on both clusters) and a **conda env** (an alternative on Ampere for those who can't or won't use containers) — plus the published **PyPI package** for off-cluster use (see [Install From PyPI (pip)](#install-from-pypi-pip) for its v1.0.0 caveats).
 
 **NGC container (canonical, runs on both clusters)**
 
@@ -56,6 +56,29 @@ Aetherscan supports two install paths off the same source tree. The NGC containe
 
 > [!NOTE]
 > The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`) — via the always-on resource instrumentation (`system_resources` DB rows). They characterize full-scale runs; small runs need substantially less.
+
+### Install From PyPI (pip)
+
+For **off-cluster** use, Aetherscan is published on PyPI. The container stays canonical on the clusters (and is **mandatory on Blackwell** — see the caveats). **v1.0.0 needs a one-time workaround** (removed in v1.0.1):
+
+```bash
+pip install aetherscan==1.0.0
+pip install "tf_keras~=2.17.0"        # REQUIRED for v1.0.0: the released weights are Keras-2 format
+export TF_USE_LEGACY_KERAS=1           # so `from tensorflow import keras` resolves to tf_keras
+
+# The three data roots are mandatory off-cluster (they must already exist):
+export AETHERSCAN_DATA_PATH=...  AETHERSCAN_MODEL_PATH=...  AETHERSCAN_OUTPUT_PATH=...
+
+# Bare inference (no --encoder-path/--rf-path/--config-path) resolves + downloads the v1.0.0 HF weights:
+python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
+```
+
+**Caveats:**
+
+- **Blackwell (sm_120) needs the NGC container, not pip.** pip's `tensorflow[and-cuda]` ships CUDA-12.3 kernels with no sm_120 support, so a Blackwell GPU raises `CUDA_ERROR_INVALID_PTX`. Ampere works on the pip path.
+- **No CPU mode.** Both `train` and `inference` hard-exit when no GPU is visible (`"… requires GPU"`).
+- The live dashboard needs the extra: `pip install 'aetherscan[dashboard]'`.
+- The `tf_keras` + `TF_USE_LEGACY_KERAS` steps are the **v1.0.0** workaround only ([#323](https://github.com/zachtheyek/Aetherscan/issues/323) — the released `.keras` weights are Keras-2 while pip pulls Keras 3). Once **v1.0.1** ships they become unnecessary and the install collapses to `pip install aetherscan`; this section will be updated at that point.
 
 ### Run From Container
 
