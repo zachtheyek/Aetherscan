@@ -258,7 +258,7 @@ jobs:
 
   # Decorate the tag into a GitHub Release with generated notes and the built artifacts
   # attached. The generated notes are a starting point — curate the body from the per-PR
-  # claude-release-notes comments afterwards (docs/RELEASE.md step 7).
+  # claude-release-notes comments afterwards (docs/RELEASE.md step 7 + the "Release notes" note).
   github-release:
     needs: [guard, publish]
     if: needs.guard.outputs.dry_run != 'true'
