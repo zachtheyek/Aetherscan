@@ -495,6 +495,15 @@ the [CLI Reference](../README.md#cli-reference) for the exact flag help.
 | `config_{tag}.json` (resolved config snapshot) | `final_save` stage | `{output_path}/` |
 | `run_state_{tag}.json` | Updated after every stage/round transition | `{output_path}/` |
 
+The RF forests are **self-describing** (#318): each is stamped at the fit site with
+`aetherscan_latent_variant_` (the variant it was trained on) and `aetherscan_active_dims_` (the
+run's active-dim set), so `random_forest_{tag}.joblib` and all 8 `random_forest_{tag}_{variant}.joblib`
+sweep artifacts record their own representation. Inference reads these back in
+`_check_rf_feature_layout` to reject a config↔weights mismatch the feature-count check alone cannot
+see — the same-width variants (`z`/`z_mean`/`z_aug`) and, for `z_mean_logvar_active`, two
+equal-length active-dim sets (see [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md) and
+[`MODELS.md`](MODELS.md)).
+
 ### The run-state manifest
 
 [`run_state.py`](../src/aetherscan/run_state.py)`:TrainingRunState` persists (atomically,
