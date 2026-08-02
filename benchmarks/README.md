@@ -25,6 +25,15 @@ python benchmarks/bench_rf.py                    # Random Forest stage: latent p
     --data-dir /datax/scratch/$USER/data/aetherscan/bench/datagen
 ```
 
+Bulk bench data (the synthetic round `bench_input_pipeline.py` writes and the generated round
+`bench_datagen.py` drives) defaults to `{AETHERSCAN_DATA_PATH}/bench/input` and
+`{AETHERSCAN_DATA_PATH}/bench/datagen` respectively — the same data root the pipeline uses
+(falling back to `/datax/scratch/zachy/data/aetherscan` when the env var is unset). Pass
+`--data-dir` to override. Result JSONs are unaffected and still land in `benchmarks/results/`.
+`bench_input_pipeline.py`'s round is ~12 GB at the default `--n-samples` and is reused across
+invocations (`--regen` to rewrite); `bench_datagen.py` deletes its round on exit unless `--keep`
+is passed.
+
 `bench_gpu.py` is a different animal — it profiles the Beta-VAE on a real GPU (throughput +
 peak VRAM, with a batch-size sweep) rather than a CPU kernel, so it only runs inside the
 container on a cluster. See [GPU benchmark](#gpu-benchmark) below.

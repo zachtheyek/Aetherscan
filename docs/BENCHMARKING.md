@@ -174,7 +174,10 @@ one can be measured in seconds instead of via a full run. Most are CPU micro-ben
 `bench_rf`) that print ops/s; `bench_gpu` is a real-GPU profiler for the Beta-VAE that reports
 throughput + peak VRAM across a per-replica batch-size sweep (NGC-container-only). **Not**
 collected by pytest (`testpaths = ["tests"]`); run on demand. Each writes a JSON result to
-`benchmarks/results/` (gitignored). See [`benchmarks/README.md`](../benchmarks/README.md) for
+`benchmarks/results/` (gitignored); the two benchmarks that need bulk data on disk
+(`bench_input_pipeline.py`, `bench_datagen.py`) default their `--data-dir` to
+`{AETHERSCAN_DATA_PATH}/bench/{input,datagen}` — the same data root the pipeline uses — and
+accept `--data-dir` to override. See [`benchmarks/README.md`](../benchmarks/README.md) for
 the maintained baseline tables and per-flag detail.
 
 ```bash
