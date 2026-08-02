@@ -46,17 +46,21 @@ jobs:
 
       # Mirror the NGC container's dependency surface on a CPU-only runner:
       # tensorflow-cpu stands in for the container's GPU TF 2.17 build, the pinned
-      # extras come from requirements-container.txt, and tf_keras/h5py/hdf5plugin/
-      # pandas/psutil/pytest are installed explicitly because the NGC base image ships
-      # them (so the requirements file intentionally omits them; hdf5plugin is
-      # pinned explicitly in environment.yml too — don't rely on setigen pulling
-      # it transitively). tf_keras backs legacy-Keras mode (TF_USE_LEGACY_KERAS is set
-      # in aetherscan/__init__.py), so the suite runs the way the pipeline does; without
-      # it, importing aetherscan under that flag fails `from tensorflow import keras`.
+      # extras come from requirements-container.txt, and h5py/hdf5plugin/pandas/
+      # psutil/pytest are installed explicitly because the NGC base image ships them
+      # (so the requirements file intentionally omits them; hdf5plugin is pinned
+      # explicitly in environment.yml too — don't rely on setigen pulling it
+      # transitively). tf_keras backs legacy-Keras mode (TF_USE_LEGACY_KERAS) and is
+      # installed separately with --no-deps: pulling it normally would drag in the
+      # 601 MB GPU tensorflow wheel on top of tensorflow-cpu, because its
+      # `tensorflow>=2.17` edge isn't satisfied by the -cpu distribution name. tf_keras
+      # imports the `tensorflow` module tensorflow-cpu already provides — the same
+      # arrangement as the NGC image, where tf_keras sits next to a TF it never installed.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "tensorflow-cpu==2.17.*" "tf_keras==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
+          pip install "tensorflow-cpu==2.17.*" -r requirements-container.txt h5py hdf5plugin pandas psutil pytest
+          pip install --no-deps "tf_keras==2.17.*"
 
       # GPU- and cluster-marked tests need physical GPUs / cluster-resident data;
       # everything else (including slow CPU TF graph tests) runs here

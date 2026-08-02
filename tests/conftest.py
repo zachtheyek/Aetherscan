@@ -31,6 +31,11 @@ import pytest
 os.environ.setdefault("MPLBACKEND", "Agg")
 # Quiet TF's C++ INFO/WARNING chatter in test output.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# Legacy Keras (#323): set before ANY test module imports tensorflow — not just the ones that
+# happen to import aetherscan first. A TF-first module collected early would otherwise pin the
+# whole session to Keras 3 and hide a missing tf_keras. aetherscan/__init__.py still carries this
+# at runtime; conftest makes the test session order-proof (and covers subprocesses that inherit it).
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
 
 def _reset_all_singletons():
