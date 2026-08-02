@@ -28,6 +28,18 @@ import re
 _RUN_TAG_PREFIXES = ("test", "train", "inf", "bench")
 # The datetime stamp resolve_save_tag appends: %Y%m%d_%H%M%S.
 _DATETIME_RE = re.compile(r"\d{8}_\d{6}")
+# Filename-safe machine-name characters; any run of anything else collapses to a single '-'. A
+# real RFC-1123 hostname already satisfies this, so blpc3/bla0 are untouched — this purely hardens a
+# pathological hostname (a path separator, space, or other filesystem-hostile character) from
+# breaking a path. It deliberately preserves `_`/digits (real hostnames need them), so it is only
+# about path-safety, not tag disambiguation.
+_MACHINE_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_machine_name(machine_name: str) -> str:
+    """Collapse any non-filename-safe characters in a machine name to '-' (identity on the
+    RFC-1123 hostnames this pipeline actually runs on)."""
+    return _MACHINE_SANITIZE_RE.sub("-", machine_name)
 
 
 def display_tag(tag: str, machine_name: str) -> str:
@@ -50,4 +62,4 @@ def display_tag(tag: str, machine_name: str) -> str:
     command, sep, datetime_part = tag.partition("_")
     if not sep or command not in _RUN_TAG_PREFIXES or not _DATETIME_RE.fullmatch(datetime_part):
         return tag
-    return f"{command}_{machine_name}_{datetime_part}"
+    return f"{command}_{_sanitize_machine_name(machine_name)}_{datetime_part}"

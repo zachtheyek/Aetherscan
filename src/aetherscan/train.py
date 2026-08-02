@@ -3088,6 +3088,15 @@ class TrainingPipeline:
                         random_state=rf_seed,
                     )
                     clf.fit(fit_features, fit_labels)
+                    # Stamp each swept forest with the representation it was trained on (#318), at
+                    # the fit site so every random_forest_{tag}_{variant}.joblib is self-describing
+                    # AND the eventual winner arrives pre-stamped. The inference guard reads these
+                    # back to reject a config<->weights variant / active-dims mismatch the
+                    # feature-COUNT check cannot see (same-width variants; two equal-length
+                    # active-dim sets). Rides through joblib.dump/load; pre-#318 forests lack the
+                    # attributes and the guard no-ops on them.
+                    clf.aetherscan_latent_variant_ = variant
+                    clf.aetherscan_active_dims_ = list(active_dims or [])
                     variant_models[variant] = clf
 
                     eval_features = build_variant_features(
@@ -3171,6 +3180,9 @@ class TrainingPipeline:
             # startup-time save_tag resolution) — not a mid-flight mutation.
             self.config.rf.latent_variant = winner
             self.config.rf.active_dims = active_dims
+            # (The winner is already #318-stamped at the fit site above — self.rf_model.model IS
+            # variant_models[winner] — so every dump of it, canonical RF / SHAP re-dump / final
+            # save, carries the variant + active-dims stamps the inference guard reads.)
 
             # Surface the selection visually (winner + the tie-break story) straight from the
             # in-memory sweep metrics. Best-effort: a plot failure must never fail the run.

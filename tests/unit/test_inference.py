@@ -404,10 +404,14 @@ class TestReferenceCloudReservoir:
 
 
 class TestRfFeatureLayoutGuard:
-    """#282 hardening: init_models fails loud on a config↔RF feature-count mismatch —
-    same-width variants (z/z_mean/z_aug all = num_obs*latent_dim) make it silent otherwise."""
+    """#282/#318 hardening: init_models fails loud on a config↔RF mismatch via three checks —
+    feature COUNT (n_features_in_), variant IDENTITY (aetherscan_latent_variant_ — same-width
+    variants z/z_mean/z_aug make the count check silent), and active-dims IDENTITY
+    (aetherscan_active_dims_, z_mean_logvar_active only). Each no-ops when its signal is absent."""
 
-    def _pipeline(self, variant, active_dims, n_features):
+    def _pipeline(
+        self, variant, active_dims, n_features, recorded_variant=None, recorded_active_dims=None
+    ):
         config = get_config()
         config.data.num_observations = 6
         config.beta_vae.latent_dim = 8
@@ -418,11 +422,16 @@ class TestRfFeatureLayoutGuard:
         model = types.SimpleNamespace()
         if n_features is not None:
             model.n_features_in_ = n_features
+        if recorded_variant is not None:
+            model.aetherscan_latent_variant_ = recorded_variant
+        if recorded_active_dims is not None:
+            model.aetherscan_active_dims_ = recorded_active_dims
         pipeline.rf_model = types.SimpleNamespace(model=model)
         return pipeline
 
     def test_matching_count_passes(self):
-        # z_mean at num_obs=6, latent_dim=8 -> 6*8 = 48 features
+        # z_mean at num_obs=6, latent_dim=8 -> 6*8 = 48 features. No variant/active-dims stamp, so
+        # this is also the stampless v1.0.0 no-op path: checks 2-3 skip, only the count is enforced.
         self._pipeline("z_mean", list(range(8)), 48)._check_rf_feature_layout()
 
     def test_mismatched_count_raises(self):
@@ -434,3 +443,61 @@ class TestRfFeatureLayoutGuard:
     def test_absent_n_features_is_a_noop(self):
         # an unfitted/stub forest without n_features_in_ -> the guard skips silently
         self._pipeline("z_mean", list(range(8)), None)._check_rf_feature_layout()
+
+    def test_matching_variant_stamp_passes(self):
+        # forest stamped with the same variant the config declares -> passes
+        self._pipeline(
+            "z_mean", list(range(8)), 48, recorded_variant="z_mean"
+        )._check_rf_feature_layout()
+
+    def test_mismatched_variant_stamp_raises(self):
+        # SAME width (z and z_mean are both 48) so the count check passes, but the #318 identity
+        # stamp catches the confusion the count check cannot
+        pipeline = self._pipeline("z_mean", list(range(8)), 48, recorded_variant="z")
+        with pytest.raises(ValueError, match="latent-variant mismatch"):
+            pipeline._check_rf_feature_layout()
+
+    def test_matching_active_dims_passes(self):
+        # z_mean_logvar_active: 48 + num_obs(6)*len([0,1,2])=3 -> 66 features; stamp agrees -> passes
+        self._pipeline(
+            "z_mean_logvar_active",
+            [0, 1, 2],
+            66,
+            recorded_variant="z_mean_logvar_active",
+            recorded_active_dims=[0, 1, 2],
+        )._check_rf_feature_layout()
+
+    def test_mismatched_active_dims_raises(self):
+        # SAME variant and SAME length (both 3 dims -> 66 features) so checks 1-2 pass, but the
+        # active-dim SETS differ ([0,1,2] vs [5,6,7]) -> different log_var columns -> raise
+        pipeline = self._pipeline(
+            "z_mean_logvar_active",
+            [0, 1, 2],
+            66,
+            recorded_variant="z_mean_logvar_active",
+            recorded_active_dims=[5, 6, 7],
+        )
+        with pytest.raises(ValueError, match="active-dims mismatch"):
+            pipeline._check_rf_feature_layout()
+
+    def test_reordered_active_dims_passes(self):
+        # Same SET, different order ([2,0,1] vs [0,1,2]): _active_logvar_columns sorts, so the
+        # columns are identical -> the set-wise (sorted) compare must NOT false-trip
+        self._pipeline(
+            "z_mean_logvar_active",
+            [0, 1, 2],
+            66,
+            recorded_variant="z_mean_logvar_active",
+            recorded_active_dims=[2, 0, 1],
+        )._check_rf_feature_layout()
+
+    def test_active_dims_drift_ignored_for_nonactive_variant(self):
+        # z_mean does NOT use active_dims for its columns, so a stamped/config active-dims drift is
+        # irrelevant and must be ignored (the check is scoped to z_mean_logvar_active). Count = 48.
+        self._pipeline(
+            "z_mean",
+            list(range(8)),
+            48,
+            recorded_variant="z_mean",
+            recorded_active_dims=[5, 6, 7],
+        )._check_rf_feature_layout()

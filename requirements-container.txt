@@ -38,7 +38,7 @@ setuptools>=78.1.1,<81
 setigen>=2.6,<3
 # Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). streamlit 1.54
 # fixes GHSA-7p48-42j8-8846 (SSRF, <1.54.0) and GHSA-vqwp-45wm-r9r5 (cache hash collision, <1.53.1);
-# it still accepts protobuf>=3.20,<6 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin
+# it still accepts protobuf>=3.20,<7 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin
 # and the numpy<2 ceiling (pyarrow/tornado/altair pulled transitively). plotly is pure-Python (no
 # numpy ABI coupling). pandas is already shipped by the NGC base, so it is not repinned here.
 streamlit>=1.54.0,<1.55

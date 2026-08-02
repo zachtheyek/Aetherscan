@@ -236,3 +236,30 @@ class TestVariantFeatureNames:
         assert names[0] == "ON-1_dim-0"
         assert names[8] == "OFF-1_dim-0"
         assert names[-1] == "OFF-3_dim-7"
+
+
+class TestVariantStampPersistence:
+    """#318: the ``aetherscan_latent_variant_`` / ``aetherscan_active_dims_`` stamps that train
+    writes onto the fitted forest and the inference feature-layout guard reads back must survive
+    ``joblib.dump``/``load`` — the load-bearing assumption of the whole variant-identity guard.
+    Kept here (TF-free) rather than in test_inference (which imports TF) so it runs without the
+    GPU stack."""
+
+    def test_variant_and_active_dims_stamps_survive_joblib_roundtrip(self, tmp_path):
+        import joblib  # noqa: PLC0415
+        from sklearn.ensemble import RandomForestClassifier  # noqa: PLC0415
+
+        clf = RandomForestClassifier(n_estimators=2, random_state=0)
+        clf.fit(
+            np.arange(12).reshape(4, 3), [0, 1, 0, 1]
+        )  # a real fitted forest (n_features_in_=3)
+        clf.aetherscan_latent_variant_ = "z_mean_logvar_active"
+        clf.aetherscan_active_dims_ = [0, 1, 2]
+
+        path = tmp_path / "rf.joblib"
+        joblib.dump(clf, path)
+        loaded = joblib.load(path)
+
+        assert loaded.aetherscan_latent_variant_ == "z_mean_logvar_active"
+        assert loaded.aetherscan_active_dims_ == [0, 1, 2]
+        assert loaded.n_features_in_ == 3  # sanity: a genuine fitted estimator, not a stub
