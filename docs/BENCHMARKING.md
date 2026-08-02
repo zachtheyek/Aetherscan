@@ -166,6 +166,38 @@ Thresholds are module constants (`DATA_GEN_ROUND_FRACTION`, `GPU_UTIL_INPUT_BOUN
 `PREPROCESS_WALL_FRACTION`, `RAM_PEAK_WARN`) — tune them there if a rule is too eager for your
 hardware.
 
+## The per-band inference plot (`utils/perband_report.py`)
+
+A sibling tool (same stdlib `sqlite3` + `csv` + numpy + matplotlib, no `aetherscan` imports) that
+answers a question the flame timeline can't: **is a whole observing band or frequency region
+systematically slower to preprocess?** It writes
+`{output_path}/plots/perband_inference_perf_{tag}.png` — a two-panel, log-y figure of per-cadence
+energy-detection preprocessing wall-clock: Panel A is a per-band boxplot + jittered strip (bands
+ordered L, S, C, X, each annotated with median/max/n), Panel B scatters the same walls against the
+catalog `Frequency` (MHz), colored by band. The preprocessing wall per cadence is the umbrella
+`inference.preprocess_cadence_<N>` span (its `.read_ed`/`.dedup`/`.extract` children are excluded),
+and the band/frequency come from the run's inference catalog CSV. It fires **automatically at the
+tail of every streaming-CSV `inference` run** right after the benchmark report
+(`_post_perband_report` in [`main.py`](../src/aetherscan/main.py), same
+`monitor.benchmark_report_enabled` gate, same Slack upload, fully guarded — a plot failure never
+fails the run), and is also runnable standalone:
+
+```bash
+python utils/perband_report.py --save-tag test --catalog /path/to/catalog.csv \
+    --db-path /path/to/aetherscan.db
+```
+
+**Join caveat.** The umbrella span carries only the 1-based planner index `N`, and no DB table maps
+`N` to a band, so the cadence → band/frequency map is reconstructed from the catalog by mirroring
+`preprocessing.group_observations_from_csv` (group rows by the default
+`cadence_group_by_cols` = `["Target", "Session", "Band", "Cadence ID", "Frequency"]`, keep the
+6-obs valid groups in first-appearance order; the i-th is cadence `N=i`). This **assumes the run
+used the default group-by columns / expected-obs**. A runtime guard compares the mapped catalog
+cadence count to the umbrella-span count and skips the plot (logged warning, never a crash) when
+they disagree — so a resumed run (fewer fresh preprocess spans than catalog cadences) or a
+non-default grouping degrades to no plot rather than a misleading one. The legacy `--test-files`
+path (no catalog CSV) is skipped for the same reason.
+
 ## Standalone benchmarks (`benchmarks/`)
 
 Small standalone scripts that time individual pipeline kernels in isolation, so a change to

@@ -23,6 +23,7 @@ from aetherscan.latent_variants import (
     apply_probability_calibrator,
     build_variant_features,
     sample_z_flat,
+    variant_feature_count,
 )
 from aetherscan.models import RandomForestModel, prepare_latent_features
 from aetherscan.seeding import (
@@ -324,6 +325,8 @@ class InferencePipeline:
             logger.error(f"Error loading Random Forest: {e}")
             raise  # Re-raise to propagate error
 
+        self._check_rf_feature_layout()
+
         # Probability calibrator (#282): the saved training config records whether one is
         # active; applying it identically at inference is mandatory (an unapplied calibrator
         # is a silent train/serve mismatch), so a missing artifact is a hard error
@@ -348,6 +351,31 @@ class InferencePipeline:
             f"Inference feature layout: latent_variant='{self.config.rf.latent_variant}', "
             f"active_dims={self.config.rf.active_dims}"
         )
+
+    def _check_rf_feature_layout(self) -> None:
+        """#282 hardening: fail loud if the loaded forest's expected feature count doesn't
+        match the variant the config declares. Several variants are the SAME width
+        (z / z_mean / z_aug all = num_observations*latent_dim), so a config↔weights mismatch
+        from mixed or hand-edited artifacts would NOT trip sklearn's own feature-count check —
+        inference would silently score the wrong representation. (The sanctioned HF path always
+        ships the winner RF with its own config, so this never fires there; it guards
+        --config-path/--rf-path pairings from different runs, or a hand-edited config.)"""
+        expected_features = variant_feature_count(
+            self.config.rf.latent_variant,
+            self.config.data.num_observations,
+            self.config.beta_vae.latent_dim,
+            self.config.rf.active_dims,
+        )
+        actual_features = getattr(self.rf_model.model, "n_features_in_", None)
+        if actual_features is not None and actual_features != expected_features:
+            raise ValueError(
+                f"RF feature-count mismatch: the loaded forest expects {actual_features} "
+                f"features, but the config declares latent_variant="
+                f"'{self.config.rf.latent_variant}' (active_dims={self.config.rf.active_dims}) "
+                f"→ {expected_features} features. The config and RF weights are from different "
+                "runs, or the config was hand-edited — refusing to score the wrong "
+                "latent representation."
+            )
 
     def run_inference(
         self,

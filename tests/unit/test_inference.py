@@ -4,6 +4,8 @@ order preservation, tail padding/truncation, bounded trace shapes), the batched 
 
 from __future__ import annotations
 
+import types
+
 import numpy as np
 import pytest
 import tensorflow as tf
@@ -399,3 +401,36 @@ class TestReferenceCloudReservoir:
         assert reservoir.seen == 20
         np.testing.assert_array_equal(mean_rows[:, 0], [14.0, 20.0, 22.0])
         np.testing.assert_allclose(screening_vals, [0.14, 0.20, 0.22], atol=1e-6)
+
+
+class TestRfFeatureLayoutGuard:
+    """#282 hardening: init_models fails loud on a config↔RF feature-count mismatch —
+    same-width variants (z/z_mean/z_aug all = num_obs*latent_dim) make it silent otherwise."""
+
+    def _pipeline(self, variant, active_dims, n_features):
+        config = get_config()
+        config.data.num_observations = 6
+        config.beta_vae.latent_dim = 8
+        config.rf.latent_variant = variant
+        config.rf.active_dims = active_dims
+        pipeline = InferencePipeline.__new__(InferencePipeline)
+        pipeline.config = config
+        model = types.SimpleNamespace()
+        if n_features is not None:
+            model.n_features_in_ = n_features
+        pipeline.rf_model = types.SimpleNamespace(model=model)
+        return pipeline
+
+    def test_matching_count_passes(self):
+        # z_mean at num_obs=6, latent_dim=8 -> 6*8 = 48 features
+        self._pipeline("z_mean", list(range(8)), 48)._check_rf_feature_layout()
+
+    def test_mismatched_count_raises(self):
+        # config declares z_mean (48) but the loaded forest carries z_mean_logvar (96) features
+        pipeline = self._pipeline("z_mean", list(range(8)), 96)
+        with pytest.raises(ValueError, match="feature-count mismatch"):
+            pipeline._check_rf_feature_layout()
+
+    def test_absent_n_features_is_a_noop(self):
+        # an unfitted/stub forest without n_features_in_ -> the guard skips silently
+        self._pipeline("z_mean", list(range(8)), None)._check_rf_feature_layout()
