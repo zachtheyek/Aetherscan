@@ -32,10 +32,10 @@
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
 #     HF_TOKEN                  HuggingFace token (write access) for --hf-upload,
 #                               forwarded into the container; never logged
-#     HF_HOME                   HuggingFace cache home. If set, bound 1:1 and forwarded
-#                               so downloaded weights persist there (e.g. on scratch)
-#                               instead of filling $HOME. Unset -> container default
-#                               (~/.cache/huggingface).
+#     HF_HOME                   HuggingFace cache home. If set, must be an existing ABSOLUTE
+#                               directory; it is bound 1:1 and forwarded so downloaded weights
+#                               persist there (e.g. on scratch) instead of filling $HOME.
+#                               Unset -> container default (~/.cache/huggingface).
 #
 # Note, the runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
 # through untouched and are additive with the binds set up from AETHERSCAN_EXTRA_BINDS.
@@ -127,6 +127,14 @@ fi
 # from AETHERSCAN_EXTRA_BINDS so an inline EXTRA_BINDS (e.g. =/datag) can't clobber it.
 HF_ENV_ARGS=()
 if [[ -n ${HF_HOME:-} ]]; then
+    # Fail fast with guidance: apptainer/singularity won't create a bind source, so a
+    # missing or relative HF_HOME would abort EVERY wrapper invocation (train included) with
+    # a cryptic mount FATAL — and HF_HOME is typically a global ~/.bashrc export.
+    if [[ $HF_HOME != /* || ! -d $HF_HOME ]]; then
+        echo "Error: HF_HOME=$HF_HOME must be an existing absolute directory (it is bound 1:1 into the container)." >&2
+        echo "  Create it: mkdir -p \"$HF_HOME\"   (or unset HF_HOME to use the container's ~/.cache/huggingface)." >&2
+        exit 1
+    fi
     BIND_ARGS+=(--bind "$HF_HOME:$HF_HOME")
     HF_ENV_ARGS+=(--env "HF_HOME=$HF_HOME")
 fi
