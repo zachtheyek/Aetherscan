@@ -243,6 +243,7 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 ├── rf_calibrator_{tag}.joblib         # kept probability calibrator (only calibrated runs)
 ├── rf_eval_artifacts_{tag}.joblib     # val features/labels/probas consumed by all RF plots
 ├── rf_shap_values_{tag}.joblib        # cached SHAP values (summary/interaction/log-loss)
+├── rf_shap_clustering_{tag}.joblib    # cached SHAP-space UMAP embedding + KMeans labels
 ├── umap_{obs,cadence}_nn{n}_md{m}_{tag}.joblib   # persisted UMAP projections
 └── checkpoints/                       # per-round vae_{encoder,decoder}_round_XX.keras
     └── archive/<timestamp>/           # previous runs' checkpoints, moved aside at startup
