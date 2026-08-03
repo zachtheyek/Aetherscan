@@ -145,6 +145,9 @@ SLACK_CHANNEL=your-slack-channel
 # Only needed for uploading model weights to the HuggingFace Hub (train --hf-upload);
 # downloads (the inference default) hit a public repo and need no token
 HF_TOKEN=your-huggingface-write-token
+# Optional: redirect the HuggingFace download cache off $HOME — must be an existing absolute
+# dir; run_container.sh binds + forwards it (equally settable in ~/.bashrc)
+# HF_HOME=/datax/scratch/zachy/hf_home
 ```
 
 > [!TIP]
@@ -160,7 +163,7 @@ export SLACK_CHANNEL="your-slack-channel"
 ./utils/run_container.sh python -m aetherscan.main train ...
 ```
 
-The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The `utils/run_container.sh` wrapper forwards `SLACK_*`, `AETHERSCAN_*`, and `HF_TOKEN` into the container explicitly; if you need additional env vars on the container side, extend the wrapper's `--env` list.
+The `AETHERSCAN_*` paths are bind-mounted 1:1 between host and container, so they must already exist on the host before the pipeline starts. The `utils/run_container.sh` wrapper forwards `SLACK_*`, `AETHERSCAN_*`, `HF_TOKEN`, and (when set) `HF_HOME` into the container explicitly — `HF_HOME` is additionally bound 1:1, so it must be an existing absolute directory; if you need additional env vars on the container side, extend the wrapper's `--env` list.
 
 **5. Run pipeline**
 

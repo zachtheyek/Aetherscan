@@ -126,10 +126,13 @@ fi
 # and HuggingFace falls back to ~/.cache/huggingface inside the container. Bound separately
 # from AETHERSCAN_EXTRA_BINDS so an inline EXTRA_BINDS (e.g. =/datag) can't clobber it.
 HF_ENV_ARGS=()
-if [[ -n ${HF_HOME:-} ]]; then
-    # Fail fast with guidance: apptainer/singularity won't create a bind source, so a
-    # missing or relative HF_HOME would abort EVERY wrapper invocation (train included) with
-    # a cryptic mount FATAL — and HF_HOME is typically a global ~/.bashrc export.
+# Test SET (not non-empty): a set-but-empty HF_HOME still forwards to the container by default
+# (no --cleanenv), where HuggingFace resolves "" to a RELATIVE hub/ under --pwd — a silent
+# download into the repo worktree. Routing empty into the error below makes it actionable.
+if [[ -n ${HF_HOME+x} ]]; then
+    # Fail fast with guidance: apptainer/singularity won't create a bind source, so a missing,
+    # empty, or relative HF_HOME would abort EVERY wrapper invocation (train included) with a
+    # cryptic mount FATAL — and HF_HOME is typically a global ~/.bashrc export.
     if [[ $HF_HOME != /* || ! -d $HF_HOME ]]; then
         echo "Error: HF_HOME=$HF_HOME must be an existing absolute directory (it is bound 1:1 into the container)." >&2
         echo "  Create it: mkdir -p \"$HF_HOME\"   (or unset HF_HOME to use the container's ~/.cache/huggingface)." >&2
