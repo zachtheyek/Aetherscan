@@ -128,8 +128,9 @@ Inference resolves models in this precedence order:
 
 Downloads happen **lazily at first inference**, never at import time (an import-time network
 download would be hostile), revision-pinned and cached under the standard HF cache
-(`~/.cache/huggingface`; set `HF_HOME` if home isn't writable/bound in your container
-setup). Public repo — downloads need no token.
+(`~/.cache/huggingface`; set `HF_HOME` to redirect it — e.g. to scratch — if home isn't
+writable/bound in your container setup: `utils/run_container.sh` binds and forwards `HF_HOME`
+when set, see [`GPU_RUNTIME_GUIDE.md`](GPU_RUNTIME_GUIDE.md)). Public repo — downloads need no token.
 
 ### HF repo layout and tag families
 

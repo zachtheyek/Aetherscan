@@ -32,6 +32,10 @@
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
 #     HF_TOKEN                  HuggingFace token (write access) for --hf-upload,
 #                               forwarded into the container; never logged
+#     HF_HOME                   HuggingFace cache home. If set, must be an existing ABSOLUTE
+#                               directory; it is bound 1:1 and forwarded so downloaded weights
+#                               persist there (e.g. on scratch) instead of filling $HOME.
+#                               Unset -> container default (~/.cache/huggingface).
 #
 # Note, the runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
 # through untouched and are additive with the binds set up from AETHERSCAN_EXTRA_BINDS.
@@ -116,6 +120,28 @@ if [[ -n ${AETHERSCAN_EXTRA_BINDS:-} ]]; then
     done
 fi
 
+# HuggingFace cache home (optional): when HF_HOME is set — e.g. to a scratch dir so
+# downloaded weights persist across runs and don't fill $HOME — bind it 1:1 and forward
+# it so the container's HF cache lands there. Unset (the off-cluster default) adds nothing,
+# and HuggingFace falls back to ~/.cache/huggingface inside the container. Bound separately
+# from AETHERSCAN_EXTRA_BINDS so an inline EXTRA_BINDS (e.g. =/datag) can't clobber it.
+HF_ENV_ARGS=()
+# Test SET (not non-empty): a set-but-empty HF_HOME still forwards to the container by default
+# (no --cleanenv), where HuggingFace resolves "" to a RELATIVE hub/ under --pwd — a silent
+# download into the repo worktree. Routing empty into the error below makes it actionable.
+if [[ -n ${HF_HOME+x} ]]; then
+    # Fail fast with guidance: apptainer/singularity won't create a bind source, so a missing,
+    # empty, or relative HF_HOME would abort EVERY wrapper invocation (train included) with a
+    # cryptic mount FATAL — and HF_HOME is typically a global ~/.bashrc export.
+    if [[ $HF_HOME != /* || ! -d $HF_HOME ]]; then
+        echo "Error: HF_HOME='$HF_HOME' must be an existing absolute directory (it is bound 1:1 into the container)." >&2
+        echo "  Create it: mkdir -p \"$HF_HOME\"   (or unset HF_HOME to use the container's ~/.cache/huggingface)." >&2
+        exit 1
+    fi
+    BIND_ARGS+=(--bind "$HF_HOME:$HF_HOME")
+    HF_ENV_ARGS+=(--env "HF_HOME=$HF_HOME")
+fi
+
 exec "$RUNTIME" exec --nv \
     "${BIND_ARGS[@]}" \
     --pwd /workspace/aetherscan \
@@ -126,4 +152,5 @@ exec "$RUNTIME" exec --nv \
     --env SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
     --env SLACK_CHANNEL="${SLACK_CHANNEL:-}" \
     --env HF_TOKEN="${HF_TOKEN:-}" \
+    ${HF_ENV_ARGS[@]+"${HF_ENV_ARGS[@]}"} \
     "$SIF" "$@"
