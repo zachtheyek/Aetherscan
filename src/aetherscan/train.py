@@ -6773,8 +6773,8 @@ class TrainingPipeline:
         # SHAP-space UMAP + KMeans persisted alongside the SHAP cache so re-runs
         # of just this plot (without retraining) reproduce the same cluster
         # layout. Unlike the cadence-level UMAP that plot_latent_space_gif fits
-        # on raw latents, this projection is over the (n_summary × 48) SHAP
-        # matrix, so it lives in its own joblib.
+        # on raw latents, this projection is over the (n_summary × F) SHAP
+        # matrix (F = the winning variant's feature width), so it lives in its own joblib.
         clustering_path = os.path.join(
             self.config.model_path,
             f"rf_shap_clustering_{display_tag(tag, get_machine_name())}.joblib",
