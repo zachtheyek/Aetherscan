@@ -32,6 +32,10 @@
 #     SLACK_CHANNEL             Slack channel, forwarded into the container
 #     HF_TOKEN                  HuggingFace token (write access) for --hf-upload,
 #                               forwarded into the container; never logged
+#     HF_HOME                   HuggingFace cache home. If set, bound 1:1 and forwarded
+#                               so downloaded weights persist there (e.g. on scratch)
+#                               instead of filling $HOME. Unset -> container default
+#                               (~/.cache/huggingface).
 #
 # Note, the runtime's native SINGULARITY_BIND / APPTAINER_BIND env vars still pass
 # through untouched and are additive with the binds set up from AETHERSCAN_EXTRA_BINDS.
@@ -116,6 +120,17 @@ if [[ -n ${AETHERSCAN_EXTRA_BINDS:-} ]]; then
     done
 fi
 
+# HuggingFace cache home (optional): when HF_HOME is set — e.g. to a scratch dir so
+# downloaded weights persist across runs and don't fill $HOME — bind it 1:1 and forward
+# it so the container's HF cache lands there. Unset (the off-cluster default) adds nothing,
+# and HuggingFace falls back to ~/.cache/huggingface inside the container. Bound separately
+# from AETHERSCAN_EXTRA_BINDS so an inline EXTRA_BINDS (e.g. =/datag) can't clobber it.
+HF_ENV_ARGS=()
+if [[ -n ${HF_HOME:-} ]]; then
+    BIND_ARGS+=(--bind "$HF_HOME:$HF_HOME")
+    HF_ENV_ARGS+=(--env "HF_HOME=$HF_HOME")
+fi
+
 exec "$RUNTIME" exec --nv \
     "${BIND_ARGS[@]}" \
     --pwd /workspace/aetherscan \
@@ -126,4 +141,5 @@ exec "$RUNTIME" exec --nv \
     --env SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
     --env SLACK_CHANNEL="${SLACK_CHANNEL:-}" \
     --env HF_TOKEN="${HF_TOKEN:-}" \
+    ${HF_ENV_ARGS[@]+"${HF_ENV_ARGS[@]}"} \
     "$SIF" "$@"

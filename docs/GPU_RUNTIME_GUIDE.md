@@ -89,7 +89,7 @@ export SINGULARITY_TMPDIR=/datax/scratch/$USER/singularity-tmp
 export SINGULARITY_CACHEDIR=/datax/scratch/$USER/singularity-cache
 ```
 
-`TMPDIR` needs ~15 GB free; `CACHEDIR` caches Docker base-layer blobs (a few GB, persists across rebuilds — keep it). Worth adding to `~/.bashrc` if you rebuild often.
+`TMPDIR` needs ~15 GB free; `CACHEDIR` caches Docker base-layer blobs (a few GB, persists across rebuilds — keep it). Worth adding to `~/.bashrc` if you rebuild often. On an **Apptainer** host (e.g. the Ampere cluster) use the `APPTAINER_TMPDIR` / `APPTAINER_CACHEDIR` equivalents instead — Apptainer reads those first and falls back to the `SINGULARITY_*` names.
 
 **Build fails in `%post` with `Could not open requirements file: /tmp/...`**
 
@@ -138,7 +138,7 @@ The conda env was bumped to TF 2.17 / numpy 1.26 to match the container's API su
     --save-tag train
 ```
 
-The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv` for GPU passthrough, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB; on Ampere, pass `--gpu-memory-limit-mb 14000` to preserve the legacy A4000 cap.
+The wrapper auto-detects `apptainer` vs `singularity`, binds the repo and `AETHERSCAN_*` paths into the container, sets `--nv` for GPU passthrough, and forwards `AETHERSCAN_*` / `SLACK_*` env vars. Environment loading happens at two layers: the wrapper auto-loads `<repo>/.env` at shell time (needed before Python starts so the `AETHERSCAN_*` paths are resolved into the right `--bind` arguments), and `aetherscan.main` calls `python-dotenv`'s `load_dotenv()` at process start (covers Slack credentials inside the container, with `os.environ` then inherited by multiprocess workers). Values already in the wrapper's env — including inline `VAR=val ./utils/run_container.sh ...` or real exports — win at both layers. By default no `--gpu-memory-limit-mb` is passed, so each Blackwell GPU uses memory-growth allocation against its full 96 GB; on Ampere, pass `--gpu-memory-limit-mb 14000` to preserve the legacy A4000 cap. The wrapper also forwards `HF_TOKEN`, and — when `HF_HOME` is set — binds and forwards it, so the HuggingFace download cache (used when bare inference resolves the released weights from the Hub) lands where you point it. Set `HF_HOME` to scratch (e.g. `export HF_HOME=/datax/scratch/$USER/hf_home` in `~/.bashrc`) so downloaded weights persist across runs and don't fill `$HOME`; left unset off-cluster, HuggingFace falls back to `~/.cache/huggingface` inside the container.
 
 ### Conda (Ampere only, alternative path)
 
