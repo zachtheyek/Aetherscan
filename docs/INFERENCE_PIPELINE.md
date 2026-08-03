@@ -118,7 +118,11 @@ When downloading, the **revision** is chosen by `resolve_hf_revision` in precede
    nothing resolves.
 
 Downloads go through `hf_hub_download` (revision-pinned, cached under `HF_HOME` /
-`~/.cache/huggingface`; repeated runs hit the cache); the public repo needs no token. The repo
+`~/.cache/huggingface`; repeated runs hit the cache); the public repo needs no token. Under the
+NGC container, `utils/run_container.sh` binds and forwards `HF_HOME` when set — it must be an
+existing absolute directory (the wrapper fails fast otherwise); point it at scratch so the
+downloaded weights persist and do not fill `$HOME`, see
+[`GPU_RUNTIME_GUIDE.md`](GPU_RUNTIME_GUIDE.md). The repo
 defaults to `config.hf.repo_id` (`zachtheyek/aetherscan`), overridable with `--hf-repo-id`.
 [`RELEASE.md`](RELEASE.md) covers how this revision couples releases to weights.
 
