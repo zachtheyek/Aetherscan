@@ -134,7 +134,7 @@ if [[ -n ${HF_HOME+x} ]]; then
     # empty, or relative HF_HOME would abort EVERY wrapper invocation (train included) with a
     # cryptic mount FATAL — and HF_HOME is typically a global ~/.bashrc export.
     if [[ $HF_HOME != /* || ! -d $HF_HOME ]]; then
-        echo "Error: HF_HOME=$HF_HOME must be an existing absolute directory (it is bound 1:1 into the container)." >&2
+        echo "Error: HF_HOME='$HF_HOME' must be an existing absolute directory (it is bound 1:1 into the container)." >&2
         echo "  Create it: mkdir -p \"$HF_HOME\"   (or unset HF_HOME to use the container's ~/.cache/huggingface)." >&2
         exit 1
     fi

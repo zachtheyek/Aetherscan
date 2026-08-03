@@ -71,7 +71,7 @@ Hierarchical, dataclass-based config with a thread-safe singleton. Resolution or
 
 At runtime, the singleton `Config` is read via `get_config()` and may be modified programmatically. See `docs/CONFIG_AND_CLI.md`.
 
-**Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards `SLACK_*`, `AETHERSCAN_*`, and `HF_TOKEN` via `--env`; the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
+**Secrets & paths** come from a `.env` file at the repo root (gitignored). Shell `export` takes precedence over `.env`. The container wrapper forwards `SLACK_*`, `AETHERSCAN_*`, `HF_TOKEN`, and (when set) `HF_HOME` via `--env` (`HF_HOME` is additionally bound 1:1 and must be an existing absolute dir; the wrapper fails fast otherwise); the source path loads the **whole** `.env` into `os.environ` at the top of `main.py` via python-dotenv.
 
 ```ini
 # .env example
@@ -84,6 +84,9 @@ AETHERSCAN_EXTRA_BINDS=/extra/host/paths
 # Only needed for uploading model weights to the HuggingFace Hub (train --hf-upload);
 # downloads (the inference default) hit a public repo and need no token
 HF_TOKEN=your-huggingface-write-token
+# Optional: redirect the HuggingFace download cache off $HOME (existing absolute dir;
+# run_container.sh binds + forwards it)
+# HF_HOME=/path/to/hf_home
 # Slack integration auto-disables if unset
 SLACK_BOT_TOKEN=your-slack-bot-token
 SLACK_CHANNEL=your-slack-channel

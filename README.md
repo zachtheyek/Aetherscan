@@ -145,9 +145,10 @@ SLACK_CHANNEL=your-slack-channel
 # Only needed for uploading model weights to the HuggingFace Hub (train --hf-upload);
 # downloads (the inference default) hit a public repo and need no token
 HF_TOKEN=your-huggingface-write-token
+
 # Optional: redirect the HuggingFace download cache off $HOME — must be an existing absolute
 # dir; run_container.sh binds + forwards it (equally settable in ~/.bashrc)
-# HF_HOME=/datax/scratch/zachy/hf_home
+# HF_HOME=/path/to/hf_home
 ```
 
 > [!TIP]
