@@ -9,7 +9,7 @@ This runbook covers running Aetherscan across GPU architectures — the Blackwel
 | Ampere    | NVIDIA RTX A4000    | sm_86              | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (via CUDA forward compat on driver 550.78) | `conda env create -f environment.yml` (TF 2.17 + CUDA 12.3) |
 | Blackwell | NVIDIA RTX PRO 6000 | sm_120             | NGC container `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` (TF 2.17 + CUDA 12.8)                      | —                                                           |
 
-All paths run TF 2.17 with Keras 3 so `@tf.function` tracing, `.keras` checkpoint format, and optimizer state are interchangeable.
+All paths run TF 2.17 in **legacy-Keras mode** (`TF_USE_LEGACY_KERAS=1` → `from tensorflow import keras` resolves to `tf_keras` 2.17), so `@tf.function` tracing, `.keras` checkpoint format, and optimizer state are interchangeable. The flag is set three ways: [`aetherscan.def`](../aetherscan.def)'s `%environment` and the [`Dockerfile`](../Dockerfile)'s `ENV` (container), plus [`src/aetherscan/__init__.py`](../src/aetherscan/__init__.py)'s `os.environ.setdefault` at package-import time (the Python-level backstop covering conda and pip). The released `.keras` weights are Keras-2 format ([#323](https://github.com/zachtheyek/Aetherscan/issues/323)).
 
 ## Why a container on Blackwell
 
@@ -228,7 +228,7 @@ Two warning families fire repeatedly on Blackwell + NGC 25.02 and have no correc
 - `W gpu_timer.cc:114] Skipping the delay kernel, measurement accuracy will be reduced` — XLA's autotuner normally launches a tiny "delay kernel" before each candidate timing to drain pending GPU work, so measurements are reproducible. TF 2.17's XLA has no delay-kernel implementation registered for sm_120, so the autotuner times without the primer. Picks of fastest kernels become slightly noisier (possibly sub-optimal autotune choices); the kernels themselves still compute correct results. Expect one emission per autotuned fusion — 1000+ lines on a cold start is normal.
 - `'+ptxNN' is not a recognized feature for this target (ignoring feature)` (from LLVM NVPTX) — LLVM expresses CUDA capabilities as feature flags. The container's LLVM was built against CUDA 12.8 (PTX ISA ≤8.4); the host driver (595.x, CUDA 13.2) advertises PTX 8.5. When XLA asks LLVM to enable a newer PTX level, LLVM ignores the flag and falls back to a level it knows. Code still compiles and runs; only a handful of PTX 8.5–only instructions are unavailable. Negligible perf delta, zero correctness impact.
 
-Bumping `TF_CPP_MIN_LOG_LEVEL=2` in `aetherscan.def`'s `%environment` silences the first family but also suppresses other potentially useful warnings; the LLVM `+ptxNN` line goes straight to stderr and isn't gated by it. The default is to leave both alone.
+Bumping `TF_CPP_MIN_LOG_LEVEL=2` in `aetherscan.def`'s `%environment` silences the first family but also suppresses other potentially useful warnings; the LLVM `+ptxNN` line goes straight to stderr and isn't gated by it. The default is to leave both alone. That same block (and the `Dockerfile`'s mirrored `ENV`) also exports `TF_USE_LEGACY_KERAS=1` — the NGC base already sets it, but it's declared explicitly so a future base-image swap can't silently drop it.
 
 ## Fallback options
 
@@ -245,6 +245,8 @@ If NGC 25.02 keeps misbehaving, escalate in this order:
 
 `.keras` checkpoints written on Ampere load on Blackwell and vice versa. The `Sampling` layer is now registered with `keras.utils.register_keras_serializable(package="aetherscan")
 ` so `keras.models.load_model(...)` resolves it automatically without `custom_objects=`.
+
+Those `.keras` checkpoints are Keras-2 (`tf_keras`) artifacts, so any environment loading them needs `tf_keras` installed **and** `TF_USE_LEGACY_KERAS=1` — importing `aetherscan` arranges the flag automatically (see [TL;DR](#tldr)); a bare `keras.models.load_model(...)` in a Keras-3 process fails with `Could not locate class 'Functional'`.
 
 Legacy `.h5` checkpoints from pre-TF-2.16 training runs will NOT load — re-train or re-save to `.keras` first.
 

@@ -50,7 +50,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 - ≥1x NVIDIA GPU:
   - Ampere with CUDA 12.3+ driver
 - VRAM / RAM same as above
-- Python 3.10 / TF 2.17 (managed by conda)
+- Python 3.10 / TF 2.17 + tf_keras 2.17, legacy-Keras mode (managed by conda)
 
 > [!NOTE]
 > There are no plans to support non-Nvidia GPUs
@@ -81,7 +81,7 @@ python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 - **No CPU mode.** Both `train` and `inference` hard-exit when no GPU is visible (`"… requires GPU"`).
 - **The two end-of-run report PNGs do not render on a pip install.** The wheel ships only `src/aetherscan` (not `utils/`), so `benchmark_report.py` / `perband_report.py` aren't found — those two plots log a warning and skip; the inference viz suite, DB, and results are unaffected. Use the container or source tree if you need them.
 - The live dashboard needs the extra: `pip install 'aetherscan[dashboard]'`.
-- The `tf_keras` + `TF_USE_LEGACY_KERAS` steps are the **v1.0.0** workaround only ([#323](https://github.com/zachtheyek/Aetherscan/issues/323) — the released `.keras` weights are Keras-2 while pip pulls Keras 3). Once **the next release** ships they become unnecessary and the install collapses to `pip install aetherscan`; this section will be updated at that point.
+- The `tf_keras` + `TF_USE_LEGACY_KERAS` steps are the **v1.0.0** workaround only ([#323](https://github.com/zachtheyek/Aetherscan/issues/323) — the released `.keras` weights are Keras-2 while pip pulls Keras 3). Once **the next release** ships they become unnecessary and the install collapses to `pip install aetherscan`; this section will be updated at that point. The fix has already **landed on `master`** ([#340](https://github.com/zachtheyek/Aetherscan/pull/340): `tf_keras==2.17.*` is a declared dependency and `src/aetherscan/__init__.py` sets the flag at import time), so a source-tree / `master` checkout needs neither step — only the published v1.0.0 wheel does.
 
 ### Run From Container
 
