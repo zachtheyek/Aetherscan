@@ -104,19 +104,23 @@ fi
 # The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
 # that release's image; a .devN checkout has no per-version image and falls back to :latest. A
 # PULLED image records its tag in "$SIF.pulled-tag"; if a later checkout wants a different tag we
-# re-pull instead of silently running the old one (tag-triggered, so every version bump re-pulls —
-# a digest-identical retag included). A user-BUILT .sif is always used as-is: it has no sidecar at
-# all, or — if built over a previously pulled image — is newer than one (see the mtime note below).
-# NOTE: a MANUAL `pull`/`build` to $SIF likewise writes no sidecar, so the wrapper keeps it across
-# version bumps — let run_container.sh do the pulling if you want it to track the pinned tag.
+# re-pull instead of silently running the old one. The trigger is a change in the TAG STRING, so a
+# release-tag checkout re-pulls on every bump (digest-identical retag included), while a .devN
+# checkout always wants the constant :latest and so keeps whatever it first cached even as :latest
+# moves — rm the .sif (and its sidecar) to pick that up. A user-BUILT .sif is always used as-is: it
+# has no sidecar at all, or — if built over a previously pulled image — is newer than one (see the
+# mtime note below). A MANUAL pull/build to $SIF likewise writes no sidecar, so it too is kept
+# across bumps — let run_container.sh do the pulling if you want it to track the pinned tag.
 #
 # GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
 # If any of these hold, BUILD from aetherscan.def instead of pulling:
 #   - non-x86_64 host (e.g. aarch64 Grace/GH200): no matching image exists;
 #   - host driver below the base's CUDA 12.8 floor (Blackwell <570 / Ampere <550): a pull would
 #     succeed but the container won't see the GPUs — upgrade the driver, or build;
-#   - you rebuilt TF from source or edited requirements-container.txt locally: a pull fetches the
-#     released image, not your variant — build locally (or set AETHERSCAN_IMAGE_TAG).
+#   - you rebuilt TF from source, edited requirements-container.txt locally, or are on a .devN
+#     checkout whose requirements-container.txt changed since the last release: a pull fetches the
+#     RELEASED image (:latest tracks the newest release, never master HEAD), not your variant —
+#     build locally (or set AETHERSCAN_IMAGE_TAG).
 IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
 if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
     # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
