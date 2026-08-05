@@ -39,7 +39,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - VRAM: **≥8 GB per GPU** recommended — measured peaks ~6 GB/GPU (training) and ~2.5 GB/GPU (inference) on the v1.0.0 release runs; gradient accumulation keeps per-GPU VRAM low
 - RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
-- Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
+- Disk: full-scale training round data ~147 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
@@ -82,7 +82,7 @@ python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 - **No CPU mode.** Both `train` and `inference` hard-exit when no GPU is visible (`"… requires GPU"`).
 - **The two end-of-run report PNGs do not render on a pip install.** The wheel ships only `src/aetherscan` (not `utils/`), so `benchmark_report.py` / `perband_report.py` aren't found — those two plots log a warning and skip; the inference viz suite, DB, and results are unaffected. Use the container or source tree if you need them.
 - The live dashboard needs the extra: `pip install 'aetherscan[dashboard]'`.
-- From **v1.1.0** the manifests declare `tf_keras` and the package sets `TF_USE_LEGACY_KERAS` itself at import time — no manual steps. Only a pinned `aetherscan==1.0.0` install needs the workaround above.
+- From **v1.1.0** the manifests declare `tf_keras` and the package sets `TF_USE_LEGACY_KERAS` itself at import time — no manual steps. Only a **v1.0.0** install (pinned, or resolved while it is the newest published release) needs the workaround above.
 
 ### Run From Container
 
