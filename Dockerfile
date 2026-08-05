@@ -10,8 +10,9 @@
 # a fork-specific artifact, sidestepping any Apptainer-vs-SingularityCE SIF-compat question.
 #
 # The Aetherscan Python code is NOT baked in — utils/run_container.sh bind-mounts the repo at
-# runtime. So this image = NGC base + the pinned pip extras only, and it changes ONLY when the
-# base digest or requirements-container.txt changes (never on a code-only release). Keep it in
+# runtime. So this image = NGC base + the pinned pip extras only, and it changes ONLY when this
+# Dockerfile (its base digest, the LABELs below, any layer) or requirements-container.txt changes —
+# never on a code-only release. Editing a LABEL below IS a Dockerfile change: it rebuilds. Keep it in
 # lockstep with aetherscan.def / requirements-container.txt / environment.yml / pyproject.toml
 # (SECURITY.md Version Selection Policy). The base MUST match aetherscan.def's `From:` digest.
 #

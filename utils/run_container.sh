@@ -121,7 +121,9 @@ fi
 #   - you rebuilt TF from source, edited requirements-container.txt locally, or are on a .devN
 #     checkout whose requirements-container.txt changed since the last release: a pull fetches the
 #     RELEASED image (:latest tracks the newest release, never master HEAD), not your variant —
-#     no published tag matches, so build locally (or push your own image and set AETHERSCAN_IMAGE).
+#     no published tag matches, so build locally (or push your own image and set AETHERSCAN_IMAGE
+#     — rm the local $SIF first, or point SIF= elsewhere, since a user-built .sif takes priority
+#     over any pull).
 IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
 if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
     # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
@@ -167,7 +169,7 @@ if [[ $need_pull -eq 1 ]]; then
         mv -f "$tmp" "$SIF"
         printf '%s\n' "$IMAGE_REF" >"$SIF.pulled-tag"
         trap - EXIT INT TERM
-        echo "Pulled and cached $SIF ($AETHERSCAN_IMAGE_TAG)." >&2
+        echo "Pulled and cached $SIF ($IMAGE_REF)." >&2
     else
         trap - EXIT INT TERM
         rm -f "$tmp"
