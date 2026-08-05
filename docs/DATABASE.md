@@ -342,7 +342,7 @@ attempt, each with its own span.
 | v6 | `is_finite INTEGER DEFAULT 1` on `training_stats` (#289 NaN-write hardening) | additive `ALTER TABLE ... ADD COLUMN` |
 | v7 | the index sweep: the `idx_injection_stats_by_stat` secondary index on `injection_stats`; `latent_snapshots`' index reshaped to `idx_latent_snapshots_by_key` | `DROP INDEX IF EXISTS idx_latent_snapshots_filter` in the migration block; the CREATEs run in `_init_database()` and are re-executed there |
 | v8 | the `idx_inference_results_supersede` partial index on `inference_results` (`(tag, npy_path) WHERE superseded = 0`, #301) | the `if version < 8` block creates it — deliberately NOT `_init_database()`: the partial predicate needs the `superseded` column the v1 ALTER adds, so an init-time CREATE would fail on a pre-v1 file. Fresh databases reach the block too (version 0 → current) |
-| v9 | the #375 index audit: `idx_injection_stats_by_round` (`(tag, round_number, timestamp)`) + the `idx_latent_snapshots_keys` covering partial index; `+round_number` planner guards in the two injection query builders | `by_round`'s CREATE runs in `_init_database()` and is re-executed in the block (v7 convention); the latent partial lives only in the block (v8 convention — its predicate needs the v1 `superseded` column). **Upgrading an existing catalog-scale DB (~190 M `injection_stats` rows) builds `by_round` with a one-time full-table scan + sort — expect the first launch to stall for minutes to tens of minutes, and budget transient WAL disk headroom well beyond the final index size (the build's pages accumulate in the `-wal` file until checkpoint)** |
+| v9 | the #375 index audit: `idx_injection_stats_by_round` (`(tag, round_number, timestamp)`) + the `idx_latent_snapshots_keys` covering partial index; `+round_number` planner guards in the two injection query builders | `by_round`'s CREATE runs in `_init_database()` and is re-executed in the block (v7 convention); the latent partial lives only in the block (v8 convention — its predicate needs the v1 `superseded` column). **Upgrading an existing catalog-scale DB builds both indexes in one stall — `by_round` over ~190 M `injection_stats` rows and the latent partial over the live subset of ~100 M `latent_snapshots` rows, each a one-time full-table scan + sort — expect the first launch to stall for minutes to tens of minutes, and budget transient WAL disk headroom well beyond the final index sizes (the builds' pages accumulate in the `-wal` file until checkpoint)** |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -402,9 +402,10 @@ attempt, each with its own span.
   `+round_number` planner guards in the two injection builders ship in the same change —
   without them the no-`ANALYZE` cost model moves the ~165-query plot pass onto `by_round`
   (measured 1.4–10.7× per-query regressions on production-shaped replicas), resurrecting
-  the pre-v7 pathology. Upgrade cost: building `by_round` over an existing catalog-scale
-  DB is a one-time full-table scan + sort — the first launch after upgrading stalls in
-  `_migrate_schema` for minutes to tens of minutes; later launches are unaffected.
+  the pre-v7 pathology. Upgrade cost: building `by_round` (and the latent partial) over an
+  existing catalog-scale DB is a one-time full-table scan + sort per index — the first
+  launch after upgrading stalls in `_migrate_schema` for minutes to tens of minutes; later
+  launches are unaffected.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped
 (the block-only partial indexes — v8's supersede index and v9's latent-keys index — land via

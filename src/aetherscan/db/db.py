@@ -683,9 +683,10 @@ class Database:
             # upgrade that actually pays the build.
             if cursor.execute("SELECT EXISTS(SELECT 1 FROM injection_stats)").fetchone()[0]:
                 logger.info(
-                    "Schema migration: v9 building idx_injection_stats_by_round — on a "
-                    "catalog-scale DB this is a one-time full-table scan + sort that can "
-                    "take minutes to tens of minutes; do not interrupt"
+                    "Schema migration: v9 building idx_injection_stats_by_round and "
+                    "idx_latent_snapshots_keys — on a catalog-scale DB this is a one-time "
+                    "full-table scan + sort per index that can take minutes to tens of "
+                    "minutes; do not interrupt"
                 )
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_round

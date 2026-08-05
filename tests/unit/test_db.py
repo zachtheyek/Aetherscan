@@ -1084,8 +1084,10 @@ class TestV9IndexPlannerContracts:
         )
         stmt, plan = self._plan_of_last(db, captured, "FROM injection_stats")
         # COUNT, not substring: both the start- and end-bound terms must carry the guard —
-        # deleting either one alone would still satisfy an `in` check.
+        # deleting either one alone would still satisfy an `in` check. The negative states
+        # the invariant directly: no unguarded round_number term reaches the planner.
         assert stmt.count("+round_number") == 2, stmt
+        assert "AND round_number" not in stmt, stmt
         assert "idx_injection_stats_by_round" not in plan, (stmt, plan)
         assert "idx_injection_stats_by_stat" in plan, (stmt, plan)
 
@@ -1100,10 +1102,14 @@ class TestV9IndexPlannerContracts:
         )
         stmt, plan = self._plan_of_last(db, captured, "GROUP BY")
         # All four guarded sites, individually deletable, individually pinned: the two WHERE
-        # bounds plus GROUP BY plus ORDER BY.
+        # bounds plus GROUP BY plus ORDER BY — and no unguarded round_number term anywhere
+        # (the negative also catches a guard MOVED rather than deleted).
         assert stmt.count("+round_number") == 4, stmt
         assert "GROUP BY +round_number" in stmt, stmt
         assert "ORDER BY +round_number" in stmt, stmt
+        assert "AND round_number" not in stmt, stmt
+        assert "GROUP BY round_number" not in stmt, stmt
+        assert "ORDER BY round_number" not in stmt, stmt
         assert "idx_injection_stats_by_round" not in plan, (stmt, plan)
         assert "idx_injection_stats_by_stat" in plan, (stmt, plan)
 
