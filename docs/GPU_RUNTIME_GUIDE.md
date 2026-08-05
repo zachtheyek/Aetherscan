@@ -25,12 +25,17 @@ Forward compatibility is a CUDA feature, not a TF feature, so the same trick wil
 
 ## One-time setup
 
-### 1. Build the .sif image (per cluster)
+### 1. Get the `.sif` image
 
-Aetherscan ships a single recipe — [`aetherscan.def`](../aetherscan.def) — that builds with either runtime. Build on the cluster you intend to run on so the image is produced by that cluster's native runtime:
+**Canonical path — let the wrapper pull it.** `utils/run_container.sh` acquires the image on first use: it **pulls the release-pinned image from GHCR** (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, derived from `pyproject.toml`) and caches it as `aetherscan-ngc25.02.sif`, recording the pulled ref (`repo:tag`) in `<sif>.pulled-tag` and re-pulling whenever that ref changes (a new version tag, or a different repo via `AETHERSCAN_IMAGE`). So on a **release checkout you build nothing** — the first pipeline run pulls and caches the image. Apptainer and SingularityCE both consume the same published OCI image (each converts it to its own native `.sif`), so there's nothing cluster-specific to produce.
 
 > [!NOTE]
-> You usually **don't** need to build. `utils/run_container.sh` pulls the release-pinned image from GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`) on first use and caches it as the `.sif` (recording the pulled ref — `repo:tag` — in `<sif>.pulled-tag`). It re-pulls whenever that ref changes, i.e. a new version tag *or* a different repo via `AETHERSCAN_IMAGE` — so a release-tag checkout re-pulls on every version bump, even a digest-identical retag; a `.devN` checkout always asks for the constant `:latest` and keeps whatever it first cached, so `rm` the `.sif` and its sidecar to pick up a moved `:latest`. A local build placed over a pulled `.sif` is detected by mtime and kept, never clobbered. Build from `aetherscan.def` only when the pull can't serve your host — a non-x86_64 host, a driver below the CUDA 12.8 floor, or local `requirements-container.txt` edits. **Either way** (pull or build), on a hardened HPC node with a quota'd `$HOME` first redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch — a pull unpacks the ~9 GB image through them exactly as a build does (see the TMPDIR/CACHEDIR note below).
+> **Hardened HPC nodes (pull *or* build):** on a quota'd `$HOME`, first redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch — a pull unpacks the ~9 GB image through them exactly as a build does. See [Hardened HPC nodes](#hardened-hpc-nodes) below.
+
+> [!NOTE]
+> A `.devN`/`master` checkout resolves to the constant `:latest`, which exists only once the first release *after* the image was introduced ships — until then the pull can't serve it and the wrapper **exits with `aetherscan.def` build instructions** (it never builds for you — see the fallback below). Once a later release *moves* `:latest`, a `.devN` checkout keeps whatever `.sif` it first cached, so `rm` the `.sif` and its `.pulled-tag` sidecar to pick the new one up. A local build placed over a pulled `.sif` is detected by mtime and kept, never clobbered.
+
+**Fallback — build from `aetherscan.def`.** Build only when the pull can't serve your host: a non-x86_64 host, a driver below the CUDA 12.8 floor, local `requirements-container.txt` edits, or no matching published image — a `master`/`.devN` checkout before the next release publishes `:latest`, or one whose `requirements-container.txt` has moved past the last release (`:latest` tracks the newest release, not master). The single recipe builds with either runtime; build on the cluster you intend to run on:
 
 ```bash
 cd /path/to/Aetherscan
@@ -45,7 +50,7 @@ apptainer build aetherscan-ngc25.02.sif aetherscan.def
 Build takes ~9 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` and layers in [`requirements-container.txt`](../requirements-container.txt) (Aetherscan's pip extras).
 
 > [!NOTE]
-> A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch.
+> A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch. Pulling sidesteps this entirely — each runtime converts the published OCI image itself.
 
 #### Pinned base image (digest)
 
@@ -68,9 +73,9 @@ docker buildx imagetools inspect nvcr.io/nvidia/tensorflow:25.02-tf2-py3 --forma
 
 Swap the new `sha256:…` into **both** the `From:` line and the `Base` label in [`aetherscan.def`](../aetherscan.def), commit, and rebuild.
 
-#### Build-time gotchas on hardened HPC nodes
+#### Hardened HPC nodes
 
-Locked-down clusters typically need three things adjusted before `singularity build` will succeed as an unprivileged user. Work through them in order:
+Locked-down clusters typically need a few things adjusted. The `TMPDIR` / `CACHEDIR` redirect below applies whether you **pull or build**; fakeroot and the `noexec /tmp` fix are **build-only**. Work through them in order:
 
 **`FATAL: --remote, --fakeroot, or the proot command are required to build this source as a non-root user`**
 
@@ -93,6 +98,9 @@ export SINGULARITY_CACHEDIR=/datax/scratch/$USER/singularity-cache
 ```
 
 `TMPDIR` needs ~15 GB free; `CACHEDIR` caches Docker base-layer blobs (a few GB, persists across rebuilds — keep it). Worth adding to `~/.bashrc` if you rebuild often. On an **Apptainer** host (e.g. the Ampere cluster) use the `APPTAINER_TMPDIR` / `APPTAINER_CACHEDIR` equivalents instead — Apptainer reads those first and falls back to the `SINGULARITY_*` names.
+
+> [!NOTE]
+> **On a `pull` you won't see the `noexec` FATAL above** (there's no `%post` root filesystem to exec), but set the same two vars anyway *before* the first `run_container.sh` call — the runtime unpacks the ~9 GB image through them, so leaving them unset fills `TMPDIR`'s default `/tmp` (the staging area, ~15 GB) and/or `CACHEDIR`'s default under `$HOME` (the blob cache) — both likely to fail on a hardened node. The fakeroot / `noexec` items above are build-only.
 
 **Build fails in `%post` with `Could not open requirements file: /tmp/...`**
 

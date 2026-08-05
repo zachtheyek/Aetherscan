@@ -111,7 +111,8 @@ A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrappe
 
 - **non-x86_64 host** (e.g. aarch64 Grace/GH200): the published image is `linux/amd64` only;
 - **host driver below the base's CUDA 12.8 floor** (Blackwell <570 / Ampere <550): a pull succeeds but the container won't see the GPUs — upgrade the driver, or build;
-- **you edited `requirements-container.txt` or rebuilt TF from source** locally: a pull fetches the *released* image, not your variant.
+- **you edited `requirements-container.txt` or rebuilt TF from source** locally: a pull fetches the *released* image, not your variant;
+- **no matching published tag exists yet** — e.g. a `master`/`.devN` clone before the next release moves `:latest` (the pull has nothing to fetch, so the wrapper prints these build instructions and exits).
 
 A local build placed over the default `.sif` path is safe: `run_container.sh` caches pulled images with a `<sif>.pulled-tag` sidecar and detects a locally-built `.sif` by mtime, so your build is kept and never overwritten by a pull — even across version bumps.
 
@@ -1137,9 +1138,11 @@ Contributions are welcome! Quick start:
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-singularity build aetherscan-ngc25.02.sif aetherscan.def
-# or:
-apptainer build aetherscan-ngc25.02.sif aetherscan.def
+# The first `utils/run_container.sh` run pulls the prebuilt image from GHCR and caches it as
+# aetherscan-ngc25.02.sif. A fresh `master` clone resolves to `:latest`, which doesn't exist until
+# the next release ships — so build once now (this is also the fallback for a host the published
+# image can't serve). Drop this step on a release-tag checkout.
+singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
 
 ./utils/start_tmux_session.sh
 
