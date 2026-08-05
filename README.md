@@ -39,7 +39,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - VRAM: **≥8 GB per GPU** recommended — measured peaks ~6 GB/GPU (training) and ~2.5 GB/GPU (inference) on the v1.0.0 release runs; gradient accumulation keeps per-GPU VRAM low
 - RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
-- Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~3 TB with `--keep-round-data`; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
+- Disk: full-scale training round data ~147 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
@@ -50,7 +50,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 - ≥1x NVIDIA GPU:
   - Ampere with CUDA 12.3+ driver
 - VRAM / RAM same as above
-- Python 3.10 / TF 2.17 (managed by conda)
+- Python 3.10 / TF 2.17 + tf_keras 2.17, legacy-Keras mode (managed by conda)
 
 > [!NOTE]
 > There are no plans to support non-Nvidia GPUs
@@ -60,20 +60,21 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 
 ### Install From PyPI (pip)
 
-For **off-cluster** use, Aetherscan is published on PyPI. The container stays canonical on the clusters (and is **mandatory on Blackwell** — see the caveats). **v1.0.0 needs a one-time workaround** (removed in the next release):
+For **off-cluster** use, Aetherscan is published on PyPI. The container stays canonical on the clusters (and is **mandatory on Blackwell** — see the caveats):
 
 ```bash
-pip install aetherscan==1.0.0
-pip install "tf_keras~=2.17.0"        # REQUIRED for v1.0.0: the released weights are Keras-2 format
-export TF_USE_LEGACY_KERAS=1           # so `from tensorflow import keras` resolves to tf_keras
+pip install aetherscan
 
 # Data roots (default to /datax/scratch/zachy/... on-cluster). Off-cluster, set them to writable
 # paths — AETHERSCAN_DATA_PATH must hold your catalog + inputs; the model/output roots are made on demand:
 export AETHERSCAN_DATA_PATH=...  AETHERSCAN_MODEL_PATH=...  AETHERSCAN_OUTPUT_PATH=...
 
-# Bare inference (no --encoder-path/--rf-path/--config-path) resolves + downloads the v1.0.0 HF weights:
+# Bare inference (no --encoder-path/--rf-path/--config-path) resolves + downloads the release's
+# matching HF weights (revision v<installed version>):
 python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 ```
+
+**If the version you resolve is v1.0.0** — whether by pinning `aetherscan==1.0.0` or because it is still the newest published release when you install — that release predates the packaged legacy-Keras fix ([#323](https://github.com/zachtheyek/Aetherscan/issues/323), fixed by [#340](https://github.com/zachtheyek/Aetherscan/pull/340) from v1.1.0): its manifest doesn't pull `tf_keras`, so you must add the two-step workaround yourself — `pip install "tf_keras~=2.17.0"` and `export TF_USE_LEGACY_KERAS=1` — or the released Keras-2 weights fail to load (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md#19-v100-pipconda-install-cannot-load-the-encoder-legacy-keras)).
 
 **Caveats:**
 
@@ -81,7 +82,7 @@ python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 - **No CPU mode.** Both `train` and `inference` hard-exit when no GPU is visible (`"… requires GPU"`).
 - **The two end-of-run report PNGs do not render on a pip install.** The wheel ships only `src/aetherscan` (not `utils/`), so `benchmark_report.py` / `perband_report.py` aren't found — those two plots log a warning and skip; the inference viz suite, DB, and results are unaffected. Use the container or source tree if you need them.
 - The live dashboard needs the extra: `pip install 'aetherscan[dashboard]'`.
-- The `tf_keras` + `TF_USE_LEGACY_KERAS` steps are the **v1.0.0** workaround only ([#323](https://github.com/zachtheyek/Aetherscan/issues/323) — the released `.keras` weights are Keras-2 while pip pulls Keras 3). Once **the next release** ships they become unnecessary and the install collapses to `pip install aetherscan`; this section will be updated at that point.
+- From **v1.1.0** the manifests declare `tf_keras` and the package sets `TF_USE_LEGACY_KERAS` itself at import time — no manual steps. Only a **v1.0.0** install (pinned, or resolved while it is the newest published release) needs the workaround above.
 
 ### Run From Container
 
@@ -97,7 +98,12 @@ cd Aetherscan
 
 **2. Get the `.sif` image**
 
-`utils/run_container.sh` acquires the image on first use, in priority order: **(1)** use a local `aetherscan-ngc25.02.sif` if present; **(2)** else **pull the release-pinned image from GHCR** (`ghcr.io/zachtheyek/aetherscan:v<version>`, derived from `pyproject.toml`) and cache it as that `.sif`; **(3)** else fail loudly with build instructions. So on a release checkout you normally build nothing — the first `run_container.sh` call pulls and caches the image (the runtime converts the OCI image to its own native `.sif`, so the same published image works under both Apptainer and SingularityCE). To pre-pull explicitly (optional):
+`utils/run_container.sh` acquires the image on first use, in priority order: **(1)** use a local `aetherscan-ngc25.02.sif` if present; **(2)** else **pull the release-pinned image from GHCR** (`ghcr.io/zachtheyek/aetherscan:v<version>`, derived from `pyproject.toml`) and cache it as that `.sif`; **(3)** else fail loudly with build instructions. So on a release checkout you normally build nothing — the first `run_container.sh` call pulls and caches the image (the runtime converts the OCI image to its own native `.sif`, so the same published image works under both Apptainer and SingularityCE).
+
+> [!NOTE]
+> **On a hardened HPC node, set `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch _before_ the first pull** — whether that pull comes from `run_container.sh` or the manual commands below. The runtime unpacks the ~9 GB image through them exactly as a build does, so leaving them unset fills `TMPDIR`'s default `/tmp` (the staging area needs ~15 GB) and/or the blob cache under `$HOME` — either of which is likely to fail on a quota'd or hardened node. See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md#hardened-hpc-nodes).
+
+To pre-pull explicitly (optional):
 
 ```bash
 # Apptainer (Ampere) or SingularityCE (Blackwell) — either converts the OCI image to a native .sif
@@ -126,7 +132,7 @@ singularity build aetherscan-ngc25.02.sif aetherscan.def
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
+Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes a build additionally needs the `--fakeroot` flag, and the `noexec /tmp` FATAL it can hit is fixed by the same `TMPDIR`/`CACHEDIR` scratch redirect the pull path needs (see the note above — the symptom is build-only, the remedy is shared); the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md#hardened-hpc-nodes).
 
 > [!NOTE]
 > The GHCR image is a derivative of NVIDIA's NGC TensorFlow container, so it is governed by the [NVIDIA Deep Learning Container License](https://developer.download.nvidia.com/licenses/NVIDIA_Deep_Learning_Container_License.pdf) — not the repo's BSD-3-Clause, which covers only the (bind-mounted) Aetherscan source.
@@ -292,7 +298,7 @@ PYTHONPATH=src python -m aetherscan.main train
 # Container
 ./utils/run_container.sh python -m aetherscan.main train \
     --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
-    --num-training-rounds 20 \
+    --num-training-rounds 10 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
     --save-tag test
@@ -300,7 +306,7 @@ PYTHONPATH=src python -m aetherscan.main train
 # Source
 PYTHONPATH=src python -m aetherscan.main train \
     --train-files real_filtered_LARGE_HIP110750.npy real_filtered_LARGE_HIP13402.npy real_filtered_LARGE_HIP8497.npy \
-    --num-training-rounds 20 \
+    --num-training-rounds 10 \
     --epochs-per-round 100 \
     --curriculum-schedule exponential \
     --save-tag test

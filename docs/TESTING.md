@@ -70,6 +70,8 @@ tests/
 │   ├── test_manager.py              # pool/SHM tracking and cleanup idempotence
 │   ├── test_monitor.py              # get_process_tree_stats cache: reuse/eviction/PSS, RAM-only path, outer guard
 │   ├── test_benchmark.py            # stage_timer nesting/failures, report tree math + suggestions
+│   ├── test_bench_common.py         # benchmarks/_common.py default_bench_data_dir: env-var + fallback parity with config.data_path
+│   ├── test_display_tag.py          # display_tag derivation: {command}_{machine}_{datetime} from the DB tag, pure/TF-free
 │   ├── test_perband_report.py       # per-band plot: umbrella-vs-child span isolation, catalog
 │   │                                #   join + count-guard skip, per-band stats, non-empty PNG
 │   ├── test_candidate_figures.py    # TF-free candidate renderer: pool/serial parity, containment

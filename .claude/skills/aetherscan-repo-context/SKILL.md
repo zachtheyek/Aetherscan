@@ -21,15 +21,16 @@ There are three install paths — two off the same source tree, plus the publish
 | ------------------------------------------- | ---------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------- |
 | **NGC container** (Apptainer/SingularityCE) | Canonical; runs on both clusters; only option on Blackwell | Default                       | `./utils/run_container.sh python -m aetherscan.main {train\|inference} ...` |
 | **Conda env**                               | Alternative; **Ampere only**                               | When containers aren't usable | `PYTHONPATH=src python -m aetherscan.main {train\|inference} ...`           |
-| **PyPI package** (`pip install aetherscan`) | Off-cluster analysis; container still **mandatory on Blackwell** | Local / off-cluster use | `pip install aetherscan` → `python -m aetherscan.main {train\|inference} ...` (v1.0.0 needs the `tf_keras` workaround — see the **Install From PyPI (pip)** section of `README.md`) |
+| **PyPI package** (`pip install aetherscan`) | Off-cluster analysis; container still **mandatory on Blackwell** | Local / off-cluster use | `pip install aetherscan` → `python -m aetherscan.main {train\|inference} ...` (a **v1.0.0** install — pinned, or resolved while it is still the newest published release — needs the `tf_keras` workaround; see the **Install From PyPI (pip)** section of `README.md`; fixed from v1.1.0) |
 
 CLI flags are identical across all three install paths; only the launcher differs. For the two source-tree paths, `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` (the container sets `PYTHONPATH` automatically); the installed PyPI wheel needs no `PYTHONPATH`.
 
 - **Container image:** `utils/run_container.sh` pulls the prebuilt image from GHCR (`ghcr.io/zachtheyek/aetherscan:v<version>`) on first run and caches it as `aetherscan-ngc25.02.sif` — the canonical path (on a release checkout, no manual build). Building from `aetherscan.def` (`singularity build aetherscan-ngc25.02.sif aetherscan.def`, or `apptainer build ...` — same recipe, either runtime, on the cluster you'll run on) is the **fallback**: a non-x86_64 host, a driver below the CUDA 12.8 floor, local `requirements-container.txt` edits, or no matching published image — a `.devN`/`master` checkout before the next release publishes `:latest`, or one whose `requirements-container.txt` has moved past the last release (`:latest` tracks the newest release, not master).
 - **Conda env:** `conda env create -f environment.yml && conda activate aetherscan`
+- **PyPI (off-cluster):** `pip install aetherscan`; full detail in `README.md` → "Install From PyPI (pip)". A **v1.0.0** install — pinned, or resolved while it is still the newest published release — needs a one-time workaround (fixed from v1.1.0, issue #323): `pip install "tf_keras~=2.17.0"` plus `export TF_USE_LEGACY_KERAS=1`, because the released `.keras` weights are Keras-2 format while the v1.0.0 manifest pulls Keras 3. Point `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` at writable paths (they default to the on-cluster `/datax/scratch/zachy/...` roots); bare `inference` with no `--encoder-path`/`--rf-path`/`--config-path` resolves and downloads the installed version's matching HF weights. Caveats: **no CPU mode** (both `train` and `inference` hard-exit when no GPU is visible); Blackwell must use the container; the two end-of-run report PNGs never render because the wheel ships only `src/aetherscan`, not `utils/` (`benchmark_report.py` / `perband_report.py` log a warning and skip — the inference viz suite, DB, and results are unaffected); the live dashboard needs `pip install 'aetherscan[dashboard]'`.
 - **`utils/fetch_run_outputs.sh`** rsyncs one run's outputs from remote cluster node(s) to the local `outputs/` tree, selecting files by the universal `*_<save_tag>.*` suffix and renaming each to `<machine>_<basename>` (collision-free across nodes). `<train|inference> <save_tag> <machine>...`; `--all` adds train checkpoints/archive, `--db` pulls the SQLite DB into `outputs/data/db/`, `--dry-run`. Per-run logs are tag-scoped (`logs/aetherscan_<save_tag>.log`, since PR #221), so the script picks each run's log up by its tag like every other output; the inference branch is provisional pending the inference pipeline.
 - **`utils/kill_pipeline.sh`** stops a running pipeline (main process + all worker children) from a separate shell on the same machine — works for both run modes, finds the process tree itself, and tries a graceful SIGTERM (lets `ResourceManager` close pools/SHM) before escalating to SIGKILL. When no main process is found, sweeps `{round_data_root}/*/producer.pid` for orphaned `RoundDataProducer` trees left by an ungraceful main-process death and reaps them. Assumes a single running instance. `--force` / `--dry-run` / `--timeout N` / `--round-data-root DIR`.
-- **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container. `AETHERSCAN_EXTRA_BINDS` (comma-separated host paths) appends additional 1:1 binds for data outside the standard dirs (e.g. raw `.h5` files under `/datag` for inference); the runtime's native `SINGULARITY_BIND` / `APPTAINER_BIND` still pass through and are additive.
+- **`utils/run_container.sh`** auto-detects apptainer vs singularity (Apptainer wins when both present), sets `--nv` for GPU passthrough, auto-loads `<repo>/.env`, and bind-mounts the repo + `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` 1:1 so absolute paths persisted in the DB stay valid across host and container. `AETHERSCAN_EXTRA_BINDS` (comma-separated host paths) appends additional 1:1 binds for data outside the standard dirs (e.g. raw `.h5` files under `/datag` for inference); the runtime's native `SINGULARITY_BIND` / `APPTAINER_BIND` still pass through and are additive. When `HF_HOME` is set it is bound 1:1 and forwarded too — it must be an existing absolute directory (the wrapper fails fast otherwise); point it at scratch so HF weight downloads persist and don't fill `$HOME`.
 - **`utils/start_tmux_session.sh`** (optional) spins up a four-window tmux session — a single-pane `pipeline` working window plus three monitoring windows: `htop` (htop 75% / CPU-MEM ticker 25%), `nvidia-smi`, and `data` (four vertical panes: `/dev/shm`, then `tree` of data / models / outputs). Idempotent.
 
 **Common invocations:**
@@ -104,7 +105,7 @@ PYTHONPATH=src python utils/print_cli_help.py all
 
 ## Project Structure
 
-The tree below annotates the **source** layout. For the complete repository structure — root-level build/config files (`pyproject.toml`, `environment.yml`, `aetherscan.def`, `requirements-container.txt`, `.pre-commit-config.yaml`), governance docs (`CLAUDE.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, `AI_POLICY.md`), and the `.claude/` and `.github/` directories — see the Project Structure tree in `CONTRIBUTING.md` (the canonical source).
+The tree below annotates the **source** layout. For the complete repository structure — root-level build/config files (`pyproject.toml`, `environment.yml`, `aetherscan.def`, `Dockerfile`, `requirements-container.txt`, `.pre-commit-config.yaml`), governance docs (`CLAUDE.md`, `CONTRIBUTING.md`, `SECURITY.md`, `KNOWN_ISSUES.md`, `AI_POLICY.md`), and the `.claude/` and `.github/` directories — see the Project Structure tree in `CONTRIBUTING.md` (the canonical source).
 
 ```
 src/aetherscan/
@@ -136,11 +137,11 @@ src/aetherscan/
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
-utils/                   # benchmark_report.py, fetch_run_outputs.sh,
-                         # find_optimal_configs.py, get_system_info.sh,
-                         # hf_tag_release.py, kill_pipeline.sh, print_cli_help.py,
-                         # run_container.sh, start_tmux_session.sh,
-                         # verify_train_test_files.py
+utils/                   # benchmark_report.py, perband_report.py,
+                         # fetch_run_outputs.sh, find_optimal_configs.py,
+                         # get_system_info.sh, hf_tag_release.py, kill_pipeline.sh,
+                         # print_cli_help.py, run_container.sh,
+                         # start_tmux_session.sh, verify_train_test_files.py
 docs/                    # Full technical doc suite, one doc per pipeline surface —
                          # indexed in docs/README.md; start at docs/ARCHITECTURE.md
 tests/                   # Pytest suite: unit/ (CI surface) + gpu/cluster-marked
@@ -257,6 +258,7 @@ pre-commit run ruff --all-files
 - **Incident response**: Contain (revoke creds) → Assess → Notify → Remediate (rotate secrets) → Document → Improve.
 - **Reporting**: non-critical → [GitHub Discussion](https://github.com/zachtheyek/Aetherscan/discussions) with the "security" label; critical → contact [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack directly (do **not** open a public issue), expect a response in 48–72h.
 - **Data security**: major outputs (weights, code, search results, training/inference data) are publicly disclosed via HuggingFace / GitHub / publications / [BL Open Data Archive](https://breakthroughinitiatives.org/opendatasearch); intermediate products (DB records, plots) stay on access-controlled HPC servers.
+- **HuggingFace artifact scan**: HF runs ProtectAI's scanner over uploaded artifacts and flags `vae_encoder.keras` as **"unsafe."** This is a known **benign** false positive — it fires because loading the encoder deserializes the model's registered custom `Sampling` layer, not because of a pickle-exec or embedded-malware finding; `random_forest.joblib` carries only the generic sklearn/joblib **"Caution"** notice. Accepted and documented; do not re-report it as a vulnerability. Full rationale in `SECURITY.md` → "HuggingFace Hub artifact scan (ProtectAI)".
 - **Dependency versions**: when bumping a dep, don't chase the latest — target the **newer** of {two minors below the latest stable, the latest stable ≥6 months old}, stable releases only (no alpha/beta/rc/nightly). A known advisory on that target overrides the lag → jump to the minimum patched version. Never cross a documented ceiling (`numpy<2.0`, `setuptools<81`) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `Dockerfile` / `pyproject.toml` in lockstep for shared deps (`aetherscan.def` + `Dockerfile` both pin the NGC base digest). Full policy in `SECURITY.md` → Security Scanning → Version Selection Policy.
 - False positives: add `file:line` to `.gitleaksignore` or inline `# gitleaks:allow` (less preferred).
 
@@ -280,8 +282,9 @@ Paths relative to the repo root:
 - `docs/MODELS.md` — Beta-VAE architecture/loss math, RF features + threshold semantics
 - `docs/DATABASE.md` — schema, writer thread, flush/supersede protocols, migrations
 - `docs/RUNTIME_SERVICES.md` — logger/Slack, ResourceManager lifecycle, resource monitor
+- `docs/BENCHMARKING.md` — always-on stage timing, benchmark/perband reports, micro-benchmarks
 - `docs/TESTING.md` — suite layout, markers, isolation fixtures, CI, cluster smokes
 - `docs/GITHUB_AUTOMATION.md` — every workflow, dedup guards, assistant-handle rules
-- `docs/RELEASE.md` — the SemVer versioning policy (which segment to bump; a same-contract retrain is at least a MINOR), version-coupling contract, CD gates, release runbook
-- `docs/GPU_RUNTIME_GUIDE.md` — container build/runtime runbook
+- `docs/RELEASE.md` — the SemVer versioning policy (which segment to bump; a same-contract retrain is at least a MINOR), the four-object version-coupling contract (git/PyPI + GitHub Release + HF weights + GHCR image), CD gates, release runbook
+- `docs/GPU_RUNTIME_GUIDE.md` — container setup/runtime runbook (GHCR pull canonical, `.def` build fallback)
 - `docs/CONFIG_AND_CLI.md` — config system deep dive

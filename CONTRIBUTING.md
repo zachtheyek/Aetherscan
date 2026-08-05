@@ -234,6 +234,7 @@ Aetherscan/
 ├── .gitignore                  # Local gitignore
 ├── .pre-commit-config.yaml     # Pre-commit hook configuration
 ├── aetherscan.def              # Apptainer/SingularityCE build recipe (NGC container)
+├── Dockerfile                  # OCI twin of aetherscan.def; published to GHCR by publish-image.yml
 ├── requirements-container.txt  # Pip extras layered into NGC container
 ├── environment.yml             # Conda dependencies
 ├── pyproject.toml              # Package metadata, ruff config
