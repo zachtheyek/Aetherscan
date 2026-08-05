@@ -1,84 +1,142 @@
-# Analyze merged PRs and suggest documentation updates
-# Creates new issue & instructs Claude assistant to create PR
+# Weekly reconciliation of merged PRs against the documentation set
+# Scans every PR merged since the last successful scheduled run; if the aggregate changes
+# left doc gaps, creates ONE issue & instructs Claude assistant to create PR
+# Runs Monday 01:00 UTC == 09:00 MYT (GMT+8), like the other weekly Claude workflows
 name: Claude Update Docs
 
 on:
-  pull_request:
-    types: [closed]
-    branches: [master]
-  # Manual re-scan of an already-merged PR. A workflow_dispatch run uses the workflow file from
-  # the default branch, so this is the way to run the CURRENT logic against an old PR — a plain
-  # re-run of a past merge would replay that commit's older workflow file instead.
+  schedule:
+    # cron is UTC; 01:00 UTC Mon == 09:00 MYT (GMT+8) Mon
+    - cron: "0 1 * * 1"
+  # Allow manual runs (scheduled workflows only fire from the default branch). A dispatch
+  # scans the same window a scheduled run would: everything merged since the last
+  # successful run.
   workflow_dispatch:
-    inputs:
-      pr_number:
-        description: "Number of a merged PR to (re)scan for documentation updates"
-        required: true
-        type: string
 
 jobs:
   claude-update-docs:
-    # Run on a real merge to master, or a manual workflow_dispatch re-scan of a merged PR.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    # Analysing one merged diff against the doc set + source↔doc contracts shouldn't take
-    # more than 30 mins (refine if data shows otherwise)
-    timeout-minutes: 30
+    # A week of merged diffs against the doc set + source↔doc contracts is a bigger scan
+    # than the old one-PR-per-merge shape; 60 mins of headroom (refine if data shows otherwise)
+    timeout-minutes: 60
     permissions:
       contents: read
-      pull-requests: write
+      # actions:read backs the window computation (`gh run list` on this workflow's own history)
+      actions: read
+      # read (not write): the pull_request trigger is gone and every PR touch is a read
+      # (`gh pr diff/view/list`); issue filing rides issues:write
+      pull-requests: read
       issues: write
       id-token: write
-    env:
-      # Target PR: the merged PR (pull_request event) or the pr_number input (manual re-scan).
-      # Everything below keys off this single value so both triggers share one code path.
-      PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
 
     steps:
-      # On a manual re-scan, enforce the same precondition the merge path gets for free (job
-      # `if: …merged == true`): the input must name a real, merged PR. Fail fast here rather than
-      # wasting the checkout + Claude run — or filing a premature doc issue for an unmerged PR.
-      - name: Validate dispatch input is a merged PR
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
-          if [[ "$STATE" != "MERGED" ]]; then
-            echo "::error::pr_number=$PR_NUMBER is not a merged PR (state = $STATE)"
-            exit 1
-          fi
-          echo "PR #$PR_NUMBER is merged — proceeding."
-
-      # Deterministic duplicate-issue guard: when this workflow files a doc issue it carries
-      # the hidden marker `<!-- aetherscan-update-docs pr=<N> -->`. If one already exists for
-      # this PR (e.g. the merge event was manually re-run), skip the Claude step so we never
-      # file a second issue (and re-trigger a second @claude follow-up PR). Checks all states
-      # since the issue may have been closed once the docs landed.
-      - name: Check for existing documentation issue for this PR
+      # Deterministic week stamp + duplicate-issue guard. Every issue this workflow opens
+      # carries the hidden marker `<!-- aetherscan-update-docs week=<WEEK> -->`. If one
+      # already exists for this ISO week (cron double-fire or a manual re-run), skip the
+      # Claude step so we never file twice. Checks all states since the issue may have been
+      # closed once the docs landed. (Pre-weekly issues carried `pr=<N>` markers — those
+      # never collide with the week-keyed ones, so history needs no migration.)
+      - name: Compute week stamp and check for existing issue
         id: guard
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          MARKER="<!-- aetherscan-update-docs pr=$PR_NUMBER -->"
+          WEEK="$(date -u +'%G-W%V')"
+          DATE="$(date -u +'%Y-%m-%d')"
+          echo "week=$WEEK" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          MARKER="<!-- aetherscan-update-docs week=$WEEK -->"
           if gh issue list --state all --limit 200 --json body --jq '.[].body' \
               | grep -qF "$MARKER"; then
-            echo "A documentation issue for PR #$PR_NUMBER already exists — skipping Claude step."
+            echo "A documentation issue for $WEEK already exists — skipping Claude step."
             echo "already_filed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No documentation issue for PR #$PR_NUMBER — proceeding."
+            echo "No documentation issue for $WEEK — proceeding."
             echo "already_filed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout repository
+      # Deterministic scan window + merged-PR enumeration. The window opens at the previous
+      # successful SCHEDULED run of this workflow and falls back to 7 days when there is none
+      # (first weekly run, or a purged run history). Coverage properties, precisely:
+      # - Failed runs never advance the window (a red week is re-covered by the next green one).
+      # - Dispatch runs never advance it: a workflow_dispatch concludes `success` even when the
+      #   week guard short-circuited it, so anchoring on one would silently drop everything
+      #   merged between the last real scan and that no-op run. A dispatch may therefore
+      #   re-scan a stretch a later scheduled run also covers; that's harmless — the scan
+      #   reconciles against CURRENT docs (already-fixed gaps produce nothing) and the week
+      #   marker prevents double-filing. Consequence: under dispatch-only operation (e.g.
+      #   GitHub disabling `schedule` after 60 days of repo inactivity) the window grows
+      #   monotonically — the --limit cap warning below is the tripwire for that.
+      # - NOT total: a SCHEDULED run the guard short-circuits (an issue already filed this
+      #   ISO week — e.g. a dispatch between Mon 00:00 UTC and the cron's ACTUAL start, which
+      #   is nominally 01:00 but observed ~04:30 on the sibling weeklies given GitHub's cron
+      #   deferral) still matches `--event schedule --status success` and becomes the anchor;
+      #   whatever merged between the suppressing run's enumeration and that cron's createdAt
+      #   falls out of every window. Accepted: `gh run list` can't see step outcomes, and the
+      #   fixes are all worse than this few-hour-slot residual (which also needs an in-week
+      #   re-file to arise at all).
+      # - Anchoring on the prior run's *createdAt* (not "now") is what makes the overlap
+      #   direction safe: a PR merged DURING a run — after its `gh pr list`, before it
+      #   finishes — still lands inside the next window.
+      # If nothing merged in the window, the Claude step is skipped outright.
+      - name: Compute scan window and enumerate merged PRs
+        id: window
         if: steps.guard.outputs.already_filed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          SINCE="$(gh run list --workflow "claude-update-docs.yml" --event schedule \
+                     --status success --limit 1 \
+                     --json createdAt --jq '.[0].createdAt // empty')"
+          if [[ -z "$SINCE" ]]; then
+            # 8 (not 7) days: the first weekly run fires ~deferral-hours after its nominal
+            # Monday 01:00, so a plain 7-day window would open after a merge that landed in
+            # the deferral band a week earlier. The extra day is one harmless re-scan once.
+            SINCE="$(date -u -d '8 days ago' +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "No prior successful scheduled run found — falling back to an 8-day window."
+          fi
+          # Normalize to one timestamp form regardless of branch (gh emits RFC3339 `Z`;
+          # the GitHub search parser honors both `Z` and `+00:00`, verified empirically).
+          SINCE="$(date -u -d "$SINCE" +'%Y-%m-%dT%H:%M:%S+00:00')"
+          echo "since=$SINCE" >> "$GITHUB_OUTPUT"
+          echo "Scanning PRs merged into master since $SINCE."
+          # 200 headroom over normal weekly traffic; warn loudly if we ever hit the cap,
+          # because search-API ordering makes a silent truncation unrecoverable downstream.
+          LIMIT=200
+          PR_LIST="$(gh pr list --state merged --base master --limit "$LIMIT" \
+                       --search "merged:>=$SINCE" --json number,title,mergedAt \
+                       --jq 'sort_by(.mergedAt) | .[] | "#\(.number) \(.title) (merged \(.mergedAt))"')"
+          PR_NUMBERS="$(gh pr list --state merged --base master --limit "$LIMIT" \
+                          --search "merged:>=$SINCE" --json number,mergedAt \
+                          --jq 'sort_by(.mergedAt) | .[].number')"
+          COUNT=0
+          [[ -n "$PR_NUMBERS" ]] && COUNT="$(wc -l <<< "$PR_NUMBERS" | tr -d ' ')"
+          if [[ "$COUNT" -ge "$LIMIT" ]]; then
+            echo "::warning::Hit the --limit cap ($COUNT PRs) — the window may be truncated."
+          fi
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          # Randomized heredoc delimiters: PR titles are user-controlled text, and a title
+          # equal to a fixed delimiter would corrupt GITHUB_OUTPUT.
+          LIST_EOF="PR_LIST_EOF_${RANDOM}${RANDOM}"
+          NUMS_EOF="PR_NUMBERS_EOF_${RANDOM}${RANDOM}"
+          {
+            echo "pr_list<<$LIST_EOF"
+            echo "$PR_LIST"
+            echo "$LIST_EOF"
+            echo "pr_numbers<<$NUMS_EOF"
+            echo "$PR_NUMBERS"
+            echo "$NUMS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Found $COUNT merged PR(s):"
+          echo "$PR_LIST"
+
+      - name: Checkout repository
+        if: steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          # The diff comes from `gh pr diff` (GitHub API).
+          # The diffs come from `gh pr diff` (GitHub API).
           # We also run utils/print_cli_help.py (contract (a) below) off the checked-out tree,
           # so the working copy must be present.
           # A shallow checkout is sufficient.
@@ -91,66 +149,84 @@ jobs:
       # which the --help output is identical — so pinning keeps the regenerated blocks matching a
       # local run regardless of whatever default python the runner image happens to ship.
       - name: Set up Python
-        if: steps.guard.outputs.already_filed != 'true'
+        if: steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
-      # Contract (a): if this PR touched src/aetherscan/cli.py, the three verbatim argparse
-      # blocks under README.md's `## CLI Reference` have almost certainly drifted. The follow-up
-      # @claude PR can't regenerate them itself — `python` is not in claude.yml's tool allowlist —
-      # so do it HERE: this runner has Python and utils/print_cli_help.py is stdlib-only. The
-      # output is written to cli_help_regenerated.txt for the Claude step below to embed verbatim
-      # in the issue, so the follow-up only pastes, never runs anything. No-op if cli.py is
-      # untouched. This is a plain shell step, so it isn't bound by the Claude tool allowlist.
-      - name: Regenerate CLI Reference blocks if cli.py changed
+      # Contract (a): if ANY PR in the window touched src/aetherscan/cli.py, the three verbatim
+      # argparse blocks under README.md's `## CLI Reference` have almost certainly drifted. The
+      # follow-up @claude PR can't regenerate them itself — `python` is not in claude.yml's tool
+      # allowlist — so do it HERE: this runner has Python and utils/print_cli_help.py is
+      # stdlib-only, and the checkout is current master, so the regenerated output is canonical
+      # no matter which of the window's PRs drifted it. The output is written to
+      # cli_help_regenerated.txt for the Claude step below to embed verbatim in the issue, so
+      # the follow-up only pastes, never runs anything. No-op if cli.py is untouched all week.
+      # This is a plain shell step, so it isn't bound by the Claude tool allowlist.
+      - name: Regenerate CLI Reference blocks if cli.py changed in the window
         id: cli_help
-        if: steps.guard.outputs.already_filed != 'true'
+        if: steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          PR_NUMBERS: ${{ steps.window.outputs.pr_numbers }}
         run: |
-          # Capture the file list first (don't pipe gh into `grep -q`: under the default
-          # `bash -eo pipefail`, grep's early exit can SIGPIPE gh and mark the pipeline failed
-          # even on a match). The here-string keeps grep out of a pipeline with gh.
-          CHANGED_FILES="$(gh pr diff "$PR_NUMBER" --name-only)"
-          if grep -qxF "src/aetherscan/cli.py" <<< "$CHANGED_FILES"; then
-            echo "cli.py changed — regenerating CLI Reference blocks."
+          CLI_CHANGED=false
+          for N in $PR_NUMBERS; do
+            # Capture the file list first rather than piping gh into `grep -q`: grep's early
+            # exit can SIGPIPE gh mid-write (and under pipefail would mark the pipeline failed
+            # even on a match). The here-string keeps grep out of a pipeline with gh.
+            CHANGED_FILES="$(gh pr diff "$N" --name-only)"
+            if grep -qxF "src/aetherscan/cli.py" <<< "$CHANGED_FILES"; then
+              echo "PR #$N touched cli.py."
+              CLI_CHANGED=true
+              break
+            fi
+          done
+          if [[ "$CLI_CHANGED" == "true" ]]; then
+            echo "cli.py changed in this window — regenerating CLI Reference blocks."
             PYTHONPATH=src python utils/print_cli_help.py all > cli_help_regenerated.txt
             echo "cli_changed=true" >> "$GITHUB_OUTPUT"
             echo "Wrote $(wc -l < cli_help_regenerated.txt) lines to cli_help_regenerated.txt"
           else
-            echo "cli.py not in this PR's diff — skipping CLI Reference regeneration."
+            echo "cli.py untouched by every PR in this window — skipping CLI Reference regeneration."
             echo "cli_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run Claude Documentation Analysis
-        if: steps.guard.outputs.already_filed != 'true'
+        if: steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0'
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             ## Role
-            A pull request has been merged to master (or is being manually re-scanned). Your task is to analyze the changes and determine if any documentation needs to be updated.
+            You are a weekly documentation auditor. A scan window of merged pull requests is
+            being reconciled against the documentation set. Your task is to analyze the
+            aggregate changes and determine if any documentation needs to be updated.
 
             ## Context
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
-            PR TITLE: ${{ github.event.pull_request.title || '(unavailable — fetch via gh pr view, see below)' }}
-            PR BODY: ${{ github.event.pull_request.body || '(unavailable — fetch via gh pr view, see below)' }}
-            AUTHOR: ${{ github.event.pull_request.user.login || '(unavailable — fetch via gh pr view, see below)' }}
-            MERGE COMMIT: ${{ github.event.pull_request.merge_commit_sha || '(unavailable — fetch via gh pr view, see below)' }}
-            (Fields shown as "(unavailable …)" — e.g. on a manual re-scan — can be fetched with
-            `gh pr view ${{ env.PR_NUMBER }} --json title,body,author,mergeCommit`.)
+            WEEK: ${{ steps.guard.outputs.week }}   (ISO week being analysed)
+            DATE: ${{ steps.guard.outputs.date }}
+            WINDOW OPENS: ${{ steps.window.outputs.since }}   (the previous successful scheduled run)
+            MERGED PRS IN WINDOW (${{ steps.window.outputs.count }}, oldest first):
+            ${{ steps.window.outputs.pr_list }}
+
+            A deterministic pre-step already confirmed no doc issue exists for WEEK, so you
+            will not double-file — produce at most one issue covering the whole window.
             CLI REFERENCE REGENERATED: ${{ steps.cli_help.outputs.cli_changed }}
-            (When 'true', this PR touched cli.py and a prior CI step regenerated the CLI Reference
-            blocks. You do NOT paste them and must NOT reference the cli_help_regenerated.txt path
-            — a later CI step appends the blocks to the issue you file (contract (a) / Task step 4).
-            When 'false' or empty, cli.py was untouched.)
+            (When 'true', at least one PR in the window touched cli.py and a prior CI step
+            regenerated the CLI Reference blocks. You do NOT paste them and must NOT reference
+            the cli_help_regenerated.txt path — a later CI step appends the blocks to the
+            issue you file (contract (a) / Task step 4). When 'false' or empty, cli.py was
+            untouched all week.)
 
             ## Task
-            1. First, get the diff of the merged PR:
-               `gh pr diff ${{ env.PR_NUMBER }}`
+            1. First, get the diff of every merged PR in the window, oldest first:
+               `gh pr diff <number>` for each PR listed above (use `gh pr view <number>` for
+               title/body/context where the diff alone is ambiguous). Later PRs may supersede
+               earlier ones — reconcile against the AGGREGATE end state, not each PR in
+               isolation: a gap that one PR opened and a later PR already closed needs nothing.
 
             2. Review the changes and identify:
                - New features or functionality added
@@ -176,14 +252,15 @@ jobs:
                (a) `src/aetherscan/cli.py` ↔ README.md's `## CLI Reference` section.
                    The three code blocks under that section (### Top-Level Help,
                    ### Train Command Help, ### Inference Command Help) are pasted
-                   verbatim argparse output. If `cli.py` changed in this PR — flags
-                   added/removed/renamed, help strings edited, subparsers added or
+                   verbatim argparse output. If `cli.py` changed anywhere in this window —
+                   flags added/removed/renamed, help strings edited, subparsers added or
                    dropped — those blocks have almost certainly drifted. Because the
                    follow-up @claude PR can't run Python (it's not in that workflow's
                    tool allowlist), a prior CI step in THIS workflow has already
                    regenerated the canonical help (via `PYTHONPATH=src python
                    utils/print_cli_help.py all`, stdlib-only; pins COLUMNS=80 for
-                   deterministic wrapping). When CLI REFERENCE REGENERATED is 'true', a
+                   deterministic wrapping) off current master — canonical regardless of
+                   which PR drifted it. When CLI REFERENCE REGENERATED is 'true', a
                    LATER CI step appends those blocks verbatim to whatever issue you file
                    — you do NOT paste them, and you must NOT reference the
                    cli_help_regenerated.txt path (that file is ephemeral to this run and
@@ -215,7 +292,7 @@ jobs:
                    must be restated, prefer a terse pointer in CLAUDE.md plus the full
                    detail in the skill over growing CLAUDE.md past its budget.
 
-                   If this PR changed README.md, CONTRIBUTING.md, SECURITY.md,
+                   If any PR in this window changed README.md, CONTRIBUTING.md, SECURITY.md,
                    KNOWN_ISSUES.md, or anything under docs/ in any way that alters facts
                    those two files restate or point to — e.g. install/setup steps,
                    supported GPUs or runtimes, how the pipeline is invoked (entry point,
@@ -245,21 +322,23 @@ jobs:
                    follow-up PR carries them verbatim for the code owner to apply locally.
 
             4. If documentation updates are needed:
-               - A deterministic pre-step already confirmed no doc issue exists for THIS PR
+               - A deterministic pre-step already confirmed no doc issue exists for THIS week
                  (the re-run guard). Separately, check for a semantically duplicate doc issue
-                 from another PR before filing: `gh issue list --label "documentation" --state open`
-               - If no existing issue covers the same updates, create a new GitHub issue with the label "documentation"
-               - Title: "[DOCUMENTATION]: <brief description>"
+                 still open from earlier scans before filing: `gh issue list --label "documentation" --state open`
+               - If no existing issue covers the same updates, create ONE new GitHub issue with
+                 the label "documentation" covering every gap found across the window
+               - Title: "[DOCUMENTATION]: <brief description of the week's gaps>"
                - Body should include:
                  - As the FIRST line, the hidden marker (invisible when rendered) so the
-                   deterministic guard can dedupe re-runs of this PR:
-                   `<!-- aetherscan-update-docs pr=${{ env.PR_NUMBER }} -->`
-                 - Reference to the merged PR (#${{ env.PR_NUMBER }})
-                 - Summary of changes that require documentation
+                   deterministic guard can dedupe re-runs of this week:
+                   `<!-- aetherscan-update-docs week=${{ steps.guard.outputs.week }} -->`
+                 - References to every merged PR in the window whose changes need documentation
+                   (a gap-free PR needs no mention)
+                 - Summary of changes that require documentation, grouped per doc file
                  - Specific files that need updates
                  - Suggested changes or additions
                  - Tag @claude with instructions to open a PR linking to this issue with the specified updates
-                 - If CLI REFERENCE REGENERATED is 'true' (this PR touched
+                 - If CLI REFERENCE REGENERATED is 'true' (some PR in the window touched
                    `src/aetherscan/cli.py`), do NOT paste or reference
                    cli_help_regenerated.txt — a later CI step automatically appends the
                    regenerated blocks (under a `### Regenerated CLI Reference` heading) to
@@ -307,8 +386,8 @@ jobs:
 
             ## Available tools
             PR inspection:
-            - `gh pr diff` to retrieve the merged PR's diff (the primary signal for what to analyze in Step 1)
-            - `gh pr view` to look up additional PR metadata (labels, comments, reviewers) if needed beyond the variables interpolated above
+            - `gh pr diff` to retrieve each merged PR's diff (the primary signal for what to analyze in Step 1)
+            - `gh pr view` / `gh pr list` to look up additional PR metadata (labels, comments, reviewers) if needed beyond the window enumeration above
 
             Issue interaction:
             - `gh issue list --label "documentation" --state open` to check for an already-open documentation issue before filing a new one (Step 4 duplicate guard)
@@ -325,36 +404,37 @@ jobs:
               workflow (`.github/workflows/claude-style-check.yml`) owns source-code style/quality
               (the CONTRIBUTING.md "Code Style" rules ruff can't catch). Do NOT file an issue about,
               or ask the follow-up PR to change, the LOGIC or STYLE of `.py` source — only the
-              regeneration/reconciliation of documentation. If the merged PR needs no *documentation*
-              change, file nothing, even if its code could be improved. This keeps the two workflows
+              regeneration/reconciliation of documentation. If the window's PRs need no *documentation*
+              change, file nothing, even if their code could be improved. This keeps the two workflows
               from filing duplicate or overlapping issues.
-            - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs pr=${{ env.PR_NUMBER }} -->` marker — the deterministic guard relies on it to skip re-runs.
-            - Your only responsibilities are to determine whether any documentation needs to be updated after the merged PR. Do not do anything that is not within this job scope.
+            - If you create an issue, its body's FIRST line must be the `<!-- aetherscan-update-docs week=${{ steps.guard.outputs.week }} -->` marker — the deterministic guard relies on it to skip re-runs.
+            - Your only responsibilities are to determine whether any documentation needs to be updated after the window's merged PRs. Do not do anything that is not within this job scope.
 
           claude_args: |
-            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh issue list:*),Bash(gh issue create:*),Read,Glob,Grep"
             --model opus
 
       # Contract (a) — deterministic embed. The Claude step above decides whether to file an issue
       # but can't be relied on to paste ~400 lines of regenerated CLI help verbatim, and the
       # follow-up @claude PR can't read cli_help_regenerated.txt (it's ephemeral to this runner).
-      # So if cli.py changed and an issue was just filed for this PR, append the regenerated blocks
-      # to that issue straight from the file — guaranteed verbatim, no reliance on the model. Runs
-      # in seconds (well before the follow-up run spins up and reads the issue) and edits via
-      # github.token, so it doesn't itself re-trigger any workflow.
+      # So if cli.py changed in the window and an issue was just filed for this week, append the
+      # regenerated blocks to that issue straight from the file — guaranteed verbatim, no reliance
+      # on the model. Runs in seconds (well before the follow-up run spins up and reads the issue)
+      # and edits via github.token, so it doesn't itself re-trigger any workflow.
       - name: Embed regenerated CLI Reference into the issue
         # !cancelled() (not the implicit success()) so the blocks are still embedded if the Claude
         # step filed the issue but then errored; no-ops harmlessly when no issue was filed.
-        if: ${{ !cancelled() && steps.guard.outputs.already_filed != 'true' && steps.cli_help.outputs.cli_changed == 'true' }}
+        if: ${{ !cancelled() && steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0' && steps.cli_help.outputs.cli_changed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          WEEK: ${{ steps.guard.outputs.week }}
         run: |
-          MARKER="<!-- aetherscan-update-docs pr=$PR_NUMBER -->"
+          MARKER="<!-- aetherscan-update-docs week=$WEEK -->"
           NUM=$(gh issue list --state open --limit 50 --json number,body \
                   --jq "[.[] | select(.body | contains(\"$MARKER\"))][0].number // empty")
           if [[ -z "$NUM" ]]; then
-            echo "No doc issue was filed for PR #$PR_NUMBER — nothing to embed."
+            echo "No doc issue was filed for $WEEK — nothing to embed."
             exit 0
           fi
           echo "Appending regenerated CLI Reference blocks to issue #$NUM."
@@ -364,7 +444,7 @@ jobs:
               '' \
               '### Regenerated CLI Reference (paste verbatim into README.md)' \
               '' \
-              'Canonical `argparse` output for this PR, regenerated deterministically by CI.' \
+              'Canonical `argparse` output for this window, regenerated deterministically by CI.' \
               'The fenced block below holds the three sections in order — split on each' \
               '`usage:` line: top-level, then `train`, then `inference`. For each, do a' \
               'strict WHOLESALE replacement: delete the ENTIRE body of the matching README' \
