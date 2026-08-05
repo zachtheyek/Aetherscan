@@ -107,8 +107,8 @@ To pre-pull explicitly (optional):
 
 ```bash
 # Apptainer (Ampere) or SingularityCE (Blackwell) — either converts the OCI image to a native .sif
-apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.0.0
-singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.0.0
+apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.1.0
+singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.1.0
 ```
 
 A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build and keeps it across version bumps. Let `run_container.sh` do the pulling if you want it to track the pinned ref (`repo:tag`, so both a version bump and an `AETHERSCAN_IMAGE` change trigger a re-pull) for you; otherwise `rm` the `.sif` when you bump versions.
