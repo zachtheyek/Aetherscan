@@ -44,7 +44,9 @@ _TIME_RESOLUTION = 18.25361108  # seconds
 # Controlled SNRs spanning the training curriculum of the persisted smoke model
 # (snr_base=10, initial range 40 → it saw SNR 10-50 during training; these are the
 # pre-#372 defaults — retune to span 1-100, e.g. (2.0, 5.0, 20.0, 80.0), when the smoke
-# model is retrained at the current defaults).
+# model is retrained at the current defaults, and revisit _TOLERANCE/_CADENCES_PER_SNR
+# with it: a bottom rung near the noise floor is both close to chance and noisier than
+# the 10-and-up rungs these values were sized for).
 _SNRS = (10.0, 20.0, 35.0, 50.0)
 _CADENCES_PER_SNR = 32
 # Allowed decrease in mean P(true) between consecutive SNR levels; absorbs sampling noise
