@@ -111,6 +111,8 @@ singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:
 - **host driver below the base's CUDA 12.8 floor** (Blackwell <570 / Ampere <550): a pull succeeds but the container won't see the GPUs — upgrade the driver, or build;
 - **you edited `requirements-container.txt` or rebuilt TF from source** locally: a pull fetches the *released* image, not your variant.
 
+A local build placed over the default `.sif` path is safe: `run_container.sh` caches pulled images with a `<sif>.pulled-tag` sidecar and detects a locally-built `.sif` by mtime, so your build is kept and never overwritten by a pull — even across version bumps.
+
 The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
 
 ```bash

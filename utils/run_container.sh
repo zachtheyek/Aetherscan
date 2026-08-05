@@ -18,7 +18,8 @@
 # Override via env var:
 #     SIF                       Path to the .sif image
 #                               (default: <repo>/aetherscan-ngc25.02.sif). If it doesn't exist
-#                               it's pulled from GHCR (see below), else built from aetherscan.def.
+#                               it's pulled from GHCR (see below); if the pull fails the wrapper
+#                               prints aetherscan.def build instructions and exits.
 #     AETHERSCAN_IMAGE          GHCR image repo to pull when the .sif is absent
 #                               (default: ghcr.io/zachtheyek/aetherscan)
 #     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version>, or `latest`
@@ -127,20 +128,30 @@ if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
 fi
 IMAGE_REF="$IMAGE_REPO:$AETHERSCAN_IMAGE_TAG"
 
-# (Re)pull if there's no image, or the cached one was pulled for a different tag.
+# (Re)pull if there's no image, or the cached one was pulled for a different tag. A $SIF NEWER than
+# its sidecar was rebuilt locally over a previously pulled image — treat that as user-built
+# (priority 1) and never clobber it (mv preserves the pulled file's mtime; the sidecar is written
+# right after, so a pulled .sif is never newer than its sidecar, a local build always is).
 need_pull=0
 if [[ ! -f "$SIF" ]]; then
     need_pull=1
-elif [[ -f "$SIF.pulled-tag" && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$AETHERSCAN_IMAGE_TAG" ]]; then
+elif [[ -f "$SIF.pulled-tag" && ! "$SIF" -nt "$SIF.pulled-tag" \
+        && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$AETHERSCAN_IMAGE_TAG" ]]; then
     echo "Cached $SIF was pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null)' but this checkout wants" \
          "'$AETHERSCAN_IMAGE_TAG' — re-pulling." >&2
     need_pull=1
 fi
 
+STALE_SIF_WARNING=""
 if [[ $need_pull -eq 1 ]]; then
     echo "Pulling docker://$IMAGE_REF -> $SIF ..." >&2
     tmp="$SIF.pulling.$$"
-    trap 'rm -f "$tmp"' EXIT INT TERM  # don't leave a multi-GB partial on Ctrl-C mid-pull
+    # Don't leave a multi-GB partial behind on Ctrl-C. INT/TERM exit explicitly: a trapped signal
+    # does NOT terminate bash, so without the exit execution would resume in the failure branch
+    # below and (with a stale $SIF present) run the job against the old image.
+    trap 'rm -f "$tmp"' EXIT
+    trap 'rm -f "$tmp"; exit 130' INT
+    trap 'rm -f "$tmp"; exit 143' TERM
     if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
         mv -f "$tmp" "$SIF"
         printf '%s\n' "$AETHERSCAN_IMAGE_TAG" >"$SIF.pulled-tag"
@@ -150,7 +161,9 @@ if [[ $need_pull -eq 1 ]]; then
         trap - EXIT INT TERM
         rm -f "$tmp"
         if [[ -f "$SIF" ]]; then
-            echo "WARNING: pull of docker://$IMAGE_REF failed; using the cached $SIF, which may be stale." >&2
+            STALE_SIF_WARNING="WARNING: pull of docker://$IMAGE_REF failed; running against the cached\
+ $SIF, which may be a different version (pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null || echo unknown)')."
+            echo "$STALE_SIF_WARNING" >&2
         else
             echo "Error: no local image at $SIF, and pulling docker://$IMAGE_REF failed." >&2
             echo "Build it from the repo root with:" >&2
@@ -209,6 +222,9 @@ if [[ -n ${HF_HOME+x} ]]; then
     BIND_ARGS+=(--bind "$HF_HOME:$HF_HOME")
     HF_ENV_ARGS+=(--env "HF_HOME=$HF_HOME")
 fi
+
+# Repeat the stale-image warning right before launch so it isn't buried far above the run in a log.
+[[ -n $STALE_SIF_WARNING ]] && echo "$STALE_SIF_WARNING" >&2
 
 exec "$RUNTIME" exec --nv \
     "${BIND_ARGS[@]}" \
