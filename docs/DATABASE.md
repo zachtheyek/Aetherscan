@@ -239,7 +239,8 @@ Index: `(tag, round_number, epoch_number, step_number, model_name, timestamp)`
 loads one capture per frame — up to `latent_viz_gif_max_frames` (500) queries with equality
 on the capture key and the run window trailing — and the old timestamp-second shape
 answered each by scanning the tag's whole window (measured 67× slower per frame at 2 M
-rows; ~1.5 h → ~2 s per GIF pass at the ~100 M-row release scale). Key columns lead so the
+rows; ~1.5 h → ~2 s per GIF pass at the ~100 M-row release scale — measured at the
+pre-#372 20-round default; a 50-round run carries ~2.5× the rows). Key columns lead so the
 dashboard's model-less latest-capture lookup walks the index backward instead of sorting
 the partition; write cost is unchanged because `round/epoch/step` grow monotonically like
 `timestamp`, so both shapes append at the B-tree's right edge
@@ -432,8 +433,9 @@ cost a multi-GB teardown RAM spike for invisible detail.
 `get_db_stats()` returns row counts per table, the covered time range, and the database file
 size — **on-demand diagnostics only** since #301: its per-table `COUNT(*)` full scans
 measured ~13 min per cold-cache launch on the 80 GB production DB (re-paid on every
-retry-loop relaunch), so `Database.__init__` no longer calls it and startup logs only the
-O(1) `db_size_bytes` pragma.
+retry-loop relaunch; both figures from a 20-round run — the #372 50-round default grows
+the DB, and that scan, ~2.5×), so `Database.__init__` no longer calls it and startup logs
+only the O(1) `db_size_bytes` pragma.
 
 ## Growth expectations
 
@@ -446,13 +448,14 @@ Rules of thumb at full-scale defaults (dominant terms only):
   signal-characteristic rows for `true_eti_rfi`, so their mean is 6.5). That is
   **~24.5 rows per cadence** (18 + 6.5). A training round generates `3 × num_samples_beta_vae`
   cadences (main + true + false), so at defaults:
-  `3 × 499 200 × ~24.5 ≈ 37 M rows per round`, times 20 rounds plus the RF dataset. This is
+  `3 × 499 200 × ~24.5 ≈ 37 M rows per round`, times 50 rounds plus the RF dataset
+  (~1.85 B rows). This is
   why these rows ride the bounded bulk lane in per-segment batches (#277), why the drainer
   runs off the training critical
   path, and why the injection plots subsample (`plot_injection_subsampling_count`). If the
   database size becomes a problem, this table is where the budget goes — smoke-scale runs
   (`--num-samples-beta-vae 3072`) keep it trivial.
-- **`training_stats`**: ~21 + `latent_dim` rows/epoch → ~58 k rows for 20 × 100 epochs at
+- **`training_stats`**: ~21 + `latent_dim` rows/epoch → ~145 k rows for 50 × 100 epochs at
   the default `latent_dim` 8; the RF stage adds
   a negligible tail (~25 scalars + `classification_threshold` + the #282 sweep/test/screen
   metrics + the per-tree
@@ -460,7 +463,7 @@ Rules of thumb at full-scale defaults (dominant terms only):
 - **`latent_snapshots`**: one row per viz cadence per capture — 3840 cadences
   (`latent_viz_num_cadences_per_type=960` × 4 signal types) × one capture every
   `latent_viz_step_interval` steps (plus the final step) × epochs. At full scale
-  (130 steps/epoch → 13 captures/epoch): ~100 M rows over 20 × 100 epochs, each carrying a
+  (130 steps/epoch → 13 captures/epoch): ~250 M rows over 50 × 100 epochs, each carrying a
   48-float JSON vector. Still the second heaviest table (behind `injection_stats`);
   `latent_viz_step_interval` and `latent_viz_num_cadences_per_type` are the knobs.
 - **`system_resources`**: (4 + 2 × n_GPUs) rows/second — ~1.2 M rows/day on a 6-GPU node.

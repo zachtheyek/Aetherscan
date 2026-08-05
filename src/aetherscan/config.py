@@ -278,7 +278,7 @@ class TrainingConfig:
     # Reproducibility now lives in ReproducibilityConfig (#279): one root seed shared by both
     # pipelines instead of a training-only seed plus an independent rf.seed.
 
-    num_training_rounds: int = 20
+    num_training_rounds: int = 50
     epochs_per_round: int = 100
 
     # Posterior-collapse guard (#282): a latent dim counts ACTIVE while its batch-mean KL
@@ -425,15 +425,19 @@ class TrainingConfig:
     # Model-quality gate params (issue #139 Gate 1)
     min_val_auc: float = 0.0  # Opt-in floor on the RF's validation ROC-AUC; 0.0 disables the check. When set and unmet after the RF fit, training logs a loud WARNING (reaches the Slack summary) rather than failing the run
 
-    # Curriculum learning params
-    snr_base: int = 10
-    initial_snr_range: int = 40
-    final_snr_range: int = 10
+    # Curriculum learning params. Injected signals draw snr = snr_base + U(0,1) * snr_range,
+    # so the easiest window spans snr_base..snr_base+initial_snr_range (1-100) and the hardest
+    # narrows to snr_base..snr_base+final_snr_range (1-10, the quietest decade).
+    snr_base: int = 1
+    initial_snr_range: int = 99
+    final_snr_range: int = 9
     curriculum_schedule: str = "exponential"  # "linear", "exponential", "step"
     exponential_decay_rate: float = -3.0  # How quickly schedule should progress from easy to hard (must be <0) (more negative = less easy rounds & more hard rounds)
     # TODO: generalize this to receive a step schedule (as a list/dict?) validate that len(list/dict) is divisible by num_training_rounds
-    step_easy_rounds: int = 5  # Number of rounds with easy signals
-    step_hard_rounds: int = 15  # Number of rounds with challenging signals
+    step_easy_rounds: int = (
+        10  # Number of rounds with easy signals (must sum with hard to num_training_rounds)
+    )
+    step_hard_rounds: int = 40  # Number of rounds with challenging signals
 
     # Adaptive LR params
     base_learning_rate: float = 0.001

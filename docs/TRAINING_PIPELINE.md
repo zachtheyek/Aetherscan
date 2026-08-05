@@ -36,7 +36,7 @@ fresh datetime tag and starts a new run).
 
 ## Round lifecycle
 
-`TrainingPipeline.train_beta_vae()` runs `training.num_training_rounds` rounds (default 20) of
+`TrainingPipeline.train_beta_vae()` runs `training.num_training_rounds` rounds (default 50) of
 `training.epochs_per_round` epochs (default 100). Each round (`train_round()`):
 
 1. **Obtain data** — reuse a validated on-disk round dataset if one exists, else wait on the
@@ -76,8 +76,9 @@ a fresh optimization problem. Adam moments are curriculum-stage-local by the sam
 ### Curriculum schedules
 
 `_calculate_curriculum_snr(round_idx)` narrows the injection SNR range from
-`initial_snr_range` (40) down to `final_snr_range` (10) above `snr_base` (10) across the
-rounds — early rounds see bright, easy signals; late rounds see predominantly faint ones.
+`initial_snr_range` (99) down to `final_snr_range` (9) above `snr_base` (1) across the
+rounds — the easiest window spans SNR 1–100, the hardest narrows to the quietest decade
+(1–10); early rounds see bright, easy signals; late rounds see predominantly faint ones.
 Three schedules (`--curriculum-schedule`):
 
 | Schedule | Behavior | Knobs |
@@ -145,7 +146,7 @@ Key properties (all in [`round_data.py`](../src/aetherscan/round_data.py) /
 > footprint at ~294 GB). `--keep-round-data` retains every round's exact on-disk dataset (plus the
 > RF training set) under `{data_path}/training/round_data/{save_tag}/{round_XX,rf}/`, so a release
 > model's training data is reproducible/inspectable after the fact — at the cost of holding the full
-> run on disk (~147 GB × num_training_rounds, e.g. ~2.94 TB for a 20-round run; double both under
+> run on disk (~147 GB × num_training_rounds, e.g. ~7.35 TB for a 50-round run; double both under
 > the `float32` setting). Nothing in the pipeline
 > *reads* an earlier round once it has trained, so this flag is purely for post-hoc retention.
 

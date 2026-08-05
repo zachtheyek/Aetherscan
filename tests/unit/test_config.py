@@ -150,3 +150,12 @@ class TestCoupledDefaultsGuard:
             Config()
         # Don't leave the half-built diverged singleton behind for the fixture teardown.
         Config._reset()
+
+    def test_default_step_schedule_sums_to_round_count(self):
+        # Not a default-value assertion (those stay unpinned on purpose) but an invariant on
+        # the shipped combination: _calculate_curriculum_snr raises when
+        # step_easy_rounds + step_hard_rounds != num_training_rounds, so a default
+        # `--curriculum-schedule step` run must never trip it out of the box (#372 rescaled
+        # 5/15 -> 10/40 alongside num_training_rounds 20 -> 50 for exactly this reason).
+        training = get_config().training
+        assert training.step_easy_rounds + training.step_hard_rounds == training.num_training_rounds
