@@ -198,7 +198,8 @@ the resume flow below consumes, so same-tag DB state there is expected. Every re
 carries a fresh second-resolution `{command}_{datetime}` stamp, so a fresh inference run can't
 collide; `--force-tag` overrides the guard if it ever fires. (The same module also guards
 training tags and, under `--hf-upload`, checks the Hub for the tag at startup rather than after
-~30 h of training.)
+~30 h of training — measured on the 20-round pre-#372 default; a 50-round run is proportionally
+longer.)
 
 ## The streaming loop
 
