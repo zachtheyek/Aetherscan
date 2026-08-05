@@ -1015,14 +1015,23 @@ class TestV9IndexPlannerContracts:
     def _plan_of_last(self, db, captured, needle):
         """EXPLAIN QUERY PLAN of the most recent captured statement containing `needle`.
         Works whether the trace delivers placeholder or expanded SQL: unbound placeholders
-        plan identically to bound ones, so Nones suffice."""
-        stmt = next(s for s in reversed(captured) if needle in s and not s.startswith("EXPLAIN"))
+        plan identically to bound ones, so Nones suffice. The plan string carries the
+        SQLite version so a failure years from now reads as 'the toolchain's planner
+        changed' rather than 'someone deleted a guard'."""
+        stmt = next(
+            (s for s in reversed(captured) if needle in s and not s.startswith("EXPLAIN")), None
+        )
+        assert stmt is not None, (
+            f"no captured statement contains {needle!r} — builder refactor? "
+            f"{len(captured)} statements captured"
+        )
         conn = sqlite3.connect(db.db_path)
         try:
             rows = conn.execute("EXPLAIN QUERY PLAN " + stmt, [None] * stmt.count("?")).fetchall()
         finally:
             conn.close()
-        return stmt, " | ".join(str(row) for row in rows)
+        plan = " | ".join(str(row) for row in rows)
+        return stmt, f"{plan} [sqlite {sqlite3.sqlite_version}]"
 
     def _seed_injection(self, db):
         rows = _bulk_rows(6, round_number=1) + _bulk_rows(6, round_number=2)
@@ -1074,7 +1083,9 @@ class TestV9IndexPlannerContracts:
             end_round_number=2,
         )
         stmt, plan = self._plan_of_last(db, captured, "FROM injection_stats")
-        assert "+round_number" in stmt, stmt
+        # COUNT, not substring: both the start- and end-bound terms must carry the guard —
+        # deleting either one alone would still satisfy an `in` check.
+        assert stmt.count("+round_number") == 2, stmt
         assert "idx_injection_stats_by_round" not in plan, (stmt, plan)
         assert "idx_injection_stats_by_stat" in plan, (stmt, plan)
 
@@ -1084,10 +1095,15 @@ class TestV9IndexPlannerContracts:
         # guards the GROUP BY/ORDER BY with `+` as well.
         db, captured = traced
         self._seed_injection(db)
-        db.query_injection_stat_stability(tag="plan_v1", stat_name="eti_snr", start_round_number=1)
+        db.query_injection_stat_stability(
+            tag="plan_v1", stat_name="eti_snr", start_round_number=1, end_round_number=2
+        )
         stmt, plan = self._plan_of_last(db, captured, "GROUP BY")
-        assert "+round_number" in stmt, stmt
+        # All four guarded sites, individually deletable, individually pinned: the two WHERE
+        # bounds plus GROUP BY plus ORDER BY.
+        assert stmt.count("+round_number") == 4, stmt
         assert "GROUP BY +round_number" in stmt, stmt
+        assert "ORDER BY +round_number" in stmt, stmt
         assert "idx_injection_stats_by_round" not in plan, (stmt, plan)
         assert "idx_injection_stats_by_stat" in plan, (stmt, plan)
 
@@ -1098,6 +1114,9 @@ class TestV9IndexPlannerContracts:
         stmt, plan = self._plan_of_last(db, captured, "SELECT DISTINCT")
         assert "idx_latent_snapshots_keys" in plan, (stmt, plan)
         assert "COVERING" in plan.upper(), plan
+        # Index-only AND sort-free: DISTINCT + ORDER BY must come from index order, not a
+        # temp b-tree — the full "index-only scan" claim in DATABASE.md.
+        assert "TEMP B-TREE" not in plan.upper(), plan
 
     def test_latent_per_frame_query_keeps_by_key(self, traced):
         # The new partial index is also predicate-eligible here (bare superseded = 0);

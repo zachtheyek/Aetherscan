@@ -676,11 +676,17 @@ class Database:
             # pipeline launch against such a DB after this upgrade to stall here for
             # minutes to tens of minutes (and budget transient WAL disk headroom well
             # beyond the final index size). Subsequent launches are unaffected.
-            logger.info(
-                "Schema migration: v9 building idx_injection_stats_by_round — on a "
-                "catalog-scale DB this is a one-time full-table scan + sort that can take "
-                "minutes to tens of minutes; do not interrupt"
-            )
+            # Warn only when there are rows to scan: fresh databases hit this block too
+            # (version 0 -> current), and a scary tens-of-minutes warning against an empty
+            # table would land in Slack (INFO forwards) on every new output path. The
+            # EXISTS probe is O(1) at any table size and keeps the warning for the one
+            # upgrade that actually pays the build.
+            if cursor.execute("SELECT EXISTS(SELECT 1 FROM injection_stats)").fetchone()[0]:
+                logger.info(
+                    "Schema migration: v9 building idx_injection_stats_by_round — on a "
+                    "catalog-scale DB this is a one-time full-table scan + sort that can "
+                    "take minutes to tens of minutes; do not interrupt"
+                )
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_round
                 ON injection_stats(tag, round_number, timestamp)
