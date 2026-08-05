@@ -35,10 +35,11 @@ Pick whichever install path matches your dev environment.
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-# Build the .sif image with whichever runtime is installed on the host:
-singularity build aetherscan-ngc25.02.sif aetherscan.def
-# or:
-apptainer build aetherscan-ngc25.02.sif aetherscan.def
+# No manual image build needed: the first `utils/run_container.sh` run pulls the prebuilt image
+# from GHCR (ghcr.io/zachtheyek/aetherscan) and caches it as aetherscan-ngc25.02.sif. Build from
+# aetherscan.def only as a fallback — when the pull can't serve your host, or on a dev checkout
+# before the next release publishes a matching tag:
+#   singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
 
 # Launch tmux session
 # All subsequent commands should be ran in the top pane of the pipeline

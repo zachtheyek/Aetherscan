@@ -1137,9 +1137,10 @@ Contributions are welcome! Quick start:
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-singularity build aetherscan-ngc25.02.sif aetherscan.def
-# or:
-apptainer build aetherscan-ngc25.02.sif aetherscan.def
+# The first `utils/run_container.sh` run pulls the prebuilt image from GHCR and caches it as
+# aetherscan-ngc25.02.sif — no manual build. Fallback (pull can't serve your host, or a dev
+# checkout before the next release publishes a tag):
+#   singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
 
 ./utils/start_tmux_session.sh
 
