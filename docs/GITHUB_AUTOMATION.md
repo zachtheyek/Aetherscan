@@ -18,9 +18,9 @@ Discussion → Issue ──────────────► PR ───�
 ```
 
 Two workflow families: **deterministic** (pre-commit, tests, publish-image, auto-assign,
-label sync) and
-**assistant-driven** (`claude-*.yml` — each wraps `anthropics/claude-code-action` with a
-task-specific prompt, authenticated via the `CLAUDE_CODE_OAUTH_TOKEN` secret).
+label sync) and **assistant-driven** (`claude-*.yml` — each wraps
+`anthropics/claude-code-action` with a task-specific prompt, authenticated via the
+`CLAUDE_CODE_OAUTH_TOKEN` secret).
 
 ## The assistant handle — read this before writing issue/PR text
 
@@ -158,11 +158,12 @@ When adding a workflow, decide explicitly which side of this each trigger actor 
   and the release-notes context all read the formal link.
 - **Branch prefixes** `feature/` / `hotfix/` / `misc/` / `claude/` (the last reserved for
   assistant-authored branches).
-- **Required checks**: pre-commit + tests (both Python versions) must pass; commits need
-  verified GPG signatures; branches rebase (never merge) onto master.
+- **Required checks**: pre-commit + tests (Python 3.10, 3.11, and 3.12) must pass; commits
+  need verified GPG signatures; branches rebase (never merge) onto master.
 - **Merges fan out**: expect a release-notes comment on your merged PR, and possibly a
-  style-check or update-docs issue referencing it — these are normal post-merge automation,
-  not review feedback.
+  style-check issue referencing it — these are normal post-merge automation, not review
+  feedback. The weekly update-docs scan may additionally cover your merge in its
+  once-a-week issue (keyed to the ISO week, not your PR).
 
 ## Secrets and permissions
 

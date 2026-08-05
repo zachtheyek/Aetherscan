@@ -39,7 +39,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - VRAM: **≥8 GB per GPU** recommended — measured peaks ~6 GB/GPU (training) and ~2.5 GB/GPU (inference) on the v1.0.0 release runs; gradient accumulation keeps per-GPU VRAM low
 - RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
-- Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~7.4 TB with `--keep-round-data` at the 50-round default; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
+- Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
@@ -74,7 +74,7 @@ export AETHERSCAN_DATA_PATH=...  AETHERSCAN_MODEL_PATH=...  AETHERSCAN_OUTPUT_PA
 python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 ```
 
-**Installing v1.0.0 specifically?** That release predates the packaged legacy-Keras fix ([#323](https://github.com/zachtheyek/Aetherscan/issues/323), fixed by [#340](https://github.com/zachtheyek/Aetherscan/pull/340) from v1.1.0): its manifest doesn't pull `tf_keras`, so after `pip install aetherscan==1.0.0` you must add the two-step workaround yourself — `pip install "tf_keras~=2.17.0"` and `export TF_USE_LEGACY_KERAS=1` — or the released Keras-2 weights fail to load (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+**If the version you resolve is v1.0.0** — whether by pinning `aetherscan==1.0.0` or because it is still the newest published release when you install — that release predates the packaged legacy-Keras fix ([#323](https://github.com/zachtheyek/Aetherscan/issues/323), fixed by [#340](https://github.com/zachtheyek/Aetherscan/pull/340) from v1.1.0): its manifest doesn't pull `tf_keras`, so you must add the two-step workaround yourself — `pip install "tf_keras~=2.17.0"` and `export TF_USE_LEGACY_KERAS=1` — or the released Keras-2 weights fail to load (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md#19-v100-pipconda-install-cannot-load-the-encoder-legacy-keras)).
 
 **Caveats:**
 

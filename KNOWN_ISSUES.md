@@ -677,11 +677,13 @@ export TF_USE_LEGACY_KERAS=1
 
 ### Status
 
-**Fixed from v1.1.0** by PR #340: `tf_keras==2.17.*` is a declared dependency in `pyproject.toml` / `environment.yml`, and `src/aetherscan/__init__.py` sets `TF_USE_LEGACY_KERAS=1` via `os.environ.setdefault` at package-import time (`aetherscan.def`'s `%environment` and the `Dockerfile`'s `ENV` export it explicitly too). The workaround is needed only for the published **v1.0.0** wheel / env manifest.
+**Mitigated** (workaround above) — fixed on `master` by PR #340 and shipping from v1.1.0: `tf_keras==2.17.*` is a declared dependency in `pyproject.toml` / `environment.yml`, and `src/aetherscan/__init__.py` sets `TF_USE_LEGACY_KERAS=1` via `os.environ.setdefault` at package-import time (`aetherscan.def`'s `%environment` and the `Dockerfile`'s `ENV` export it explicitly too). The workaround is needed only for the published **v1.0.0** wheel / env manifest; flip this entry to **Closed** once v1.1.0 is on PyPI.
 
 ### Related Code
 
 `src/aetherscan/__init__.py` (the `setdefault`), `pyproject.toml` / `environment.yml` (the `tf_keras==2.17.*` pin), `requirements-container.txt` (intentionally omits it — the NGC base provides it), `aetherscan.def` / `Dockerfile` (the explicit exports), `src/aetherscan/models/vae.py` (the `Sampling` back-compat serialization comment).
+
+---
 
 ## Pre-#283 saved configs: `training.seed` / `training.tf_deterministic_ops` are silently skipped on restore
 
