@@ -107,6 +107,13 @@ singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:
 
 A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build and keeps it across version bumps. Let `run_container.sh` do the pulling if you want it to track the pinned ref (`repo:tag`, so both a version bump and an `AETHERSCAN_IMAGE` change trigger a re-pull) for you; otherwise `rm` the `.sif` when you bump versions.
 
+> [!NOTE]
+> **On a hardened HPC node with a quota'd `$HOME`, set `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR`
+> (or the `APPTAINER_*` equivalents) to scratch _before_ the first `run_container.sh` call** — a pull
+> unpacks the ~9 GB image through them exactly as a build does, so leaving them unset fills `/tmp`
+> (the staging area needs ~15 GB) and/or the blob cache under `$HOME`. See
+> [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md#hardened-hpc-nodes).
+
 **Build locally instead** — necessary when the prebuilt image doesn't fit the host:
 
 - **non-x86_64 host** (e.g. aarch64 Grace/GH200): the published image is `linux/amd64` only;
@@ -126,7 +133,7 @@ singularity build aetherscan-ngc25.02.sif aetherscan.def
 apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
-Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
+Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes a build additionally needs the `--fakeroot` flag and a `noexec /tmp` workaround (both build-only) on top of the `TMPDIR`/`CACHEDIR` redirect noted above; the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md#hardened-hpc-nodes).
 
 > [!NOTE]
 > The GHCR image is a derivative of NVIDIA's NGC TensorFlow container, so it is governed by the [NVIDIA Deep Learning Container License](https://developer.download.nvidia.com/licenses/NVIDIA_Deep_Learning_Container_License.pdf) — not the repo's BSD-3-Clause, which covers only the (bind-mounted) Aetherscan source.
