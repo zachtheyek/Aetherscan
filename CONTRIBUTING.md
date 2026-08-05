@@ -35,10 +35,13 @@ Pick whichever install path matches your dev environment.
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-# Build the .sif image with whichever runtime is installed on the host:
-singularity build aetherscan-ngc25.02.sif aetherscan.def
-# or:
-apptainer build aetherscan-ngc25.02.sif aetherscan.def
+# No build needed on a release checkout: utils/run_container.sh pulls the
+# release-pinned GHCR image on first use and caches it as aetherscan-ngc25.02.sif.
+# Build from aetherscan.def only when the pull can't serve your host (non-x86_64,
+# driver below the CUDA 12.8 floor, or local requirements-container.txt edits) —
+# see README.md#run-from-container:
+#   singularity build aetherscan-ngc25.02.sif aetherscan.def
+#   # or: apptainer build aetherscan-ngc25.02.sif aetherscan.def
 
 # Launch tmux session
 # All subsequent commands should be ran in the top pane of the pipeline
@@ -231,6 +234,7 @@ Aetherscan/
 ├── .gitignore                  # Local gitignore
 ├── .pre-commit-config.yaml     # Pre-commit hook configuration
 ├── aetherscan.def              # Apptainer/SingularityCE build recipe (NGC container)
+├── Dockerfile                  # OCI twin of aetherscan.def; published to GHCR by publish-image.yml
 ├── requirements-container.txt  # Pip extras layered into NGC container
 ├── environment.yml             # Conda dependencies
 ├── pyproject.toml              # Package metadata, ruff config

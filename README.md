@@ -1137,9 +1137,13 @@ Contributions are welcome! Quick start:
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-singularity build aetherscan-ngc25.02.sif aetherscan.def
-# or:
-apptainer build aetherscan-ngc25.02.sif aetherscan.def
+# No build needed on a release checkout: utils/run_container.sh pulls the
+# release-pinned GHCR image on first use and caches it as aetherscan-ngc25.02.sif.
+# Build from aetherscan.def only when the pull can't serve your host (non-x86_64,
+# driver below the CUDA 12.8 floor, or local requirements-container.txt edits) —
+# see Run From Container above:
+#   singularity build aetherscan-ngc25.02.sif aetherscan.def
+#   # or: apptainer build aetherscan-ngc25.02.sif aetherscan.def
 
 ./utils/start_tmux_session.sh
 

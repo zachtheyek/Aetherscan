@@ -25,7 +25,7 @@ Forward compatibility is a CUDA feature, not a TF feature, so the same trick wil
 
 ## One-time setup
 
-### 1. Build the .sif image (per cluster)
+### 1. Get the .sif image (per cluster)
 
 Aetherscan ships a single recipe — [`aetherscan.def`](../aetherscan.def) — that builds with either runtime. Build on the cluster you intend to run on so the image is produced by that cluster's native runtime:
 
