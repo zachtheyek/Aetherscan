@@ -89,7 +89,13 @@ jobs:
         id: prep
         run: |
           if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::version input '$VERSION' is not X.Y.Z"; exit 1
+            # Only a real publish needs a taggable version; the dry run computes the fingerprint
+            # and stops, so a static .devN checkout must not fail it (release.yml's dry run passes
+            # pyproject's version verbatim, which is `X.Y.Z.devN` between releases).
+            if [ "$PUSH" = "true" ]; then
+              echo "::error::version input '$VERSION' is not X.Y.Z"; exit 1
+            fi
+            echo "::notice::version '$VERSION' is a pre-release — validate-only run, publishing nothing."
           fi
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]') # GHCR path is lowercase
           IMG="ghcr.io/$OWNER/aetherscan"
