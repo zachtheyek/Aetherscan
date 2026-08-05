@@ -23,7 +23,9 @@ jobs:
       contents: read
       # actions:read backs the window computation (`gh run list` on this workflow's own history)
       actions: read
-      pull-requests: write
+      # read (not write): the pull_request trigger is gone and every PR touch is a read
+      # (`gh pr diff/view/list`); issue filing rides issues:write
+      pull-requests: read
       issues: write
       id-token: write
 
@@ -55,10 +57,16 @@ jobs:
           fi
 
       # Deterministic scan window + merged-PR enumeration. The window opens at the previous
-      # successful run of THIS workflow (whatever its trigger — a scanned window is a scanned
-      # window) and falls back to 7 days when there is none (first weekly run, or a purged run
-      # history). Failed runs never advance the window, so a red week is re-covered by the
-      # next green one. If nothing merged in the window, the Claude step is skipped outright.
+      # successful SCHEDULED run of this workflow and falls back to 7 days when there is none
+      # (first weekly run, or a purged run history). Two invariants keep coverage total:
+      # failed runs never advance the window (a red week is re-covered by the next green one),
+      # and non-scheduled runs never advance it either — a workflow_dispatch, and any run the
+      # week guard above short-circuited, still concludes `success`, so anchoring on it would
+      # silently drop everything merged between the last real scan and that no-op run. A
+      # dispatch may therefore re-scan a stretch a later scheduled run also covers; that's
+      # harmless — the scan reconciles against CURRENT docs (already-fixed gaps produce
+      # nothing) and the week marker prevents double-filing. If nothing merged in the window,
+      # the Claude step is skipped outright.
       - name: Compute scan window and enumerate merged PRs
         id: window
         if: steps.guard.outputs.already_filed != 'true'
@@ -66,30 +74,41 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          SINCE="$(gh run list --workflow "claude-update-docs.yml" --status success --limit 1 \
+          SINCE="$(gh run list --workflow "claude-update-docs.yml" --event schedule \
+                     --status success --limit 1 \
                      --json createdAt --jq '.[0].createdAt // empty')"
           if [[ -z "$SINCE" ]]; then
-            SINCE="$(date -u -d '7 days ago' +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "No prior successful run found — falling back to a 7-day window."
+            SINCE="$(date -u -d '7 days ago' +'%Y-%m-%dT%H:%M:%S+00:00')"
+            echo "No prior successful scheduled run found — falling back to a 7-day window."
           fi
           echo "since=$SINCE" >> "$GITHUB_OUTPUT"
           echo "Scanning PRs merged into master since $SINCE."
-          PR_LIST="$(gh pr list --state merged --base master --limit 100 \
+          # 200 headroom over normal weekly traffic; warn loudly if we ever hit the cap,
+          # because search-API ordering makes a silent truncation unrecoverable downstream.
+          LIMIT=200
+          PR_LIST="$(gh pr list --state merged --base master --limit "$LIMIT" \
                        --search "merged:>=$SINCE" --json number,title,mergedAt \
                        --jq 'sort_by(.mergedAt) | .[] | "#\(.number) \(.title) (merged \(.mergedAt))"')"
-          PR_NUMBERS="$(gh pr list --state merged --base master --limit 100 \
+          PR_NUMBERS="$(gh pr list --state merged --base master --limit "$LIMIT" \
                           --search "merged:>=$SINCE" --json number,mergedAt \
                           --jq 'sort_by(.mergedAt) | .[].number')"
           COUNT=0
           [[ -n "$PR_NUMBERS" ]] && COUNT="$(wc -l <<< "$PR_NUMBERS" | tr -d ' ')"
+          if [[ "$COUNT" -ge "$LIMIT" ]]; then
+            echo "::warning::Hit the --limit cap ($COUNT PRs) — the window may be truncated."
+          fi
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          # Randomized heredoc delimiters: PR titles are user-controlled text, and a title
+          # equal to a fixed delimiter would corrupt GITHUB_OUTPUT.
+          LIST_EOF="PR_LIST_EOF_${RANDOM}${RANDOM}"
+          NUMS_EOF="PR_NUMBERS_EOF_${RANDOM}${RANDOM}"
           {
-            echo "pr_list<<PR_LIST_EOF"
+            echo "pr_list<<$LIST_EOF"
             echo "$PR_LIST"
-            echo "PR_LIST_EOF"
-            echo "pr_numbers<<PR_NUMBERS_EOF"
+            echo "$LIST_EOF"
+            echo "pr_numbers<<$NUMS_EOF"
             echo "$PR_NUMBERS"
-            echo "PR_NUMBERS_EOF"
+            echo "$NUMS_EOF"
           } >> "$GITHUB_OUTPUT"
           echo "Found $COUNT merged PR(s):"
           echo "$PR_LIST"
@@ -135,9 +154,9 @@ jobs:
         run: |
           CLI_CHANGED=false
           for N in $PR_NUMBERS; do
-            # Capture the file list first (don't pipe gh into `grep -q`: under the default
-            # `bash -eo pipefail`, grep's early exit can SIGPIPE gh and mark the pipeline
-            # failed even on a match). The here-string keeps grep out of a pipeline with gh.
+            # Capture the file list first rather than piping gh into `grep -q`: grep's early
+            # exit can SIGPIPE gh mid-write (and under pipefail would mark the pipeline failed
+            # even on a match). The here-string keeps grep out of a pipeline with gh.
             CHANGED_FILES="$(gh pr diff "$N" --name-only)"
             if grep -qxF "src/aetherscan/cli.py" <<< "$CHANGED_FILES"; then
               echo "PR #$N touched cli.py."
