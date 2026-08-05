@@ -29,6 +29,9 @@ Forward compatibility is a CUDA feature, not a TF feature, so the same trick wil
 
 Aetherscan ships a single recipe — [`aetherscan.def`](../aetherscan.def) — that builds with either runtime. Build on the cluster you intend to run on so the image is produced by that cluster's native runtime:
 
+> [!NOTE]
+> You usually **don't** need to build. `utils/run_container.sh` pulls the release-pinned image from GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`) on first use and caches it as the `.sif`, re-pulling when a version bump changed the image. Build from `aetherscan.def` only when the pull can't serve your host — a non-x86_64 host, a driver below the CUDA 12.8 floor, or local `requirements-container.txt` edits. **Either way** (pull or build), on a hardened HPC node with a quota'd `$HOME` first redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch — a pull unpacks the ~9 GB image through them exactly as a build does (see the TMPDIR/CACHEDIR note below).
+
 ```bash
 cd /path/to/Aetherscan
 

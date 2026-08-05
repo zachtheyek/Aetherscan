@@ -95,13 +95,16 @@ else
 fi
 
 # Image acquisition, in priority order:
-#   1. Use the local .sif at $SIF if it already exists (zero-cost; identical to a local build).
+#   1. Use the local .sif at $SIF if it exists AND still matches the wanted tag (zero-cost).
 #   2. Else pull the release-pinned OCI image from GHCR into $SIF (one-time download, cached;
 #      the runtime converts docker://… into its own native .sif, so no fork-specific artifact).
 #   3. Else fail loudly with build instructions.
 #
 # The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
-# that release's image; a .devN checkout has no per-version image and falls back to :latest.
+# that release's image; a .devN checkout has no per-version image and falls back to :latest. A
+# PULLED image records its tag in "$SIF.pulled-tag"; if a later checkout wants a different tag
+# (e.g. a version bump that changed the image), we re-pull instead of silently running the old
+# one. A user-BUILT .sif has no sidecar and is always used as-is.
 #
 # GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
 # If any of these hold, BUILD from aetherscan.def instead of pulling:
@@ -113,8 +116,9 @@ fi
 IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
 if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
     # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
-    # `set -o pipefail` can't trip the wrapper. Empty if the file/line is absent -> `latest`.
-    VER=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO/pyproject.toml")
+    # `set -o pipefail` can't trip the wrapper. `|| true` (+ 2>/dev/null) so a missing file yields
+    # an empty VER (-> `latest`) rather than aborting the whole wrapper under `set -e`.
+    VER=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO/pyproject.toml" 2>/dev/null || true)
     if [[ $VER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         AETHERSCAN_IMAGE_TAG="v$VER"
     else
@@ -123,19 +127,40 @@ if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
 fi
 IMAGE_REF="$IMAGE_REPO:$AETHERSCAN_IMAGE_TAG"
 
+# (Re)pull if there's no image, or the cached one was pulled for a different tag.
+need_pull=0
 if [[ ! -f "$SIF" ]]; then
-    echo "No local image at $SIF — pulling docker://$IMAGE_REF ..." >&2
+    need_pull=1
+elif [[ -f "$SIF.pulled-tag" && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$AETHERSCAN_IMAGE_TAG" ]]; then
+    echo "Cached $SIF was pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null)' but this checkout wants" \
+         "'$AETHERSCAN_IMAGE_TAG' — re-pulling." >&2
+    need_pull=1
+fi
+
+if [[ $need_pull -eq 1 ]]; then
+    echo "Pulling docker://$IMAGE_REF -> $SIF ..." >&2
     tmp="$SIF.pulling.$$"
+    trap 'rm -f "$tmp"' EXIT INT TERM  # don't leave a multi-GB partial on Ctrl-C mid-pull
     if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
-        mv "$tmp" "$SIF"
-        echo "Pulled and cached $SIF" >&2
+        mv -f "$tmp" "$SIF"
+        printf '%s\n' "$AETHERSCAN_IMAGE_TAG" >"$SIF.pulled-tag"
+        trap - EXIT INT TERM
+        echo "Pulled and cached $SIF ($AETHERSCAN_IMAGE_TAG)." >&2
     else
+        trap - EXIT INT TERM
         rm -f "$tmp"
-        echo "Error: no local image at $SIF, and pulling docker://$IMAGE_REF failed." >&2
-        echo "Build it from the repo root with:" >&2
-        echo "    $RUNTIME build $SIF aetherscan.def" >&2
-        echo "(or point SIF=/path/to/existing.sif, or set AETHERSCAN_IMAGE_TAG=<tag>)" >&2
-        exit 1
+        if [[ -f "$SIF" ]]; then
+            echo "WARNING: pull of docker://$IMAGE_REF failed; using the cached $SIF, which may be stale." >&2
+        else
+            echo "Error: no local image at $SIF, and pulling docker://$IMAGE_REF failed." >&2
+            echo "Build it from the repo root with:" >&2
+            echo "    $RUNTIME build $SIF aetherscan.def" >&2
+            echo "On a hardened HPC node with a quota'd \$HOME, first redirect APPTAINER_CACHEDIR /" >&2
+            echo "APPTAINER_TMPDIR (or the SINGULARITY_* equivalents) to scratch — a pull unpacks the" >&2
+            echo "~9 GB image through them; see docs/GPU_RUNTIME_GUIDE.md." >&2
+            echo "(Or point SIF=/path/to/existing.sif, or set AETHERSCAN_IMAGE_TAG=<tag>.)" >&2
+            exit 1
+        fi
     fi
 fi
 

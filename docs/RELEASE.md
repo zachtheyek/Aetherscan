@@ -411,6 +411,11 @@ gh workflow run publish-image.yml -f version=1.0.0 -f ref=v1.0.0
 gh run watch "$(gh run list --workflow=publish-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
+The `:latest` tag tracks the **newest** release: a real release (`workflow_call` from `release.yml`)
+moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaults to `false`) — so
+publishing an older version never regresses `:latest`, which `run_container.sh` pulls for `.devN`
+checkouts. If you ever need to move it, pass `-f latest=true`.
+
 Verify: `docker buildx imagetools inspect ghcr.io/zachtheyek/aetherscan:v1.0.0`, or just pull it on
 a cluster via `utils/run_container.sh`.
 
@@ -432,6 +437,6 @@ a cluster via `utils/run_container.sh`.
   version number is spent.
 - *Do source-tree users see any of this?* The `PYTHONPATH=src` / conda path is untouched
   (`__version__` reads `0.0.0.dev0`, explicit model paths keep working). The **container** path now
-  pulls the release-pinned image from GHCR when no local `.sif` is present (falling back to a local
-  `aetherscan.def` build) — a convenience, not a contract change: a checkout of a release tag pulls
-  that version's image, a `.devN` checkout falls back to `:latest`.
+  pulls the release-pinned image from GHCR when no local `.sif` is present (or prints
+  `aetherscan.def` build instructions if the pull fails) — a convenience, not a contract change: a
+  checkout of a release tag pulls that version's image, a `.devN` checkout falls back to `:latest`.

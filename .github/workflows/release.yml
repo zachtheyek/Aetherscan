@@ -225,7 +225,9 @@ jobs:
   # otherwise the existing digest is retagged under the new version (code is bind-mounted, not
   # baked in). Auth is the built-in GITHUB_TOKEN — no PAT.
   image:
-    needs: [guard, tests]
+    # Gated on verify-weights (like build) so a skipped bless can't leave a published GHCR tag
+    # for a version that never gets PyPI/GitHub-Release/blessed weights.
+    needs: [guard, tests, verify-weights]
     permissions:
       contents: read
       packages: write

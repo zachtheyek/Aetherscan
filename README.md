@@ -41,7 +41,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 - RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
 - Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~3 TB with `--keep-round-data`; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
-- Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically and falls back to a local `aetherscan.def` build — see [Run From Container](#run-from-container)
+- Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
 
 **Conda env (alternative, Ampere only)**

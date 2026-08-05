@@ -34,6 +34,11 @@ on:
         required: false
         type: boolean
         default: true
+      latest:
+        description: "Also move :latest to this version (true for real releases)."
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       version:
@@ -50,6 +55,11 @@ on:
         required: false
         type: boolean
         default: true
+      latest:
+        description: "Also move :latest to this version. Leave FALSE when backfilling an OLDER release."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -63,6 +73,9 @@ jobs:
       REF: ${{ inputs.ref }}
       # Both triggers define `push` (default true); release.yml passes false on the dry run.
       PUSH: ${{ inputs.push }}
+      # `latest` defaults true for real releases (workflow_call) and false for a backfill dispatch,
+      # so publishing an OLDER version never regresses :latest.
+      LATEST: ${{ inputs.latest }}
     steps:
       - name: Checkout the workflow ref (release tag on release; chosen branch on backfill)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -85,8 +98,13 @@ jobs:
             git show "$REF:requirements-container.txt" > requirements-container.txt
             echo "Overlaid requirements-container.txt from $REF"
           fi
-          BASE=$(grep -oP '^FROM \K\S+' Dockerfile)
-          FP=$( { echo "$BASE"; cat requirements-container.txt; } | sha256sum | cut -c1-16 )
+          # BASE is only for the log below + is what claude-dependency-check compares against
+          # aetherscan.def; awk keeps it portable (no GNU-only grep -oP).
+          BASE=$(awk '/^FROM /{print $2; exit}' Dockerfile)
+          # Fingerprint the WHOLE Dockerfile (not just FROM) plus the pip inputs it installs, so ANY
+          # recipe edit — an ENV, a LABEL like the NVIDIA notice, an added layer — forces a rebuild
+          # instead of silently retagging a stale digest under the new version.
+          FP=$( cat Dockerfile requirements-container.txt | sha256sum | cut -c1-16 )
           {
             echo "img=$IMG"
             echo "fp=$FP"
@@ -124,7 +142,6 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t "${{ steps.prep.outputs.img }}:v$VERSION" \
-            -t "${{ steps.prep.outputs.img }}:latest" \
             "${{ steps.prep.outputs.img }}:fp-${{ steps.prep.outputs.fp }}"
 
       - name: Free disk space (the NGC base is large)
@@ -150,7 +167,13 @@ jobs:
           tags: |
             ${{ steps.prep.outputs.img }}:v${{ env.VERSION }}
             ${{ steps.prep.outputs.img }}:fp-${{ steps.prep.outputs.fp }}
-            ${{ steps.prep.outputs.img }}:latest
+
+      - name: Move :latest to this version (real releases only — never on a backfill)
+        if: env.PUSH == 'true' && env.LATEST == 'true'
+        run: |
+          docker buildx imagetools create \
+            -t "${{ steps.prep.outputs.img }}:latest" \
+            "${{ steps.prep.outputs.img }}:v$VERSION"
 
       - name: Summary
         if: env.PUSH == 'true'

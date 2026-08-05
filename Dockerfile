@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1
-#
 # Aetherscan runtime image (OCI) — the registry-published twin of aetherscan.def.
+# (No `# syntax=` frontend directive on purpose: nothing here uses BuildKit-specific syntax, so
+# we avoid an unpinned, rate-limited Docker Hub pull of the frontend image on the CI runner.)
 #
 # CI (.github/workflows/publish-image.yml) builds this and pushes it to GHCR so clusters can
 # `pull` a prebuilt image instead of each building a .sif locally. Publishing OCI (not a .sif)
