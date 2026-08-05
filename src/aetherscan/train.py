@@ -1129,8 +1129,20 @@ def _silence_stderr():
         logger.debug("Exiting _silence_stderr() — stderr restored")
 
 
+_SHAP_CACHE_KEYS = frozenset(
+    {
+        "shap_values_summary",
+        "summary_indices",
+        "shap_values_interaction",
+        "interaction_indices",
+        "shap_values_logloss",
+        "expected_value",
+    }
+)
+
+
 def _shap_cache_consistent(
-    cached: dict, *, n_val: int, n_features: int, n_summary: int, n_interact: int
+    cached: object, *, n_val: int, n_features: int, n_summary: int, n_interact: int
 ) -> bool:
     """
     True when a disk-cached SHAP payload matches the current eval artifacts + config (#359).
@@ -1140,19 +1152,37 @@ def _shap_cache_consistent(
     a stale payload on disk whose indices/matrices no longer line up with the artifacts being
     plotted — downstream, `summary_indices` index the *current* val arrays and the SHAP matrices
     are masked with arrays sized to the *current* subset, so any mismatch is a latent IndexError
-    (or a silently wrong plot). Checks are shape-only: sample counts, index ranges, and the
-    feature width of the winning variant.
+    (or a silently wrong plot). Total over arbitrary on-disk junk: a non-dict blob or a payload
+    missing keys (an older cache schema) is simply inconsistent, never an exception.
+
+    Checks are shape-only: sample counts, index ranges, and the winning variant's feature width.
+    Known gap: a retrain under a reused tag that changes the val *contents* but not `n_val`
+    passes (the seeded rng reproduces identical indices) — closing it needs a content
+    fingerprint of the artifacts, which is deliberately out of scope here; the clustering-side
+    split is closed exactly (see plot_rf_shap_explanation_clustering's element-wise check).
     """
+    if not isinstance(cached, dict) or not set(cached) >= _SHAP_CACHE_KEYS:
+        return False
     summary_indices = cached["summary_indices"]
     interaction_indices = cached["interaction_indices"]
     shap_values_summary = cached["shap_values_summary"]
     shap_values_interaction = cached["shap_values_interaction"]
+    shap_values_logloss = cached["shap_values_logloss"]
+    arrays = (
+        summary_indices,
+        interaction_indices,
+        shap_values_summary,
+        shap_values_interaction,
+        shap_values_logloss,
+    )
+    if not all(isinstance(a, np.ndarray) for a in arrays):
+        return False
     return (
         len(summary_indices) == n_summary
         and len(interaction_indices) == n_interact
-        and shap_values_summary.shape[0] == n_summary
-        and shap_values_summary.shape[1] == n_features
-        and shap_values_interaction.shape[0] == n_interact
+        and shap_values_summary.shape == (n_summary, n_features)
+        and shap_values_logloss.shape == (n_summary, n_features)
+        and shap_values_interaction.shape == (n_interact, n_features, n_features)
         and (n_summary == 0 or int(np.max(summary_indices)) < n_val)
         and (n_interact == 0 or int(np.max(interaction_indices)) < n_val)
     )
@@ -3627,6 +3657,14 @@ class TrainingPipeline:
                 f"Cached SHAP values at {shap_path} are inconsistent with the current eval "
                 f"artifacts/config (stale cache under a reused tag?) — recomputing"
             )
+            # The recompute below dumps + explains the in-process RF; before this guard a
+            # (stale) cache could be served with no RF loaded, so fail with a pointed
+            # message rather than an AttributeError deep in the dump.
+            if self.rf_model is None or getattr(self.rf_model, "model", None) is None:
+                raise RuntimeError(
+                    f"SHAP cache at {shap_path} is stale and no trained RF is loaded to "
+                    f"recompute it — retrain the RF for this tag or delete the stale cache"
+                )
 
         rng = derive_rng(self.config.reproducibility.seed, STREAM_SHAP_SAMPLES)
         summary_indices = np.sort(rng.choice(n_val, size=n_summary, replace=False))
@@ -6829,19 +6867,35 @@ class TrainingPipeline:
             # #359 guard: this joblib and the SHAP-values joblib are two disk caches keyed on
             # the same {tag} but written at different times — if they split (one regenerated,
             # the other stale), the cached embedding no longer matches shap_values row-for-row
-            # and the mask-indexing below raises IndexError. Refit on mismatch (the dump below
-            # overwrites the stale file).
-            if len(cached["embedding"]) == len(shap_values) and len(
-                cached["cluster_labels"]
-            ) == len(shap_values):
+            # and the mask-indexing below raises IndexError. Row counts alone can't catch a
+            # same-n_val retrain under a reused tag (the seeded rng reproduces identical
+            # index draws), so the cache also persists the summary_indices it was fit against
+            # and must match them element-wise. Total over junk/older-schema payloads: any
+            # malformed cache is simply refit (which also self-heals pre-#359 caches that
+            # lack the indices key). The dump below overwrites the stale file.
+            n_rows = len(shap_values)
+            if (
+                isinstance(cached, dict)
+                and {"embedding", "cluster_labels", "summary_indices"} <= set(cached)
+                and isinstance(cached["embedding"], np.ndarray)
+                and isinstance(cached["cluster_labels"], np.ndarray)
+                and len(cached["embedding"]) == n_rows
+                and len(cached["cluster_labels"]) == n_rows
+                and np.array_equal(cached["summary_indices"], summary_indices)
+            ):
                 logger.info(f"Loading cached SHAP clustering from {clustering_path}")
                 embedding = cached["embedding"]
                 cluster_labels = cached["cluster_labels"]
             else:
+                cached_rows = (
+                    len(cached["embedding"])
+                    if isinstance(cached, dict) and isinstance(cached.get("embedding"), np.ndarray)
+                    else "?"
+                )
                 logger.warning(
                     f"Cached SHAP clustering at {clustering_path} does not match the current "
-                    f"SHAP values ({len(cached['embedding'])} vs {len(shap_values)} rows; "
-                    f"split cache state under a reused tag?) — refitting"
+                    f"SHAP values (embedding rows {cached_rows} vs {n_rows}, or stale/missing "
+                    f"summary_indices; split cache state under a reused tag?) — refitting"
                 )
         if embedding is None:
             logger.info("Fitting SHAP-space UMAP + KMeans on summary SHAP values")
@@ -6861,8 +6915,14 @@ class TrainingPipeline:
             )
             cluster_labels = kmeans.fit_predict(shap_values)
             os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+            # summary_indices ride along so the guard above can detect a same-shape
+            # SHAP-cache regeneration (#359), not just a row-count change.
             joblib.dump(
-                {"embedding": embedding, "cluster_labels": cluster_labels},
+                {
+                    "embedding": embedding,
+                    "cluster_labels": cluster_labels,
+                    "summary_indices": summary_indices,
+                },
                 clustering_path,
             )
             logger.info(f"Saved SHAP clustering to {clustering_path}")

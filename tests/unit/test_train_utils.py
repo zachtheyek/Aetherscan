@@ -821,6 +821,26 @@ class TestShapCacheConsistent:
             _shap_payload(n_features=6), n_val=32, n_features=48, n_summary=8, n_interact=4
         )
 
+    def test_malformed_payloads_rejected_not_raised(self):
+        # The guard exists to tolerate whatever is on disk: junk must be inconsistent,
+        # never an exception.
+        kwargs = {"n_val": 32, "n_features": 6, "n_summary": 8, "n_interact": 4}
+        assert not _shap_cache_consistent("not a dict", **kwargs)
+        assert not _shap_cache_consistent(None, **kwargs)
+        missing_key = _shap_payload()
+        del missing_key["expected_value"]
+        assert not _shap_cache_consistent(missing_key, **kwargs)
+        wrong_type = _shap_payload()
+        wrong_type["shap_values_summary"] = [[0.0] * 6] * 8  # list, not ndarray
+        assert not _shap_cache_consistent(wrong_type, **kwargs)
+
+    def test_logloss_shape_mismatch_rejected(self):
+        payload = _shap_payload(n_summary=8, n_features=6)
+        payload["shap_values_logloss"] = np.zeros((8, 5), dtype=np.float32)
+        assert not _shap_cache_consistent(
+            payload, n_val=32, n_features=6, n_summary=8, n_interact=4
+        )
+
 
 class TestComputeOrLoadShapValuesCacheGuard:
     """_compute_or_load_shap_values (#359): the on-disk cache is returned only when it passes
@@ -955,6 +975,8 @@ class TestShapClusteringCacheGuard:
         pipeline.config = get_config()
         pipeline._load_rf_eval_artifacts = lambda tag=None: artifacts
         pipeline._compute_or_load_shap_values = lambda artifacts: shap_data
+        # Exposed for tests that need to build a matching/mismatching on-disk cache.
+        pipeline.test_summary_indices = shap_data["summary_indices"]
 
         # Stub UMAP + KMeans: the guard under test decides whether they run at all, and real
         # fits (numba JIT) would dominate the test's wall time without testing our logic.
@@ -995,7 +1017,8 @@ class TestShapClusteringCacheGuard:
         pipeline = self._pipeline(monkeypatch, umap_fits=fits)
         clustering_path = self._clustering_path(pipeline.config)
         os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
-        # Written by an earlier run whose n_summary was 10 — stale against today's 24.
+        # Written by an earlier run whose n_summary was 10 — stale against today's 24
+        # (and a pre-#359 schema: no summary_indices key).
         joblib.dump(
             {
                 "embedding": np.zeros((10, 2), dtype=np.float32),
@@ -1012,23 +1035,65 @@ class TestShapClusteringCacheGuard:
         refit = joblib.load(clustering_path)
         assert len(refit["embedding"]) == self.N_SUMMARY
         assert len(refit["cluster_labels"]) == self.N_SUMMARY
+        # the refit persists the indices it was fit against, arming the element-wise guard
+        assert np.array_equal(refit["summary_indices"], pipeline.test_summary_indices)
+
+    def test_same_shape_different_indices_refit(self, monkeypatch, caplog):
+        # The silent-wrongness case row counts can't catch: a same-n_summary cache whose
+        # indices belong to a different SHAP regeneration must be refit, not served.
+        fits = []
+        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        clustering_path = self._clustering_path(pipeline.config)
+        os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+        wrong_indices = pipeline.test_summary_indices.copy()
+        wrong_indices[0] = (wrong_indices[0] + 1) % self.N_VAL
+        joblib.dump(
+            {
+                "embedding": np.zeros((self.N_SUMMARY, 2), dtype=np.float32),
+                "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
+                "summary_indices": np.sort(wrong_indices),
+            },
+            clustering_path,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            TrainingPipeline.plot_rf_shap_explanation_clustering(pipeline, tag="test_v1")
+
+        assert any("refitting" in r.message for r in caplog.records)
+        assert fits == ["umap"]
+
+    def test_malformed_clustering_cache_refit_not_raised(self, monkeypatch, caplog):
+        fits = []
+        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        clustering_path = self._clustering_path(pipeline.config)
+        os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+        joblib.dump("junk, not a dict", clustering_path)
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            TrainingPipeline.plot_rf_shap_explanation_clustering(pipeline, tag="test_v1")
+
+        assert any("refitting" in r.message for r in caplog.records)
+        assert fits == ["umap"]
 
     def test_matching_clustering_cache_used_without_refit(self, monkeypatch):
         fits = []
         pipeline = self._pipeline(monkeypatch, umap_fits=fits)
         clustering_path = self._clustering_path(pipeline.config)
         os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
-        joblib.dump(
-            {
-                "embedding": np.zeros((self.N_SUMMARY, 2), dtype=np.float32),
-                "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
-            },
-            clustering_path,
-        )
+        cached = {
+            "embedding": np.arange(self.N_SUMMARY * 2, dtype=np.float32).reshape(-1, 2),
+            "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
+            "summary_indices": pipeline.test_summary_indices,
+        }
+        joblib.dump(cached, clustering_path)
 
         TrainingPipeline.plot_rf_shap_explanation_clustering(pipeline, tag="test_v1")
 
         assert fits == []  # cache accepted, no refit
+        # ...and the accepted cache is untouched on disk (no rewrite happened)
+        reloaded = joblib.load(clustering_path)
+        assert np.array_equal(reloaded["embedding"], cached["embedding"])
+        assert np.array_equal(reloaded["cluster_labels"], cached["cluster_labels"])
 
 
 class _StageMachineStub:
