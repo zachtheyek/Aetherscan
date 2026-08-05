@@ -96,7 +96,7 @@ else
 fi
 
 # Image acquisition, in priority order:
-#   1. Use the local .sif at $SIF if it exists AND still matches the wanted tag (zero-cost).
+#   1. Use the local .sif at $SIF if it exists and isn't a pull cached for a different tag (zero-cost).
 #   2. Else pull the release-pinned OCI image from GHCR into $SIF (one-time download, cached;
 #      the runtime converts docker://… into its own native .sif, so no fork-specific artifact).
 #   3. Else fail loudly with build instructions.
@@ -120,7 +120,7 @@ fi
 #   - you rebuilt TF from source, edited requirements-container.txt locally, or are on a .devN
 #     checkout whose requirements-container.txt changed since the last release: a pull fetches the
 #     RELEASED image (:latest tracks the newest release, never master HEAD), not your variant —
-#     build locally (or set AETHERSCAN_IMAGE_TAG).
+#     no published tag matches, so build locally (or push your own image and set AETHERSCAN_IMAGE).
 IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
 if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
     # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
@@ -159,6 +159,9 @@ if [[ $need_pull -eq 1 ]]; then
     trap 'rm -f "$tmp"' EXIT
     trap 'rm -f "$tmp"; exit 130' INT
     trap 'rm -f "$tmp"; exit 143' TERM
+    # A SIGKILL/OOM/power-loss can't run the traps, so a partial from an earlier run with this PID
+    # may still be here; both runtimes refuse to overwrite an existing pull target, so clear it.
+    rm -f "$tmp"
     if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
         mv -f "$tmp" "$SIF"
         printf '%s\n' "$AETHERSCAN_IMAGE_TAG" >"$SIF.pulled-tag"
