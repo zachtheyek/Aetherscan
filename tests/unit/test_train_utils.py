@@ -41,6 +41,7 @@ from aetherscan.train import (
     _execute_training_stages,
     _resolve_load_tag,
     _shap_cache_consistent,
+    _shap_content_fingerprint,
     archive_directory,
     build_epoch_history,
     check_encoder_trained,
@@ -941,6 +942,21 @@ class TestComputeOrLoadShapValuesCacheGuard:
         # the stale file was overwritten with the fresh payload
         assert len(joblib.load(shap_path)["summary_indices"]) == 16
 
+    def test_compute_path_without_rf_raises_pointed_error(self, monkeypatch):
+        # Any entry into the compute path (stale cache here; no cache behaves identically)
+        # needs a loaded RF — the guard's message is the behavior under test.
+        pipeline = self._pipeline(n_summary=16, n_interact=4)
+        pipeline.rf_model = None
+        stale = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(stale, shap_path)
+
+        with pytest.raises(RuntimeError, match="no trained RF is loaded"):
+            TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
 
 class TestShapClusteringCacheGuard:
     """plot_rf_shap_explanation_clustering (#359): a cached UMAP/KMeans joblib whose row count
@@ -975,8 +991,6 @@ class TestShapClusteringCacheGuard:
         pipeline.config = get_config()
         pipeline._load_rf_eval_artifacts = lambda tag=None: artifacts
         pipeline._compute_or_load_shap_values = lambda artifacts: shap_data
-        # Exposed for tests that need to build a matching/mismatching on-disk cache.
-        pipeline.test_summary_indices = shap_data["summary_indices"]
 
         # Stub UMAP + KMeans: the guard under test decides whether they run at all, and real
         # fits (numba JIT) would dominate the test's wall time without testing our logic.
@@ -1004,7 +1018,7 @@ class TestShapClusteringCacheGuard:
 
         monkeypatch.setattr(train_module, "umap", types.SimpleNamespace(UMAP=_FakeUmap))
         monkeypatch.setattr(train_module, "KMeans", _FakeKmeans)
-        return pipeline
+        return pipeline, shap_data
 
     def _clustering_path(self, config, tag="test_v1"):
         return os.path.join(
@@ -1014,11 +1028,11 @@ class TestShapClusteringCacheGuard:
 
     def test_stale_clustering_cache_refit_and_overwritten(self, monkeypatch, caplog):
         fits = []
-        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        pipeline, shap_data = self._pipeline(monkeypatch, umap_fits=fits)
         clustering_path = self._clustering_path(pipeline.config)
         os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
         # Written by an earlier run whose n_summary was 10 — stale against today's 24
-        # (and a pre-#359 schema: no summary_indices key).
+        # (and a pre-fingerprint schema: no shap_fingerprint key).
         joblib.dump(
             {
                 "embedding": np.zeros((10, 2), dtype=np.float32),
@@ -1035,23 +1049,25 @@ class TestShapClusteringCacheGuard:
         refit = joblib.load(clustering_path)
         assert len(refit["embedding"]) == self.N_SUMMARY
         assert len(refit["cluster_labels"]) == self.N_SUMMARY
-        # the refit persists the indices it was fit against, arming the element-wise guard
-        assert np.array_equal(refit["summary_indices"], pipeline.test_summary_indices)
+        # the refit persists the fingerprint of the SHAP matrix it consumed, arming the guard
+        assert refit["shap_fingerprint"] == _shap_content_fingerprint(
+            shap_data["shap_values_summary"]
+        )
 
-    def test_same_shape_different_indices_refit(self, monkeypatch, caplog):
-        # The silent-wrongness case row counts can't catch: a same-n_summary cache whose
-        # indices belong to a different SHAP regeneration must be refit, not served.
+    def test_same_shape_different_content_refit(self, monkeypatch, caplog):
+        # The silent-wrongness case neither row counts nor seeded indices can catch: a cache
+        # fit on a DIFFERENT SHAP matrix of identical shape (e.g. a different latent variant
+        # winning the sweep under a reused tag) must be refit, not served.
         fits = []
-        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        pipeline, shap_data = self._pipeline(monkeypatch, umap_fits=fits)
         clustering_path = self._clustering_path(pipeline.config)
         os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
-        wrong_indices = pipeline.test_summary_indices.copy()
-        wrong_indices[0] = (wrong_indices[0] + 1) % self.N_VAL
+        other_matrix = shap_data["shap_values_summary"] + 1.0  # same shape, different content
         joblib.dump(
             {
                 "embedding": np.zeros((self.N_SUMMARY, 2), dtype=np.float32),
                 "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
-                "summary_indices": np.sort(wrong_indices),
+                "shap_fingerprint": _shap_content_fingerprint(other_matrix),
             },
             clustering_path,
         )
@@ -1064,7 +1080,7 @@ class TestShapClusteringCacheGuard:
 
     def test_malformed_clustering_cache_refit_not_raised(self, monkeypatch, caplog):
         fits = []
-        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        pipeline, _ = self._pipeline(monkeypatch, umap_fits=fits)
         clustering_path = self._clustering_path(pipeline.config)
         os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
         joblib.dump("junk, not a dict", clustering_path)
@@ -1077,13 +1093,15 @@ class TestShapClusteringCacheGuard:
 
     def test_matching_clustering_cache_used_without_refit(self, monkeypatch):
         fits = []
-        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        pipeline, shap_data = self._pipeline(monkeypatch, umap_fits=fits)
         clustering_path = self._clustering_path(pipeline.config)
         os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+        # Sentinel values: if the accepted cache were silently overwritten or ignored, the
+        # reload below would not still hold them.
         cached = {
-            "embedding": np.arange(self.N_SUMMARY * 2, dtype=np.float32).reshape(-1, 2),
+            "embedding": np.full((self.N_SUMMARY, 2), 7.0, dtype=np.float32),
             "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
-            "summary_indices": pipeline.test_summary_indices,
+            "shap_fingerprint": _shap_content_fingerprint(shap_data["shap_values_summary"]),
         }
         joblib.dump(cached, clustering_path)
 
