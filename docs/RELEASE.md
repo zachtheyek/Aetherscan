@@ -9,17 +9,21 @@ this document disagree, fix whichever is wrong *as a PR that says so*.
 
 ## TL;DR — the version-coupling contract
 
-**One version string, e.g. `v1.0.0`, names three synchronized objects:**
+**One version string, e.g. `v1.0.0`, names four synchronized objects:**
 
 1. A **git tag** `v1.0.0` on `master` — which GitHub decorates into a **GitHub Release**
    (notes + source tarballs) and which the CD builds into the **PyPI release** `1.0.0`.
 2. An **HF weights tag** `v1.0.0` on the model repo `zachtheyek/aetherscan`, pointing at the
    blessed trained weights.
+3. A **GHCR image tag** `v1.0.0` on `ghcr.io/zachtheyek/aetherscan` — the prebuilt runtime
+   container that `utils/run_container.sh` pulls instead of building the `.sif` locally.
 
-The coupling is **by convention, enforced by verification**: CD checks that the HF tag
-exists before publishing anything, but never creates weights — weights can only come from
-cluster training runs (CI has neither the GPUs nor the data). The installed package pulls
-its matching weights at runtime because the package version is the default HF revision:
+The coupling is **by convention, enforced in CD**: CD verifies the HF weights tag exists and
+itself builds+pushes the container image, and only then publishes PyPI + the GitHub Release — so
+the four never drift. CD **verifies** weights but never creates them (weights come only from
+cluster training runs — CI has neither the GPUs nor the data); it **does** create the image
+(a Dockerfile build needs neither GPUs nor data). The installed package pulls its matching
+weights at runtime because the package version is the default HF revision:
 
 ```
 pip install aetherscan==1.0.0
@@ -32,6 +36,13 @@ Two invariants to internalize:
 - **PyPI versions are immutable.** A botched release means `v1.0.1`, never a re-upload.
 - **Installing `aetherscan==1.0.0` *is* the tagged source** — the sdist/wheel are built from
   the tag by CD. There is nothing further to "sync" between PyPI and GitHub.
+- **HF and GHCR carry a tag *per version*, but reuse *content* when nothing changed.** A release
+  whose weights didn't change re-points its HF tag at the same training commit; a release whose
+  image inputs (the `Dockerfile` — base digest, labels, layers — and `requirements-container.txt`)
+  didn't change retags the same GHCR digest. So `v1.0.0` and `v1.1.0` can be byte-identical
+  weights/image under distinct
+  version tags — each checkout still pulls *its own* tag. See
+  [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change).
 
 ## Versioning policy (SemVer)
 
@@ -46,7 +57,8 @@ Aetherscan follows [Semantic Versioning 2.0.0](https://semver.org): every releas
   backward-compatible `aetherscan_latent_variant_` / `aetherscan_active_dims_` stamps, which
   inference's identity checks simply no-op on when absent — the `.keras`/`.joblib` formats, the HF
   repo layout and weight-resolution rules);
-- the **supported runtimes** (NGC container / conda env / PyPI package) and their documented floors.
+- the **supported runtimes** (NGC container — built from `aetherscan.def` or pulled prebuilt from
+  GHCR — / conda env / PyPI package) and their documented floors.
 
 Internal implementation details, private helpers, log wording, and plot cosmetics are **not** part
 of the contract. Bump the leftmost segment that applies:
@@ -174,10 +186,22 @@ impossible:
 5. **Build** — `python -m build` (sdist + wheel) from the tagged source, then **smoke the
    wheel**: install it `--no-deps` and assert `aetherscan.__version__` equals the guarded
    version (catches a packaging/version-single-sourcing mismatch before anything publishes).
-6. **Publish to PyPI via trusted publishing** — `pypa/gh-action-pypi-publish` (SHA-pinned)
+6. **Container image** — the reusable
+   [`publish-image.yml`](../.github/workflows/publish-image.yml) builds the OCI image from
+   [`Dockerfile`](../Dockerfile) and pushes it to `ghcr.io/zachtheyek/aetherscan:vX.Y.Z` (auth is
+   the built-in `GITHUB_TOKEN` with `packages: write` — no PAT). It runs in parallel with the
+   build and **gates the PyPI publish** (step 7 `needs` it), so a real release never reaches PyPI
+   unless the image is up. The image is rebuilt only when its inputs (the whole `Dockerfile`, base
+   digest included, plus `requirements-container.txt`) change; otherwise it **retags the existing
+   digest** under the new version — the Aetherscan code is bind-mounted at runtime, not baked in,
+   so a code-only release
+   reuses the prior image (see
+   [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change)). On
+   the TestPyPI dry run it validates only (no build, no push), so the gate stays uniform.
+7. **Publish to PyPI via trusted publishing** — `pypa/gh-action-pypi-publish` (SHA-pinned)
    with `permissions: id-token: write` and the `pypi` environment. OIDC-based: **no long-lived
    PyPI API token is stored anywhere** in the repo or its secrets.
-7. **GitHub Release** — created from the tag (`gh release create --verify-tag
+8. **GitHub Release** — created from the tag (`gh release create --verify-tag
    --generate-notes`) with the built sdist + wheel attached; curate the body from the
    per-PR `claude-release-notes` comments (see
    [`GITHUB_AUTOMATION.md`](GITHUB_AUTOMATION.md)) — they are the raw material, written one
@@ -211,6 +235,12 @@ verify against.
   downloads need no token), and that wherever the bless is run (a cluster, or any machine running
   `hf_tag_release.py`) has a **write-scoped** `HF_TOKEN` in its gitignored `.env`. CD never writes
   to HF — only the training upload and the bless do.
+- **GHCR (container image)**: no secret to create — CD authenticates with the built-in
+  `GITHUB_TOKEN` (the `image` job grants it `packages: write`). After the **first** image push the
+  package `ghcr.io/zachtheyek/aetherscan` is created *private*; set it **public** once (GitHub →
+  Packages → `aetherscan` → Package settings → Change visibility → Public), so clusters pull with
+  no token. The `org.opencontainers.image.source` label links it back to this repo. Then confirm
+  the package page stays license-compliant (see [Container image licensing](#container-image-licensing)).
 - **Verify** the environments exist before a release:
   `gh api repos/zachtheyek/Aetherscan/environments --jq '.environments[].name'` must list both
   `pypi` and `testpypi`.
@@ -258,9 +288,9 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
    gh workflow run release.yml -f test_pypi=true --ref master
    gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
    ```
-   The dry run does guard → tests → build + **wheel smoke** → publish to test.pypi.org. It
-   **skips** the signed-tag gate, the HF-weights verification, and the GitHub Release — so it needs
-   **no bless and no git tag**. Its whole job is to catch packaging / version-single-sourcing /
+   The dry run does guard → tests → build + **wheel smoke** + **image (validate-only)** → publish to
+   test.pypi.org. It **skips** the signed-tag gate, the HF-weights verification, and the GitHub
+   Release — so it needs **no bless and no git tag**. Its whole job is to catch packaging / version-single-sourcing /
    build breakage *before* you spend the immutable real version number. Confirm it went green (and,
    if you like, that `aetherscan X.Y.Z` shows up on test.pypi.org) before continuing.
 
@@ -275,6 +305,11 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
    CD's HF-verify checks it); re-running for an existing tag errors clearly rather than
    duplicating.
 
+   > **No retrain this release?** Skip step 2 and bless the **existing** training tag under the new
+   > version — `hf_tag_release.py --save-tag <the same old train tag> --release vX.Y.Z` re-points a
+   > new HF tag at the same commit, so the old and new versions resolve to identical weights. See
+   > [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change).
+
 6. **Sign + push the tag (maintainer ONLY).** Update local `master` to the release PR's merge
    commit (`git checkout master && git pull`), then:
    ```bash
@@ -286,10 +321,13 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
    is the point of no return: it triggers the real CD, and PyPI versions are immutable.
 
 7. **CD does the rest (automatic — watch it).** guard (signed tag + `tag == v+version`) → tests →
-   HF-weights verify → build + wheel smoke → publish to PyPI (trusted publishing) → GitHub Release
-   (notes + sdist/wheel). If **HF-verify** fails, you skipped step 5: the git tag is already
-   correct, so **do NOT retag** — run step 5, then re-run the failed workflow
-   (`gh run rerun <run-id> --failed`).
+   HF-weights verify + build + wheel smoke + image build/push to GHCR → publish to PyPI (trusted
+   publishing) → GitHub Release (notes + sdist/wheel). If **HF-verify** fails, you skipped step 5:
+   the git tag is already correct, so **do NOT retag** — run step 5, then re-run the failed
+   workflow (`gh run rerun <run-id> --failed`). If the **image** job fails (e.g. a transient
+   runner/registry error), likewise re-run the failed job — the git tag is already correct, don't
+   re-push it; PyPI/GitHub-Release are gated behind the image, so a failed image blocks them rather
+   than half-releasing.
 
 8. **Smoke the release (agent/maintainer).** On a clean venv/machine (**not** the source tree, so
    `__version__` comes from the installed package):
@@ -313,13 +351,99 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 >
 > **Recovering from a broken release.** PyPI versions are immutable: if a published release is
 > broken, fix forward with `vX.Y.(Z+1)` (a fresh release PR + tag). You can `pip`-yank the bad
-> version on PyPI so resolvers skip it, but the number is spent.
+> version on PyPI so resolvers skip it, but the number is spent. Releases are always cut forward
+> from `master`, never on a maintenance branch — note that an out-of-order tag push (tagging an
+> older line *after* a newer one shipped) would also drag GHCR `:latest` backward onto the older
+> image, since `:latest` is a mutable pointer whoever pushed last owns (unlike PyPI, which orders
+> versions). The fix-forward-only rule keeps that from happening.
+
+## Version bump with no weights or image change
+
+Most releases change only code (a bug fix, a new flag). Weights change only on a retrain; the
+container image changes only when the `Dockerfile` (its base digest, labels, or layers) or
+`requirements-container.txt` changes (the Aetherscan code is **bind-mounted at runtime, not baked
+into the image**). So a release often needs
+**no new weights and no new image** — but the vX.Y.Z contract still wants a tag for each, so a
+`v1.0.0` and a `v1.1.0` checkout each pull *their own* tag. The rule is **new tag, reused content**:
+
+| Object | This release… | What the release does |
+| --- | --- | --- |
+| PyPI / GitHub | always (code is versioned) | build + publish `vX.Y.Z` from the tag |
+| **HF weights** | did **not** retrain | re-bless: `hf_tag_release.py --save-tag <old train tag> --release vX.Y.Z` → a new HF tag on the **same commit** as the prior release |
+| **HF weights** | retrained | train `--hf-upload`, then bless the **new** training tag (runbook steps 2 + 5) |
+| **GHCR image** | `Dockerfile` (base digest, labels, layers) + `requirements-container.txt` unchanged | CD **retags the existing digest** to `vX.Y.Z` automatically — no rebuild (its input fingerprint `fp-<hash>` already exists in GHCR) |
+| **GHCR image** | any `Dockerfile` or `requirements-container.txt` change | CD **rebuilds** and pushes a new digest as `vX.Y.Z` |
+
+You do nothing special for the image: the `image` job fingerprints its inputs (the whole `Dockerfile`
+— base digest, labels, and layers — plus `requirements-container.txt`) into an `fp-<hash>` marker tag
+and decides build-vs-retag on its own. For weights the only manual
+choice is *which* training tag to bless — the existing one (no retrain) or a fresh one (retrain).
+Either way both `v1.0.0` and `v1.1.0` end up as real tags on HF **and** GHCR: a v1.0.0 checkout
+pulls `:v1.0.0`, a v1.1.0 checkout pulls `:v1.1.0`, and when nothing changed those tags resolve to
+the same underlying commit/digest.
+
+## Container image licensing
+
+The GHCR image is a derivative of NVIDIA's NGC TensorFlow container, so **the image as a whole is
+governed by the [NVIDIA Deep Learning Container License](https://developer.download.nvidia.com/licenses/NVIDIA_Deep_Learning_Container_License.pdf)**
+— **not** this repo's BSD-3-Clause, which covers only the Aetherscan source (bind-mounted at
+runtime, absent from the image). Publishing is expressly permitted (license §1(c), distributing a
+"Compatible derived CONTAINER") as long as we keep meeting the following, which the
+[`Dockerfile`](../Dockerfile) labels and the package-visibility step encode — **future releases
+must preserve them**:
+
+- **§2(a) material added functionality** — the image adds the Aetherscan runtime stack; never
+  publish the bare NGC base.
+- **§2(b) required notice** — the Dockerfile sets `LABEL com.nvidia.notice="This software contains
+  source code provided by NVIDIA Corporation."`; keep it.
+- **§2(c) / §4(g) at-least-as-protective terms, no OSS-license infection** — the
+  `org.opencontainers.image.licenses` label is `LicenseRef-NVIDIA-Deep-Learning-Container-License`;
+  present the GHCR package as governed by that license, and **do not** relabel the whole image
+  under BSD-3-Clause or any OSI license.
+- **§4(d) no implied endorsement** — don't describe the image as sponsored/endorsed by NVIDIA.
+- **§7 / §15 third-party components & export** — TF (Apache-2.0), CUDA/cuDNN (their own EULAs) keep
+  their licenses; a public GHCR image is a distribution subject to US export rules.
+
+If any of this is ever in doubt for a release, the license routes questions to
+`nvidia-compute-license-questions@nvidia.com`.
+
+### Backfilling an older release's image (e.g. v1.0.0)
+
+v1.0.0 predates the `Dockerfile`, so its image is published once by dispatching the reusable
+workflow **after this change lands on `master`** (`workflow_dispatch` only runs workflows present on
+the default branch). It builds from the current `Dockerfile` + that version's
+`requirements-container.txt` and pushes `:vX.Y.Z` (auth is the built-in `GITHUB_TOKEN` — no PAT):
+
+```bash
+gh workflow run publish-image.yml -f version=1.0.0 -f ref=v1.0.0
+gh run watch "$(gh run list --workflow=publish-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+The `:latest` tag tracks the **newest** release: a real release (`workflow_call` from `release.yml`)
+moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaults to `false`) — so
+publishing an older version never regresses `:latest`, which `run_container.sh` pulls for `.devN`
+checkouts. If you ever need to move it, pass `-f latest=true`.
+
+**Until the first release *after* this lands, there is no `:latest`** — the backfill above publishes
+`:v1.0.0` (plus its internal `fp-<hash>` marker tag) and does **not** move `:latest`. A
+`.devN`/`master` checkout therefore can't pull and must build from `aetherscan.def`
+(the wrapper says so and exits). This is deliberate: master's `requirements-container.txt` has
+already moved past v1.0.0's (notably the `streamlit` security bump), so pinning `:latest` to the
+backfilled v1.0.0 image would serve dev checkouts a knowingly stale dependency set. The next real
+release moves `:latest` and closes the gap.
+
+Verify: `docker buildx imagetools inspect ghcr.io/zachtheyek/aetherscan:v1.0.0`, or just pull it on
+a cluster via `utils/run_container.sh`.
 
 ## FAQ
 
 - *Can GitHub releases and HF tagged weights get out of sync?* Only by skipping the bless (step 5) —
   and then CD refuses to publish. The same tag string on both sides, with CD enforcing
   existence, is the whole synchronization mechanism.
+- *Can the GHCR image get out of sync with the release?* No — CD builds/pushes it during the
+  release run and **gates PyPI on it**, so `vX.Y.Z` exists on GHCR whenever the PyPI/GitHub release
+  does. When the image inputs didn't change, CD retags the existing digest instead of rebuilding
+  (see [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change)).
 - *Why can't CI produce the weights?* Training needs cluster GPUs, hundreds of GB of
   scratch, and real background data. Hence verify-don't-create: the pipeline's most
   expensive artifact is produced and reviewed by humans, and automation only checks it's
@@ -327,5 +451,8 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 - *What if a release is broken?* PyPI is immutable: fix forward with `vX.Y.(Z+1)` (a new
   release PR + tag). You can yank the bad version on PyPI so resolvers skip it, but the
   version number is spent.
-- *Do source-tree users see any of this?* No — the container/`PYTHONPATH=src` workflows are
-  untouched; `__version__` just reads `0.0.0.dev0` and explicit model paths keep working.
+- *Do source-tree users see any of this?* The `PYTHONPATH=src` / conda path is untouched
+  (`__version__` reads `0.0.0.dev0`, explicit model paths keep working). The **container** path now
+  pulls the release-pinned image from GHCR when no local `.sif` is present (or prints
+  `aetherscan.def` build instructions if the pull fails) — a convenience, not a contract change: a
+  checkout of a release tag pulls that version's image, a `.devN` checkout falls back to `:latest`.

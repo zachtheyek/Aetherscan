@@ -1,0 +1,189 @@
+# Publish the Aetherscan runtime container image to GHCR — the container half of the release
+# contract in docs/RELEASE.md. Reusable (workflow_call) so release.yml invokes it per release,
+# and directly dispatchable (workflow_dispatch) to backfill an older release's image
+# (e.g. v1.0.0, which predates the Dockerfile).
+#
+# Auth is the built-in GITHUB_TOKEN (packages: write) — no PAT or stored secret. The image is
+# an OCI image (Dockerfile), so Apptainer and SingularityCE each `pull docker://…` and convert
+# it to their own native .sif; nothing fork-specific is published.
+#
+# Rebuild-vs-retag: the image depends only on the Dockerfile (base digest, labels, layers) +
+# requirements-container.txt (code is bind-mounted, not baked in). We tag each built image with a
+# content fingerprint `fp-<hash>`; if that fingerprint is already in GHCR, a new release just
+# retags the SAME digest to vX.Y.Z (no rebuild) — so a code-only release reuses the existing
+# image, and v1.0.0/v1.1.0 can share one digest while still showing distinct version tags
+# (docs/RELEASE.md).
+#
+# The docker/* actions below are SHA-pinned (version in the trailing comment) to match this
+# repo's convention; claude-dependency-check flags newer versions weekly.
+name: Publish container image
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version X.Y.Z; the image is tagged vX.Y.Z."
+        required: true
+        type: string
+      ref:
+        description: "Git ref whose requirements-container.txt to build (blank = this checkout)."
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Actually build/retag and push (false = validate only, for the dry run)."
+        required: false
+        type: boolean
+        default: true
+      latest:
+        description: "Also move :latest to this version (true for real releases)."
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version X.Y.Z to publish the image as (e.g. 1.0.0 to backfill)."
+        required: true
+        type: string
+      ref:
+        description: "Git ref whose requirements-container.txt to build (e.g. v1.0.0; blank = default branch)."
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Actually build/retag and push (uncheck to validate only)."
+        required: false
+        type: boolean
+        default: true
+      latest:
+        description: "Also move :latest to this version. Leave FALSE when backfilling an OLDER release."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-image:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      REF: ${{ inputs.ref }}
+      # Both triggers define `push` (default true); release.yml passes false on the dry run.
+      PUSH: ${{ inputs.push }}
+      # `latest` defaults true for real releases (workflow_call) and false for a backfill dispatch,
+      # so publishing an OLDER version never regresses :latest.
+      LATEST: ${{ inputs.latest }}
+    steps:
+      - name: Checkout the workflow ref (release tag on release; chosen branch on backfill)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Provides the Dockerfile + (by default) requirements-container.txt. fetch-depth: 0 so a
+          # backfill's `ref` input can read an OLDER release's requirements via `git show`.
+          fetch-depth: 0
+
+      - name: Resolve image ref, overlay target requirements, fingerprint inputs
+        id: prep
+        run: |
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            # Only a real publish needs a taggable version; the dry run computes the fingerprint
+            # and stops, so a static .devN checkout must not fail it (release.yml's dry run passes
+            # pyproject's version verbatim, which is `X.Y.Z.devN` between releases).
+            if [ "$PUSH" = "true" ]; then
+              echo "::error::version input '$VERSION' is not X.Y.Z"; exit 1
+            fi
+            echo "::notice::version '$VERSION' is not X.Y.Z — validate-only run, publishing nothing."
+          fi
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]') # GHCR path is lowercase
+          IMG="ghcr.io/$OWNER/aetherscan"
+          # Build a specified ref's requirements (release tag / backfill). The Dockerfile always
+          # comes from the default branch checkout above — older refs may not have one.
+          if [ -n "$REF" ]; then
+            git show "$REF:requirements-container.txt" > requirements-container.txt
+            echo "Overlaid requirements-container.txt from $REF"
+          fi
+          # BASE is only for the log below + is what claude-dependency-check compares against
+          # aetherscan.def; awk keeps it portable (no GNU-only grep -oP).
+          BASE=$(awk '/^FROM /{print $2; exit}' Dockerfile)
+          # Fingerprint the WHOLE Dockerfile (not just FROM) plus the pip inputs it installs, so ANY
+          # recipe edit — an ENV, a LABEL like the NVIDIA notice, an added layer — forces a rebuild
+          # instead of silently retagging a stale digest under the new version.
+          FP=$( cat Dockerfile requirements-container.txt | sha256sum | cut -c1-16 )
+          {
+            echo "img=$IMG"
+            echo "fp=$FP"
+          } >> "$GITHUB_OUTPUT"
+          echo "image=$IMG  base=$BASE  fingerprint=fp-$FP  version=v$VERSION  push=$PUSH"
+
+      - name: Validate-only (dry run) — stop before any registry write
+        if: env.PUSH != 'true'
+        run: |
+          test -f Dockerfile && test -f requirements-container.txt
+          echo "Dry run: Dockerfile + requirements present, fingerprint computed. Not pushing."
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide build vs retag (does this fingerprint already exist?)
+        id: decide
+        if: env.PUSH == 'true'
+        run: |
+          if docker buildx imagetools inspect "${{ steps.prep.outputs.img }}:fp-${{ steps.prep.outputs.fp }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Inputs unchanged (fp-${{ steps.prep.outputs.fp }} already published) — retag to v$VERSION."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New image inputs — build and push."
+          fi
+
+      - name: Retag existing digest to this version (no rebuild)
+        if: env.PUSH == 'true' && steps.decide.outputs.exists == 'true'
+        run: |
+          docker buildx imagetools create \
+            -t "${{ steps.prep.outputs.img }}:v$VERSION" \
+            "${{ steps.prep.outputs.img }}:fp-${{ steps.prep.outputs.fp }}"
+
+      - name: Free disk space (the NGC base is large)
+        if: env.PUSH == 'true' && steps.decide.outputs.exists != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Set up Buildx
+        if: env.PUSH == 'true' && steps.decide.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and push (first publish / inputs changed)
+        if: env.PUSH == 'true' && steps.decide.outputs.exists != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64 # single-arch on purpose — both clusters are x86_64 (docs/RELEASE.md)
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.prep.outputs.img }}:v${{ env.VERSION }}
+            ${{ steps.prep.outputs.img }}:fp-${{ steps.prep.outputs.fp }}
+
+      - name: Move :latest to this version (real releases only — never on a backfill)
+        if: env.PUSH == 'true' && env.LATEST == 'true'
+        run: |
+          docker buildx imagetools create \
+            -t "${{ steps.prep.outputs.img }}:latest" \
+            "${{ steps.prep.outputs.img }}:v$VERSION"
+
+      - name: Summary
+        if: env.PUSH == 'true'
+        run: |
+          echo "Published \`${{ steps.prep.outputs.img }}:v$VERSION\` (fp-${{ steps.prep.outputs.fp }})." \
+            >> "$GITHUB_STEP_SUMMARY"

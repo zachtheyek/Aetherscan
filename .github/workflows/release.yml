@@ -1,11 +1,12 @@
 # Release CD — the automation half of the release contract in docs/RELEASE.md.
 #
 # Trigger: pushing a release tag (git tag -s vX.Y.Z && git push origin vX.Y.Z). The gates run
-# in order — signed-tag + version guard -> unit tests -> HF weights verification -> build -> PyPI publish
-# (trusted publishing) -> GitHub Release — so a half-released state is impossible: nothing
-# publishes unless the tag matches pyproject.toml, the suite is green, and the blessed
-# weights tag already exists on the HF model repo (CD verifies weights, never creates them —
-# weights only come from cluster training runs).
+# in order — signed-tag + version guard -> unit tests -> HF weights verification -> build (sdist +
+# wheel) + image (GHCR container, via publish-image.yml) -> PyPI publish (trusted publishing) ->
+# GitHub Release — so a half-released state is impossible: PyPI never publishes unless the tag
+# matches pyproject.toml, the suite is green, the blessed weights tag already exists on the HF
+# model repo (CD verifies weights, never creates them — weights only come from cluster training
+# runs), and the container image was pushed to GHCR.
 #
 # One-time maintainer prerequisites (see docs/RELEASE.md):
 #   - PyPI: create the `aetherscan` project with GitHub as a trusted publisher
@@ -216,10 +217,31 @@ jobs:
           name: dist
           path: dist/
 
+  # Producer: build (or retag) the runtime container image and push it to GHCR as vX.Y.Z — the
+  # 4th synchronized release object (docs/RELEASE.md). Reusable workflow (publish-image.yml) so
+  # the same logic backfills older releases via manual dispatch. On the dry run it validates only
+  # (push: false — no heavy build, no registry write), so `publish` can gate on it uniformly.
+  # The image is rebuilt only when the Dockerfile (base digest, labels, layers) or
+  # requirements-container.txt change; otherwise the existing digest is retagged under the new
+  # version (code is bind-mounted, not baked in). Auth is the built-in GITHUB_TOKEN — no PAT.
+  image:
+    # Gated on verify-weights (like build) so a skipped bless can't leave a published GHCR tag
+    # for a version that never gets PyPI/GitHub-Release/blessed weights.
+    needs: [guard, tests, verify-weights]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      version: ${{ needs.guard.outputs.version }}
+      push: ${{ needs.guard.outputs.dry_run != 'true' }}
+
   # Publish via PyPI trusted publishing (OIDC): the `pypi` / `testpypi` GitHub environment
-  # plus id-token permission is the whole credential — no stored API token.
+  # plus id-token permission is the whole credential — no stored API token. Needs `image` so a
+  # real release never publishes PyPI unless the container image was pushed too (on the dry run
+  # `image` only validated, so this still runs).
   publish:
-    needs: [guard, build]
+    needs: [guard, build, image]
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.guard.outputs.dry_run == 'true' && 'testpypi' || 'pypi' }}

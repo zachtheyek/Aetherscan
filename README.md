@@ -41,6 +41,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 - RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
 - Disk: full-scale training round data ~150 GB per retained round (float16 default), up to ~3 TB with `--keep-round-data`; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
+- Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
 
 **Conda env (alternative, Ampere only)**
@@ -94,9 +95,27 @@ git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 ```
 
-**2. Build the `.sif` image**
+**2. Get the `.sif` image**
 
-The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime — use whichever is installed on the host. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
+`utils/run_container.sh` acquires the image on first use, in priority order: **(1)** use a local `aetherscan-ngc25.02.sif` if present; **(2)** else **pull the release-pinned image from GHCR** (`ghcr.io/zachtheyek/aetherscan:v<version>`, derived from `pyproject.toml`) and cache it as that `.sif`; **(3)** else fail loudly with build instructions. So on a release checkout you normally build nothing — the first `run_container.sh` call pulls and caches the image (the runtime converts the OCI image to its own native `.sif`, so the same published image works under both Apptainer and SingularityCE). To pre-pull explicitly (optional):
+
+```bash
+# Apptainer (Ampere) or SingularityCE (Blackwell) — either converts the OCI image to a native .sif
+apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.0.0
+singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.0.0
+```
+
+A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build and keeps it across version bumps. Let `run_container.sh` do the pulling if you want it to track the pinned ref (`repo:tag`, so both a version bump and an `AETHERSCAN_IMAGE` change trigger a re-pull) for you; otherwise `rm` the `.sif` when you bump versions.
+
+**Build locally instead** — necessary when the prebuilt image doesn't fit the host:
+
+- **non-x86_64 host** (e.g. aarch64 Grace/GH200): the published image is `linux/amd64` only;
+- **host driver below the base's CUDA 12.8 floor** (Blackwell <570 / Ampere <550): a pull succeeds but the container won't see the GPUs — upgrade the driver, or build;
+- **you edited `requirements-container.txt` or rebuilt TF from source** locally: a pull fetches the *released* image, not your variant.
+
+A local build placed over the default `.sif` path is safe: `run_container.sh` caches pulled images with a `<sif>.pulled-tag` sidecar and detects a locally-built `.sif` by mtime, so your build is kept and never overwritten by a pull — even across version bumps.
+
+The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
 
 ```bash
 # SingularityCE (e.g. Blackwell cluster running 4.1.1)
@@ -107,6 +126,9 @@ apptainer build aetherscan-ngc25.02.sif aetherscan.def
 ```
 
 Build takes ~9 minutes and produces a ~9 GB image. On hardened HPC nodes you may also need the `--fakeroot` flag, and to redirect `SINGULARITY_TMPDIR` / `APPTAINER_TMPDIR` and `SINGULARITY_CACHEDIR` / `APPTAINER_CACHEDIR` to scratch storage; the full troubleshooting walkthrough lives in [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md).
+
+> [!NOTE]
+> The GHCR image is a derivative of NVIDIA's NGC TensorFlow container, so it is governed by the [NVIDIA Deep Learning Container License](https://developer.download.nvidia.com/licenses/NVIDIA_Deep_Learning_Container_License.pdf) — not the repo's BSD-3-Clause, which covers only the (bind-mounted) Aetherscan source.
 
 **3. Set up monitoring dashboards in tmux (optional)**
 

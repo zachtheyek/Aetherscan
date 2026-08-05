@@ -17,7 +17,13 @@
 #
 # Override via env var:
 #     SIF                       Path to the .sif image
-#                               (default: <repo>/aetherscan-ngc25.02.sif)
+#                               (default: <repo>/aetherscan-ngc25.02.sif). If it doesn't exist
+#                               it's pulled from GHCR (see below); if the pull fails the wrapper
+#                               prints aetherscan.def build instructions and exits.
+#     AETHERSCAN_IMAGE          GHCR image repo to pull (when the .sif is absent, or a re-pull is
+#                               triggered) (default: ghcr.io/zachtheyek/aetherscan)
+#     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version>, or `latest`
+#                               on a .devN checkout that has no per-version image)
 #     AETHERSCAN_DATA_PATH      Host data dir, bound 1:1
 #                               (default: /datax/scratch/zachy/data/aetherscan)
 #     AETHERSCAN_MODEL_PATH     Host models dir, bound 1:1
@@ -89,11 +95,99 @@ else
     exit 1
 fi
 
+# Image acquisition, in priority order:
+#   1. Use the local .sif at $SIF if it exists and isn't a pull cached for a different tag (zero-cost).
+#   2. Else pull the release-pinned OCI image from GHCR into $SIF (one-time download, cached;
+#      the runtime converts docker://… into its own native .sif, so no fork-specific artifact).
+#   3. Else fail loudly with build instructions.
+#
+# The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
+# that release's image; a .devN checkout has no per-version image and falls back to :latest. A
+# PULLED image records its full ref (repo:tag) in "$SIF.pulled-tag"; if a later checkout — or a
+# different AETHERSCAN_IMAGE — wants a different ref we re-pull instead of silently running the old
+# one. The trigger is a change in that REF string, so a release-tag checkout re-pulls on every bump
+# (digest-identical retag included), while a .devN checkout always wants the constant :latest and so
+# keeps whatever it first cached even as :latest moves — rm the .sif (and its sidecar) to pick that
+# up. A user-BUILT .sif is always used as-is: it has no sidecar at all, or — if built over a
+# previously pulled image — is newer than one (see the mtime note below). A MANUAL pull/build to
+# $SIF likewise writes no sidecar, so it too is kept across bumps — let run_container.sh do the
+# pulling if you want it to track the pinned ref.
+#
+# GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
+# If any of these hold, BUILD from aetherscan.def instead of pulling:
+#   - non-x86_64 host (e.g. aarch64 Grace/GH200): no matching image exists;
+#   - host driver below the base's CUDA 12.8 floor (Blackwell <570 / Ampere <550): a pull would
+#     succeed but the container won't see the GPUs — upgrade the driver, or build;
+#   - you rebuilt TF from source, edited requirements-container.txt locally, or are on a .devN
+#     checkout whose requirements-container.txt changed since the last release: a pull fetches the
+#     RELEASED image (:latest tracks the newest release, never master HEAD), not your variant —
+#     no published tag matches, so build locally (or push your own image and set AETHERSCAN_IMAGE
+#     — rm the local $SIF first, or point SIF= elsewhere, since a user-built .sif takes priority
+#     over any pull).
+IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
+if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
+    # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
+    # `set -o pipefail` can't trip the wrapper. `|| true` (+ 2>/dev/null) so a missing file yields
+    # an empty VER (-> `latest`) rather than aborting the whole wrapper under `set -e`.
+    VER=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO/pyproject.toml" 2>/dev/null || true)
+    if [[ $VER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        AETHERSCAN_IMAGE_TAG="v$VER"
+    else
+        AETHERSCAN_IMAGE_TAG="latest"
+    fi
+fi
+IMAGE_REF="$IMAGE_REPO:$AETHERSCAN_IMAGE_TAG"
+
+# (Re)pull if there's no image, or the cached one was pulled for a different tag. A $SIF NEWER than
+# its sidecar was rebuilt locally over a previously pulled image — treat that as user-built
+# (priority 1) and never clobber it (mv preserves the pulled file's mtime; the sidecar is written
+# right after, so a pulled .sif is never newer than its sidecar, a local build always is).
+need_pull=0
 if [[ ! -f "$SIF" ]]; then
-    echo "Error: container image not found at $SIF" >&2
-    echo "Build it from the repo root with:" >&2
-    echo "    $RUNTIME build aetherscan-ngc25.02.sif aetherscan.def" >&2
-    exit 1
+    need_pull=1
+elif [[ -f "$SIF.pulled-tag" && ! "$SIF" -nt "$SIF.pulled-tag" \
+        && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$IMAGE_REF" ]]; then
+    echo "Cached $SIF was pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null)' but this checkout wants" \
+         "'$IMAGE_REF' — re-pulling." >&2
+    need_pull=1
+fi
+
+STALE_SIF_WARNING=""
+if [[ $need_pull -eq 1 ]]; then
+    echo "Pulling docker://$IMAGE_REF -> $SIF ..." >&2
+    tmp="$SIF.pulling.$$"
+    # Don't leave a multi-GB partial behind on Ctrl-C. INT/TERM exit explicitly: a trapped signal
+    # does NOT terminate bash, so without the exit execution would resume in the failure branch
+    # below and (with a stale $SIF present) run the job against the old image.
+    trap 'rm -f "$tmp"' EXIT
+    trap 'rm -f "$tmp"; exit 130' INT
+    trap 'rm -f "$tmp"; exit 143' TERM
+    # A SIGKILL/OOM/power-loss can't run the traps, so a partial from an earlier run with this PID
+    # may still be here; both runtimes refuse to overwrite an existing pull target, so clear it.
+    rm -f "$tmp"
+    if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
+        mv -f "$tmp" "$SIF"
+        printf '%s\n' "$IMAGE_REF" >"$SIF.pulled-tag"
+        trap - EXIT INT TERM
+        echo "Pulled and cached $SIF ($IMAGE_REF)." >&2
+    else
+        trap - EXIT INT TERM
+        rm -f "$tmp"
+        if [[ -f "$SIF" ]]; then
+            STALE_SIF_WARNING="WARNING: pull of docker://$IMAGE_REF failed; running against the cached\
+ $SIF, which may be a different version (pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null || echo unknown)')."
+            echo "$STALE_SIF_WARNING" >&2
+        else
+            echo "Error: no local image at $SIF, and pulling docker://$IMAGE_REF failed." >&2
+            echo "Build it from the repo root with:" >&2
+            echo "    $RUNTIME build $SIF aetherscan.def" >&2
+            echo "On a hardened HPC node with a quota'd \$HOME, first redirect APPTAINER_CACHEDIR /" >&2
+            echo "APPTAINER_TMPDIR (or the SINGULARITY_* equivalents) to scratch — a pull unpacks the" >&2
+            echo "~9 GB image through them; see docs/GPU_RUNTIME_GUIDE.md." >&2
+            echo "(Or point SIF=/path/to/existing.sif, or set AETHERSCAN_IMAGE_TAG=<tag>.)" >&2
+            exit 1
+        fi
+    fi
 fi
 
 DATA_PATH=${AETHERSCAN_DATA_PATH:-/datax/scratch/zachy/data/aetherscan}
@@ -141,6 +235,9 @@ if [[ -n ${HF_HOME+x} ]]; then
     BIND_ARGS+=(--bind "$HF_HOME:$HF_HOME")
     HF_ENV_ARGS+=(--env "HF_HOME=$HF_HOME")
 fi
+
+# Repeat the stale-image warning right before launch so it isn't buried far above the run in a log.
+[[ -n $STALE_SIF_WARNING ]] && echo "$STALE_SIF_WARNING" >&2
 
 exec "$RUNTIME" exec --nv \
     "${BIND_ARGS[@]}" \

@@ -24,7 +24,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     # Mirrors requirements-container.txt's ranges for the packaged runtime — keep them (and
-    # environment.yml / aetherscan.def) in lockstep per SECURITY.md's Version Selection Policy.
+    # environment.yml / aetherscan.def / Dockerfile) in lockstep per SECURITY.md's Version Selection Policy.
     # Documented ceilings (numpy<2.0, setuptools<81, the NGC TF 2.17 ABI) apply to the package
     # exactly as to the container. The dashboard stack (streamlit/plotly/pandas) lives in the
     # optional `dashboard` extra below — not core deps — so a bare install stays lean while
