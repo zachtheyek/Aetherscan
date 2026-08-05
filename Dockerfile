@@ -36,6 +36,9 @@ RUN pip install --no-cache-dir -r /opt/aetherscan-requirements.txt \
     && rm -f /opt/aetherscan-requirements.txt
 
 # Mirrors aetherscan.def's %environment: don't pick up host-side Python packages that would
-# shadow the pinned image versions; quieten TF's C++ INFO flood (INFO+ still prints).
+# shadow the pinned image versions; quieten TF's C++ INFO flood (INFO+ still prints); run legacy
+# Keras (#323) — the NGC base already sets TF_USE_LEGACY_KERAS, but declare it explicitly so a
+# future base swap can't silently drop it (aetherscan/__init__.py is the Python-level backstop).
 ENV PYTHONNOUSERSITE=1 \
-    TF_CPP_MIN_LOG_LEVEL=1
+    TF_CPP_MIN_LOG_LEVEL=1 \
+    TF_USE_LEGACY_KERAS=1

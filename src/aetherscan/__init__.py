@@ -9,7 +9,15 @@ exposes only the version string.
 
 from __future__ import annotations
 
+import os
 from importlib.metadata import PackageNotFoundError, version
+
+# tf_keras / legacy-Keras compatibility (#323): Aetherscan runs on legacy Keras
+# (`from tensorflow import keras` == tf_keras) and the released `.keras` weights are Keras-2
+# format. Set the flag at package-import time — importing `aetherscan` runs this before any
+# submodule performs a TF import — using setdefault so an explicit environment value (or the
+# NGC container, which already exports it) always wins.
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
 # Version is single-sourced from pyproject.toml's [project].version via the installed
 # distribution's metadata. Source-tree runs (PYTHONPATH=src, the NGC container) have no

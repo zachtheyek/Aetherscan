@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 
 
 # Use keras.utils.* rather than keras.saving.* — the latter is the canonical
-# Keras 3 path, but `from tensorflow import keras` in TF 2.17 + NGC 25.02
-# resolves to the tf-keras compat shim (`keras._tf_keras.keras`), which
-# doesn't re-export the `saving` submodule. keras.utils.register_keras_serializable
+# Keras 3 path, but the pipeline runs legacy Keras (TF_USE_LEGACY_KERAS=1, set in
+# aetherscan/__init__.py and by the NGC base image), so `from tensorflow import keras`
+# resolves to tf_keras (`tf_keras.api._v2.keras`). keras.utils.register_keras_serializable
 # is the back-compat alias that exists in both tf.keras lineages and standalone
 # Keras 3 — pick the path that works everywhere.
 @keras.utils.register_keras_serializable(package="aetherscan")

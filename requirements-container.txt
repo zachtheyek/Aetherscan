@@ -1,6 +1,8 @@
 # Pip-only extras layered into the NGC TensorFlow 25.02 base image
 # (nvcr.io/nvidia/tensorflow:25.02-tf2-py3 already ships with numpy, scipy,
-# scikit-learn, matplotlib, pandas, h5py, psutil, pytest, and tensorflow 2.17).
+# scikit-learn, matplotlib, pandas, h5py, psutil, pytest, tensorflow 2.17, and
+# tf_keras 2.17 -- so tf_keras is omitted here; pyproject.toml / environment.yml declare it
+# for the base-less pip/conda paths that back legacy-Keras mode, #323).
 # Version ranges should be kept in lockstep with conda environment that targets the
 # Ampere cluster (see environment.yml)
 

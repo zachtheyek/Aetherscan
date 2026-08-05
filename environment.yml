@@ -56,6 +56,10 @@ dependencies:
       # nvidia-nccl-cu12 2.21.x, etc. -- the exact ABI the TF 2.17 wheel was built
       # against. Driver requirement: NVIDIA driver >= 525.60 on the host.
       - tensorflow[and-cuda]==2.17.*
+      # tf_keras backs legacy-Keras mode (TF_USE_LEGACY_KERAS, set in aetherscan/__init__.py);
+      # the v1.0.0 .keras weights are Keras-2 format (#323). The NGC container gets tf_keras from
+      # its base image (so requirements-container.txt omits it), but conda/pip has no base.
+      - tf_keras==2.17.*
       # Range mirrors requirements-container.txt (see the rationale there).
       - setigen>=2.6,<3
       - imageio>=2.34,<3

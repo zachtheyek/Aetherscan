@@ -119,8 +119,8 @@ jobs:
                  `environment.yml` and `requirements-container.txt` (numpy, scipy, scikit-learn,
                  scikit-image, astropy, matplotlib, joblib, setuptools, setigen, imageio,
                  umap-learn, shap, slack-sdk, python-dotenv). Conda-only deps (h5py, hdf5plugin,
-                 psutil, pytest, ipykernel) are intentionally ABSENT from requirements-container.txt
-                 because the NGC base ships them — that is NOT drift.
+                 psutil, pytest, ipykernel, tf_keras) are intentionally ABSENT from
+                 requirements-container.txt because the NGC base ships them — that is NOT drift.
                - The **runtime stack** version must agree across `aetherscan.def` (its `From:` base
                  image tag and `%labels` for Base / Python / TF / CUDA / cuDNN / NCCL),
                  `Dockerfile` (its `FROM ...@sha256:<digest>` — MUST pin the SAME NGC base image,

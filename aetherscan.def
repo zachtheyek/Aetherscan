@@ -43,6 +43,11 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3@sha256:c83b37d26f19ab00d8a13cf974e
     export PYTHONNOUSERSITE=1
     # Quieten TF startup noise; INFO+ still prints, only the C++ INFO floodgate closes.
     export TF_CPP_MIN_LOG_LEVEL=1
+    # Legacy-Keras mode (#323): the v1.0.0 .keras weights are Keras-2 format, so
+    # `from tensorflow import keras` must resolve to tf_keras. The NGC base image already
+    # sets this, but declare it explicitly so a future base swap can't silently drop it
+    # (aetherscan/__init__.py also sets it via setdefault as the Python-level backstop).
+    export TF_USE_LEGACY_KERAS=1
 
 %labels
     Maintainer Zach Yek <xiaoxiyek1.5@gmail.com>
