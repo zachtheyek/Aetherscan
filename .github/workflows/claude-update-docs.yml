@@ -58,15 +58,26 @@ jobs:
 
       # Deterministic scan window + merged-PR enumeration. The window opens at the previous
       # successful SCHEDULED run of this workflow and falls back to 7 days when there is none
-      # (first weekly run, or a purged run history). Two invariants keep coverage total:
-      # failed runs never advance the window (a red week is re-covered by the next green one),
-      # and non-scheduled runs never advance it either — a workflow_dispatch, and any run the
-      # week guard above short-circuited, still concludes `success`, so anchoring on it would
-      # silently drop everything merged between the last real scan and that no-op run. A
-      # dispatch may therefore re-scan a stretch a later scheduled run also covers; that's
-      # harmless — the scan reconciles against CURRENT docs (already-fixed gaps produce
-      # nothing) and the week marker prevents double-filing. If nothing merged in the window,
-      # the Claude step is skipped outright.
+      # (first weekly run, or a purged run history). Coverage properties, precisely:
+      # - Failed runs never advance the window (a red week is re-covered by the next green one).
+      # - Dispatch runs never advance it: a workflow_dispatch concludes `success` even when the
+      #   week guard short-circuited it, so anchoring on one would silently drop everything
+      #   merged between the last real scan and that no-op run. A dispatch may therefore
+      #   re-scan a stretch a later scheduled run also covers; that's harmless — the scan
+      #   reconciles against CURRENT docs (already-fixed gaps produce nothing) and the week
+      #   marker prevents double-filing. Consequence: under dispatch-only operation (e.g.
+      #   GitHub disabling `schedule` after 60 days of repo inactivity) the window grows
+      #   monotonically — the --limit cap warning below is the tripwire for that.
+      # - NOT total: a SCHEDULED run the guard short-circuits (an issue already filed this
+      #   ISO week — e.g. a dispatch in the Mon 00:00–01:00 UTC slot before the cron) still
+      #   matches `--event schedule --status success` and becomes the anchor; whatever merged
+      #   between the suppressing run's enumeration and that cron's createdAt falls out of
+      #   every window. Accepted: `gh run list` can't see step outcomes, and the fixes are
+      #   all worse than this one-hour-slot residual.
+      # - Anchoring on the prior run's *createdAt* (not "now") is what makes the overlap
+      #   direction safe: a PR merged DURING a run — after its `gh pr list`, before it
+      #   finishes — still lands inside the next window.
+      # If nothing merged in the window, the Claude step is skipped outright.
       - name: Compute scan window and enumerate merged PRs
         id: window
         if: steps.guard.outputs.already_filed != 'true'
@@ -78,9 +89,12 @@ jobs:
                      --status success --limit 1 \
                      --json createdAt --jq '.[0].createdAt // empty')"
           if [[ -z "$SINCE" ]]; then
-            SINCE="$(date -u -d '7 days ago' +'%Y-%m-%dT%H:%M:%S+00:00')"
+            SINCE="$(date -u -d '7 days ago' +'%Y-%m-%dT%H:%M:%SZ')"
             echo "No prior successful scheduled run found — falling back to a 7-day window."
           fi
+          # Normalize to one timestamp form regardless of branch (gh emits RFC3339 `Z`;
+          # the GitHub search parser honors both `Z` and `+00:00`, verified empirically).
+          SINCE="$(date -u -d "$SINCE" +'%Y-%m-%dT%H:%M:%S+00:00')"
           echo "since=$SINCE" >> "$GITHUB_OUTPUT"
           echo "Scanning PRs merged into master since $SINCE."
           # 200 headroom over normal weekly traffic; warn loudly if we ever hit the cap,
