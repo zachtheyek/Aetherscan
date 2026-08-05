@@ -99,6 +99,9 @@ export SINGULARITY_CACHEDIR=/datax/scratch/$USER/singularity-cache
 
 `TMPDIR` needs ~15 GB free; `CACHEDIR` caches Docker base-layer blobs (a few GB, persists across rebuilds — keep it). Worth adding to `~/.bashrc` if you rebuild often. On an **Apptainer** host (e.g. the Ampere cluster) use the `APPTAINER_TMPDIR` / `APPTAINER_CACHEDIR` equivalents instead — Apptainer reads those first and falls back to the `SINGULARITY_*` names.
 
+> [!NOTE]
+> **On a `pull` you won't see the `noexec` FATAL above** (there's no `%post` root filesystem to exec), but set the same two vars anyway *before* the first `run_container.sh` call — the runtime unpacks the ~9 GB image through `TMPDIR`/`CACHEDIR`, so on a quota'd `$HOME` an unset pair lands the unpack in `$HOME` and fills it. The fakeroot / `noexec` items above are build-only.
+
 **Build fails in `%post` with `Could not open requirements file: /tmp/...`**
 
 A symptom of Singularity bind-mounting the host's `/tmp` over the container's `/tmp` during `%post`, which hides files placed there by `%files`. Already fixed in [`aetherscan.def`](../aetherscan.def) — we stage to `/opt/` instead. If you hit this, you're on an old revision of the branch; `git pull` and rebuild.

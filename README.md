@@ -1139,9 +1139,10 @@ git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
 # The first `utils/run_container.sh` run pulls the prebuilt image from GHCR and caches it as
-# aetherscan-ngc25.02.sif. A fresh `master` clone has no `:latest` to pull until the next release,
-# so build it now (this is also the fallback for a host the image can't serve):
-#   singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
+# aetherscan-ngc25.02.sif. A fresh `master` clone resolves to `:latest`, which doesn't exist until
+# the next release ships — so build once now (this is also the fallback for a host the published
+# image can't serve). Drop this step on a release-tag checkout.
+singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
 
 ./utils/start_tmux_session.sh
 
