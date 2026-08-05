@@ -35,10 +35,11 @@ Pick whichever install path matches your dev environment.
 git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
-# No manual image build needed: the first `utils/run_container.sh` run pulls the prebuilt image
-# from GHCR (ghcr.io/zachtheyek/aetherscan) and caches it as aetherscan-ngc25.02.sif. Build from
-# aetherscan.def only as a fallback — when the pull can't serve your host, or on a dev checkout
-# before the next release publishes a matching tag:
+# The image is acquired automatically on the first `utils/run_container.sh` run: it pulls the
+# prebuilt image from GHCR (ghcr.io/zachtheyek/aetherscan) and caches it as aetherscan-ngc25.02.sif.
+# (A fresh `master` clone has no `:latest` to pull until the next release ships, so build it now —
+# the pull becomes automatic once you're on a release tag or the next release lands. Also build for
+# a host the image can't serve — non-x86_64, driver below the CUDA 12.8 floor, local reqs edits.)
 #   singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
 
 # Launch tmux session

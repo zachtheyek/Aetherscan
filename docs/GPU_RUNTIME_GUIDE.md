@@ -30,7 +30,10 @@ Forward compatibility is a CUDA feature, not a TF feature, so the same trick wil
 **Canonical path — let the wrapper pull it.** `utils/run_container.sh` acquires the image on first use: it **pulls the release-pinned image from GHCR** (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, derived from `pyproject.toml`) and caches it as `aetherscan-ngc25.02.sif`, recording the pulled ref (`repo:tag`) in `<sif>.pulled-tag` and re-pulling whenever that ref changes (a new version tag, or a different repo via `AETHERSCAN_IMAGE`). So on a **release checkout you build nothing** — the first pipeline run pulls and caches the image. Apptainer and SingularityCE both consume the same published OCI image (each converts it to its own native `.sif`), so there's nothing cluster-specific to produce.
 
 > [!NOTE]
-> A `.devN`/`master` checkout resolves to the constant `:latest`, which exists only once the first release *after* the image was introduced ships — until then the pull can't serve it and the wrapper falls back to building (below). A local build placed over a pulled `.sif` is detected by mtime and kept, never clobbered.
+> **Hardened HPC nodes (pull *or* build):** on a quota'd `$HOME`, first redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch — a pull unpacks the ~9 GB image through them exactly as a build does. See [Hardened HPC nodes](#hardened-hpc-nodes) below.
+
+> [!NOTE]
+> A `.devN`/`master` checkout resolves to the constant `:latest`, which exists only once the first release *after* the image was introduced ships — until then the pull can't serve it and the wrapper **exits with `aetherscan.def` build instructions** (it never builds for you — see the fallback below). Once a later release *moves* `:latest`, a `.devN` checkout keeps whatever `.sif` it first cached, so `rm` the `.sif` and its `.pulled-tag` sidecar to pick the new one up. A local build placed over a pulled `.sif` is detected by mtime and kept, never clobbered.
 
 **Fallback — build from `aetherscan.def`.** Build only when the pull can't serve your host: a non-x86_64 host, a driver below the CUDA 12.8 floor, local `requirements-container.txt` edits, or a checkout with no matching published tag yet. The single recipe builds with either runtime; build on the cluster you intend to run on:
 
@@ -48,9 +51,6 @@ Build takes ~9 minutes and produces a ~9 GB `.sif`. The recipe pulls `nvcr.io/nv
 
 > [!NOTE]
 > A `.sif` built by one runtime is generally readable by the other (both use the SIF format), but rebuilding per cluster avoids any subtle ABI mismatch. Pulling sidesteps this entirely — each runtime converts the published OCI image itself.
-
-> [!NOTE]
-> **Hardened HPC nodes:** whether pulling or building, on a quota'd `$HOME` first redirect `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch — a pull unpacks the ~9 GB image through them exactly as a build does (see the TMPDIR/CACHEDIR note below).
 
 #### Pinned base image (digest)
 
@@ -73,9 +73,9 @@ docker buildx imagetools inspect nvcr.io/nvidia/tensorflow:25.02-tf2-py3 --forma
 
 Swap the new `sha256:…` into **both** the `From:` line and the `Base` label in [`aetherscan.def`](../aetherscan.def), commit, and rebuild.
 
-#### Build-time gotchas on hardened HPC nodes
+#### Hardened HPC nodes
 
-Locked-down clusters typically need three things adjusted before `singularity build` will succeed as an unprivileged user. Work through them in order:
+Locked-down clusters typically need a few things adjusted. The `TMPDIR` / `CACHEDIR` redirect below applies whether you **pull or build**; fakeroot and the `noexec /tmp` fix are **build-only**. Work through them in order:
 
 **`FATAL: --remote, --fakeroot, or the proot command are required to build this source as a non-root user`**
 
