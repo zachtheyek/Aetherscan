@@ -17,7 +17,12 @@
 #
 # Override via env var:
 #     SIF                       Path to the .sif image
-#                               (default: <repo>/aetherscan-ngc25.02.sif)
+#                               (default: <repo>/aetherscan-ngc25.02.sif). If it doesn't exist
+#                               it's pulled from GHCR (see below), else built from aetherscan.def.
+#     AETHERSCAN_IMAGE          GHCR image repo to pull when the .sif is absent
+#                               (default: ghcr.io/zachtheyek/aetherscan)
+#     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version>, or `latest`
+#                               on a .devN checkout that has no per-version image)
 #     AETHERSCAN_DATA_PATH      Host data dir, bound 1:1
 #                               (default: /datax/scratch/zachy/data/aetherscan)
 #     AETHERSCAN_MODEL_PATH     Host models dir, bound 1:1
@@ -89,11 +94,49 @@ else
     exit 1
 fi
 
+# Image acquisition, in priority order:
+#   1. Use the local .sif at $SIF if it already exists (zero-cost; identical to a local build).
+#   2. Else pull the release-pinned OCI image from GHCR into $SIF (one-time download, cached;
+#      the runtime converts docker://… into its own native .sif, so no fork-specific artifact).
+#   3. Else fail loudly with build instructions.
+#
+# The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
+# that release's image; a .devN checkout has no per-version image and falls back to :latest.
+#
+# GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
+# If any of these hold, BUILD from aetherscan.def instead of pulling:
+#   - non-x86_64 host (e.g. aarch64 Grace/GH200): no matching image exists;
+#   - host driver below the base's CUDA 12.8 floor (Blackwell <570 / Ampere <550): a pull would
+#     succeed but the container won't see the GPUs — upgrade the driver, or build;
+#   - you rebuilt TF from source or edited requirements-container.txt locally: a pull fetches the
+#     released image, not your variant — build locally (or set AETHERSCAN_IMAGE_TAG).
+IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
+if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
+    # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
+    # `set -o pipefail` can't trip the wrapper. Empty if the file/line is absent -> `latest`.
+    VER=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO/pyproject.toml")
+    if [[ $VER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        AETHERSCAN_IMAGE_TAG="v$VER"
+    else
+        AETHERSCAN_IMAGE_TAG="latest"
+    fi
+fi
+IMAGE_REF="$IMAGE_REPO:$AETHERSCAN_IMAGE_TAG"
+
 if [[ ! -f "$SIF" ]]; then
-    echo "Error: container image not found at $SIF" >&2
-    echo "Build it from the repo root with:" >&2
-    echo "    $RUNTIME build aetherscan-ngc25.02.sif aetherscan.def" >&2
-    exit 1
+    echo "No local image at $SIF — pulling docker://$IMAGE_REF ..." >&2
+    tmp="$SIF.pulling.$$"
+    if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
+        mv "$tmp" "$SIF"
+        echo "Pulled and cached $SIF" >&2
+    else
+        rm -f "$tmp"
+        echo "Error: no local image at $SIF, and pulling docker://$IMAGE_REF failed." >&2
+        echo "Build it from the repo root with:" >&2
+        echo "    $RUNTIME build $SIF aetherscan.def" >&2
+        echo "(or point SIF=/path/to/existing.sif, or set AETHERSCAN_IMAGE_TAG=<tag>)" >&2
+        exit 1
+    fi
 fi
 
 DATA_PATH=${AETHERSCAN_DATA_PATH:-/datax/scratch/zachy/data/aetherscan}

@@ -78,6 +78,7 @@ jobs:
                - `environment.yml` — conda packages (note channels) + a nested `pip:` block
                - `requirements-container.txt` — pip packages
                - `aetherscan.def` — the container base image (`From: nvcr.io/nvidia/...:<tag>`) plus any apt/pip installs
+               - `Dockerfile` — the OCI twin of `aetherscan.def` (published to GHCR by publish-image.yml): same `FROM nvcr.io/nvidia/...@sha256:<digest>` base image and `requirements-container.txt` install
                - `pyproject.toml` — build-system requires and tool pins (e.g. ruff)
                - `.pre-commit-config.yaml` — hook versions (`rev:` per repo)
                - `.github/workflows/*.yml` — pinned GitHub Action versions (`uses: owner/repo@<sha|tag>`)
@@ -122,6 +123,8 @@ jobs:
                  because the NGC base ships them — that is NOT drift.
                - The **runtime stack** version must agree across `aetherscan.def` (its `From:` base
                  image tag and `%labels` for Base / Python / TF / CUDA / cuDNN / NCCL),
+                 `Dockerfile` (its `FROM ...@sha256:<digest>` — MUST pin the SAME NGC base image,
+                 digest included, as `aetherscan.def`'s `From:`; a divergent digest is drift),
                  `environment.yml` (`tensorflow[and-cuda]==2.17.*`, `python=3.10`), and
                  `pyproject.toml` (`requires-python`, `[tool.ruff] target-version`, and the Python /
                  CUDA `classifiers`).

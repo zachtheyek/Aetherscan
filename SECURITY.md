@@ -181,7 +181,7 @@ This deliberately trails the newest release: brand-new versions are where regres
 
 **Exception — known advisories override the lag.** If the version selected by the rule above is itself affected by a known security advisory, instead pin the **minimum version that resolves the advisory**, even if it is newer than the default target (see _Responding to Vulnerabilities_ below).
 
-These targets are additionally bounded by the project's intentional version ceilings (e.g. `numpy<2.0`, `setuptools<81`) and the NGC TensorFlow 2.17 ABI — never select a version that crosses a documented upper bound. See the header comments in `environment.yml` and `requirements-container.txt` for the rationale behind each ceiling, and keep the coupled manifests (`environment.yml`, `requirements-container.txt`, `aetherscan.def`, `pyproject.toml`) in lockstep when bumping a shared dependency.
+These targets are additionally bounded by the project's intentional version ceilings (e.g. `numpy<2.0`, `setuptools<81`) and the NGC TensorFlow 2.17 ABI — never select a version that crosses a documented upper bound. See the header comments in `environment.yml` and `requirements-container.txt` for the rationale behind each ceiling, and keep the coupled manifests (`environment.yml`, `requirements-container.txt`, `aetherscan.def`, `Dockerfile`, `pyproject.toml`) in lockstep when bumping a shared dependency. `aetherscan.def` and `Dockerfile` both pin the NGC base image by digest — bump both together.
 
 #### Responding to Vulnerabilities
 
