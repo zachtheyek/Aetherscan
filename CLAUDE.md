@@ -9,10 +9,14 @@ Aetherscan: Breakthrough Listen's deep-learning SETI pipeline. Two-stage ML (Bet
 ## Run / lint
 
 ```bash
-# Canonical: NGC container (only option on Blackwell)
+# Canonical: NGC container (only option on Blackwell); run_container.sh pulls the
+# GHCR image on first use (local .sif → GHCR pull → build-instructions fallback)
 ./utils/run_container.sh python -m aetherscan.main {train|inference} --save-tag train
 # Alternative: conda env (Ampere only) — prefix with PYTHONPATH=src
 PYTHONPATH=src python -m aetherscan.main {train|inference} --save-tag train
+# Off-cluster: the published PyPI package (Ampere only; no PYTHONPATH needed) —
+# see README "Install From PyPI (pip)"
+pip install aetherscan && python -m aetherscan.main {train|inference} --save-tag train
 # Lint + format (also enforced via pre-commit)
 ruff check src/ && ruff format src/
 ```
@@ -35,6 +39,7 @@ pytest -m "not gpu and not cluster" -q
 ## Hard rules (don't break these)
 
 - Create all TensorFlow models **inside `strategy.scope()`**.
+- The pipeline runs **legacy Keras** (`TF_USE_LEGACY_KERAS=1`, set by `src/aetherscan/__init__.py` + the container env), so `from tensorflow import keras` is `tf_keras` — use back-compat APIs (`keras.utils.*`), never Keras-3-only paths (`keras.saving.*`).
 - Use singleton accessors `get_config()` / `get_db()` / `get_manager()` — never instantiate directly; never mutate config post-init in multi-threaded code.
 - Shared memory: only the **creator** calls `shm.unlink()`, never workers. Register pools/SHM with ResourceManager; call `holder.clear()` when done.
 - **Never log inside SIGTERM handlers** (deadlock).
@@ -50,8 +55,8 @@ ruff lint+format, 100-char lines, Python 3.10 target ([`pyproject.toml`](pyproje
 - Every PR links an existing issue (`Closes #N`); branch prefixes `feature/`/`hotfix/`/`misc/`/`claude/`; rebase (not merge) onto `master`; commits need **verified GPG signatures**; all pre-commit hooks must pass (ruff-format may rewrite files → `git add` again before re-committing).
 - **Don't tag the assistant unintentionally.** The assistant handle (an `@` immediately followed by `claude`) in a Discussion/issue/PR title or body triggers the assistant workflow (`claude.yml`) — write it only when you actually want to invoke the assistant. To reference it as plain text, write `"@ claude"` (space after the `@`, double quotes on both sides) so the trigger can't match.
 - If you change `cli.py`, regenerate the README CLI Reference: `PYTHONPATH=src python utils/print_cli_help.py all`.
-- Bumping a dependency? Don't jump to the latest — target a proven version per [SECURITY.md](SECURITY.md) (the newer of ~2 minors back / latest stable ≥6 months old; a known advisory on that target overrides the lag). Never cross a documented ceiling (`numpy<2.0`, …) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `Dockerfile` / `pyproject.toml` in sync (`aetherscan.def` + `Dockerfile` both pin the NGC base digest).
-- Releases are SemVer (`vX.Y.Z`): the compatibility contract covers the CLI, artifact/config formats + model contract, and supported runtimes; highest bump wins, and code + weights share one version string (a same-contract retrain is at least a MINOR). Full policy: [docs/RELEASE.md](docs/RELEASE.md#versioning-policy-semver).
+- Bumping a dependency? Don't jump to the latest — target a proven version per [SECURITY.md](SECURITY.md) (the newer of ~2 minors back / latest stable ≥6 months old; a known advisory on that target overrides the lag). Never cross a documented ceiling (`numpy<2.0`, …) or the NGC TF 2.17 ABI, and keep `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `Dockerfile` / `pyproject.toml` in sync (`aetherscan.def` + `Dockerfile` both pin the NGC base digest). Packages the NGC base provides (`tensorflow`, `tf_keras`, `h5py`, `hdf5plugin`, `psutil`, `pytest`, `pandas`) are intentionally **absent** from `requirements-container.txt` — that's convention, not drift.
+- Releases are SemVer (`vX.Y.Z`): the compatibility contract covers the CLI, artifact/config formats + model contract, and supported runtimes; highest bump wins, and **four** objects share one version string — git/PyPI, the GitHub Release, HF weights, and the GHCR image (a same-contract retrain is at least a MINOR). Full policy: [docs/RELEASE.md](docs/RELEASE.md#versioning-policy-semver).
 - Security: non-critical → GitHub Discussion w/ "security" label; critical → [@zachtheyek](https://breakthroughlisten.slack.com/archives/D01SJG0L0TE) on Slack, no public issue. Rotate any leaked token immediately.
 
 ## Code review

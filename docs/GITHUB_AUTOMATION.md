@@ -12,12 +12,13 @@ process is [`CONTRIBUTING.md`](../CONTRIBUTING.md); this is the machine side.
 Discussion → Issue ──────────────► PR ─────────────► merge to master ──► weekly upkeep
              │ auto-assign-author   │ auto-assign      │ claude-release-notes   │ claude-dependency-check
              │ claude-issue-triage  │ sync-pr-labels   │ claude-style-check     │ claude-flaky-test-tracker
-             │ claude-contribution- │ claude-code-      │ claude-update-docs
+             │ claude-contribution- │ claude-code-                              │ claude-update-docs
              │   check              │   review
                                     │ pre-commit + tests (required checks)
 ```
 
-Two workflow families: **deterministic** (pre-commit, tests, auto-assign, label sync) and
+Two workflow families: **deterministic** (pre-commit, tests, publish-image, auto-assign,
+label sync) and
 **assistant-driven** (`claude-*.yml` — each wraps `anthropics/claude-code-action` with a
 task-specific prompt, authenticated via the `CLAUDE_CODE_OAUTH_TOKEN` secret).
 
@@ -58,6 +59,22 @@ Runs `pytest -m "not gpu and not cluster and not integration" -q` on Python 3.10
 container's GPU build. Details in [`TESTING.md`](TESTING.md). Its run history is the data
 source for the flaky-test tracker below.
 
+### `publish-image.yml`
+
+**Trigger:** `workflow_call` (reusable — invoked by `release.yml`'s `image` job) and
+`workflow_dispatch` (backfill an older release's image, e.g.
+`-f version=1.0.0 -f ref=v1.0.0`).
+Builds the OCI image from the root [`Dockerfile`](../Dockerfile) and pushes
+`ghcr.io/zachtheyek/aetherscan:vX.Y.Z` — the container half of the release contract, and the
+4th version-synchronized release object. Auth is the built-in `GITHUB_TOKEN`
+(`packages: write`); no PAT or stored secret. It fingerprints its inputs (`Dockerfile` +
+`requirements-container.txt` — the source is bind-mounted, not baked in) as a `fp-<hash>` tag
+and **retags that existing digest** instead of rebuilding when the inputs are unchanged, so a
+code-only release reuses the published image. On the release dry run it is invoked with
+`push: false` and stops after validating its inputs. `release.yml`'s `publish` job `needs` it,
+so a real release can never reach PyPI without the image. Full contract (tag scheme, licensing,
+backfills) in [`RELEASE.md`](RELEASE.md).
+
 ### `auto-assign-author.yml`
 
 **Trigger:** issue or PR opened.
@@ -89,17 +106,18 @@ double-post.
 | [`claude-contribution-check.yml`](../.github/workflows/claude-contribution-check.yml) | Issue or PR opened | Verifies workflow compliance (issue linkage, branch-prefix conventions, template use) and comments when something's missing. **Never runs for bot authors, nor on maintainer-authored issues or PRs** — see the gotcha below. | — |
 | [`claude-release-notes.yml`](../.github/workflows/claude-release-notes.yml) | PR **merged** to master | Drafts a release-note entry as a PR comment — the curated raw material for release bodies (see [`RELEASE.md`](RELEASE.md)). | `<!-- claude-release-notes -->` first line of the comment |
 | [`claude-style-check.yml`](../.github/workflows/claude-style-check.yml) | PR merged to master | Scans the merged diff's *added* lines against the project style rules ruff can't express (docstring prose style, canonical comment markers, logging idioms); files one consolidated issue when violations exist. | `<!-- aetherscan-style-check pr=<N> -->` |
-| [`claude-update-docs.yml`](../.github/workflows/claude-update-docs.yml) | PR merged to master; `workflow_dispatch` with a `pr_number` (re-scan an old PR with the *current* workflow logic) | Detects doc drift caused by the merge. If `cli.py` changed, a **shell step** regenerates the README CLI Reference blocks with `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13) and embeds the output in the issue, because the follow-up assistant run has no `python` in its tool allowlist. The filed issue contains an intentional handle mention, which triggers `claude.yml` to open the actual docs PR. | `<!-- aetherscan-update-docs pr=<N> -->` |
-| [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `pyproject.toml` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
+| [`claude-update-docs.yml`](../.github/workflows/claude-update-docs.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` (#374 — was per-PR-merge) | Scans **every PR merged since the previous successful scheduled run** (8-day fallback) and reconciles the aggregate end state against the doc set; files at most ONE issue per week covering all gaps. If any PR in the window touched `cli.py`, a **shell step** regenerates the README CLI Reference blocks with `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13) off current master and embeds the output in the issue, because the follow-up assistant run has no `python` in its tool allowlist. The filed issue contains an intentional handle mention, which triggers `claude.yml` to open the actual docs PR. | `<!-- aetherscan-update-docs week=<WEEK> -->` (legacy per-merge issues carry `pr=<N>`) |
+| [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `Dockerfile` / `pyproject.toml` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; also flags base-image drift when `Dockerfile`'s `FROM ...@sha256:<digest>` diverges from `aetherscan.def`'s `From:` (base-provided packages — `tf_keras`, `h5py`, etc. — are intentionally absent from `requirements-container.txt` and are not drift). Files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
 | [`claude-flaky-test-tracker.yml`](../.github/workflows/claude-flaky-test-tracker.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Reads the week's `tests.yml` runs, identifies flaky/failing tests, diagnoses the worst offender, files a weekly report issue. | `<!-- aetherscan-flaky-test-tracker week=<WEEK> -->` |
 
 > [!NOTE]
 > **`claude-update-docs` is a two-step relay**, which is why its row is dense. Step 1 is a
-> deterministic shell step: when `cli.py` changed it regenerates the README CLI Reference with
+> deterministic shell step: when `cli.py` changed anywhere in the week's window it regenerates
+> the README CLI Reference with
 > `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13)
-> and files an issue embedding that output. Step 2 is the assistant: the filed issue carries an
-> intentional handle mention that triggers `claude.yml` to open the actual docs PR. The split
-> exists because the follow-up assistant run has no `python` in its tool allowlist, so it
+> and embeds that output into the filed issue. Step 2 is the assistant: the filed issue carries
+> an intentional handle mention that triggers `claude.yml` to open the actual docs PR. The
+> split exists because the follow-up assistant run has no `python` in its tool allowlist, so it
 > cannot regenerate the CLI help itself — the shell step must do it first.
 
 The dedup-marker pattern is a convention to preserve in any new workflow that posts content:

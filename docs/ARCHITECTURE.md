@@ -135,6 +135,10 @@ main-process threads.
 
 The order is load-bearing — each step depends on the previous:
 
+0. **Package import** — importing `aetherscan` runs [`src/aetherscan/__init__.py`](../src/aetherscan/__init__.py),
+   which does `os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")` before any submodule TF import,
+   so `from tensorflow import keras` resolves to `tf_keras` (#323). `setdefault`, so an explicit
+   env value (or the container's export) wins.
 1. `load_dotenv(find_dotenv())` — `.env` into `os.environ` before any module reads it
    (workers inherit the environment later).
 2. `init_config()` — the `Config` singleton; everything else reads it.

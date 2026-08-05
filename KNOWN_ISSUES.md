@@ -645,6 +645,44 @@ No action required. The alert is not exploitable in this project's usage.
 
 `pyproject.toml` / `requirements-container.txt` / `environment.yml` (the `setuptools>=78.1.1,<81` pin and its rationale comment), issue #4 (the `pkg_resources`/`blimpy` coupling that fixes the `<81` ceiling).
 
+---
+
+## 19. v1.0.0 pip/conda Install Cannot Load the Encoder (legacy Keras)
+
+### Symptom
+
+After a clean `pip install aetherscan==1.0.0` (or a conda env built from the v1.0.0 `environment.yml`), inference fails while loading the encoder:
+
+```
+TypeError: Could not locate class 'Functional'. Make sure custom classes are decorated with
+`@keras.saving.register_keras_serializable()`. Full object config: {'module': 'tf_keras.src.engine.functional', ...}
+```
+
+### Cause
+
+The released `.keras` weights are **Keras-2** (`tf_keras`) artifacts, but no v1.0.0 manifest pulls `tf_keras` and TF 2.17 defaults to **Keras 3** unless `TF_USE_LEGACY_KERAS=1` is set. Keras 3 therefore tries to deserialize a `tf_keras.src.engine.functional` config it has no class for. See issue #323.
+
+### Impact
+
+**pip / conda install paths only.** The NGC container path is unaffected — its base image ships `tf_keras` 2.17 and already sets `TF_USE_LEGACY_KERAS`. Training on a fresh pip install is also unaffected until it reloads a released checkpoint; the failure is specific to loading the v1.0.0 artifacts.
+
+### Workaround
+
+Install `tf_keras` and set the flag before running — the two extra steps in [Install From PyPI (pip)](README.md#install-from-pypi-pip):
+
+```bash
+pip install "tf_keras~=2.17.0"
+export TF_USE_LEGACY_KERAS=1
+```
+
+### Status
+
+**Fixed from v1.1.0** by PR #340: `tf_keras==2.17.*` is a declared dependency in `pyproject.toml` / `environment.yml`, and `src/aetherscan/__init__.py` sets `TF_USE_LEGACY_KERAS=1` via `os.environ.setdefault` at package-import time (`aetherscan.def`'s `%environment` and the `Dockerfile`'s `ENV` export it explicitly too). The workaround is needed only for the published **v1.0.0** wheel / env manifest.
+
+### Related Code
+
+`src/aetherscan/__init__.py` (the `setdefault`), `pyproject.toml` / `environment.yml` (the `tf_keras==2.17.*` pin), `requirements-container.txt` (intentionally omits it — the NGC base provides it), `aetherscan.def` / `Dockerfile` (the explicit exports), `src/aetherscan/models/vae.py` (the `Sampling` back-compat serialization comment).
+
 ## Pre-#283 saved configs: `training.seed` / `training.tf_deterministic_ops` are silently skipped on restore
 
 PR #283 (issue #279) moved the root seed to `reproducibility.seed` (new default **11**) and
