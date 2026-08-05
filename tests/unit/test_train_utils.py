@@ -2,9 +2,10 @@
 
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
 schedules, directory archiving, encoder-trained heuristics, the val-AUC quality floor, SHAP
-output normalization, the rf_train dataset producer-await/fallback composition
-(_obtain_rf_dataset), the rf_plots overlap coordinator (plot_rf_diagnostics), and the training
-stage machine (skip-if-done / record-failure semantics against a stub pipeline)."""
+output normalization, the SHAP disk-cache consistency guards (#359), the rf_train dataset
+producer-await/fallback composition (_obtain_rf_dataset), the rf_plots overlap coordinator
+(plot_rf_diagnostics), and the training stage machine (skip-if-done / record-failure semantics
+against a stub pipeline)."""
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import os
 import threading
 import types
 
+import joblib
 import numpy as np
 import pytest
 
@@ -38,6 +40,7 @@ from aetherscan.train import (
     TrainingPipeline,
     _execute_training_stages,
     _resolve_load_tag,
+    _shap_cache_consistent,
     archive_directory,
     build_epoch_history,
     check_encoder_trained,
@@ -767,6 +770,265 @@ class TestPlotRfDiagnosticsOverlap:
         pipeline = self._pipeline(log, artifacts_error=FileNotFoundError("no artifacts"))
         pipeline.plot_rf_diagnostics()
         assert log == self.NON_SHAP[:2] + self.SHAP + self.NON_SHAP[2:]
+
+
+def _shap_payload(n_summary=8, n_interact=4, n_features=6, n_val=32):
+    """A well-formed rf_shap_values_{tag} payload, indices drawn in-range for `n_val`."""
+    rng = np.random.default_rng(0)
+    return {
+        "shap_values_summary": np.zeros((n_summary, n_features), dtype=np.float32),
+        "summary_indices": np.sort(rng.choice(n_val, size=n_summary, replace=False)),
+        "shap_values_interaction": np.zeros((n_interact, n_features, n_features), dtype=np.float32),
+        "interaction_indices": np.sort(rng.choice(n_val, size=n_interact, replace=False)),
+        "shap_values_logloss": np.zeros((n_summary, n_features), dtype=np.float32),
+        "expected_value": 0.5,
+    }
+
+
+class TestShapCacheConsistent:
+    """_shap_cache_consistent (#359): shape-only validation of a disk-cached SHAP payload
+    against the eval artifacts + config in hand — the cache is keyed on {tag} alone, so every
+    mismatch here is a stale-cache-under-a-reused-tag scenario."""
+
+    def test_matching_payload_accepted(self):
+        assert _shap_cache_consistent(
+            _shap_payload(), n_val=32, n_features=6, n_summary=8, n_interact=4
+        )
+
+    def test_summary_count_mismatch_rejected(self):
+        # shap_max_samples_summary changed between the cache write and this run
+        assert not _shap_cache_consistent(
+            _shap_payload(n_summary=8), n_val=32, n_features=6, n_summary=16, n_interact=4
+        )
+
+    def test_interaction_count_mismatch_rejected(self):
+        assert not _shap_cache_consistent(
+            _shap_payload(n_interact=4), n_val=32, n_features=6, n_summary=8, n_interact=2
+        )
+
+    def test_out_of_range_summary_indices_rejected(self):
+        # cache written against a larger val split than the current artifacts carry — counts
+        # can still match, so the index-range check is what catches it
+        payload = _shap_payload(n_summary=8, n_val=32)
+        payload["summary_indices"] = np.array([0, 1, 2, 3, 4, 5, 6, 600])
+        assert not _shap_cache_consistent(
+            payload, n_val=32, n_features=6, n_summary=8, n_interact=4
+        )
+
+    def test_feature_width_mismatch_rejected(self):
+        # a different latent variant won under the same tag → different feature width
+        assert not _shap_cache_consistent(
+            _shap_payload(n_features=6), n_val=32, n_features=48, n_summary=8, n_interact=4
+        )
+
+
+class TestComputeOrLoadShapValuesCacheGuard:
+    """_compute_or_load_shap_values (#359): the on-disk cache is returned only when it passes
+    the consistency guard; a stale payload is recomputed and its file overwritten."""
+
+    N_VAL = 32
+    N_FEATURES = 6
+
+    def _artifacts(self):
+        rng = np.random.default_rng(1)
+        return {
+            "tag": "test_v1",
+            "train_features": rng.normal(size=(64, self.N_FEATURES)).astype(np.float32),
+            "val_features": rng.normal(size=(self.N_VAL, self.N_FEATURES)).astype(np.float32),
+            "val_binary_labels": (np.arange(self.N_VAL) % 2).astype(np.int64),
+        }
+
+    def _pipeline(self, n_summary=8, n_interact=4):
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline.config.training.shap_max_samples_summary = n_summary
+        pipeline.config.training.shap_max_samples_interaction = n_interact
+        pipeline.config.manager.n_processes = 1
+        pipeline._rf_shap_cache = {}
+        pipeline.rf_model = types.SimpleNamespace(model={"stub": "rf"})
+        return pipeline
+
+    def _shap_path(self, config, tag="test_v1"):
+        return os.path.join(
+            config.model_path, f"rf_shap_values_{display_tag(tag, get_machine_name())}.joblib"
+        )
+
+    def _stub_compute(self, monkeypatch, calls):
+        """Replace the SHAP pool + explainer with counting stubs so the recompute path runs
+        without the real TreeSHAP machinery."""
+        import contextlib as _contextlib  # noqa: PLC0415
+
+        import aetherscan.train as train_module  # noqa: PLC0415
+
+        @_contextlib.contextmanager
+        def _fake_pool(rf_path, n_workers, background=None):
+            def _run_pass(name, features, y=None):
+                calls.append(name)
+                if name == "interaction":
+                    return np.zeros(
+                        (len(features), features.shape[1], features.shape[1]),
+                        dtype=np.float32,
+                    )
+                return np.zeros((len(features), features.shape[1]), dtype=np.float32)
+
+            yield _run_pass
+
+        monkeypatch.setattr(train_module, "shap_pool", _fake_pool)
+        monkeypatch.setattr(
+            train_module,
+            "shap",
+            types.SimpleNamespace(
+                TreeExplainer=lambda model: types.SimpleNamespace(expected_value=[0.3, 0.7])
+            ),
+        )
+
+    def test_consistent_cache_returned_without_recompute(self, monkeypatch):
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        payload = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(payload, shap_path)
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
+        assert calls == []  # never entered the compute path
+        assert np.array_equal(result["summary_indices"], payload["summary_indices"])
+        assert pipeline._rf_shap_cache["test_v1"] is result
+
+    def test_stale_cache_recomputed_and_overwritten(self, monkeypatch, caplog):
+        # The cache on disk was written when shap_max_samples_summary was 8; this run wants 16.
+        pipeline = self._pipeline(n_summary=16, n_interact=4)
+        stale = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(stale, shap_path)
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
+        assert any("recomputing" in r.message for r in caplog.records)
+        assert calls == ["summary", "interaction", "logloss"]
+        assert result["shap_values_summary"].shape == (16, self.N_FEATURES)
+        assert len(result["summary_indices"]) == 16
+        # the stale file was overwritten with the fresh payload
+        assert len(joblib.load(shap_path)["summary_indices"]) == 16
+
+
+class TestShapClusteringCacheGuard:
+    """plot_rf_shap_explanation_clustering (#359): a cached UMAP/KMeans joblib whose row count
+    no longer matches the SHAP values is refit and overwritten instead of IndexError-ing —
+    the clustering joblib and the SHAP-values joblib are separate {tag}-keyed caches that can
+    go out of sync when only one is regenerated."""
+
+    N_SUMMARY = 24
+    N_VAL = 40
+    N_FEATURES = 4
+
+    def _pipeline(self, monkeypatch, umap_fits: list | None = None):
+        rng = np.random.default_rng(2)
+        subtypes = np.array(["false_no_signal", "false_with_rfi", "true_only_eti", "true_eti_rfi"])[
+            np.arange(self.N_VAL) % 4
+        ]
+        artifacts = {
+            "tag": "test_v1",
+            "val_subtype_labels": subtypes,
+            "val_binary_labels": (np.arange(self.N_VAL) % 2).astype(np.int64),
+            "val_preds": (np.arange(self.N_VAL) % 3 == 0).astype(np.int64),
+            "classification_threshold": 0.5,
+        }
+        shap_data = {
+            "shap_values_summary": rng.normal(size=(self.N_SUMMARY, self.N_FEATURES)).astype(
+                np.float32
+            ),
+            "summary_indices": np.sort(rng.choice(self.N_VAL, size=self.N_SUMMARY, replace=False)),
+        }
+
+        pipeline = TrainingPipeline.__new__(TrainingPipeline)
+        pipeline.config = get_config()
+        pipeline._load_rf_eval_artifacts = lambda tag=None: artifacts
+        pipeline._compute_or_load_shap_values = lambda artifacts: shap_data
+
+        # Stub UMAP + KMeans: the guard under test decides whether they run at all, and real
+        # fits (numba JIT) would dominate the test's wall time without testing our logic.
+        fits = umap_fits if umap_fits is not None else []
+
+        class _FakeUmap:
+            def __init__(self, **kwargs):
+                pass
+
+            def fit(self, values):
+                fits.append("umap")
+                return self
+
+            def transform(self, values):
+                return np.zeros((len(values), 2), dtype=np.float32)
+
+        class _FakeKmeans:
+            def __init__(self, **kwargs):
+                pass
+
+            def fit_predict(self, values):
+                return np.arange(len(values)) % 4
+
+        import aetherscan.train as train_module  # noqa: PLC0415
+
+        monkeypatch.setattr(train_module, "umap", types.SimpleNamespace(UMAP=_FakeUmap))
+        monkeypatch.setattr(train_module, "KMeans", _FakeKmeans)
+        return pipeline
+
+    def _clustering_path(self, config, tag="test_v1"):
+        return os.path.join(
+            config.model_path,
+            f"rf_shap_clustering_{display_tag(tag, get_machine_name())}.joblib",
+        )
+
+    def test_stale_clustering_cache_refit_and_overwritten(self, monkeypatch, caplog):
+        fits = []
+        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        clustering_path = self._clustering_path(pipeline.config)
+        os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+        # Written by an earlier run whose n_summary was 10 — stale against today's 24.
+        joblib.dump(
+            {
+                "embedding": np.zeros((10, 2), dtype=np.float32),
+                "cluster_labels": np.zeros(10, dtype=np.int64),
+            },
+            clustering_path,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            TrainingPipeline.plot_rf_shap_explanation_clustering(pipeline, tag="test_v1")
+
+        assert any("refitting" in r.message for r in caplog.records)
+        assert fits == ["umap"]
+        refit = joblib.load(clustering_path)
+        assert len(refit["embedding"]) == self.N_SUMMARY
+        assert len(refit["cluster_labels"]) == self.N_SUMMARY
+
+    def test_matching_clustering_cache_used_without_refit(self, monkeypatch):
+        fits = []
+        pipeline = self._pipeline(monkeypatch, umap_fits=fits)
+        clustering_path = self._clustering_path(pipeline.config)
+        os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+        joblib.dump(
+            {
+                "embedding": np.zeros((self.N_SUMMARY, 2), dtype=np.float32),
+                "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
+            },
+            clustering_path,
+        )
+
+        TrainingPipeline.plot_rf_shap_explanation_clustering(pipeline, tag="test_v1")
+
+        assert fits == []  # cache accepted, no refit
 
 
 class _StageMachineStub:
