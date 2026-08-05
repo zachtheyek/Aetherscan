@@ -35,7 +35,7 @@ Forward compatibility is a CUDA feature, not a TF feature, so the same trick wil
 > [!NOTE]
 > A `.devN`/`master` checkout resolves to the constant `:latest`, which exists only once the first release *after* the image was introduced ships — until then the pull can't serve it and the wrapper **exits with `aetherscan.def` build instructions** (it never builds for you — see the fallback below). Once a later release *moves* `:latest`, a `.devN` checkout keeps whatever `.sif` it first cached, so `rm` the `.sif` and its `.pulled-tag` sidecar to pick the new one up. A local build placed over a pulled `.sif` is detected by mtime and kept, never clobbered.
 
-**Fallback — build from `aetherscan.def`.** Build only when the pull can't serve your host: a non-x86_64 host, a driver below the CUDA 12.8 floor, local `requirements-container.txt` edits, or a checkout with no matching published tag yet. The single recipe builds with either runtime; build on the cluster you intend to run on:
+**Fallback — build from `aetherscan.def`.** Build only when the pull can't serve your host: a non-x86_64 host, a driver below the CUDA 12.8 floor, local `requirements-container.txt` edits, or no matching published image — a `master`/`.devN` checkout before the next release publishes `:latest`, or one whose `requirements-container.txt` has moved past the last release (`:latest` tracks the newest release, not master). The single recipe builds with either runtime; build on the cluster you intend to run on:
 
 ```bash
 cd /path/to/Aetherscan
@@ -100,7 +100,7 @@ export SINGULARITY_CACHEDIR=/datax/scratch/$USER/singularity-cache
 `TMPDIR` needs ~15 GB free; `CACHEDIR` caches Docker base-layer blobs (a few GB, persists across rebuilds — keep it). Worth adding to `~/.bashrc` if you rebuild often. On an **Apptainer** host (e.g. the Ampere cluster) use the `APPTAINER_TMPDIR` / `APPTAINER_CACHEDIR` equivalents instead — Apptainer reads those first and falls back to the `SINGULARITY_*` names.
 
 > [!NOTE]
-> **On a `pull` you won't see the `noexec` FATAL above** (there's no `%post` root filesystem to exec), but set the same two vars anyway *before* the first `run_container.sh` call — the runtime unpacks the ~9 GB image through `TMPDIR`/`CACHEDIR`, so on a quota'd `$HOME` an unset pair lands the unpack in `$HOME` and fills it. The fakeroot / `noexec` items above are build-only.
+> **On a `pull` you won't see the `noexec` FATAL above** (there's no `%post` root filesystem to exec), but set the same two vars anyway *before* the first `run_container.sh` call — the runtime unpacks the ~9 GB image through them, so leaving them unset fills `TMPDIR`'s default `/tmp` (the staging area, ~15 GB) and/or `CACHEDIR`'s default under `$HOME` (the blob cache) — both likely to fail on a hardened node. The fakeroot / `noexec` items above are build-only.
 
 **Build fails in `%post` with `Could not open requirements file: /tmp/...`**
 
