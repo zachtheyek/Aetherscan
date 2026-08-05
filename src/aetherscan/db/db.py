@@ -456,6 +456,10 @@ class Database:
                 ON latent_snapshots(tag, round_number, epoch_number, step_number,
                                     model_name, timestamp)
             """)
+            # A second latent_snapshots index exists — idx_latent_snapshots_keys, the v9
+            # covering partial for query_latent_snapshot_keys — but its CREATE lives only
+            # in _migrate_schema (its WHERE superseded = 0 predicate needs the v1 column;
+            # same convention as idx_inference_results_supersede below).
 
             # Inference results table
             cursor.execute("""
@@ -670,7 +674,13 @@ class Database:
             # NOTE: on an existing catalog-scale DB (~190M injection_stats rows / 80 GB)
             # the by_round build is a one-time full-table scan + sort — expect the FIRST
             # pipeline launch against such a DB after this upgrade to stall here for
-            # minutes to tens of minutes. Subsequent launches are unaffected.
+            # minutes to tens of minutes (and budget transient WAL disk headroom well
+            # beyond the final index size). Subsequent launches are unaffected.
+            logger.info(
+                "Schema migration: v9 building idx_injection_stats_by_round — on a "
+                "catalog-scale DB this is a one-time full-table scan + sort that can take "
+                "minutes to tens of minutes; do not interrupt"
+            )
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_round
                 ON injection_stats(tag, round_number, timestamp)
@@ -2165,10 +2175,12 @@ class Database:
                 query = self._add_str_filter(query, params, "stat_name", stat_name)
 
             # `+round_number`: the unary plus keeps the term out of index selection
-            # (semantics unchanged). Without it, the no-ANALYZE planner prefers
-            # idx_injection_stats_by_round's leading range over by_stat's equality
-            # prefix for the ~165-query plot pass — re-creating the pre-v7 pathology
-            # (see the v9 entry in the version-history comment).
+            # (semantics unchanged for the int-typed params this API takes — the `+` also
+            # drops column affinity, so a numeric *string* bound here would no longer
+            # coerce; the signature's `int | None` is the boundary). Without it, the
+            # no-ANALYZE planner prefers idx_injection_stats_by_round's leading range over
+            # by_stat's equality prefix for the ~165-query plot pass — re-creating the
+            # pre-v7 pathology (see the v9 entry in the version-history comment).
             if start_round_number is not None:
                 query += " AND +round_number >= ?"
                 params.append(start_round_number)
