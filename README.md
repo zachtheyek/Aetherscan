@@ -105,6 +105,8 @@ apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:
 singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.0.0
 ```
 
+A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build and keeps it across version bumps. Let `run_container.sh` do the pulling if you want it to track the pinned tag for you; otherwise `rm` the `.sif` when you bump versions.
+
 **Build locally instead** — necessary when the prebuilt image doesn't fit the host:
 
 - **non-x86_64 host** (e.g. aarch64 Grace/GH200): the published image is `linux/amd64` only;

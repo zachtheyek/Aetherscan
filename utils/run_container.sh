@@ -103,9 +103,12 @@ fi
 #
 # The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
 # that release's image; a .devN checkout has no per-version image and falls back to :latest. A
-# PULLED image records its tag in "$SIF.pulled-tag"; if a later checkout wants a different tag
-# (e.g. a version bump that changed the image), we re-pull instead of silently running the old
-# one. A user-BUILT .sif has no sidecar and is always used as-is.
+# PULLED image records its tag in "$SIF.pulled-tag"; if a later checkout wants a different tag we
+# re-pull instead of silently running the old one (tag-triggered, so every version bump re-pulls —
+# a digest-identical retag included). A user-BUILT .sif is always used as-is: it has no sidecar at
+# all, or — if built over a previously pulled image — is newer than one (see the mtime note below).
+# NOTE: a MANUAL `pull`/`build` to $SIF likewise writes no sidecar, so the wrapper keeps it across
+# version bumps — let run_container.sh do the pulling if you want it to track the pinned tag.
 #
 # GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
 # If any of these hold, BUILD from aetherscan.def instead of pulling:
