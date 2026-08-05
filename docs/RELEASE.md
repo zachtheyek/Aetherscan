@@ -38,7 +38,7 @@ Two invariants to internalize:
   the tag by CD. There is nothing further to "sync" between PyPI and GitHub.
 - **HF and GHCR carry a tag *per version*, but reuse *content* when nothing changed.** A release
   whose weights didn't change re-points its HF tag at the same training commit; a release whose
-  image inputs (NGC base digest + `requirements-container.txt`) didn't change retags the same
+  image inputs (the `Dockerfile` — base digest, labels, layers — and `requirements-container.txt`) didn't change retags the same
   GHCR digest. So `v1.0.0` and `v1.1.0` can be byte-identical weights/image under distinct
   version tags — each checkout still pulls *its own* tag. See
   [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change).
@@ -190,8 +190,8 @@ impossible:
    [`Dockerfile`](../Dockerfile) and pushes it to `ghcr.io/zachtheyek/aetherscan:vX.Y.Z` (auth is
    the built-in `GITHUB_TOKEN` with `packages: write` — no PAT). It runs in parallel with the
    build and **gates the PyPI publish** (step 7 `needs` it), so a real release never reaches PyPI
-   unless the image is up. The image is rebuilt only when its inputs (the NGC base digest +
-   `requirements-container.txt`) change; otherwise it **retags the existing digest** under the new
+   unless the image is up. The image is rebuilt only when its inputs (the whole `Dockerfile`, base
+   digest included, plus `requirements-container.txt`) change; otherwise it **retags the existing digest** under the new
    version — the Aetherscan code is bind-mounted at runtime, not baked in, so a code-only release
    reuses the prior image (see
    [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change)). On
@@ -354,7 +354,7 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 ## Version bump with no weights or image change
 
 Most releases change only code (a bug fix, a new flag). Weights change only on a retrain; the
-container image changes only when the NGC base digest or `requirements-container.txt` changes (the
+container image changes only when the `Dockerfile` (its base digest, labels, or layers) or `requirements-container.txt` changes (the
 Aetherscan code is **bind-mounted at runtime, not baked into the image**). So a release often needs
 **no new weights and no new image** — but the vX.Y.Z contract still wants a tag for each, so a
 `v1.0.0` and a `v1.1.0` checkout each pull *their own* tag. The rule is **new tag, reused content**:
@@ -364,11 +364,12 @@ Aetherscan code is **bind-mounted at runtime, not baked into the image**). So a 
 | PyPI / GitHub | always (code is versioned) | build + publish `vX.Y.Z` from the tag |
 | **HF weights** | did **not** retrain | re-bless: `hf_tag_release.py --save-tag <old train tag> --release vX.Y.Z` → a new HF tag on the **same commit** as the prior release |
 | **HF weights** | retrained | train `--hf-upload`, then bless the **new** training tag (runbook steps 2 + 5) |
-| **GHCR image** | base digest + `requirements-container.txt` unchanged | CD **retags the existing digest** to `vX.Y.Z` automatically — no rebuild (its input fingerprint already exists in GHCR) |
-| **GHCR image** | base or requirements changed | CD **rebuilds** and pushes a new digest as `vX.Y.Z` |
+| **GHCR image** | `Dockerfile` (base digest, labels, layers) + `requirements-container.txt` unchanged | CD **retags the existing digest** to `vX.Y.Z` automatically — no rebuild (its input fingerprint `fp-<hash>` already exists in GHCR) |
+| **GHCR image** | any `Dockerfile` or `requirements-container.txt` change | CD **rebuilds** and pushes a new digest as `vX.Y.Z` |
 
-You do nothing special for the image: the `image` job fingerprints its inputs (base digest +
-`requirements-container.txt`) and decides build-vs-retag on its own. For weights the only manual
+You do nothing special for the image: the `image` job fingerprints its inputs (the whole `Dockerfile`
+— base digest, labels, and layers — plus `requirements-container.txt`) into an `fp-<hash>` marker tag
+and decides build-vs-retag on its own. For weights the only manual
 choice is *which* training tag to bless — the existing one (no retrain) or a fresh one (retrain).
 Either way both `v1.0.0` and `v1.1.0` end up as real tags on HF **and** GHCR: a v1.0.0 checkout
 pulls `:v1.0.0`, a v1.1.0 checkout pulls `:v1.1.0`, and when nothing changed those tags resolve to
@@ -417,7 +418,8 @@ publishing an older version never regresses `:latest`, which `run_container.sh` 
 checkouts. If you ever need to move it, pass `-f latest=true`.
 
 **Until the first release *after* this lands, there is no `:latest`** — the backfill above publishes
-only `:v1.0.0`. A `.devN`/`master` checkout therefore can't pull and must build from `aetherscan.def`
+`:v1.0.0` (plus its internal `fp-<hash>` marker tag) and does **not** move `:latest`. A
+`.devN`/`master` checkout therefore can't pull and must build from `aetherscan.def`
 (the wrapper says so and exits). This is deliberate: master's `requirements-container.txt` has
 already moved past v1.0.0's (notably the `streamlit` security bump), so pinning `:latest` to the
 backfilled v1.0.0 image would serve dev checkouts a knowingly stale dependency set. The next real

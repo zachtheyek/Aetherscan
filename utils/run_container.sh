@@ -20,8 +20,8 @@
 #                               (default: <repo>/aetherscan-ngc25.02.sif). If it doesn't exist
 #                               it's pulled from GHCR (see below); if the pull fails the wrapper
 #                               prints aetherscan.def build instructions and exits.
-#     AETHERSCAN_IMAGE          GHCR image repo to pull when the .sif is absent
-#                               (default: ghcr.io/zachtheyek/aetherscan)
+#     AETHERSCAN_IMAGE          GHCR image repo to pull (when the .sif is absent, or a re-pull is
+#                               triggered) (default: ghcr.io/zachtheyek/aetherscan)
 #     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version>, or `latest`
 #                               on a .devN checkout that has no per-version image)
 #     AETHERSCAN_DATA_PATH      Host data dir, bound 1:1
@@ -103,14 +103,15 @@ fi
 #
 # The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
 # that release's image; a .devN checkout has no per-version image and falls back to :latest. A
-# PULLED image records its tag in "$SIF.pulled-tag"; if a later checkout wants a different tag we
-# re-pull instead of silently running the old one. The trigger is a change in the TAG STRING, so a
-# release-tag checkout re-pulls on every bump (digest-identical retag included), while a .devN
-# checkout always wants the constant :latest and so keeps whatever it first cached even as :latest
-# moves — rm the .sif (and its sidecar) to pick that up. A user-BUILT .sif is always used as-is: it
-# has no sidecar at all, or — if built over a previously pulled image — is newer than one (see the
-# mtime note below). A MANUAL pull/build to $SIF likewise writes no sidecar, so it too is kept
-# across bumps — let run_container.sh do the pulling if you want it to track the pinned tag.
+# PULLED image records its full ref (repo:tag) in "$SIF.pulled-tag"; if a later checkout — or a
+# different AETHERSCAN_IMAGE — wants a different ref we re-pull instead of silently running the old
+# one. The trigger is a change in that REF string, so a release-tag checkout re-pulls on every bump
+# (digest-identical retag included), while a .devN checkout always wants the constant :latest and so
+# keeps whatever it first cached even as :latest moves — rm the .sif (and its sidecar) to pick that
+# up. A user-BUILT .sif is always used as-is: it has no sidecar at all, or — if built over a
+# previously pulled image — is newer than one (see the mtime note below). A MANUAL pull/build to
+# $SIF likewise writes no sidecar, so it too is kept across bumps — let run_container.sh do the
+# pulling if you want it to track the pinned ref.
 #
 # GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
 # If any of these hold, BUILD from aetherscan.def instead of pulling:
@@ -143,9 +144,9 @@ need_pull=0
 if [[ ! -f "$SIF" ]]; then
     need_pull=1
 elif [[ -f "$SIF.pulled-tag" && ! "$SIF" -nt "$SIF.pulled-tag" \
-        && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$AETHERSCAN_IMAGE_TAG" ]]; then
+        && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$IMAGE_REF" ]]; then
     echo "Cached $SIF was pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null)' but this checkout wants" \
-         "'$AETHERSCAN_IMAGE_TAG' — re-pulling." >&2
+         "'$IMAGE_REF' — re-pulling." >&2
     need_pull=1
 fi
 
@@ -164,7 +165,7 @@ if [[ $need_pull -eq 1 ]]; then
     rm -f "$tmp"
     if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
         mv -f "$tmp" "$SIF"
-        printf '%s\n' "$AETHERSCAN_IMAGE_TAG" >"$SIF.pulled-tag"
+        printf '%s\n' "$IMAGE_REF" >"$SIF.pulled-tag"
         trap - EXIT INT TERM
         echo "Pulled and cached $SIF ($AETHERSCAN_IMAGE_TAG)." >&2
     else
