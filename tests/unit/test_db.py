@@ -624,14 +624,18 @@ class TestSchemaMigration:
         "inference_results",
     )
 
-    # The complete expected index set per table — the v7 index sweep's final state. Both
-    # _init_database() (fresh dbs) and the `if version < 7` migration block (pre-v7 dbs)
-    # must land exactly here, so tests assert equality, not membership.
+    # The complete expected index set per table — the v9 audit's final state. Both
+    # _init_database() (fresh dbs) and the migration blocks (older dbs) must land exactly
+    # here, so tests assert equality, not membership.
     _EXPECTED_INDEXES = {
         "system_resources": {"idx_system_resources_filter"},
-        "injection_stats": {"idx_injection_stats_filter", "idx_injection_stats_by_stat"},
+        "injection_stats": {
+            "idx_injection_stats_filter",
+            "idx_injection_stats_by_stat",
+            "idx_injection_stats_by_round",
+        },
         "training_stats": {"idx_training_stats_filter"},
-        "latent_snapshots": {"idx_latent_snapshots_by_key"},
+        "latent_snapshots": {"idx_latent_snapshots_by_key", "idx_latent_snapshots_keys"},
         "inference_results": {"idx_inference_results_filter", "idx_inference_results_supersede"},
         "inference_cadences": {"idx_inference_cadences_filter"},
         "pipeline_stages": {"idx_pipeline_stages_filter"},
@@ -975,6 +979,103 @@ class TestInjectionStatTimeSpan:
         assert _wait_backlog_empty(db)
         db.mark_superseded("injection_stats", tag="span_v2", round_ge=1)
         assert db.query_injection_stat_time_span(tag="span_v2") == (50.0, 60.0)
+
+
+class TestV9IndexPlannerContracts:
+    """The v9 by_round index (#375) must serve the supersede/time-span shapes WITHOUT
+    stealing the plot-pass plans from idx_injection_stats_by_stat — the `+round_number`
+    guards in query_injection_stat / query_injection_stat_stability enforce the latter.
+    Pin both directions with EXPLAIN QUERY PLAN on the real schema (no ANALYZE, matching
+    production, where the un-stat'd cost model would otherwise prefer the leading-range
+    index). The SQL literals mirror the shapes the builders emit."""
+
+    def _plan(self, db, sql, params=()):
+        conn = sqlite3.connect(db.db_path)
+        try:
+            rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+        finally:
+            conn.close()
+        return " | ".join(str(row) for row in rows)
+
+    @pytest.fixture()
+    def seeded(self, db):
+        # A few real rows so the planner works against a non-degenerate table.
+        rows = _bulk_rows(6, round_number=1) + _bulk_rows(6, round_number=2)
+        db.write_injection_stats_bulk(rows, tag="plan_v1")
+        assert _wait_backlog_empty(db)
+        return db
+
+    def test_supersede_update_shape_uses_by_round(self, seeded):
+        plan = self._plan(
+            seeded,
+            "UPDATE injection_stats SET superseded = 1"
+            " WHERE superseded = 0 AND tag = ? AND round_number >= ?",
+            ("plan_v1", 2),
+        )
+        assert "idx_injection_stats_by_round" in plan
+
+    def test_time_span_shape_uses_by_round_covering(self, seeded):
+        plan = self._plan(
+            seeded,
+            "SELECT MIN(timestamp), MAX(timestamp) FROM injection_stats"
+            " WHERE tag = ? AND round_number >= ? AND round_number <= ?",
+            ("plan_v1", 1, 2),
+        )
+        assert "idx_injection_stats_by_round" in plan
+        assert "COVERING" in plan.upper()
+
+    def test_guarded_plot_shape_stays_off_by_round(self, seeded):
+        # query_injection_stat's guarded round terms (`+round_number`): the v7 stat-scoped
+        # plan must survive by_round's presence.
+        plan = self._plan(
+            seeded,
+            "SELECT * FROM injection_stats WHERE 1=1 AND stat_name = ?"
+            " AND +round_number >= ? AND +round_number <= ?"
+            " AND injection_stage = ? AND tag = ? AND superseded = 0",
+            ("drift_hz", 1, 2, "post", "plan_v1"),
+        )
+        assert "idx_injection_stats_by_round" not in plan
+
+    def test_guarded_stability_shape_stays_off_by_round(self, seeded):
+        # query_injection_stat_stability's guarded aggregate shape, WITHOUT timestamp
+        # bounds — the hardest case: with a bare GROUP BY round_number the planner picks
+        # by_round(tag=?) purely for its free grouping order, so the builder guards the
+        # GROUP BY/ORDER BY with `+` as well.
+        plan = self._plan(
+            seeded,
+            "SELECT round_number, COUNT(*) FROM injection_stats"
+            " WHERE 1=1 AND stat_name = ? AND +round_number >= ? AND tag = ?"
+            " AND superseded = 0 GROUP BY +round_number ORDER BY +round_number",
+            ("drift_hz", 1, "plan_v1"),
+        )
+        assert "idx_injection_stats_by_round" not in plan
+
+    def test_latent_keys_query_is_covering_on_partial_index(self, db):
+        db.write_latent_snapshot(
+            model_name="beta_vae",
+            round_number=1,
+            epoch_number=1,
+            step_number=10,
+            cadence_index=0,
+            signal_type="true_only_eti",
+            latent_vector=[0.0] * 8,
+            snr_base=1,
+            snr_range=99,
+            tag="plan_v2",
+        )
+        assert db.flush(timeout=10.0)
+        # query_latent_snapshot_keys' default shape: bare superseded = 0 proves the
+        # partial predicate; the projection + ORDER BY come from index order.
+        plan = self._plan(
+            db,
+            "SELECT DISTINCT model_name, round_number, epoch_number, step_number,"
+            " snr_base, snr_range FROM latent_snapshots"
+            " WHERE 1=1 AND tag = ? AND timestamp >= ? AND superseded = 0"
+            " ORDER BY model_name, round_number, epoch_number, step_number",
+            ("plan_v2", 0.0),
+        )
+        assert "idx_latent_snapshots_keys" in plan
+        assert "COVERING" in plan.upper()
 
 
 class TestBulkLane:

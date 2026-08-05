@@ -88,7 +88,18 @@ _MARK_SUPERSEDED_SENTINEL = object()
 #     index led with (tag, timestamp, ...), so the once-per-cadence supersede UPDATE (which
 #     BLOCKS the inference thread via the writer-queue sentinel) visited every live row of
 #     the tag partition — a quadratic-in-catalog term on RFI-dense 6k-cadence runs (#301).
-_SCHEMA_VERSION = 8
+# v9: the #375 index audit. Added idx_injection_stats_by_round (tag, round_number,
+#     timestamp) — before it, round_number appeared in NO injection_stats index, so the
+#     training-resume supersede UPDATE (writer-thread-blocking) and the round-bounded
+#     time-span aggregate each row-fetched the tag's entire partition (~190M rows on a
+#     catalog DB) to test the round predicate. Because the no-ANALYZE planner prefers a
+#     leading-range index over by_stat's equality columns, the round-bound terms in
+#     query_injection_stat / query_injection_stat_stability are written `+round_number`
+#     (unary plus = not usable for index selection) so the v7 plot-pass plans are
+#     untouched. Also added idx_latent_snapshots_keys, a covering partial index (WHERE
+#     superseded = 0) for query_latent_snapshot_keys' DISTINCT scan — previously a
+#     whole-partition row fetch through latent_vector JSON payloads once per GIF pass.
+_SCHEMA_VERSION = 9
 
 
 # Per-process cache for get_system_metadata(): every field (hostname, user, outbound IP, PID)
@@ -357,6 +368,21 @@ class Database:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_injection_stats_by_stat
                 ON injection_stats(tag, stat_name, signal_type, injection_stage, timestamp)
+            """)
+
+            # Round-scoped index (schema v9, #375): serves exactly two consumers — the
+            # training-resume supersede UPDATE (superseded=0 AND tag=? AND round_number>=?,
+            # which blocks the writer thread) and query_injection_stat_time_span's round
+            # bounds — as a bounded (tag, round-range) seek instead of a whole-partition
+            # row fetch. DELIBERATELY invisible to the plot-pass queries: without ANALYZE
+            # (which this pipeline never runs) SQLite's cost model would prefer this
+            # leading-range shape over by_stat's equality prefix and re-create the ~6h
+            # pathology v7 fixed, so query_injection_stat / query_injection_stat_stability
+            # disqualify it with unary-plus round terms (`+round_number`). Keep those
+            # guards if you touch either builder.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_injection_stats_by_round
+                ON injection_stats(tag, round_number, timestamp)
             """)
 
             # Training statistics table
@@ -635,6 +661,30 @@ class Database:
                 ON inference_results(tag, npy_path) WHERE superseded = 0
             """)
             logger.info("Schema migration: v8 supersede partial index applied")
+
+        if version < 9:
+            # v9: the #375 index audit (see the version-history comment). The by_round
+            # CREATE mirrors _init_database (idempotent recording, v7 convention); the
+            # latent-keys partial index lives ONLY here, for the same reason as v8: its
+            # WHERE superseded = 0 predicate needs the column the v1 block above adds.
+            # NOTE: on an existing catalog-scale DB (~190M injection_stats rows / 80 GB)
+            # the by_round build is a one-time full-table scan + sort — expect the FIRST
+            # pipeline launch against such a DB after this upgrade to stall here for
+            # minutes to tens of minutes. Subsequent launches are unaffected.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_injection_stats_by_round
+                ON injection_stats(tag, round_number, timestamp)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_latent_snapshots_keys
+                ON latent_snapshots(tag, model_name, round_number, epoch_number,
+                                    step_number, snr_base, snr_range, timestamp)
+                WHERE superseded = 0
+            """)
+            logger.info(
+                "Schema migration: v9 index audit applied "
+                "(injection_stats by_round + latent_snapshots keys partial)"
+            )
 
         # PRAGMA doesn't support parameter binding; _SCHEMA_VERSION is a module-level int constant
         cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION:d}")
@@ -2037,11 +2087,14 @@ class Database:
         MIN/MAX timestamp over a tag's injection_stats rows, optionally bounded to a round
         range. One deliberate full-partition aggregate (no timestamp filter; superseded and
         non-finite rows included) that lets callers tighten the (tag, timestamp) index window
-        for the many row-level queries that follow — idx_injection_stats_filter leads with
-        (tag, timestamp) and round_number is not in it, so a run-wide window makes every
-        round-scoped query re-scan the tag's whole history. The span covers every row a
-        filtered query could return for those rounds, so intersecting a query window with it
-        never changes that query's result set. Returns None when no rows match.
+        for the many row-level queries that follow — those run on the timestamp/stat-leading
+        indexes (their round terms carry the `+` planner guard, see query_injection_stat), so
+        a run-wide window would make every round-scoped query re-scan the tag's whole
+        history. This aggregate itself is the intended reader of idx_injection_stats_by_round
+        (v9): tag equality + round range + in-index timestamp make it a covering index-only
+        scan. The span covers every row a filtered query could return for those rounds, so
+        intersecting a query window with it never changes that query's result set. Returns
+        None when no rows match.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -2111,12 +2164,17 @@ class Database:
             if stat_name:
                 query = self._add_str_filter(query, params, "stat_name", stat_name)
 
+            # `+round_number`: the unary plus keeps the term out of index selection
+            # (semantics unchanged). Without it, the no-ANALYZE planner prefers
+            # idx_injection_stats_by_round's leading range over by_stat's equality
+            # prefix for the ~165-query plot pass — re-creating the pre-v7 pathology
+            # (see the v9 entry in the version-history comment).
             if start_round_number is not None:
-                query += " AND round_number >= ?"
+                query += " AND +round_number >= ?"
                 params.append(start_round_number)
 
             if end_round_number is not None:
-                query += " AND round_number <= ?"
+                query += " AND +round_number <= ?"
                 params.append(end_round_number)
 
             if start_chunk_number is not None:
@@ -2223,12 +2281,14 @@ class Database:
             if stat_name:
                 query = self._add_str_filter(query, params, "stat_name", stat_name)
 
+            # `+round_number` planner guard — same rationale as query_injection_stat
+            # (keep the per-round aggregation on by_stat/filter, not by_round).
             if start_round_number is not None:
-                query += " AND round_number >= ?"
+                query += " AND +round_number >= ?"
                 params.append(start_round_number)
 
             if end_round_number is not None:
-                query += " AND round_number <= ?"
+                query += " AND +round_number <= ?"
                 params.append(end_round_number)
 
             if injection_stage:
@@ -2248,7 +2308,11 @@ class Database:
             if not include_superseded:
                 query += " AND superseded = 0"
 
-            query += " GROUP BY round_number ORDER BY round_number"
+            # `+round_number` here too: without it, a call with no timestamp bounds lets the
+            # planner pick by_round(tag=?) purely for its free GROUP BY ordering — the
+            # whole-partition row-fetch plan the term guards above exist to prevent. The
+            # span-tightened caller shape is safe either way; this covers every shape.
+            query += " GROUP BY +round_number ORDER BY +round_number"
 
             cursor.execute(query, params)
 
@@ -2459,11 +2523,13 @@ class Database:
             if not include_superseded:
                 query += " AND superseded = 0"
 
-            # The DISTINCT set includes snr_base/snr_range, which no index carries, so this
-            # is a tag-partition scan regardless of index shape — the tag prefix of
-            # idx_latent_snapshots_by_key still bounds it to one tag. It runs once per GIF
-            # pass, and the resulting key set is small enough that the filesort for this
-            # ORDER BY (model_name leading, unlike the index) is negligible
+            # The bare `superseded = 0` above proves idx_latent_snapshots_keys' partial
+            # predicate (v9), whose column order after the tag equality matches this
+            # DISTINCT projection and ORDER BY prefix exactly — so the default-path query
+            # is a covering index-only scan (timestamp bounds evaluate in-index on the
+            # trailing column), never touching the latent_vector row payloads. An
+            # include_superseded=True audit call can't use the partial index and falls
+            # back to a tag-bounded scan of idx_latent_snapshots_by_key — accepted.
             query += " ORDER BY model_name, round_number, epoch_number, step_number"
 
             cursor.execute(query, params)
