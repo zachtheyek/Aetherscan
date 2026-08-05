@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
@@ -624,14 +625,18 @@ class TestSchemaMigration:
         "inference_results",
     )
 
-    # The complete expected index set per table — the v7 index sweep's final state. Both
-    # _init_database() (fresh dbs) and the `if version < 7` migration block (pre-v7 dbs)
-    # must land exactly here, so tests assert equality, not membership.
+    # The complete expected index set per table — the v9 audit's final state. Both
+    # _init_database() (fresh dbs) and the migration blocks (older dbs) must land exactly
+    # here, so tests assert equality, not membership.
     _EXPECTED_INDEXES = {
         "system_resources": {"idx_system_resources_filter"},
-        "injection_stats": {"idx_injection_stats_filter", "idx_injection_stats_by_stat"},
+        "injection_stats": {
+            "idx_injection_stats_filter",
+            "idx_injection_stats_by_stat",
+            "idx_injection_stats_by_round",
+        },
         "training_stats": {"idx_training_stats_filter"},
-        "latent_snapshots": {"idx_latent_snapshots_by_key"},
+        "latent_snapshots": {"idx_latent_snapshots_by_key", "idx_latent_snapshots_keys"},
         "inference_results": {"idx_inference_results_filter", "idx_inference_results_supersede"},
         "inference_cadences": {"idx_inference_cadences_filter"},
         "pipeline_stages": {"idx_pipeline_stages_filter"},
@@ -975,6 +980,176 @@ class TestInjectionStatTimeSpan:
         assert _wait_backlog_empty(db)
         db.mark_superseded("injection_stats", tag="span_v2", round_ge=1)
         assert db.query_injection_stat_time_span(tag="span_v2") == (50.0, 60.0)
+
+
+class TestV9IndexPlannerContracts:
+    """The v9 by_round index (#375) must serve the supersede/time-span shapes WITHOUT
+    stealing the plot-pass plans from idx_injection_stats_by_stat — the `+round_number`
+    guards in query_injection_stat / query_injection_stat_stability enforce the latter —
+    and the latent partial index must serve the keys query without stealing the per-frame
+    or supersede shapes from by_key. Pin every direction with EXPLAIN QUERY PLAN on the
+    real schema (no ANALYZE, matching production, where the un-stat'd cost model would
+    otherwise prefer a leading-range index). The SQL under test is captured from the REAL
+    builders via a connection trace, so dropping a `+` guard in db.py fails here — the
+    assertions cover the builders, not hand-written literals that could drift from them."""
+
+    @pytest.fixture()
+    def traced(self, db, monkeypatch):
+        """(db, captured): every statement the Database's own connections execute lands in
+        `captured` — including the inline (no-writer) mark_superseded path."""
+        captured: list[str] = []
+        orig = Database._get_connection
+
+        @contextmanager
+        def traced_connection(db_self):
+            with orig(db_self) as conn:
+                conn.set_trace_callback(captured.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        monkeypatch.setattr(Database, "_get_connection", traced_connection)
+        return db, captured
+
+    def _plan_of_last(self, db, captured, needle):
+        """EXPLAIN QUERY PLAN of the most recent captured statement containing `needle`.
+        Works whether the trace delivers placeholder or expanded SQL: unbound placeholders
+        plan identically to bound ones, so Nones suffice. The plan string carries the
+        SQLite version so a failure years from now reads as 'the toolchain's planner
+        changed' rather than 'someone deleted a guard'."""
+        stmt = next(
+            (s for s in reversed(captured) if needle in s and not s.startswith("EXPLAIN")), None
+        )
+        assert stmt is not None, (
+            f"no captured statement contains {needle!r} — builder refactor? "
+            f"{len(captured)} statements captured"
+        )
+        conn = sqlite3.connect(db.db_path)
+        try:
+            rows = conn.execute("EXPLAIN QUERY PLAN " + stmt, [None] * stmt.count("?")).fetchall()
+        finally:
+            conn.close()
+        plan = " | ".join(str(row) for row in rows)
+        return stmt, f"{plan} [sqlite {sqlite3.sqlite_version}]"
+
+    def _seed_injection(self, db):
+        rows = _bulk_rows(6, round_number=1) + _bulk_rows(6, round_number=2)
+        db.write_injection_stats_bulk(rows, tag="plan_v1")
+        assert _wait_backlog_empty(db)
+
+    def _seed_latent(self, db):
+        for step in (10, 20):
+            db.write_latent_snapshot(
+                model_name="beta_vae",
+                round_number=1,
+                epoch_number=1,
+                step_number=step,
+                cadence_index=0,
+                signal_type="true_only_eti",
+                latent_vector=[0.0] * 8,
+                snr_base=1,
+                snr_range=99,
+                tag="plan_v2",
+            )
+        assert db.flush(timeout=10.0)
+
+    def test_injection_supersede_update_uses_by_round(self, traced):
+        db, captured = traced
+        self._seed_injection(db)
+        db.stop()  # no writer → mark_superseded executes inline through _get_connection
+        db.mark_superseded("injection_stats", tag="plan_v1", round_ge=2)
+        stmt, plan = self._plan_of_last(db, captured, "UPDATE injection_stats")
+        assert "idx_injection_stats_by_round" in plan, (stmt, plan)
+
+    def test_time_span_uses_by_round_covering(self, traced):
+        db, captured = traced
+        self._seed_injection(db)
+        db.query_injection_stat_time_span(tag="plan_v1", start_round_number=1, end_round_number=2)
+        stmt, plan = self._plan_of_last(db, captured, "MIN(timestamp)")
+        assert "idx_injection_stats_by_round" in plan, (stmt, plan)
+        assert "COVERING" in plan.upper(), plan
+
+    def test_guarded_plot_query_keeps_by_stat(self, traced):
+        # The builder must emit `+round_number` (the guard itself) AND the resulting plan
+        # must keep the v7 stat-scoped index — positive and negative pinned together.
+        db, captured = traced
+        self._seed_injection(db)
+        db.query_injection_stat(
+            tag="plan_v1",
+            stat_name="eti_snr",
+            injection_stage="post",
+            start_round_number=1,
+            end_round_number=2,
+        )
+        stmt, plan = self._plan_of_last(db, captured, "FROM injection_stats")
+        # COUNT, not substring: both the start- and end-bound terms must carry the guard —
+        # deleting either one alone would still satisfy an `in` check. The negative states
+        # the invariant directly: no unguarded round_number term reaches the planner.
+        assert stmt.count("+round_number") == 2, stmt
+        assert "AND round_number" not in stmt, stmt
+        assert "idx_injection_stats_by_round" not in plan, (stmt, plan)
+        assert "idx_injection_stats_by_stat" in plan, (stmt, plan)
+
+    def test_guarded_stability_query_keeps_by_stat(self, traced):
+        # No timestamp bounds — the hardest case: with a bare GROUP BY round_number the
+        # planner picks by_round(tag=?) purely for its free grouping order, so the builder
+        # guards the GROUP BY/ORDER BY with `+` as well.
+        db, captured = traced
+        self._seed_injection(db)
+        db.query_injection_stat_stability(
+            tag="plan_v1", stat_name="eti_snr", start_round_number=1, end_round_number=2
+        )
+        stmt, plan = self._plan_of_last(db, captured, "GROUP BY")
+        # All four guarded sites, individually deletable, individually pinned: the two WHERE
+        # bounds plus GROUP BY plus ORDER BY — and no unguarded round_number term anywhere
+        # (the negative also catches a guard MOVED rather than deleted).
+        assert stmt.count("+round_number") == 4, stmt
+        assert "GROUP BY +round_number" in stmt, stmt
+        assert "ORDER BY +round_number" in stmt, stmt
+        assert "AND round_number" not in stmt, stmt
+        assert "GROUP BY round_number" not in stmt, stmt
+        assert "ORDER BY round_number" not in stmt, stmt
+        assert "idx_injection_stats_by_round" not in plan, (stmt, plan)
+        assert "idx_injection_stats_by_stat" in plan, (stmt, plan)
+
+    def test_latent_keys_query_is_covering_on_partial_index(self, traced):
+        db, captured = traced
+        self._seed_latent(db)
+        db.query_latent_snapshot_keys(tag="plan_v2", start_time=0.0)
+        stmt, plan = self._plan_of_last(db, captured, "SELECT DISTINCT")
+        assert "idx_latent_snapshots_keys" in plan, (stmt, plan)
+        assert "COVERING" in plan.upper(), plan
+        # Index-only AND sort-free: DISTINCT + ORDER BY must come from index order, not a
+        # temp b-tree — the full "index-only scan" claim in DATABASE.md.
+        assert "TEMP B-TREE" not in plan.upper(), plan
+
+    def test_latent_per_frame_query_keeps_by_key(self, traced):
+        # The new partial index is also predicate-eligible here (bare superseded = 0);
+        # by_key's full six-column seek must keep winning.
+        db, captured = traced
+        self._seed_latent(db)
+        db.query_latent_snapshots(
+            model_name="beta_vae",
+            round_number=1,
+            epoch_number=1,
+            step_number=10,
+            tag="plan_v2",
+            start_time=0.0,
+            end_time=99.0,
+        )
+        stmt, plan = self._plan_of_last(db, captured, "FROM latent_snapshots")
+        assert "idx_latent_snapshots_by_key" in plan, (stmt, plan)
+        assert "idx_latent_snapshots_keys" not in plan, (stmt, plan)
+
+    def test_latent_supersede_update_keeps_by_key(self, traced):
+        db, captured = traced
+        self._seed_latent(db)
+        db.stop()
+        db.mark_superseded("latent_snapshots", tag="plan_v2", round_ge=1)
+        stmt, plan = self._plan_of_last(db, captured, "UPDATE latent_snapshots")
+        assert "idx_latent_snapshots_by_key" in plan, (stmt, plan)
+        assert "idx_latent_snapshots_keys" not in plan, (stmt, plan)
 
 
 class TestBulkLane:

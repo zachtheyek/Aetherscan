@@ -14,7 +14,7 @@ high-volume injection-stat chunks (#277) — drained by **one background writer 
 batches rows and commits with `executemany()`; reads open short-lived connections directly.
 Failed-attempt rows are never deleted — they're flagged `superseded = 1`, and every query
 filters them out by default. Schema evolution is a minimal `PRAGMA user_version` gate
-(currently version 8).
+(currently version 9).
 
 > [!IMPORTANT]
 > The write queue is a **thread** queue, not process-safe. Worker *processes* must never call
@@ -185,8 +185,16 @@ filters with run-wide timestamp bounds the first index can only answer by scanni
 whole timestamp range. The trailing column is deliberately `timestamp`: that shape is chosen
 by SQLite's default cost model with no `ANALYZE` stats (a `round_number`-trailing variant
 measured as never chosen without `sqlite_stat1`), and it serves the round-scoped per-round
-queries too via their span-tightened timestamp windows. No query changes: the planner picks
-the better index per query.
+queries too via their span-tightened timestamp windows. Since v9 (#375) a third index,
+`(tag, round_number, timestamp)` (`idx_injection_stats_by_round`), serves exactly two
+consumers: the training-resume supersede `UPDATE` (writer-thread-blocking; previously a
+whole-partition row fetch to test the round predicate) and the round-bounded
+`query_injection_stat_time_span` aggregate (now a covering index-only scan). It is
+**deliberately invisible to the plot-pass queries**: with no `ANALYZE` stats the planner
+would prefer its leading range over `by_stat`'s equality prefix and re-create the pre-v7
+pathology, so the round-bound terms in `query_injection_stat` /
+`query_injection_stat_stability` are written `+round_number` (SQLite's unary-plus term
+disqualification) — keep those guards if you touch either builder.
 
 ### `training_stats`
 
@@ -233,9 +241,16 @@ steps — the raw material of the latent-space GIFs.
 | `snr_base`, `snr_range` | INTEGER | Curriculum stage at capture time |
 | `superseded` | INTEGER | Default 0 |
 
-Index: `(tag, round_number, epoch_number, step_number, model_name, timestamp)`
+Indexes: `(tag, round_number, epoch_number, step_number, model_name, timestamp)`
 (`idx_latent_snapshots_by_key`, reshaped in v7 from the original
-`(tag, timestamp, model_name, round_number, epoch_number, step_number)`). The GIF pass
+`(tag, timestamp, model_name, round_number, epoch_number, step_number)`) plus, since v9
+(#375), the covering **partial** index `(tag, model_name, round_number, epoch_number,
+step_number, snr_base, snr_range, timestamp) WHERE superseded = 0`
+(`idx_latent_snapshots_keys`) for `query_latent_snapshot_keys`: its bare `superseded = 0`
+term proves the partial predicate, and the column order matches the `DISTINCT` projection
+and `ORDER BY` prefix, so the once-per-GIF-pass key enumeration is an index-only scan
+instead of a whole-partition row fetch through the `latent_vector` JSON payloads (an
+`include_superseded=True` audit call falls back to `by_key`). The GIF pass
 loads one capture per frame — up to `latent_viz_gif_max_frames` (500) queries with equality
 on the capture key and the run window trailing — and the old timestamp-second shape
 answered each by scanning the tag's whole window (measured 67× slower per frame at 2 M
@@ -327,6 +342,7 @@ attempt, each with its own span.
 | v6 | `is_finite INTEGER DEFAULT 1` on `training_stats` (#289 NaN-write hardening) | additive `ALTER TABLE ... ADD COLUMN` |
 | v7 | the index sweep: the `idx_injection_stats_by_stat` secondary index on `injection_stats`; `latent_snapshots`' index reshaped to `idx_latent_snapshots_by_key` | `DROP INDEX IF EXISTS idx_latent_snapshots_filter` in the migration block; the CREATEs run in `_init_database()` and are re-executed there |
 | v8 | the `idx_inference_results_supersede` partial index on `inference_results` (`(tag, npy_path) WHERE superseded = 0`, #301) | the `if version < 8` block creates it — deliberately NOT `_init_database()`: the partial predicate needs the `superseded` column the v1 ALTER adds, so an init-time CREATE would fail on a pre-v1 file. Fresh databases reach the block too (version 0 → current) |
+| v9 | the #375 index audit: `idx_injection_stats_by_round` (`(tag, round_number, timestamp)`) + the `idx_latent_snapshots_keys` covering partial index; `+round_number` planner guards in the two injection query builders | `by_round`'s CREATE runs in `_init_database()` and is re-executed in the block (v7 convention); the latent partial lives only in the block (v8 convention — its predicate needs the v1 `superseded` column). **Upgrading an existing catalog-scale DB builds both indexes in one stall — `by_round` over ~190 M `injection_stats` rows and the latent partial over the live subset of ~100 M `latent_snapshots` rows, each a one-time full-table scan + sort — expect the first launch to stall for minutes to tens of minutes, and budget transient WAL disk headroom well beyond the final index sizes (the builds' pages accumulate in the `-wal` file until checkpoint)** |
 
 - **v0 → v1**: `ALTER TABLE ... ADD COLUMN superseded INTEGER DEFAULT 0` on the four tables
   above — the only in-place change SQLite supports is additive `ADD COLUMN`, which is exactly
@@ -377,9 +393,23 @@ attempt, each with its own span.
   adds, so an init-time CREATE would precede the ALTER and fail on a pre-v1 file. Fresh
   databases reach the block too (version 0 → current), so both paths land the same final
   index set.
+- **v8 → v9** (the #375 index audit): `idx_injection_stats_by_round` follows the v7
+  convention (CREATE in `_init_database()`, re-executed in the block — its columns all
+  pre-date v1), `idx_latent_snapshots_keys` the v8 convention (block-only — partial
+  predicate on `superseded`). The audit also verified every pre-existing index against the
+  live query set (none dropped: each traced to concrete consumers) and rejected a
+  `system_resources` per-series candidate the planner would never choose unforced. The
+  `+round_number` planner guards in the two injection builders ship in the same change —
+  without them the no-`ANALYZE` cost model moves the ~165-query plot pass onto `by_round`
+  (measured 1.4–10.7× per-query regressions on production-shaped replicas), resurrecting
+  the pre-v7 pathology. Upgrade cost: building `by_round` (and the latent partial) over an
+  existing catalog-scale DB is a one-time full-table scan + sort per index — the first
+  launch after upgrading stalls in `_migrate_schema` for minutes to tens of minutes; later
+  launches are unaffected.
 
 Fresh databases get the full current schema from the CREATE statements and are just stamped
-(the one v8 exception above lands via the migration block either way).
+(the block-only partial indexes — v8's supersede index and v9's latent-keys index — land via
+the migration block either way).
 The pattern to follow for future changes: bump `_SCHEMA_VERSION`, add a
 `if version < N:` block with additive, idempotent statements, and rely on
 `CREATE TABLE IF NOT EXISTS` for whole new tables.
@@ -412,12 +442,14 @@ bounded to a round range), or `None` when no rows match. It is a single whole-pa
 aggregate with **no timestamp filter and no superseded/`is_finite` filtering** — a deliberate
 **superset bound**: the span covers every row a filtered query could return for those rounds,
 so a caller that intersects its own time window with the span can only narrow index scans,
-never change a result set. It exists because `idx_injection_stats_filter` leads with
-`(tag, timestamp)` and `round_number` is not in the index, so a round-scoped query with a
-run-wide window re-scans the tag's entire row history (measured 10.5× slower at 12M rows,
-quadratic over a campaign as history accumulates) — `plot_injection_stats` issues ~165 such
-queries per call and now pays this one aggregate up front, tightening every window to the
-plotted rounds' actual span (±1 s).
+never change a result set. It exists because the row-level plot queries run on the
+timestamp/stat-leading indexes (their round terms carry the `+` planner guard since v9), so
+a round-scoped query with a run-wide window would re-scan the tag's entire row history
+(measured 10.5× slower at 12M rows, quadratic over a campaign as history accumulates) —
+`plot_injection_stats` issues ~165 such queries per call and now pays this one aggregate up
+front, tightening every window to the plotted rounds' actual span (±1 s). Since v9 the
+aggregate itself runs on `idx_injection_stats_by_round` as a covering index-only scan
+(previously it row-fetched the whole tag partition to test the round predicate).
 
 **`query_system_resource_decimated(tag, start_time, end_time, max_points_per_series)`**
 (#301) returns a per-series uniformly-strided subset of `system_resources` rows (same dict
