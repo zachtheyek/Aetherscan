@@ -1194,8 +1194,14 @@ def _shap_cache_consistent(
         and shap_values_summary.shape == (n_summary, n_features)
         and shap_values_logloss.shape == (n_summary, n_features)
         and shap_values_interaction.shape == (n_interact, n_features, n_features)
-        and (n_summary == 0 or int(np.max(summary_indices)) < n_val)
-        and (n_interact == 0 or int(np.max(interaction_indices)) < n_val)
+        and (
+            n_summary == 0
+            or 0 <= int(np.min(summary_indices)) <= int(np.max(summary_indices)) < n_val
+        )
+        and (
+            n_interact == 0
+            or 0 <= int(np.min(interaction_indices)) <= int(np.max(interaction_indices)) < n_val
+        )
     )
 
 

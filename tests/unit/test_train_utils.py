@@ -959,9 +959,11 @@ class TestComputeOrLoadShapValuesCacheGuard:
 
 
 class TestShapClusteringCacheGuard:
-    """plot_rf_shap_explanation_clustering (#359): a cached UMAP/KMeans joblib whose row count
-    no longer matches the SHAP values is refit and overwritten instead of IndexError-ing —
-    the clustering joblib and the SHAP-values joblib are separate {tag}-keyed caches that can
+    """plot_rf_shap_explanation_clustering (#359): a cached UMAP/KMeans joblib is accepted only
+    when its row count matches AND its persisted content fingerprint equals the current SHAP
+    matrix's — anything else (stale rows, same-shape different content, pre-fingerprint schema,
+    junk) is refit and overwritten instead of IndexError-ing or plotting silently wrong points.
+    The clustering joblib and the SHAP-values joblib are separate {tag}-keyed caches that can
     go out of sync when only one is regenerated."""
 
     N_SUMMARY = 24
