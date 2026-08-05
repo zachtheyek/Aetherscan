@@ -21,15 +21,16 @@ jobs:
     # up a runner and claude-code-action would abort with a "non-human actor" error — a red
     # failure on every bot issue. Skip the whole job instead. (allowed_bots is already unset, so
     # no comment is ever posted; this additionally avoids the noisy failed run.) See issue #83.
-    # Also skip PRs authored by the maintainer (#373) — the compliance reminder is for incoming
-    # contributions. Issue-opened events still fire regardless of author: the pull_request
-    # context is empty on an issues event, so the login clause can't match there.
+    # Also skip issues AND PRs authored by the maintainer (#373, extended by #383) — the
+    # compliance reminders are for incoming contributions. Each login clause is inert on the
+    # other event type (that event's context object is empty there).
     if: >-
       github.event.issue.user.type != 'Bot' &&
       github.event.pull_request.user.type != 'Bot' &&
       !endsWith(github.actor, '[bot]') &&
       github.actor != 'claude' &&
-      github.event.pull_request.user.login != 'zachtheyek'
+      github.event.pull_request.user.login != 'zachtheyek' &&
+      github.event.issue.user.login != 'zachtheyek'
     runs-on: ubuntu-latest
     # Contribution check shouldn't take more than 5 mins (refine if data shows otherwise)
     timeout-minutes: 5

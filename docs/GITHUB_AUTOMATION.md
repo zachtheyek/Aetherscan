@@ -86,7 +86,7 @@ double-post.
 | [`claude.yml`](../.github/workflows/claude.yml) | Handle mention / assignment / `claude` label on issues, PRs, Discussions, comments, reviews | The general-purpose assistant: answers, implements, opens PRs on `claude/*` branches. `allowed_bots: "claude,claude[bot]"` — deliberately, so issues *filed by* the other workflows (as the `claude` bot) can invoke it for follow-up PRs. | — |
 | [`claude-code-review.yml`](../.github/workflows/claude-code-review.yml) | PR opened / ready_for_review | Automated first-pass code review with inline comments. Every PR gets one on open; address the actionable notes and resolve the conversations before human review. | — |
 | [`claude-issue-triage.yml`](../.github/workflows/claude-issue-triage.yml) | Issue opened | Triage: applies labels (type/area/priority) so label sync can propagate them to the eventual PR. | — |
-| [`claude-contribution-check.yml`](../.github/workflows/claude-contribution-check.yml) | Issue or PR opened | Verifies workflow compliance (issue linkage, branch-prefix conventions, template use) and comments when something's missing. **Never runs for bot authors, nor on maintainer-authored PRs** (issue-opened events still fire for every human author) — see the gotcha below. | — |
+| [`claude-contribution-check.yml`](../.github/workflows/claude-contribution-check.yml) | Issue or PR opened | Verifies workflow compliance (issue linkage, branch-prefix conventions, template use) and comments when something's missing. **Never runs for bot authors, nor on maintainer-authored issues or PRs** — see the gotcha below. | — |
 | [`claude-release-notes.yml`](../.github/workflows/claude-release-notes.yml) | PR **merged** to master | Drafts a release-note entry as a PR comment — the curated raw material for release bodies (see [`RELEASE.md`](RELEASE.md)). | `<!-- claude-release-notes -->` first line of the comment |
 | [`claude-style-check.yml`](../.github/workflows/claude-style-check.yml) | PR merged to master | Scans the merged diff's *added* lines against the project style rules ruff can't express (docstring prose style, canonical comment markers, logging idioms); files one consolidated issue when violations exist. | `<!-- aetherscan-style-check pr=<N> -->` |
 | [`claude-update-docs.yml`](../.github/workflows/claude-update-docs.yml) | PR merged to master; `workflow_dispatch` with a `pr_number` (re-scan an old PR with the *current* workflow logic) | Detects doc drift caused by the merge. If `cli.py` changed, a **shell step** regenerates the README CLI Reference blocks with `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13) and embeds the output in the issue, because the follow-up assistant run has no `python` in its tool allowlist. The filed issue contains an intentional handle mention, which triggers `claude.yml` to open the actual docs PR. | `<!-- aetherscan-update-docs pr=<N> -->` |
@@ -123,10 +123,10 @@ its `allowed_bots` list. Three configurations coexist here, each deliberate:
   runner just for the action to abort with a "non-human actor" error — a red ✗ on every
   automated issue (this is the other half of the issue #83 story). Skipping the job at the
   `if:` level avoids both the comment and the noisy failure. The same guard also skips
-  **maintainer-authored PRs** (#373) — the compliance reminder targets incoming
-  contributions, so the maintainer's own PRs don't spend a runner on it; maintainer-opened
-  *issues* still get the discussion-link nudge (the `pull_request` context is empty on an
-  issues event, so the login clause can't match there).
+  **maintainer-authored issues and PRs** (#373, extended by #383) — the compliance
+  reminders target incoming contributions, so the maintainer's own issues/PRs don't spend a
+  runner on them. Each login clause is inert on the other event type: that event's context
+  object is empty, so the comparison can't match.
 
 When adding a workflow, decide explicitly which side of this each trigger actor falls on.
 
