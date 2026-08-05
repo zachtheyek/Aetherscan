@@ -1181,10 +1181,10 @@ def _shap_cache_consistent(
     )
     if not all(isinstance(a, np.ndarray) for a in arrays):
         return False
-    # The index arrays feed len()/np.max() below — a 0-d or non-numeric ndarray would raise
-    # out of the guard whose docstring promises totality, so gate shape and dtype too.
+    # The index arrays feed len()/np.max() below — a 0-d or non-integer ndarray would raise
+    # (or lie) out of the guard whose docstring promises totality, so gate shape and dtype.
     if not all(
-        a.ndim == 1 and np.issubdtype(a.dtype, np.number)
+        a.ndim == 1 and np.issubdtype(a.dtype, np.integer)
         for a in (summary_indices, interaction_indices)
     ):
         return False
@@ -6889,6 +6889,10 @@ class TrainingPipeline:
         )
         embedding = None
         cluster_labels = None
+        # One fingerprint for this matrix: the guard compares against it, and a refit
+        # persists the same value.
+        n_rows = len(shap_values)
+        shap_fingerprint = _shap_content_fingerprint(shap_values)
         if os.path.exists(clustering_path):
             cached = joblib.load(clustering_path)
             # #359 guard: this joblib and the SHAP-values joblib are two disk caches keyed on
@@ -6902,16 +6906,14 @@ class TrainingPipeline:
             # was fit on and must match it. Total over junk/older-schema payloads: any
             # malformed cache is simply refit (which also self-heals pre-fingerprint caches).
             # The dump below overwrites the stale file.
-            n_rows = len(shap_values)
-            current_fingerprint = _shap_content_fingerprint(shap_values)
             if (
                 isinstance(cached, dict)
                 and {"embedding", "cluster_labels", "shap_fingerprint"} <= set(cached)
                 and isinstance(cached["embedding"], np.ndarray)
                 and isinstance(cached["cluster_labels"], np.ndarray)
-                and len(cached["embedding"]) == n_rows
+                and cached["embedding"].shape == (n_rows, 2)
                 and len(cached["cluster_labels"]) == n_rows
-                and cached["shap_fingerprint"] == current_fingerprint
+                and cached["shap_fingerprint"] == shap_fingerprint
             ):
                 logger.info(f"Loading cached SHAP clustering from {clustering_path}")
                 embedding = cached["embedding"]
@@ -6959,7 +6961,7 @@ class TrainingPipeline:
                 {
                     "embedding": embedding,
                     "cluster_labels": cluster_labels,
-                    "shap_fingerprint": _shap_content_fingerprint(shap_values),
+                    "shap_fingerprint": shap_fingerprint,
                 },
                 clustering_path,
             )

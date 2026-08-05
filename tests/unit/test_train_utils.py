@@ -989,6 +989,9 @@ class TestShapClusteringCacheGuard:
 
         pipeline = TrainingPipeline.__new__(TrainingPipeline)
         pipeline.config = get_config()
+        # _training_plots_dir builds the savefig base from config.checkpoint.save_tag (not
+        # the tag argument) — without this the plot path joins None and TypeErrors.
+        pipeline.config.checkpoint.save_tag = "test_v1"
         pipeline._load_rf_eval_artifacts = lambda tag=None: artifacts
         pipeline._compute_or_load_shap_values = lambda artifacts: shap_data
 
@@ -1077,6 +1080,29 @@ class TestShapClusteringCacheGuard:
 
         assert any("refitting" in r.message for r in caplog.records)
         assert fits == ["umap"]
+
+    def test_pre_fingerprint_schema_with_matching_rows_refit(self, monkeypatch, caplog):
+        # The actual migration path for every clustering joblib on disk today: correct row
+        # count, no shap_fingerprint key. Pins the key-set precheck in isolation — the
+        # stale-cache test above bundles it with a row-count mismatch.
+        fits = []
+        pipeline, _ = self._pipeline(monkeypatch, umap_fits=fits)
+        clustering_path = self._clustering_path(pipeline.config)
+        os.makedirs(os.path.dirname(clustering_path), exist_ok=True)
+        joblib.dump(
+            {
+                "embedding": np.zeros((self.N_SUMMARY, 2), dtype=np.float32),
+                "cluster_labels": (np.arange(self.N_SUMMARY) % 4).astype(np.int64),
+            },
+            clustering_path,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            TrainingPipeline.plot_rf_shap_explanation_clustering(pipeline, tag="test_v1")
+
+        assert any("refitting" in r.message for r in caplog.records)
+        assert fits == ["umap"]
+        assert "shap_fingerprint" in joblib.load(clustering_path)
 
     def test_malformed_clustering_cache_refit_not_raised(self, monkeypatch, caplog):
         fits = []
