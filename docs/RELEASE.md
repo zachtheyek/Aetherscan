@@ -288,9 +288,9 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
    gh workflow run release.yml -f test_pypi=true --ref master
    gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
    ```
-   The dry run does guard → tests → build + **wheel smoke** → publish to test.pypi.org. It
-   **skips** the signed-tag gate, the HF-weights verification, and the GitHub Release — so it needs
-   **no bless and no git tag**. Its whole job is to catch packaging / version-single-sourcing /
+   The dry run does guard → tests → build + **wheel smoke** + **image (validate-only)** → publish to
+   test.pypi.org. It **skips** the signed-tag gate, the HF-weights verification, and the GitHub
+   Release — so it needs **no bless and no git tag**. Its whole job is to catch packaging / version-single-sourcing /
    build breakage *before* you spend the immutable real version number. Confirm it went green (and,
    if you like, that `aetherscan X.Y.Z` shows up on test.pypi.org) before continuing.
 

@@ -95,7 +95,7 @@ jobs:
             if [ "$PUSH" = "true" ]; then
               echo "::error::version input '$VERSION' is not X.Y.Z"; exit 1
             fi
-            echo "::notice::version '$VERSION' is a pre-release — validate-only run, publishing nothing."
+            echo "::notice::version '$VERSION' is not X.Y.Z — validate-only run, publishing nothing."
           fi
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]') # GHCR path is lowercase
           IMG="ghcr.io/$OWNER/aetherscan"
