@@ -8,10 +8,11 @@
 # it to their own native .sif; nothing fork-specific is published.
 #
 # Rebuild-vs-retag: the image depends only on the Dockerfile (base digest, labels, layers) +
-# requirements-container.txt (code is bind-mounted, not baked in). We tag each built image with a content fingerprint
-# `fp-<hash>`; if that fingerprint is already in GHCR, a new release just retags the SAME digest
-# to vX.Y.Z (no rebuild) — so a code-only release reuses the existing image, and v1.0.0/v1.1.0
-# can share one digest while still showing distinct version tags (docs/RELEASE.md).
+# requirements-container.txt (code is bind-mounted, not baked in). We tag each built image with a
+# content fingerprint `fp-<hash>`; if that fingerprint is already in GHCR, a new release just
+# retags the SAME digest to vX.Y.Z (no rebuild) — so a code-only release reuses the existing
+# image, and v1.0.0/v1.1.0 can share one digest while still showing distinct version tags
+# (docs/RELEASE.md).
 #
 # The docker/* actions below are SHA-pinned (version in the trailing comment) to match this
 # repo's convention; claude-dependency-check flags newer versions weekly.

@@ -38,8 +38,9 @@ Two invariants to internalize:
   the tag by CD. There is nothing further to "sync" between PyPI and GitHub.
 - **HF and GHCR carry a tag *per version*, but reuse *content* when nothing changed.** A release
   whose weights didn't change re-points its HF tag at the same training commit; a release whose
-  image inputs (the `Dockerfile` — base digest, labels, layers — and `requirements-container.txt`) didn't change retags the same
-  GHCR digest. So `v1.0.0` and `v1.1.0` can be byte-identical weights/image under distinct
+  image inputs (the `Dockerfile` — base digest, labels, layers — and `requirements-container.txt`)
+  didn't change retags the same GHCR digest. So `v1.0.0` and `v1.1.0` can be byte-identical
+  weights/image under distinct
   version tags — each checkout still pulls *its own* tag. See
   [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change).
 
@@ -191,8 +192,9 @@ impossible:
    the built-in `GITHUB_TOKEN` with `packages: write` — no PAT). It runs in parallel with the
    build and **gates the PyPI publish** (step 7 `needs` it), so a real release never reaches PyPI
    unless the image is up. The image is rebuilt only when its inputs (the whole `Dockerfile`, base
-   digest included, plus `requirements-container.txt`) change; otherwise it **retags the existing digest** under the new
-   version — the Aetherscan code is bind-mounted at runtime, not baked in, so a code-only release
+   digest included, plus `requirements-container.txt`) change; otherwise it **retags the existing
+   digest** under the new version — the Aetherscan code is bind-mounted at runtime, not baked in,
+   so a code-only release
    reuses the prior image (see
    [Version bump with no weights/image change](#version-bump-with-no-weights-or-image-change)). On
    the TestPyPI dry run it validates only (no build, no push), so the gate stays uniform.
@@ -349,13 +351,18 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 >
 > **Recovering from a broken release.** PyPI versions are immutable: if a published release is
 > broken, fix forward with `vX.Y.(Z+1)` (a fresh release PR + tag). You can `pip`-yank the bad
-> version on PyPI so resolvers skip it, but the number is spent.
+> version on PyPI so resolvers skip it, but the number is spent. Releases are always cut forward
+> from `master`, never on a maintenance branch — note that an out-of-order tag push (tagging an
+> older line *after* a newer one shipped) would also drag GHCR `:latest` backward onto the older
+> image, since `:latest` is a mutable pointer whoever pushed last owns (unlike PyPI, which orders
+> versions). The fix-forward-only rule keeps that from happening.
 
 ## Version bump with no weights or image change
 
 Most releases change only code (a bug fix, a new flag). Weights change only on a retrain; the
-container image changes only when the `Dockerfile` (its base digest, labels, or layers) or `requirements-container.txt` changes (the
-Aetherscan code is **bind-mounted at runtime, not baked into the image**). So a release often needs
+container image changes only when the `Dockerfile` (its base digest, labels, or layers) or
+`requirements-container.txt` changes (the Aetherscan code is **bind-mounted at runtime, not baked
+into the image**). So a release often needs
 **no new weights and no new image** — but the vX.Y.Z contract still wants a tag for each, so a
 `v1.0.0` and a `v1.1.0` checkout each pull *their own* tag. The rule is **new tag, reused content**:
 
