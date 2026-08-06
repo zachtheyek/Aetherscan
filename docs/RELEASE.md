@@ -277,7 +277,10 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
      run tags + hardware for provenance);
    - bumps `CITATION.cff` `version` and `date-released` — CI-enforced, not honor-system:
      `tests/unit/test_release_metadata.py` fails the release PR if CITATION's version doesn't
-     match `pyproject.toml`'s, or if `date-released` is malformed/in the future;
+     match `pyproject.toml`'s; the `date-released` guard (ISO format, not dated ahead of
+     today) runs on every PR, so a future date can't be staged early either — and the same
+     suite runs again as the CD publish gate (step 7), so a stale CITATION aborts the real
+     release run too;
    - links the release issue (`Closes #183`).
    Run the normal review loop. **This repo allows merge commits only** (rebase/squash are
    disabled), and branch protection keeps the PR at `mergeStateStatus: BLOCKED` until it has a
