@@ -275,7 +275,12 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
    - updates the README **System Requirements** with the real RAM/VRAM/disk numbers from the
      training + inference runs (issue #183; read them off the `system_resources` DB rows — cite the
      run tags + hardware for provenance);
-   - bumps `CITATION.cff` `version` and `date-released`;
+   - bumps `CITATION.cff` `version` and `date-released` — CI-enforced, not honor-system:
+     `tests/unit/test_release_metadata.py` fails the release PR if CITATION's version doesn't
+     match `pyproject.toml`'s; the `date-released` guard (ISO format, not dated ahead of
+     today) runs on every PR, so a future date can't be staged early either — and the same
+     suite runs again as the CD publish gate (step 7), so a stale CITATION aborts the real
+     release run too;
    - links the release issue (`Closes #183`).
    Run the normal review loop. **This repo allows merge commits only** (rebase/squash are
    disabled), and branch protection keeps the PR at `mergeStateStatus: BLOCKED` until it has a
@@ -341,7 +346,9 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 9. **Reset the dev version (agent drafts, maintainer merges).** Small follow-up chore PR right
    after the release lands: bump `pyproject.toml` `version` from `X.Y.Z` to the next pre-release
    (e.g. `X.Y.(Z+1).dev0`) so `master` stops advertising itself as a shipped stable version between
-   releases (`src/aetherscan/__init__.py` reads it back via `importlib.metadata`). Revisit the
+   releases (`src/aetherscan/__init__.py` reads it back via `importlib.metadata`). Leave
+   `CITATION.cff` at the released `X.Y.Z` — `tests/unit/test_release_metadata.py` enforces this
+   phase too (CITATION must lag, never pre-claim, the next `.devN`'s release number). Revisit the
    Development-Status classifier only if the maturity level actually changed.
 
 > **Release notes.** CD creates the GitHub Release with `--generate-notes`; curate the body
