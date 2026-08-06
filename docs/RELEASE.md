@@ -424,14 +424,18 @@ moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaul
 publishing an older version never regresses `:latest`, which `run_container.sh` pulls for `.devN`
 checkouts. If you ever need to move it, pass `-f latest=true`.
 
-**A backfill never creates or moves `:latest`** — the dispatch above publishes the version tag
-(plus its internal `fp-<hash>` marker tag) only. Historical note: between the v1.0.0 backfill and
-the v1.1.0 release there was **no** `:latest` at all, so `.devN`/`master` checkouts had to build
-from `aetherscan.def` — deliberate, because master's `requirements-container.txt` had already
-moved past v1.0.0's (notably the `streamlit` security bump), and pinning `:latest` to the
-backfilled image would have served dev checkouts a knowingly stale dependency set. Since v1.1.0's
-CD run, `:latest` exists and tracks the newest real release, so dev checkouts pull normally
-(until their `requirements-container.txt` moves past the last release again).
+Historical note: between the v1.0.0 backfill and the v1.1.0 release there was **no** `:latest`
+at all, so `.devN`/`master` checkouts had to build from `aetherscan.def` — deliberate, because
+master's `requirements-container.txt` had already moved past v1.0.0's (notably the `streamlit`
+security bump), and pinning `:latest` to the backfilled image would have served dev checkouts a
+knowingly stale dependency set. Since v1.1.0's CD run, `:latest` exists and tracks the newest
+real release. Note the failure mode changed **kind** with it: in the no-`:latest` window a dev
+checkout failed *hard* (the pull found nothing; the wrapper printed build instructions and
+exited), whereas now a dev checkout whose `requirements-container.txt` has moved past the last
+release **still pulls the released `:latest`, silently stale** — the wrapper never inspects
+requirements drift, so building from `aetherscan.def` in that state is on the user (and a
+`.devN` checkout keeps whatever `.sif` it first cached even as `:latest` moves — see the
+`<sif>.pulled-tag` sidecar logic in `run_container.sh`).
 
 Verify: `docker buildx imagetools inspect ghcr.io/zachtheyek/aetherscan:v1.0.0`, or just pull it on
 a cluster via `utils/run_container.sh`.
