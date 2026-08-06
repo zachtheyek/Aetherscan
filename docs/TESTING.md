@@ -79,7 +79,8 @@ tests/
 │   ├── test_dashboard_cli.py        # aetherscan-dashboard console entry: exec-argv builder + streamlit-missing guard
 │   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths
 │   ├── test_logger.py               # StreamToLogger redirect probes + log_path_for_tag / tagged FileHandler
-│   └── test_legacy_keras_env.py     # TF_USE_LEGACY_KERAS default: import sets it, explicit value kept, tf.keras == tf_keras
+│   ├── test_legacy_keras_env.py     # TF_USE_LEGACY_KERAS default: import sets it, explicit value kept, tf.keras == tf_keras
+│   └── test_release_metadata.py     # CITATION.cff version tracks pyproject.toml (release-PR coupling)
 └── integration/                 # marked integration+gpu+cluster: needs real GPUs + cluster data
     ├── conftest.py                  # repo-root launcher + cluster path resolution
     ├── test_train_smoke.py          # known-good training smoke config, end to end

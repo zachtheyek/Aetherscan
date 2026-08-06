@@ -677,7 +677,7 @@ export TF_USE_LEGACY_KERAS=1
 
 ### Status
 
-**Mitigated** (workaround above) — fixed on `master` by PR #340 and shipping from v1.1.0: `tf_keras==2.17.*` is a declared dependency in `pyproject.toml` / `environment.yml`, and `src/aetherscan/__init__.py` sets `TF_USE_LEGACY_KERAS=1` via `os.environ.setdefault` at package-import time (`aetherscan.def`'s `%environment` and the `Dockerfile`'s `ENV` export it explicitly too). The workaround is needed only for the published **v1.0.0** wheel / env manifest; flip this entry to **Closed** once v1.1.0 is on PyPI.
+**Closed.** Fixed in **v1.1.0** by PR #340: `tf_keras==2.17.*` is a declared dependency in `pyproject.toml` / `environment.yml`, and `src/aetherscan/__init__.py` sets `TF_USE_LEGACY_KERAS=1` via `os.environ.setdefault` at package-import time (`aetherscan.def`'s `%environment` and the `Dockerfile`'s `ENV` export it explicitly too). The workaround remains necessary only for the published **v1.0.0** wheel / env manifest.
 
 ### Related Code
 

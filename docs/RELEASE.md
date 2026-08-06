@@ -424,13 +424,14 @@ moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaul
 publishing an older version never regresses `:latest`, which `run_container.sh` pulls for `.devN`
 checkouts. If you ever need to move it, pass `-f latest=true`.
 
-**Until the first release *after* this lands, there is no `:latest`** — the backfill above publishes
-`:v1.0.0` (plus its internal `fp-<hash>` marker tag) and does **not** move `:latest`. A
-`.devN`/`master` checkout therefore can't pull and must build from `aetherscan.def`
-(the wrapper says so and exits). This is deliberate: master's `requirements-container.txt` has
-already moved past v1.0.0's (notably the `streamlit` security bump), so pinning `:latest` to the
-backfilled v1.0.0 image would serve dev checkouts a knowingly stale dependency set. The next real
-release moves `:latest` and closes the gap.
+**A backfill never creates or moves `:latest`** — the dispatch above publishes the version tag
+(plus its internal `fp-<hash>` marker tag) only. Historical note: between the v1.0.0 backfill and
+the v1.1.0 release there was **no** `:latest` at all, so `.devN`/`master` checkouts had to build
+from `aetherscan.def` — deliberate, because master's `requirements-container.txt` had already
+moved past v1.0.0's (notably the `streamlit` security bump), and pinning `:latest` to the
+backfilled image would have served dev checkouts a knowingly stale dependency set. Since v1.1.0's
+CD run, `:latest` exists and tracks the newest real release, so dev checkouts pull normally
+(until their `requirements-container.txt` moves past the last release again).
 
 Verify: `docker buildx imagetools inspect ghcr.io/zachtheyek/aetherscan:v1.0.0`, or just pull it on
 a cluster via `utils/run_container.sh`.
