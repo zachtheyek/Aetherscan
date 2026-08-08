@@ -38,7 +38,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
   - Blackwell (sm_120, e.g. RTX PRO 6000) — driver ≥570 (native CUDA 12.8)
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - VRAM: **≥8 GB per GPU** recommended — measured peaks ~6 GB/GPU (training) and ~2.5 GB/GPU (inference) on the v1.0.0 release runs; gradient accumulation keeps per-GPU VRAM low
-- RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
+- RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~215 GB inference at the depth-4 default, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, and the depth-4 default's RFI-dense worst case (~5 in-flight × ~65 GB ≈ 325 GB) can exceed the 288 GB floor — hosts at or near that minimum should pass `--prefetch-depth 3`, and smaller-RAM hosts lower it further
 - Disk: full-scale training round data ~147 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamp caches are retained by default (~1 GB/cadence average — re-scores under the same energy-detection config then skip preprocessing entirely; pass `--prune-stamps` on catalog-scale runs, which keeps ~1 MB/cadence metadata + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
@@ -56,7 +56,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 > There are no plans to support non-Nvidia GPUs
 
 > [!NOTE]
-> The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`) — via the always-on resource instrumentation (`system_resources` DB rows). They characterize full-scale runs; small runs need substantially less.
+> The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`; the inference RAM peak is refreshed from the #406 depth-4 grid run on the same subset) — via the always-on resource instrumentation (`system_resources` DB rows). They characterize full-scale runs; small runs need substantially less.
 
 ### Install From PyPI (pip)
 
@@ -988,7 +988,10 @@ options:
                         serial per-cadence sections, costing one in-flight
                         cadence of RAM (up to ~65 GB for RFI-dense C-band
                         cadences); outputs are identical at any depth
-                        (default: 3 per the on-cluster A/B)
+                        (default: 4 per the full-subset grid searches, which
+                        measured depth 4 faster than 3 under both the strict-
+                        order and completion-order loops; tune down on hosts
+                        with less RAM)
   --cadence-group-by-cols CADENCE_GROUP_BY_COLS [CADENCE_GROUP_BY_COLS ...]
                         Space-separated list of CSV column names whose joint
                         value defines cadence membership (e.g., Target Session

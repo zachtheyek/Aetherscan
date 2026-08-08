@@ -484,16 +484,23 @@ class InferenceConfig:
     # ahead of the GPU stage, overlapping disk-bound energy detection with
     # decompression-bound extraction and the per-cadence serial sections, at the cost of
     # one in-flight cadence of RAM per unit of depth (stamps + loaded array — up to
-    # ~65 GB each for RFI-dense C-band cadences, so depth 3 budgets ~4 in-flight worst
-    # case ≈ 260 GB on a 503 GB host). Default 3 per the #301 on-cluster A/B (the same 8
-    # fresh /datag cadences as the #298 depth-1→2 A/B: depth 3 = 4,071 s vs depth 2 =
-    # 5,118 s wall, ~-20%, identical candidates with 0.0 score deltas; caveat: the
-    # depth-3 leg ran last and warmest, so treat the honest win as ~10-20% — same
-    # confound structure the 1→2 flip carried). Per-cadence outputs are identical at any
-    # depth AND any completion order (#401: consumption is completion-ordered; seeding
-    # keys on the catalog index and the reference-cloud reservoir selects by
-    # content-derived keys); depth 1 restores the historical serial behavior.
-    prefetch_depth: int = 3
+    # ~65 GB each for RFI-dense C-band cadences, so depth 4 budgets ~5 in-flight worst
+    # case ≈ 325 GB on a 503 GB host; observed peaks on the 350-cadence subset were
+    # 207 GB at depth 3 vs 215 GB at depth 4 — tune down on smaller hosts). Default 4
+    # per the #406 grid searches on the full 350-cadence /datag subset, cold stamp cache
+    # each run, identical science every run: pre-#401 strict-order loop depth 3 =
+    # 12,561 s vs depth 4 = 11,427 s (−9.0%); post-#401 completion-order loop depth 3 =
+    # 10,227 s vs depth 4 = 9,755 s (−4.6%) vs depth 5 = 10,420 s (regression). Depth 4
+    # beat depth 3 in BOTH loops independently; the post-#401 margin alone sits inside
+    # the ~10% run-to-run band documented for the micro-benchmarks (BENCHMARKING.md),
+    # applied here as the working band for whole-run wall-clock, so the call rests on
+    # the sign agreeing across both grids, not on any single run. (Historical: the #301 8-cadence A/B that
+    # set the old default 3 measured depth 2 → 3 at ~10-20%.) Per-cadence outputs are
+    # identical at any depth AND any completion order (#401: consumption is
+    # completion-ordered; seeding keys on the catalog index and the reference-cloud
+    # reservoir selects by content-derived keys); depth 1 restores the historical serial
+    # behavior.
+    prefetch_depth: int = 4
 
     # NOTE: come back to this later (is this the optimal grouping?)
     # Energy detection preprocessing
