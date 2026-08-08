@@ -15,8 +15,7 @@ import os
 import socket
 import sys
 import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -710,8 +709,10 @@ def _run_streaming_csv_inference(
             [prefetch thread(s)] preprocess + load/log-norm upcoming cadences (energy
                                  detection skipped when the stamp .npy already exists —
                                  preprocessing-artifact resume; see _prefetch_cadence)
-            [main thread]        encode cadence i on GPUs -> RF -> write per-cadence
-                                 results + manifest row (_infer_cadence), in catalog order
+            [main thread]        encode on GPUs -> RF -> write per-cadence results +
+                                 manifest row (_infer_cadence), consuming cadences in
+                                 COMPLETION order (#401) — scores are order-free (seeded
+                                 on the catalog index), only row/log order varies
 
     Failure containment mirrors preprocessing's: a cadence whose inference stage fails is
     logged, recorded as status='failed' in the manifest, and the loop continues; the pass
@@ -843,20 +844,29 @@ def _run_streaming_csv_inference(
         # mid-operation locks in the children)
         preprocessor.start_energy_detection_pool()
         try:
-            # Prefetch depth (#298 N2): `depth` cadences preprocess+load concurrently ahead
-            # of the GPU stage. Futures are consumed strictly in catalog order, so results,
-            # manifest/supersede ordering, the reference-cloud offer order, and per-cadence
-            # seeding (keyed on unit.index — the catalog position, not execution order) are
-            # identical at any depth. Cost: up to `depth` in-flight cadences of RAM.
+            # Prefetch depth (#298 N2) with completion-order consumption (#401): `depth`
+            # cadences preprocess+load concurrently ahead of the GPU stage, and the main
+            # thread consumes WHICHEVER future finishes first, submitting a replacement
+            # immediately — so one straggler (a 30-minute RFI-dense preprocess, a
+            # 10-minute load of a monster stamp array) no longer head-of-line-blocks the
+            # other slots into idleness (measured: 12% of the depth-3 baseline run's wall
+            # had ZERO preprocessing running while finished slots waited behind a
+            # straggler). Per-cadence science is order-free by construction — seeding
+            # keys on unit.index (the catalog position, not execution order) and the
+            # reference-cloud reservoir selects by content-derived keys (#401) — so
+            # results are identical at any depth and any completion order; what does vary
+            # run-to-run is manifest/DB ROW ORDER and log interleaving (row content is
+            # unchanged; resume/queries key on tag+npy_path, never order). Cost: up to
+            # `depth` in-flight cadences of RAM.
             depth = max(1, config.inference.prefetch_depth)
             with ThreadPoolExecutor(
                 max_workers=depth, thread_name_prefix="preproc_prefetch"
             ) as prefetch:
-                futures = deque(
-                    prefetch.submit(_prefetch_cadence, preprocessor, unit)
+                in_flight = {
+                    prefetch.submit(_prefetch_cadence, preprocessor, unit): unit
                     for unit in pending[:depth]
-                )
-                next_submit = len(futures)
+                }
+                next_submit = len(in_flight)
 
                 # Load models AFTER the first prefetch is in flight (#298 rider): the
                 # 10-60 s encoder+RF+calibrator load hides under the first cadence's
@@ -864,19 +874,25 @@ def _run_streaming_csv_inference(
                 # and every cadence reuses this one pipeline.
                 pipeline = InferencePipeline(strategy=strategy)
 
-                for i, unit in enumerate(pending):
+                n_consumed = 0
+                while in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                     # NOTE: an exception inside a prefetched preprocessing task surfaces
-                    # here, `depth` iterations after it was submitted, when its future is
-                    # resolved — and then propagates to inference_command's retry loop. In
-                    # practice process_pending_cadence swallows per-cadence failures
-                    # (returns None) and _prefetch_cadence contains load failures, so only
+                    # at .result() below, when its future completes — and then propagates
+                    # to inference_command's retry loop. In practice
+                    # process_pending_cadence swallows per-cadence failures (returns
+                    # None) and _prefetch_cadence contains load failures, so only
                     # infrastructure-level errors (e.g. a broken worker pool) raise.
-                    cadence_result, cadence_data = futures.popleft().result()
+                    future = next(iter(done))
+                    unit = in_flight.pop(future)
+                    cadence_result, cadence_data = future.result()
+                    n_consumed += 1
 
                     # Keep `depth` cadences in flight while the main thread encodes this one
                     if next_submit < len(pending):
-                        futures.append(
-                            prefetch.submit(_prefetch_cadence, preprocessor, pending[next_submit])
+                        next_unit = pending[next_submit]
+                        in_flight[prefetch.submit(_prefetch_cadence, preprocessor, next_unit)] = (
+                            next_unit
                         )
                         next_submit += 1
 
@@ -955,7 +971,7 @@ def _run_streaming_csv_inference(
 
                     logger.info(
                         f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "
-                        f"{len(pending) - i - 1} to go): {results['n_processed']} snippets, "
+                        f"{len(pending) - n_consumed} to go): {results['n_processed']} snippets, "
                         f"{results['n_candidates']} candidate(s)"
                     )
                     del results

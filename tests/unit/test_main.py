@@ -412,9 +412,10 @@ class TestStreamingResumeStateMachine:
         for unit in preprocessor.units:
             assert os.path.exists(unit.npy_path)  # kept on failure
 
-    def test_prefetch_depth_2_preserves_catalog_order(self, stubbed_streaming):
-        """#298 N2: at depth 2 the futures are consumed strictly in catalog order, so
-        inference order, manifest rows, and totals are identical to depth 1."""
+    def test_prefetch_depth_2_completes_all_cadences(self, stubbed_streaming):
+        """#298 N2 + #401: at depth 2 every cadence is inferred exactly once and the
+        totals/manifest are complete — consumption order is completion order, so only
+        the SET of inferred cadences is contractual, not their sequence."""
         db, make_preprocessor = stubbed_streaming
         get_config().inference.prefetch_depth = 2
         preprocessor = make_preprocessor(keys=[("A", "1"), ("B", "2"), ("C", "3"), ("D", "4")])
@@ -423,9 +424,35 @@ class TestStreamingResumeStateMachine:
 
         assert totals["n_cadences"] == 4
         pipeline = _StubPipeline.instances[-1]
-        assert pipeline.inferred_paths == [u.npy_path for u in preprocessor.units]
+        assert sorted(pipeline.inferred_paths) == sorted(u.npy_path for u in preprocessor.units)
         assert db.flush(timeout=10) is True
         assert len(db.query_inference_cadences(tag="test_v1", status="inferred")) == 4
+
+    def test_completion_order_consumes_fast_cadence_before_straggler(self, stubbed_streaming):
+        """#401: with depth 2, a slow first cadence must NOT head-of-line-block the fast
+        second one — the fast cadence is inferred while the straggler still preprocesses.
+        (Under the old strict-catalog-order consumption this asserted the reverse.)"""
+        import time as _time  # noqa: PLC0415
+
+        db, make_preprocessor = stubbed_streaming
+        get_config().inference.prefetch_depth = 2
+        preprocessor = make_preprocessor(keys=[("SLOW", "1"), ("FAST", "2")])
+        slow_path = preprocessor.units[0].npy_path
+        original = preprocessor.process_pending_cadence
+
+        def stalling(unit):
+            if unit.npy_path == slow_path:
+                _time.sleep(0.8)
+            return original(unit)
+
+        preprocessor.process_pending_cadence = stalling
+
+        totals = _run_streaming_csv_inference(preprocessor, strategy=None)
+
+        assert totals["n_cadences"] == 2
+        pipeline = _StubPipeline.instances[-1]
+        fast_path = preprocessor.units[1].npy_path
+        assert pipeline.inferred_paths == [fast_path, slow_path]
 
     def test_prefetch_load_failure_falls_back_to_inference_thread(self, stubbed_streaming):
         """#298 I5-overlap: a prefetch-side load failure must not abort the pass one

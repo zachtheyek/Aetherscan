@@ -8,6 +8,8 @@ predictions / latent vectors to the database for downstream analysis.
 from __future__ import annotations
 
 import gc
+import heapq
+import itertools
 import logging
 import os
 import time
@@ -126,62 +128,81 @@ def _batched_mc_scores(
 
 class ReferenceCloudReservoir:
     """
-    Seeded uniform reservoir (algorithm R) over the pass-1 rejects' posterior parameters
-    (#282): a fixed-size, catalog-representative sample — deliberately NOT near-threshold,
-    which would bias the reference cloud toward the boundary and make every candidate look
-    ordinary. offer() is O(1) per row; the MC scoring cost at finalize is fixed
+    Order-independent bottom-k reservoir over the pass-1 rejects' posterior parameters
+    (#282; reworked by #401): every offered row carries a caller-derived uniform random
+    KEY — a pure function of (root seed, cadence catalog index, row position), see
+    run_inference — and the reservoir keeps the `capacity` rows with the SMALLEST keys.
+    Bottom-k of iid uniform keys is a uniform k-subset (the same distribution the old
+    sequential algorithm R produced), but membership is now a pure function of the
+    survey's content, independent of the order cadences complete in — the property
+    completion-order consumption (#401) requires, and strictly stronger than the old
+    scheme, whose sample was depth-invariant only because consumption was forced into
+    catalog order. The sample stays deliberately survey-representative, NOT
+    near-threshold (that would bias the cloud toward the boundary and make every
+    candidate look ordinary); the MC scoring cost at finalize is fixed
     (capacity x mc_draws) regardless of survey size.
+
+    Steady-state offer() cost is ~O(n) per batch for the key prefilter plus O(log k) per
+    accepted row (expected accepts decay as capacity/seen). arrays() returns rows sorted
+    by key, so the persisted cloud is byte-identical across arrival orders too. An exact
+    float64 key collision (~n^2 / 2^53) is the one residual order sensitivity — it could
+    swap that single row pair's membership, never the distribution.
     """
 
-    def __init__(self, capacity: int, rng: np.random.Generator):
+    def __init__(self, capacity: int):
         self.capacity = int(capacity)
-        self.rng = rng
         self.seen = 0
-        self._mean_rows: list[np.ndarray] = []
-        self._log_var_rows: list[np.ndarray] = []
-        self._screening: list[float] = []
+        # Max-heap via negated keys; the monotonic counter breaks exact key ties without
+        # ever comparing the payload arrays
+        self._heap: list[tuple[float, int, np.ndarray, np.ndarray, float]] = []
+        self._tiebreak = itertools.count()
 
     def offer(
-        self, mean_flat: np.ndarray, log_var_flat: np.ndarray, screening_probas: np.ndarray
+        self,
+        keys: np.ndarray,
+        mean_flat: np.ndarray,
+        log_var_flat: np.ndarray,
+        screening_probas: np.ndarray,
     ) -> None:
         if self.capacity <= 0:
             return
+        keys = np.asarray(keys, dtype=np.float64)
         n_rows = len(mean_flat)
-        start = 0
-        # Fill phase (rare: only until the reservoir reaches capacity)
-        while start < n_rows and len(self._mean_rows) < self.capacity:
-            self._mean_rows.append(np.array(mean_flat[start]))
-            self._log_var_rows.append(np.array(log_var_flat[start]))
-            self._screening.append(float(screening_probas[start]))
-            self.seen += 1
-            start += 1
-        if start >= n_rows:
-            return
+        self.seen += n_rows
 
-        # Replacement phase, vectorized (this runs for every reject batch of the survey, so
-        # the per-row Python loop it replaces was a real cost): item t (1-indexed global
-        # count) is accepted with probability capacity/t and lands in a uniform slot —
-        # textbook algorithm R, with one rng call per batch instead of one per row
-        remaining = n_rows - start
-        t_values = self.seen + 1 + np.arange(remaining)
-        accepted = self.rng.random(remaining) < (self.capacity / t_values)
-        slots = self.rng.integers(0, self.capacity, size=remaining)
-        self.seen += remaining
-        for offset in np.nonzero(accepted)[0]:
-            row_index = start + int(offset)
-            slot = int(slots[offset])
-            self._mean_rows[slot] = np.array(mean_flat[row_index])
-            self._log_var_rows[slot] = np.array(log_var_flat[row_index])
-            self._screening[slot] = float(screening_probas[row_index])
+        # Vectorized prefilter: only rows that beat the current k-th smallest key can
+        # enter. Ascending-key processing lets the loop stop at the first non-qualifier.
+        if len(self._heap) >= self.capacity:
+            candidate_idx = np.nonzero(keys < -self._heap[0][0])[0]
+        else:
+            candidate_idx = np.arange(n_rows)
+        candidate_idx = candidate_idx[np.argsort(keys[candidate_idx], kind="stable")]
+
+        for i in candidate_idx:
+            row = int(i)
+            item = (
+                -float(keys[row]),
+                next(self._tiebreak),
+                np.array(mean_flat[row]),
+                np.array(log_var_flat[row]),
+                float(screening_probas[row]),
+            )
+            if len(self._heap) < self.capacity:
+                heapq.heappush(self._heap, item)
+            elif float(keys[row]) < -self._heap[0][0]:
+                heapq.heapreplace(self._heap, item)
+            else:
+                break  # keys ascend from here on — nothing later can qualify
 
     def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if not self._mean_rows:
+        if not self._heap:
             empty = np.empty((0, 0), dtype=np.float32)
             return empty, empty, np.empty(0, dtype=np.float32)
+        ordered = sorted(self._heap, key=lambda item: -item[0])
         return (
-            np.stack(self._mean_rows),
-            np.stack(self._log_var_rows),
-            np.asarray(self._screening, dtype=np.float32),
+            np.stack([item[2] for item in ordered]),
+            np.stack([item[3] for item in ordered]),
+            np.asarray([item[4] for item in ordered], dtype=np.float32),
         )
 
 
@@ -273,10 +294,10 @@ class InferencePipeline:
 
         # Reference cloud (#282): a seeded uniform reservoir over the pass-1 REJECTS across
         # the whole run — MC-scored once at finalize so the candidate uncertainty plot
-        # compares candidates against the survey, not against other candidates
+        # compares candidates against the survey, not against other candidates. Selection
+        # keys are derived per cadence at offer time (#401), so no reservoir-level rng.
         self._reference_reservoir = ReferenceCloudReservoir(
-            capacity=self.config.inference.reference_cloud_size,
-            rng=derive_rng(self.config.reproducibility.seed, STREAM_REFERENCE_CLOUD),
+            capacity=self.config.inference.reference_cloud_size
         )
 
         # Lazily-built tf.function for the distributed encode step, cached so repeated
@@ -581,10 +602,24 @@ class InferencePipeline:
                 predictions = (proba_true > self.threshold).astype(int)
                 confidence_scores = np.where(predictions, proba_true, 1.0 - proba_true)
 
-                # Reference cloud: feed the pass-1 rejects to the seeded uniform reservoir
+                # Reference cloud: feed the pass-1 rejects to the bottom-k reservoir.
+                # Selection keys (#401) are a pure function of (root seed, cadence
+                # seed_key, snippet position) — every snippet owns a key whatever order
+                # cadences complete in, so reservoir membership is arrival-order-free.
+                # The (STREAM_REFERENCE_CLOUD, 2, ...) sub-key is disjoint from the
+                # finalize-time MC stream (STREAM_REFERENCE_CLOUD, 1).
                 reject_idx = np.nonzero(~survivors)[0]
                 if len(reject_idx):
+                    key_stream = (
+                        (STREAM_REFERENCE_CLOUD, 2)
+                        if seed_key is None
+                        else (STREAM_REFERENCE_CLOUD, 2, seed_key)
+                    )
+                    snippet_keys = derive_rng(self.config.reproducibility.seed, *key_stream).random(
+                        n_samples
+                    )
                     self._reference_reservoir.offer(
+                        snippet_keys[reject_idx],
                         mean_flat[reject_idx],
                         logvar_flat[reject_idx],
                         screening_probas[reject_idx],
@@ -926,10 +961,10 @@ class InferencePipeline:
                 -1 if self.config.reproducibility.seed is None else self.config.reproducibility.seed
             ),
             # Explicit stream provenance so a reader can reproduce the cloud without
-            # reverse-engineering the derivation: the reservoir consumes
-            # derive_rng(root, STREAM_REFERENCE_CLOUD) and the MC scoring
-            # derive_rng(root, STREAM_REFERENCE_CLOUD, 1)
-            reservoir_stream_id=np.int64(STREAM_REFERENCE_CLOUD),
+            # reverse-engineering the derivation: each cadence's selection keys come from
+            # derive_rng(root, STREAM_REFERENCE_CLOUD, 2, cadence_index) (#401) and the
+            # finalize-time MC scoring from derive_rng(root, STREAM_REFERENCE_CLOUD, 1)
+            reservoir_key_stream=np.array([STREAM_REFERENCE_CLOUD, 2], dtype=np.int64),
             mc_stream_key=np.array([STREAM_REFERENCE_CLOUD, 1], dtype=np.int64),
         )
         logger.info(f"Reference cloud persisted to {cloud_path}")
