@@ -987,3 +987,47 @@ class TestCandidateTriageReport:
             db, record.npy_path, [(1.0, 1400.5, [0.0] * 48), (1.0, 8438.0, [30.0] * 48)]
         )
         _assert_figure(viz.plot_candidate_gallery())
+
+
+class TestRenderCapStarvation:
+    """Audit fix on #395: a wall of excluded RFI at the head of the review order must not
+    consume the whole --max-candidate-plots budget and starve reported candidates out of
+    their figures and uploads."""
+
+    def test_reported_candidate_rendered_despite_excluded_wall(
+        self, initialized_runtime, collector, monkeypatch
+    ):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        config.inference.max_candidate_plots = 1
+        config.inference.report_exclude_frequency_ranges = [[1575.0, 1576.0]]
+        record = collector.records[0]
+        latent = list(np.random.default_rng(5).normal(size=48))
+        # Excluded GPS hit outranks the clean candidate -> under the old cap-first logic
+        # the clean candidate would never render or upload
+        for idx, (conf, freq) in enumerate(((0.999, 1575.42), (0.99, 8438.0))):
+            db.write_inference_result(
+                record.npy_path,
+                idx,
+                1,
+                conf,
+                latent_vector=np.asarray(latent),
+                target="HIP110750",
+                band="L",
+                frequency_mhz=freq,
+                tag=TAG,
+            )
+        assert db.flush(timeout=10) is True
+
+        uploads = []
+        monkeypatch.setattr(viz._uploader, "submit", lambda path, title: uploads.append(title))
+        _assert_figure(viz.plot_candidate_gallery())
+        tag_dir = os.path.join(config.output_path, "plots", "inference", TAG)
+        # Both rendered: index 0 = the excluded top-of-cap row, index 1 = the reported one
+        assert os.path.exists(os.path.join(tag_dir, f"candidate_0_{TAG}.png"))
+        assert os.path.exists(os.path.join(tag_dir, f"candidate_1_{TAG}.png"))
+        # Only the reported candidate uploaded (plus the gallery)
+        assert any(title.startswith("Candidate 1") for title in uploads)
+        assert not any(title.startswith("Candidate 0") for title in uploads)

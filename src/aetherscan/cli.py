@@ -1546,9 +1546,9 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
     # inference_viz uses argparse.BooleanOptionalAction with default=None so that the CLI
     # can express "leave the config default" (omit), "force on" (--inference-viz), and
     # "force off" (--no-inference-viz)
-    # prune_stamps uses BooleanOptionalAction with default=None, where None means AUTO
-    # (on for the fingerprint-default cache dir, off for an explicit one) — resolved at
-    # run time by main._resolve_prune_stamps, so only explicit flags land here
+    # prune_stamps uses BooleanOptionalAction with default=None; None resolves OFF at
+    # run time by main._resolve_prune_stamps (#399 — stamps retained unless --prune-stamps
+    # is passed explicitly), so only explicit flags land here
     if hasattr(args, "prune_stamps") and args.prune_stamps is not None:
         config.inference.prune_stamps = args.prune_stamps
     if hasattr(args, "inference_viz") and args.inference_viz is not None:

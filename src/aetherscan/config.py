@@ -490,8 +490,9 @@ class InferenceConfig:
     # 5,118 s wall, ~-20%, identical candidates with 0.0 score deltas; caveat: the
     # depth-3 leg ran last and warmest, so treat the honest win as ~10-20% — same
     # confound structure the 1→2 flip carried). Per-cadence outputs are identical at any
-    # depth (results are consumed in catalog order and seeding keys on the catalog
-    # index); depth 1 restores the historical serial behavior.
+    # depth AND any completion order (#401: consumption is completion-ordered; seeding
+    # keys on the catalog index and the reference-cloud reservoir selects by
+    # content-derived keys); depth 1 restores the historical serial behavior.
     prefetch_depth: int = 3
 
     # NOTE: come back to this later (is this the optimal grouping?)

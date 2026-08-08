@@ -152,6 +152,10 @@ class ReferenceCloudReservoir:
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
         self.seen = 0
+        # One offer() call per cadence-with-rejects: persisted as n_contributing_cadences
+        # so downstream OOD consumers can detect a survey-unrepresentative cloud (a
+        # failed-then-retried pass rebuilds the reservoir from only the final attempt)
+        self.cadences_offered = 0
         # Max-heap via negated keys; the monotonic counter breaks exact key ties without
         # ever comparing the payload arrays
         self._heap: list[tuple[float, int, np.ndarray, np.ndarray, float]] = []
@@ -169,6 +173,7 @@ class ReferenceCloudReservoir:
         keys = np.asarray(keys, dtype=np.float64)
         n_rows = len(mean_flat)
         self.seen += n_rows
+        self.cadences_offered += 1
 
         # Vectorized prefilter: only rows that beat the current k-th smallest key can
         # enter. Ascending-key processing lets the loop stop at the first non-qualifier.
@@ -566,9 +571,13 @@ class InferencePipeline:
                 mc_std = np.full(n_samples, np.nan, dtype=np.float32)
                 survivor_idx = np.nonzero(survivors)[0]
                 if len(survivor_idx):
-                    # None gets the BARE stream key, a real cadence index its own sub-key:
-                    # SeedSequence([root, id]) and SeedSequence([root, id, 0]) are distinct,
-                    # so a keyless legacy call can never collide with catalog cadence 0
+                    # None gets the BARE stream key, a real cadence index its own sub-key.
+                    # NOTE: SeedSequence treats a trailing 0 entropy word as an identity,
+                    # so the keyless (root, id) stream IS catalog cadence 0's
+                    # (root, id, 0) — benign here because the keyless legacy path and the
+                    # streaming path never feed one run's results, but do not rely on
+                    # these streams being distinct (the reservoir keys below avoid the
+                    # same trap explicitly)
                     mc_key = (
                         (STREAM_INFERENCE_MC,)
                         if seed_key is None
@@ -606,12 +615,19 @@ class InferencePipeline:
                 # Selection keys (#401) are a pure function of (root seed, cadence
                 # seed_key, snippet position) — every snippet owns a key whatever order
                 # cadences complete in, so reservoir membership is arrival-order-free.
-                # The (STREAM_REFERENCE_CLOUD, 2, ...) sub-key is disjoint from the
-                # finalize-time MC stream (STREAM_REFERENCE_CLOUD, 1).
+                # Sub-key layout: cadences use (STREAM_REFERENCE_CLOUD, 2, seed_key);
+                # the keyless legacy path uses (STREAM_REFERENCE_CLOUD, 3), NOT
+                # (STREAM_REFERENCE_CLOUD, 2) — SeedSequence treats a trailing 0 entropy
+                # word as an identity, so (S, 2) would be the SAME stream as catalog
+                # cadence 0's (S, 2, 0) and a caller mixing both derivations in one
+                # pipeline would offer duplicate keys (which the strict-< bottom-k can
+                # never both admit). (S, 3) collides with nothing: no cadence stream has
+                # 3 in that slot. Both stay disjoint from the finalize-time MC stream
+                # (STREAM_REFERENCE_CLOUD, 1).
                 reject_idx = np.nonzero(~survivors)[0]
                 if len(reject_idx):
                     key_stream = (
-                        (STREAM_REFERENCE_CLOUD, 2)
+                        (STREAM_REFERENCE_CLOUD, 3)
                         if seed_key is None
                         else (STREAM_REFERENCE_CLOUD, 2, seed_key)
                     )
@@ -960,9 +976,15 @@ class InferencePipeline:
             root_seed=np.int64(
                 -1 if self.config.reproducibility.seed is None else self.config.reproducibility.seed
             ),
+            # Survey-representativeness signal (#401): how many cadences fed the
+            # reservoir. A failed-then-retried pass rebuilds it from only the final
+            # attempt's cadences — OOD consumers compare this against the run's
+            # inferred-cadence count and annotate when the cloud is unrepresentative.
+            n_contributing_cadences=np.int64(self._reference_reservoir.cadences_offered),
             # Explicit stream provenance so a reader can reproduce the cloud without
             # reverse-engineering the derivation: each cadence's selection keys come from
-            # derive_rng(root, STREAM_REFERENCE_CLOUD, 2, cadence_index) (#401) and the
+            # derive_rng(root, STREAM_REFERENCE_CLOUD, 2, cadence_index) (#401; the
+            # keyless legacy path uses (root, STREAM_REFERENCE_CLOUD, 3)) and the
             # finalize-time MC scoring from derive_rng(root, STREAM_REFERENCE_CLOUD, 1)
             reservoir_key_stream=np.array([STREAM_REFERENCE_CLOUD, 2], dtype=np.int64),
             mc_stream_key=np.array([STREAM_REFERENCE_CLOUD, 1], dtype=np.int64),

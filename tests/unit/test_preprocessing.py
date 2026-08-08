@@ -364,11 +364,14 @@ class TestLogNormChunkVectorized:
 
     def _chunk(self, dtype=np.float32):
         rng = np.random.default_rng(31)
-        chunk = rng.chisquare(df=4, size=(7, 6, 4, 16)).astype(dtype)
+        chunk = rng.chisquare(df=4, size=(8, 6, 4, 16)).astype(dtype)
         chunk[1, 0, 0, 0] = np.nan  # invalid: NaN
         chunk[3, 2, 1, 5] = np.inf  # invalid: Inf
         chunk[5] = 0.0  # invalid: non-positive max
         chunk[6] = 2.5  # valid but constant: zero range after the log shift
+        # Invalid (#400): a negative finite value with positive max passed the old filter
+        # and its log would NaN-poison the normalized row — now rejected like NaN/Inf
+        chunk[7, 1, 2, 3] = -1.0
         return chunk
 
     def _worker_reference(self, chunk, monkeypatch):

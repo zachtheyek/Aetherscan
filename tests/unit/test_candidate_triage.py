@@ -42,6 +42,7 @@ class TestNormalizedFrequencyRanges:
             [[1616, float("nan")]],  # so does nan
             [["iridium", 1626.5]],  # non-numeric
             [[1616]],  # missing end
+            ["1616", "1626.5"],  # flat string pair: '1616'[0] would index characters
         ],
     )
     def test_malformed_ranges_raise(self, bad):
@@ -126,6 +127,19 @@ class TestCandidateLatentMatrix:
         assert matrix.size == 0
         assert indices == []
 
+    def test_expected_width_filters_per_row_not_anchor_first(self):
+        # One anomalous-width FIRST row must not veto the normal rows behind it when the
+        # reference dimensionality is known (audit fix: anchor-first let a single corrupt
+        # row kill every OOD column for the run)
+        rows = [
+            {"latent_vector": json.dumps([1.0, 2.0])},  # anomalous width
+            {"latent_vector": json.dumps([1.0] * 4)},
+            {"latent_vector": json.dumps([2.0] * 4)},
+        ]
+        matrix, indices = candidate_latent_matrix(rows, expected_width=4)
+        assert matrix.shape == (2, 4)
+        assert indices == [1, 2]
+
 
 class TestTriageSortRows:
     def test_confidence_first_then_ood_then_mc_std(self):
@@ -201,3 +215,44 @@ class TestOodScoreSources:
         config_path = tmp_path / "config.json"
         config_path.write_text(json.dumps({"checkpoint": {"save_tag": "train_missing"}}))
         assert training_ood_scores([], str(tmp_path), str(config_path)) == {}
+
+    def test_training_ood_finds_display_tagged_artifact(self, tmp_path):
+        # train.py names the artifact with the TRAINING host's display tag
+        # (rf_eval_artifacts_train_{machine}_{datetime}.joblib); inference may run on a
+        # different host, so the glob fallback must find it (audit blocker: the plain-tag
+        # lookup missed every display-tagged artifact in production)
+        train_tag = "train_20260729_152426"
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"checkpoint": {"save_tag": train_tag}}))
+        rng = np.random.default_rng(5)
+        joblib.dump(
+            {
+                "latent_variant": "z_mean",
+                "train_features": rng.normal(size=(300, 8)),
+                "train_binary_labels": np.array([1] * 200 + [0] * 100),
+            },
+            tmp_path / "rf_eval_artifacts_train_otherhost_20260729_152426.joblib",
+        )
+        rows = [{"npy_path": "n", "snippet_index": 0, "latent_vector": json.dumps([0.1] * 8)}]
+        assert ("n", 0) in training_ood_scores(rows, str(tmp_path), str(config_path))
+
+    def test_module_import_is_stdlib_only(self):
+        # cli.py imports the range validator from this module, and the weekly docs
+        # workflow imports cli.py on a bare interpreter with no numpy installed — the
+        # MODULE import must not pull numpy (deferred into the OOD functions)
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        code = (
+            "import sys; sys.modules['numpy'] = None; "
+            "import aetherscan.candidate_triage; print('ok')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PYTHONPATH": "src"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ok" in result.stdout

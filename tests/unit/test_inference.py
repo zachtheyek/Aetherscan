@@ -518,3 +518,18 @@ class TestRfFeatureLayoutGuard:
             recorded_variant="z_mean",
             recorded_active_dims=[5, 6, 7],
         )._check_rf_feature_layout()
+
+
+class TestReservoirCadenceCount:
+    def test_cadences_offered_counts_offer_calls(self):
+        reservoir = ReferenceCloudReservoir(capacity=5)
+        keys = np.random.default_rng(0).random(4)
+        mean = np.zeros((4, 2), dtype=np.float32)
+        log_var = np.zeros((4, 2), dtype=np.float32)
+        screening = np.zeros(4, dtype=np.float32)
+        for _ in range(3):
+            reservoir.offer(keys, mean, log_var, screening)
+        # One offer() per cadence-with-rejects: the persisted n_contributing_cadences
+        # signal downstream OOD consumers use to detect an unrepresentative cloud
+        assert reservoir.cadences_offered == 3
+        assert reservoir.seen == 12

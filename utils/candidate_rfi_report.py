@@ -42,6 +42,7 @@ import csv
 import os
 import sqlite3
 import sys
+import urllib.parse
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -71,7 +72,11 @@ def default_db_path() -> str:
 
 def load_candidates(db_path: str, tag: str) -> list[dict]:
     """This tag's live candidate rows (prediction=1, superseded=0), one dict per row."""
-    with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+    # quote() the path: sqlite's URI parser treats raw ? and # as parameter/fragment
+    # markers, which would truncate the path and silently open (or CREATE) a different
+    # file read-write — breaking the read-only guarantee this script advertises
+    ro_uri = f"file:{urllib.parse.quote(db_path)}?mode=ro"
+    with contextlib.closing(sqlite3.connect(ro_uri, uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT target, band, frequency_mhz, confidence, mc_mean, mc_std, "

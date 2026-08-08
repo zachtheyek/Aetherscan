@@ -10,19 +10,20 @@ science record stays complete while the review surface stays clean. Accordingly,
 ``inference.report_exclude_frequency_ranges`` sits in ``run_state.py``'s fingerprint
 denylist: changing it must never stale a resume row or rename a stamp-cache directory.
 
-TF-free by design (mirrors ``candidate_figures``): imported by ``inference_viz`` (viz
-surfaces) and ``main`` (summary tallies), and importable by standalone utils without
-dragging in the model stack.
+TF-free by design (mirrors ``candidate_figures``), and the MODULE import is
+stdlib-only: ``cli.py`` imports the frequency-range validator from here, and the
+cli/config import chain must stay importable on a bare interpreter (the weekly
+docs workflow runs ``utils/print_cli_help.py`` with no dependencies installed).
+numpy and joblib are deferred into the OOD functions that need them.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import math
 import os
-
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,10 @@ def normalized_frequency_ranges(ranges) -> list[tuple[float, float]]:
         return []
     normalized = []
     for pair in ranges:
+        if isinstance(pair, str):
+            # A bare string would "work" by indexing its characters ('1616'[0] -> '1'),
+            # silently mangling the range — reject it like any other malformed pair
+            raise ValueError(f"malformed frequency range {pair!r}: expected [start_mhz, end_mhz]")
         try:
             start, end = float(pair[0]), float(pair[1])
         except (TypeError, ValueError, IndexError):
@@ -102,7 +107,7 @@ def report_exclusion_ranges(config) -> list[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-def mahalanobis_ood(candidates: np.ndarray, reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def mahalanobis_ood(candidates, reference):
     """
     (distances, percentiles) of each candidate row against the reference distribution:
     Mahalanobis distance under the reference's mean/covariance (ridge-stabilized pinv, so
@@ -110,6 +115,8 @@ def mahalanobis_ood(candidates: np.ndarray, reference: np.ndarray) -> tuple[np.n
     distance among the reference rows' own distances (100 = farther than every reference
     row, i.e. maximally unusual).
     """
+    import numpy as np  # noqa: PLC0415  # deferred: the module import must stay stdlib-only
+
     reference = np.asarray(reference, dtype=np.float64)
     candidates = np.asarray(candidates, dtype=np.float64)
     mean = reference.mean(axis=0)
@@ -134,12 +141,18 @@ def mahalanobis_ood(candidates: np.ndarray, reference: np.ndarray) -> tuple[np.n
     return candidate_distances, percentiles
 
 
-def candidate_latent_matrix(rows: list[dict]) -> tuple[np.ndarray, list[int]]:
+def candidate_latent_matrix(rows: list[dict], expected_width: int | None = None):
     """Parse the candidate rows' stored latent_vector JSON payloads into a (n, d) float
-    matrix, returning it with the indices of the rows that had a parseable vector."""
+    matrix, returning it with the indices of the rows that had a parseable vector.
+    With expected_width given (the reference cloud's dimensionality), rows of any other
+    width are dropped individually — anchoring the width to the first parseable row would
+    let one anomalous row (tag reuse across models, row corruption) veto every normal
+    row behind it. Without it, the first parseable row's width anchors."""
+    import numpy as np  # noqa: PLC0415  # deferred: the module import must stay stdlib-only
+
     vectors: list[list[float]] = []
     row_indices: list[int] = []
-    width: int | None = None
+    width: int | None = expected_width
     for i, row in enumerate(rows):
         payload = row.get("latent_vector")
         if payload is None:
@@ -159,16 +172,12 @@ def candidate_latent_matrix(rows: list[dict]) -> tuple[np.ndarray, list[int]]:
     return np.asarray(vectors, dtype=np.float64), row_indices
 
 
-def _ood_map(rows: list[dict], reference: np.ndarray) -> dict[tuple[str, int], tuple[float, float]]:
+def _ood_map(rows: list[dict], reference) -> dict[tuple[str, int], tuple[float, float]]:
     """{(npy_path, snippet_index): (distance, percentile)} for rows with usable latents
-    matching the reference dimensionality."""
-    latents, row_indices = candidate_latent_matrix(rows)
-    if latents.size == 0 or latents.shape[1] != reference.shape[1]:
-        if latents.size and latents.shape[1] != reference.shape[1]:
-            logger.info(
-                f"OOD triage: candidate latent width {latents.shape[1]} != reference "
-                f"width {reference.shape[1]}; skipping"
-            )
+    matching the reference dimensionality (per-row width filter, so one anomalous row
+    never vetoes the rest)."""
+    latents, row_indices = candidate_latent_matrix(rows, expected_width=reference.shape[1])
+    if latents.size == 0:
         return {}
     distances, percentiles = mahalanobis_ood(latents, reference)
     return {
@@ -190,6 +199,8 @@ def survey_ood_scores(
     survey background. Requires the cloud NPZ to carry latent_mean rows (clouds written
     before #397 lack them — skipped with a log). Best-effort: {} on any failure.
     """
+    import numpy as np  # noqa: PLC0415  # deferred: the module import must stay stdlib-only
+
     try:
         if not os.path.exists(cloud_path):
             logger.info(f"OOD triage: no reference cloud at {cloud_path}; skipping survey OOD")
@@ -210,20 +221,79 @@ def survey_ood_scores(
         return {}
 
 
+def survey_cloud_cadence_count(cloud_path: str) -> int | None:
+    """The number of cadences that contributed rejects to the reference cloud
+    (n_contributing_cadences, persisted since #401), or None when unavailable. Consumers
+    compare it against the run's inferred-cadence count: a failed-then-retried pass
+    rebuilds the reservoir from only the final attempt's cadences (documented at the
+    finalize callsite), and OOD percentiles against such a cloud are survey-UNrepresentative
+    — worth a loud annotation, never a hard failure."""
+    import numpy as np  # noqa: PLC0415  # deferred: the module import must stay stdlib-only
+
+    try:
+        if not os.path.exists(cloud_path):
+            return None
+        with np.load(cloud_path) as npz:
+            if "n_contributing_cadences" not in npz.files:
+                return None
+            return int(npz["n_contributing_cadences"])
+    except Exception:
+        return None
+
+
+def _training_artifact_path(model_path: str, train_tag: str) -> str | None:
+    """Locate rf_eval_artifacts for the training tag. train.py names the artifact with the
+    machine-scoped display tag of the TRAINING host (rf_eval_artifacts_train_{machine}_
+    {datetime}.joblib), while artifacts written before that naming landed carry the plain
+    tag — and inference may run on a different host than training. Try, in order: the
+    current host's display-tagged name, the plain-tag name, then a glob for any host's
+    display-tagged variant. Returns None when nothing matches."""
+    from aetherscan.display_tag import display_tag  # noqa: PLC0415  # stdlib-only module
+
+    candidates = [
+        os.path.join(model_path, f"rf_eval_artifacts_{display_tag(train_tag, _machine())}.joblib"),
+        os.path.join(model_path, f"rf_eval_artifacts_{train_tag}.joblib"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    if "_" in train_tag:
+        command, datetime_part = train_tag.split("_", 1)
+        matches = sorted(
+            glob.glob(
+                os.path.join(model_path, f"rf_eval_artifacts_{command}_*_{datetime_part}.joblib")
+            )
+        )
+        if matches:
+            return matches[0]
+    return None
+
+
+def _machine() -> str:
+    """The current machine name via the one accessor — deferred import because
+    aetherscan.db pulls numpy at module level and this module must import stdlib-only."""
+    from aetherscan.db import get_machine_name  # noqa: PLC0415
+
+    return get_machine_name()
+
+
 def training_ood_scores(
     rows: list[dict], model_path: str, training_config_path: str | None
 ) -> dict[tuple[str, int], tuple[float, float]]:
     """
     Candidate-vs-training OOD (#397): distance of each candidate's latent to the training
-    run's TRUE-class feature cloud from rf_eval_artifacts_{train_tag}.joblib — how unlike
-    the synthetic signal manifold a candidate is. Only computed when the deployed variant
-    is 'z_mean' (the one variant whose train_features live in the same space as the
-    stored candidate z_mean latents); anything else, or a missing cluster-local artifact,
-    skips with a log. Best-effort: {} on any failure.
+    run's TRUE-class feature cloud from the rf_eval_artifacts joblib (located via
+    _training_artifact_path — display-tagged and plain namings both occur in the wild) —
+    how unlike the synthetic signal manifold a candidate is. Only computed when the
+    deployed variant is 'z_mean' (the one variant whose train_features live in the same
+    space as the stored candidate z_mean latents); anything else, or a missing
+    cluster-local artifact, skips with a log. Best-effort: {} on any failure, including
+    an environment without joblib/numpy.
     """
-    import joblib  # noqa: PLC0415  # deferred: only this scorer needs it
-
     try:
+        import joblib  # noqa: PLC0415  # deferred: best-effort even without joblib
+        import numpy as np  # noqa: PLC0415  # deferred: the module import stays stdlib-only
+
         if not training_config_path or not os.path.exists(training_config_path):
             logger.info("OOD triage: no training config available; skipping training OOD")
             return {}
@@ -232,11 +302,11 @@ def training_ood_scores(
         if not train_tag:
             logger.info("OOD triage: training config lacks checkpoint.save_tag; skipping")
             return {}
-        artifact_path = os.path.join(model_path, f"rf_eval_artifacts_{train_tag}.joblib")
-        if not os.path.exists(artifact_path):
+        artifact_path = _training_artifact_path(model_path, train_tag)
+        if artifact_path is None:
             logger.info(
-                f"OOD triage: no rf_eval_artifacts at {artifact_path} (cluster-local "
-                f"artifact); skipping training OOD"
+                f"OOD triage: no rf_eval_artifacts for training tag {train_tag!r} under "
+                f"{model_path} (cluster-local artifact); skipping training OOD"
             )
             return {}
         artifacts = joblib.load(artifact_path)

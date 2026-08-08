@@ -216,13 +216,19 @@ def _init_plain_worker():
 def _downsample_cadence(cadence, downsample_factor: int, final_width: int):
     """
     Downsample one cadence's 6 observations, or return None for an invalid cadence
-    (NaN/Inf or non-positive max). Pure function of its arguments — the thread-safe core
+    (NaN/Inf, non-positive max, or any negative value — power spectra are non-negative by
+    construction, and a negative value would log-norm to NaN downstream, #400). Pure function of its arguments — the thread-safe core
     shared by the pool worker (which resolves its cadence from _GLOBAL_CHUNK_DATA) and the
     sequential path (which passes the row directly, so it never touches the module global
     and stays safe on the multi-threaded prefetch side — #298 review note).
     """
     # Skip invalid cadences
-    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+    if (
+        np.any(np.isnan(cadence))
+        or np.any(np.isinf(cadence))
+        or np.max(cadence) <= 0
+        or np.min(cadence) < 0
+    ):
         return None
 
     # Downsample each observation separately
@@ -276,7 +282,12 @@ def _lognorm_worker(args):
     cadence = _GLOBAL_CHUNK_DATA[cadence_idx]
 
     # Skip invalid cadences (same validity rule as _downsample_worker)
-    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+    if (
+        np.any(np.isnan(cadence))
+        or np.any(np.isinf(cadence))
+        or np.max(cadence) <= 0
+        or np.min(cadence) < 0
+    ):
         return None
 
     return log_norm(cadence.astype(np.float32))
@@ -298,8 +309,9 @@ def _log_norm_chunk_vectorized(chunk: np.ndarray) -> tuple[np.ndarray, np.ndarra
     reduce_axes = (1, 2, 3)
     finite = np.isfinite(chunk).all(axis=reduce_axes)
     maxes = chunk.max(axis=reduce_axes)
+    mins = chunk.min(axis=reduce_axes)
     with np.errstate(invalid="ignore"):
-        valid = finite & (maxes > 0)
+        valid = finite & (maxes > 0) & (mins >= 0)
 
     # Advanced indexing always yields a fresh array we own, so copy=False only avoids a
     # second copy when the dtype is already float32 — in-place mutation below is safe.
@@ -1551,8 +1563,10 @@ class DataPreprocessor:
         # min/max/mean triple was 3 extra passes over up-to-65 GB arrays at peak allocation
         # (~15-20% of the streaming load stage), guarding raises that are unreachable by
         # construction — rows are validity-filtered upstream (_downsample_cadence,
-        # _lognorm_worker, _log_norm_chunk_vectorized reject NaN/Inf/non-positive-max) and
-        # the normalization lands exact IEEE [0, 1] bounds (x - min(x) has min 0.0,
+        # _lognorm_worker, _log_norm_chunk_vectorized reject NaN/Inf, non-positive max,
+        # AND negative values — the negative-value rule closes the one input class whose
+        # log would NaN-poison a normalized row past the old filters) and the
+        # normalization lands exact IEEE [0, 1] bounds (x - min(x) has min 0.0,
         # x / max(x) has max 1.0, zero-range rows skip the division). The [0, 1] contract
         # is pinned by tests/unit/test_preprocessing.py (TestLoadInferenceDataPaths). This
         # row-0 check keeps the guard's raise semantics against a future normalization bug

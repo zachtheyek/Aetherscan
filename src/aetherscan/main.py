@@ -796,6 +796,7 @@ def _run_streaming_csv_inference(
                     unit.npy_path,
                     DataPreprocessor.cadence_metadata_path(unit.npy_path),
                     manifest_row,
+                    catalog_index=unit.index,
                 )
             except Exception as e:
                 logger.error(
@@ -855,8 +856,10 @@ def _run_streaming_csv_inference(
             # keys on unit.index (the catalog position, not execution order) and the
             # reference-cloud reservoir selects by content-derived keys (#401) — so
             # results are identical at any depth and any completion order; what does vary
-            # run-to-run is manifest/DB ROW ORDER and log interleaving (row content is
-            # unchanged; resume/queries key on tag+npy_path, never order). Cost: up to
+            # run-to-run is manifest/DB ROW ORDER, log interleaving, and the
+            # latent-projection figure's bounded non-candidate subsample (viz-only; the
+            # render phase catalog-sorts the records for everything else). Row content is
+            # unchanged; resume/queries key on tag+npy_path, never order. Cost: up to
             # `depth` in-flight cadences of RAM.
             depth = max(1, config.inference.prefetch_depth)
             with ThreadPoolExecutor(
@@ -886,6 +889,14 @@ def _run_streaming_csv_inference(
                     future = next(iter(done))
                     unit = in_flight.pop(future)
                     cadence_result, cadence_data = future.result()
+                    # Drop the future AND the done set immediately: Future._result pins
+                    # the (cadence_result, cadence_data) tuple, so a surviving reference
+                    # would keep a cadence-sized array (~65 GB worst case) resident
+                    # through this iteration's encode and the next blocking wait() —
+                    # exactly what the `del cadence_data` below exists to prevent. (The
+                    # old popleft().result() shape dropped the future as a temporary;
+                    # this is that shape's explicit equivalent.)
+                    del future, done
                     n_consumed += 1
 
                     # Keep `depth` cadences in flight while the main thread encodes this one
@@ -955,6 +966,7 @@ def _run_streaming_csv_inference(
                                 results["provenance"],
                                 results,
                                 results["duration_s"],
+                                catalog_index=unit.index,
                             )
                         except Exception as e:
                             logger.error(
@@ -1052,7 +1064,9 @@ def _run_legacy_test_files_inference(
 def _log_report_exclusion_summary(config) -> None:
     """Report-time frequency exclusion tally (#395): with ranges configured, append the
     excluded/reported split under the final candidate count, sourced from the whole tag's
-    live candidate rows (matching the totals, which also aggregate resumed cadences).
+    live candidate rows. On a normal run this matches the totals (which also aggregate
+    resumed cadences); reusing a tag across DIFFERENT catalogs can leave live rows the
+    current catalog never supersedes, so this tag-wide tally is the more inclusive count.
     Best-effort — a tally bug must never fail a completed science run."""
     ranges = report_exclusion_ranges(config)
     if not ranges:
