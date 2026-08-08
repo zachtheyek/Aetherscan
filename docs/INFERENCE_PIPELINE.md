@@ -232,8 +232,10 @@ proportionally longer.)
    every run: depth 4 beat depth 3 under BOTH the pre-#401 strict-order loop (11,427 s
    vs 12,561 s, −9.0%) and the post-#401 completion-order loop (9,755 s vs 10,227 s,
    −4.6%; depth 5 regressed to 10,420 s), with observed RAM peaks moving only
-   207 → 215 GB). The post-#401 margin alone sits inside the ~10% cluster noise band —
-   the default rests on the sign agreeing across both grids. Historical context: the
+   207 → 215 GB). The post-#401 margin alone sits inside the ~10% run-to-run band
+   documented for the micro-benchmarks ([`BENCHMARKING.md`](BENCHMARKING.md)), applied
+   here as the working band for whole-run wall-clock — the default rests on the sign
+   agreeing across both grids. Historical context: the
    #301 8-cadence A/B that set the old default 3 measured depth 2 → 3 at ~10–20%. A
    `ThreadPoolExecutor` keeps that many `_prefetch_cadence` futures in flight — each
    preprocesses AND loads/log-norms its cadence (`load_inference_data(parallel=False)`:

@@ -492,8 +492,9 @@ class InferenceConfig:
     # 12,561 s vs depth 4 = 11,427 s (−9.0%); post-#401 completion-order loop depth 3 =
     # 10,227 s vs depth 4 = 9,755 s (−4.6%) vs depth 5 = 10,420 s (regression). Depth 4
     # beat depth 3 in BOTH loops independently; the post-#401 margin alone sits inside
-    # the documented ~10% cluster noise band, so the call rests on the sign agreeing
-    # across both grids, not on any single run. (Historical: the #301 8-cadence A/B that
+    # the ~10% run-to-run band documented for the micro-benchmarks (BENCHMARKING.md),
+    # applied here as the working band for whole-run wall-clock, so the call rests on
+    # the sign agreeing across both grids, not on any single run. (Historical: the #301 8-cadence A/B that
     # set the old default 3 measured depth 2 → 3 at ~10-20%.) Per-cadence outputs are
     # identical at any depth AND any completion order (#401: consumption is
     # completion-ordered; seeding keys on the catalog index and the reference-cloud

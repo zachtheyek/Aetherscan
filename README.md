@@ -56,7 +56,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 > There are no plans to support non-Nvidia GPUs
 
 > [!NOTE]
-> The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`) — via the always-on resource instrumentation (`system_resources` DB rows). They characterize full-scale runs; small runs need substantially less.
+> The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`; the inference RAM peak is refreshed from the #406 depth-4 grid run on the same subset) — via the always-on resource instrumentation (`system_resources` DB rows). They characterize full-scale runs; small runs need substantially less.
 
 ### Install From PyPI (pip)
 
