@@ -213,16 +213,30 @@ def _init_plain_worker():
     _IN_POOL_WORKER = True
 
 
+def _format_array_size(nbytes: int) -> str:
+    """Adaptive array-size label (#398): MB below 0.1 GB so small-but-real arrays never
+    print as 0.0, GB above so RFI-dense monsters stay readable at a glance."""
+    if nbytes < 1e8:
+        return f"{nbytes / 1e6:.1f} MB"
+    return f"{nbytes / 1e9:.2f} GB"
+
+
 def _downsample_cadence(cadence, downsample_factor: int, final_width: int):
     """
     Downsample one cadence's 6 observations, or return None for an invalid cadence
-    (NaN/Inf or non-positive max). Pure function of its arguments — the thread-safe core
+    (NaN/Inf, non-positive max, or any negative value — power spectra are non-negative by
+    construction, and a negative value would log-norm to NaN downstream, #400). Pure function of its arguments — the thread-safe core
     shared by the pool worker (which resolves its cadence from _GLOBAL_CHUNK_DATA) and the
     sequential path (which passes the row directly, so it never touches the module global
     and stays safe on the multi-threaded prefetch side — #298 review note).
     """
     # Skip invalid cadences
-    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+    if (
+        np.any(np.isnan(cadence))
+        or np.any(np.isinf(cadence))
+        or np.max(cadence) <= 0
+        or np.min(cadence) < 0
+    ):
         return None
 
     # Downsample each observation separately
@@ -244,7 +258,7 @@ def _downsample_worker(args):
     args is a (cadence_idx, downsample_factor, final_width) tuple — the cadence itself is
     pulled from _GLOBAL_CHUNK_DATA to avoid pickling it across the pool boundary. Returns the
     downsampled cadence of shape (6, 16, final_width), or None if the source cadence contained
-    NaN/Inf or had non-positive max (treated as invalid).
+    NaN/Inf, had non-positive max, or carried any negative value (treated as invalid, #400).
     """
     cadence_idx, downsample_factor, final_width = args
 
@@ -264,8 +278,9 @@ def _lognorm_worker(args):
     needs the per-cadence log-norm. args is a (cadence_idx,) tuple — the cadence itself is
     pulled from _GLOBAL_CHUNK_DATA to avoid pickling it across the pool boundary. Returns the
     log-normalized cadence of shape (6, time_bins, final_width) as float32, or None if the
-    source cadence contained NaN/Inf or had non-positive max (treated as invalid, matching
-    _downsample_worker).
+    source cadence contained NaN/Inf, had non-positive max, or carried any negative value
+    (treated as invalid, matching _downsample_worker; the negative clause is #400's
+    NaN-poisoning guard, load-bearing like _log_norm_chunk_vectorized's).
     """
     (cadence_idx,) = args
 
@@ -276,7 +291,12 @@ def _lognorm_worker(args):
     cadence = _GLOBAL_CHUNK_DATA[cadence_idx]
 
     # Skip invalid cadences (same validity rule as _downsample_worker)
-    if np.any(np.isnan(cadence)) or np.any(np.isinf(cadence)) or np.max(cadence) <= 0:
+    if (
+        np.any(np.isnan(cadence))
+        or np.any(np.isinf(cadence))
+        or np.max(cadence) <= 0
+        or np.min(cadence) < 0
+    ):
         return None
 
     return log_norm(cadence.astype(np.float32))
@@ -288,8 +308,11 @@ def _log_norm_chunk_vectorized(chunk: np.ndarray) -> tuple[np.ndarray, np.ndarra
     (n, obs, time_bins, width): returns (normalized_valid_rows, valid_mask) (#298 I5).
 
     Bit-identical per element to the per-cadence path, by construction: the validity rule is
-    the same (any NaN/Inf or non-positive max rejects the cadence — NaN/Inf rows fail the
-    finite mask, so the max comparison never decides them); the arithmetic runs in float32
+    the same (any NaN/Inf, non-positive max, or negative value rejects the cadence — NaN/Inf
+    rows fail the finite mask, so the max/min comparisons never decide them; the negative
+    clause, #400, is load-bearing on BOTH sides — it is what keeps a row whose log would
+    NaN-poison the normalized output from ever entering the array, so do not "simplify" it
+    away from either path); the arithmetic runs in float32
     with the same scalar casts (numpy converts the 1e-10 epsilon and the per-cadence min/max
     scalars to float32 in both forms); min/max are exact order-independent reductions; and
     rows whose post-shift range is 0 skip the division exactly as log_norm's range_log > 0
@@ -298,8 +321,9 @@ def _log_norm_chunk_vectorized(chunk: np.ndarray) -> tuple[np.ndarray, np.ndarra
     reduce_axes = (1, 2, 3)
     finite = np.isfinite(chunk).all(axis=reduce_axes)
     maxes = chunk.max(axis=reduce_axes)
+    mins = chunk.min(axis=reduce_axes)
     with np.errstate(invalid="ignore"):
-        valid = finite & (maxes > 0)
+        valid = finite & (maxes > 0) & (mins >= 0)
 
     # Advanced indexing always yields a fresh array we own, so copy=False only avoids a
     # second copy when the dtype is already float32 — in-place mutation below is safe.
@@ -1252,7 +1276,10 @@ class DataPreprocessor:
         logger.info(f"Background array shape: {background_array.shape}")
         logger.info(f"Background value range: [{min_val:.6f}, {max_val:.6f}]")
         logger.info(f"Background mean: {mean_val:.6f}")
-        logger.info(f"Memory usage: {background_array.nbytes / 1e9:.2f} GB")
+        # Array nbytes, not process memory (#398): the old "Memory usage" label plus %.2f GB
+        # floored small-but-real arrays to a broken-looking "0.00 GB". Adaptive unit: MB
+        # keeps tiny arrays visible, GB keeps the 65 GB monsters readable (review note)
+        logger.info(f"Background array size: {_format_array_size(background_array.nbytes)}")
         logger.info(f"Background data ready at {background_array.shape[3]} resolution")
 
         return background_array
@@ -1475,7 +1502,18 @@ class DataPreprocessor:
                     shared_chunk = None
                     results = []
 
-                    normalized, _ = _log_norm_chunk_vectorized(chunk_data)
+                    normalized, valid_mask = _log_norm_chunk_vectorized(chunk_data)
+                    n_rejected = int((~valid_mask).sum())
+                    if n_rejected:
+                        # The validity filter is now the ONLY guard between a bad row and
+                        # the encoder (#400 review note) — make the sensitivity loss
+                        # observable instead of inferable from the funnel figure
+                        logger.warning(
+                            f"Load-time validity filter rejected {n_rejected} of "
+                            f"{len(valid_mask)} snippet row(s) (NaN/Inf, non-positive "
+                            f"max, or negative values)"
+                        )
+                    del valid_mask
                     if len(normalized):
                         all_blocks.append(normalized)
                     del normalized
@@ -1510,6 +1548,15 @@ class DataPreprocessor:
                     for result in results
                     if result is not None
                 ]
+                n_rejected = len(results) - len(chunk_cadences)
+                if n_rejected:
+                    # Same observability contract as the vectorized branch above (#400
+                    # review note): rejected rows must be counted, not silently dropped
+                    logger.warning(
+                        f"Load-time validity filter rejected {n_rejected} of "
+                        f"{len(results)} snippet row(s) (NaN/Inf, non-positive max, "
+                        f"or negative values)"
+                    )
                 if chunk_cadences:
                     all_blocks.append(np.array(chunk_cadences, dtype=np.float32))
                 del chunk_cadences
@@ -1545,34 +1592,39 @@ class DataPreprocessor:
         # Clear all_blocks reference
         del all_blocks
 
-        # Sanity check: print descriptive stats. NaN detection rides the min reduction
-        # (NaN propagates through np.min, and NaN > 1.0 / NaN < 0.0 are both False, so a
-        # NaN array reaches that branch exactly as it did via the old full-array
-        # .any() pass); the two extra full-array validity passes and their full-size
-        # bool temporaries are gone (#301). The old isinf branch was unreachable: +inf
-        # always tripped the max check first, -inf the min check, and NaN the isnan
-        # branch — outcomes and messages are unchanged for every input.
-        min_val = np.min(cadence_array)
-        max_val = np.max(cadence_array)
-        mean_val = np.mean(cadence_array)
-
-        if max_val > 1.0:
-            logger.error(f"Cadence array values too large! Max: {max_val}")
+        # Normalization spot-check on the first cadence only (#400): the old full-array
+        # min/max/mean triple was 3 extra passes over up-to-65 GB arrays at peak allocation
+        # (~15-20% of the streaming load stage), guarding raises that are unreachable by
+        # construction — rows are validity-filtered upstream (_downsample_cadence,
+        # _lognorm_worker, _log_norm_chunk_vectorized reject NaN/Inf, non-positive max,
+        # AND negative values — the negative-value rule closes the one input class whose
+        # log would NaN-poison a normalized row past the old filters) and the
+        # normalization lands exact IEEE [0, 1] bounds (x - min(x) has min 0.0,
+        # x / max(x) has max 1.0, zero-range rows skip the division). The [0, 1] contract
+        # is pinned by tests/unit/test_preprocessing.py (TestLoadInferenceDataPaths). This
+        # row-0 check keeps the guard's raise semantics against a future normalization bug
+        # at microseconds instead of full passes; NaN rides the min reduction (NaN > 1.0
+        # and NaN < 0.0 are both False, so a NaN row reaches that branch).
+        spot = cadence_array[0]
+        spot_min = np.min(spot)
+        spot_max = np.max(spot)
+        if spot_max > 1.0:
+            logger.error(f"Cadence array values too large! Max: {spot_max}")
             raise ValueError("Preprocessing normalization check failed")
-        elif min_val < 0.0:
-            logger.error(f"Cadence array values too small! Min: {min_val}")
+        elif spot_min < 0.0:
+            logger.error(f"Cadence array values too small! Min: {spot_min}")
             raise ValueError("Preprocessing normalization check failed")
-        elif np.isnan(min_val):
+        elif np.isnan(spot_min):
             logger.error("Cadence array contains NaN values!")
             raise ValueError("Preprocessing normalization check failed")
-        else:
-            logger.info("Cadence array properly normalized")
-            logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
-            logger.info(f"Cadence array shape: {cadence_array.shape}")
-            logger.info(f"Cadence value range: [{min_val:.6f}, {max_val:.6f}]")
-            logger.info(f"Cadence mean: {mean_val:.6f}")
-            logger.info(f"Memory usage: {cadence_array.nbytes / 1e9:.2f} GB")
-            logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
+
+        logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
+        logger.info(f"Cadence array shape: {cadence_array.shape}")
+        # Array nbytes, not process memory (#398): the old "Memory usage" label plus %.2f GB
+        # floored small-but-real arrays to a broken-looking "0.00 GB". Adaptive unit: MB
+        # keeps tiny arrays visible, GB keeps the 65 GB monsters readable (review note)
+        logger.info(f"Cadence array size: {_format_array_size(cadence_array.nbytes)}")
+        logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
 
         return cadence_array
 

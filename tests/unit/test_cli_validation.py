@@ -1142,3 +1142,48 @@ class TestMaxRetriesValidation:
     def test_one_accepted(self):
         errors = collect_validation_errors(_parse(["train", "--max-retries", "1"]), None)
         assert not any(e.field == "training.max_retries" for e in errors)
+
+
+class TestReportExcludeFrequencyRangeValidation:
+    """#395: report-time exclusion ranges must be finite, positive, ordered pairs; the
+    flag is repeatable and lands on config as [[start, end], ...]."""
+
+    FLAG = "--report-exclude-frequency-range"
+
+    def test_valid_single_range_accepted(self):
+        errors = collect_validation_errors(_parse(["inference", self.FLAG, "1616", "1626.5"]), None)
+        assert not any(e.field == "inference.report_exclude_frequency_ranges" for e in errors)
+
+    def test_valid_repeated_ranges_accepted(self):
+        args = _parse(["inference", self.FLAG, "1616", "1626.5", self.FLAG, "1575", "1576"])
+        assert args.report_exclude_frequency_range == [[1616.0, 1626.5], [1575.0, 1576.0]]
+        errors = collect_validation_errors(args, None)
+        assert not any(e.field == "inference.report_exclude_frequency_ranges" for e in errors)
+
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            ["1626.5", "1616"],  # start >= end
+            ["1616", "1616"],  # zero-width
+            ["-5", "10"],  # negative
+            ["0", "10"],  # zero start
+            ["inf", "2000"],  # inf parses as float
+            ["1616", "nan"],  # so does nan
+        ],
+    )
+    def test_malformed_ranges_rejected(self, pair):
+        errors = collect_validation_errors(_parse(["inference", self.FLAG, *pair]), None)
+        assert any(
+            e.field == "inference.report_exclude_frequency_ranges" and e.fix_kind == "format"
+            for e in errors
+        )
+
+    def test_non_numeric_rejected_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            _parse(["inference", self.FLAG, "iridium", "1626.5"])
+
+    def test_one_bad_range_among_good_rejected(self):
+        errors = collect_validation_errors(
+            _parse(["inference", self.FLAG, "1616", "1626.5", self.FLAG, "10", "5"]), None
+        )
+        assert any(e.field == "inference.report_exclude_frequency_ranges" for e in errors)

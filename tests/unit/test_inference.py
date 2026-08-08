@@ -134,9 +134,7 @@ class TestDistributedEncodeSlicing:
         pipeline.screening_threshold = 0.5
         pipeline.mc_draws = 2
         pipeline.calibrator = None
-        pipeline._reference_reservoir = ReferenceCloudReservoir(
-            capacity=0, rng=np.random.default_rng(0)
-        )
+        pipeline._reference_reservoir = ReferenceCloudReservoir(capacity=0)
         pipeline._write_inference_results = lambda **kwargs: 0
         with pytest.raises(ValueError, match="Not enough samples"):
             pipeline.run_inference(
@@ -193,9 +191,7 @@ class TestLatentPaddingRowTruncation:
         pipeline.screening_threshold = 0.5
         pipeline.mc_draws = 2
         pipeline.calibrator = None
-        pipeline._reference_reservoir = ReferenceCloudReservoir(
-            capacity=0, rng=np.random.default_rng(0)
-        )
+        pipeline._reference_reservoir = ReferenceCloudReservoir(capacity=0)
         pipeline._encode_step = None
         # DB writes are covered elsewhere; keep this test on the truncation seam.
         pipeline._write_inference_results = lambda **kwargs: 0
@@ -350,57 +346,78 @@ class TestBatchedMcScores:
 
 
 class TestReferenceCloudReservoir:
-    """#282: seeded uniform reservoir over pass-1 rejects."""
+    """#282 (reworked by #401): order-independent bottom-k reservoir over pass-1 rejects —
+    membership is a pure function of the offered (key, row) content, never arrival order."""
 
-    def _rows(self, n, offset=0):
+    def _batch(self, n, offset=0, key_seed=0):
+        keys = np.random.default_rng(key_seed).random(n)
         mean = np.arange(n * 4, dtype=np.float32).reshape(n, 4) + offset
         log_var = np.full((n, 4), -2.0, dtype=np.float32)
         screening = np.linspace(0, 0.4, n).astype(np.float32)
-        return mean, log_var, screening
+        return keys, mean, log_var, screening
 
     def test_fills_to_capacity_then_stays_bounded(self):
-        reservoir = ReferenceCloudReservoir(capacity=5, rng=np.random.default_rng(0))
-        reservoir.offer(*self._rows(3))
-        reservoir.offer(*self._rows(10, offset=100))
+        reservoir = ReferenceCloudReservoir(capacity=5)
+        reservoir.offer(*self._batch(3, key_seed=1))
+        reservoir.offer(*self._batch(10, offset=100, key_seed=2))
         mean, log_var, screening = reservoir.arrays()
         assert mean.shape == (5, 4) and log_var.shape == (5, 4) and screening.shape == (5,)
         assert reservoir.seen == 13
 
-    def test_seeded_reservoir_is_reproducible(self):
-        def build():
-            reservoir = ReferenceCloudReservoir(capacity=4, rng=np.random.default_rng(42))
-            for chunk in range(5):
-                reservoir.offer(*self._rows(7, offset=chunk * 10))
+    def test_keeps_exactly_the_smallest_keys(self):
+        reservoir = ReferenceCloudReservoir(capacity=3)
+        keys = np.array([0.9, 0.1, 0.5, 0.3, 0.7])
+        mean = np.arange(5, dtype=np.float32).reshape(5, 1)
+        log_var = np.zeros((5, 1), dtype=np.float32)
+        screening = np.arange(5, dtype=np.float32) / 10
+        reservoir.offer(keys, mean, log_var, screening)
+        mean_rows, _, screening_vals = reservoir.arrays()
+        # Bottom-3 keys are 0.1, 0.3, 0.5 -> rows 1, 3, 2, returned key-ascending
+        np.testing.assert_array_equal(mean_rows[:, 0], [1.0, 3.0, 2.0])
+        np.testing.assert_allclose(screening_vals, [0.1, 0.3, 0.2], atol=1e-6)
+
+    def test_membership_is_arrival_order_independent(self):
+        # The #401 property completion-order consumption relies on: offering the same
+        # cadence batches in ANY order yields byte-identical arrays()
+        batches = [self._batch(7, offset=10 * i, key_seed=i) for i in range(5)]
+
+        def build(order):
+            reservoir = ReferenceCloudReservoir(capacity=4)
+            for i in order:
+                reservoir.offer(*batches[i])
             return reservoir.arrays()
 
-        first_mean, _, first_screening = build()
-        second_mean, _, second_screening = build()
-        np.testing.assert_array_equal(first_mean, second_mean)
-        np.testing.assert_array_equal(first_screening, second_screening)
+        forward = build(range(5))
+        reversed_ = build(reversed(range(5)))
+        shuffled = build([2, 0, 4, 1, 3])
+        for a, b in ((forward, reversed_), (forward, shuffled)):
+            np.testing.assert_array_equal(a[0], b[0])
+            np.testing.assert_array_equal(a[1], b[1])
+            np.testing.assert_array_equal(a[2], b[2])
 
     def test_zero_capacity_collects_nothing(self):
-        reservoir = ReferenceCloudReservoir(capacity=0, rng=np.random.default_rng(0))
-        reservoir.offer(*self._rows(6))
+        reservoir = ReferenceCloudReservoir(capacity=0)
+        reservoir.offer(*self._batch(6))
         _, _, screening = reservoir.arrays()
         assert len(screening) == 0
 
-    def test_rng_consumption_pattern_is_frozen(self):
-        # GOLDEN test: pins the exact rng-consumption pattern of offer()'s vectorized
-        # replacement phase (one rng.random(batch) acceptance draw, then one
-        # rng.integers(batch) slot draw, ALWAYS both, regardless of acceptance count).
-        # A same-seed-twice comparison cannot catch a refactor that reorders these calls —
-        # both sides would drift together — so the surviving items are frozen here.
-        # Regenerate the goldens ONLY for a deliberate, documented stream change.
-        reservoir = ReferenceCloudReservoir(capacity=3, rng=np.random.default_rng(123))
+    def test_selection_is_frozen(self):
+        # GOLDEN test: pins the exact bottom-k selection for a fixed key sequence. A
+        # same-input-twice comparison cannot catch a refactor that changes the selection
+        # rule — both sides would drift together — so the surviving rows are frozen here.
+        # Regenerate the goldens ONLY for a deliberate, documented selection change
+        # (the #401 rework that replaced the sequential algorithm-R goldens was one).
+        reservoir = ReferenceCloudReservoir(capacity=3)
         for chunk in range(4):
+            keys = np.random.default_rng(100 + chunk).random(5)
             mean = (np.arange(5, dtype=np.float32) + 10 * chunk).reshape(5, 1)
             log_var = np.full((5, 1), -2.0, dtype=np.float32)
             screening = (np.arange(5, dtype=np.float32) + 10 * chunk) / 100.0
-            reservoir.offer(mean, log_var, screening.astype(np.float32))
+            reservoir.offer(keys, mean, log_var, screening.astype(np.float32))
         mean_rows, _, screening_vals = reservoir.arrays()
         assert reservoir.seen == 20
-        np.testing.assert_array_equal(mean_rows[:, 0], [14.0, 20.0, 22.0])
-        np.testing.assert_allclose(screening_vals, [0.14, 0.20, 0.22], atol=1e-6)
+        np.testing.assert_array_equal(mean_rows[:, 0], [3.0, 20.0, 32.0])
+        np.testing.assert_allclose(screening_vals, [0.03, 0.2, 0.32], atol=1e-6)
 
 
 class TestRfFeatureLayoutGuard:
@@ -501,3 +518,18 @@ class TestRfFeatureLayoutGuard:
             recorded_variant="z_mean",
             recorded_active_dims=[5, 6, 7],
         )._check_rf_feature_layout()
+
+
+class TestReservoirCadenceCount:
+    def test_cadences_offered_counts_offer_calls(self):
+        reservoir = ReferenceCloudReservoir(capacity=5)
+        keys = np.random.default_rng(0).random(4)
+        mean = np.zeros((4, 2), dtype=np.float32)
+        log_var = np.zeros((4, 2), dtype=np.float32)
+        screening = np.zeros(4, dtype=np.float32)
+        for _ in range(3):
+            reservoir.offer(keys, mean, log_var, screening)
+        # One offer() per cadence-with-rejects: the persisted n_contributing_cadences
+        # signal downstream OOD consumers use to detect an unrepresentative cloud
+        assert reservoir.cadences_offered == 3
+        assert reservoir.seen == 12

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 import h5py
 import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.candidate_figures import (
@@ -47,6 +48,15 @@ from aetherscan.candidate_figures import (
     render_candidate_figure,
     render_candidate_figures,
     stamp_frequency_range_mhz,
+)
+from aetherscan.candidate_triage import (
+    frequency_excluded,
+    partition_candidates_by_frequency,
+    report_exclusion_ranges,
+    survey_cloud_cadence_count,
+    survey_ood_scores,
+    training_ood_scores,
+    triage_sort_rows,
 )
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
@@ -169,6 +179,10 @@ class CadenceVizRecord:
     skipped: bool  # True when the stage-aware resume skipped the cadence this pass
     n_stamps: int
     n_candidates: int
+    # Stable catalog position (PendingCadence.index): the render phase sorts records by it
+    # so figures are catalog-ordered and deterministic under completion-order collection
+    # (#401); None (legacy callers) sorts last by key
+    catalog_index: int | None = None
     provenance: dict = field(default_factory=dict)
     confidence_hist: np.ndarray | None = None  # counts over CONFIDENCE_HIST_EDGES
     inference_duration_s: float | None = None
@@ -210,7 +224,12 @@ class InferenceVizCollector:
         )
 
     def record_skipped(
-        self, key: tuple, npy_path: str, metadata_path: str, manifest_row: dict
+        self,
+        key: tuple,
+        npy_path: str,
+        metadata_path: str,
+        manifest_row: dict,
+        catalog_index: int | None = None,
     ) -> None:
         """Record a cadence the stage-aware resume skipped (aggregates from its manifest row)."""
         self.records.append(
@@ -219,6 +238,7 @@ class InferenceVizCollector:
                 npy_path=npy_path,
                 metadata_path=metadata_path,
                 skipped=True,
+                catalog_index=catalog_index,
                 n_stamps=int(manifest_row.get("n_stamps") or 0),
                 n_candidates=int(manifest_row.get("n_candidates") or 0),
                 inference_duration_s=manifest_row.get("duration_s"),
@@ -233,6 +253,7 @@ class InferenceVizCollector:
         provenance: dict,
         results: dict,
         duration_s: float,
+        catalog_index: int | None = None,
     ) -> None:
         """Record a cadence inferred this pass. `results` is run_inference's dict; its
         proba_true / predictions / latents arrays are reduced here and not retained."""
@@ -246,6 +267,7 @@ class InferenceVizCollector:
                 npy_path=npy_path,
                 metadata_path=metadata_path,
                 skipped=False,
+                catalog_index=catalog_index,
                 n_stamps=int(results["n_cadence_snippets"]),
                 n_candidates=int(results["n_candidates"]),
                 provenance=provenance,
@@ -340,6 +362,14 @@ def _viz_safe(name: str, fn: Callable, *args, **kwargs):
     except Exception as e:
         logger.error(f"Inference viz '{name}' failed (run continues without it): {e}")
         return None
+
+
+def _reference_cloud_path(config, tag: str) -> str:
+    """The run's reference-cloud NPZ path (written by finalize_reference_cloud)."""
+    return os.path.join(
+        config.output_path,
+        f"inference_reference_cloud_{display_tag(tag, get_machine_name())}.npz",
+    )
 
 
 def _plots_dir(tag: str) -> str:
@@ -988,7 +1018,8 @@ def plot_preproc_funnel(
         rest = [i for i in range(len(stage_counts)) if i not in keep]
         agg_counts = tuple(int(sum(stage_counts[i][j] for i in rest)) for j in range(4))
         agg_storage = float(np.nansum([storage_gb[i] for i in rest]))
-        # Kept cadences stay in catalog order; the aggregate bar closes the figure
+        # Kept cadences stay in the (catalog-sorted, see render entry point) records
+        # order; the aggregate bar closes the figure
         kept = sorted(keep)
         labels = [labels[i] for i in kept] + [f"+{len(rest)} more (aggregated)"]
         stage_counts = [stage_counts[i] for i in kept] + [agg_counts]
@@ -1090,6 +1121,111 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     )
 
 
+_CANDIDATE_FREQ_MAX_TARGETS = 40
+_BAND_COLORS = {"L": "tab:blue", "S": "tab:green", "C": "tab:red", "X": "tab:purple"}
+
+
+def plot_candidate_frequency() -> str | None:
+    """
+    Candidate frequency map (#394): every candidate as a dot at (frequency, target row),
+    colored by band — targets sorted by candidate count, report-excluded frequency ranges
+    (#395) shaded. The load-bearing read is VERTICAL alignment: the same frequency lighting
+    up across many targets is the signature of a terrestrial transmitter (multi-target
+    coincidence), whereas a genuine technosignature is a dot with no vertical company. In
+    inf_blpc3_20260807_011509 two target/bands held 49% of all candidates and several top
+    candidates sat in GPS/Iridium allocations — structure no other figure showed.
+    """
+    config = get_config()
+    tag = config.checkpoint.save_tag
+
+    db = get_db()
+    if db is None:
+        logger.info("Viz: no database instance; skipping candidate frequency map")
+        return None
+    db.flush()
+    rows = db.query_inference_result(
+        tag=tag, prediction=1, columns=["target", "band", "frequency_mhz"]
+    )
+    rows = [r for r in rows if r.get("frequency_mhz") is not None]
+    if not rows:
+        logger.info("Viz: no candidates with frequencies recorded; skipping frequency map")
+        return None
+
+    counts = Counter(r.get("target") or "?" for r in rows)
+    ordered_targets = [target for target, _ in counts.most_common(_CANDIDATE_FREQ_MAX_TARGETS)]
+    overflow = len(counts) - len(ordered_targets)
+    overflow_label = f"(+{overflow} more targets)"
+    if overflow:
+        # The aggregate row's count is its candidate total, mirroring the per-target rows
+        counts[overflow_label] = len(rows) - sum(counts[t] for t in ordered_targets)
+        ordered_targets.append(overflow_label)
+    # Row 0 at the top: most candidate-heavy target first
+    y_index = {target: i for i, target in enumerate(ordered_targets)}
+
+    fig = Figure(figsize=(12, 0.28 * len(ordered_targets) + 2.8))
+    ax = fig.subplots()
+
+    # One scatter per band, not one artist per row: candidate counts reach 10^4+ at
+    # catalog scale and per-row Line2D artists would make this figure the slowest in the
+    # suite for no visual gain
+    points_by_band: dict[str, list[tuple[float, int]]] = {}
+    for row in rows:
+        target = row.get("target") or "?"
+        y = y_index.get(target, y_index.get(overflow_label))
+        band = row.get("band") or "?"
+        points_by_band.setdefault(band, []).append((float(row["frequency_mhz"]), y))
+    seen_bands = list(points_by_band)
+    for band, points in points_by_band.items():
+        xs, ys = zip(*points, strict=True)
+        ax.scatter(
+            xs,
+            ys,
+            s=16,
+            alpha=0.55,
+            color=_BAND_COLORS.get(band, "tab:gray"),
+            edgecolors="none",
+        )
+
+    exclusion_ranges = report_exclusion_ranges(config)
+    for start, end in exclusion_ranges:
+        ax.axvspan(start, end, color="red", alpha=0.12, zorder=0)
+    if exclusion_ranges:
+        range_label = ", ".join(f"{start:g}-{end:g}" for start, end in exclusion_ranges)
+        ax.set_title(
+            f"Candidate frequency map ({display_tag(tag, get_machine_name())}) — "
+            f"{len(rows):,} candidates; shaded: report-excluded {range_label} MHz"
+        )
+    else:
+        ax.set_title(
+            f"Candidate frequency map ({display_tag(tag, get_machine_name())}) — "
+            f"{len(rows):,} candidates"
+        )
+
+    ax.set_yticks(range(len(ordered_targets)))
+    ax.set_yticklabels([f"{target} ({counts[target]})" for target in ordered_targets], fontsize=7)
+    ax.invert_yaxis()
+    ax.set_xlabel("frequency (MHz)")
+    ax.grid(True, axis="x", alpha=0.2)
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="none",
+            color=_BAND_COLORS.get(band, "tab:gray"),
+            label=band,
+        )
+        for band in sorted(seen_bands)
+    ]
+    ax.legend(handles=handles, title="band", fontsize=8, loc="upper right")
+
+    return _save_and_upload(
+        fig,
+        f"candidate_frequency_map_{display_tag(tag, get_machine_name())}.png",
+        "Candidate Frequency Map",
+    )
+
+
 def plot_candidate(row: dict, index: int) -> str | None:
     """One candidate's full picture (implements the long-standing inference.py stub):
     6-panel cadence waterfall of its stamp, annotated with confidence / frequency /
@@ -1107,9 +1243,11 @@ def plot_candidate(row: dict, index: int) -> str | None:
 
 
 def plot_candidate_gallery() -> str | None:
-    """Gallery of the top candidates by confidence (6-obs waterfall strips) plus capped
-    per-candidate figures, sourced from the inference_results table so it also covers
-    cadences the resume skipped this pass."""
+    """Gallery of the top candidates (6-obs waterfall strips) plus capped per-candidate
+    figures, sourced from the inference_results table so it also covers cadences the
+    resume skipped this pass. Ordering (#397): confidence descending, tie-broken by
+    survey-OOD distance descending then MC spread ascending — within a saturated P=1.000
+    tie the candidate least like the survey background reviews first."""
     config = get_config()
     tag = config.checkpoint.save_tag
     display_tag_value = display_tag(tag, get_machine_name())
@@ -1124,26 +1262,59 @@ def plot_candidate_gallery() -> str | None:
     if not rows:
         logger.info("Viz: no candidates recorded; skipping candidate plots")
         return None
-    rows.sort(key=lambda r: r.get("confidence") or 0.0, reverse=True)
+    survey_ood = survey_ood_scores(rows, _reference_cloud_path(config, tag))
+    rows = triage_sort_rows(rows, survey_ood)
 
-    # Per-candidate figures (highest confidence first, capped): rendered across the
-    # forkserver pool (#298 I9 — independent row dict + memmap read + PNG each; per-figure
-    # failures return None and degrade the suite exactly like _viz_safe), then uploaded in
-    # index order through the async FIFO uploader.
+    # Report-time frequency exclusion (#395): excluded candidates keep their DB rows and
+    # their rendered figures on disk; only the Slack uploads and the gallery membership
+    # below are filtered.
+    exclusion_ranges = report_exclusion_ranges(config)
+    reported_rows, excluded_rows = partition_candidates_by_frequency(rows, exclusion_ranges)
+
+    # Per-candidate figures (review order, capped): the cap applies to the overall top-K
+    # (science record — excluded candidates keep their saved figures) AND separately to
+    # the top-K of the REPORTED side, so a wall of excluded RFI at the head of the order
+    # can never starve reported candidates out of their figures and uploads — the exact
+    # review surface #395 exists to protect. Rendered across the forkserver pool (#298 I9
+    # — independent row dict + memmap read + PNG each; per-figure failures return None
+    # and degrade the suite exactly like _viz_safe), then uploaded in index order through
+    # the async FIFO uploader.
     top_rows = rows[:max_candidate_plots]
+    rendered_keys = {(r.get("npy_path"), r.get("snippet_index")) for r in top_rows}
+    top_rows += [
+        r
+        for r in reported_rows[:max_candidate_plots]
+        if (r.get("npy_path"), r.get("snippet_index")) not in rendered_keys
+    ]
     rendered = render_candidate_figures(top_rows, display_tag_value, _plots_dir(tag))
+    n_upload_excluded = 0
     for index, save_path in rendered:
         if save_path is None:
             continue
         logger.info(f"Inference viz saved: {save_path}")
+        if exclusion_ranges and frequency_excluded(
+            top_rows[index].get("frequency_mhz"), exclusion_ranges
+        ):
+            n_upload_excluded += 1
+            continue
         _uploader.submit(save_path, f"Candidate {index} - ({display_tag_value})")
-    if len(rows) > max_candidate_plots:
+    if n_upload_excluded:
         logger.info(
-            f"Viz: rendered {max_candidate_plots} of {len(rows)} candidate figures "
+            f"Viz: {n_upload_excluded} candidate figure(s) rendered and saved but not "
+            f"uploaded (--report-exclude-frequency-range)"
+        )
+    if len(rows) > len(top_rows):
+        logger.info(
+            f"Viz: rendered {len(top_rows)} of {len(rows)} candidate figures "
             f"(--max-candidate-plots cap)"
         )
-
-    gallery_rows = rows[:_CANDIDATE_GALLERY_MAX]
+    if not reported_rows:
+        logger.info(
+            f"Viz: all {len(rows)} candidate(s) fall in --report-exclude-frequency-range "
+            f"ranges; skipping the gallery figure (per-candidate figures are still on disk)"
+        )
+        return None
+    gallery_rows = reported_rows[:_CANDIDATE_GALLERY_MAX]
     n_cols = len(gallery_rows)
     n_rows = len(_OBS_ROW_LABELS)
     fig = Figure(figsize=(1.9 * n_cols + 1.2, 1.1 * n_rows + 1.6))
@@ -1164,17 +1335,130 @@ def plot_candidate_gallery() -> str | None:
         )
         freq = row.get("frequency_mhz")
         freq_label = f"{freq:.4f} MHz" if freq is not None else "freq n/a"
-        axes[0][col].set_title(
-            f"P={row.get('confidence', 0):.3f}\n{freq_label}\n{row.get('target') or ''}",
-            fontsize=7,
-        )
+        title = f"P={row.get('confidence', 0):.3f}\n{freq_label}\n{row.get('target') or ''}"
+        ood = survey_ood.get((row.get("npy_path"), int(row.get("snippet_index") or 0)))
+        if ood is not None:
+            # Survey-OOD percentile (#397): how unlike the run's reference cloud this
+            # candidate's latent is (triage annotation, never a gate)
+            title += f"\nOOD p{ood[1]:.1f}"
+        axes[0][col].set_title(title, fontsize=7)
+    exclusion_note = (
+        f" ({len(excluded_rows)} excluded by frequency filter)" if excluded_rows else ""
+    )
     fig.suptitle(
-        f"Candidate gallery ({display_tag(tag, get_machine_name())}): top {n_cols} of {len(rows)} by confidence"
+        f"Candidate gallery ({display_tag(tag, get_machine_name())}): "
+        f"top {n_cols} of {len(reported_rows)} by confidence{exclusion_note}"
     )
 
     return _save_and_upload(
         fig, f"candidate_gallery_{display_tag(tag, get_machine_name())}.png", "Candidate Gallery"
     )
+
+
+def write_candidate_triage_report() -> str | None:
+    """
+    Candidate triage CSV (#397): one row per candidate in review order (triage_sort_rows),
+    carrying the scores a reviewer triages by — confidence, MC mean/spread, survey-OOD
+    distance/percentile (vs this run's reference cloud), training-OOD distance/percentile
+    (vs the training run's true-class features, when the cluster-local eval artifact is
+    available), and the report-time frequency-exclusion flag (#395). Written beside the
+    figures; logged, not uploaded (Slack surfaces stay image-only). Scores are triage
+    ranking only — nothing here gates candidacy: a genuine technosignature is itself OOD
+    with respect to synthetic training data.
+    """
+    import csv  # noqa: PLC0415  # stdlib; only this report needs it
+
+    config = get_config()
+    tag = config.checkpoint.save_tag
+
+    db = get_db()
+    if db is None:
+        logger.info("Viz: no database instance; skipping candidate triage report")
+        return None
+    db.flush()
+    rows = db.query_inference_result(tag=tag, prediction=1)
+    if not rows:
+        logger.info("Viz: no candidates recorded; skipping candidate triage report")
+        return None
+
+    cloud_path = _reference_cloud_path(config, tag)
+    survey_ood = survey_ood_scores(rows, cloud_path)
+    training_ood = training_ood_scores(rows, config.model_path, config.inference.config_path)
+    exclusion_ranges = report_exclusion_ranges(config)
+    ordered = triage_sort_rows(rows, survey_ood)
+
+    # Representativeness guard (#401): after a failed-then-retried pass the reference
+    # cloud holds only the final attempt's cadences' rejects — flag loudly when the
+    # survey-OOD background is drawn from a small fraction of the run's cadences, so
+    # nobody reads percentiles against an unrepresentative cloud as survey-relative
+    if survey_ood:
+        contributing = survey_cloud_cadence_count(cloud_path)
+        n_inferred = len(db.query_inference_cadences(tag=tag, status="inferred"))
+        if contributing is not None and n_inferred > 0 and contributing < 0.5 * n_inferred:
+            logger.warning(
+                f"Candidate triage: the reference cloud was built from only {contributing} "
+                f"of the tag's {n_inferred} inferred cadence(s) — expected on a resumed or "
+                f"retried pass (only the current attempt's cadences feed the reservoir), "
+                f"not a failure; just read survey-OOD percentiles as drawn from that "
+                f"partial background rather than the whole tag"
+            )
+
+    report_path = os.path.join(
+        _plots_dir(tag), f"candidate_triage_{display_tag(tag, get_machine_name())}.csv"
+    )
+    with open(report_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "rank",
+                "target",
+                "band",
+                "frequency_mhz",
+                "confidence",
+                "mc_mean",
+                "mc_std",
+                "survey_ood_distance",
+                "survey_ood_percentile",
+                "training_ood_distance",
+                "training_ood_percentile",
+                "excluded_by_report_filter",
+                "npy_path",
+                "snippet_index",
+            ]
+        )
+        for rank, row in enumerate(ordered):
+            key = (row.get("npy_path"), int(row.get("snippet_index") or 0))
+            s_dist, s_pct = survey_ood.get(key, (None, None))
+            t_dist, t_pct = training_ood.get(key, (None, None))
+            writer.writerow(
+                [
+                    rank,
+                    row.get("target"),
+                    row.get("band"),
+                    row.get("frequency_mhz"),
+                    row.get("confidence"),
+                    row.get("mc_mean"),
+                    row.get("mc_std"),
+                    s_dist,
+                    s_pct,
+                    t_dist,
+                    t_pct,
+                    int(
+                        bool(exclusion_ranges)
+                        and frequency_excluded(row.get("frequency_mhz"), exclusion_ranges)
+                    ),
+                    row.get("npy_path"),
+                    row.get("snippet_index"),
+                ]
+            )
+
+    n_survey = len(survey_ood)
+    n_training = len(training_ood)
+    logger.info(
+        f"Candidate triage report saved: {report_path} ({len(ordered)} candidate(s); "
+        f"survey OOD for {n_survey}, training OOD for {n_training})"
+    )
+    return report_path
 
 
 def plot_candidate_uncertainty() -> str | None:
@@ -1200,9 +1484,7 @@ def plot_candidate_uncertainty() -> str | None:
     )
     rows = [r for r in rows if r.get("mc_mean") is not None and r.get("mc_std") is not None]
 
-    cloud_path = os.path.join(
-        config.output_path, f"inference_reference_cloud_{display_tag(tag, get_machine_name())}.npz"
-    )
+    cloud_path = _reference_cloud_path(config, tag)
     cloud = None
     if os.path.exists(cloud_path):
         # Materialize the arrays and close the archive immediately — an NpzFile keeps its
@@ -1431,6 +1713,19 @@ def plot_inference_summary(
         np.nansum([s.npy_size_bytes for s in summaries.values()]) / 1e9 if summaries else 0.0
     )
 
+    # Report-time frequency exclusion (#395): the card carries all three numbers so the
+    # science record (original) and the review surface (reported) stay distinguishable
+    exclusion_ranges = report_exclusion_ranges(config)
+    exclusion_rows: list[tuple[str, str]] = []
+    if exclusion_ranges and db is not None:
+        freq_rows = db.query_inference_result(tag=tag, prediction=1, columns=["frequency_mhz"])
+        reported, excluded = partition_candidates_by_frequency(freq_rows, exclusion_ranges)
+        range_label = ", ".join(f"{start:g}-{end:g}" for start, end in exclusion_ranges)
+        exclusion_rows = [
+            (f"  excluded ({range_label} MHz)", f"{len(excluded):,}"),
+            ("  reported after exclusion", f"{len(reported):,}"),
+        ]
+
     summary_rows = [
         ("run tag", tag),
         ("rendered", time.strftime("%Y-%m-%d %H:%M:%S")),
@@ -1440,6 +1735,7 @@ def plot_inference_summary(
         ("merged hits", f"{n_merged_hits:,}"),
         ("snippets inferred", f"{n_snippets:,}"),
         ("candidates", f"{totals.get('n_candidates', 0):,}"),
+        *exclusion_rows,
         ("stamp storage", f"{storage_gb:.2f} GB"),
         ("preprocessing time", f"{preproc_duration:,.1f} s"),
         ("inference time", f"{inference_duration:,.1f} s"),
@@ -1507,7 +1803,16 @@ def render_inference_visualizations(
         f"Rendering inference visualization suite under plots/inference/{display_tag(tag, get_machine_name())}/"
     )
 
-    records = collector.records
+    # Catalog-sort the records (#401): the collector fills in completion order, which is
+    # nondeterministic run-to-run — sorting by the stable catalog index restores
+    # deterministic, catalog-ordered figures (funnel bar order, the bandpass figure's
+    # source-cadence pick, stamp-gallery tie resolution). The one order-sensitive surface
+    # this cannot fix is the latent-projection pool's non-candidate subsample, whose
+    # budget fills at collection time — bounded, viz-only, candidates always kept.
+    records = sorted(
+        collector.records,
+        key=lambda r: (r.catalog_index is None, r.catalog_index or 0, str(r.key)),
+    )
     if config.inference.inference_viz_scope == "new":
         # Scope 'new' (#301): resumed passes on an accumulating tag re-rendered the FULL
         # catalog's figures every pass. This renders only cadences inferred THIS pass;
@@ -1532,7 +1837,9 @@ def render_inference_visualizations(
         )
         _viz_safe("preproc_funnel", plot_preproc_funnel, records, summaries)
         _viz_safe("confidence_distribution", plot_confidence_distribution, records)
+        _viz_safe("candidate_frequency_map", plot_candidate_frequency)
         _viz_safe("candidate_gallery", plot_candidate_gallery)
+        _viz_safe("candidate_triage", write_candidate_triage_report)
         _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
         _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
         _viz_safe("inference_summary", plot_inference_summary, records, summaries, totals)

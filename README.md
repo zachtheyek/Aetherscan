@@ -39,7 +39,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
   - Ampere (sm_86, e.g. RTX A4000) — driver ≥550 (host CUDA 12.3) via CUDA forward compatibility
 - VRAM: **≥8 GB per GPU** recommended — measured peaks ~6 GB/GPU (training) and ~2.5 GB/GPU (inference) on the v1.0.0 release runs; gradient accumulation keeps per-GPU VRAM low
 - RAM: **≥288 GB** for full-scale training and default catalog-scale inference (measured peaks ~260 GB training / ~200 GB inference, plus headroom — a strict-256 GB host sits too close to the training peak and risks OOM under page-cache pressure). Means are much lower (~150 GB training / ~36 GB inference); inference RAM scales with `--prefetch-depth` × the largest in-flight cadence, so lower `--prefetch-depth` for smaller-RAM hosts or small catalogs
-- Disk: full-scale training round data ~147 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamps are auto-pruned by default (~1 MB/cadence metadata retained + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
+- Disk: full-scale training round data ~147 GB per retained round (float16 default), up to ~7.4 TB (~147 GB × 50) with `--keep-round-data` at the 50-round default; inference stamp caches are retained by default (~1 GB/cadence average — re-scores under the same energy-detection config then skip preprocessing entirely; pass `--prune-stamps` on catalog-scale runs, which keeps ~1 MB/cadence metadata + a transient ~5–20 GB/cadence × `--prefetch-depth` during extraction)
 - Apptainer 1.4+ or SingularityCE 4.1+ (Python 3.12 / TF 2.17 / CUDA 12.8 live inside the container)
 - Prebuilt image published to GHCR (`ghcr.io/zachtheyek/aetherscan:vX.Y.Z`, `linux/amd64`); `utils/run_container.sh` pulls it automatically, or prints `aetherscan.def` build instructions if the pull fails — see [Run From Container](#run-from-container)
 - See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md) for the full runbook
@@ -868,6 +868,7 @@ usage: inference [-h] [--seed SEED] [--unseeded]
                  [--overlap-fraction OVERLAP_FRACTION]
                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
                  [--prune-stamps | --no-prune-stamps]
+                 [--report-exclude-frequency-range START_MHZ END_MHZ]
                  [--inference-viz | --no-inference-viz]
                  [--inference-viz-scope {full,new}]
                  [--stamp-gallery-top-k STAMP_GALLERY_TOP_K]
@@ -1069,13 +1070,25 @@ options:
                         'inferred' manifest row lands, keeping the metadata
                         .json plus a ~196 KB snippet sidecar per candidate —
                         resume rides the DB row, and only stamps this run
-                        freshly extracted are ever pruned. Without pruning a
-                        full catalog writes ~30-90 TB of stamps. Default: AUTO
-                        — enabled for the fingerprint-scoped default cache
-                        directory, disabled when --preprocess-output-dir is
-                        set explicitly. Pass --no-prune-stamps to keep every
-                        stamp (slice-scale runs wanting the cross-run rerun
-                        cache).
+                        freshly extracted are ever pruned. Default: DISABLED —
+                        stamps are retained (~1 GB/cadence average) so re-
+                        scoring the same data under the same energy-detection
+                        config (new weights, threshold sweeps) skips
+                        preprocessing entirely via the fingerprint-scoped
+                        cache. Pass --prune-stamps on catalog-scale runs:
+                        without pruning a full catalog writes ~30-90 TB of
+                        stamps and dies on disk.
+  --report-exclude-frequency-range START_MHZ END_MHZ
+                        Report-time frequency exclusion (repeatable):
+                        candidates whose frequency falls inside any given
+                        [START_MHZ, END_MHZ] range (inclusive) are dropped
+                        from the final run tallies and the Slack candidate
+                        uploads — detection, database rows, and rendered/saved
+                        figures are untouched, and the summary reports
+                        original vs excluded vs reported counts. Use for known
+                        RFI allocations (e.g. --report-exclude-frequency-range
+                        1616 1626.5 for Iridium). Each range needs finite 0 <
+                        START < END. Default: off.
   --inference-viz, --no-inference-viz
                         Render the inference visualization suite (energy
                         detection distributions, hit spectrum, bandpass
@@ -1099,8 +1112,13 @@ options:
                         gallery figure, each as a 6-observation waterfall grid
                         (default: 12)
   --max-candidate-plots MAX_CANDIDATE_PLOTS
-                        Maximum number of per-candidate figures rendered per
-                        run, highest confidence first (default: 50; the
+                        Per-candidate figure cap, applied in review order
+                        (confidence, then survey-OOD distance, then MC spread)
+                        to the overall top candidates AND separately to the
+                        reported-after-exclusion subset when --report-exclude-
+                        frequency-range is set -- so up to 2x this many
+                        figures with exclusions, while Slack uploads stay
+                        bounded by the reported side alone (default: 50; the
                         candidate gallery is unaffected)
   --max-retries MAX_RETRIES
                         Maximum number of retry attempts for inference

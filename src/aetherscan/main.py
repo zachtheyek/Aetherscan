@@ -15,8 +15,7 @@ import os
 import socket
 import sys
 import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +24,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.candidate_figures import write_candidate_snippet_sidecar
+from aetherscan.candidate_triage import partition_candidates_by_frequency, report_exclusion_ranges
 from aetherscan.cli import (
     apply_args_to_config,
     apply_saved_config,
@@ -544,13 +544,14 @@ def _prefetch_cadence(preprocessor: DataPreprocessor, unit: PendingCadence) -> t
 
 
 def _resolve_prune_stamps(config) -> bool:
-    """Resolve the stamp-cache pruning mode (#302): an explicit inference.prune_stamps
-    wins; the None default means AUTO — ON for the fingerprint-scoped default cache
-    directory, OFF when --preprocess-output-dir pins an operator-curated one (a handed
-    cache is never destroyed implicitly)."""
+    """Resolve the stamp-cache pruning mode (#302, default flipped by #399): an explicit
+    inference.prune_stamps wins; the None default means OFF — stamps are kept so the
+    fingerprint-scoped cache makes re-scores (new weights / threshold sweeps under the
+    same ED config) skip preprocessing out of the box. Catalog-scale runs must opt in
+    with --prune-stamps or the stamp volume exceeds scratch (~30-90 TB unpruned)."""
     if config.inference.prune_stamps is not None:
         return bool(config.inference.prune_stamps)
-    return config.inference.preprocess_output_dir is None
+    return False
 
 
 def _prune_cadence_stamps(
@@ -708,8 +709,10 @@ def _run_streaming_csv_inference(
             [prefetch thread(s)] preprocess + load/log-norm upcoming cadences (energy
                                  detection skipped when the stamp .npy already exists —
                                  preprocessing-artifact resume; see _prefetch_cadence)
-            [main thread]        encode cadence i on GPUs -> RF -> write per-cadence
-                                 results + manifest row (_infer_cadence), in catalog order
+            [main thread]        encode on GPUs -> RF -> write per-cadence results +
+                                 manifest row (_infer_cadence), consuming cadences in
+                                 COMPLETION order (#401) — scores are order-free (seeded
+                                 on the catalog index), only row/log order varies
 
     Failure containment mirrors preprocessing's: a cadence whose inference stage fails is
     logged, recorded as status='failed' in the manifest, and the loop continues; the pass
@@ -793,6 +796,7 @@ def _run_streaming_csv_inference(
                     unit.npy_path,
                     DataPreprocessor.cadence_metadata_path(unit.npy_path),
                     manifest_row,
+                    catalog_index=unit.index,
                 )
             except Exception as e:
                 logger.error(
@@ -820,9 +824,19 @@ def _run_streaming_csv_inference(
     prune_stamps = _resolve_prune_stamps(config)
     logger.info(
         f"Stamp-cache pruning: {'ON' if prune_stamps else 'OFF'} "
-        f"({'explicit' if config.inference.prune_stamps is not None else 'auto'}; "
-        f"{'default fingerprint-scoped cache dir' if config.inference.preprocess_output_dir is None else 'explicit --preprocess-output-dir'})"
+        f"({'explicit' if config.inference.prune_stamps is not None else 'default'}; "
+        f"{'fingerprint-scoped default cache dir' if config.inference.preprocess_output_dir is None else 'explicit --preprocess-output-dir'})"
     )
+    if not prune_stamps:
+        # Loud on purpose (#399): keeping the cache is the right default for subset-scale
+        # work (re-scores under the same ED config skip preprocessing entirely), but a
+        # full catalog writes ~30-90 TB of stamps — a catalog run without --prune-stamps
+        # dies on disk after a few hundred cadences.
+        logger.info(
+            "Stamp cache will be RETAINED (~1 GB/cadence average; enables free re-scores "
+            "under the same ED config). Catalog-scale runs should pass --prune-stamps to "
+            "bound disk usage."
+        )
 
     failed_keys: list[tuple] = []
     if pending:
@@ -831,20 +845,31 @@ def _run_streaming_csv_inference(
         # mid-operation locks in the children)
         preprocessor.start_energy_detection_pool()
         try:
-            # Prefetch depth (#298 N2): `depth` cadences preprocess+load concurrently ahead
-            # of the GPU stage. Futures are consumed strictly in catalog order, so results,
-            # manifest/supersede ordering, the reference-cloud offer order, and per-cadence
-            # seeding (keyed on unit.index — the catalog position, not execution order) are
-            # identical at any depth. Cost: up to `depth` in-flight cadences of RAM.
+            # Prefetch depth (#298 N2) with completion-order consumption (#401): `depth`
+            # cadences preprocess+load concurrently ahead of the GPU stage, and the main
+            # thread consumes WHICHEVER future finishes first, submitting a replacement
+            # immediately — so one straggler (a 30-minute RFI-dense preprocess, a
+            # 10-minute load of a monster stamp array) no longer head-of-line-blocks the
+            # other slots into idleness (measured: 12% of the depth-3 baseline run's wall
+            # had ZERO preprocessing running while finished slots waited behind a
+            # straggler). Per-cadence science is order-free by construction — seeding
+            # keys on unit.index (the catalog position, not execution order) and the
+            # reference-cloud reservoir selects by content-derived keys (#401) — so
+            # results are identical at any depth and any completion order; what does vary
+            # run-to-run is manifest/DB ROW ORDER, log interleaving, and the
+            # latent-projection figure's bounded non-candidate subsample (viz-only; the
+            # render phase catalog-sorts the records for everything else). Row content is
+            # unchanged; resume/queries key on tag+npy_path, never order. Cost: up to
+            # `depth` in-flight cadences of RAM.
             depth = max(1, config.inference.prefetch_depth)
             with ThreadPoolExecutor(
                 max_workers=depth, thread_name_prefix="preproc_prefetch"
             ) as prefetch:
-                futures = deque(
-                    prefetch.submit(_prefetch_cadence, preprocessor, unit)
+                in_flight = {
+                    prefetch.submit(_prefetch_cadence, preprocessor, unit): unit
                     for unit in pending[:depth]
-                )
-                next_submit = len(futures)
+                }
+                next_submit = len(in_flight)
 
                 # Load models AFTER the first prefetch is in flight (#298 rider): the
                 # 10-60 s encoder+RF+calibrator load hides under the first cadence's
@@ -852,19 +877,33 @@ def _run_streaming_csv_inference(
                 # and every cadence reuses this one pipeline.
                 pipeline = InferencePipeline(strategy=strategy)
 
-                for i, unit in enumerate(pending):
+                n_consumed = 0
+                while in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                     # NOTE: an exception inside a prefetched preprocessing task surfaces
-                    # here, `depth` iterations after it was submitted, when its future is
-                    # resolved — and then propagates to inference_command's retry loop. In
-                    # practice process_pending_cadence swallows per-cadence failures
-                    # (returns None) and _prefetch_cadence contains load failures, so only
+                    # at .result() below, when its future completes — and then propagates
+                    # to inference_command's retry loop. In practice
+                    # process_pending_cadence swallows per-cadence failures (returns
+                    # None) and _prefetch_cadence contains load failures, so only
                     # infrastructure-level errors (e.g. a broken worker pool) raise.
-                    cadence_result, cadence_data = futures.popleft().result()
+                    future = next(iter(done))
+                    unit = in_flight.pop(future)
+                    cadence_result, cadence_data = future.result()
+                    # Drop the future AND the done set immediately: Future._result pins
+                    # the (cadence_result, cadence_data) tuple, so a surviving reference
+                    # would keep a cadence-sized array (~65 GB worst case) resident
+                    # through this iteration's encode and the next blocking wait() —
+                    # exactly what the `del cadence_data` below exists to prevent. (The
+                    # old popleft().result() shape dropped the future as a temporary;
+                    # this is that shape's explicit equivalent.)
+                    del future, done
+                    n_consumed += 1
 
                     # Keep `depth` cadences in flight while the main thread encodes this one
                     if next_submit < len(pending):
-                        futures.append(
-                            prefetch.submit(_prefetch_cadence, preprocessor, pending[next_submit])
+                        next_unit = pending[next_submit]
+                        in_flight[prefetch.submit(_prefetch_cadence, preprocessor, next_unit)] = (
+                            next_unit
                         )
                         next_submit += 1
 
@@ -927,6 +966,7 @@ def _run_streaming_csv_inference(
                                 results["provenance"],
                                 results,
                                 results["duration_s"],
+                                catalog_index=unit.index,
                             )
                         except Exception as e:
                             logger.error(
@@ -943,7 +983,7 @@ def _run_streaming_csv_inference(
 
                     logger.info(
                         f"Cadence {cadence_result.key} ({totals['n_cadences']} done, "
-                        f"{len(pending) - i - 1} to go): {results['n_processed']} snippets, "
+                        f"{len(pending) - n_consumed} to go): {results['n_processed']} snippets, "
                         f"{results['n_candidates']} candidate(s)"
                     )
                     del results
@@ -1019,6 +1059,34 @@ def _run_legacy_test_files_inference(
     )
     del cadence_data
     return results
+
+
+def _log_report_exclusion_summary(config) -> None:
+    """Report-time frequency exclusion tally (#395): with ranges configured, append the
+    excluded/reported split under the final candidate count, sourced from the whole tag's
+    live candidate rows. On a normal run this matches the totals (which also aggregate
+    resumed cadences); reusing a tag across DIFFERENT catalogs can leave live rows the
+    current catalog never supersedes, so this tag-wide tally is the more inclusive count.
+    Best-effort — a tally bug must never fail a completed science run."""
+    ranges = report_exclusion_ranges(config)
+    if not ranges:
+        return
+    try:
+        db = get_db()
+        if db is None:
+            return
+        db.flush()
+        rows = db.query_inference_result(
+            tag=config.checkpoint.save_tag, prediction=1, columns=["frequency_mhz"]
+        )
+        reported, excluded = partition_candidates_by_frequency(rows, ranges)
+        range_label = ", ".join(f"{start:g}-{end:g}" for start, end in ranges)
+        logger.info(
+            f"    Excluded by --report-exclude-frequency-range ({range_label} MHz): {len(excluded)}"
+        )
+        logger.info(f"    Reported after exclusion: {len(reported)}")
+    except Exception as e:
+        logger.error(f"Report-time exclusion tally failed ({e}); run is unaffected")
 
 
 # NOTE: we need to load the saved config from the corresponding training run, but when/where should we do that, and how does that play with apply_args_to_config()?
@@ -1146,6 +1214,7 @@ def inference_command():
     logger.info(f"  Total cadence snippets: {results['n_cadence_snippets']}")
     logger.info(f"    Processed: {results['n_processed']}")
     logger.info(f"    Candidates found: {results['n_candidates']}")
+    _log_report_exclusion_summary(config)
     logger.info("=" * 60)
 
     _post_benchmark_report(config.checkpoint.save_tag)

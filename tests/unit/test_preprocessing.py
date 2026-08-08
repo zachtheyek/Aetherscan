@@ -33,6 +33,7 @@ from aetherscan.preprocessing import (
     _energy_detect_channel_worker,
     _extract_stamps_worker,
     _fit_channel_bandpass,
+    _format_array_size,
     _log_norm_chunk_vectorized,
     _lognorm_worker,
     _pfb_flatten_bandpass,
@@ -364,11 +365,14 @@ class TestLogNormChunkVectorized:
 
     def _chunk(self, dtype=np.float32):
         rng = np.random.default_rng(31)
-        chunk = rng.chisquare(df=4, size=(7, 6, 4, 16)).astype(dtype)
+        chunk = rng.chisquare(df=4, size=(8, 6, 4, 16)).astype(dtype)
         chunk[1, 0, 0, 0] = np.nan  # invalid: NaN
         chunk[3, 2, 1, 5] = np.inf  # invalid: Inf
         chunk[5] = 0.0  # invalid: non-positive max
         chunk[6] = 2.5  # valid but constant: zero range after the log shift
+        # Invalid (#400): a negative finite value with positive max passed the old filter
+        # and its log would NaN-poison the normalized row — now rejected like NaN/Inf
+        chunk[7, 1, 2, 3] = -1.0
         return chunk
 
     def _worker_reference(self, chunk, monkeypatch):
@@ -1874,3 +1878,39 @@ class TestEnergyDetectChannelWorker:
         )
         assert hits == []
         assert stat_hist.sum() > 0
+
+
+class TestFormatArraySize:
+    """#398 review nit: the adaptive unit must leave no floored-to-zero zone at either end."""
+
+    def test_small_arrays_stay_visible_in_mb(self):
+        assert _format_array_size(196_608) == "0.2 MB"  # a single-stamp cadence
+        assert _format_array_size(4_700_000) == "4.7 MB"
+
+    def test_large_arrays_read_in_gb(self):
+        assert _format_array_size(100_000_000) == "0.10 GB"  # boundary
+        assert _format_array_size(64_830_000_000) == "64.83 GB"  # the budgeted monster
+
+
+class TestValidityRejectionWarning:
+    """#400 review nit: rejected rows must be counted in the log, not silently dropped."""
+
+    def test_streaming_load_warns_on_rejected_rows(self, initialized_runtime, tmp_path, caplog):
+        config = get_config()
+        config.data.downsample_factor = 8
+        config.data.width_bin = 64
+        config.data.time_bins = 4
+        config.inference.store_downsampled_stamps = True
+
+        rng = np.random.default_rng(3)
+        stamps = rng.chisquare(df=4, size=(4, 6, 4, 8)).astype(np.float32)
+        stamps[1, 0, 0, 0] = np.nan  # rejected: NaN
+        stamps[2, 2, 1, 3] = -1.0  # rejected: negative (#400)
+        npy_path = str(tmp_path / "cad.npy")
+        np.save(npy_path, stamps)
+
+        preprocessor = DataPreprocessor()
+        with caplog.at_level(logging.WARNING, logger="aetherscan.preprocessing"):
+            loaded = preprocessor.load_inference_data(override_filepaths=[npy_path], parallel=False)
+        assert loaded.shape[0] == 2  # the two clean rows survive
+        assert any("rejected 2 of 4 snippet row(s)" in record.message for record in caplog.records)

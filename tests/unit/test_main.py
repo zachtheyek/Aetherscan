@@ -305,15 +305,25 @@ class TestStreamingResumeStateMachine:
         b_rows = db.query_inference_cadences(tag="test_v1", npy_path=fail_path)
         assert [r["status"] for r in b_rows] == ["inferred"]
 
-    def test_prune_on_by_default_deletes_npy_keeps_metadata_and_sidecar(self, stubbed_streaming):
-        """#302: with the fingerprint-default cache dir, pruning resolves ON — after a
-        successful pass every freshly-extracted stamp .npy is gone, the metadata .json
-        stays, each candidate's snippet is sidecarred, and the manifest-driven resume
-        still skips everything on the next pass without touching the missing .npy."""
+    def test_prune_off_by_default_keeps_stamps(self, stubbed_streaming):
+        """#399: the None default resolves OFF — a default-configured run retains every
+        stamp .npy so the fingerprint-scoped cache serves re-scores out of the box."""
+        db, make_preprocessor = stubbed_streaming
+        assert get_config().inference.prune_stamps is None  # default
+        preprocessor = make_preprocessor()
+        _run_streaming_csv_inference(preprocessor, strategy=None)
+        for unit in preprocessor.units:
+            assert os.path.exists(unit.npy_path)
+
+    def test_explicit_prune_deletes_npy_keeps_metadata_and_sidecar(self, stubbed_streaming):
+        """#302 (+#399 default flip): with --prune-stamps, after a successful pass every
+        freshly-extracted stamp .npy is gone, the metadata .json stays, each candidate's
+        snippet is sidecarred, and the manifest-driven resume still skips everything on
+        the next pass without touching the missing .npy."""
         from aetherscan.candidate_figures import candidate_sidecar_path  # noqa: PLC0415
 
         db, make_preprocessor = stubbed_streaming
-        assert get_config().inference.prune_stamps is None  # AUTO
+        get_config().inference.prune_stamps = True
         preprocessor = make_preprocessor()
 
         _run_streaming_csv_inference(preprocessor, strategy=None)
@@ -343,8 +353,8 @@ class TestStreamingResumeStateMachine:
             assert os.path.exists(unit.npy_path)
 
     def test_explicit_output_dir_defaults_prune_off(self, stubbed_streaming, tmp_path):
-        """AUTO mode: an operator-curated --preprocess-output-dir is never destroyed
-        implicitly — pruning resolves OFF unless --prune-stamps is passed explicitly."""
+        """An operator-curated --preprocess-output-dir with the default (off) pruning is
+        never destroyed — pruning stays OFF unless --prune-stamps is passed explicitly."""
         db, make_preprocessor = stubbed_streaming
         get_config().inference.preprocess_output_dir = str(tmp_path)
         preprocessor = make_preprocessor()
@@ -357,6 +367,7 @@ class TestStreamingResumeStateMachine:
         pre-existing .npy (freshly_extracted=False) keeps its stamps even with pruning
         ON."""
         db, make_preprocessor = stubbed_streaming
+        get_config().inference.prune_stamps = True
         preprocessor = make_preprocessor()
         original = preprocessor.process_pending_cadence
 
@@ -371,17 +382,20 @@ class TestStreamingResumeStateMachine:
             assert os.path.exists(unit.npy_path)
 
     def test_resolve_prune_stamps_matrix(self):
+        """#399: None resolves OFF regardless of the cache dir; explicit flags win."""
         config = get_config()
         config.inference.prune_stamps = None
         config.inference.preprocess_output_dir = None
-        assert main._resolve_prune_stamps(config) is True
+        assert main._resolve_prune_stamps(config) is False  # default: keep stamps
         config.inference.preprocess_output_dir = "/some/dir"
         assert main._resolve_prune_stamps(config) is False
         config.inference.prune_stamps = True
         assert main._resolve_prune_stamps(config) is True  # explicit ON beats explicit dir
-        config.inference.prune_stamps = False
+        config.inference.prune_stamps = True
         config.inference.preprocess_output_dir = None
-        assert main._resolve_prune_stamps(config) is False  # explicit OFF beats default dir
+        assert main._resolve_prune_stamps(config) is True  # explicit ON, default dir
+        config.inference.prune_stamps = False
+        assert main._resolve_prune_stamps(config) is False  # explicit OFF
 
     def test_prune_failure_keeps_stamps_and_run_continues(self, stubbed_streaming, monkeypatch):
         """Pruning is best-effort: a sidecar-write failure must keep the stamps and never
@@ -398,9 +412,10 @@ class TestStreamingResumeStateMachine:
         for unit in preprocessor.units:
             assert os.path.exists(unit.npy_path)  # kept on failure
 
-    def test_prefetch_depth_2_preserves_catalog_order(self, stubbed_streaming):
-        """#298 N2: at depth 2 the futures are consumed strictly in catalog order, so
-        inference order, manifest rows, and totals are identical to depth 1."""
+    def test_prefetch_depth_2_completes_all_cadences(self, stubbed_streaming):
+        """#298 N2 + #401: at depth 2 every cadence is inferred exactly once and the
+        totals/manifest are complete — consumption order is completion order, so only
+        the SET of inferred cadences is contractual, not their sequence."""
         db, make_preprocessor = stubbed_streaming
         get_config().inference.prefetch_depth = 2
         preprocessor = make_preprocessor(keys=[("A", "1"), ("B", "2"), ("C", "3"), ("D", "4")])
@@ -409,9 +424,35 @@ class TestStreamingResumeStateMachine:
 
         assert totals["n_cadences"] == 4
         pipeline = _StubPipeline.instances[-1]
-        assert pipeline.inferred_paths == [u.npy_path for u in preprocessor.units]
+        assert sorted(pipeline.inferred_paths) == sorted(u.npy_path for u in preprocessor.units)
         assert db.flush(timeout=10) is True
         assert len(db.query_inference_cadences(tag="test_v1", status="inferred")) == 4
+
+    def test_completion_order_consumes_fast_cadence_before_straggler(self, stubbed_streaming):
+        """#401: with depth 2, a slow first cadence must NOT head-of-line-block the fast
+        second one — the fast cadence is inferred while the straggler still preprocesses.
+        (Under the old strict-catalog-order consumption this asserted the reverse.)"""
+        import time as _time  # noqa: PLC0415
+
+        db, make_preprocessor = stubbed_streaming
+        get_config().inference.prefetch_depth = 2
+        preprocessor = make_preprocessor(keys=[("SLOW", "1"), ("FAST", "2")])
+        slow_path = preprocessor.units[0].npy_path
+        original = preprocessor.process_pending_cadence
+
+        def stalling(unit):
+            if unit.npy_path == slow_path:
+                _time.sleep(0.8)
+            return original(unit)
+
+        preprocessor.process_pending_cadence = stalling
+
+        totals = _run_streaming_csv_inference(preprocessor, strategy=None)
+
+        assert totals["n_cadences"] == 2
+        pipeline = _StubPipeline.instances[-1]
+        fast_path = preprocessor.units[1].npy_path
+        assert pipeline.inferred_paths == [fast_path, slow_path]
 
     def test_prefetch_load_failure_falls_back_to_inference_thread(self, stubbed_streaming):
         """#298 I5-overlap: a prefetch-side load failure must not abort the pass one

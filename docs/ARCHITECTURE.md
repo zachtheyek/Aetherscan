@@ -114,8 +114,10 @@ worker processes; everything I/O-ish runs on background threads of the main proc
 - **Main process threads**: the TF runtime (its own thread pool), the DB writer thread
   ([`DATABASE.md`](DATABASE.md)), the `QueueListener` logging thread
   ([`RUNTIME_SERVICES.md`](RUNTIME_SERVICES.md)), the 1 Hz resource-monitor thread, the
-  round-data drainer thread (training), and a 1-worker preprocessing prefetch thread
-  (streaming inference).
+  round-data drainer thread (training), and the preprocessing prefetch pool (streaming
+  inference): a `ThreadPoolExecutor` of `inference.prefetch_depth` workers (default 3),
+  consumed in completion order (#401) — see the streaming-loop section of
+  [`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md).
 - **Worker pools** (fork-started, plain `multiprocessing.Pool`): background
   downsampling (training load), energy detection + stamp extraction (one persistent pool per
   inference run), and signal injection (owned by the producer, below).
