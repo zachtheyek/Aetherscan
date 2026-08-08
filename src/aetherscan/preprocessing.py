@@ -1252,7 +1252,9 @@ class DataPreprocessor:
         logger.info(f"Background array shape: {background_array.shape}")
         logger.info(f"Background value range: [{min_val:.6f}, {max_val:.6f}]")
         logger.info(f"Background mean: {mean_val:.6f}")
-        logger.info(f"Memory usage: {background_array.nbytes / 1e9:.2f} GB")
+        # Array nbytes, not process memory (#398): the old "Memory usage" label plus %.2f GB
+        # floored small-but-real arrays to a broken-looking "0.00 GB"
+        logger.info(f"Background array size: {background_array.nbytes / 1e6:.1f} MB")
         logger.info(f"Background data ready at {background_array.shape[3]} resolution")
 
         return background_array
@@ -1545,34 +1547,36 @@ class DataPreprocessor:
         # Clear all_blocks reference
         del all_blocks
 
-        # Sanity check: print descriptive stats. NaN detection rides the min reduction
-        # (NaN propagates through np.min, and NaN > 1.0 / NaN < 0.0 are both False, so a
-        # NaN array reaches that branch exactly as it did via the old full-array
-        # .any() pass); the two extra full-array validity passes and their full-size
-        # bool temporaries are gone (#301). The old isinf branch was unreachable: +inf
-        # always tripped the max check first, -inf the min check, and NaN the isnan
-        # branch — outcomes and messages are unchanged for every input.
-        min_val = np.min(cadence_array)
-        max_val = np.max(cadence_array)
-        mean_val = np.mean(cadence_array)
-
-        if max_val > 1.0:
-            logger.error(f"Cadence array values too large! Max: {max_val}")
+        # Normalization spot-check on the first cadence only (#400): the old full-array
+        # min/max/mean triple was 3 extra passes over up-to-65 GB arrays at peak allocation
+        # (~15-20% of the streaming load stage), guarding raises that are unreachable by
+        # construction — rows are validity-filtered upstream (_downsample_cadence,
+        # _lognorm_worker, _log_norm_chunk_vectorized reject NaN/Inf/non-positive-max) and
+        # the normalization lands exact IEEE [0, 1] bounds (x - min(x) has min 0.0,
+        # x / max(x) has max 1.0, zero-range rows skip the division). The [0, 1] contract
+        # is pinned by tests/unit/test_preprocessing.py (TestLoadInferenceDataPaths). This
+        # row-0 check keeps the guard's raise semantics against a future normalization bug
+        # at microseconds instead of full passes; NaN rides the min reduction (NaN > 1.0
+        # and NaN < 0.0 are both False, so a NaN row reaches that branch).
+        spot = cadence_array[0]
+        spot_min = np.min(spot)
+        spot_max = np.max(spot)
+        if spot_max > 1.0:
+            logger.error(f"Cadence array values too large! Max: {spot_max}")
             raise ValueError("Preprocessing normalization check failed")
-        elif min_val < 0.0:
-            logger.error(f"Cadence array values too small! Min: {min_val}")
+        elif spot_min < 0.0:
+            logger.error(f"Cadence array values too small! Min: {spot_min}")
             raise ValueError("Preprocessing normalization check failed")
-        elif np.isnan(min_val):
+        elif np.isnan(spot_min):
             logger.error("Cadence array contains NaN values!")
             raise ValueError("Preprocessing normalization check failed")
-        else:
-            logger.info("Cadence array properly normalized")
-            logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
-            logger.info(f"Cadence array shape: {cadence_array.shape}")
-            logger.info(f"Cadence value range: [{min_val:.6f}, {max_val:.6f}]")
-            logger.info(f"Cadence mean: {mean_val:.6f}")
-            logger.info(f"Memory usage: {cadence_array.nbytes / 1e9:.2f} GB")
-            logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
+
+        logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
+        logger.info(f"Cadence array shape: {cadence_array.shape}")
+        # Array nbytes, not process memory (#398): the old "Memory usage" label plus %.2f GB
+        # floored small-but-real arrays to a broken-looking "0.00 GB"
+        logger.info(f"Cadence array size: {cadence_array.nbytes / 1e6:.1f} MB")
+        logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
 
         return cadence_array
 
