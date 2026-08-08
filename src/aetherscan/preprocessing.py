@@ -258,7 +258,7 @@ def _downsample_worker(args):
     args is a (cadence_idx, downsample_factor, final_width) tuple — the cadence itself is
     pulled from _GLOBAL_CHUNK_DATA to avoid pickling it across the pool boundary. Returns the
     downsampled cadence of shape (6, 16, final_width), or None if the source cadence contained
-    NaN/Inf or had non-positive max (treated as invalid).
+    NaN/Inf, had non-positive max, or carried any negative value (treated as invalid, #400).
     """
     cadence_idx, downsample_factor, final_width = args
 
@@ -278,8 +278,9 @@ def _lognorm_worker(args):
     needs the per-cadence log-norm. args is a (cadence_idx,) tuple — the cadence itself is
     pulled from _GLOBAL_CHUNK_DATA to avoid pickling it across the pool boundary. Returns the
     log-normalized cadence of shape (6, time_bins, final_width) as float32, or None if the
-    source cadence contained NaN/Inf or had non-positive max (treated as invalid, matching
-    _downsample_worker).
+    source cadence contained NaN/Inf, had non-positive max, or carried any negative value
+    (treated as invalid, matching _downsample_worker; the negative clause is #400's
+    NaN-poisoning guard, load-bearing like _log_norm_chunk_vectorized's).
     """
     (cadence_idx,) = args
 
@@ -1547,6 +1548,15 @@ class DataPreprocessor:
                     for result in results
                     if result is not None
                 ]
+                n_rejected = len(results) - len(chunk_cadences)
+                if n_rejected:
+                    # Same observability contract as the vectorized branch above (#400
+                    # review note): rejected rows must be counted, not silently dropped
+                    logger.warning(
+                        f"Load-time validity filter rejected {n_rejected} of "
+                        f"{len(results)} snippet row(s) (NaN/Inf, non-positive max, "
+                        f"or negative values)"
+                    )
                 if chunk_cadences:
                     all_blocks.append(np.array(chunk_cadences, dtype=np.float32))
                 del chunk_cadences
