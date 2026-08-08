@@ -295,18 +295,19 @@ proportionally longer.)
    `--preprocess-output-dir` or with pruning left at its off default (a deliberate design
    choice — cross-process file locking was deferred as disproportionate for a self-healing,
    science-neutral race).
-> **Considered and rejected: per-cadence stamp caps (#402).** The runtime heavy tail is
-> driven entirely by a handful of RFI-dense cadences — per-cadence stamp counts in the
-> subset benchmark spanned 168 (median) to 329,749 (max: BOL520, C-band, 8438 MHz), and
-> every downstream cost (extraction, load, encode) is linear in stamps. Capping stamps per
-> cadence (top-K by detection statistic) would bound those tails, and was **rejected**:
-> a real signal co-located with dense RFI could rank below the cap and be dropped before
-> the RF ever scores it — sensitivity in RFI-dense cadences is exactly what a survey
-> search cannot silently trade away (primary reason). Secondary: a cap enters the ED
-> fingerprint, invalidating every existing stamp cache on adoption. Recorded here so the
-> option isn't re-litigated from scratch each time the tail bites; the sanctioned tail
-> mitigations are prefetch depth + completion-order consumption (#401), which hide the
-> stragglers instead of truncating them.
+   > **Considered and rejected: per-cadence stamp caps (#402).** The runtime heavy tail
+   > is driven entirely by a handful of RFI-dense cadences — per-cadence stamp counts in
+   > the subset benchmark spanned 168 (median) to 329,749 (max: BOL520, C-band,
+   > 8438 MHz), and every downstream cost (extraction, load, encode) is linear in stamps.
+   > Capping stamps per cadence (top-K by detection statistic) would bound those tails,
+   > and was **rejected**: a real signal co-located with dense RFI could rank below the
+   > cap and be dropped before the RF ever scores it — sensitivity in RFI-dense cadences
+   > is exactly what a survey search cannot silently trade away (primary reason).
+   > Secondary: a cap enters the ED fingerprint, invalidating every existing stamp cache
+   > on adoption. Recorded here so the option isn't re-litigated from scratch each time
+   > the tail bites; the sanctioned tail mitigations are prefetch depth +
+   > completion-order consumption (#401), which hide the stragglers instead of
+   > truncating them.
 
 7. **Failure containment.** A cadence whose inference stage throws is logged, recorded as
    `status='failed'` in the manifest, and the loop moves on — one bad cadence never aborts

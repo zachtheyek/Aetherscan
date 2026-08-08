@@ -1112,8 +1112,13 @@ options:
                         gallery figure, each as a 6-observation waterfall grid
                         (default: 12)
   --max-candidate-plots MAX_CANDIDATE_PLOTS
-                        Maximum number of per-candidate figures rendered per
-                        run, highest confidence first (default: 50; the
+                        Per-candidate figure cap, applied in review order
+                        (confidence, then survey-OOD distance, then MC spread)
+                        to the overall top candidates AND separately to the
+                        reported-after-exclusion subset when --report-exclude-
+                        frequency-range is set -- so up to 2x this many
+                        figures with exclusions, while Slack uploads stay
+                        bounded by the reported side alone (default: 50; the
                         candidate gallery is unaffected)
   --max-retries MAX_RETRIES
                         Maximum number of retry attempts for inference

@@ -213,6 +213,14 @@ def _init_plain_worker():
     _IN_POOL_WORKER = True
 
 
+def _format_array_size(nbytes: int) -> str:
+    """Adaptive array-size label (#398): MB below 0.1 GB so small-but-real arrays never
+    print as 0.0, GB above so RFI-dense monsters stay readable at a glance."""
+    if nbytes < 1e8:
+        return f"{nbytes / 1e6:.1f} MB"
+    return f"{nbytes / 1e9:.2f} GB"
+
+
 def _downsample_cadence(cadence, downsample_factor: int, final_width: int):
     """
     Downsample one cadence's 6 observations, or return None for an invalid cadence
@@ -299,8 +307,11 @@ def _log_norm_chunk_vectorized(chunk: np.ndarray) -> tuple[np.ndarray, np.ndarra
     (n, obs, time_bins, width): returns (normalized_valid_rows, valid_mask) (#298 I5).
 
     Bit-identical per element to the per-cadence path, by construction: the validity rule is
-    the same (any NaN/Inf or non-positive max rejects the cadence — NaN/Inf rows fail the
-    finite mask, so the max comparison never decides them); the arithmetic runs in float32
+    the same (any NaN/Inf, non-positive max, or negative value rejects the cadence — NaN/Inf
+    rows fail the finite mask, so the max/min comparisons never decide them; the negative
+    clause, #400, is load-bearing on BOTH sides — it is what keeps a row whose log would
+    NaN-poison the normalized output from ever entering the array, so do not "simplify" it
+    away from either path); the arithmetic runs in float32
     with the same scalar casts (numpy converts the 1e-10 epsilon and the per-cadence min/max
     scalars to float32 in both forms); min/max are exact order-independent reductions; and
     rows whose post-shift range is 0 skip the division exactly as log_norm's range_log > 0
@@ -1265,8 +1276,9 @@ class DataPreprocessor:
         logger.info(f"Background value range: [{min_val:.6f}, {max_val:.6f}]")
         logger.info(f"Background mean: {mean_val:.6f}")
         # Array nbytes, not process memory (#398): the old "Memory usage" label plus %.2f GB
-        # floored small-but-real arrays to a broken-looking "0.00 GB"
-        logger.info(f"Background array size: {background_array.nbytes / 1e6:.1f} MB")
+        # floored small-but-real arrays to a broken-looking "0.00 GB". Adaptive unit: MB
+        # keeps tiny arrays visible, GB keeps the 65 GB monsters readable (review note)
+        logger.info(f"Background array size: {_format_array_size(background_array.nbytes)}")
         logger.info(f"Background data ready at {background_array.shape[3]} resolution")
 
         return background_array
@@ -1489,7 +1501,18 @@ class DataPreprocessor:
                     shared_chunk = None
                     results = []
 
-                    normalized, _ = _log_norm_chunk_vectorized(chunk_data)
+                    normalized, valid_mask = _log_norm_chunk_vectorized(chunk_data)
+                    n_rejected = int((~valid_mask).sum())
+                    if n_rejected:
+                        # The validity filter is now the ONLY guard between a bad row and
+                        # the encoder (#400 review note) — make the sensitivity loss
+                        # observable instead of inferable from the funnel figure
+                        logger.warning(
+                            f"Load-time validity filter rejected {n_rejected} of "
+                            f"{len(valid_mask)} snippet row(s) (NaN/Inf, non-positive "
+                            f"max, or negative values)"
+                        )
+                    del valid_mask
                     if len(normalized):
                         all_blocks.append(normalized)
                     del normalized
@@ -1588,8 +1611,9 @@ class DataPreprocessor:
         logger.info(f"Total cadences loaded: {cadence_array.shape[0]}")
         logger.info(f"Cadence array shape: {cadence_array.shape}")
         # Array nbytes, not process memory (#398): the old "Memory usage" label plus %.2f GB
-        # floored small-but-real arrays to a broken-looking "0.00 GB"
-        logger.info(f"Cadence array size: {cadence_array.nbytes / 1e6:.1f} MB")
+        # floored small-but-real arrays to a broken-looking "0.00 GB". Adaptive unit: MB
+        # keeps tiny arrays visible, GB keeps the 65 GB monsters readable (review note)
+        logger.info(f"Cadence array size: {_format_array_size(cadence_array.nbytes)}")
         logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
 
         return cadence_array

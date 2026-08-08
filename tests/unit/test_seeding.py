@@ -118,3 +118,22 @@ class TestUnseededWarning:
             derive_rng(11, STREAM_DATA_GEN, 1)
             derive_seed(11, STREAM_RF)
         assert not [r for r in caplog.records if "NOT reproducible" in r.message]
+
+
+class TestReferenceCloudKeyStreamDisjointness:
+    """#401 review note: SeedSequence treats a trailing 0 entropy word as an identity, so
+    (root, S, 2) IS catalog cadence 0's (root, S, 2, 0) — which is exactly why the keyless
+    reservoir path derives from (root, S, 3). Pin both facts so a refactor can't quietly
+    reintroduce the collision."""
+
+    def test_keyless_stream_disjoint_from_cadence_zero(self):
+        keyless = derive_rng(11, STREAM_REFERENCE_CLOUD, 3).random(8)
+        cadence_zero = derive_rng(11, STREAM_REFERENCE_CLOUD, 2, 0).random(8)
+        assert not (keyless == cadence_zero).all()
+
+    def test_trailing_zero_identity_is_real(self):
+        # The trap the (S, 3) choice avoids: a trailing 0 entropy word is a SeedSequence
+        # identity, so these two "different" derivations are one stream
+        bare = derive_rng(11, STREAM_REFERENCE_CLOUD, 2).random(8)
+        trailing_zero = derive_rng(11, STREAM_REFERENCE_CLOUD, 2, 0).random(8)
+        assert (bare == trailing_zero).all()

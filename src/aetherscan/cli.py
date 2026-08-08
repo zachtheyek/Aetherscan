@@ -1065,7 +1065,7 @@ def _add_inference_flags_to(parser):
         "--max-candidate-plots",
         type=int,
         default=None,
-        help="Maximum number of per-candidate figures rendered per run, highest confidence first (default: 50; the candidate gallery is unaffected)",
+        help="Per-candidate figure cap, applied in review order (confidence, then survey-OOD distance, then MC spread) to the overall top candidates AND separately to the reported-after-exclusion subset when --report-exclude-frequency-range is set -- so up to 2x this many figures with exclusions, while Slack uploads stay bounded by the reported side alone (default: 50; the candidate gallery is unaffected)",
     )
     parser.add_argument(
         "--max-retries",

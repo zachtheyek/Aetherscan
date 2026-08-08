@@ -158,7 +158,9 @@ class TestReportAndCli:
             )
             == 1
         )
-        assert candidate_rfi_report.main(["--save-tag", "absent", "--db-path", str(db)]) == 1
+        # "no candidates" is a clean-run outcome, not an error (review note): exit 0 so
+        # set -e wrappers can tell it apart from the genuine failures above
+        assert candidate_rfi_report.main(["--save-tag", "absent", "--db-path", str(db)]) == 0
 
     def test_db_opened_read_only(self, tmp_path):
         db = tmp_path / "a.db"

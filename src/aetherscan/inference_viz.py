@@ -1397,9 +1397,10 @@ def write_candidate_triage_report() -> str | None:
         if contributing is not None and n_inferred > 0 and contributing < 0.5 * n_inferred:
             logger.warning(
                 f"Candidate triage: the reference cloud was built from only {contributing} "
-                f"of the run's {n_inferred} inferred cadence(s) (a retried pass rebuilds "
-                f"the reservoir from the final attempt only) — survey-OOD percentiles are "
-                f"NOT survey-representative for this run"
+                f"of the tag's {n_inferred} inferred cadence(s) — expected on a resumed or "
+                f"retried pass (only the current attempt's cadences feed the reservoir), "
+                f"not a failure; just read survey-OOD percentiles as drawn from that "
+                f"partial background rather than the whole tag"
             )
 
     report_path = os.path.join(

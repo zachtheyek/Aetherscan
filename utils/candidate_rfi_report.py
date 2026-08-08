@@ -295,8 +295,10 @@ def main(argv: list[str] | None = None) -> int:
 
     candidates = load_candidates(db_path, args.save_tag)
     if not candidates:
+        # A clean run is a legitimate, informative outcome — exit 0 so set -e wrappers
+        # and cron callers can tell "no candidates" from "the report couldn't run"
         print(f"No live candidates for tag {args.save_tag!r} in {db_path}")
-        return 1
+        return 0
 
     exclusion_ranges = parse_exclusion_ranges(args.exclude_frequency_range)
     report, flagged_rows = build_report(

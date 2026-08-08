@@ -19,6 +19,7 @@ numpy and joblib are deferred into the OOD functions that need them.
 
 from __future__ import annotations
 
+import functools
 import glob
 import json
 import logging
@@ -199,26 +200,33 @@ def survey_ood_scores(
     survey background. Requires the cloud NPZ to carry latent_mean rows (clouds written
     before #397 lack them — skipped with a log). Best-effort: {} on any failure.
     """
-    import numpy as np  # noqa: PLC0415  # deferred: the module import must stay stdlib-only
-
     try:
         if not os.path.exists(cloud_path):
             logger.info(f"OOD triage: no reference cloud at {cloud_path}; skipping survey OOD")
             return {}
-        with np.load(cloud_path) as npz:
-            if "latent_mean" not in npz.files:
-                logger.info(
-                    "OOD triage: reference cloud predates #397 (no latent_mean); "
-                    "skipping survey OOD"
-                )
-                return {}
-            reference = np.asarray(npz["latent_mean"], dtype=np.float64)
-        if len(reference) < 2:
+        reference = _cloud_latents(cloud_path, os.path.getmtime(cloud_path))
+        if reference is None or len(reference) < 2:
             return {}
         return _ood_map(rows, reference)
     except Exception as e:
         logger.error(f"Survey OOD scoring failed ({e}); skipping")
         return {}
+
+
+@functools.lru_cache(maxsize=4)
+def _cloud_latents(cloud_path: str, mtime: float):
+    """Memoized cloud-latent load (review note): the viz suite scores survey OOD twice
+    per run (gallery ordering + triage CSV) — cache the NPZ read by (path, mtime) so the
+    second call is free. Returns None when the cloud predates #397 (no latent_mean)."""
+    import numpy as np  # noqa: PLC0415  # deferred: the module import must stay stdlib-only
+
+    with np.load(cloud_path) as npz:
+        if "latent_mean" not in npz.files:
+            logger.info(
+                "OOD triage: reference cloud predates #397 (no latent_mean); skipping survey OOD"
+            )
+            return None
+        return np.asarray(npz["latent_mean"], dtype=np.float64)
 
 
 def survey_cloud_cadence_count(cloud_path: str) -> int | None:
