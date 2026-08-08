@@ -53,6 +53,9 @@ from aetherscan.candidate_triage import (
     frequency_excluded,
     partition_candidates_by_frequency,
     report_exclusion_ranges,
+    survey_ood_scores,
+    training_ood_scores,
+    triage_sort_rows,
 )
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
@@ -346,6 +349,14 @@ def _viz_safe(name: str, fn: Callable, *args, **kwargs):
     except Exception as e:
         logger.error(f"Inference viz '{name}' failed (run continues without it): {e}")
         return None
+
+
+def _reference_cloud_path(config, tag: str) -> str:
+    """The run's reference-cloud NPZ path (written by finalize_reference_cloud)."""
+    return os.path.join(
+        config.output_path,
+        f"inference_reference_cloud_{display_tag(tag, get_machine_name())}.npz",
+    )
 
 
 def _plots_dir(tag: str) -> str:
@@ -1214,9 +1225,11 @@ def plot_candidate(row: dict, index: int) -> str | None:
 
 
 def plot_candidate_gallery() -> str | None:
-    """Gallery of the top candidates by confidence (6-obs waterfall strips) plus capped
-    per-candidate figures, sourced from the inference_results table so it also covers
-    cadences the resume skipped this pass."""
+    """Gallery of the top candidates (6-obs waterfall strips) plus capped per-candidate
+    figures, sourced from the inference_results table so it also covers cadences the
+    resume skipped this pass. Ordering (#397): confidence descending, tie-broken by
+    survey-OOD distance descending then MC spread ascending — within a saturated P=1.000
+    tie the candidate least like the survey background reviews first."""
     config = get_config()
     tag = config.checkpoint.save_tag
     display_tag_value = display_tag(tag, get_machine_name())
@@ -1231,7 +1244,8 @@ def plot_candidate_gallery() -> str | None:
     if not rows:
         logger.info("Viz: no candidates recorded; skipping candidate plots")
         return None
-    rows.sort(key=lambda r: r.get("confidence") or 0.0, reverse=True)
+    survey_ood = survey_ood_scores(rows, _reference_cloud_path(config, tag))
+    rows = triage_sort_rows(rows, survey_ood)
 
     # Report-time frequency exclusion (#395): excluded candidates keep their DB rows and
     # their rendered figures on disk; only the Slack uploads and the gallery membership
@@ -1294,10 +1308,13 @@ def plot_candidate_gallery() -> str | None:
         )
         freq = row.get("frequency_mhz")
         freq_label = f"{freq:.4f} MHz" if freq is not None else "freq n/a"
-        axes[0][col].set_title(
-            f"P={row.get('confidence', 0):.3f}\n{freq_label}\n{row.get('target') or ''}",
-            fontsize=7,
-        )
+        title = f"P={row.get('confidence', 0):.3f}\n{freq_label}\n{row.get('target') or ''}"
+        ood = survey_ood.get((row.get("npy_path"), int(row.get("snippet_index") or 0)))
+        if ood is not None:
+            # Survey-OOD percentile (#397): how unlike the run's reference cloud this
+            # candidate's latent is (triage annotation, never a gate)
+            title += f"\nOOD p{ood[1]:.1f}"
+        axes[0][col].set_title(title, fontsize=7)
     exclusion_note = (
         f" ({len(excluded_rows)} excluded by frequency filter)" if excluded_rows else ""
     )
@@ -1309,6 +1326,95 @@ def plot_candidate_gallery() -> str | None:
     return _save_and_upload(
         fig, f"candidate_gallery_{display_tag(tag, get_machine_name())}.png", "Candidate Gallery"
     )
+
+
+def write_candidate_triage_report() -> str | None:
+    """
+    Candidate triage CSV (#397): one row per candidate in review order (triage_sort_rows),
+    carrying the scores a reviewer triages by — confidence, MC mean/spread, survey-OOD
+    distance/percentile (vs this run's reference cloud), training-OOD distance/percentile
+    (vs the training run's true-class features, when the cluster-local eval artifact is
+    available), and the report-time frequency-exclusion flag (#395). Written beside the
+    figures; logged, not uploaded (Slack surfaces stay image-only). Scores are triage
+    ranking only — nothing here gates candidacy: a genuine technosignature is itself OOD
+    with respect to synthetic training data.
+    """
+    import csv  # noqa: PLC0415  # stdlib; only this report needs it
+
+    config = get_config()
+    tag = config.checkpoint.save_tag
+
+    db = get_db()
+    if db is None:
+        logger.info("Viz: no database instance; skipping candidate triage report")
+        return None
+    db.flush()
+    rows = db.query_inference_result(tag=tag, prediction=1)
+    if not rows:
+        logger.info("Viz: no candidates recorded; skipping candidate triage report")
+        return None
+
+    survey_ood = survey_ood_scores(rows, _reference_cloud_path(config, tag))
+    training_ood = training_ood_scores(rows, config.model_path, config.inference.config_path)
+    exclusion_ranges = report_exclusion_ranges(config)
+    ordered = triage_sort_rows(rows, survey_ood)
+
+    report_path = os.path.join(
+        _plots_dir(tag), f"candidate_triage_{display_tag(tag, get_machine_name())}.csv"
+    )
+    with open(report_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "rank",
+                "target",
+                "band",
+                "frequency_mhz",
+                "confidence",
+                "mc_mean",
+                "mc_std",
+                "survey_ood_distance",
+                "survey_ood_percentile",
+                "training_ood_distance",
+                "training_ood_percentile",
+                "excluded_by_report_filter",
+                "npy_path",
+                "snippet_index",
+            ]
+        )
+        for rank, row in enumerate(ordered):
+            key = (row.get("npy_path"), int(row.get("snippet_index") or 0))
+            s_dist, s_pct = survey_ood.get(key, (None, None))
+            t_dist, t_pct = training_ood.get(key, (None, None))
+            writer.writerow(
+                [
+                    rank,
+                    row.get("target"),
+                    row.get("band"),
+                    row.get("frequency_mhz"),
+                    row.get("confidence"),
+                    row.get("mc_mean"),
+                    row.get("mc_std"),
+                    s_dist,
+                    s_pct,
+                    t_dist,
+                    t_pct,
+                    int(
+                        bool(exclusion_ranges)
+                        and frequency_excluded(row.get("frequency_mhz"), exclusion_ranges)
+                    ),
+                    row.get("npy_path"),
+                    row.get("snippet_index"),
+                ]
+            )
+
+    n_survey = len(survey_ood)
+    n_training = len(training_ood)
+    logger.info(
+        f"Candidate triage report saved: {report_path} ({len(ordered)} candidate(s); "
+        f"survey OOD for {n_survey}, training OOD for {n_training})"
+    )
+    return report_path
 
 
 def plot_candidate_uncertainty() -> str | None:
@@ -1334,9 +1440,7 @@ def plot_candidate_uncertainty() -> str | None:
     )
     rows = [r for r in rows if r.get("mc_mean") is not None and r.get("mc_std") is not None]
 
-    cloud_path = os.path.join(
-        config.output_path, f"inference_reference_cloud_{display_tag(tag, get_machine_name())}.npz"
-    )
+    cloud_path = _reference_cloud_path(config, tag)
     cloud = None
     if os.path.exists(cloud_path):
         # Materialize the arrays and close the archive immediately — an NpzFile keeps its
@@ -1682,6 +1786,7 @@ def render_inference_visualizations(
         _viz_safe("confidence_distribution", plot_confidence_distribution, records)
         _viz_safe("candidate_frequency_map", plot_candidate_frequency)
         _viz_safe("candidate_gallery", plot_candidate_gallery)
+        _viz_safe("candidate_triage", write_candidate_triage_report)
         _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
         _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
         _viz_safe("inference_summary", plot_inference_summary, records, summaries, totals)

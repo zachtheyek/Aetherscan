@@ -5,6 +5,7 @@ science run)."""
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 
@@ -889,3 +890,100 @@ class TestReportExclusionSurfaces:
         assert viz.plot_inference_summary(collector.records, summaries, totals) == "captured"
         assert "excluded (1575-1576 MHz)" in captured["text"]
         assert "reported after exclusion" in captured["text"]
+
+
+class TestCandidateTriageReport:
+    """#397: triage CSV in review order, survey-OOD tie-break within equal confidence,
+    graceful skips when scores are unavailable."""
+
+    def _write_candidates_with_latents(self, db, npy_path, specs):
+        for idx, (conf, freq, latent) in enumerate(specs):
+            db.write_inference_result(
+                npy_path,
+                idx,
+                1,
+                conf,
+                latent_vector=np.asarray(latent, dtype=np.float64),
+                target="HIP110750",
+                band="L",
+                frequency_mhz=freq,
+                tag=TAG,
+                mc_mean=conf,
+                mc_std=0.001 * (idx + 1),
+            )
+        assert db.flush(timeout=10) is True
+
+    def test_report_orders_by_survey_ood_within_confidence_tie(
+        self, initialized_runtime, collector
+    ):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        rng = np.random.default_rng(9)
+        # Reference cloud of typical latents at the path the pipeline would write
+        cloud = rng.normal(size=(300, 48)).astype(np.float32)
+        np.savez_compressed(
+            viz._reference_cloud_path(config, TAG),
+            latent_mean=cloud,
+            mc_mean=np.zeros(300, dtype=np.float32),
+            mc_std=np.zeros(300, dtype=np.float32),
+        )
+
+        record = collector.records[0]
+        # Equal confidence: snippet 0 is a deep inlier, snippet 1 an extreme outlier ->
+        # snippet 1 must review first
+        self._write_candidates_with_latents(
+            db,
+            record.npy_path,
+            [(1.0, 1400.5, [0.0] * 48), (1.0, 8438.0, [30.0] * 48)],
+        )
+
+        report_path = viz.write_candidate_triage_report()
+        assert report_path is not None and os.path.exists(report_path)
+        with open(report_path) as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 2
+        assert [int(r["snippet_index"]) for r in rows] == [1, 0]
+        assert float(rows[0]["survey_ood_percentile"]) == 100.0
+        # No training artifact in this environment -> training columns empty, not a crash
+        assert rows[0]["training_ood_distance"] == ""
+
+    def test_report_without_candidates_skips(self, initialized_runtime):
+        from aetherscan.inference_viz import write_candidate_triage_report  # noqa: PLC0415
+
+        assert write_candidate_triage_report() is None
+
+    def test_report_marks_frequency_excluded(self, initialized_runtime, collector):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        config.inference.report_exclude_frequency_ranges = [[1575.0, 1576.0]]
+        record = collector.records[0]
+        self._write_candidates_with_latents(
+            db,
+            record.npy_path,
+            [(0.999, 1575.42, [0.0] * 48), (0.995, 8438.0, [0.1] * 48)],
+        )
+        report_path = viz.write_candidate_triage_report()
+        with open(report_path) as f:
+            rows = {int(r["snippet_index"]): r for r in csv.DictReader(f)}
+        assert rows[0]["excluded_by_report_filter"] == "1"
+        assert rows[1]["excluded_by_report_filter"] == "0"
+
+    def test_gallery_renders_with_ood_annotation(self, initialized_runtime, collector):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        rng = np.random.default_rng(9)
+        np.savez_compressed(
+            viz._reference_cloud_path(config, TAG),
+            latent_mean=rng.normal(size=(100, 48)).astype(np.float32),
+        )
+        record = collector.records[0]
+        self._write_candidates_with_latents(
+            db, record.npy_path, [(1.0, 1400.5, [0.0] * 48), (1.0, 8438.0, [30.0] * 48)]
+        )
+        _assert_figure(viz.plot_candidate_gallery())

@@ -17,8 +17,12 @@ dragging in the model stack.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -86,3 +90,192 @@ def report_exclusion_ranges(config) -> list[tuple[float, float]]:
     except ValueError as e:
         logger.error(f"Ignoring malformed inference.report_exclude_frequency_ranges: {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# OOD triage scores (#397)
+#
+# Both scores below are TRIAGE surfaces — review ordering and a CSV column — and must
+# never gate candidacy: a genuine technosignature is itself out-of-distribution with
+# respect to synthetic training data, so "unusual" ranks candidates for human eyes,
+# it never drops them.
+# ---------------------------------------------------------------------------
+
+
+def mahalanobis_ood(candidates: np.ndarray, reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    (distances, percentiles) of each candidate row against the reference distribution:
+    Mahalanobis distance under the reference's mean/covariance (ridge-stabilized pinv, so
+    a degenerate or small reference never raises), and the percentile of each candidate's
+    distance among the reference rows' own distances (100 = farther than every reference
+    row, i.e. maximally unusual).
+    """
+    reference = np.asarray(reference, dtype=np.float64)
+    candidates = np.asarray(candidates, dtype=np.float64)
+    mean = reference.mean(axis=0)
+    centered = reference - mean
+    cov = centered.T @ centered / max(len(reference) - 1, 1)
+    # Ridge scaled to the average variance: keeps pinv stable when the reference has
+    # collapsed/duplicated dimensions without materially moving healthy distances
+    cov[np.diag_indices_from(cov)] += 1e-6 * max(float(np.trace(cov)) / len(cov), 1e-12)
+    inverse = np.linalg.pinv(cov)
+
+    def _distances(rows: np.ndarray) -> np.ndarray:
+        delta = rows - mean
+        return np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", delta, inverse, delta), 0.0))
+
+    reference_distances = np.sort(_distances(reference))
+    candidate_distances = _distances(candidates)
+    percentiles = (
+        np.searchsorted(reference_distances, candidate_distances, side="right")
+        / len(reference_distances)
+        * 100.0
+    )
+    return candidate_distances, percentiles
+
+
+def candidate_latent_matrix(rows: list[dict]) -> tuple[np.ndarray, list[int]]:
+    """Parse the candidate rows' stored latent_vector JSON payloads into a (n, d) float
+    matrix, returning it with the indices of the rows that had a parseable vector."""
+    vectors: list[list[float]] = []
+    row_indices: list[int] = []
+    width: int | None = None
+    for i, row in enumerate(rows):
+        payload = row.get("latent_vector")
+        if payload is None:
+            continue
+        try:
+            vector = json.loads(payload) if isinstance(payload, str) else list(payload)
+        except (TypeError, ValueError):
+            continue
+        if width is None:
+            width = len(vector)
+        if len(vector) != width or width == 0:
+            continue
+        vectors.append(vector)
+        row_indices.append(i)
+    if not vectors:
+        return np.empty((0, 0), dtype=np.float64), []
+    return np.asarray(vectors, dtype=np.float64), row_indices
+
+
+def _ood_map(rows: list[dict], reference: np.ndarray) -> dict[tuple[str, int], tuple[float, float]]:
+    """{(npy_path, snippet_index): (distance, percentile)} for rows with usable latents
+    matching the reference dimensionality."""
+    latents, row_indices = candidate_latent_matrix(rows)
+    if latents.size == 0 or latents.shape[1] != reference.shape[1]:
+        if latents.size and latents.shape[1] != reference.shape[1]:
+            logger.info(
+                f"OOD triage: candidate latent width {latents.shape[1]} != reference "
+                f"width {reference.shape[1]}; skipping"
+            )
+        return {}
+    distances, percentiles = mahalanobis_ood(latents, reference)
+    return {
+        (rows[i]["npy_path"], int(rows[i]["snippet_index"])): (
+            float(distances[j]),
+            float(percentiles[j]),
+        )
+        for j, i in enumerate(row_indices)
+    }
+
+
+def survey_ood_scores(
+    rows: list[dict], cloud_path: str
+) -> dict[tuple[str, int], tuple[float, float]]:
+    """
+    Candidate-vs-survey OOD (#397): distance of each candidate's latent to THIS run's
+    reference cloud — the seeded uniform reservoir of pass-1 rejects, i.e. what the
+    surveyed sky ordinarily looks like in latent space. High percentile = unlike the
+    survey background. Requires the cloud NPZ to carry latent_mean rows (clouds written
+    before #397 lack them — skipped with a log). Best-effort: {} on any failure.
+    """
+    try:
+        if not os.path.exists(cloud_path):
+            logger.info(f"OOD triage: no reference cloud at {cloud_path}; skipping survey OOD")
+            return {}
+        with np.load(cloud_path) as npz:
+            if "latent_mean" not in npz.files:
+                logger.info(
+                    "OOD triage: reference cloud predates #397 (no latent_mean); "
+                    "skipping survey OOD"
+                )
+                return {}
+            reference = np.asarray(npz["latent_mean"], dtype=np.float64)
+        if len(reference) < 2:
+            return {}
+        return _ood_map(rows, reference)
+    except Exception as e:
+        logger.error(f"Survey OOD scoring failed ({e}); skipping")
+        return {}
+
+
+def training_ood_scores(
+    rows: list[dict], model_path: str, training_config_path: str | None
+) -> dict[tuple[str, int], tuple[float, float]]:
+    """
+    Candidate-vs-training OOD (#397): distance of each candidate's latent to the training
+    run's TRUE-class feature cloud from rf_eval_artifacts_{train_tag}.joblib — how unlike
+    the synthetic signal manifold a candidate is. Only computed when the deployed variant
+    is 'z_mean' (the one variant whose train_features live in the same space as the
+    stored candidate z_mean latents); anything else, or a missing cluster-local artifact,
+    skips with a log. Best-effort: {} on any failure.
+    """
+    import joblib  # noqa: PLC0415  # deferred: only this scorer needs it
+
+    try:
+        if not training_config_path or not os.path.exists(training_config_path):
+            logger.info("OOD triage: no training config available; skipping training OOD")
+            return {}
+        with open(training_config_path) as f:
+            train_tag = (json.load(f).get("checkpoint") or {}).get("save_tag")
+        if not train_tag:
+            logger.info("OOD triage: training config lacks checkpoint.save_tag; skipping")
+            return {}
+        artifact_path = os.path.join(model_path, f"rf_eval_artifacts_{train_tag}.joblib")
+        if not os.path.exists(artifact_path):
+            logger.info(
+                f"OOD triage: no rf_eval_artifacts at {artifact_path} (cluster-local "
+                f"artifact); skipping training OOD"
+            )
+            return {}
+        artifacts = joblib.load(artifact_path)
+        if artifacts.get("latent_variant") != "z_mean":
+            logger.info(
+                f"OOD triage: deployed variant {artifacts.get('latent_variant')!r} features "
+                f"are not directly comparable to stored z_mean latents; skipping training OOD"
+            )
+            return {}
+        labels = np.asarray(artifacts["train_binary_labels"])
+        reference = np.asarray(artifacts["train_features"])[labels == 1]
+        if len(reference) < 2:
+            return {}
+        return _ood_map(rows, reference)
+    except Exception as e:
+        logger.error(f"Training OOD scoring failed ({e}); skipping")
+        return {}
+
+
+def triage_sort_rows(
+    rows: list[dict], survey_ood: dict[tuple[str, int], tuple[float, float]]
+) -> list[dict]:
+    """
+    Review ordering (#397): confidence descending (unchanged science-first primary),
+    tie-broken by survey-OOD distance descending — within a saturated P=1.000 tie the
+    candidate LEAST like the survey background reviews first — then MC spread ascending
+    (stable scores first; missing spread last). Pure function so the ordering contract
+    is unit-testable apart from the gallery.
+    """
+
+    def _key(row: dict):
+        distance, _ = survey_ood.get(
+            (row.get("npy_path"), int(row.get("snippet_index") or 0)), (0.0, 0.0)
+        )
+        mc_std = row.get("mc_std")
+        return (
+            -(row.get("confidence") or 0.0),
+            -distance,
+            mc_std if mc_std is not None else float("inf"),
+        )
+
+    return sorted(rows, key=_key)

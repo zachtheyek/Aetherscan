@@ -915,6 +915,10 @@ class InferencePipeline:
             screening_proba=screening,
             mc_mean=draw_scores.mean(axis=0).astype(np.float32),
             mc_std=draw_scores.std(axis=0).astype(np.float32),
+            # Reservoir latents (#397): the reject rows' flattened z_mean features, making
+            # the cloud a survey-representative latent sample for candidate OOD triage
+            # (candidate_triage.survey_ood_scores). ~2 MB at the 10k default capacity.
+            latent_mean=mean_flat.astype(np.float32),
             subsample_size=np.int64(len(screening)),
             rejects_seen=np.int64(self._reference_reservoir.seen),
             mc_draws=np.int64(self.mc_draws),
