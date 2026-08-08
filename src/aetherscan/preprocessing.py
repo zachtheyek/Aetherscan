@@ -1252,7 +1252,7 @@ class DataPreprocessor:
         logger.info(f"Background array shape: {background_array.shape}")
         logger.info(f"Background value range: [{min_val:.6f}, {max_val:.6f}]")
         logger.info(f"Background mean: {mean_val:.6f}")
-        logger.info(f"Memory usage: {background_array.nbytes / 1e9:.2f} GB")
+        logger.info(f"Background array size: {background_array.nbytes / 1e6:.1f} MB")
         logger.info(f"Background data ready at {background_array.shape[3]} resolution")
 
         return background_array
@@ -1571,7 +1571,7 @@ class DataPreprocessor:
             logger.info(f"Cadence array shape: {cadence_array.shape}")
             logger.info(f"Cadence value range: [{min_val:.6f}, {max_val:.6f}]")
             logger.info(f"Cadence mean: {mean_val:.6f}")
-            logger.info(f"Memory usage: {cadence_array.nbytes / 1e9:.2f} GB")
+            logger.info(f"Cadence array size: {cadence_array.nbytes / 1e6:.1f} MB")
             logger.info(f"Cadence data ready at {cadence_array.shape[3]} resolution")
 
         return cadence_array
