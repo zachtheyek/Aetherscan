@@ -227,10 +227,14 @@ proportionally longer.)
    under the first cadence's energy detection. The distributed encode step is a
    lazily-built, cached `tf.function` — repeated `run_inference` calls reuse a bounded set
    of traces (one per batch-shape bucket) instead of retracing per cadence.
-4. **Prefetch depth = `inference.prefetch_depth`** (default 3 — the #301 A/B on the same
-   8 fresh /datag cadences as #298's depth-1→2 measurement: depth 3 = 4,071 s vs depth 2
-   = 5,118 s wall, ~10–20% honest win after the run-order warmth caveat, identical
-   candidates with 0.0 score deltas). A
+4. **Prefetch depth = `inference.prefetch_depth`** (default 4 — the #406 grid searches
+   on the full 350-cadence /datag subset, cold stamp cache per run, identical science on
+   every run: depth 4 beat depth 3 under BOTH the pre-#401 strict-order loop (11,427 s
+   vs 12,561 s, −9.0%) and the post-#401 completion-order loop (9,755 s vs 10,227 s,
+   −4.6%; depth 5 regressed to 10,420 s), with observed RAM peaks moving only
+   207 → 215 GB. The post-#401 margin alone sits inside the ~10% cluster noise band —
+   the default rests on the sign agreeing across both grids. Historical: the #301
+   8-cadence A/B that set the old default 3 measured depth 2 → 3 at ~10–20%.). A
    `ThreadPoolExecutor` keeps that many `_prefetch_cadence` futures in flight — each
    preprocesses AND loads/log-norms its cadence (`load_inference_data(parallel=False)`:
    the sequential vectorized branch, since the persistent energy-detection pool already
