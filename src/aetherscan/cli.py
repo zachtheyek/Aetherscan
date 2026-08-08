@@ -1026,7 +1026,7 @@ def _add_inference_flags_to(parser):
         "--prune-stamps",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Without pruning a full catalog writes ~30-90 TB of stamps. Default: AUTO — enabled for the fingerprint-scoped default cache directory, disabled when --preprocess-output-dir is set explicitly. Pass --no-prune-stamps to keep every stamp (slice-scale runs wanting the cross-run rerun cache).",
+        help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Default: DISABLED — stamps are retained (~1 GB/cadence average) so re-scoring the same data under the same energy-detection config (new weights, threshold sweeps) skips preprocessing entirely via the fingerprint-scoped cache. Pass --prune-stamps on catalog-scale runs: without pruning a full catalog writes ~30-90 TB of stamps and dies on disk.",
     )
 
     # Visualization suite

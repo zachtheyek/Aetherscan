@@ -548,24 +548,27 @@ class InferenceConfig:
     # to pin one directory across runs and CSVs (the resume guard still verifies each
     # sidecar's h5_paths and recorded fingerprint before reuse).
     preprocess_output_dir: str | None = None
-    # Stamp-cache pruning (#302): delete a cadence's stamp .npy right after its 'inferred'
-    # manifest row lands (metadata .json always kept; resume rides the DB row; each
-    # candidate's snippet is snapshotted into a ~196 KB .candidates.npz sidecar so the
-    # candidate figures survive, and a bounded top-K pixel pool — persisted across the
-    # in-process retry attempts, #305 — keeps the stamp gallery whole within one run).
-    # Without pruning a full catalog writes ~30-90 TB of stamps vs ~2.7 TB free on /datax —
-    # the run dies on disk after a few hundred cadences. None (default) = AUTO: ON for the
-    # fingerprint-scoped default cache dir, OFF when preprocess_output_dir is explicitly set
-    # (an operator-curated cache is never destroyed implicitly). Only stamps THIS run
-    # extracted are pruned (a resumed run never deletes a handed cache; a failed-then-retried
-    # cadence of the same run IS pruned). Same-run resume/retry is science-unaffected.
-    # Known limitations (viz-only, graceful): a cross-PROCESS relaunch cannot recover an
-    # earlier process's pruned pixels, so its stamp gallery may show blank columns for
-    # earlier-run cadences; and concurrent runs sharing the default cache dir with pruning
-    # ON can race (one deletes/overwrites a .npy or .candidates.npz another is mid-read of —
-    # self-heals via retry). Use a per-run --preprocess-output-dir or --no-prune-stamps to
-    # run concurrently in one dir. Trade: pruning forfeits the cross-run stamp-reuse rerun
-    # win for pruned cadences (re-extraction ~5-15 min each).
+    # Stamp-cache pruning (#302; default flipped OFF by #399): when ON, delete a cadence's
+    # stamp .npy right after its 'inferred' manifest row lands (metadata .json always kept;
+    # resume rides the DB row; each candidate's snippet is snapshotted into a ~196 KB
+    # .candidates.npz sidecar so the candidate figures survive, and a bounded top-K pixel
+    # pool — persisted across the in-process retry attempts, #305 — keeps the stamp gallery
+    # whole within one run). None (default) = OFF: stamps are RETAINED so the
+    # fingerprint-scoped cache works out of the box — re-scoring the same data under the
+    # same ED config (new weights, threshold sweeps) skips preprocessing entirely, the
+    # measured bulk of inference wall time (#399: 25.8k stage-seconds of the subset run's
+    # 12.6k-second wall). The trade is disk: ~1 GB/cadence average (380 GB for the
+    # 350-cadence subset), and a FULL catalog writes ~30-90 TB vs ~2.7 TB free on /datax —
+    # catalog-scale runs must pass --prune-stamps or die on disk after a few hundred
+    # cadences. When pruning is ON: only stamps THIS run extracted are pruned (a resumed
+    # run never deletes a handed cache; a failed-then-retried cadence of the same run IS
+    # pruned); same-run resume/retry is science-unaffected; pruning forfeits the cross-run
+    # stamp-reuse win for pruned cadences (re-extraction ~5-15 min each). Known limitations
+    # (viz-only, graceful): a cross-PROCESS relaunch cannot recover an earlier process's
+    # pruned pixels, so its stamp gallery may show blank columns for earlier-run cadences;
+    # and concurrent runs sharing the default cache dir with pruning ON can race (one
+    # deletes/overwrites a .npy or .candidates.npz another is mid-read of — self-heals via
+    # retry). Use a per-run --preprocess-output-dir to run concurrently in one dir.
     prune_stamps: bool | None = None
 
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming

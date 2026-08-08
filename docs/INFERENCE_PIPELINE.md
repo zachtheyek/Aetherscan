@@ -250,12 +250,19 @@ proportionally longer.)
      dead attempt are retired *before* fresh rows land;
    - `run_inference()` (below), then a superseding `inference_cadences` row with
      `status='inferred'` carrying the aggregate stats.
-6. **Stamp-cache pruning (#302).** With `inference.prune_stamps` resolved ON (the `None`
-   default is AUTO: ON for the fingerprint-scoped default cache directory, OFF when
-   `--preprocess-output-dir` pins an operator-curated one; `--prune-stamps` /
-   `--no-prune-stamps` override), each cadence's multi-GB stamp `.npy` is deleted right
-   after its `'inferred'` manifest row lands and viz collection ran — without pruning a
-   full catalog writes ~30–90 TB of stamps. The metadata `.json` always stays (provenance,
+6. **Stamp-cache pruning (#302; default flipped OFF by #399).** With
+   `inference.prune_stamps` resolved ON (the `None` default is OFF — stamps are retained;
+   `--prune-stamps` / `--no-prune-stamps` set it explicitly), each cadence's multi-GB
+   stamp `.npy` is deleted right after its `'inferred'` manifest row lands and viz
+   collection ran. **The default trade (#399):** keeping the cache costs ~1 GB/cadence
+   average on disk (380 GB for the 350-cadence subset benchmark) and buys free re-scores —
+   preprocessing is the measured bulk of inference wall time (25.8k stage-seconds of the
+   subset run's 12.6k-second wall), and any rerun under the same ED config (new weights,
+   threshold sweeps) skips it entirely via the fingerprint-scoped cache, so the default
+   favors the common subset-scale iteration loop. Pruning exists for catalog scale:
+   without it a full catalog writes ~30–90 TB of stamps and dies on disk after a few
+   hundred cadences — **catalog runs must pass `--prune-stamps`** (the run start logs a
+   loud reminder when pruning is off). The metadata `.json` always stays (provenance,
    viz, resume guard), resume rides the DB row, and only stamps **this run extracted** are
    ever pruned — tracked by an in-process set on the preprocessor, so a genuinely handed
    cache (extracted by another process/operator) is never deleted, while a cadence *this*
@@ -274,9 +281,9 @@ proportionally longer.)
    columns for earlier-run cadences; and two runs sharing the default cache dir with pruning
    ON can race (one deletes/overwrites a `.npy` or `.candidates.npz` another is mid-read of —
    contained, self-heals via retry). Run concurrently in one dir only with a per-run
-   `--preprocess-output-dir` or `--no-prune-stamps` (a deliberate design choice — cross-
-   process file locking was deferred as disproportionate for a self-healing, science-neutral
-   race).
+   `--preprocess-output-dir` or with pruning left at its off default (a deliberate design
+   choice — cross-process file locking was deferred as disproportionate for a self-healing,
+   science-neutral race).
 7. **Failure containment.** A cadence whose inference stage throws is logged, recorded as
    `status='failed'` in the manifest, and the loop moves on — one bad cadence never aborts
    the catalog. After the loop, the pass raises so the retry loop re-attempts, and the

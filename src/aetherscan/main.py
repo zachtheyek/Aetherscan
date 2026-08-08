@@ -544,13 +544,14 @@ def _prefetch_cadence(preprocessor: DataPreprocessor, unit: PendingCadence) -> t
 
 
 def _resolve_prune_stamps(config) -> bool:
-    """Resolve the stamp-cache pruning mode (#302): an explicit inference.prune_stamps
-    wins; the None default means AUTO — ON for the fingerprint-scoped default cache
-    directory, OFF when --preprocess-output-dir pins an operator-curated one (a handed
-    cache is never destroyed implicitly)."""
+    """Resolve the stamp-cache pruning mode (#302, default flipped by #399): an explicit
+    inference.prune_stamps wins; the None default means OFF — stamps are kept so the
+    fingerprint-scoped cache makes re-scores (new weights / threshold sweeps under the
+    same ED config) skip preprocessing out of the box. Catalog-scale runs must opt in
+    with --prune-stamps or the stamp volume exceeds scratch (~30-90 TB unpruned)."""
     if config.inference.prune_stamps is not None:
         return bool(config.inference.prune_stamps)
-    return config.inference.preprocess_output_dir is None
+    return False
 
 
 def _prune_cadence_stamps(
@@ -820,9 +821,19 @@ def _run_streaming_csv_inference(
     prune_stamps = _resolve_prune_stamps(config)
     logger.info(
         f"Stamp-cache pruning: {'ON' if prune_stamps else 'OFF'} "
-        f"({'explicit' if config.inference.prune_stamps is not None else 'auto'}; "
-        f"{'default fingerprint-scoped cache dir' if config.inference.preprocess_output_dir is None else 'explicit --preprocess-output-dir'})"
+        f"({'explicit' if config.inference.prune_stamps is not None else 'default'}; "
+        f"{'fingerprint-scoped default cache dir' if config.inference.preprocess_output_dir is None else 'explicit --preprocess-output-dir'})"
     )
+    if not prune_stamps:
+        # Loud on purpose (#399): keeping the cache is the right default for subset-scale
+        # work (re-scores under the same ED config skip preprocessing entirely), but a
+        # full catalog writes ~30-90 TB of stamps — a catalog run without --prune-stamps
+        # dies on disk after a few hundred cadences.
+        logger.info(
+            "Stamp cache will be RETAINED (~1 GB/cadence average; enables free re-scores "
+            "under the same ED config). Catalog-scale runs should pass --prune-stamps to "
+            "bound disk usage."
+        )
 
     failed_keys: list[tuple] = []
     if pending:
