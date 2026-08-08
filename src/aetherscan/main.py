@@ -25,6 +25,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.candidate_figures import write_candidate_snippet_sidecar
+from aetherscan.candidate_triage import partition_candidates_by_frequency, report_exclusion_ranges
 from aetherscan.cli import (
     apply_args_to_config,
     apply_saved_config,
@@ -1032,6 +1033,32 @@ def _run_legacy_test_files_inference(
     return results
 
 
+def _log_report_exclusion_summary(config) -> None:
+    """Report-time frequency exclusion tally (#395): with ranges configured, append the
+    excluded/reported split under the final candidate count, sourced from the whole tag's
+    live candidate rows (matching the totals, which also aggregate resumed cadences).
+    Best-effort — a tally bug must never fail a completed science run."""
+    ranges = report_exclusion_ranges(config)
+    if not ranges:
+        return
+    try:
+        db = get_db()
+        if db is None:
+            return
+        db.flush()
+        rows = db.query_inference_result(
+            tag=config.checkpoint.save_tag, prediction=1, columns=["frequency_mhz"]
+        )
+        reported, excluded = partition_candidates_by_frequency(rows, ranges)
+        range_label = ", ".join(f"{start:g}-{end:g}" for start, end in ranges)
+        logger.info(
+            f"    Excluded by --report-exclude-frequency-range ({range_label} MHz): {len(excluded)}"
+        )
+        logger.info(f"    Reported after exclusion: {len(reported)}")
+    except Exception as e:
+        logger.error(f"Report-time exclusion tally failed ({e}); run is unaffected")
+
+
 # NOTE: we need to load the saved config from the corresponding training run, but when/where should we do that, and how does that play with apply_args_to_config()?
 def inference_command():
     """Execute inference pipeline with distributed strategy & fault tolerance"""
@@ -1157,6 +1184,7 @@ def inference_command():
     logger.info(f"  Total cadence snippets: {results['n_cadence_snippets']}")
     logger.info(f"    Processed: {results['n_processed']}")
     logger.info(f"    Candidates found: {results['n_candidates']}")
+    _log_report_exclusion_summary(config)
     logger.info("=" * 60)
 
     _post_benchmark_report(config.checkpoint.save_tag)

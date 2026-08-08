@@ -16,6 +16,7 @@ from datetime import datetime
 from math import gcd, lcm
 from typing import Any
 
+from aetherscan.candidate_triage import normalized_frequency_ranges
 from aetherscan.config import InferenceConfig, get_config
 from aetherscan.run_state import (
     _INFERENCE_FINGERPRINT_DATA_KEYS,
@@ -1029,6 +1030,17 @@ def _add_inference_flags_to(parser):
         help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Default: DISABLED — stamps are retained (~1 GB/cadence average) so re-scoring the same data under the same energy-detection config (new weights, threshold sweeps) skips preprocessing entirely via the fingerprint-scoped cache. Pass --prune-stamps on catalog-scale runs: without pruning a full catalog writes ~30-90 TB of stamps and dies on disk.",
     )
 
+    parser.add_argument(
+        "--report-exclude-frequency-range",
+        action="append",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("START_MHZ", "END_MHZ"),
+        dest="report_exclude_frequency_range",
+        help="Report-time frequency exclusion (repeatable): candidates whose frequency falls inside any given [START_MHZ, END_MHZ] range (inclusive) are dropped from the final run tallies and the Slack candidate uploads — detection, database rows, and rendered/saved figures are untouched, and the summary reports original vs excluded vs reported counts. Use for known RFI allocations (e.g. --report-exclude-frequency-range 1616 1626.5 for Iridium). Each range needs finite 0 < START < END. Default: off.",
+    )
+
     # Visualization suite
     parser.add_argument(
         "--inference-viz",
@@ -1541,6 +1553,16 @@ def apply_args_to_config(args: argparse.Namespace) -> None:
         config.inference.prune_stamps = args.prune_stamps
     if hasattr(args, "inference_viz") and args.inference_viz is not None:
         config.inference.inference_viz_enabled = args.inference_viz
+    if (
+        hasattr(args, "report_exclude_frequency_range")
+        and args.report_exclude_frequency_range is not None
+    ):
+        # argparse append+nargs=2 yields [[start, end], ...]; stored as plain lists so the
+        # config JSON round-trips
+        config.inference.report_exclude_frequency_ranges = [
+            [float(start), float(end)] for start, end in args.report_exclude_frequency_range
+        ]
+
     if hasattr(args, "inference_viz_scope") and args.inference_viz_scope is not None:
         config.inference.inference_viz_scope = args.inference_viz_scope
     if hasattr(args, "stamp_gallery_top_k") and args.stamp_gallery_top_k is not None:
@@ -2468,6 +2490,27 @@ def collect_validation_errors(
                     fix_kind="format",
                 )
             )
+
+        # argparse's type=float already rejects non-numeric tokens, but it happily parses
+        # inf/nan, and ordering/positivity need checking either way; the same normalizer
+        # re-guards programmatically-set config values at report time (#395)
+        exclude_ranges = _resolve(
+            args,
+            "report_exclude_frequency_range",
+            config.inference.report_exclude_frequency_ranges,
+        )
+        if exclude_ranges is not None:
+            try:
+                normalized_frequency_ranges(exclude_ranges)
+            except ValueError as e:
+                errors.append(
+                    ValidationError(
+                        field="inference.report_exclude_frequency_ranges",
+                        current=exclude_ranges,
+                        message=f"--report-exclude-frequency-range invalid: {e}",
+                        fix_kind="format",
+                    )
+                )
 
         # -------------------------------------------- Energy detection preprocessing
         # When inference_files is set the energy-detection pipeline runs before

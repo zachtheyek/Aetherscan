@@ -48,6 +48,11 @@ from aetherscan.candidate_figures import (
     render_candidate_figures,
     stamp_frequency_range_mhz,
 )
+from aetherscan.candidate_triage import (
+    frequency_excluded,
+    partition_candidates_by_frequency,
+    report_exclusion_ranges,
+)
 from aetherscan.config import get_config
 from aetherscan.data_generation import log_norm
 from aetherscan.db import get_db, get_machine_name
@@ -1126,24 +1131,47 @@ def plot_candidate_gallery() -> str | None:
         return None
     rows.sort(key=lambda r: r.get("confidence") or 0.0, reverse=True)
 
+    # Report-time frequency exclusion (#395): excluded candidates keep their DB rows and
+    # their rendered figures on disk; only the Slack uploads and the gallery membership
+    # below are filtered.
+    exclusion_ranges = report_exclusion_ranges(config)
+
     # Per-candidate figures (highest confidence first, capped): rendered across the
     # forkserver pool (#298 I9 — independent row dict + memmap read + PNG each; per-figure
     # failures return None and degrade the suite exactly like _viz_safe), then uploaded in
     # index order through the async FIFO uploader.
     top_rows = rows[:max_candidate_plots]
     rendered = render_candidate_figures(top_rows, display_tag_value, _plots_dir(tag))
+    n_upload_excluded = 0
     for index, save_path in rendered:
         if save_path is None:
             continue
         logger.info(f"Inference viz saved: {save_path}")
+        if exclusion_ranges and frequency_excluded(
+            top_rows[index].get("frequency_mhz"), exclusion_ranges
+        ):
+            n_upload_excluded += 1
+            continue
         _uploader.submit(save_path, f"Candidate {index} - ({display_tag_value})")
+    if n_upload_excluded:
+        logger.info(
+            f"Viz: {n_upload_excluded} candidate figure(s) rendered and saved but not "
+            f"uploaded (--report-exclude-frequency-range)"
+        )
     if len(rows) > max_candidate_plots:
         logger.info(
             f"Viz: rendered {max_candidate_plots} of {len(rows)} candidate figures "
             f"(--max-candidate-plots cap)"
         )
 
-    gallery_rows = rows[:_CANDIDATE_GALLERY_MAX]
+    reported_rows, excluded_rows = partition_candidates_by_frequency(rows, exclusion_ranges)
+    if not reported_rows:
+        logger.info(
+            f"Viz: all {len(rows)} candidate(s) fall in --report-exclude-frequency-range "
+            f"ranges; skipping the gallery figure (per-candidate figures are still on disk)"
+        )
+        return None
+    gallery_rows = reported_rows[:_CANDIDATE_GALLERY_MAX]
     n_cols = len(gallery_rows)
     n_rows = len(_OBS_ROW_LABELS)
     fig = Figure(figsize=(1.9 * n_cols + 1.2, 1.1 * n_rows + 1.6))
@@ -1168,8 +1196,12 @@ def plot_candidate_gallery() -> str | None:
             f"P={row.get('confidence', 0):.3f}\n{freq_label}\n{row.get('target') or ''}",
             fontsize=7,
         )
+    exclusion_note = (
+        f" ({len(excluded_rows)} excluded by frequency filter)" if excluded_rows else ""
+    )
     fig.suptitle(
-        f"Candidate gallery ({display_tag(tag, get_machine_name())}): top {n_cols} of {len(rows)} by confidence"
+        f"Candidate gallery ({display_tag(tag, get_machine_name())}): "
+        f"top {n_cols} of {len(reported_rows)} by confidence{exclusion_note}"
     )
 
     return _save_and_upload(
@@ -1431,6 +1463,19 @@ def plot_inference_summary(
         np.nansum([s.npy_size_bytes for s in summaries.values()]) / 1e9 if summaries else 0.0
     )
 
+    # Report-time frequency exclusion (#395): the card carries all three numbers so the
+    # science record (original) and the review surface (reported) stay distinguishable
+    exclusion_ranges = report_exclusion_ranges(config)
+    exclusion_rows: list[tuple[str, str]] = []
+    if exclusion_ranges and db is not None:
+        freq_rows = db.query_inference_result(tag=tag, prediction=1, columns=["frequency_mhz"])
+        reported, excluded = partition_candidates_by_frequency(freq_rows, exclusion_ranges)
+        range_label = ", ".join(f"{start:g}-{end:g}" for start, end in exclusion_ranges)
+        exclusion_rows = [
+            (f"  excluded ({range_label} MHz)", f"{len(excluded):,}"),
+            ("  reported after exclusion", f"{len(reported):,}"),
+        ]
+
     summary_rows = [
         ("run tag", tag),
         ("rendered", time.strftime("%Y-%m-%d %H:%M:%S")),
@@ -1440,6 +1485,7 @@ def plot_inference_summary(
         ("merged hits", f"{n_merged_hits:,}"),
         ("snippets inferred", f"{n_snippets:,}"),
         ("candidates", f"{totals.get('n_candidates', 0):,}"),
+        *exclusion_rows,
         ("stamp storage", f"{storage_gb:.2f} GB"),
         ("preprocessing time", f"{preproc_duration:,.1f} s"),
         ("inference time", f"{inference_duration:,.1f} s"),

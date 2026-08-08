@@ -571,6 +571,15 @@ class InferenceConfig:
     # retry). Use a per-run --preprocess-output-dir to run concurrently in one dir.
     prune_stamps: bool | None = None
 
+    # Report-time frequency exclusion (#395): [[start_mhz, end_mhz], ...] ranges whose
+    # candidates are dropped from the run tallies and Slack candidate uploads — and ONLY
+    # those surfaces. Detection, inference_results rows, and rendered/saved figures are
+    # untouched (the science record stays complete; known-RFI allocations like GPS L1 /
+    # Iridium stop flooding the review surface). None (default) = off. Report-time only,
+    # so it sits in run_state.py's fingerprint denylist — changing it never stales resume
+    # rows or renames stamp-cache directories.
+    report_exclude_frequency_ranges: list[list[float]] | None = None
+
     # Visualization suite (aetherscan.inference_viz): rendered at the end of a streaming
     # CSV inference run, saved under {output_path}/plots/inference/{save_tag}/ and uploaded
     # to Slack. Every figure is individually exception-guarded — a plot bug can never kill
@@ -956,9 +965,11 @@ class Config:
                 "side_channel_count": self.inference.side_channel_count,
                 "preprocess_output_dir": self.inference.preprocess_output_dir,
                 # NOTE: any key added here also enters BOTH inference fingerprints unless
-                # it joins the run_state.py denylists — prune_stamps and
-                # inference_viz_scope are excluded there (#301/#302: retention/viz only)
+                # it joins the run_state.py denylists — prune_stamps,
+                # inference_viz_scope, and report_exclude_frequency_ranges are excluded
+                # there (#301/#302/#395: retention/viz/report only)
                 "prune_stamps": self.inference.prune_stamps,
+                "report_exclude_frequency_ranges": self.inference.report_exclude_frequency_ranges,
                 "inference_viz_enabled": self.inference.inference_viz_enabled,
                 "inference_viz_scope": self.inference.inference_viz_scope,
                 "stamp_gallery_top_k": self.inference.stamp_gallery_top_k,

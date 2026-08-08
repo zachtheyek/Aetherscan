@@ -118,6 +118,10 @@ _INFERENCE_FINGERPRINT_EXCLUDE_INFERENCE_KEYS = frozenset(
         # would otherwise enter BOTH fingerprints, staling every 'inferred' resume row
         # and renaming every ED cache directory on upgrade.
         "prune_stamps",
+        # Report-time only (#395): filters the run tallies and Slack candidate uploads,
+        # never what a cadence scores or which rows land in inference_results. Same
+        # MUST-stay-excluded reasoning as prune_stamps above.
+        "report_exclude_frequency_ranges",
     }
 )
 _INFERENCE_FINGERPRINT_DATA_KEYS = frozenset(
