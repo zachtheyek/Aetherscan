@@ -868,6 +868,7 @@ usage: inference [-h] [--seed SEED] [--unseeded]
                  [--overlap-fraction OVERLAP_FRACTION]
                  [--preprocess-output-dir PREPROCESS_OUTPUT_DIR]
                  [--prune-stamps | --no-prune-stamps]
+                 [--report-exclude-frequency-range START_MHZ END_MHZ]
                  [--inference-viz | --no-inference-viz]
                  [--inference-viz-scope {full,new}]
                  [--stamp-gallery-top-k STAMP_GALLERY_TOP_K]
@@ -1069,13 +1070,25 @@ options:
                         'inferred' manifest row lands, keeping the metadata
                         .json plus a ~196 KB snippet sidecar per candidate —
                         resume rides the DB row, and only stamps this run
-                        freshly extracted are ever pruned. Without pruning a
-                        full catalog writes ~30-90 TB of stamps. Default: AUTO
-                        — enabled for the fingerprint-scoped default cache
-                        directory, disabled when --preprocess-output-dir is
-                        set explicitly. Pass --no-prune-stamps to keep every
-                        stamp (slice-scale runs wanting the cross-run rerun
-                        cache).
+                        freshly extracted are ever pruned. Default: DISABLED —
+                        stamps are retained (~1 GB/cadence average) so re-
+                        scoring the same data under the same energy-detection
+                        config (new weights, threshold sweeps) skips
+                        preprocessing entirely via the fingerprint-scoped
+                        cache. Pass --prune-stamps on catalog-scale runs:
+                        without pruning a full catalog writes ~30-90 TB of
+                        stamps and dies on disk.
+  --report-exclude-frequency-range START_MHZ END_MHZ
+                        Report-time frequency exclusion (repeatable):
+                        candidates whose frequency falls inside any given
+                        [START_MHZ, END_MHZ] range (inclusive) are dropped
+                        from the final run tallies and the Slack candidate
+                        uploads — detection, database rows, and rendered/saved
+                        figures are untouched, and the summary reports
+                        original vs excluded vs reported counts. Use for known
+                        RFI allocations (e.g. --report-exclude-frequency-range
+                        1616 1626.5 for Iridium). Each range needs finite 0 <
+                        START < END. Default: off.
   --inference-viz, --no-inference-viz
                         Render the inference visualization suite (energy
                         detection distributions, hit spectrum, bandpass

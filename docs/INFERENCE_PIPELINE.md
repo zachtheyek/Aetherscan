@@ -234,12 +234,21 @@ proportionally longer.)
    `ThreadPoolExecutor` keeps that many `_prefetch_cadence` futures in flight — each
    preprocesses AND loads/log-norms its cadence (`load_inference_data(parallel=False)`:
    the sequential vectorized branch, since the persistent energy-detection pool already
-   owns the CPU) — consumed strictly in catalog order, so results, manifest ordering, and
-   per-cadence seeding are identical at any depth. Each unit of depth overlaps disk-bound
-   energy detection with decompression-bound extraction and the serial per-cadence
-   sections, at the cost of one in-flight cadence of RAM (up to ~65 GB for RFI-dense
-   C-band cadences). A prefetch-side load failure degrades to
-   loading on the inference thread under the per-cadence containment below.
+   owns the CPU) — consumed in **completion order** (#401): the main thread takes
+   whichever future finishes first and submits a replacement immediately, so one
+   straggler (a 30-minute RFI-dense preprocess, a 10-minute load of a monster stamp
+   array) never head-of-line-blocks the other slots into idleness. (Under the old
+   strict-catalog-order consumption, the depth-3 baseline run measured 12% of its wall —
+   1,511 s — with ZERO preprocessing running while finished slots waited behind a
+   straggler.) Per-cadence results are identical at any depth and any completion order:
+   seeding keys on the catalog index and the reference-cloud reservoir selects by
+   content-derived keys (see Reproducibility). What varies run-to-run is manifest/DB
+   ROW ORDER and log interleaving — row content is unchanged, and resume/queries key on
+   `(tag, npy_path)`, never on order. Each unit of depth overlaps disk-bound energy
+   detection with decompression-bound extraction and the serial per-cadence sections, at
+   the cost of one in-flight cadence of RAM (up to ~65 GB for RFI-dense C-band
+   cadences). A prefetch-side load failure degrades to loading on the inference thread
+   under the per-cadence containment below.
 5. **Per-cadence inference** (`main.py:_infer_cadence`):
    - provenance derived from the group key + metadata JSON
      (`preprocessing.derive_cadence_provenance`): target, session, band, cadence id, header
@@ -284,6 +293,19 @@ proportionally longer.)
    `--preprocess-output-dir` or with pruning left at its off default (a deliberate design
    choice — cross-process file locking was deferred as disproportionate for a self-healing,
    science-neutral race).
+> **Considered and rejected: per-cadence stamp caps (#402).** The runtime heavy tail is
+> driven entirely by a handful of RFI-dense cadences — per-cadence stamp counts in the
+> subset benchmark spanned 168 (median) to 329,749 (max: BOL520, C-band, 8438 MHz), and
+> every downstream cost (extraction, load, encode) is linear in stamps. Capping stamps per
+> cadence (top-K by detection statistic) would bound those tails, and was **rejected**:
+> a real signal co-located with dense RFI could rank below the cap and be dropped before
+> the RF ever scores it — sensitivity in RFI-dense cadences is exactly what a survey
+> search cannot silently trade away (primary reason). Secondary: a cap enters the ED
+> fingerprint, invalidating every existing stamp cache on adoption. Recorded here so the
+> option isn't re-litigated from scratch each time the tail bites; the sanctioned tail
+> mitigations are prefetch depth + completion-order consumption (#401), which hide the
+> stragglers instead of truncating them.
+
 7. **Failure containment.** A cadence whose inference stage throws is logged, recorded as
    `status='failed'` in the manifest, and the loop moves on — one bad cadence never aborts
    the catalog. After the loop, the pass raises so the retry loop re-attempts, and the
@@ -388,15 +410,19 @@ spread over latent draws is the informative axis.
 ### The reference cloud
 
 A `(p, spread)` pair is only interpretable against where the *survey* sits, so pass 1 also
-feeds a seeded uniform reservoir (algorithm R, `inference.reference_cloud_size`, default
-10 000; `0` disables) over the **rejects'** posterior parameters — deliberately uniform, not
+feeds a seeded uniform reservoir (`inference.reference_cloud_size`, default 10 000; `0`
+disables) over the **rejects'** posterior parameters — deliberately uniform, not
 near-threshold, which would bias the cloud toward the boundary and make every candidate look
-ordinary. After the last cadence, `finalize_reference_cloud()` MC-scores the reservoir once
-and persists `{output_path}/inference_reference_cloud_{tag}.npz` (screening/mc_mean/mc_std
-arrays plus subsample size, rejects seen, root seed, and draw count), so the candidate
-uncertainty figure can be regenerated without re-running inference. Best-effort: a failure
-degrades the plot, never the science. On a resumed run only the final attempt's cadences
-feed the reservoir (manifest-skipped cadences never re-offer their rejects).
+ordinary. Selection is a bottom-k over per-snippet random keys (#401 — content-derived, so
+membership is independent of cadence completion order; see Reproducibility below). After
+the last cadence, `finalize_reference_cloud()` MC-scores the reservoir once and persists
+`{output_path}/inference_reference_cloud_{tag}.npz` (screening/mc_mean/mc_std arrays, the
+reservoir rows' latent `z_mean` features (#397 — the survey-representative latent sample
+`candidate_triage` scores OOD against), plus subsample size, rejects seen, root seed, and
+draw count), so the candidate uncertainty figure and the OOD triage scores can be
+regenerated without re-running inference. Best-effort: a failure degrades the plot, never
+the science. On a resumed run only the final attempt's cadences feed the reservoir
+(manifest-skipped cadences never re-offer their rejects).
 
 ## Reproducibility
 
@@ -415,6 +441,16 @@ flagged runs were bit-identical). Neither reproducibility field is layered from 
 reference-cloud reservoir derive their own NumPy streams from the same root (see
 [`seeding.py`](../src/aetherscan/seeding.py) and the Reproducibility section of
 [`TRAINING_PIPELINE.md`](TRAINING_PIPELINE.md)).
+
+Completion-order consumption (#401) keeps this contract with one refinement: the
+reference-cloud reservoir no longer consumes a sequential RNG stream in arrival order
+(algorithm R) but selects the bottom-k rows by per-snippet random keys derived from
+`(root seed, STREAM_REFERENCE_CLOUD, 2, cadence index, snippet position)` — the same
+uniform-subsample distribution, now a pure function of survey content, so the persisted
+cloud is byte-identical across prefetch depths *and* cadence completion orders. The
+deliberately NON-reproducible remainder: manifest/DB row insertion order and log-line
+interleaving follow completion order and vary run-to-run (content is order-free by
+construction — nothing in resume, queries, or reporting keys on row order).
 
 ## The run manifest: `inference_cadences`
 
@@ -439,7 +475,7 @@ flagged while later writes stay live (`Database.mark_superseded`).
 | Candidate snippet sidecars | same directory, `*.candidates.npz` | Written by the pruning step (#302): each pruned cadence's candidate snippets (~196 KB each), atomically published; `load_display_cadence` falls back to it when the stamp `.npy` is gone, so candidate figures and galleries survive pruning. |
 | Candidate rows | `inference_results` table | Positives only, with latents + provenance + the two-pass scores (`screening_proba`/`mc_mean`/`mc_std`, schema v5). |
 | Run manifest | `inference_cadences` table | Per-cadence stages, aggregates, durations. |
-| Reference cloud | `{output_path}/inference_reference_cloud_{tag}.npz` | MC scores for the seeded uniform reservoir of pass-1 rejects — the survey background of the candidate uncertainty figure (regenerable without re-running inference). |
+| Reference cloud | `{output_path}/inference_reference_cloud_{tag}.npz` | MC scores AND latent `z_mean` rows (#397) for the seeded uniform reservoir of pass-1 rejects — the survey background of the candidate uncertainty figure and the reference for survey-OOD triage scores (regenerable without re-running inference). |
 | Config snapshot | `{output_path}/config_{tag}.json` | The resolved (saved-config + CLI) view this run actually used. |
 | Figures | `{output_path}/plots/inference/{tag}/` | The visualization suite below; also uploaded to the run's Slack thread. |
 | Resource plot | `{output_path}/plots/resource_utilization_{tag}.png` | Written by the monitor at shutdown. |
@@ -514,10 +550,12 @@ borders high → low; a stamp with no recoverable `fch1`/`foff` (legacy sidecar)
 | `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. Cadences pruned in this run (incl. across its in-process retries) render from the collector's pooled pixels (#302); cadences pruned by an earlier *process* (a relaunch-resume) degrade to blank columns. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
 | `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. Past 120 cadences the strongest (by raw hits) keep individual bars and the rest aggregate into one summary bar (#301 — the unbounded figure exceeded Agg's 2¹⁶-px canvas limit past 242 cadences and was silently lost). | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
-| `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates by confidence + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall, its frequency axis labeled with the MHz value at the left and right borders, annotated with confidence, frequency, target/session/band, and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
+| `candidate_frequency_map_{tag}.png` | Every candidate as a dot at (frequency, target row) colored by band, targets sorted by candidate count, report-excluded ranges (#395) shaded. | The load-bearing read is VERTICAL alignment (#394): the same frequency lighting up across many targets is the multi-target-coincidence signature of a terrestrial transmitter; a genuine technosignature has no vertical company. `utils/candidate_rfi_report.py` (#396) quantifies the same signal off-cluster. |
+| `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall, its frequency axis labeled with the MHz value at the left and right borders, annotated with confidence, frequency, target/session/band, survey-OOD percentile (#397, when the reference cloud carries latents), and the latent bar chart. Sourced from `inference_results`, so resumed cadences are included. Ordered by confidence desc, tie-broken by survey-OOD distance desc then MC spread asc (#397 — within a saturated P=1.000 tie, the candidate least like the survey background reviews first). Report-excluded candidates (#395) keep their saved figures but are dropped from the gallery and the Slack uploads. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
+| `candidate_triage_{tag}.csv` | One row per candidate in review order: confidence, MC mean/spread, survey-OOD distance/percentile (vs this run's reference cloud), training-OOD distance/percentile (vs the training run's true-class features from the cluster-local `rf_eval_artifacts` joblib; `z_mean` variant only, gracefully skipped otherwise), and the report-exclusion flag. Not uploaded — Slack surfaces stay image-only. | The triage sheet (#397). OOD scores RANK review order and never gate candidacy — a genuine technosignature is itself OOD with respect to synthetic training data. High survey-OOD = unlike the surveyed sky background; high training-OOD = unlike the synthetic signal manifold. |
 | `candidate_uncertainty_{tag}.png` | Each candidate (red star) at x = final RF probability (MC mean), y = MC spread, over a hexbin density background of the reference cloud (the survey's pass-1 rejects), with the science threshold as a vertical line. | Population context is the whole point: "p = 0.97, spread = 0.05" is only interpretable against where the survey sits. The dangerous quadrant is **high p + high spread** — a mean that looks confident while draws swing — exactly what `p` alone cannot flag (see the interpretation table above). Candidates hugging the survey cloud are threshold noise. |
 | `inference_latent_projection_{tag}.png` | This run's cadence-level latents projected through the **training run's persisted UMAP** (`umap_cadence_nn*_md*_*.joblib`, located via the training config JSON's `model_path` + tag), over the training embedding as backdrop; candidates highlighted. Skips gracefully if the UMAP is absent. | "Where does real data live relative to the synthetic classes?" Real snippets clustering onto the training false-class region = healthy. Candidates far from *any* training class are the interesting anomalies; candidates inside the false-class cloud are threshold noise. |
-| `inference_summary_{tag}.png` | Table-style run card: cadence/snippet/candidate counts, per-stage durations and throughput from the manifest, per-target/band candidate counts. | The one-glance run report — read it before opening anything else. |
+| `inference_summary_{tag}.png` | Table-style run card: cadence/snippet/candidate counts (plus excluded vs reported-after-exclusion when `--report-exclude-frequency-range` is set, #395), per-stage durations and throughput from the manifest, per-target/band candidate counts. | The one-glance run report — read it before opening anything else. |
 
 Outside the suite, a streaming-CSV run also closes by writing
 `{output_path}/plots/perband_inference_perf_{tag}.png` — per-cadence energy-detection
@@ -549,5 +587,6 @@ Inference-specific fields live on `InferenceConfig`
 | Cadence grouping | `cadence_group_by_cols`, `cadence_h5_path_col`, `cadence_expected_obs` |
 | Energy detection | `coarse_channel_width`, `coarse_channel_log_interval`, `bandpass_method`, `pfb_taps_per_channel`, `bandpass_debug_plot`, `spline_order`, `detection_window_size`, `detection_step_size`, `stat_threshold` |
 | Stamps | `stamp_width`, `store_downsampled_stamps`, `overlap_search`, `overlap_fraction`, `preprocess_output_dir`, `prune_stamps` |
+| Reporting | `report_exclude_frequency_ranges` (#395 — report-time only: filters tallies + Slack uploads, never detection/DB/figures) |
 | Visualization | `inference_viz_enabled`, `inference_viz_scope`, `stamp_gallery_top_k`, `max_candidate_plots` |
 | Fault tolerance | `max_retries`, `retry_delay` |
