@@ -742,3 +742,150 @@ class TestSuiteEntryPoint:
         # The resumed record's missing sidecar would have warned; the two live ones render
         tag_dir = os.path.join(get_config().output_path, "plots", "inference", TAG)
         assert f"ed_stat_distributions_{TAG}.png" in os.listdir(tag_dir)
+
+
+class TestCandidateFrequencyMap:
+    """#394: candidate frequency map — dots at (frequency, target) colored by band, with
+    report-excluded ranges shaded; skips gracefully with no candidates."""
+
+    def _write_candidates(self, db, npy_path, specs):
+        for idx, (target, band, freq) in enumerate(specs):
+            db.write_inference_result(
+                npy_path,
+                idx,
+                1,
+                0.999,
+                target=target,
+                band=band,
+                frequency_mhz=freq,
+                tag=TAG,
+            )
+        assert db.flush(timeout=10) is True
+
+    def test_renders_with_candidates(self, initialized_runtime, collector):
+        from aetherscan.inference_viz import plot_candidate_frequency  # noqa: PLC0415
+
+        db = initialized_runtime
+        record = collector.records[0]
+        self._write_candidates(
+            db,
+            record.npy_path,
+            [("NGC1172", "C", 1552.7), ("CVNI", "L", 1576.39), ("MESSIER87", "X", 8205.0)],
+        )
+        _assert_figure(plot_candidate_frequency())
+
+    def test_renders_with_exclusion_shading_and_target_overflow(
+        self, initialized_runtime, collector, monkeypatch
+    ):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        record = collector.records[0]
+        # More targets than the row cap -> the overflow aggregate row must carry the
+        # remaining candidate count without KeyErrors
+        monkeypatch.setattr(viz, "_CANDIDATE_FREQ_MAX_TARGETS", 2)
+        get_config().inference.report_exclude_frequency_ranges = [[1616.0, 1626.5]]
+        self._write_candidates(
+            db,
+            record.npy_path,
+            [
+                ("T1", "L", 1620.0),
+                ("T1", "L", 1621.0),
+                ("T2", "C", 8438.0),
+                ("T3", "X", 9500.0),
+                ("T4", "S", 2300.0),
+            ],
+        )
+        _assert_figure(viz.plot_candidate_frequency())
+
+    def test_skips_without_candidates(self, initialized_runtime):
+        from aetherscan.inference_viz import plot_candidate_frequency  # noqa: PLC0415
+
+        assert plot_candidate_frequency() is None
+
+
+class TestReportExclusionSurfaces:
+    """#395: excluded candidates keep their rendered figures on disk but are dropped from
+    Slack uploads and the gallery; tallies carry original vs excluded vs reported."""
+
+    def _write_two_candidates(self, db, npy_path):
+        latent = list(np.random.default_rng(5).normal(size=48))
+        # Higher confidence on the GPS-band candidate so it ranks first
+        for idx, (conf, freq) in enumerate(((0.999, 1575.42), (0.995, 8438.0))):
+            db.write_inference_result(
+                npy_path,
+                idx,
+                1,
+                conf,
+                latent_vector=np.asarray(latent),
+                target="HIP110750",
+                band="L",
+                frequency_mhz=freq,
+                tag=TAG,
+            )
+        assert db.flush(timeout=10) is True
+
+    def test_gallery_skips_uploads_for_excluded_but_saves_figures(
+        self, initialized_runtime, collector, monkeypatch
+    ):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        config.inference.report_exclude_frequency_ranges = [[1575.0, 1576.0]]
+        record = collector.records[0]
+        self._write_two_candidates(db, record.npy_path)
+
+        uploads = []
+        monkeypatch.setattr(viz._uploader, "submit", lambda path, title: uploads.append(title))
+
+        _assert_figure(viz.plot_candidate_gallery())
+        tag_dir = os.path.join(config.output_path, "plots", "inference", TAG)
+        # Both per-candidate figures rendered and saved (index 0 = the excluded GPS hit)...
+        assert os.path.exists(os.path.join(tag_dir, f"candidate_0_{TAG}.png"))
+        assert os.path.exists(os.path.join(tag_dir, f"candidate_1_{TAG}.png"))
+        # ...but only the clean candidate and the gallery itself were uploaded
+        assert any(title.startswith("Candidate 1") for title in uploads)
+        assert not any(title.startswith("Candidate 0") for title in uploads)
+        assert any(title.startswith("Candidate Gallery") for title in uploads)
+
+    def test_gallery_all_excluded_skips_gallery_figure(
+        self, initialized_runtime, collector, monkeypatch
+    ):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        config.inference.report_exclude_frequency_ranges = [[1000.0, 9000.0]]
+        record = collector.records[0]
+        self._write_two_candidates(db, record.npy_path)
+        monkeypatch.setattr(viz._uploader, "submit", lambda path, title: None)
+
+        assert viz.plot_candidate_gallery() is None
+        # The per-candidate figures still landed on disk
+        tag_dir = os.path.join(config.output_path, "plots", "inference", TAG)
+        assert os.path.exists(os.path.join(tag_dir, f"candidate_0_{TAG}.png"))
+
+    def test_summary_card_carries_exclusion_counts(
+        self, initialized_runtime, collector, summaries, monkeypatch
+    ):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        config = get_config()
+        config.inference.report_exclude_frequency_ranges = [[1575.0, 1576.0]]
+        record = collector.records[0]
+        self._write_two_candidates(db, record.npy_path)
+
+        captured = {}
+
+        def _capture(fig, filename, slack_title):
+            ax = fig.axes[0]
+            captured["text"] = "\n".join(t.get_text() for t in ax.texts)
+            return "captured"
+
+        monkeypatch.setattr(viz, "_save_and_upload", _capture)
+        totals = {"n_cadences": 2, "n_candidates": 2, "n_cadence_snippets": 10}
+        assert viz.plot_inference_summary(collector.records, summaries, totals) == "captured"
+        assert "excluded (1575-1576 MHz)" in captured["text"]
+        assert "reported after exclusion" in captured["text"]

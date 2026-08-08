@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 import h5py
 import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.candidate_figures import (
@@ -1095,6 +1096,107 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     )
 
 
+_CANDIDATE_FREQ_MAX_TARGETS = 40
+_BAND_COLORS = {"L": "tab:blue", "S": "tab:green", "C": "tab:red", "X": "tab:purple"}
+
+
+def plot_candidate_frequency() -> str | None:
+    """
+    Candidate frequency map (#394): every candidate as a dot at (frequency, target row),
+    colored by band — targets sorted by candidate count, report-excluded frequency ranges
+    (#395) shaded. The load-bearing read is VERTICAL alignment: the same frequency lighting
+    up across many targets is the signature of a terrestrial transmitter (multi-target
+    coincidence), whereas a genuine technosignature is a dot with no vertical company. In
+    inf_blpc3_20260807_011509 two target/bands held 49% of all candidates and several top
+    candidates sat in GPS/Iridium allocations — structure no other figure showed.
+    """
+    config = get_config()
+    tag = config.checkpoint.save_tag
+
+    db = get_db()
+    if db is None:
+        logger.info("Viz: no database instance; skipping candidate frequency map")
+        return None
+    db.flush()
+    rows = db.query_inference_result(
+        tag=tag, prediction=1, columns=["target", "band", "frequency_mhz"]
+    )
+    rows = [r for r in rows if r.get("frequency_mhz") is not None]
+    if not rows:
+        logger.info("Viz: no candidates with frequencies recorded; skipping frequency map")
+        return None
+
+    counts = Counter(r.get("target") or "?" for r in rows)
+    ordered_targets = [target for target, _ in counts.most_common(_CANDIDATE_FREQ_MAX_TARGETS)]
+    overflow = len(counts) - len(ordered_targets)
+    overflow_label = f"(+{overflow} more targets)"
+    if overflow:
+        # The aggregate row's count is its candidate total, mirroring the per-target rows
+        counts[overflow_label] = len(rows) - sum(counts[t] for t in ordered_targets)
+        ordered_targets.append(overflow_label)
+    # Row 0 at the top: most candidate-heavy target first
+    y_index = {target: i for i, target in enumerate(ordered_targets)}
+
+    fig = Figure(figsize=(12, 0.28 * len(ordered_targets) + 2.8))
+    ax = fig.subplots()
+
+    seen_bands = []
+    for row in rows:
+        target = row.get("target") or "?"
+        y = y_index.get(target, y_index.get(overflow_label))
+        band = row.get("band") or "?"
+        if band not in seen_bands:
+            seen_bands.append(band)
+        ax.plot(
+            float(row["frequency_mhz"]),
+            y,
+            marker="o",
+            markersize=4,
+            alpha=0.55,
+            color=_BAND_COLORS.get(band, "tab:gray"),
+            linestyle="none",
+        )
+
+    exclusion_ranges = report_exclusion_ranges(config)
+    for start, end in exclusion_ranges:
+        ax.axvspan(start, end, color="red", alpha=0.12, zorder=0)
+    if exclusion_ranges:
+        range_label = ", ".join(f"{start:g}-{end:g}" for start, end in exclusion_ranges)
+        ax.set_title(
+            f"Candidate frequency map ({display_tag(tag, get_machine_name())}) — "
+            f"{len(rows):,} candidates; shaded: report-excluded {range_label} MHz"
+        )
+    else:
+        ax.set_title(
+            f"Candidate frequency map ({display_tag(tag, get_machine_name())}) — "
+            f"{len(rows):,} candidates"
+        )
+
+    ax.set_yticks(range(len(ordered_targets)))
+    ax.set_yticklabels([f"{target} ({counts[target]})" for target in ordered_targets], fontsize=7)
+    ax.invert_yaxis()
+    ax.set_xlabel("frequency (MHz)")
+    ax.grid(True, axis="x", alpha=0.2)
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="none",
+            color=_BAND_COLORS.get(band, "tab:gray"),
+            label=band,
+        )
+        for band in sorted(seen_bands)
+    ]
+    ax.legend(handles=handles, title="band", fontsize=8, loc="upper right")
+
+    return _save_and_upload(
+        fig,
+        f"candidate_frequency_map_{display_tag(tag, get_machine_name())}.png",
+        "Candidate Frequency Map",
+    )
+
+
 def plot_candidate(row: dict, index: int) -> str | None:
     """One candidate's full picture (implements the long-standing inference.py stub):
     6-panel cadence waterfall of its stamp, annotated with confidence / frequency /
@@ -1578,6 +1680,7 @@ def render_inference_visualizations(
         )
         _viz_safe("preproc_funnel", plot_preproc_funnel, records, summaries)
         _viz_safe("confidence_distribution", plot_confidence_distribution, records)
+        _viz_safe("candidate_frequency_map", plot_candidate_frequency)
         _viz_safe("candidate_gallery", plot_candidate_gallery)
         _viz_safe("candidate_uncertainty", plot_candidate_uncertainty)
         _viz_safe("inference_latent_projection", plot_inference_latent_projection, collector)
