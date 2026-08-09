@@ -891,6 +891,7 @@ class TestComputeOrLoadShapValuesCacheGuard:
         os.makedirs(os.path.dirname(rf_path), exist_ok=True)
         joblib.dump(model if model is not None else {"stub": "rf"}, rf_path)
         return _shap_input_fingerprint(
+            artifacts["train_features"],
             artifacts["val_features"],
             artifacts["val_binary_labels"],
             _rf_artifact_digest(rf_path),
@@ -995,6 +996,7 @@ class TestComputeOrLoadShapValuesCacheGuard:
         assert calls == ["summary", "interaction", "logloss"]
         # The fresh cache is fingerprinted against the CURRENT RF artifact
         assert result["input_fingerprint"] == _shap_input_fingerprint(
+            artifacts["train_features"],
             artifacts["val_features"],
             artifacts["val_binary_labels"],
             _rf_artifact_digest(self._rf_path(pipeline.config)),

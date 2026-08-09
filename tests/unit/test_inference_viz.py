@@ -799,7 +799,25 @@ class TestCandidateFrequencyMap:
                 ("T4", "S", 2300.0),
             ],
         )
+        # Capture the legend off the figure on its way to disk: the redesign's contract is
+        # cap + 1 target-labeled entries with NO band letters (band is implied by x).
+        real_save = viz._save_and_upload
+        captured = {}
+
+        def _capturing_save(fig, filename, label):
+            legend = fig.axes[0].get_legend()
+            captured["labels"] = [t.get_text() for t in legend.get_texts()]
+            captured["title"] = legend.get_title().get_text()
+            return real_save(fig, filename, label)
+
+        monkeypatch.setattr(viz, "_save_and_upload", _capturing_save)
         _assert_figure(viz.plot_candidate_frequency())
+        assert len(captured["labels"]) == 3  # cap (2) + the overflow aggregate
+        assert captured["title"] == "target"
+        assert any(label.startswith("T1") for label in captured["labels"])
+        assert any("more targets" in label for label in captured["labels"])
+        # Band must not be a legend dimension: no bare band-letter labels
+        assert not any(label.split(" ")[0] in {"L", "S", "C", "X"} for label in captured["labels"])
 
     def test_skips_without_candidates(self, initialized_runtime):
         from aetherscan.inference_viz import plot_candidate_frequency  # noqa: PLC0415

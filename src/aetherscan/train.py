@@ -1222,7 +1222,17 @@ def _shap_content_fingerprint(shap_values: np.ndarray) -> str:
 def _rf_artifact_digest(rf_path: str) -> str:
     """sha256 over the persisted RF joblib's bytes. Raises OSError when the file is
     missing/unreadable — the caller decides whether that means fail (write side, where the
-    file was just dumped) or degrade (read side, where cannot-verify is not verified-stale)."""
+    file was just dumped) or degrade (read side, where cannot-verify is not verified-stale).
+
+    NOTE: byte-digest validity rests on the invariant that re-dumping the SAME in-process
+    forest is byte-identical — which holds today (final_save re-dumps this exact path after
+    rf_plots) but breaks benignly when the bytes legitimately change for the same forest: a
+    resume that reloads the RF under a different rf.n_jobs (RandomForestModel.load mutates
+    the estimator) or a re-dump under a newer sklearn/joblib re-pickles differently, and the
+    next run pays one spurious SHAP recompute (fails safe; the mismatch warning names
+    re-pickling as a cause). A structural digest over the trees would be stable across
+    re-pickles at the cost of loading the joblib — revisit if spurious recomputes ever show
+    up in practice."""
     digest = hashlib.sha256()
     with open(rf_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -1231,24 +1241,27 @@ def _rf_artifact_digest(rf_path: str) -> str:
 
 
 def _shap_input_fingerprint(
-    val_features: np.ndarray, val_binary_labels: np.ndarray, rf_digest: str
+    train_features: np.ndarray,
+    val_features: np.ndarray,
+    val_binary_labels: np.ndarray,
+    rf_digest: str,
 ) -> str:
     """
     Stable identity of the SHAP-VALUES cache's INPUTS (#414): the eval matrix + labels the
-    passes explain, plus the persisted RF artifact the pool workers load, folded into one
-    sha256. Persisted into rf_shap_values_{tag}.joblib as `input_fingerprint` and verified
-    on reuse — closing the coherently-stale-pair gap where a leftover values cache from an
-    older model is reused, its clustering cache matches it (they are consistent with each
-    other), and nothing notices that neither belongs to the current model. The model
-    component is the RF FILE's digest, not an in-memory hash: the compute path re-dumps the
-    in-process model to that file before the pool runs, so write side and read side hash
-    the same canonical bytes whether or not a model is in memory (plots-only reruns
-    validate against the artifact on disk). Sampling indices/counts are deliberately
-    absent — they are seeded functions of (n_val, config) already pinned by
-    _shap_cache_consistent's shape checks.
+    passes explain, the train matrix the log-loss background subset is drawn from, plus the
+    persisted RF artifact the pool workers load, folded into one sha256. Persisted into
+    rf_shap_values_{tag}.joblib as `input_fingerprint` and verified on reuse — closing the
+    coherently-stale-pair gap where a leftover values cache from an older model is reused,
+    its clustering cache matches it (they are consistent with each other), and nothing
+    notices that neither belongs to the current model. The model component is the RF FILE's
+    digest, not an in-memory hash: the compute path re-dumps the in-process model to that
+    file before the pool runs, so write side and read side hash the same canonical bytes
+    whether or not a model is in memory (plots-only reruns validate against the artifact on
+    disk). Sampling indices/counts are deliberately absent — they are seeded functions of
+    (n_val, config) already pinned by _shap_cache_consistent's shape checks.
     """
     digest = hashlib.sha256()
-    for arr in (val_features, np.asarray(val_binary_labels)):
+    for arr in (train_features, val_features, np.asarray(val_binary_labels)):
         payload = np.ascontiguousarray(arr)
         digest.update(f"{payload.dtype!s}:{payload.shape!r}:".encode())
         digest.update(payload.tobytes())
@@ -3751,14 +3764,18 @@ class TrainingPipeline:
                     )
                     self._rf_shap_cache[tag] = cached
                     return cached
-                if recorded == _shap_input_fingerprint(val_features, val_binary_labels, rf_digest):
+                if recorded == _shap_input_fingerprint(
+                    train_features, val_features, val_binary_labels, rf_digest
+                ):
                     logger.info(f"Loading cached SHAP values from {shap_path}")
                     self._rf_shap_cache[tag] = cached
                     return cached
                 logger.warning(
                     f"Cached SHAP values at {shap_path} were computed from DIFFERENT "
                     f"inputs than the current eval artifacts/model (#414 input-fingerprint "
-                    f"mismatch; stale cache under a reused tag?) — recomputing"
+                    f"mismatch: stale cache under a reused tag, or the RF artifact was "
+                    f"re-pickled — e.g. reloaded under a different rf.n_jobs or a newer "
+                    f"sklearn/joblib) — recomputing"
                 )
 
         # The compute path below dumps + explains the in-process RF, so it needs one loaded
@@ -3790,7 +3807,7 @@ class TrainingPipeline:
         # #414: fingerprint the inputs against the RF artifact JUST dumped — the same
         # canonical bytes a later reuse (with or without a model in memory) will verify.
         input_fingerprint = _shap_input_fingerprint(
-            val_features, val_binary_labels, _rf_artifact_digest(rf_path)
+            train_features, val_features, val_binary_labels, _rf_artifact_digest(rf_path)
         )
 
         # Expected value (positive-class base value): one lightweight in-process explainer.

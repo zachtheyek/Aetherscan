@@ -1121,10 +1121,14 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     )
 
 
-# Distinct legend/color slots for the dot plot — tab20's palette size; everything past the
-# cap collapses into one gray aggregate entry (color is the target encoding now, and >20
-# colors stop being distinguishable)
-_CANDIDATE_FREQ_MAX_TARGETS = 20
+# Distinct target colors for the dot plot: tab20 minus its gray pair (slots 14/15), which
+# would collide with the overflow aggregate's gray — color is the target encoding now, so
+# two legend entries must never share a color. The cap derives from the palette; everything
+# past it collapses into one gray aggregate entry.
+_CANDIDATE_FREQ_PALETTE = [
+    color for i, color in enumerate(colormaps["tab20"].colors) if i not in (14, 15)
+]
+_CANDIDATE_FREQ_MAX_TARGETS = len(_CANDIDATE_FREQ_PALETTE)
 
 
 def plot_candidate_frequency() -> str | None:
@@ -1156,15 +1160,16 @@ def plot_candidate_frequency() -> str | None:
         return None
 
     counts = Counter(r.get("target") or "?" for r in rows)
-    ordered_targets = [target for target, _ in counts.most_common(_CANDIDATE_FREQ_MAX_TARGETS)]
+    # min() keeps a monkeypatched/lowered cap honest against the fixed palette length —
+    # colors must never cycle into duplicates now that color IS the target encoding
+    max_targets = min(_CANDIDATE_FREQ_MAX_TARGETS, len(_CANDIDATE_FREQ_PALETTE))
+    ordered_targets = [target for target, _ in counts.most_common(max_targets)]
     overflow = len(counts) - len(ordered_targets)
     overflow_label = f"(+{overflow} more targets)"
     if overflow:
         # The aggregate entry's count is its candidate total, mirroring per-target entries
         counts[overflow_label] = len(rows) - sum(counts[t] for t in ordered_targets)
-    color_by_target = {
-        target: colormaps["tab20"](i % 20) for i, target in enumerate(ordered_targets)
-    }
+    color_by_target = dict(zip(ordered_targets, _CANDIDATE_FREQ_PALETTE, strict=False))
 
     fig = Figure(figsize=(12, 4.5))
     ax = fig.subplots()

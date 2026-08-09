@@ -106,8 +106,9 @@ jobs:
                      --json createdAt --jq '.[0].createdAt // empty')"
           if [[ -z "$SINCE" ]]; then
             # 8 (not 7) days: the first weekly run fires ~deferral-hours after its nominal
-            # Monday 01:00, so a plain 7-day window would open after a merge that landed in
-            # the deferral band a week earlier. The extra day is one harmless re-scan once.
+            # Monday 03:00 (#413 stagger), so a plain 7-day window would open after a merge
+            # that landed in the deferral band a week earlier. The extra day is one harmless
+            # re-scan once.
             SINCE="$(date -u -d '8 days ago' +'%Y-%m-%dT%H:%M:%SZ')"
             echo "No prior successful scheduled run found — falling back to an 8-day window."
           fi

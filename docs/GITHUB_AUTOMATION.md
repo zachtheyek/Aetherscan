@@ -136,7 +136,9 @@ cron string), so a stagger changes one window's length once, with no gap. **Conc
 groups**: every scheduled workflow carries `concurrency: group: ${{ github.workflow }}` with
 `cancel-in-progress: false` (matching `release.yml`), so a scheduler-delayed weekly and a
 manual dispatch of the same workflow queue instead of racing — while distinct workflows never
-share a group. Keep cancel-in-progress false: each run's own dedup guard makes a queued
+share a group. (GitHub keeps at most ONE pending run per group — a third entry replaces the
+queued one rather than stacking; benign here, since each run's ISO-week dedup guard makes a
+dropped duplicate a no-op.) Keep cancel-in-progress false: each run's own dedup guard makes a queued
 second run a cheap no-op, whereas cancelling update-docs mid-run could strand the week's
 issue without its embedded CLI blocks (unrecoverable within the ISO week).
 
