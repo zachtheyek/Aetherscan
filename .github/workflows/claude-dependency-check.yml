@@ -1,6 +1,7 @@
 # Weekly routine check for outdated / vulnerable dependencies across the repo
 # Opens a single GitHub issue grouping findings by severity (security first)
-# Runs Monday 09:00 MYT (GMT+8) == Monday 01:00 UTC
+# Runs Monday 09:00 MYT (GMT+8) == Monday 01:00 UTC (#413: the three weeklies are
+# staggered an hour apart so they don't compete for runners/API capacity)
 name: Claude Dependency Check
 
 on:
@@ -9,6 +10,15 @@ on:
     - cron: "0 1 * * 1"
   # Allow manual runs (scheduled workflows only fire from the default branch)
   workflow_dispatch:
+
+# One run of THIS workflow at a time (#413): a scheduler-delayed weekly and a manual
+# dispatch queue instead of racing (both could otherwise file the week's issue
+# simultaneously). Group keys on the workflow name so the three weeklies never touch
+# each other; no cancel-in-progress (house style, see release.yml) — a queued run's
+# own dedup guard makes the second run a cheap no-op.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   claude-dependency-check:

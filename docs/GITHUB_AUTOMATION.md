@@ -106,9 +106,9 @@ double-post.
 | [`claude-contribution-check.yml`](../.github/workflows/claude-contribution-check.yml) | Issue or PR opened | Verifies workflow compliance (issue linkage, branch-prefix conventions, template use) and comments when something's missing. **Never runs for bot authors, nor on maintainer-authored issues or PRs** — see the gotcha below. | — |
 | [`claude-release-notes.yml`](../.github/workflows/claude-release-notes.yml) | PR **merged** to master | Drafts a release-note entry as a PR comment — the curated raw material for release bodies (see [`RELEASE.md`](RELEASE.md)). | `<!-- claude-release-notes -->` first line of the comment |
 | [`claude-style-check.yml`](../.github/workflows/claude-style-check.yml) | PR merged to master | Scans the merged diff's *added* lines against the project style rules ruff can't express (docstring prose style, canonical comment markers, logging idioms); files one consolidated issue when violations exist. | `<!-- aetherscan-style-check pr=<N> -->` |
-| [`claude-update-docs.yml`](../.github/workflows/claude-update-docs.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` (#374 — was per-PR-merge) | Scans **every PR merged since the previous successful scheduled run** (8-day fallback) and reconciles the aggregate end state against the doc set; files at most ONE issue per week covering all gaps. If any PR in the window touched `cli.py`, a **shell step** regenerates the README CLI Reference blocks with `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13) off current master and embeds the output in the issue, because the follow-up assistant run has no `python` in its tool allowlist. The filed issue contains an intentional handle mention, which triggers `claude.yml` to open the actual docs PR. | `<!-- aetherscan-update-docs week=<WEEK> -->` (legacy per-merge issues carry `pr=<N>`) |
-| [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `Dockerfile` / `pyproject.toml` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; also flags base-image drift when `Dockerfile`'s `FROM ...@sha256:<digest>` diverges from `aetherscan.def`'s `From:` (base-provided packages — `tf_keras`, `h5py`, etc. — are intentionally absent from `requirements-container.txt` and are not drift). Files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
-| [`claude-flaky-test-tracker.yml`](../.github/workflows/claude-flaky-test-tracker.yml) | Weekly (Mon 01:00 UTC) + `workflow_dispatch` | Reads the week's `tests.yml` runs, identifies flaky/failing tests, diagnoses the worst offender, files a weekly report issue. | `<!-- aetherscan-flaky-test-tracker week=<WEEK> -->` |
+| [`claude-update-docs.yml`](../.github/workflows/claude-update-docs.yml) | Weekly (Mon 03:00 UTC, #413 stagger) + `workflow_dispatch` (#374 — was per-PR-merge) | Scans **every PR merged since the previous successful scheduled run** (8-day fallback) and reconciles the aggregate end state against the doc set; files at most ONE issue per week covering all gaps. If any PR in the window touched `cli.py`, a **shell step** regenerates the README CLI Reference blocks with `utils/print_cli_help.py` (Python pinned to 3.12 — argparse help formatting changes in 3.13) off current master and embeds the output in the issue, because the follow-up assistant run has no `python` in its tool allowlist. The filed issue contains an intentional handle mention, which triggers `claude.yml` to open the actual docs PR. | `<!-- aetherscan-update-docs week=<WEEK> -->` (legacy per-merge issues carry `pr=<N>`) |
+| [`claude-dependency-check.yml`](../.github/workflows/claude-dependency-check.yml) | Weekly (Mon 01:00 UTC, #413 stagger) + `workflow_dispatch` | Audits `environment.yml` / `requirements-container.txt` / `aetherscan.def` / `Dockerfile` / `pyproject.toml` against registries and advisories under [`SECURITY.md`](../SECURITY.md)'s version-selection policy; also flags base-image drift when `Dockerfile`'s `FROM ...@sha256:<digest>` diverges from `aetherscan.def`'s `From:` (base-provided packages — `tf_keras`, `h5py`, etc. — are intentionally absent from `requirements-container.txt` and are not drift). Files a weekly report issue. | `<!-- aetherscan-dependency-check week=<WEEK> -->` |
+| [`claude-flaky-test-tracker.yml`](../.github/workflows/claude-flaky-test-tracker.yml) | Weekly (Mon 02:00 UTC, #413 stagger) + `workflow_dispatch` | Reads the week's `tests.yml` runs, identifies flaky/failing tests, diagnoses the worst offender, files a weekly report issue. | `<!-- aetherscan-flaky-test-tracker week=<WEEK> -->` |
 
 > [!NOTE]
 > **`claude-update-docs` is a two-step relay**, which is why its row is dense. Step 1 is a
@@ -124,6 +124,21 @@ The dedup-marker pattern is a convention to preserve in any new workflow that po
 the guard step greps existing issues/comments for the marker (`gh ... --json body --jq` +
 `grep`), and the prompt instructs the assistant to put the marker as the **first line** of
 anything it posts — deterministic idempotence without trusting the model to check.
+
+Two more conventions ride on the weekly trio (#413). **Staggered crons**: the three weeklies
+run an hour apart (dependency-check 01:00 → flaky-test-tracker 02:00 → update-docs 03:00 UTC
+Mondays) so they don't wake simultaneously and compete for runners/API capacity; keep any new
+scheduled workflow off the taken hours, keep exactly ONE `cron:` entry per workflow, and keep
+them on Monday UTC (the `%G-W%V` dedup week key rolls at Monday 00:00 UTC). The hours
+themselves are safe to move: update-docs — the only one with a time-anchored window — anchors
+on the previous successful *scheduled* run's `createdAt` (event type + conclusion, never the
+cron string), so a stagger changes one window's length once, with no gap. **Concurrency
+groups**: every scheduled workflow carries `concurrency: group: ${{ github.workflow }}` with
+`cancel-in-progress: false` (matching `release.yml`), so a scheduler-delayed weekly and a
+manual dispatch of the same workflow queue instead of racing — while distinct workflows never
+share a group. Keep cancel-in-progress false: each run's own dedup guard makes a queued
+second run a cheap no-op, whereas cancelling update-docs mid-run could strand the week's
+issue without its embedded CLI blocks (unrecoverable within the ISO week).
 
 ### The `allowed_bots` gotchas
 

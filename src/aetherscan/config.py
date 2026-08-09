@@ -85,7 +85,7 @@ class LoggerConfig:
     slack_username: str = "Aetherscan"
     slack_timeout: float = 15.0
     slack_retry_attempts: int = 3
-    slack_buffer_size: int = 100  # Max messages to buffer before flushing
+    slack_buffer_size: int = 20  # Max messages to buffer before flushing
     slack_flush_interval: float = 60.0  # Seconds between automatic flushes
     slack_broadcast_level: str = "ERROR"  # Messages at this level+ are broadcast to main channel
 
