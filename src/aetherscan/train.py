@@ -1264,7 +1264,10 @@ def _shap_input_fingerprint(
     for arr in (train_features, val_features, np.asarray(val_binary_labels)):
         payload = np.ascontiguousarray(arr)
         digest.update(f"{payload.dtype!s}:{payload.shape!r}:".encode())
-        digest.update(payload.tobytes())
+        # No .tobytes(): hashing through the buffer protocol avoids materializing a full
+        # byte copy (~100 MB transient for train_features at catalog-scale row counts);
+        # contiguity is guaranteed by ascontiguousarray above.
+        digest.update(payload)
     digest.update(rf_digest.encode())
     return digest.hexdigest()
 
@@ -3725,6 +3728,14 @@ class TrainingPipeline:
             self.config.model_path, f"random_forest_{display_tag(tag, get_machine_name())}.joblib"
         )
 
+        # Whether a recompute is even possible decides how every degraded cache case below
+        # resolves: with a model in memory, recomputing is strictly safer than serving an
+        # unverifiable/unverified cache; without one, best-effort reuse is the only
+        # non-fatal option (and matches the pre-#414 behavior for those caches).
+        model_loaded = (
+            self.rf_model is not None and getattr(self.rf_model, "model", None) is not None
+        )
+
         if os.path.exists(shap_path):
             cached = joblib.load(shap_path)
             # #359 shape guard + #414 input fingerprint: the cache is keyed on {tag}
@@ -3744,44 +3755,65 @@ class TrainingPipeline:
                     f"eval artifacts/config (stale cache under a reused tag?) — recomputing"
                 )
             elif (recorded := cached.get("input_fingerprint")) is None:
+                if not model_loaded:
+                    # A plots-only rerun against a legacy cache with no RF anywhere:
+                    # nothing to verify against and nothing to migrate with — reuse
+                    # unverified (exactly what pre-#414 code did) rather than die.
+                    logger.warning(
+                        f"Cached SHAP values at {shap_path} predate the input fingerprint "
+                        f"(#414) and no model is loaded to recompute from; reusing the "
+                        f"legacy cache unverified"
+                    )
+                    self._rf_shap_cache[tag] = cached
+                    return cached
                 logger.warning(
                     f"Cached SHAP values at {shap_path} predate the input fingerprint "
                     f"(#414) and cannot be tied to the current model/data — recomputing "
                     f"(one-time migration of a pre-#414 cache)"
                 )
             else:
+                rf_digest = None
                 try:
                     rf_digest = _rf_artifact_digest(rf_path)
                 except OSError as e:
-                    # Cannot-verify is not verified-stale: with no RF artifact on disk
-                    # there is nothing to check the model component against, and a forced
-                    # recompute would itself need the missing RF — serve the cache
-                    # unverified (the historical behavior) rather than fail.
+                    if model_loaded:
+                        # The RF artifact is gone/unreadable but the model itself is in
+                        # hand — recomputing (which re-dumps the artifact) is strictly
+                        # safer than serving a cache that might belong to an older model.
+                        logger.warning(
+                            f"Cached SHAP values at {shap_path}: RF artifact unreadable "
+                            f"({e}), so the input fingerprint cannot be verified — "
+                            f"recomputing from the in-process model"
+                        )
+                    else:
+                        # Cannot-verify AND cannot-recompute: best-effort reuse (the
+                        # historical behavior) is the only non-fatal option.
+                        logger.warning(
+                            f"Cached SHAP values at {shap_path}: RF artifact unreadable "
+                            f"({e}) and no model is loaded to recompute from; reusing "
+                            f"the cache unverified"
+                        )
+                        self._rf_shap_cache[tag] = cached
+                        return cached
+                if rf_digest is not None:
+                    if recorded == _shap_input_fingerprint(
+                        train_features, val_features, val_binary_labels, rf_digest
+                    ):
+                        logger.info(f"Loading cached SHAP values from {shap_path}")
+                        self._rf_shap_cache[tag] = cached
+                        return cached
                     logger.warning(
-                        f"Cached SHAP values at {shap_path}: RF artifact unreadable "
-                        f"({e}), so the input fingerprint cannot be verified; reusing "
-                        f"the cache unverified"
+                        f"Cached SHAP values at {shap_path} were computed from DIFFERENT "
+                        f"inputs than the current eval artifacts/model (#414 "
+                        f"input-fingerprint mismatch: stale cache under a reused tag, or "
+                        f"the RF artifact was re-pickled — e.g. reloaded under a different "
+                        f"rf.n_jobs or a newer sklearn/joblib) — recomputing"
                     )
-                    self._rf_shap_cache[tag] = cached
-                    return cached
-                if recorded == _shap_input_fingerprint(
-                    train_features, val_features, val_binary_labels, rf_digest
-                ):
-                    logger.info(f"Loading cached SHAP values from {shap_path}")
-                    self._rf_shap_cache[tag] = cached
-                    return cached
-                logger.warning(
-                    f"Cached SHAP values at {shap_path} were computed from DIFFERENT "
-                    f"inputs than the current eval artifacts/model (#414 input-fingerprint "
-                    f"mismatch: stale cache under a reused tag, or the RF artifact was "
-                    f"re-pickled — e.g. reloaded under a different rf.n_jobs or a newer "
-                    f"sklearn/joblib) — recomputing"
-                )
 
         # The compute path below dumps + explains the in-process RF, so it needs one loaded
         # regardless of WHY it's being entered (stale cache or no cache at all) — fail with a
         # pointed message rather than an AttributeError deep in the dump.
-        if self.rf_model is None or getattr(self.rf_model, "model", None) is None:
+        if not model_loaded:
             raise RuntimeError(
                 f"SHAP values for tag {tag!r} need to be computed (no usable cache at "
                 f"{shap_path}) but no trained RF is loaded — train or load the RF for this "

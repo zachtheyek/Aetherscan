@@ -847,10 +847,11 @@ class TestShapCacheConsistent:
 
 class TestComputeOrLoadShapValuesCacheGuard:
     """_compute_or_load_shap_values (#359 + #414): the on-disk cache is returned only when it
-    passes the shape-consistency guard AND its recorded input fingerprint (eval matrix +
-    labels + persisted RF artifact) matches the inputs in hand; a stale payload is recomputed
-    and its file overwritten, and a fingerprint that cannot be verified (no RF artifact on
-    disk) degrades to warn-and-reuse."""
+    passes the shape-consistency guard AND its recorded input fingerprint (train + eval
+    matrices, labels, persisted RF artifact) matches the inputs in hand; a stale payload is
+    recomputed and its file overwritten. Degraded cases key on "can we recompute?": with a
+    model in memory an unverifiable/legacy cache recomputes; without one, best-effort
+    warn-and-reuse is the only non-fatal option."""
 
     N_VAL = 32
     N_FEATURES = 6
@@ -1025,10 +1026,10 @@ class TestComputeOrLoadShapValuesCacheGuard:
         assert any("input-fingerprint mismatch" in r.message for r in caplog.records)
         assert calls == ["summary", "interaction", "logloss"]
 
-    def test_missing_rf_artifact_serves_cache_unverified(self, monkeypatch, caplog):
-        # Cannot-verify is not verified-stale: with no RF artifact on disk the model
-        # component can't be checked (and a recompute would itself need the missing RF) —
-        # the cache is served with a warning.
+    def test_missing_rf_artifact_with_model_recomputes(self, monkeypatch, caplog):
+        # The degrade predicate is "can we recompute?", not "is the RF file readable?":
+        # with a model in memory, recomputing (which re-dumps the artifact) is strictly
+        # safer than serving a cache that might belong to an older model.
         pipeline = self._pipeline(n_summary=8, n_interact=4)
         payload = _shap_payload(
             n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
@@ -1044,9 +1045,56 @@ class TestComputeOrLoadShapValuesCacheGuard:
         with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
             result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
 
-        assert any("cannot be verified" in r.message for r in caplog.records)
+        assert any("recomputing from the in-process model" in r.message for r in caplog.records)
+        assert calls == ["summary", "interaction", "logloss"]
+        # The recompute re-dumped the RF artifact and fingerprinted against it
+        assert os.path.exists(self._rf_path(pipeline.config))
+        assert "input_fingerprint" in result
+
+    def test_missing_rf_artifact_without_model_serves_cache_unverified(self, monkeypatch, caplog):
+        # Cannot-verify AND cannot-recompute: best-effort reuse is the only non-fatal
+        # option — the cache is served with a warning.
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        pipeline.rf_model = None
+        payload = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        payload["input_fingerprint"] = "whatever-was-recorded"
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(payload, shap_path)
+        assert not os.path.exists(self._rf_path(pipeline.config))
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
+        assert any("reusing the cache unverified" in r.message for r in caplog.records)
         assert calls == []
         assert np.array_equal(result["summary_indices"], payload["summary_indices"])
+
+    def test_pre_414_cache_without_model_serves_cache_unverified(self, monkeypatch, caplog):
+        # A plots-only rerun against a legacy (pre-#414) cache with no RF anywhere used to
+        # render pre-#414 — it must keep doing so (best-effort reuse), not die on the
+        # compute path's pointed RuntimeError.
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        pipeline.rf_model = None
+        legacy = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(legacy, shap_path)
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
+        assert any("reusing the legacy cache unverified" in r.message for r in caplog.records)
+        assert calls == []
+        assert np.array_equal(result["summary_indices"], legacy["summary_indices"])
 
     def test_stale_cache_recomputed_and_overwritten(self, monkeypatch, caplog):
         # The cache on disk was written when shap_max_samples_summary was 8; this run wants 16.

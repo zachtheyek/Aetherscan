@@ -731,10 +731,11 @@ outcome, val partition indices).
 The five SHAP figures share `rf_shap_values_{tag}.joblib`, computed once by
 `_compute_or_load_shap_values`. Both SHAP caches are **self-validating on load** (#359/#414):
 the values cache passes shape/config checks *and* an `input_fingerprint` comparison — a sha256
-of the eval matrix + labels and the persisted RF artifact's bytes — so a leftover cache from
-an older model or a changed val split recomputes with a warning instead of being served (a
-pre-#414 cache without the fingerprint migrates via one recompute; an un-verifiable
-fingerprint — no RF artifact on disk — degrades to warn-and-reuse); the clustering cache
+of the train + eval matrices, labels, and the persisted RF artifact's bytes — so a leftover
+cache from an older model or a changed val split recomputes with a warning instead of being
+served. Degraded cases key on whether a recompute is possible: with a model in memory, a
+pre-#414 cache or an unverifiable fingerprint (RF artifact unreadable) recomputes; with no
+model loaded, best-effort warn-and-reuse keeps plots-only reruns rendering; the clustering cache
 carries its own content fingerprint of the exact SHAP matrix it was fit on. Together the two
 fingerprints close the coherently-stale-pair gap: a values+clustering pair that is internally
 consistent but belongs to a previous model can no longer slip through as a matched set.
