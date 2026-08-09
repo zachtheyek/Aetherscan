@@ -1600,9 +1600,14 @@ class TestResumeProvenanceGuard:
             metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
         )
         os.remove(group.h5_paths[0])
+        os.remove(group.h5_paths[1])
         with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
             assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
-        assert any("could not stat" in r.message for r in caplog.records)
+        # ONE aggregated warning per cadence (not one per file): unreachable raws are the
+        # steady state of a no-raw-bind re-score, and WARNING-level records reach Slack.
+        stat_warnings = [r for r in caplog.records if "could not be stat'd" in r.message]
+        assert len(stat_warnings) == 1
+        assert "2/6" in stat_warnings[0].message
 
     def test_unreachable_h5_does_not_mask_a_real_mismatch(self, tmp_path, initialized_runtime):
         # One file un-stat-able (skipped) while another genuinely changed: still a miss.

@@ -1865,19 +1865,19 @@ class DataPreprocessor:
                         f"reusing"
                     )
                     return False
+                unverifiable: list[str] = []
                 for h5_path, recorded in zip(group.h5_paths, recorded_stats, strict=True):
                     try:
                         stat = os.stat(h5_path)
-                    except OSError as e:
+                    except OSError:
                         # Cannot verify is not "verified stale": the raw h5 may be
                         # legitimately unreachable (archived, or no raw-data bind in this
                         # container) while the cached stamps are exactly what a warm
                         # re-score needs — skip this file's check, don't invalidate.
-                        logger.warning(
-                            f"Cadence {group.key}: could not stat {h5_path} ({e}); reusing "
-                            f"stamps at {npy_path} without (size, mtime) verification for "
-                            f"this file"
-                        )
+                        # Aggregated to ONE warning per cadence below: unreachable raws
+                        # are the STEADY STATE of a no-raw-bind re-score run, and 6
+                        # warnings x every cadence would flood the log (and Slack).
+                        unverifiable.append(h5_path)
                         continue
                     if stat.st_size != recorded.get("size") or stat.st_mtime != recorded.get(
                         "mtime"
@@ -1889,6 +1889,13 @@ class DataPreprocessor:
                             f"{npy_path}"
                         )
                         return False
+                if unverifiable:
+                    logger.warning(
+                        f"Cadence {group.key}: {len(unverifiable)}/{len(group.h5_paths)} h5 "
+                        f"file(s) could not be stat'd (first: {unverifiable[0]}); reusing "
+                        f"stamps at {npy_path} without (size, mtime) verification for those "
+                        f"files"
+                    )
             except (TypeError, AttributeError) as e:
                 logger.warning(
                     f"Cadence {group.key}: sidecar for {npy_path} has malformed "
