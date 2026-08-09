@@ -1658,7 +1658,9 @@ class DataPreprocessor:
         """
         Group every CSV in config.data.inference_files into per-cadence work units without
         processing anything. Returns one PendingCadence (valid group + target .npy path) per
-        valid cadence, in CSV order — the unit list the streaming inference loop iterates.
+        distinct valid cadence, in CSV order — the unit list the streaming inference loop
+        iterates. Cadences whose content identity (ordered h5 path list) repeats across the
+        run's CSVs are planned once (first occurrence wins, #412).
         """
         inference_files = self.config.data.inference_files
         if not inference_files:
@@ -1692,6 +1694,7 @@ class DataPreprocessor:
         expected_obs = self.config.inference.cadence_expected_obs
 
         units: list[PendingCadence] = []
+        planned_npy_paths: set[str] = set()
 
         for csv_filename in inference_files:
             csv_path = self.config.get_inference_file_path(csv_filename)
@@ -1713,14 +1716,21 @@ class DataPreprocessor:
             )
 
             for group in valid_groups:
-                npy_filename = self._cadence_npy_filename(group.h5_paths)
-                units.append(
-                    PendingCadence(
-                        group=group,
-                        npy_path=os.path.join(output_dir, npy_filename),
-                        index=len(units) + 1,
+                npy_path = os.path.join(output_dir, self._cadence_npy_filename(group.h5_paths))
+                # Dedupe by content identity (#412): overlapping catalogs in one run can
+                # list the SAME cadence (same ordered h5 files) more than once. Identical
+                # cadences produce identical stamps and scores, and letting two units share
+                # one npy_path would double the work and let pruning race the duplicate's
+                # prefetch — plan the first occurrence only.
+                if npy_path in planned_npy_paths:
+                    logger.info(
+                        f"Skipping duplicate cadence {group.key} from {csv_filename}: an "
+                        f"identical cadence (same ordered h5 files) is already planned this "
+                        f"run ({npy_path})"
                     )
-                )
+                    continue
+                planned_npy_paths.add(npy_path)
+                units.append(PendingCadence(group=group, npy_path=npy_path, index=len(units) + 1))
 
         logger.info(
             f"Planned {len(units)} cadence work unit(s) across {len(inference_files)} CSV(s)"
@@ -1790,10 +1800,14 @@ class DataPreprocessor:
         key, so a benign re-stage re-extracts in place rather than churning keys). With the
         content-addressed default directory the h5_paths + fingerprint checks verify exactly
         what the key encodes; they are also what protects an EXPLICIT
-        --preprocess-output-dir against reusing another catalog's stamps. Missing/unreadable
-        metadata or a metadata file without a given field (a pre-#298/pre-#412 artifact)
-        degrades to a warn-and-reuse / skip-that-check — the historical, unguarded
-        behavior — never a hard failure.
+        --preprocess-output-dir against reusing another catalog's stamps. Fail-open on
+        anything that prevents VERIFYING rather than proves staleness: missing/unreadable
+        metadata (e.g. a crash between the .npy and .json publications), a sidecar without a
+        given field, or an un-stat-able h5 (raws archived, or a container run without the
+        raw-data bind — cached stamps are exactly what such a re-score run needs) all
+        degrade to warn-and-reuse / skip-that-check. Only positive evidence of staleness
+        (mismatched paths/fingerprint/stats) or a malformed sidecar re-extracts; the guard
+        itself never hard-fails the cadence.
         """
         try:
             with open(metadata_path) as f:
@@ -1825,29 +1839,49 @@ class DataPreprocessor:
 
         recorded_stats = metadata.get("h5_file_stats")
         if recorded_stats is not None:
-            if len(recorded_stats) != len(group.h5_paths):
+            # The try contains type-level malformation (a non-list value, non-dict
+            # entries): a foreign or hand-edited sidecar must degrade to a warn +
+            # re-extract, never crash the streaming loop (this call site sits outside
+            # process_pending_cadence's containment).
+            try:
+                if len(recorded_stats) != len(group.h5_paths):
+                    logger.warning(
+                        f"Cadence {group.key}: sidecar for {npy_path} records "
+                        f"{len(recorded_stats)} h5_file_stats entries for "
+                        f"{len(group.h5_paths)} files (malformed); reprocessing instead of "
+                        f"reusing"
+                    )
+                    return False
+                for h5_path, recorded in zip(group.h5_paths, recorded_stats, strict=True):
+                    try:
+                        stat = os.stat(h5_path)
+                    except OSError as e:
+                        # Cannot verify is not "verified stale": the raw h5 may be
+                        # legitimately unreachable (archived, or no raw-data bind in this
+                        # container) while the cached stamps are exactly what a warm
+                        # re-score needs — skip this file's check, don't invalidate.
+                        logger.warning(
+                            f"Cadence {group.key}: could not stat {h5_path} ({e}); reusing "
+                            f"stamps at {npy_path} without (size, mtime) verification for "
+                            f"this file"
+                        )
+                        continue
+                    if stat.st_size != recorded.get("size") or stat.st_mtime != recorded.get(
+                        "mtime"
+                    ):
+                        logger.warning(
+                            f"Cadence {group.key}: {h5_path} changed on disk since its "
+                            f"stamps were extracted (size/mtime mismatch — re-staged or "
+                            f"repaired?); reprocessing instead of reusing stamps at "
+                            f"{npy_path}"
+                        )
+                        return False
+            except (TypeError, AttributeError) as e:
                 logger.warning(
-                    f"Cadence {group.key}: sidecar for {npy_path} records "
-                    f"{len(recorded_stats)} h5_file_stats entries for "
-                    f"{len(group.h5_paths)} files (malformed); reprocessing instead of reusing"
+                    f"Cadence {group.key}: sidecar for {npy_path} has malformed "
+                    f"h5_file_stats ({e}); reprocessing instead of reusing"
                 )
                 return False
-            for h5_path, recorded in zip(group.h5_paths, recorded_stats, strict=True):
-                try:
-                    stat = os.stat(h5_path)
-                except OSError as e:
-                    logger.warning(
-                        f"Cadence {group.key}: could not stat {h5_path} ({e}); "
-                        f"reprocessing instead of reusing stamps at {npy_path}"
-                    )
-                    return False
-                if stat.st_size != recorded.get("size") or stat.st_mtime != recorded.get("mtime"):
-                    logger.warning(
-                        f"Cadence {group.key}: {h5_path} changed on disk since its stamps "
-                        f"were extracted (size/mtime mismatch — re-staged or repaired?); "
-                        f"reprocessing instead of reusing stamps at {npy_path}"
-                    )
-                    return False
         return True
 
     # NOTE: come back to this later (based on docstring, we're processing cadences sequentially. if so, any way to parallelize?)
@@ -1954,6 +1988,17 @@ class DataPreprocessor:
         downsample_factor = self.config.data.downsample_factor if store_downsampled else 1
         time_bins = self.config.data.time_bins
         n_processes = self.config.manager.n_processes
+
+        # Snapshot each h5's (size, mtime) BEFORE the first read (#412): the sidecar must
+        # describe the files the stamps were extracted FROM. Snapshotting after extraction
+        # would let an h5 re-staged mid-extraction (a multi-minute window) record the NEW
+        # file's stats against stamps holding pre-restage bytes — permanently certifying
+        # them; with a pre-read snapshot that re-stage instead surfaces as a (size, mtime)
+        # mismatch on the next resume check.
+        h5_file_stats = [
+            {"size": stat.st_size, "mtime": stat.st_mtime}
+            for stat in (os.stat(p) for p in group.h5_paths)
+        ]
 
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
@@ -2338,14 +2383,12 @@ class DataPreprocessor:
             "key": group.key,
             "csv_path": group.csv_path,
             "h5_paths": group.h5_paths,
-            # Per-file (size, mtime) at extraction time (#412), aligned with h5_paths —
-            # compared by the resume guard so an h5 re-staged/repaired at the same path
-            # re-extracts instead of silently serving stale stamps. Sidecar-only: keeping
-            # these OUT of the cache key means a benign re-stage never churns keys.
-            "h5_file_stats": [
-                {"size": stat.st_size, "mtime": stat.st_mtime}
-                for stat in (os.stat(p) for p in group.h5_paths)
-            ],
+            # Per-file (size, mtime) snapshotted before this cadence's first h5 read
+            # (#412), aligned with h5_paths — compared by the resume guard so an h5
+            # re-staged/repaired at the same path re-extracts instead of silently serving
+            # stale stamps. Sidecar-only: keeping these OUT of the cache key means a
+            # benign re-stage never churns keys.
+            "h5_file_stats": h5_file_stats,
             "header": header,
             "stamp_starts": [int(start) for start, _, _ in stamp_centers],
             "stamp_width": stamp_width,

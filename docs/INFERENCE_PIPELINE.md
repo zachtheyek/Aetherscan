@@ -78,6 +78,16 @@ re-stage re-extracts in place without churning keys. Only scores stay tag-scoped
 DB). Pass `--preprocess-output-dir` explicitly to pin a different directory (reuse is
 still guarded).
 
+> **Migrating from the pre-#412 layout.** The old trees —
+> `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/` and `{output_path}/cache/pfb/`
+> — are orphaned by the re-keying (nothing reads or deletes them): delete them by hand after
+> upgrading (both are regenerable; the PFB response can alternatively be `mv`'d to
+> `{data_path}/cache/pfb/`). Leaving old stamp trees in place transiently doubles the stamp
+> footprint on scratch while the new cache warms. And don't resume a `--save-tag` started
+> pre-#412 across the upgrade: resume and supersede both key on `npy_path`, so such a run
+> re-preprocesses and re-infers every cadence at the new paths while the old-layout rows
+> under that tag stay live — start a fresh tag instead.
+
 ## Model loading
 
 ### Artifact resolution: local paths or the HuggingFace Hub

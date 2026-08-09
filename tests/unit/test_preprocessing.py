@@ -249,6 +249,15 @@ class TestCadenceNpyFilename:
             DataPreprocessor._cadence_npy_filename(["a", "bc"])
         )
 
+    def test_golden_digest_is_a_cross_version_contract(self):
+        # The exact digest is persisted on-disk state: every future release must compute
+        # sha256(json.dumps(list(h5_paths)))[:12] byte-for-byte (json.dumps's default ", "
+        # separator included), or every existing cache entry is silently orphaned. If this
+        # test fails, you are breaking cache compatibility — that needs to be a deliberate,
+        # documented decision, not a refactor side effect.
+        paths = [f"/data/obs_{i}.h5" for i in range(6)]
+        assert DataPreprocessor._cadence_npy_filename(paths) == "a182acea8ce3.npy"
+
 
 class TestToJsonSafe:
     def test_bytes_decode(self):
@@ -801,6 +810,46 @@ class TestProcessCadenceEndToEnd:
         assert metadata["stored_width"] == config.inference.stamp_width
         assert metadata["downsample_factor_applied"] == 1
 
+    def test_stats_mismatch_actually_reextracts(self, tmp_path, initialized_runtime, caplog):
+        """The re-extract half of #412's warn+re-extract: a cached .npy whose sidecar
+        (size, mtime) no longer matches the h5 on disk must fall through the resume guard
+        into a real re-extraction (fresh .npy + fresh sidecar), not be skipped."""
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure("spline")
+        h5_paths = self._make_cadence(tmp_path)
+        group = CadenceGroup(
+            key=("T4", "S1", "L", "10", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cadence_restage.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        first = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert first is not None and first.freshly_extracted is True
+        with open(first.metadata_path) as f:
+            first_stats = json.load(f)["h5_file_stats"]
+
+        # Simulate a re-stage at the same path: bump one h5's mtime
+        stat = os.stat(h5_paths[2])
+        os.utime(h5_paths[2], (stat.st_atime, stat.st_mtime + 60.0))
+
+        # A DIFFERENT preprocessor (fresh process/operator) must re-extract, not resume
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            second = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert any("changed on disk" in r.message for r in caplog.records)
+        assert second is not None and second.freshly_extracted is True
+        assert second.n_hits == first.n_hits  # same bytes -> same stamps
+        with open(second.metadata_path) as f:
+            second_stats = json.load(f)["h5_file_stats"]
+        # The rewritten sidecar records the NEW mtime, so a third run resumes cleanly
+        assert second_stats != first_stats
+        third = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert third is not None and third.freshly_extracted is False
+
     @pytest.mark.parametrize("missing_attr", ["foff", "fch1"])
     def test_missing_header_attr_raises_keyerror(self, tmp_path, initialized_runtime, missing_attr):
         """A cadence whose primary ON-source .h5 lacks a required header attr (fch1/foff)
@@ -1348,11 +1397,13 @@ class TestPlanCadencesOutputDir:
         # otherwise resume-skip the cadence off stamps produced under a different ED config.
         assert not os.path.exists(second[0].npy_path)
 
-    def test_duplicate_csv_basenames_plan_cleanly(self, initialized_runtime, make_inference_csv):
+    def test_duplicate_cadences_plan_once(self, initialized_runtime, make_inference_csv):
         # Pre-#412 the stem-keyed layout had to reject duplicate CSV basenames (they would
         # have collided into one directory and cross-resumed). Content addressing removes
-        # the collision by construction: identical cadences resolve to the SAME cache entry
-        # (shared, atomically published), distinct cadences to different ones.
+        # the collision by construction, and identical cadences (same ordered h5 files)
+        # across a run's CSVs dedupe to one planned unit — scoring the same cadence twice
+        # under one tag is pure waste, and two units sharing an npy_path would let pruning
+        # race the duplicate's prefetch.
         config = get_config()
         make_inference_csv("run_a/subset.csv")
         make_inference_csv("run_b/subset.csv")
@@ -1360,15 +1411,30 @@ class TestPlanCadencesOutputDir:
 
         units = DataPreprocessor().plan_cadences()
 
-        assert len(units) == 2
-        assert units[0].npy_path == units[1].npy_path  # same files -> same entry
+        assert len(units) == 1
 
     def test_explicit_override_shared_across_csvs(
         self, initialized_runtime, make_inference_csv, tmp_path
     ):
         config = get_config()
         make_inference_csv("a.csv")
-        make_inference_csv("b.csv")
+        # Distinct h5 files so the two CSVs stay two distinct cadences (identical
+        # cadences would dedupe to one planned unit, #412)
+        make_inference_csv(
+            "b.csv",
+            groups=[
+                (
+                    {
+                        "Target": "HIP99999",
+                        "Session": "AGBT21B_999_32",
+                        "Band": "L",
+                        "Cadence ID": "1",
+                        "Frequency": "1400",
+                    },
+                    [f"/data/other_{i}.h5" for i in range(6)],
+                )
+            ],
+        )
         config.data.inference_files = ["a.csv", "b.csv"]
         override = str(tmp_path / "shared_preproc")
         config.inference.preprocess_output_dir = override
@@ -1471,8 +1537,12 @@ class TestResumeProvenanceGuard:
         self._write_metadata(
             metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
         )
-        with open(group.h5_paths[2], "ab") as f:  # a re-staged file grew at the same path
+        # Grow one file, then restore its original mtime — ONLY the size arm can fire
+        # (a re-stage with preserved timestamps, e.g. rsync -t / cp -p, must still miss)
+        original = os.stat(group.h5_paths[2])
+        with open(group.h5_paths[2], "ab") as f:
             f.write(b"extra")
+        os.utime(group.h5_paths[2], (original.st_atime, original.st_mtime))
         with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
             assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
         assert any("changed on disk" in r.message for r in caplog.records)
@@ -1489,7 +1559,10 @@ class TestResumeProvenanceGuard:
         os.utime(group.h5_paths[4], (stat.st_atime, stat.st_mtime + 60.0))
         assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
 
-    def test_missing_h5_reprocesses_with_warning(self, tmp_path, initialized_runtime, caplog):
+    def test_unreachable_h5_reuses_with_warning(self, tmp_path, initialized_runtime, caplog):
+        # Cannot-verify is not verified-stale: with the raws unreachable (archived, or a
+        # container run without the raw-data bind) the cached stamps are exactly what a
+        # warm re-score needs — the guard warns and reuses rather than invalidating.
         preprocessor = DataPreprocessor()
         group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
         self._write_metadata(
@@ -1497,8 +1570,20 @@ class TestResumeProvenanceGuard:
         )
         os.remove(group.h5_paths[0])
         with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
-            assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+            assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
         assert any("could not stat" in r.message for r in caplog.records)
+
+    def test_unreachable_h5_does_not_mask_a_real_mismatch(self, tmp_path, initialized_runtime):
+        # One file un-stat-able (skipped) while another genuinely changed: still a miss.
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
+        )
+        os.remove(group.h5_paths[0])
+        stat = os.stat(group.h5_paths[3])
+        os.utime(group.h5_paths[3], (stat.st_atime, stat.st_mtime + 60.0))
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
 
     def test_malformed_stats_length_reprocesses(self, tmp_path, initialized_runtime, caplog):
         preprocessor = DataPreprocessor()
@@ -1508,6 +1593,20 @@ class TestResumeProvenanceGuard:
             h5_paths=group.h5_paths,
             h5_file_stats=self._stats_for(group.h5_paths)[:3],  # truncated: 3 entries, 6 files
         )
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        assert any("malformed" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("bad_stats", [5, [[100, 1.5]] * 6, ["x"] * 6])
+    def test_malformed_stats_types_reprocess_contained(
+        self, tmp_path, initialized_runtime, caplog, bad_stats
+    ):
+        # Type-level malformation (non-list value, non-dict entries) must degrade to a
+        # warn + re-extract, never raise out of the guard — the resume call site sits
+        # outside process_pending_cadence's per-cadence containment.
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(metadata_path, h5_paths=group.h5_paths, h5_file_stats=bad_stats)
         with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
             assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
         assert any("malformed" in r.message for r in caplog.records)
