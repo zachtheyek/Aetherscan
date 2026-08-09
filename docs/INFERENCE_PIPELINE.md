@@ -55,25 +55,28 @@ from `inference.cadence_h5_path_col` (default `".h5 path"`):
   raises `KeyError` for that CSV (logged, and the CSV is skipped).
 
 `DataPreprocessor.plan_cadences()` turns the valid groups into `PendingCadence` work units,
-each paired with a deterministic output path
-`{output_dir}/{csv_stem}_{sanitized_group_key}.npy`. The output directory default is
-**ED-fingerprint-scoped per CSV** (#298) —
-`{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/`, where the hash is
+each paired with a deterministic, **content-addressed** output path (#298/#412):
+`{output_dir}/<sha12-of-ordered-h5-paths>.npy` — 12 sha256 hex chars over the cadence's
+ordered h5 path list (CSV row order: ABACAD order is scientifically meaningful, so the same
+files listed in a different order are a different cadence and miss). The output directory
+default is **ED-fingerprint-scoped and shared by every catalog** —
+`{data_path}/cache/stamps/ed_<fingerprint12>/`, where the fingerprint is
 `run_state.preprocessing_config_fingerprint`: a fail-safe **denylist** hash of the inference
 config minus its scoring/model/viz/retry/batching keys, plus the data-section geometry.
-Energy detection is deterministic given (csv, h5 files, ED config), so **runs sharing an ED
-config share stamps** — a threshold sweep or a re-inference with new weights skips
-preprocessing entirely — while any ED-config change lands in a different directory by
+A cadence's stamps are a pure function of exactly (ordered h5 paths, ED config), and the
+cache key encodes exactly that — the catalog's name appears nowhere in it, so **runs
+sharing an ED config share stamps regardless of catalog name**: a threshold sweep, a
+re-inference with new weights, or a renamed/subset/superset catalog over the same files
+skips preprocessing entirely, while any ED-config change lands in a different directory by
 construction (an unknown new config key over-invalidates rather than ever reusing wrong
 stamps). Published `.npy` files can't be stale (atomic per-run-unique tmp → `os.replace`
-publication), and the resume guard additionally verifies each sidecar's `h5_paths` and
-recorded `ed_config_fingerprint` before reuse; only scores stay tag-scoped (in the DB).
-Pass `--preprocess-output-dir` explicitly to pin one directory across runs and CSVs (reuse
-is still guarded). Because both the output directory and per-cadence stamp filenames are
-keyed on the CSV basename stem, all `inference_files` entries must have **unique basename
-stems** — `plan_cadences()` raises `ValueError` naming both colliding entries if two share
-a stem (e.g. `runA/x.csv` and `runB/x.csv`). The fix is to rename one CSV so basenames are
-distinct.
+publication), and the resume guard additionally verifies each sidecar's `h5_paths`,
+recorded `ed_config_fingerprint`, and per-file `(size, mtime)` before reuse — the last
+warns and re-extracts when an h5 was re-staged or repaired at the same path since
+extraction (#412); size/mtime live only in the sidecar, never in the key, so a benign
+re-stage re-extracts in place without churning keys. Only scores stay tag-scoped (in the
+DB). Pass `--preprocess-output-dir` explicitly to pin a different directory (reuse is
+still guarded).
 
 ## Model loading
 
@@ -281,7 +284,7 @@ proportionally longer.)
    average on disk (380 GB for the 350-cadence subset benchmark) and buys free re-scores —
    preprocessing is the measured bulk of inference wall time (25.8k stage-seconds of the
    subset run's 12.6k-second wall), and any rerun under the same ED config (new weights,
-   threshold sweeps) skips it entirely via the fingerprint-scoped cache, so the default
+   threshold sweeps) skips it entirely via the content-addressed cache, so the default
    favors the common subset-scale iteration loop. Pruning exists for catalog scale:
    without it a full catalog writes ~30–90 TB of stamps and dies on disk after a few
    hundred cadences — **catalog runs must pass `--prune-stamps`** (the run start logs a
@@ -488,7 +491,7 @@ flagged while later writes stay live (`Database.mark_superseded`).
 
 | Artifact | Where | Notes |
 | --- | --- | --- |
-| Stamp arrays + metadata | `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/*.npy` + `.json` | Shared across runs with the same ED config (#298) — though with pruning ON (#302, the default for this directory) each `.npy` is deleted once its cadence is scored, leaving the `.json`. The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, the pre-binned `hit_spectrum_hist` + merged hit list and stored `bandpass_envelopes` (#301 — the raw per-hit frequency list is no longer stored; see [`PREPROCESSING.md`](PREPROCESSING.md)), the `.h5` header, and the `ed_config_fingerprint` the resume guard checks. |
+| Stamp arrays + metadata | `{data_path}/cache/stamps/ed_<fingerprint12>/<sha12>.npy` + `.json` | Content-addressed (#298/#412): shared across runs and catalogs with the same ED config — though with pruning ON (#302; OFF by default since #399) each `.npy` is deleted once its cadence is scored, leaving the `.json`. The `.json` carries hit provenance: stamp starts/frequencies/statistics/p-values, ED statistic histograms, the pre-binned `hit_spectrum_hist` + merged hit list and stored `bandpass_envelopes` (#301 — the raw per-hit frequency list is no longer stored; see [`PREPROCESSING.md`](PREPROCESSING.md)), the `.h5` header, and the `ed_config_fingerprint` + per-file `(size, mtime)` the resume guard checks (#412). |
 | Candidate snippet sidecars | same directory, `*.candidates.npz` | Written by the pruning step (#302): each pruned cadence's candidate snippets (~196 KB each), atomically published; `load_display_cadence` falls back to it when the stamp `.npy` is gone, so candidate figures and galleries survive pruning. |
 | Candidate rows | `inference_results` table | Positives only, with latents + provenance + the two-pass scores (`screening_proba`/`mc_mean`/`mc_std`, schema v5). |
 | Run manifest | `inference_cadences` table | Per-cadence stages, aggregates, durations. |
@@ -496,11 +499,11 @@ flagged while later writes stay live (`Database.mark_superseded`).
 | Config snapshot | `{output_path}/config_{tag}.json` | The resolved (saved-config + CLI) view this run actually used. |
 | Figures | `{output_path}/plots/inference/{tag}/` | The visualization suite below; also uploaded to the run's Slack thread. |
 | Resource plot | `{output_path}/plots/resource_utilization_{tag}.png` | Written by the monitor at shutdown. |
-| PFB response cache | `{output_path}/cache/pfb/pfb_response_*.npy` | Content-addressed by channelization geometry; one file per `(width, coarse count, taps)`, shared across all `.h5` and all runs. See [The PFB response cache](#the-pfb-response-cache). |
+| PFB response cache | `{data_path}/cache/pfb/pfb_response_*.npy` | Content-addressed by channelization geometry; one file per `(width, coarse count, taps)`, shared across all `.h5` and all runs. Moved from `{output_path}` into the unified `{data_path}/cache/` root by #412. See [The PFB response cache](#the-pfb-response-cache). |
 
 ### The PFB response cache
 
-`{output_path}/cache/pfb/pfb_response_w{W}_c{C}_t{T}.npy` caches the **static PFB coarse-channel
+`{data_path}/cache/pfb/pfb_response_w{W}_c{C}_t{T}.npy` caches the **static PFB coarse-channel
 passband response** — the filter shape that `pfb.equalize_passband` divides each coarse channel by
 during bandpass flattening. It is **not** a cache of preprocessed `.h5` output: it holds a single
 ~8 MB array, computed once per channelization *geometry* by an ~`n_chans`-point FFT

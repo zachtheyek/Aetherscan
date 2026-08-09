@@ -10,11 +10,10 @@ bind by default — either bind it explicitly:
     SINGULARITY_BIND=/datag ./utils/run_container.sh python -m pytest tests/ -m "gpu or cluster" -q
 
 or rely on the resume path: preprocessing skips any cadence whose stamp .npy already exists.
-Since #298 the default stamp directory is ED-fingerprint-scoped ({data_path}/inference/
-preprocessed/<csv_stem>_ed<hash12>/), shared across runs with the same ED config — so a
-fresh-tagged run resumes automatically off any prior same-config run's stamps. When /datag
-is not mounted and only legacy stamps exist under <output>/preprocessed, the test still
-points --preprocess-output-dir at them explicitly (the pinned-directory escape hatch).
+Since #412 the default stamp cache is content-addressed ({data_path}/cache/stamps/
+ed_<fingerprint12>/<sha12-of-ordered-h5-paths>.npy), shared across catalogs and runs with
+the same ED config — so a fresh-tagged run resumes automatically off any prior
+same-config run's stamps, whatever CSV produced them.
 """
 
 from __future__ import annotations
@@ -62,15 +61,16 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
         if not os.path.exists(required):
             pytest.skip(f"required cluster artifact missing: {required}")
 
-    # Raw .h5 reads need /datag; already-preprocessed stamps make it optional (and since
-    # #298 the fingerprint-scoped default cache resumes same-ED-config stamps on its own);
-    # only legacy stamps under <output>/preprocessed still need the explicit directory.
-    extra_flags: list[str] = []
-    if not os.path.exists("/datag"):
-        legacy_dir = os.path.join(output_path, "preprocessed")
-        if not glob.glob(os.path.join(legacy_dir, "subset_test_*.npy")):
-            pytest.skip("/datag not mounted and no preprocessed subset stamps to resume from")
-        extra_flags = ["--preprocess-output-dir", legacy_dir]
+    # Raw .h5 reads need /datag; already-cached stamps make it optional — the
+    # content-addressed default cache (#412) resumes same-ED-config stamps on its own,
+    # regardless of which catalog produced them. Without /datag or any cached stamps
+    # there is nothing to run against. (Coarse check: an ED-config mismatch between the
+    # cached stamps and this run would still fail on the missing /datag — acceptable for
+    # a cluster smoke.)
+    if not os.path.exists("/datag") and not glob.glob(
+        os.path.join(data_path, "cache", "stamps", "ed_*", "*.npy")
+    ):
+        pytest.skip("/datag not mounted and no cached stamps to resume from")
 
     # --save-tag takes a BARE PREFIX since #272 (the run stamps its own datetime); this
     # smoke passed a bare datetime — rejected by validation — and had been silently broken
@@ -91,7 +91,6 @@ def test_inference_smoke(cluster_paths, run_pipeline, smoke_model_tag):
             "inf",
             "--max-retries",
             "1",
-            *extra_flags,
         ]
     )
 

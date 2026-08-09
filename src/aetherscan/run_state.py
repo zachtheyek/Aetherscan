@@ -151,8 +151,8 @@ def preprocessing_config_fingerprint(config_dict: dict) -> str:
     """
     Stable hash of the PREPROCESSING-result-affecting config — everything that changes what
     energy detection writes into a stamp .npy (#298 I3). Keys the default stamp cache
-    directory ({data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/), is persisted into
-    each cadence's metadata JSON as ed_config_fingerprint, and is verified by the resume
+    directory ({data_path}/cache/stamps/ed_<hash12>/, #412), is persisted into each
+    cadence's metadata JSON as ed_config_fingerprint, and is verified by the resume
     guard — so runs sharing an ED config share stamps, and any ED-config change lands in a
     different directory by construction.
     """

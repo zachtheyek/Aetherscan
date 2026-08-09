@@ -1020,14 +1020,14 @@ def _add_inference_flags_to(parser):
         "--preprocess-output-dir",
         type=str,
         default=None,
-        help="Directory for per-cadence .npy outputs from preprocessing. Default: a per-CSV directory {data_path}/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on the energy-detection config fingerprint — runs sharing an ED config reuse each other's stamps automatically, and any ED-config change resolves to a fresh directory. Pass a directory explicitly to pin/share one location (reuse is still guarded by the sidecar's recorded h5 paths and ED fingerprint)",
+        help="Directory for per-cadence .npy outputs from preprocessing. Default: the content-addressed stamp cache {data_path}/cache/stamps/ed_<hash>/ keyed on the energy-detection config fingerprint, with filenames hashed from each cadence's ordered h5 path list — runs sharing an ED config reuse each other's stamps automatically regardless of catalog name, and any ED-config change resolves to a fresh directory. Pass a directory explicitly to pin/share one location (reuse is still guarded by the sidecar's recorded h5 paths, ED fingerprint, and per-file size/mtime)",
     )
 
     parser.add_argument(
         "--prune-stamps",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Default: DISABLED — stamps are retained (~1 GB/cadence average) so re-scoring the same data under the same energy-detection config (new weights, threshold sweeps) skips preprocessing entirely via the fingerprint-scoped cache. Pass --prune-stamps on catalog-scale runs: without pruning a full catalog writes ~30-90 TB of stamps and dies on disk.",
+        help="Delete each cadence's stamp .npy right after its 'inferred' manifest row lands, keeping the metadata .json plus a ~196 KB snippet sidecar per candidate — resume rides the DB row, and only stamps this run freshly extracted are ever pruned. Default: DISABLED — stamps are retained (~1 GB/cadence average) so re-scoring the same data under the same energy-detection config (new weights, threshold sweeps) skips preprocessing entirely via the content-addressed cache. Pass --prune-stamps on catalog-scale runs: without pruning a full catalog writes ~30-90 TB of stamps and dies on disk.",
     )
 
     parser.add_argument(

@@ -94,7 +94,7 @@ flowchart TB
         CSV["CSV catalog(s)<br/>{data_path}/inference/"] --> GROUP["group_observations_from_csv()<br/>rows → 6-obs cadences"]
         H5[".h5 filterbank files"] --> ED
         GROUP --> ED["energy detection per cadence<br/>DC spike → bandpass flatten → k² threshold"]
-        ED --> NPY["per-cadence stamp .npy + metadata .json<br/>preprocessed/&lt;csv_stem&gt;_ed&lt;hash12&gt;/"]
+        ED --> NPY["per-cadence stamp .npy + metadata .json<br/>cache/stamps/ed_&lt;fingerprint12&gt;/"]
         NPY --> ENC["InferencePipeline.run_inference()<br/>encoder → latents → RF P(true)"]
         ART -. "trained models" .-> ENC
         ENC -. "inference_results (positives) + inference_cadences manifest" .-> DB
@@ -236,10 +236,12 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 {data_path}/
 ├── training/                          # background plate .npy files (config.data.train_files)
 ├── testing/                           # preprocessed test .npy files (config.data.test_files)
-└── inference/                         # CSV catalogs (config.data.inference_files)
-    └── preprocessed/<csv_stem>_ed<hash12>/ # per-cadence stamp .npy + metadata .json
-                                       #   (ED-config-fingerprint-scoped: runs sharing an
-                                       #    energy-detection config reuse each other's stamps)
+├── inference/                         # CSV catalogs (config.data.inference_files)
+└── cache/                             # unified preprocessing-cache root (#412)
+    ├── stamps/ed_<fingerprint12>/     # content-addressed per-cadence stamp .npy + metadata
+    │                                  #   .json — <sha12-of-ordered-h5-paths>.npy: runs and
+    │                                  #   catalogs sharing an ED config reuse each other's stamps
+    └── pfb/pfb_response_*.npy         # content-addressed PFB passband responses (tag-independent)
 
 {model_path}/
 ├── vae_encoder_{tag}.keras            # final encoder (the inference model)
@@ -260,7 +262,6 @@ Three roots, set by `AETHERSCAN_{DATA,MODEL,OUTPUT}_PATH` (defaults under
 ├── inference_reference_cloud_{tag}.npz # MC-scored survey reference cloud (candidate uncertainty plot)
 ├── db/aetherscan.db                   # SQLite (WAL) — all stats/results tables
 ├── logs/aetherscan_{tag}.log          # this run's log (mode="w": overwrites the same tag's log on rerun)
-├── cache/pfb/pfb_response_*.npy       # content-addressed PFB passband responses (tag-independent)
 ├── round_data/{tag}/round_XX/         # per-round training memmaps (deleted after the round trains)
 │   └── rf/                            #   plus the RF training dataset
 └── plots/
