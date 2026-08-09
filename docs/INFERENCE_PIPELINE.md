@@ -75,18 +75,34 @@ recorded `ed_config_fingerprint`, and per-file `(size, mtime)` before reuse — 
 warns and re-extracts when an h5 was re-staged or repaired at the same path since
 extraction (#412); size/mtime live only in the sidecar, never in the key, so a benign
 re-stage re-extracts in place without churning keys. Only scores stay tag-scoped (in the
-DB). Pass `--preprocess-output-dir` explicitly to pin a different directory (reuse is
-still guarded).
+DB). Cadences whose ordered h5 list repeats across a run's `inference_files` — including
+within **one** catalog, e.g. the same six files listed at two hit frequencies (the default
+`cadence_group_by_cols` include `Frequency`, which energy detection never reads: hits are
+re-derived over the whole band, so such rows' stamps and scores are identical by
+construction) — are **planned once**, first occurrence wins: one manifest row, one
+`group.key`, one candidate set. A truncated-digest collision between two genuinely
+*different* cadences raises a `ValueError` naming the cadence rather than silently dropping
+one. Cache keys compare the h5 **path strings byte-for-byte** (deliberately no
+`normpath`/`realpath` — resolution would break the unreachable-raws re-score case), so a
+symlink alias or a different mount prefix for the same files misses the cache; keep catalog
+path spellings stable across regenerations. Pass `--preprocess-output-dir` explicitly to
+pin a different directory (reuse is still guarded).
 
 > **Migrating from the pre-#412 layout.** The old trees —
 > `{data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/` and `{output_path}/cache/pfb/`
 > — are orphaned by the re-keying (nothing reads or deletes them): delete them by hand after
 > upgrading (both are regenerable; the PFB response can alternatively be `mv`'d to
-> `{data_path}/cache/pfb/`). Leaving old stamp trees in place transiently doubles the stamp
-> footprint on scratch while the new cache warms. And don't resume a `--save-tag` started
-> pre-#412 across the upgrade: resume and supersede both key on `npy_path`, so such a run
-> re-preprocesses and re-infers every cadence at the new paths while the old-layout rows
-> under that tag stay live — start a fresh tag instead.
+> `{data_path}/cache/pfb/`). A large stamp cache can instead be **re-keyed without
+> re-extraction**: every old sidecar records `h5_paths`, and the new name is exactly
+> `sha256(json.dumps(h5_paths).encode()).hexdigest()[:12] + ".npy"` — rename each
+> `.npy`/`.json` pair accordingly and move it under `{data_path}/cache/stamps/ed_<fp12>/`.
+> Stamps inside a pinned `--preprocess-output-dir` are orphaned in place the same way (the
+> planner now looks for content-hashed names in that directory too). Leaving old stamp
+> trees in place transiently doubles the stamp footprint on scratch while the new cache
+> warms. And don't resume a `--save-tag` started pre-#412 across the upgrade: resume and
+> supersede both key on `npy_path`, so such a run re-preprocesses and re-infers every
+> cadence at the new paths while the old-layout rows under that tag stay live — start a
+> fresh tag instead.
 
 ## Model loading
 

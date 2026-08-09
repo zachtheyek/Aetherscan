@@ -1406,12 +1406,73 @@ class TestPlanCadencesOutputDir:
         # race the duplicate's prefetch.
         config = get_config()
         make_inference_csv("run_a/subset.csv")
-        make_inference_csv("run_b/subset.csv")
+        default_h5 = [f"/data/obs_{i}.h5" for i in range(6)]
+        make_inference_csv(
+            "run_b/subset.csv",
+            groups=[
+                # Same ordered h5 list under a DIFFERENT group key (a fixed Target typo):
+                # same cadence content -> deduped, first occurrence's key survives
+                (
+                    {
+                        "Target": "HIP_RENAMED",
+                        "Session": "AGBT21B_999_31",
+                        "Band": "L",
+                        "Cadence ID": "0",
+                        "Frequency": "1400",
+                    },
+                    default_h5,
+                ),
+                # A genuinely distinct cadence must survive the dedupe
+                (
+                    {
+                        "Target": "HIP99999",
+                        "Session": "AGBT21B_999_32",
+                        "Band": "L",
+                        "Cadence ID": "1",
+                        "Frequency": "1400",
+                    },
+                    [f"/data/other_{i}.h5" for i in range(6)],
+                ),
+            ],
+        )
         config.data.inference_files = ["run_a/subset.csv", "run_b/subset.csv"]
 
         units = DataPreprocessor().plan_cadences()
 
+        assert len(units) == 2
+        # First occurrence wins: run_a's key survives, the renamed duplicate's doesn't
+        assert units[0].group.key[0] == "HIP110750"
+        assert units[1].group.key[0] == "HIP99999"
+        # unit.index stays contiguous across the skip (stage-timer span names ride on it)
+        assert [u.index for u in units] == [1, 2]
+
+    def test_same_csv_duplicate_cadences_plan_once(self, initialized_runtime, make_inference_csv):
+        # The common real-catalog shape (#417 review note 2): ONE catalog listing the same
+        # six files at two hit frequencies makes two groups with identical ordered h5
+        # lists — the default cadence_group_by_cols include Frequency, which energy
+        # detection never reads (hits are re-derived over the whole band), so the rows'
+        # stamps and scores are identical by construction: one planned unit.
+        config = get_config()
+        h5_paths = [f"/data/obs_{i}.h5" for i in range(6)]
+        base_key = {
+            "Target": "HIP110750",
+            "Session": "AGBT21B_999_31",
+            "Band": "L",
+            "Cadence ID": "0",
+        }
+        make_inference_csv(
+            "subset.csv",
+            groups=[
+                ({**base_key, "Frequency": "1400"}, h5_paths),
+                ({**base_key, "Frequency": "1670"}, h5_paths),
+            ],
+        )
+        config.data.inference_files = ["subset.csv"]
+
+        units = DataPreprocessor().plan_cadences()
+
         assert len(units) == 1
+        assert units[0].group.key[-1] == "1400"  # first occurrence wins
 
     def test_true_digest_collision_raises(
         self, initialized_runtime, make_inference_csv, monkeypatch
