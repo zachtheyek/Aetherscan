@@ -255,7 +255,13 @@ proportionally longer.)
    content is unchanged, and resume/queries key on `(tag, npy_path)`, never on order. Each unit of depth overlaps disk-bound energy
    detection with decompression-bound extraction and the serial per-cadence sections, at
    the cost of one in-flight cadence of RAM (up to ~65 GB for RFI-dense C-band
-   cadences). A prefetch-side load failure degrades to loading on the inference thread
+   cadences). A catalog-derived RAM preflight (#408) runs at startup: it estimates
+   (depth + 1) in-flight cadences of the largest per-band worst-case footprint among the
+   bands actually present in the pending catalog (C ~65 GB / L ~15 / S ~12 / X ~8,
+   observed tails from the subset benchmark; unknown bands assume the C figure) and logs
+   a WARNING with a suggested `--prefetch-depth` when that exceeds ~90% of host RAM —
+   deliberately warn-only, never a clamp, so cross-host wall-clock comparisons stay
+   comparable. A prefetch-side load failure degrades to loading on the inference thread
    under the per-cadence containment below.
 5. **Per-cadence inference** (`main.py:_infer_cadence`):
    - provenance derived from the group key + metadata JSON

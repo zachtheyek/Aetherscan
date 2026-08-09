@@ -675,3 +675,61 @@ class TestPostBenchmarkReport:
             pass
         main._post_benchmark_report("test_v1")  # must not raise
         assert slack_upload == []
+
+
+class TestPrefetchRamPreflight:
+    """#408: catalog-derived RAM preflight — warn, never clamp. The estimate keys on the
+    bands actually present in the pending catalog, so an X-band-only catalog stays quiet
+    where a C-band one warns on the same small host."""
+
+    def _units(self, bands):
+        cols = ["Target", "Session", "Band", "Cadence ID", "Frequency"]
+        units = []
+        for i, band in enumerate(bands):
+            group = types.SimpleNamespace(key=(f"T{i}", "S1", band, str(i), "1400"))
+            units.append(types.SimpleNamespace(group=group, npy_path=f"/x/{i}.npy", index=i + 1))
+        return units, cols
+
+    def test_c_band_catalog_warns_on_small_host_with_suggestion(self):
+        units, cols = self._units(["C", "X"])
+        # depth 4 -> 5 in-flight x 65 GB = 325 GB > 90% of 288 GB
+        message = main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0)
+        assert message is not None
+        assert "325 GB" in message
+        # 0.9 * 288 // 65 = 3 -> suggested depth 2 (3 in-flight fit the budget)
+        assert "--prefetch-depth 2" in message
+
+    def test_x_band_only_catalog_quiet_on_same_host(self):
+        units, cols = self._units(["X", "X", "X"])
+        # 5 in-flight x 8 GB = 40 GB, far under the budget
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0) is None
+
+    def test_large_host_quiet_even_for_c_band(self):
+        units, cols = self._units(["C"])
+        # blpc3-scale: 325 GB < 0.9 * 503 GB
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=503.0) is None
+
+    def test_unknown_band_and_missing_band_column_are_conservative(self):
+        units, cols = self._units(["Q"])  # not in the table -> C-band worst case
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0) is not None
+        # No 'Band' group-by column at all -> conservative too
+        units2, _ = self._units(["X"])
+        no_band_cols = ["Target", "Session", "Cadence ID"]
+        assert (
+            main._prefetch_ram_preflight(units2, no_band_cols, depth=4, total_ram_gb=288.0)
+            is not None
+        )
+
+    def test_empty_pending_and_degenerate_inputs_return_none(self):
+        units, cols = self._units(["C"])
+        assert main._prefetch_ram_preflight([], cols, depth=4, total_ram_gb=288.0) is None
+        assert main._prefetch_ram_preflight(units, cols, depth=0, total_ram_gb=288.0) is None
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=0.0) is None
+
+    def test_suggested_depth_never_below_one(self):
+        units, cols = self._units(["C"])
+        # 65 GB host: even depth 1 (2 in-flight = 130 GB) exceeds the budget, but the
+        # suggestion floors at 1 rather than suggesting an invalid depth
+        message = main._prefetch_ram_preflight(units, cols, depth=3, total_ram_gb=65.0)
+        assert message is not None
+        assert "--prefetch-depth 1" in message

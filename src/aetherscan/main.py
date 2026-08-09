@@ -501,6 +501,72 @@ def train_command():
     _report_final_training_status(pipeline)
 
 
+# Observed per-band worst-case in-flight cadence footprints (GB) for the RAM preflight
+# (#408): the largest single-cadence loaded stamp array measured on the 350-cadence /datag
+# subset benchmark, per band (max stamps/cadence x 196,608 B/snippet: C 329,749 stamps at
+# 8438 MHz -> ~65 GB; L 73,004 -> ~15; S 56,880 -> ~12; X 37,139 -> ~8). These are observed
+# tails, not bounds — a catalog can exceed them — so the preflight is a WARNING, never a
+# clamp (#408: a silent step-down would make cross-host wall-clock comparisons quietly
+# incomparable). Bands the table doesn't know assume the C-band worst case.
+_BAND_WORST_CASE_INFLIGHT_GB = {"L": 15.0, "S": 12.0, "C": 65.0, "X": 8.0}
+_UNKNOWN_BAND_WORST_CASE_GB = 65.0
+# Fraction of total host RAM the worst case may occupy before the preflight warns: the
+# remainder covers TF/models/pool overhead and page-cache headroom (the README's OOM note).
+_RAM_PREFLIGHT_BUDGET_FRACTION = 0.9
+
+
+def _prefetch_ram_preflight(
+    pending: list, group_by_cols: list[str], depth: int, total_ram_gb: float
+) -> str | None:
+    """
+    Catalog-derived RAM preflight for the prefetch pipeline (#408): estimate the worst-case
+    resident footprint as (depth + 1) in-flight cadences (the prefetch slots plus the one
+    being inferred) of the largest per-band footprint among the bands ACTUALLY present in
+    the pending catalog, and return a warning string when it exceeds the host budget
+    (None otherwise — the caller logs, nothing is ever clamped). Keying on the catalog's
+    band mix rather than the static C-band worst case keeps the warning quiet on e.g. an
+    X-band-only catalog, whose observed tail is ~8x smaller. Bands are read from the
+    cadence group keys via the configured 'Band' group-by column; catalogs grouped without
+    one assume the conservative unknown-band worst case.
+    """
+    if not pending or depth < 1 or total_ram_gb <= 0:
+        return None
+    try:
+        band_index = group_by_cols.index("Band")
+    except ValueError:
+        band_index = None
+
+    worst_gb = 0.0
+    bands: set[str] = set()
+    for unit in pending:
+        key = unit.group.key
+        if band_index is not None and band_index < len(key):
+            band = str(key[band_index]).strip().upper() or "?"
+        else:
+            band = "?"
+        bands.add(band)
+        worst_gb = max(
+            worst_gb, _BAND_WORST_CASE_INFLIGHT_GB.get(band, _UNKNOWN_BAND_WORST_CASE_GB)
+        )
+
+    budget_gb = total_ram_gb * _RAM_PREFLIGHT_BUDGET_FRACTION
+    worst_total_gb = (depth + 1) * worst_gb
+    if worst_total_gb <= budget_gb:
+        return None
+
+    # The largest depth whose worst case fits the budget ((d + 1) in-flight cadences)
+    suggested_depth = max(1, int(budget_gb // worst_gb) - 1)
+    return (
+        f"RAM preflight (#408): --prefetch-depth {depth} budgets {depth + 1} in-flight "
+        f"cadence(s) x ~{worst_gb:.0f} GB (worst observed for band(s) "
+        f"{', '.join(sorted(bands))}) ≈ {worst_total_gb:.0f} GB, above "
+        f"{_RAM_PREFLIGHT_BUDGET_FRACTION:.0%} of this host's {total_ram_gb:.0f} GB RAM. "
+        f"The estimate is a per-band worst case, not a measurement — the run proceeds "
+        f"unclamped — but if this host has OOM'd before, consider --prefetch-depth "
+        f"{suggested_depth}."
+    )
+
+
 class NonRetryableInferenceError(RuntimeError):
     """A permanent inference failure (bad catalog/config) that retrying cannot fix.
 
@@ -837,6 +903,23 @@ def _run_streaming_csv_inference(
             "under the same ED config). Catalog-scale runs should pass --prune-stamps to "
             "bound disk usage."
         )
+
+    # RAM preflight (#408): warn — never clamp — when the catalog's per-band worst case
+    # exceeds the host budget at the configured depth. psutil is deferred so this module
+    # stays importable without it (the monitor already owns the hard dependency).
+    try:
+        import psutil  # noqa: PLC0415
+
+        preflight_warning = _prefetch_ram_preflight(
+            pending,
+            config.inference.cadence_group_by_cols,
+            max(1, config.inference.prefetch_depth),
+            psutil.virtual_memory().total / 1e9,
+        )
+        if preflight_warning:
+            logger.warning(preflight_warning)
+    except Exception as e:
+        logger.info(f"RAM preflight skipped ({e}); run is unaffected")
 
     failed_keys: list[tuple] = []
     if pending:
