@@ -1158,8 +1158,8 @@ def _shap_cache_consistent(
 
     Checks are shape-only: sample counts, index ranges, and the winning variant's feature width.
     Content identity is deliberately out of scope here and handled one level up (#414): the
-    caller verifies the payload's `input_fingerprint` (eval matrix + labels + persisted RF —
-    see _shap_input_fingerprint) after this shape gate passes, so a retrain under a reused
+    caller verifies the payload's `input_fingerprint` (train + eval matrices + labels +
+    persisted RF — see _shap_input_fingerprint) after this shape gate passes, so a retrain under a reused
     tag that changes the val *contents* but not `n_val` no longer slips through. The
     clustering cache carries its own content fingerprint of the SHAP matrix it was fit on
     (see plot_rf_shap_explanation_clustering), so with both fingerprints in place a
@@ -1221,8 +1221,9 @@ def _shap_content_fingerprint(shap_values: np.ndarray) -> str:
 
 def _rf_artifact_digest(rf_path: str) -> str:
     """sha256 over the persisted RF joblib's bytes. Raises OSError when the file is
-    missing/unreadable — the caller decides whether that means fail (write side, where the
-    file was just dumped) or degrade (read side, where cannot-verify is not verified-stale).
+    missing/unreadable — the caller decides what that means: fail (write side, where the
+    file was just dumped) or, on the read side, choose between recomputing and degrading to
+    unverified reuse depending on whether a model is in memory to recompute from.
 
     NOTE: byte-digest validity rests on the invariant that re-dumping the SAME in-process
     forest is byte-identical — which holds today (final_save re-dumps this exact path after
