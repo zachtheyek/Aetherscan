@@ -200,7 +200,10 @@ impossible:
    the TestPyPI dry run it validates only (no build, no push), so the gate stays uniform.
 7. **Publish to PyPI via trusted publishing** — `pypa/gh-action-pypi-publish` (SHA-pinned)
    with `permissions: id-token: write` and the `pypi` environment. OIDC-based: **no long-lived
-   PyPI API token is stored anywhere** in the repo or its secrets.
+   PyPI API token is stored anywhere** in the repo or its secrets. The `pypi` environment
+   carries a **required-reviewer protection rule**, so the `publish` job WAITS for approval
+   rather than running — it is not hung. Approve in the run's UI, or as the maintainer via
+   `gh api .../pending_deployments` + POST `state=approved`.
 8. **GitHub Release** — created from the tag (`gh release create --verify-tag
    --generate-notes`) with the built sdist + wheel attached; curate the body from the
    per-PR `claude-release-notes` comments (see
