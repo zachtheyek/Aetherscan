@@ -554,25 +554,36 @@ def _prefetch_ram_preflight(
             worst_gb = band_gb
             driving_band = band
 
+    if driving_band == "?":
+        # No band column in the cadence grouping (or blank cells): "driven by band ? of ?"
+        # would read as a formatting bug — name the conservative assumption instead
+        band_label = "the conservative unknown-band worst case (no band in the grouping)"
+    else:
+        band_label = f"band {driving_band} of {', '.join(sorted(bands))}"
+
     budget_gb = total_ram_gb * _RAM_PREFLIGHT_BUDGET_FRACTION
     worst_total_gb = (depth + 1) * worst_gb
     if worst_total_gb <= budget_gb:
         return None
 
-    # The largest depth whose worst case fits the budget ((d + 1) in-flight cadences)
-    suggested_depth = max(1, int(budget_gb // worst_gb) - 1)
-    if suggested_depth < depth:
+    # The largest depth whose worst case fits the budget ((d + 1) in-flight cadences).
+    # Tested UNCLAMPED (second-pass review): flooring first would lift a "nothing fits"
+    # candidate of 0 to 1, and 1 < depth for every depth >= 2 — the message would then
+    # recommend a depth its own arithmetic rejects (e.g. a 100 GB host at depth 4:
+    # budget 90, 90 // 65 = 1, raw candidate 0, but 2 x 65 = 130 GB still over budget).
+    suggested_depth = int(budget_gb // worst_gb) - 1
+    if 1 <= suggested_depth < depth:
         advice = f"but if this host has OOM'd before, consider --prefetch-depth {suggested_depth}."
     else:
-        # depth is already at (or below) the floor: no step-down exists, say so honestly
+        # No depth >= 1 fits the budget: say so honestly instead of suggesting one
         advice = (
-            f"and no --prefetch-depth fits this host's budget for band {driving_band} — "
+            f"and no --prefetch-depth fits this host's budget for {band_label} — "
             f"a smaller catalog slice or a larger-RAM host is the real fix."
         )
     return (
         f"RAM preflight: --prefetch-depth {depth} budgets {depth + 1} in-flight "
-        f"cadence(s) x ~{worst_gb:.0f} GB (worst case, driven by band {driving_band} of "
-        f"{', '.join(sorted(bands))}) ≈ {worst_total_gb:.0f} GB, above "
+        f"cadence(s) x ~{worst_gb:.0f} GB (worst case, driven by {band_label}) "
+        f"≈ {worst_total_gb:.0f} GB, above "
         f"{_RAM_PREFLIGHT_BUDGET_FRACTION:.0%} of this host's {total_ram_gb:.0f} GB "
         f"({total_ram_gb * 1e9 / 2**30:.1f} GiB — the monitor's 'GB' figure) RAM. "
         f"The estimate is a per-band worst case, not a measurement — the run proceeds "

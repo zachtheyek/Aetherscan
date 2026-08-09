@@ -755,6 +755,25 @@ class TestPrefetchRamPreflight:
         assert "no --prefetch-depth fits" in message
         assert "consider --prefetch-depth" not in message
 
+    def test_nothing_fits_at_depth_ge_2_does_not_suggest_a_rejected_depth(self):
+        # Second-pass review catch: on a 100 GB host at depth 4 the budget holds exactly
+        # one in-flight cadence (90 // 65 = 1, raw candidate 0) — the pre-fix clamp lifted
+        # 0 to 1 and recommended a depth whose own worst case (2 x 65 = 130 GB) the
+        # arithmetic rejects. The unclamped test must fall through to the honest branch.
+        units, cols = self._units(["C"])
+        message = main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=100.0)
+        assert message is not None
+        assert "no --prefetch-depth fits" in message
+        assert "consider --prefetch-depth" not in message
+
+    def test_unknown_band_message_names_the_assumption_not_a_question_mark(self):
+        # Catalogs grouped without a band column must not render "driven by band ? of ?"
+        units, no_band_cols = self._units(["X"], group_by_cols=["Target", "Session", "Cadence ID"])
+        message = main._prefetch_ram_preflight(units, no_band_cols, depth=4, total_ram_gb=288.0)
+        assert message is not None
+        assert "unknown-band worst case" in message
+        assert "band ? of" not in message
+
     def test_call_site_wiring_logs_warning_through_streaming_loop(
         self, stubbed_streaming, monkeypatch, caplog
     ):
