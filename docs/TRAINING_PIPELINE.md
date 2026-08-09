@@ -729,7 +729,16 @@ outcome, val partition indices).
 ### SHAP explainability performance (CPU multiprocessing; GPU is a documented alternative)
 
 The five SHAP figures share `rf_shap_values_{tag}.joblib`, computed once by
-`_compute_or_load_shap_values`. shap's TreeSHAP C extension is **single-threaded** (no OpenMP, no
+`_compute_or_load_shap_values`. Both SHAP caches are **self-validating on load** (#359/#414):
+the values cache passes shape/config checks *and* an `input_fingerprint` comparison — a sha256
+of the eval matrix + labels and the persisted RF artifact's bytes — so a leftover cache from
+an older model or a changed val split recomputes with a warning instead of being served (a
+pre-#414 cache without the fingerprint migrates via one recompute; an un-verifiable
+fingerprint — no RF artifact on disk — degrades to warn-and-reuse); the clustering cache
+carries its own content fingerprint of the exact SHAP matrix it was fit on. Together the two
+fingerprints close the coherently-stale-pair gap: a values+clustering pair that is internally
+consistent but belongs to a previous model can no longer slip through as a matched set.
+shap's TreeSHAP C extension is **single-threaded** (no OpenMP, no
 `n_jobs`; the RF's own `n_jobs` does not apply — shap re-walks the trees itself), so on a 1000-tree
 forest the step is dominated by the **interaction** pass and runs for hours-to-days if left serial
 (measured ~183 s/sample on a depth-53 RF → ~76 h for 1500 interaction samples; the whole tail is

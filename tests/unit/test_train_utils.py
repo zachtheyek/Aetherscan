@@ -2,10 +2,10 @@
 
 """Unit tests for aetherscan.train pure-logic helpers: checkpoint tag resolution, curriculum
 schedules, directory archiving, encoder-trained heuristics, the val-AUC quality floor, SHAP
-output normalization, the SHAP disk-cache consistency guards (#359), the rf_train dataset
-producer-await/fallback composition (_obtain_rf_dataset), the rf_plots overlap coordinator
-(plot_rf_diagnostics), and the training stage machine (skip-if-done / record-failure semantics
-against a stub pipeline)."""
+output normalization, the SHAP disk-cache consistency guards (#359) and input fingerprint
+(#414), the rf_train dataset producer-await/fallback composition (_obtain_rf_dataset), the
+rf_plots overlap coordinator (plot_rf_diagnostics), and the training stage machine
+(skip-if-done / record-failure semantics against a stub pipeline)."""
 
 from __future__ import annotations
 
@@ -40,8 +40,10 @@ from aetherscan.train import (
     TrainingPipeline,
     _execute_training_stages,
     _resolve_load_tag,
+    _rf_artifact_digest,
     _shap_cache_consistent,
     _shap_content_fingerprint,
+    _shap_input_fingerprint,
     archive_directory,
     build_epoch_history,
     check_encoder_trained,
@@ -844,8 +846,11 @@ class TestShapCacheConsistent:
 
 
 class TestComputeOrLoadShapValuesCacheGuard:
-    """_compute_or_load_shap_values (#359): the on-disk cache is returned only when it passes
-    the consistency guard; a stale payload is recomputed and its file overwritten."""
+    """_compute_or_load_shap_values (#359 + #414): the on-disk cache is returned only when it
+    passes the shape-consistency guard AND its recorded input fingerprint (eval matrix +
+    labels + persisted RF artifact) matches the inputs in hand; a stale payload is recomputed
+    and its file overwritten, and a fingerprint that cannot be verified (no RF artifact on
+    disk) degrades to warn-and-reuse."""
 
     N_VAL = 32
     N_FEATURES = 6
@@ -872,6 +877,23 @@ class TestComputeOrLoadShapValuesCacheGuard:
     def _shap_path(self, config, tag="test_v1"):
         return os.path.join(
             config.model_path, f"rf_shap_values_{display_tag(tag, get_machine_name())}.joblib"
+        )
+
+    def _rf_path(self, config, tag="test_v1"):
+        return os.path.join(
+            config.model_path, f"random_forest_{display_tag(tag, get_machine_name())}.joblib"
+        )
+
+    def _dump_rf_and_fingerprint(self, config, artifacts, model=None):
+        """Persist an RF artifact and return the #414 input fingerprint a cache written
+        against (these artifacts, that RF file) would carry."""
+        rf_path = self._rf_path(config)
+        os.makedirs(os.path.dirname(rf_path), exist_ok=True)
+        joblib.dump(model if model is not None else {"stub": "rf"}, rf_path)
+        return _shap_input_fingerprint(
+            artifacts["val_features"],
+            artifacts["val_binary_labels"],
+            _rf_artifact_digest(rf_path),
         )
 
     def _stub_compute(self, monkeypatch, calls):
@@ -905,20 +927,124 @@ class TestComputeOrLoadShapValuesCacheGuard:
 
     def test_consistent_cache_returned_without_recompute(self, monkeypatch):
         pipeline = self._pipeline(n_summary=8, n_interact=4)
+        artifacts = self._artifacts()
         payload = _shap_payload(
             n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
         )
+        # #414: a servable cache carries the input fingerprint of (these artifacts, the
+        # RF artifact on disk)
+        payload["input_fingerprint"] = self._dump_rf_and_fingerprint(pipeline.config, artifacts)
         shap_path = self._shap_path(pipeline.config)
         os.makedirs(os.path.dirname(shap_path), exist_ok=True)
         joblib.dump(payload, shap_path)
 
         calls = []
         self._stub_compute(monkeypatch, calls)
-        result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+        result = TrainingPipeline._compute_or_load_shap_values(pipeline, artifacts)
 
         assert calls == []  # never entered the compute path
         assert np.array_equal(result["summary_indices"], payload["summary_indices"])
         assert pipeline._rf_shap_cache["test_v1"] is result
+
+    def test_pre_414_cache_without_fingerprint_recomputed(self, monkeypatch, caplog):
+        # A pre-#414 cache passes every shape check but records no input fingerprint —
+        # it cannot be tied to the current model/data, so it migrates via one recompute.
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        legacy = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(legacy, shap_path)
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
+        assert any("predate the input fingerprint" in r.message for r in caplog.records)
+        assert calls == ["summary", "interaction", "logloss"]
+        # The rewritten cache is post-#414: it now carries the fingerprint
+        assert "input_fingerprint" in result
+        assert joblib.load(shap_path)["input_fingerprint"] == result["input_fingerprint"]
+
+    def test_different_model_same_shapes_recomputed(self, monkeypatch, caplog):
+        # The #414 core case: every shape matches (same seeds, same n_val), but the cache
+        # was fingerprinted against a DIFFERENT RF artifact — a leftover values cache from
+        # an older model must not be served.
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        artifacts = self._artifacts()
+        stale = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        stale["input_fingerprint"] = self._dump_rf_and_fingerprint(
+            pipeline.config, artifacts, model={"stub": "OLD rf"}
+        )
+        # The current model's artifact replaces the old one on disk
+        joblib.dump({"stub": "rf"}, self._rf_path(pipeline.config))
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(stale, shap_path)
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = TrainingPipeline._compute_or_load_shap_values(pipeline, artifacts)
+
+        assert any("input-fingerprint mismatch" in r.message for r in caplog.records)
+        assert calls == ["summary", "interaction", "logloss"]
+        # The fresh cache is fingerprinted against the CURRENT RF artifact
+        assert result["input_fingerprint"] == _shap_input_fingerprint(
+            artifacts["val_features"],
+            artifacts["val_binary_labels"],
+            _rf_artifact_digest(self._rf_path(pipeline.config)),
+        )
+
+    def test_different_val_contents_same_shapes_recomputed(self, monkeypatch, caplog):
+        # Same shapes, same n_val, same RF — but the val CONTENTS changed (the exact gap
+        # _shap_cache_consistent's docstring used to disclaim).
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        artifacts = self._artifacts()
+        other = dict(artifacts)
+        other["val_features"] = artifacts["val_features"] + 1.0
+        stale = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        stale["input_fingerprint"] = self._dump_rf_and_fingerprint(pipeline.config, other)
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(stale, shap_path)
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            TrainingPipeline._compute_or_load_shap_values(pipeline, artifacts)
+
+        assert any("input-fingerprint mismatch" in r.message for r in caplog.records)
+        assert calls == ["summary", "interaction", "logloss"]
+
+    def test_missing_rf_artifact_serves_cache_unverified(self, monkeypatch, caplog):
+        # Cannot-verify is not verified-stale: with no RF artifact on disk the model
+        # component can't be checked (and a recompute would itself need the missing RF) —
+        # the cache is served with a warning.
+        pipeline = self._pipeline(n_summary=8, n_interact=4)
+        payload = _shap_payload(
+            n_summary=8, n_interact=4, n_features=self.N_FEATURES, n_val=self.N_VAL
+        )
+        payload["input_fingerprint"] = "whatever-was-recorded"
+        shap_path = self._shap_path(pipeline.config)
+        os.makedirs(os.path.dirname(shap_path), exist_ok=True)
+        joblib.dump(payload, shap_path)
+        assert not os.path.exists(self._rf_path(pipeline.config))
+
+        calls = []
+        self._stub_compute(monkeypatch, calls)
+        with caplog.at_level(logging.WARNING, logger="aetherscan.train"):
+            result = TrainingPipeline._compute_or_load_shap_values(pipeline, self._artifacts())
+
+        assert any("cannot be verified" in r.message for r in caplog.records)
+        assert calls == []
+        assert np.array_equal(result["summary_indices"], payload["summary_indices"])
 
     def test_stale_cache_recomputed_and_overwritten(self, monkeypatch, caplog):
         # The cache on disk was written when shap_max_samples_summary was 8; this run wants 16.
