@@ -273,7 +273,7 @@ pre-commit run ruff --all-files
 **Release operations.**
 - **GHCR visibility check** (anchors the "set it public once" step in `docs/RELEASE.md`): a bare `curl` against the registry returns 401 even for PUBLIC packages. The correct anonymous check is `TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:zachtheyek/aetherscan:pull" | jq -r .token)` then `curl -s -H "Authorization: Bearer $TOKEN" https://ghcr.io/v2/zachtheyek/aetherscan/tags/list`.
 - **PyPI publish gate**: the `pypi` GitHub environment has a required-reviewer gate — a release's `publish` job waits for approval (`gh api .../pending_deployments` + POST `state=approved` as the maintainer).
-- **Weekly automations** (deps / flaky / update-docs) are scheduled Mondays 01:00 UTC; GitHub's scheduler commonly delays them 1–4 h (load-dependent, unbounded).
+- **Weekly automations** (deps / flaky / update-docs) are scheduled Mondays 01:00 UTC (`docs/GITHUB_AUTOMATION.md`); GitHub's scheduler commonly delays them 1–4 h (load-dependent, unbounded).
 
 **Runtime gotchas.**
 - **Bare-keras weight loads need `import aetherscan.models` first** — that import registers the custom `Sampling` layer; without it, Keras-2's deserializer degrades the unregistered custom to a bare string and `load_model` dies with a cryptic `'str' object is not callable`. The pipeline's own import path always does this; only hand-rolled snippets can miss it.
