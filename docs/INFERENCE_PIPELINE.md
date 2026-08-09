@@ -80,7 +80,10 @@ within **one** catalog, e.g. the same six files listed at two hit frequencies (t
 `cadence_group_by_cols` include `Frequency`, which energy detection never reads: hits are
 re-derived over the whole band, so such rows' stamps and scores are identical by
 construction) — are **planned once**, first occurrence wins: one manifest row, one
-`group.key`, one candidate set. A truncated-digest collision between two genuinely
+`group.key`, one candidate set. The same collapse extends **across runs under one
+`--save-tag`**: resume keys on `npy_path`, so a cadence shared by catalog A on Monday and
+catalog B on Tuesday resume-skips under B, and its only manifest row names A's key. A
+truncated-digest collision between two genuinely
 *different* cadences raises a `ValueError` naming the cadence rather than silently dropping
 one. Cache keys compare the h5 **path strings byte-for-byte** (deliberately no
 `normpath`/`realpath` — resolution would break the unreachable-raws re-score case), so a
@@ -95,7 +98,9 @@ pin a different directory (reuse is still guarded).
 > `{data_path}/cache/pfb/`). A large stamp cache can instead be **re-keyed without
 > re-extraction**: every old sidecar records `h5_paths`, and the new name is exactly
 > `sha256(json.dumps(h5_paths).encode()).hexdigest()[:12] + ".npy"` — rename each
-> `.npy`/`.json` pair accordingly and move it under `{data_path}/cache/stamps/ed_<fp12>/`.
+> `.npy`/`.json` pair accordingly and move it under `{data_path}/cache/stamps/ed_<fp12>/`
+> (the `<fp12>` is the same 12-hex fingerprint already sitting in the old directory's
+> `<csv_stem>_ed<hash12>` name — no need to re-derive it).
 > Stamps inside a pinned `--preprocess-output-dir` are orphaned in place the same way (the
 > planner now looks for content-hashed names in that directory too). Leaving old stamp
 > trees in place transiently doubles the stamp footprint on scratch while the new cache
@@ -332,7 +337,9 @@ proportionally longer.)
    can't recover an earlier process's pruned pixels, so the stamp gallery may show blank
    columns for earlier-run cadences; and two runs sharing the default cache dir with pruning
    ON can race (one deletes/overwrites a `.npy` or `.candidates.npz` another is mid-read of —
-   contained, self-heals via retry). Run concurrently in one dir only with a per-run
+   contained, self-heals via retry) — and since #412 that dir is shared by *every* catalog,
+   so this now covers concurrent runs over differently-named catalogs that overlap in `.h5`
+   files, not just reruns of one catalog. Run concurrently in one dir only with a per-run
    `--preprocess-output-dir` or with pruning left at its off default (a deliberate design
    choice — cross-process file locking was deferred as disproportionate for a self-healing,
    science-neutral race).
