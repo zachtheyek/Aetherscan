@@ -66,6 +66,8 @@ Every PR gets an automated `claude-code-review` first pass. **Wait for it to lan
 - Genuine gaps → fix in focused, self-contained commits on the **same** PR. Notes you think are wrong → leave the code, argue concretely why.
 - Post **one** reply covering both (what you changed and why, then where you think the review erred and why), and end it by deliberately tagging the assistant handle to trigger a second pass — the sanctioned intentional case of the handle rule above, not a contradiction of it.
 - Loop (wait → validate → address/rebut → comment → re-tag) until the review is clean/LGTM, or it drifts off the PR's theme or turns nonsensical — then post why you're stopping and **don't** tag again.
+- Cosmetic suggestions arriving with/after an LGTM: apply verbatim, push, post a closing comment — **no** re-tag.
+- When the loop is done and every check is green: `gh pr merge <N> --admin --merge --delete-branch`, then `git checkout master && git pull` and prune stale local branches.
 
 ## More detail
 
