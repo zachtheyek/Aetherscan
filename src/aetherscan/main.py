@@ -516,7 +516,7 @@ _RAM_PREFLIGHT_BUDGET_FRACTION = 0.9
 
 
 def _prefetch_ram_preflight(
-    pending: list, group_by_cols: list[str], depth: int, total_ram_gb: float
+    pending: list[PendingCadence], group_by_cols: list[str], depth: int, total_ram_gb: float
 ) -> str | None:
     """
     Catalog-derived RAM preflight for the prefetch pipeline (#408): estimate the worst-case
@@ -526,17 +526,21 @@ def _prefetch_ram_preflight(
     (None otherwise — the caller logs, nothing is ever clamped). Keying on the catalog's
     band mix rather than the static C-band worst case keeps the warning quiet on e.g. an
     X-band-only catalog, whose observed tail is ~8x smaller. Bands are read from the
-    cadence group keys via the configured 'Band' group-by column; catalogs grouped without
-    one assume the conservative unknown-band worst case.
+    cadence group keys via the configured band group-by column (matched
+    case-insensitively, like derive_cadence_provenance — the column names are
+    user-supplied CSV headers); catalogs grouped without one assume the conservative
+    unknown-band worst case. total_ram_gb is decimal GB (psutil bytes / 1e9); note the
+    resource monitor's startup line reports GiB labelled "GB", so the two host-RAM
+    figures in one log differ by ~7% — the message prints both to head off confusion.
     """
     if not pending or depth < 1 or total_ram_gb <= 0:
         return None
-    try:
-        band_index = group_by_cols.index("Band")
-    except ValueError:
-        band_index = None
+    band_index = next(
+        (i for i, col in enumerate(group_by_cols) if col.strip().lower() == "band"), None
+    )
 
     worst_gb = 0.0
+    driving_band = "?"
     bands: set[str] = set()
     for unit in pending:
         key = unit.group.key
@@ -545,9 +549,10 @@ def _prefetch_ram_preflight(
         else:
             band = "?"
         bands.add(band)
-        worst_gb = max(
-            worst_gb, _BAND_WORST_CASE_INFLIGHT_GB.get(band, _UNKNOWN_BAND_WORST_CASE_GB)
-        )
+        band_gb = _BAND_WORST_CASE_INFLIGHT_GB.get(band, _UNKNOWN_BAND_WORST_CASE_GB)
+        if band_gb > worst_gb:
+            worst_gb = band_gb
+            driving_band = band
 
     budget_gb = total_ram_gb * _RAM_PREFLIGHT_BUDGET_FRACTION
     worst_total_gb = (depth + 1) * worst_gb
@@ -556,14 +561,22 @@ def _prefetch_ram_preflight(
 
     # The largest depth whose worst case fits the budget ((d + 1) in-flight cadences)
     suggested_depth = max(1, int(budget_gb // worst_gb) - 1)
+    if suggested_depth < depth:
+        advice = f"but if this host has OOM'd before, consider --prefetch-depth {suggested_depth}."
+    else:
+        # depth is already at (or below) the floor: no step-down exists, say so honestly
+        advice = (
+            f"and no --prefetch-depth fits this host's budget for band {driving_band} — "
+            f"a smaller catalog slice or a larger-RAM host is the real fix."
+        )
     return (
-        f"RAM preflight (#408): --prefetch-depth {depth} budgets {depth + 1} in-flight "
-        f"cadence(s) x ~{worst_gb:.0f} GB (worst observed for band(s) "
+        f"RAM preflight: --prefetch-depth {depth} budgets {depth + 1} in-flight "
+        f"cadence(s) x ~{worst_gb:.0f} GB (worst case, driven by band {driving_band} of "
         f"{', '.join(sorted(bands))}) ≈ {worst_total_gb:.0f} GB, above "
-        f"{_RAM_PREFLIGHT_BUDGET_FRACTION:.0%} of this host's {total_ram_gb:.0f} GB RAM. "
+        f"{_RAM_PREFLIGHT_BUDGET_FRACTION:.0%} of this host's {total_ram_gb:.0f} GB "
+        f"({total_ram_gb * 1e9 / 2**30:.1f} GiB — the monitor's 'GB' figure) RAM. "
         f"The estimate is a per-band worst case, not a measurement — the run proceeds "
-        f"unclamped — but if this host has OOM'd before, consider --prefetch-depth "
-        f"{suggested_depth}."
+        f"unclamped — {advice}"
     )
 
 
@@ -905,8 +918,10 @@ def _run_streaming_csv_inference(
         )
 
     # RAM preflight (#408): warn — never clamp — when the catalog's per-band worst case
-    # exceeds the host budget at the configured depth. psutil is deferred so this module
-    # stays importable without it (the monitor already owns the hard dependency).
+    # exceeds the host budget at the configured depth. psutil is already a hard transitive
+    # dependency (aetherscan.monitor imports it at module level); the local import +
+    # blanket guard exist so a preflight failure of ANY kind degrades to one INFO line —
+    # this estimate must never be able to fail a science run.
     try:
         import psutil  # noqa: PLC0415
 
