@@ -1,17 +1,31 @@
 # Weekly reconciliation of merged PRs against the documentation set
 # Scans every PR merged since the last successful scheduled run; if the aggregate changes
 # left doc gaps, creates ONE issue & instructs Claude assistant to create PR
-# Runs Monday 01:00 UTC == 09:00 MYT (GMT+8), like the other weekly Claude workflows
+# Runs Monday 03:00 UTC == 11:00 MYT (GMT+8) — the last of the three staggered weekly
+# Claude workflows (#413). The hour is safe to change freely within Monday UTC: the scan
+# window below anchors on the previous successful SCHEDULED run's createdAt (event type +
+# conclusion, never the cron string), so the first run after a stagger just covers a
+# once-off slightly-longer window with no gap.
 name: Claude Update Docs
 
 on:
   schedule:
-    # cron is UTC; 01:00 UTC Mon == 09:00 MYT (GMT+8) Mon
-    - cron: "0 1 * * 1"
+    # cron is UTC; 03:00 UTC Mon == 11:00 MYT (GMT+8) Mon
+    - cron: "0 3 * * 1"
   # Allow manual runs (scheduled workflows only fire from the default branch). A dispatch
   # scans the same window a scheduled run would: everything merged since the last
   # successful run.
   workflow_dispatch:
+
+# One run of THIS workflow at a time (#413): a scheduler-delayed weekly and a manual
+# dispatch queue instead of racing. Group keys on the workflow name so the three weeklies
+# never touch each other. cancel-in-progress stays false (house style, see release.yml) —
+# and here it is load-bearing: a cancel landing between `gh issue create` and the CLI-help
+# embed step would leave the week's issue without its regenerated CLI Reference blocks,
+# unrecoverable within the ISO week (the dedup guard blocks a re-file).
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   claude-update-docs:
@@ -70,7 +84,7 @@ jobs:
       #   monotonically — the --limit cap warning below is the tripwire for that.
       # - NOT total: a SCHEDULED run the guard short-circuits (an issue already filed this
       #   ISO week — e.g. a dispatch between Mon 00:00 UTC and the cron's ACTUAL start, which
-      #   is nominally 01:00 but observed ~04:30 on the sibling weeklies given GitHub's cron
+      #   is nominally 03:00 (#413 stagger) but commonly hours later given GitHub's cron
       #   deferral) still matches `--event schedule --status success` and becomes the anchor;
       #   whatever merged between the suppressing run's enumeration and that cron's createdAt
       #   falls out of every window. Accepted: `gh run list` can't see step outcomes, and the
@@ -92,8 +106,9 @@ jobs:
                      --json createdAt --jq '.[0].createdAt // empty')"
           if [[ -z "$SINCE" ]]; then
             # 8 (not 7) days: the first weekly run fires ~deferral-hours after its nominal
-            # Monday 01:00, so a plain 7-day window would open after a merge that landed in
-            # the deferral band a week earlier. The extra day is one harmless re-scan once.
+            # Monday 03:00 (#413 stagger), so a plain 7-day window would open after a merge
+            # that landed in the deferral band a week earlier. The extra day is one harmless
+            # re-scan once.
             SINCE="$(date -u -d '8 days ago' +'%Y-%m-%dT%H:%M:%SZ')"
             echo "No prior successful scheduled run found — falling back to an 8-day window."
           fi

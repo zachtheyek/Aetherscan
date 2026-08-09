@@ -89,7 +89,7 @@ listener's handler list; otherwise Slack quietly disables itself.
 - **Per-run thread.** `start_run()` posts one summary message (host, CPU/GPU/RAM inventory,
   the CLI invocation) and caches its thread timestamp; every subsequent record is posted as a
   **reply in that thread**, so one channel can carry many runs without interleaving.
-- **Batching.** Records buffer up to `slack_buffer_size` (100) or `slack_flush_interval`
+- **Batching.** Records buffer up to `slack_buffer_size` (20) or `slack_flush_interval`
   (60 s) and go out as one combined message, color-coded by the batch's highest severity and
   truncated to Slack's limits.
 - **Broadcast escalation.** Records at `slack_broadcast_level`+ (ERROR) are echoed to the
