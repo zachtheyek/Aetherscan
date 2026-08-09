@@ -176,6 +176,12 @@ Thresholds are module constants (`DATA_GEN_ROUND_FRACTION`, `GPU_UTIL_INPUT_BOUN
 `PREPROCESS_WALL_FRACTION`, `RAM_PEAK_WARN`) — tune them there if a rule is too eager for your
 hardware.
 
+The RAM-pressure rule is post-run; its pre-run complement is the catalog-derived RAM
+preflight (#408) in `main.py`, which warns at inference startup — with a suggested
+`--prefetch-depth` — when the pending catalog's per-band worst case exceeds the host
+budget (see the streaming-loop section of
+[`INFERENCE_PIPELINE.md`](INFERENCE_PIPELINE.md)).
+
 ## The per-band inference plot (`utils/perband_report.py`)
 
 A sibling tool (same stdlib `sqlite3` + `csv` + numpy + matplotlib, no `aetherscan` imports) that

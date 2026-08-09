@@ -675,3 +675,118 @@ class TestPostBenchmarkReport:
             pass
         main._post_benchmark_report("test_v1")  # must not raise
         assert slack_upload == []
+
+
+class TestPrefetchRamPreflight:
+    """#408: catalog-derived RAM preflight — warn, never clamp. The estimate keys on the
+    bands actually present in the pending catalog, so an X-band-only catalog stays quiet
+    where a C-band one warns on the same small host."""
+
+    def _units(self, bands, group_by_cols=None):
+        cols = group_by_cols or ["Target", "Session", "Band", "Cadence ID", "Frequency"]
+        band_slot = next((i for i, c in enumerate(cols) if c.strip().lower() == "band"), None)
+        units = []
+        for i, band in enumerate(bands):
+            key = [f"T{i}", "S1", "?", str(i), "1400"][: len(cols)]
+            if band_slot is not None:
+                key[band_slot] = band
+            group = CadenceGroup(
+                key=tuple(key),
+                h5_paths=[f"/x/{i}_{j}.h5" for j in range(6)],
+                csv_path="catalog.csv",
+                expected_obs=6,
+                is_valid=True,
+            )
+            units.append(PendingCadence(group=group, npy_path=f"/x/{i}.npy", index=i + 1))
+        return units, cols
+
+    def test_c_band_catalog_warns_on_small_host_with_suggestion(self):
+        units, cols = self._units(["C", "X"])
+        # depth 4 -> 5 in-flight x 65 GB = 325 GB > 90% of 288 GB
+        message = main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0)
+        assert message is not None
+        assert "325 GB" in message
+        assert "driven by band C" in message
+        # 0.9 * 288 // 65 = 3 -> suggested depth 2 (3 in-flight fit the budget)
+        assert "--prefetch-depth 2" in message
+
+    def test_x_band_only_catalog_quiet_on_same_host(self):
+        units, cols = self._units(["X", "X", "X"])
+        # 5 in-flight x 8 GB = 40 GB, far under the budget
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0) is None
+
+    def test_lowercase_band_column_matches(self):
+        # Group-by column names are user-supplied CSV headers; the lookup must be
+        # case-insensitive like derive_cadence_provenance (review note) — a catalog
+        # headed 'band' must NOT fall to the conservative unknown-band branch
+        units, cols = self._units(
+            ["X"], group_by_cols=["Target", "Session", "band", "Cadence ID", "Frequency"]
+        )
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0) is None
+
+    def test_large_host_quiet_even_for_c_band(self):
+        units, cols = self._units(["C"])
+        # blpc3-scale: 325 GB < 0.9 * 503 GB
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=503.0) is None
+
+    def test_unknown_band_and_missing_band_column_are_conservative(self):
+        units, cols = self._units(["Q"])  # not in the table -> C-band worst case
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=288.0) is not None
+        # No band group-by column at all -> conservative too
+        units2, no_band_cols = self._units(["X"], group_by_cols=["Target", "Session", "Cadence ID"])
+        assert (
+            main._prefetch_ram_preflight(units2, no_band_cols, depth=4, total_ram_gb=288.0)
+            is not None
+        )
+
+    def test_empty_pending_and_degenerate_inputs_return_none(self):
+        units, cols = self._units(["C"])
+        assert main._prefetch_ram_preflight([], cols, depth=4, total_ram_gb=288.0) is None
+        assert main._prefetch_ram_preflight(units, cols, depth=0, total_ram_gb=288.0) is None
+        assert main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=0.0) is None
+
+    def test_no_step_down_edge_says_so_instead_of_suggesting_current_depth(self):
+        units, cols = self._units(["C"])
+        # 65 GB host: even depth 1 (2 in-flight = 130 GB) exceeds the budget; the old
+        # floor would have "suggested" the depth the user is already at (review note) —
+        # the honest message is that no depth fits
+        message = main._prefetch_ram_preflight(units, cols, depth=1, total_ram_gb=65.0)
+        assert message is not None
+        assert "no --prefetch-depth fits" in message
+        assert "consider --prefetch-depth" not in message
+
+    def test_nothing_fits_at_depth_ge_2_does_not_suggest_a_rejected_depth(self):
+        # Second-pass review catch: on a 100 GB host at depth 4 the budget holds exactly
+        # one in-flight cadence (90 // 65 = 1, raw candidate 0) — the pre-fix clamp lifted
+        # 0 to 1 and recommended a depth whose own worst case (2 x 65 = 130 GB) the
+        # arithmetic rejects. The unclamped test must fall through to the honest branch.
+        units, cols = self._units(["C"])
+        message = main._prefetch_ram_preflight(units, cols, depth=4, total_ram_gb=100.0)
+        assert message is not None
+        assert "no --prefetch-depth fits" in message
+        assert "consider --prefetch-depth" not in message
+
+    def test_unknown_band_message_names_the_assumption_not_a_question_mark(self):
+        # Catalogs grouped without a band column must not render "driven by band ? of ?"
+        units, no_band_cols = self._units(["X"], group_by_cols=["Target", "Session", "Cadence ID"])
+        message = main._prefetch_ram_preflight(units, no_band_cols, depth=4, total_ram_gb=288.0)
+        assert message is not None
+        assert "unknown-band worst case" in message
+        assert "band ? of" not in message
+
+    def test_call_site_wiring_logs_warning_through_streaming_loop(
+        self, stubbed_streaming, monkeypatch, caplog
+    ):
+        """The whole preflight call is exception-guarded, so a wiring regression (argument
+        order, units) would silently degrade to an INFO line — pin the happy path end to
+        end: a small-host run through _run_streaming_csv_inference must emit the WARNING
+        (the stub cadences' 2-tuple keys have no band slot -> conservative branch)."""
+        import psutil  # noqa: PLC0415
+
+        db, make_preprocessor = stubbed_streaming
+        fake = types.SimpleNamespace(total=int(100e9))  # 100 GB host, C worst case
+        monkeypatch.setattr(psutil, "virtual_memory", lambda: fake)
+        preprocessor = make_preprocessor()
+        with caplog.at_level(logging.WARNING, logger="aetherscan.main"):
+            _run_streaming_csv_inference(preprocessor, strategy=None)
+        assert any("RAM preflight" in record.message for record in caplog.records)
