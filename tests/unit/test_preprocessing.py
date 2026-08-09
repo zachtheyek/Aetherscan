@@ -1,10 +1,10 @@
 # NOTE: come back to this later
 
-"""Unit tests for aetherscan.preprocessing: hit deduplication, CSV cadence grouping, filename
-sanitization, JSON coercion, DC-spike removal, spline bandpass fitting, the vectorized
-normality test (equivalence-gated against scipy.stats.normaltest), the fused energy-detection
-worker, downsample-at-extraction, provenance derivation, and the legacy-vs-downsampled
-load_inference_data paths."""
+"""Unit tests for aetherscan.preprocessing: hit deduplication, CSV cadence grouping,
+content-addressed cadence filenames, JSON coercion, DC-spike removal, spline bandpass fitting,
+the vectorized normality test (equivalence-gated against scipy.stats.normaltest), the fused
+energy-detection worker, downsample-at-extraction, provenance derivation, and the
+legacy-vs-downsampled load_inference_data paths."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 
 import numpy as np
 import pytest
@@ -220,28 +221,42 @@ class TestGroupObservationsFromCsv:
 
 
 class TestCadenceNpyFilename:
-    def test_clean_key_passes_through(self):
-        name = DataPreprocessor._cadence_npy_filename("catalog", ("HIP110750", "L", "0"))
-        assert name == "catalog_HIP110750_L_0.npy"
+    """#412: stamp filenames are content-addressed — 12 sha256 hex chars over the ORDERED h5
+    path list. No trace of the source catalog's name or the group key survives in the name."""
 
-    def test_hostile_characters_collapse_to_underscore(self):
-        name = DataPreprocessor._cadence_npy_filename(
-            "catalog", ("HIP 110750", "AGBT/18A", "a;b|c", "$(rm -rf)")
+    def test_deterministic_hex_name(self):
+        paths = [f"/data/obs_{i}.h5" for i in range(6)]
+        name = DataPreprocessor._cadence_npy_filename(paths)
+        assert re.fullmatch(r"[0-9a-f]{12}\.npy", name)
+        assert name == DataPreprocessor._cadence_npy_filename(list(paths))
+
+    def test_order_sensitive(self):
+        # ABACAD order is scientifically meaningful: the same files listed in a different
+        # order are a different cadence and must resolve to a different cache entry.
+        paths = [f"/data/obs_{i}.h5" for i in range(6)]
+        assert DataPreprocessor._cadence_npy_filename(paths) != (
+            DataPreprocessor._cadence_npy_filename(list(reversed(paths)))
         )
-        assert "/" not in name
-        assert " " not in name
-        assert ";" not in name
-        assert "$" not in name
-        assert name.startswith("catalog_")
-        assert name.endswith(".npy")
 
-    def test_dash_and_dot_survive(self):
-        name = DataPreprocessor._cadence_npy_filename("catalog", ("L-band", "1.5"))
-        assert name == "catalog_L-band_1.5.npy"
+    def test_different_files_differ(self):
+        a = DataPreprocessor._cadence_npy_filename([f"/data/a_{i}.h5" for i in range(6)])
+        b = DataPreprocessor._cadence_npy_filename([f"/data/b_{i}.h5" for i in range(6)])
+        assert a != b
 
-    def test_non_string_key_components(self):
-        name = DataPreprocessor._cadence_npy_filename("catalog", (0, 1400.5))
-        assert name == "catalog_0_1400.5.npy"
+    def test_no_concatenation_ambiguity(self):
+        # The list is JSON-encoded before hashing, so ["ab","c"] and ["a","bc"] can't collide
+        assert DataPreprocessor._cadence_npy_filename(["ab", "c"]) != (
+            DataPreprocessor._cadence_npy_filename(["a", "bc"])
+        )
+
+    def test_golden_digest_is_a_cross_version_contract(self):
+        # The exact digest is persisted on-disk state: every future release must compute
+        # sha256(json.dumps(list(h5_paths)))[:12] byte-for-byte (json.dumps's default ", "
+        # separator included), or every existing cache entry is silently orphaned. If this
+        # test fails, you are breaking cache compatibility — that needs to be a deliberate,
+        # documented decision, not a refactor side effect.
+        paths = [f"/data/obs_{i}.h5" for i in range(6)]
+        assert DataPreprocessor._cadence_npy_filename(paths) == "a182acea8ce3.npy"
 
 
 class TestToJsonSafe:
@@ -660,16 +675,18 @@ class TestProcessCadenceEndToEnd:
         os.makedirs(os.path.dirname(npy_path), exist_ok=True)
 
         # Abandoned partial outputs are age-swept (#298 I3: tmp names are per-run-unique in
-        # the shared cache dir, so only AGE proves abandonment): an expired tmp — legacy
-        # fixed name or unique-name — is removed; a fresh unique-name tmp may be a live
-        # concurrent run's in-progress write and must survive.
+        # the shared cache dir, so only AGE proves abandonment): an expired unique-name tmp
+        # is removed; a fresh unique-name tmp may be a live concurrent run's in-progress
+        # write and must survive. The fixed pre-#298 "<stem>.tmp.npy" legacy name is NOT
+        # swept anymore (#412: no historical writer ever produced it next to a
+        # content-hashed stem).
         import time as time_module  # noqa: PLC0415
 
         expired = (time_module.time() - 25 * 3600,) * 2
-        stale_tmp = os.path.splitext(npy_path)[0] + ".tmp.npy"
-        with open(stale_tmp, "wb") as f:
-            f.write(b"junk from a SIGKILLed pre-#298 run")
-        os.utime(stale_tmp, expired)
+        legacy_tmp = os.path.splitext(npy_path)[0] + ".tmp.npy"
+        with open(legacy_tmp, "wb") as f:
+            f.write(b"a fixed-name file the sweep no longer targets")
+        os.utime(legacy_tmp, expired)
         stale_unique_tmp = os.path.splitext(npy_path)[0] + ".12345.deadbeef.tmp.npy"
         with open(stale_unique_tmp, "wb") as f:
             f.write(b"junk from a SIGKILLed run")
@@ -681,7 +698,8 @@ class TestProcessCadenceEndToEnd:
         preprocessor = DataPreprocessor()
         result = preprocessor.process_pending_cadence(PendingCadence(group, npy_path))
 
-        assert not os.path.exists(stale_tmp)
+        assert os.path.exists(legacy_tmp)  # untouched: the legacy sweep entry is gone
+        os.remove(legacy_tmp)
         assert not os.path.exists(stale_unique_tmp)
         assert os.path.exists(fresh_tmp)
         os.remove(fresh_tmp)
@@ -703,6 +721,14 @@ class TestProcessCadenceEndToEnd:
         assert metadata["stamp_width"] == config.inference.stamp_width
         assert len(metadata["stamp_frequencies_mhz"]) == result.n_hits
         assert len(metadata["stamp_starts"]) == result.n_hits
+
+        # #412: per-file (size, mtime) recorded at extraction, aligned with h5_paths — the
+        # resume guard's evidence that the h5 files haven't been re-staged since extraction
+        assert len(metadata["h5_file_stats"]) == len(metadata["h5_paths"]) == 6
+        for h5_path, recorded in zip(metadata["h5_paths"], metadata["h5_file_stats"], strict=True):
+            stat = os.stat(h5_path)
+            assert recorded["size"] == stat.st_size
+            assert recorded["mtime"] == stat.st_mtime
 
         # Viz-suite provenance: per-ON-file all-window statistic histograms on the shared
         # bins, the pre-binned hit-frequency histograms (#301 — the raw per-hit list is no
@@ -783,6 +809,46 @@ class TestProcessCadenceEndToEnd:
             metadata = json.load(f)
         assert metadata["stored_width"] == config.inference.stamp_width
         assert metadata["downsample_factor_applied"] == 1
+
+    def test_stats_mismatch_actually_reextracts(self, tmp_path, initialized_runtime, caplog):
+        """The re-extract half of #412's warn+re-extract: a cached .npy whose sidecar
+        (size, mtime) no longer matches the h5 on disk must fall through the resume guard
+        into a real re-extraction (fresh .npy + fresh sidecar), not be skipped."""
+        from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
+
+        self._configure("spline")
+        h5_paths = self._make_cadence(tmp_path)
+        group = CadenceGroup(
+            key=("T4", "S1", "L", "10", "2251"),
+            h5_paths=h5_paths,
+            csv_path="unused.csv",
+            expected_obs=6,
+            is_valid=True,
+        )
+        npy_path = str(tmp_path / "out" / "cadence_restage.npy")
+        os.makedirs(os.path.dirname(npy_path), exist_ok=True)
+
+        first = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert first is not None and first.freshly_extracted is True
+        with open(first.metadata_path) as f:
+            first_stats = json.load(f)["h5_file_stats"]
+
+        # Simulate a re-stage at the same path: bump one h5's mtime
+        stat = os.stat(h5_paths[2])
+        os.utime(h5_paths[2], (stat.st_atime, stat.st_mtime + 60.0))
+
+        # A DIFFERENT preprocessor (fresh process/operator) must re-extract, not resume
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            second = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert any("changed on disk" in r.message for r in caplog.records)
+        assert second is not None and second.freshly_extracted is True
+        assert second.n_hits == first.n_hits  # same bytes -> same stamps
+        with open(second.metadata_path) as f:
+            second_stats = json.load(f)["h5_file_stats"]
+        # The rewritten sidecar records the NEW mtime, so a third run resumes cleanly
+        assert second_stats != first_stats
+        third = DataPreprocessor().process_pending_cadence(PendingCadence(group, npy_path))
+        assert third is not None and third.freshly_extracted is False
 
     @pytest.mark.parametrize("missing_attr", ["foff", "fch1"])
     def test_missing_header_attr_raises_keyerror(self, tmp_path, initialized_runtime, missing_attr):
@@ -1036,14 +1102,16 @@ class TestProcessCadenceEndToEnd:
         assert result is not None
         # The debug overlay is display-tagged ({command}_{machine}_{datetime}), matching the
         # inference-viz plot dir; save_tag ("inf_20260101_120000") is a real run tag, so the
-        # machine token is inserted.
+        # machine token is inserted. Named after the plotted primary ON file (#412 — the
+        # stamp .npy basename is an opaque content hash, so it no longer names the PNG).
         display_tag_value = display_tag(config.checkpoint.save_tag, get_machine_name())
+        primary_stem = os.path.splitext(os.path.basename(group.h5_paths[0]))[0]
         plot_path = os.path.join(
             config.output_path,
             "plots",
             "inference",
             display_tag_value,
-            f"bandpass_overlay_cadence_dbg_{display_tag_value}.png",
+            f"bandpass_overlay_{primary_stem}_{display_tag_value}.png",
         )
         assert os.path.exists(plot_path)
         assert os.path.getsize(plot_path) > 0
@@ -1063,9 +1131,10 @@ class TestBandpassFlattenerSelection:
         flattener = DataPreprocessor()._get_bandpass_flattener(num_coarse_channels=4)
         assert flattener.func is _pfb_flatten_bandpass
         response_path = flattener.keywords["response_path"]
-        # The sidecar file lives under the run's output path and holds exactly the response
+        # The sidecar file lives in the unified cache root under data_path (#412) and holds
+        # exactly the response
         # the parent computed for (width, coarse count, taps)
-        assert response_path.startswith(os.path.join(config.output_path, "cache", "pfb"))
+        assert response_path.startswith(os.path.join(config.data_path, "cache", "pfb"))
         expected = gen_coarse_channel_response(512, 4, config.inference.pfb_taps_per_channel)
         np.testing.assert_array_equal(np.load(response_path), expected)
 
@@ -1253,11 +1322,12 @@ class TestDecimateForPlot:
 
 
 class TestPlanCadencesOutputDir:
-    """plan_cadences resolves the .npy output dir per CSV: ED-fingerprint-scoped default
-    under {data_path}/inference/preprocessed/ (#298 I3 — runs sharing an ED config share
-    stamps), with an explicit --preprocess-output-dir shared across CSVs."""
+    """plan_cadences resolves the .npy output dir to the content-addressed stamp cache
+    {data_path}/cache/stamps/ed_<fingerprint12>/ (#298 I3 + #412 — catalog-name-free, shared
+    across CSVs and runs with the same ED config), with an explicit --preprocess-output-dir
+    pinning one directory instead."""
 
-    def test_default_is_fingerprint_scoped_not_tag_scoped(
+    def test_default_is_content_addressed_not_catalog_or_tag_scoped(
         self, initialized_runtime, make_inference_csv
     ):
         config = get_config()
@@ -1269,12 +1339,31 @@ class TestPlanCadencesOutputDir:
 
         assert len(units) == 1
         fingerprint = preprocessing_config_fingerprint(config.to_dict())
-        expected_dir = os.path.join(
-            config.data_path, "inference", "preprocessed", f"subset_ed{fingerprint[:12]}"
-        )
+        expected_dir = os.path.join(config.data_path, "cache", "stamps", f"ed_{fingerprint[:12]}")
         assert os.path.dirname(units[0].npy_path) == expected_dir
         assert os.path.isdir(expected_dir)
-        assert "test_v1" not in os.path.basename(expected_dir)
+        # Neither the save tag nor the catalog's name may leak into the cache key
+        assert "test_v1" not in units[0].npy_path
+        assert "subset" not in os.path.relpath(units[0].npy_path, config.data_path)
+        assert os.path.basename(units[0].npy_path) == (
+            DataPreprocessor._cadence_npy_filename(units[0].group.h5_paths)
+        )
+
+    def test_renamed_catalog_resolves_to_same_entries(
+        self, initialized_runtime, make_inference_csv
+    ):
+        # The point of #412: the same files under a renamed/copied catalog must hit the
+        # same cache entries instead of re-preprocessing from scratch.
+        config = get_config()
+        make_inference_csv("subset.csv")
+        make_inference_csv("renamed_copy.csv")
+
+        config.data.inference_files = ["subset.csv"]
+        first = DataPreprocessor().plan_cadences()
+        config.data.inference_files = ["renamed_copy.csv"]
+        second = DataPreprocessor().plan_cadences()
+
+        assert [u.npy_path for u in first] == [u.npy_path for u in second]
 
     def test_scoring_change_reuses_directory(self, initialized_runtime, make_inference_csv):
         # The point of #298 I3: a new threshold / model must land in the SAME stamp dir
@@ -1308,15 +1397,112 @@ class TestPlanCadencesOutputDir:
         # otherwise resume-skip the cadence off stamps produced under a different ED config.
         assert not os.path.exists(second[0].npy_path)
 
-    def test_duplicate_csv_basenames_rejected(self, initialized_runtime, make_inference_csv):
-        # Same basename in different subdirectories would collide into one tag-scoped
-        # output dir (and shared stamp filenames) — plan_cadences fails fast instead.
+    def test_duplicate_cadences_plan_once(self, initialized_runtime, make_inference_csv):
+        # Pre-#412 the stem-keyed layout had to reject duplicate CSV basenames (they would
+        # have collided into one directory and cross-resumed). Content addressing removes
+        # the collision by construction, and identical cadences (same ordered h5 files)
+        # across a run's CSVs dedupe to one planned unit — scoring the same cadence twice
+        # under one tag is pure waste, and two units sharing an npy_path would let pruning
+        # race the duplicate's prefetch.
         config = get_config()
         make_inference_csv("run_a/subset.csv")
-        make_inference_csv("run_b/subset.csv")
+        default_h5 = [f"/data/obs_{i}.h5" for i in range(6)]
+        make_inference_csv(
+            "run_b/subset.csv",
+            groups=[
+                # Same ordered h5 list under a DIFFERENT group key (a fixed Target typo):
+                # same cadence content -> deduped, first occurrence's key survives
+                (
+                    {
+                        "Target": "HIP_RENAMED",
+                        "Session": "AGBT21B_999_31",
+                        "Band": "L",
+                        "Cadence ID": "0",
+                        "Frequency": "1400",
+                    },
+                    default_h5,
+                ),
+                # A genuinely distinct cadence must survive the dedupe
+                (
+                    {
+                        "Target": "HIP99999",
+                        "Session": "AGBT21B_999_32",
+                        "Band": "L",
+                        "Cadence ID": "1",
+                        "Frequency": "1400",
+                    },
+                    [f"/data/other_{i}.h5" for i in range(6)],
+                ),
+            ],
+        )
         config.data.inference_files = ["run_a/subset.csv", "run_b/subset.csv"]
 
-        with pytest.raises(ValueError, match="subset"):
+        units = DataPreprocessor().plan_cadences()
+
+        assert len(units) == 2
+        # First occurrence wins: run_a's key survives, the renamed duplicate's doesn't
+        assert units[0].group.key[0] == "HIP110750"
+        assert units[1].group.key[0] == "HIP99999"
+        # unit.index stays contiguous across the skip (stage-timer span names ride on it)
+        assert [u.index for u in units] == [1, 2]
+
+    def test_same_csv_duplicate_cadences_plan_once(self, initialized_runtime, make_inference_csv):
+        # The common real-catalog shape (#417 review note 2): ONE catalog listing the same
+        # six files at two hit frequencies makes two groups with identical ordered h5
+        # lists — the default cadence_group_by_cols include Frequency, which energy
+        # detection never reads (hits are re-derived over the whole band), so the rows'
+        # stamps and scores are identical by construction: one planned unit.
+        config = get_config()
+        h5_paths = [f"/data/obs_{i}.h5" for i in range(6)]
+        base_key = {
+            "Target": "HIP110750",
+            "Session": "AGBT21B_999_31",
+            "Band": "L",
+            "Cadence ID": "0",
+        }
+        make_inference_csv(
+            "subset.csv",
+            groups=[
+                ({**base_key, "Frequency": "1400"}, h5_paths),
+                ({**base_key, "Frequency": "1670"}, h5_paths),
+            ],
+        )
+        config.data.inference_files = ["subset.csv"]
+
+        units = DataPreprocessor().plan_cadences()
+
+        assert len(units) == 1
+        assert units[0].group.key[-1] == "1400"  # first occurrence wins
+
+    def test_true_digest_collision_raises(
+        self, initialized_runtime, make_inference_csv, monkeypatch
+    ):
+        # Two DIFFERENT cadences forced onto one 12-hex name (un-constructable for real
+        # sha256, so simulated): the planner must refuse rather than silently drop one —
+        # missing science data is far worse than a cache miss.
+        config = get_config()
+        make_inference_csv("a.csv")
+        make_inference_csv(
+            "b.csv",
+            groups=[
+                (
+                    {
+                        "Target": "HIP99999",
+                        "Session": "AGBT21B_999_32",
+                        "Band": "L",
+                        "Cadence ID": "1",
+                        "Frequency": "1400",
+                    },
+                    [f"/data/other_{i}.h5" for i in range(6)],
+                )
+            ],
+        )
+        config.data.inference_files = ["a.csv", "b.csv"]
+        monkeypatch.setattr(
+            DataPreprocessor, "_cadence_npy_filename", staticmethod(lambda h5_paths: "cafe.npy")
+        )
+
+        with pytest.raises(ValueError, match="collision"):
             DataPreprocessor().plan_cadences()
 
     def test_explicit_override_shared_across_csvs(
@@ -1324,7 +1510,23 @@ class TestPlanCadencesOutputDir:
     ):
         config = get_config()
         make_inference_csv("a.csv")
-        make_inference_csv("b.csv")
+        # Distinct h5 files so the two CSVs stay two distinct cadences (identical
+        # cadences would dedupe to one planned unit, #412)
+        make_inference_csv(
+            "b.csv",
+            groups=[
+                (
+                    {
+                        "Target": "HIP99999",
+                        "Session": "AGBT21B_999_32",
+                        "Band": "L",
+                        "Cadence ID": "1",
+                        "Frequency": "1400",
+                    },
+                    [f"/data/other_{i}.h5" for i in range(6)],
+                )
+            ],
+        )
         config.data.inference_files = ["a.csv", "b.csv"]
         override = str(tmp_path / "shared_preproc")
         config.inference.preprocess_output_dir = override
@@ -1336,8 +1538,10 @@ class TestPlanCadencesOutputDir:
 
 
 class TestResumeProvenanceGuard:
-    """#298 I3: an existing stamp .npy is only reused when its metadata sidecar's h5_paths
-    and recorded ED fingerprint match; missing/legacy metadata degrades to warn-and-reuse."""
+    """#298 I3 + #412: an existing stamp .npy is only reused when its metadata sidecar's
+    h5_paths and recorded ED fingerprint match AND its recorded per-file (size, mtime) still
+    match the h5 files on disk; missing/legacy metadata (or a legacy sidecar without a given
+    field) degrades to warn-and-reuse / skip-that-check."""
 
     def _group_and_paths(self, tmp_path, h5_paths=None):
         from aetherscan.preprocessing import CadenceGroup  # noqa: PLC0415
@@ -1392,6 +1596,128 @@ class TestResumeProvenanceGuard:
         preprocessor = DataPreprocessor()
         group, npy_path, metadata_path = self._group_and_paths(tmp_path)
         self._write_metadata(metadata_path, h5_paths=group.h5_paths)
+        assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def _group_with_real_files(self, tmp_path):
+        """Like _group_and_paths but with real (stat-able) h5 stand-ins, for the #412
+        (size, mtime) guard tests."""
+        h5_paths = []
+        for i in range(6):
+            path = tmp_path / f"obs_{i}.h5"
+            path.write_bytes(b"x" * (100 + i))
+            h5_paths.append(str(path))
+        return self._group_and_paths(tmp_path, h5_paths=h5_paths)
+
+    @staticmethod
+    def _stats_for(h5_paths):
+        return [{"size": os.stat(p).st_size, "mtime": os.stat(p).st_mtime} for p in h5_paths]
+
+    def test_matching_file_stats_reuse(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path,
+            h5_paths=group.h5_paths,
+            ed_config_fingerprint=preprocessing_config_fingerprint(get_config().to_dict()),
+            h5_file_stats=self._stats_for(group.h5_paths),
+        )
+        assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_size_change_reprocesses_with_warning(self, tmp_path, initialized_runtime, caplog):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
+        )
+        # Grow one file, then restore its original mtime — ONLY the size arm can fire
+        # (a re-stage with preserved timestamps, e.g. rsync -t / cp -p, must still miss)
+        original = os.stat(group.h5_paths[2])
+        with open(group.h5_paths[2], "ab") as f:
+            f.write(b"extra")
+        os.utime(group.h5_paths[2], (original.st_atime, original.st_mtime))
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        assert any("changed on disk" in r.message for r in caplog.records)
+
+    def test_mtime_change_reprocesses(self, tmp_path, initialized_runtime):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
+        )
+        # Same size, shifted mtime — a byte-identical re-stage still invalidates (the guard
+        # cannot cheaply prove content identity, so it errs toward re-extraction)
+        stat = os.stat(group.h5_paths[4])
+        os.utime(group.h5_paths[4], (stat.st_atime, stat.st_mtime + 60.0))
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_unreachable_h5_reuses_with_warning(self, tmp_path, initialized_runtime, caplog):
+        # Cannot-verify is not verified-stale: with the raws unreachable (archived, or a
+        # container run without the raw-data bind) the cached stamps are exactly what a
+        # warm re-score needs — the guard warns and reuses rather than invalidating.
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
+        )
+        os.remove(group.h5_paths[0])
+        os.remove(group.h5_paths[1])
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        # ONE aggregated warning per cadence (not one per file): unreachable raws are the
+        # steady state of a no-raw-bind re-score, and WARNING-level records reach Slack.
+        stat_warnings = [r for r in caplog.records if "could not be stat'd" in r.message]
+        assert len(stat_warnings) == 1
+        assert "2/6" in stat_warnings[0].message
+
+    def test_unreachable_h5_does_not_mask_a_real_mismatch(self, tmp_path, initialized_runtime):
+        # One file un-stat-able (skipped) while another genuinely changed: still a miss.
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path, h5_paths=group.h5_paths, h5_file_stats=self._stats_for(group.h5_paths)
+        )
+        os.remove(group.h5_paths[0])
+        stat = os.stat(group.h5_paths[3])
+        os.utime(group.h5_paths[3], (stat.st_atime, stat.st_mtime + 60.0))
+        assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+
+    def test_malformed_stats_length_reprocesses(self, tmp_path, initialized_runtime, caplog):
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(
+            metadata_path,
+            h5_paths=group.h5_paths,
+            h5_file_stats=self._stats_for(group.h5_paths)[:3],  # truncated: 3 entries, 6 files
+        )
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        assert any("malformed" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("bad_stats", [5, [[100, 1.5]] * 6, ["x"] * 6])
+    def test_malformed_stats_types_reprocess_contained(
+        self, tmp_path, initialized_runtime, caplog, bad_stats
+    ):
+        # Type-level malformation (non-list value, non-dict entries) must degrade to a
+        # warn + re-extract, never raise out of the guard — the resume call site sits
+        # outside process_pending_cadence's per-cadence containment.
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_with_real_files(tmp_path)
+        self._write_metadata(metadata_path, h5_paths=group.h5_paths, h5_file_stats=bad_stats)
+        with caplog.at_level("WARNING", logger="aetherscan.preprocessing"):
+            assert not preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
+        assert any("malformed" in r.message for r in caplog.records)
+
+    def test_legacy_sidecar_without_file_stats_reuses(self, tmp_path, initialized_runtime):
+        # A pre-#412 sidecar has no h5_file_stats — the guard skips that check (its h5
+        # paths need not even exist on disk to reuse, matching historical behavior).
+        preprocessor = DataPreprocessor()
+        group, npy_path, metadata_path = self._group_and_paths(tmp_path)
+        self._write_metadata(
+            metadata_path,
+            h5_paths=group.h5_paths,
+            ed_config_fingerprint=preprocessing_config_fingerprint(get_config().to_dict()),
+        )
         assert preprocessor._resume_provenance_ok(group, npy_path, metadata_path)
 
 

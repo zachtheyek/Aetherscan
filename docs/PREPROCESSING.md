@@ -96,7 +96,7 @@ reference implementation):
 
 At GBT scale the one-time FFT is an ~`n_chans`-point transform with a tens-of-GB transient,
 so it runs **once in the parent**, is persisted to a content-addressed sidecar
-(`{output_path}/cache/pfb/pfb_response_w{W}_c{C}_t{T}.npy`, atomic write), and workers just
+(`{data_path}/cache/pfb/pfb_response_w{W}_c{C}_t{T}.npy`, atomic write), and workers just
 read the ~8 MB file (cached per process by `_load_pfb_response`). Afterwards, flattening a
 channel is a single vectorized divide — versus a fresh spline fit per channel per file.
 
@@ -247,8 +247,10 @@ stamps.
 
 The metadata JSON also carries the full ED provenance for the visualization suite —
 per-stamp starts/frequencies/statistics/p-values, the per-ON-file statistic histograms, and
-the `.h5` header — plus the `ed_config_fingerprint` the stamp-cache resume guard verifies
-(#298). Hit frequencies are stored **pre-binned** since #301: `hit_spectrum_hist` (8,192
+the `.h5` header — plus the `ed_config_fingerprint` and per-h5 `(size, mtime)` (recorded at
+extraction) that the stamp-cache resume guard verifies before reuse (#298/#412 — a
+size/mtime mismatch means the h5 was re-staged at the same path, and that cadence warns and
+re-extracts). Hit frequencies are stored **pre-binned** since #301: `hit_spectrum_hist` (8,192
 bins spanning the file band — `freq_lo`/`freq_hi`/`n_bins`, raw + merged counts, and the
 exact raw-hit min/max so the figure reproduces the historical axis bounds) replaces the raw
 per-hit frequency list, which ran ~19 MB of JSON on an RFI-dense cadence and had exactly

@@ -13,11 +13,11 @@ import csv
 import functools
 import gc
 import glob
+import hashlib
 import json
 import logging
 import math
 import os
-import re
 import signal
 import time
 import uuid
@@ -1658,52 +1658,45 @@ class DataPreprocessor:
         """
         Group every CSV in config.data.inference_files into per-cadence work units without
         processing anything. Returns one PendingCadence (valid group + target .npy path) per
-        valid cadence, in CSV order — the unit list the streaming inference loop iterates.
-        Raises ValueError when two inference_files entries share a basename stem (their
-        output dir and stamp filenames would collide).
+        distinct valid cadence, in CSV order — the unit list the streaming inference loop
+        iterates. Cadences whose content identity (ordered h5 path list) repeats across the
+        run's CSVs are planned once (first occurrence wins, #412); a truncated-digest
+        collision between two DIFFERENT cadences raises ValueError rather than silently
+        dropping one.
         """
         inference_files = self.config.data.inference_files
         if not inference_files:
             logger.warning("plan_cadences() called with no inference_files configured")
             return []
 
-        # Fail fast on duplicate CSV basename stems: both the fingerprint-scoped default
-        # output dir and the per-cadence stamp .npy names are keyed on the stem, so two
-        # entries like runA/x.csv and runB/x.csv would silently share a directory (and/or
-        # stamp filenames) and cross-resume each other's cadences.
-        stem_sources: dict[str, str] = {}
-        for csv_filename in inference_files:
-            stem = os.path.splitext(os.path.basename(csv_filename))[0]
-            if stem in stem_sources:
-                raise ValueError(
-                    f"Duplicate inference CSV basename stem '{stem}' "
-                    f"('{stem_sources[stem]}' vs '{csv_filename}'): output directories and "
-                    f"stamp filenames are keyed on the basename, so these entries would "
-                    f"overwrite/resume each other. Rename one so basenames are unique."
-                )
-            stem_sources[stem] = csv_filename
-
-        # Output directory resolution (#298 I3): an explicit --preprocess-output-dir is
-        # used as-is (shared across CSVs); otherwise each CSV gets its own ED-FINGERPRINT-
-        # scoped default, {data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/. Energy
-        # detection is deterministic given (csv, h5 files, ED config), so any run sharing
-        # the ED config reuses the stamps — threshold sweeps and re-inference with new
-        # weights skip preprocessing entirely — while any ED-config change lands in a
-        # different directory by construction (the fingerprint is a fail-safe denylist —
-        # see run_state.preprocessing_config_fingerprint). Staleness is impossible for a
-        # published .npy (atomic tmp -> os.replace publication + per-run-unique tmp names);
-        # the resume guard additionally verifies each sidecar's h5_paths and fingerprint.
-        # This deliberately replaces the old <csv_stem>_<save_tag> tag-scoped default
-        # (maintainer decision on #298): scores stay tag-scoped in the DB — only the
-        # deterministic preprocessing artifacts are shared.
+        # Output directory resolution (#298 I3, content-addressed by #412): an explicit
+        # --preprocess-output-dir is used as-is (shared across CSVs); otherwise every CSV
+        # shares the ED-FINGERPRINT-scoped default {data_path}/cache/stamps/ed_<hash12>/.
+        # A cadence's stamps are a pure function of (ordered h5 path list, ED config), and
+        # the cache key encodes exactly that: the directory carries the ED fingerprint (a
+        # fail-safe denylist — see run_state.preprocessing_config_fingerprint) and the
+        # filename hashes the ordered h5 paths (_cadence_npy_filename). The catalog's name
+        # appears nowhere in the key, so renamed/subset/superset catalogs over the same
+        # files hit the same entries, and any ED-config change lands in a different
+        # directory by construction. Staleness is impossible for a published .npy (atomic
+        # tmp -> os.replace publication + per-run-unique tmp names); the resume guard
+        # additionally verifies each sidecar's h5_paths, fingerprint, and per-file
+        # (size, mtime). Scores stay tag-scoped in the DB — only the deterministic
+        # preprocessing artifacts are shared.
         explicit_output_dir = self.config.inference.preprocess_output_dir
         ed_fingerprint = preprocessing_config_fingerprint(self.config.to_dict())
+        output_dir = explicit_output_dir or os.path.join(
+            self.config.data_path, "cache", "stamps", f"ed_{ed_fingerprint[:12]}"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Stamp cache directory: {output_dir}")
 
         group_by_cols = self.config.inference.cadence_group_by_cols
         h5_path_col = self.config.inference.cadence_h5_path_col
         expected_obs = self.config.inference.cadence_expected_obs
 
         units: list[PendingCadence] = []
+        planned_npy_paths: dict[str, list[str]] = {}
 
         for csv_filename in inference_files:
             csv_path = self.config.get_inference_file_path(csv_filename)
@@ -1724,23 +1717,33 @@ class DataPreprocessor:
                 f"CSV {csv_filename}: {len(valid_groups)} valid, {len(flagged_groups)} flagged"
             )
 
-            csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
-
-            output_dir = explicit_output_dir or self.config.get_inference_file_path(
-                os.path.join("preprocessed", f"{csv_stem}_ed{ed_fingerprint[:12]}")
-            )
-            os.makedirs(output_dir, exist_ok=True)
-            logger.info(f"Preprocessing output directory for {csv_filename}: {output_dir}")
-
             for group in valid_groups:
-                npy_filename = self._cadence_npy_filename(csv_stem, group.key)
-                units.append(
-                    PendingCadence(
-                        group=group,
-                        npy_path=os.path.join(output_dir, npy_filename),
-                        index=len(units) + 1,
+                npy_path = os.path.join(output_dir, self._cadence_npy_filename(group.h5_paths))
+                # Dedupe by content identity (#412): overlapping catalogs in one run can
+                # list the SAME cadence (same ordered h5 files) more than once. Identical
+                # cadences produce identical stamps and scores, and letting two units share
+                # one npy_path would double the work and let pruning race the duplicate's
+                # prefetch — plan the first occurrence only. Compare the h5 lists, not just
+                # the 48-bit digest: a truncated-hash collision between two DIFFERENT
+                # cadences must never silently drop one of them.
+                planned = planned_npy_paths.get(npy_path)
+                if planned is not None:
+                    if list(planned) == list(group.h5_paths):
+                        logger.info(
+                            f"Skipping duplicate cadence {group.key} from {csv_filename}: an "
+                            f"identical cadence (same ordered h5 files) is already planned "
+                            f"this run ({npy_path})"
+                        )
+                        continue
+                    raise ValueError(
+                        f"Stamp cache filename collision at {npy_path}: cadence "
+                        f"{group.key} from {csv_filename} hashes to the same 12-hex name as "
+                        f"an already-planned cadence over DIFFERENT .h5 files. Widen "
+                        f"_cadence_npy_filename's digest prefix rather than dropping a "
+                        f"cadence."
                     )
-                )
+                planned_npy_paths[npy_path] = group.h5_paths
+                units.append(PendingCadence(group=group, npy_path=npy_path, index=len(units) + 1))
 
         logger.info(
             f"Planned {len(units)} cadence work unit(s) across {len(inference_files)} CSV(s)"
@@ -1801,15 +1804,23 @@ class DataPreprocessor:
 
     def _resume_provenance_ok(self, group: CadenceGroup, npy_path: str, metadata_path: str) -> bool:
         """
-        Provenance guard on stamp reuse (#298 I3): an existing .npy is trusted only when its
-        sidecar metadata's h5_paths match this cadence's files and its recorded
-        ed_config_fingerprint (when present) matches the current config's. With the
-        fingerprint-scoped default directory the fingerprint check is belt-and-braces (a
-        changed ED config lands in a different directory by construction); the h5_paths
-        check is what protects an EXPLICIT --preprocess-output-dir against reusing another
-        catalog's stamps. Missing/unreadable metadata or a metadata file without the
-        fingerprint field (a pre-#298 artifact in an explicitly shared directory) degrades
-        to a warn-and-reuse — the historical, unguarded behavior — never a hard failure.
+        Provenance guard on stamp reuse (#298 I3, extended by #412): an existing .npy is
+        trusted only when its sidecar metadata's h5_paths match this cadence's files, its
+        recorded ed_config_fingerprint (when present) matches the current config's, and its
+        recorded per-file (size, mtime) (when present) still match the h5 files on disk —
+        the last closes the blind spot where an h5 re-staged/repaired AT THE SAME PATH would
+        silently serve stale stamps (size/mtime live only in the sidecar, never in the cache
+        key, so a benign re-stage re-extracts in place rather than churning keys). With the
+        content-addressed default directory the h5_paths + fingerprint checks verify exactly
+        what the key encodes; they are also what protects an EXPLICIT
+        --preprocess-output-dir against reusing another catalog's stamps. Fail-open on
+        anything that prevents VERIFYING rather than proves staleness: missing/unreadable
+        metadata (e.g. a crash between the .npy and .json publications), a sidecar without a
+        given field, or an un-stat-able h5 (raws archived, or a container run without the
+        raw-data bind — cached stamps are exactly what such a re-score run needs) all
+        degrade to warn-and-reuse / skip-that-check. Only positive evidence of staleness
+        (mismatched paths/fingerprint/stats) or a malformed sidecar re-extracts; the guard
+        itself never hard-fails the cadence.
         """
         try:
             with open(metadata_path) as f:
@@ -1836,6 +1847,59 @@ class DataPreprocessor:
                 logger.warning(
                     f"Cadence {group.key}: existing stamps at {npy_path} were written under "
                     f"a DIFFERENT energy-detection config; reprocessing instead of reusing"
+                )
+                return False
+
+        recorded_stats = metadata.get("h5_file_stats")
+        if recorded_stats is not None:
+            # The try contains type-level malformation (a non-list value, non-dict
+            # entries): a foreign or hand-edited sidecar must degrade to a warn +
+            # re-extract, never crash the streaming loop (this call site sits outside
+            # process_pending_cadence's containment).
+            try:
+                if len(recorded_stats) != len(group.h5_paths):
+                    logger.warning(
+                        f"Cadence {group.key}: sidecar for {npy_path} records "
+                        f"{len(recorded_stats)} h5_file_stats entries for "
+                        f"{len(group.h5_paths)} files (malformed); reprocessing instead of "
+                        f"reusing"
+                    )
+                    return False
+                unverifiable: list[str] = []
+                for h5_path, recorded in zip(group.h5_paths, recorded_stats, strict=True):
+                    try:
+                        stat = os.stat(h5_path)
+                    except OSError:
+                        # Cannot verify is not "verified stale": the raw h5 may be
+                        # legitimately unreachable (archived, or no raw-data bind in this
+                        # container) while the cached stamps are exactly what a warm
+                        # re-score needs — skip this file's check, don't invalidate.
+                        # Aggregated to ONE warning per cadence below: unreachable raws
+                        # are the STEADY STATE of a no-raw-bind re-score run, and 6
+                        # warnings x every cadence would flood the log (and Slack).
+                        unverifiable.append(h5_path)
+                        continue
+                    if stat.st_size != recorded.get("size") or stat.st_mtime != recorded.get(
+                        "mtime"
+                    ):
+                        logger.warning(
+                            f"Cadence {group.key}: {h5_path} changed on disk since its "
+                            f"stamps were extracted (size/mtime mismatch — re-staged or "
+                            f"repaired?); reprocessing instead of reusing stamps at "
+                            f"{npy_path}"
+                        )
+                        return False
+                if unverifiable:
+                    logger.warning(
+                        f"Cadence {group.key}: {len(unverifiable)}/{len(group.h5_paths)} h5 "
+                        f"file(s) could not be stat'd (first: {unverifiable[0]}); reusing "
+                        f"stamps at {npy_path} without (size, mtime) verification for those "
+                        f"files"
+                    )
+            except (TypeError, AttributeError) as e:
+                logger.warning(
+                    f"Cadence {group.key}: sidecar for {npy_path} has malformed "
+                    f"h5_file_stats ({e}); reprocessing instead of reusing"
                 )
                 return False
         return True
@@ -1875,17 +1939,18 @@ class DataPreprocessor:
         logger.info(f"find_hits completed: {len(results)} cadence .npy files available")
         return results
 
-    # NOTE: come back to this later (ensure filenames are structured similarly as in train_files & test_files)
     @staticmethod
-    def _cadence_npy_filename(csv_stem: str, key: tuple) -> str:
-        """Build a deterministic filename for a cadence group's .npy output."""
-        # Sanitize each key component via an allowlist: only word chars, dash, and
-        # dot survive — everything else collapses to underscore. This is broader
-        # than just stripping path separators / whitespace: CSV column values can
-        # carry quotes, control chars, shell metacharacters, or path-traversal
-        # sequences (e.g. "..") that would otherwise leak through.
-        safe_parts = [re.sub(r"[^\w\-.]+", "_", str(part)) for part in key]
-        return f"{csv_stem}_{'_'.join(safe_parts)}.npy"
+    def _cadence_npy_filename(h5_paths: list[str]) -> str:
+        """
+        Content-addressed filename for a cadence's stamp .npy (#412): the first 12 hex chars
+        of the sha256 over the ORDERED h5 path list. Order is part of the identity — ABACAD
+        order is scientifically meaningful, so the same files listed in a different order
+        are a different cadence and must miss. The catalog's name and the group key appear
+        nowhere (the sidecar keeps them as human-readable provenance), so renamed/subset
+        catalogs over the same files resolve to the same entry.
+        """
+        digest = hashlib.sha256(json.dumps(list(h5_paths)).encode()).hexdigest()
+        return f"{digest[:12]}.npy"
 
     @staticmethod
     def cadence_metadata_path(npy_path: str) -> str:
@@ -1943,6 +2008,17 @@ class DataPreprocessor:
         downsample_factor = self.config.data.downsample_factor if store_downsampled else 1
         time_bins = self.config.data.time_bins
         n_processes = self.config.manager.n_processes
+
+        # Snapshot each h5's (size, mtime) BEFORE the first read (#412): the sidecar must
+        # describe the files the stamps were extracted FROM. Snapshotting after extraction
+        # would let an h5 re-staged mid-extraction (a multi-minute window) record the NEW
+        # file's stats against stamps holding pre-restage bytes — permanently certifying
+        # them; with a pre-read snapshot that re-stage instead surfaces as a (size, mtime)
+        # mismatch on the next resume check.
+        h5_file_stats = [
+            {"size": stat.st_size, "mtime": stat.st_mtime}
+            for stat in (os.stat(p) for p in group.h5_paths)
+        ]
 
         # Read header / metadata from the first ON-source file
         on_source_paths = [group.h5_paths[i] for i in (0, 2, 4)]
@@ -2048,7 +2124,7 @@ class DataPreprocessor:
 
         if self.config.inference.bandpass_debug_plot:
             try:
-                self._plot_bandpass_overlay(primary_h5, n_coarse_total, bandpass_flatten, npy_path)
+                self._plot_bandpass_overlay(primary_h5, n_coarse_total, bandpass_flatten)
             except Exception as e:
                 logger.error(f"Cadence {group.key}: bandpass overlay plot failed: {e}")
 
@@ -2226,15 +2302,13 @@ class DataPreprocessor:
         # metadata "<stem>.json.<pid>.<hex>.tmp", and the #302 candidate sidecar
         # "<stem>.candidates.npz.<pid>.<hex>.tmp" (the latter two ended in ".tmp" but not
         # ".tmp.npy", so the old ".*.tmp.npy" glob leaked them). The fixed pre-#298
-        # "<stem>.tmp.npy" legacy name is swept too.
+        # "<stem>.tmp.npy" legacy sweep entry is gone (#412): no historical writer ever
+        # produced it next to a content-hashed stem.
         stale_cutoff = time.time() - _STALE_TMP_MAX_AGE_S
         stem = os.path.splitext(npy_path)[0]
         escaped = glob.escape(stem)
-        stale_tmps = (
-            glob.glob(f"{escaped}.*.tmp.npy")  # stamp memmap tmps
-            + glob.glob(f"{escaped}.*.tmp")  # metadata + candidate-sidecar tmps
-            + [f"{stem}.tmp.npy"]  # fixed pre-#298 legacy name
-        )
+        # Stamp memmap tmps, then metadata + candidate-sidecar tmps
+        stale_tmps = glob.glob(f"{escaped}.*.tmp.npy") + glob.glob(f"{escaped}.*.tmp")
         for stale in stale_tmps:
             with contextlib.suppress(OSError):
                 if os.path.getmtime(stale) < stale_cutoff:
@@ -2329,6 +2403,12 @@ class DataPreprocessor:
             "key": group.key,
             "csv_path": group.csv_path,
             "h5_paths": group.h5_paths,
+            # Per-file (size, mtime) snapshotted before this cadence's first h5 read
+            # (#412), aligned with h5_paths — compared by the resume guard so an h5
+            # re-staged/repaired at the same path re-extracts instead of silently serving
+            # stale stamps. Sidecar-only: keeping these OUT of the cache key means a
+            # benign re-stage never churns keys.
+            "h5_file_stats": h5_file_stats,
             "header": header,
             "stamp_starts": [int(start) for start, _, _ in stamp_centers],
             "stamp_width": stamp_width,
@@ -2446,7 +2526,7 @@ class DataPreprocessor:
     ) -> str:
         """
         Compute the PFB passband response in the parent process and persist it to a
-        deterministic sidecar .npy under {output_path}/cache/pfb/, returning its path.
+        deterministic sidecar .npy under {data_path}/cache/pfb/, returning its path.
 
         The heavy work (an ~n_chans-point FFT) runs exactly once per parameter combination in
         the parent — gen_coarse_channel_response is process-cached and the file is reused when
@@ -2463,7 +2543,7 @@ class DataPreprocessor:
             fine_per_coarse, num_coarse_channels, taps_per_channel
         )
 
-        cache_dir = os.path.join(self.config.output_path, "cache", "pfb")
+        cache_dir = os.path.join(self.config.data_path, "cache", "pfb")
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(
             cache_dir,
@@ -2479,7 +2559,7 @@ class DataPreprocessor:
             except Exception as e:
                 logger.warning(f"PFB response cache {path} unreadable ({e}); rewriting")
 
-        # Per-writer tmp name (pid + uuid) so two runs sharing this output_path don't clobber
+        # Per-writer tmp name (pid + uuid) so two runs sharing this data_path don't clobber
         # each other's in-progress write on a single shared "{path}.tmp"; os.replace stays
         # atomic and the content is deterministic, so whichever writer lands last is harmless.
         tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -2668,7 +2748,6 @@ class DataPreprocessor:
         h5_path: str,
         n_coarse_total: int,
         bandpass_flatten: Callable[[np.ndarray], np.ndarray],
-        npy_path: str,
     ) -> None:
         """
         Opt-in debug artifact (--bandpass-debug-plot): for a few coarse channels sampled evenly
@@ -2739,7 +2818,10 @@ class DataPreprocessor:
         display_tag_value = display_tag(tag, get_machine_name())
         save_dir = os.path.join(self.config.output_path, "plots", "inference", display_tag_value)
         os.makedirs(save_dir, exist_ok=True)
-        stem = os.path.splitext(os.path.basename(npy_path))[0]
+        # Named after the plotted ON file (matching the suptitle), not the stamp .npy: the
+        # #412 content-addressed stamp basename is an opaque hash, useless to the human this
+        # debug artifact exists for.
+        stem = os.path.splitext(os.path.basename(h5_path))[0]
         out_path = os.path.join(save_dir, f"bandpass_overlay_{stem}_{display_tag_value}.png")
         # No close/registry bookkeeping needed: an OO-API Figure is garbage-collected
         fig.savefig(out_path, dpi=120)

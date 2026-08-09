@@ -549,12 +549,14 @@ class InferenceConfig:
     side_channel_count: int = 0
 
     # Per-cadence .npy output directory for energy-detection preprocessing. None (default)
-    # resolves per CSV to {data_path}/inference/preprocessed/<csv_stem>_ed<hash12>/, keyed
-    # on the ED-config fingerprint (#298 I3): runs sharing an ED config share stamps (a
-    # threshold sweep or re-inference with new weights skips preprocessing entirely), while
-    # any ED-config change lands in a different directory by construction. Set explicitly
-    # to pin one directory across runs and CSVs (the resume guard still verifies each
-    # sidecar's h5_paths and recorded fingerprint before reuse).
+    # resolves to the content-addressed stamp cache {data_path}/cache/stamps/ed_<hash12>/
+    # (#298 I3 + #412), keyed on the ED-config fingerprint with filenames hashed from each
+    # cadence's ordered h5 path list: runs sharing an ED config share stamps regardless of
+    # catalog name (a threshold sweep, re-inference with new weights, or a renamed/subset
+    # catalog over the same files skips preprocessing entirely), while any ED-config change
+    # lands in a different directory by construction. Set explicitly to pin one directory
+    # across runs and CSVs (the resume guard still verifies each sidecar's h5_paths,
+    # recorded fingerprint, and per-file (size, mtime) before reuse).
     preprocess_output_dir: str | None = None
     # Stamp-cache pruning (#302; default flipped OFF by #399): when ON, delete a cadence's
     # stamp .npy right after its 'inferred' manifest row lands (metadata .json always kept;
@@ -562,7 +564,7 @@ class InferenceConfig:
     # .candidates.npz sidecar so the candidate figures survive, and a bounded top-K pixel
     # pool — persisted across the in-process retry attempts, #305 — keeps the stamp gallery
     # whole within one run). None (default) = OFF: stamps are RETAINED so the
-    # fingerprint-scoped cache works out of the box — re-scoring the same data under the
+    # content-addressed cache works out of the box — re-scoring the same data under the
     # same ED config (new weights, threshold sweeps) skips preprocessing entirely, the
     # measured bulk of inference wall time (#399: 25.8k stage-seconds of the subset run's
     # 12.6k-second wall). The trade is disk: ~1 GB/cadence average (380 GB for the

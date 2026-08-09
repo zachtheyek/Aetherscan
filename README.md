@@ -1060,14 +1060,16 @@ options:
                         overlap-search stamps (default: 0.5)
   --preprocess-output-dir PREPROCESS_OUTPUT_DIR
                         Directory for per-cadence .npy outputs from
-                        preprocessing. Default: a per-CSV directory {data_path
-                        }/inference/preprocessed/<csv_stem>_ed<hash>/ keyed on
-                        the energy-detection config fingerprint — runs sharing
-                        an ED config reuse each other's stamps automatically,
-                        and any ED-config change resolves to a fresh
-                        directory. Pass a directory explicitly to pin/share
-                        one location (reuse is still guarded by the sidecar's
-                        recorded h5 paths and ED fingerprint)
+                        preprocessing. Default: the content-addressed stamp
+                        cache {data_path}/cache/stamps/ed_<hash>/ keyed on the
+                        energy-detection config fingerprint, with filenames
+                        hashed from each cadence's ordered h5 path list — runs
+                        sharing an ED config reuse each other's stamps
+                        automatically regardless of catalog name, and any ED-
+                        config change resolves to a fresh directory. Pass a
+                        directory explicitly to pin/share one location (reuse
+                        is still guarded by the sidecar's recorded h5 paths,
+                        ED fingerprint, and per-file size/mtime)
   --prune-stamps, --no-prune-stamps
                         Delete each cadence's stamp .npy right after its
                         'inferred' manifest row lands, keeping the metadata
@@ -1077,7 +1079,7 @@ options:
                         stamps are retained (~1 GB/cadence average) so re-
                         scoring the same data under the same energy-detection
                         config (new weights, threshold sweeps) skips
-                        preprocessing entirely via the fingerprint-scoped
+                        preprocessing entirely via the content-addressed
                         cache. Pass --prune-stamps on catalog-scale runs:
                         without pruning a full catalog writes ~30-90 TB of
                         stamps and dies on disk.
