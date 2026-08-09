@@ -1413,6 +1413,37 @@ class TestPlanCadencesOutputDir:
 
         assert len(units) == 1
 
+    def test_true_digest_collision_raises(
+        self, initialized_runtime, make_inference_csv, monkeypatch
+    ):
+        # Two DIFFERENT cadences forced onto one 12-hex name (un-constructable for real
+        # sha256, so simulated): the planner must refuse rather than silently drop one —
+        # missing science data is far worse than a cache miss.
+        config = get_config()
+        make_inference_csv("a.csv")
+        make_inference_csv(
+            "b.csv",
+            groups=[
+                (
+                    {
+                        "Target": "HIP99999",
+                        "Session": "AGBT21B_999_32",
+                        "Band": "L",
+                        "Cadence ID": "1",
+                        "Frequency": "1400",
+                    },
+                    [f"/data/other_{i}.h5" for i in range(6)],
+                )
+            ],
+        )
+        config.data.inference_files = ["a.csv", "b.csv"]
+        monkeypatch.setattr(
+            DataPreprocessor, "_cadence_npy_filename", staticmethod(lambda h5_paths: "cafe.npy")
+        )
+
+        with pytest.raises(ValueError, match="collision"):
+            DataPreprocessor().plan_cadences()
+
     def test_explicit_override_shared_across_csvs(
         self, initialized_runtime, make_inference_csv, tmp_path
     ):

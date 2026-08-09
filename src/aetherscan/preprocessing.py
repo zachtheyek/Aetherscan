@@ -1660,7 +1660,9 @@ class DataPreprocessor:
         processing anything. Returns one PendingCadence (valid group + target .npy path) per
         distinct valid cadence, in CSV order — the unit list the streaming inference loop
         iterates. Cadences whose content identity (ordered h5 path list) repeats across the
-        run's CSVs are planned once (first occurrence wins, #412).
+        run's CSVs are planned once (first occurrence wins, #412); a truncated-digest
+        collision between two DIFFERENT cadences raises ValueError rather than silently
+        dropping one.
         """
         inference_files = self.config.data.inference_files
         if not inference_files:
@@ -1694,7 +1696,7 @@ class DataPreprocessor:
         expected_obs = self.config.inference.cadence_expected_obs
 
         units: list[PendingCadence] = []
-        planned_npy_paths: set[str] = set()
+        planned_npy_paths: dict[str, list[str]] = {}
 
         for csv_filename in inference_files:
             csv_path = self.config.get_inference_file_path(csv_filename)
@@ -1721,15 +1723,26 @@ class DataPreprocessor:
                 # list the SAME cadence (same ordered h5 files) more than once. Identical
                 # cadences produce identical stamps and scores, and letting two units share
                 # one npy_path would double the work and let pruning race the duplicate's
-                # prefetch — plan the first occurrence only.
-                if npy_path in planned_npy_paths:
-                    logger.info(
-                        f"Skipping duplicate cadence {group.key} from {csv_filename}: an "
-                        f"identical cadence (same ordered h5 files) is already planned this "
-                        f"run ({npy_path})"
+                # prefetch — plan the first occurrence only. Compare the h5 lists, not just
+                # the 48-bit digest: a truncated-hash collision between two DIFFERENT
+                # cadences must never silently drop one of them.
+                planned = planned_npy_paths.get(npy_path)
+                if planned is not None:
+                    if list(planned) == list(group.h5_paths):
+                        logger.info(
+                            f"Skipping duplicate cadence {group.key} from {csv_filename}: an "
+                            f"identical cadence (same ordered h5 files) is already planned "
+                            f"this run ({npy_path})"
+                        )
+                        continue
+                    raise ValueError(
+                        f"Stamp cache filename collision at {npy_path}: cadence "
+                        f"{group.key} from {csv_filename} hashes to the same 12-hex name as "
+                        f"an already-planned cadence over DIFFERENT .h5 files. Widen "
+                        f"_cadence_npy_filename's digest prefix rather than dropping a "
+                        f"cadence."
                     )
-                    continue
-                planned_npy_paths.add(npy_path)
+                planned_npy_paths[npy_path] = group.h5_paths
                 units.append(PendingCadence(group=group, npy_path=npy_path, index=len(units) + 1))
 
         logger.info(
