@@ -746,8 +746,10 @@ class TestSuiteEntryPoint:
 
 
 class TestCandidateFrequencyMap:
-    """#394: candidate frequency map — dots at (frequency, target) colored by band, with
-    report-excluded ranges shaded; skips gracefully with no candidates."""
+    """#394: candidate frequency map — a dot plot of candidates along frequency (jittered y,
+    no y encoding), colored by TARGET with legend labels (band stays out of the legend —
+    x-position implies it), report-excluded ranges shaded; skips gracefully with no
+    candidates."""
 
     def _write_candidates(self, db, npy_path, specs):
         for idx, (target, band, freq) in enumerate(specs):
@@ -782,8 +784,8 @@ class TestCandidateFrequencyMap:
 
         db = initialized_runtime
         record = collector.records[0]
-        # More targets than the row cap -> the overflow aggregate row must carry the
-        # remaining candidate count without KeyErrors
+        # More targets than the legend/color cap -> the overflow aggregate entry must
+        # carry the remaining candidate count without KeyErrors
         monkeypatch.setattr(viz, "_CANDIDATE_FREQ_MAX_TARGETS", 2)
         get_config().inference.report_exclude_frequency_ranges = [[1616.0, 1626.5]]
         self._write_candidates(

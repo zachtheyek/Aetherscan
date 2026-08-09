@@ -36,8 +36,8 @@ from dataclasses import dataclass, field
 
 import h5py
 import numpy as np
+from matplotlib import colormaps
 from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
 
 from aetherscan.benchmark import stage_timer
 from aetherscan.candidate_figures import (
@@ -1121,17 +1121,21 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     )
 
 
-_CANDIDATE_FREQ_MAX_TARGETS = 40
-_BAND_COLORS = {"L": "tab:blue", "S": "tab:green", "C": "tab:red", "X": "tab:purple"}
+# Distinct legend/color slots for the dot plot — tab20's palette size; everything past the
+# cap collapses into one gray aggregate entry (color is the target encoding now, and >20
+# colors stop being distinguishable)
+_CANDIDATE_FREQ_MAX_TARGETS = 20
 
 
 def plot_candidate_frequency() -> str | None:
     """
-    Candidate frequency map (#394): every candidate as a dot at (frequency, target row),
-    colored by band — targets sorted by candidate count, report-excluded frequency ranges
-    (#395) shaded. The load-bearing read is VERTICAL alignment: the same frequency lighting
-    up across many targets is the signature of a terrestrial transmitter (multi-target
-    coincidence), whereas a genuine technosignature is a dot with no vertical company. In
+    Candidate frequency map (#394): a dot plot — every candidate at its frequency along x
+    with deterministic vertical jitter (y carries no meaning), COLORED BY TARGET with legend
+    labels, report-excluded frequency ranges (#395) shaded. Band is deliberately absent from
+    the legend: x-position already implies it. The load-bearing read is one x-position
+    carrying MANY COLORS: the same frequency lighting up across many targets is the
+    signature of a terrestrial transmitter (multi-target coincidence), whereas a genuine
+    technosignature is a dot whose frequency has no multi-color company. In
     inf_blpc3_20260807_011509 two target/bands held 49% of all candidates and several top
     candidates sat in GPS/Iridium allocations — structure no other figure showed.
     """
@@ -1156,34 +1160,36 @@ def plot_candidate_frequency() -> str | None:
     overflow = len(counts) - len(ordered_targets)
     overflow_label = f"(+{overflow} more targets)"
     if overflow:
-        # The aggregate row's count is its candidate total, mirroring the per-target rows
+        # The aggregate entry's count is its candidate total, mirroring per-target entries
         counts[overflow_label] = len(rows) - sum(counts[t] for t in ordered_targets)
-        ordered_targets.append(overflow_label)
-    # Row 0 at the top: most candidate-heavy target first
-    y_index = {target: i for i, target in enumerate(ordered_targets)}
+    color_by_target = {
+        target: colormaps["tab20"](i % 20) for i, target in enumerate(ordered_targets)
+    }
 
-    fig = Figure(figsize=(12, 0.28 * len(ordered_targets) + 2.8))
+    fig = Figure(figsize=(12, 4.5))
     ax = fig.subplots()
 
-    # One scatter per band, not one artist per row: candidate counts reach 10^4+ at
-    # catalog scale and per-row Line2D artists would make this figure the slowest in the
-    # suite for no visual gain
-    points_by_band: dict[str, list[tuple[float, int]]] = {}
+    # One scatter per legend target, not one artist per point: candidate counts reach
+    # 10^4+ at catalog scale. y is a seeded uniform jitter — a strip to keep coincident
+    # frequencies from overplotting into one dot; the axis itself encodes nothing.
+    jitter_rng = np.random.default_rng(0)
+    points_by_target: dict[str, list[float]] = {}
     for row in rows:
         target = row.get("target") or "?"
-        y = y_index.get(target, y_index.get(overflow_label))
-        band = row.get("band") or "?"
-        points_by_band.setdefault(band, []).append((float(row["frequency_mhz"]), y))
-    seen_bands = list(points_by_band)
-    for band, points in points_by_band.items():
-        xs, ys = zip(*points, strict=True)
+        key = target if target in color_by_target else overflow_label
+        points_by_target.setdefault(key, []).append(float(row["frequency_mhz"]))
+    for target in [*ordered_targets, *([overflow_label] if overflow else [])]:
+        xs = points_by_target.get(target)
+        if not xs:
+            continue
         ax.scatter(
             xs,
-            ys,
+            jitter_rng.uniform(0.0, 1.0, size=len(xs)),
             s=16,
             alpha=0.55,
-            color=_BAND_COLORS.get(band, "tab:gray"),
+            color=color_by_target.get(target, "tab:gray"),
             edgecolors="none",
+            label=f"{target} ({counts[target]})",
         )
 
     exclusion_ranges = report_exclusion_ranges(config)
@@ -1201,23 +1207,19 @@ def plot_candidate_frequency() -> str | None:
             f"{len(rows):,} candidates"
         )
 
-    ax.set_yticks(range(len(ordered_targets)))
-    ax.set_yticklabels([f"{target} ({counts[target]})" for target in ordered_targets], fontsize=7)
-    ax.invert_yaxis()
+    ax.set_yticks([])
+    ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("frequency (MHz)")
     ax.grid(True, axis="x", alpha=0.2)
-    handles = [
-        Line2D(
-            [],
-            [],
-            marker="o",
-            linestyle="none",
-            color=_BAND_COLORS.get(band, "tab:gray"),
-            label=band,
-        )
-        for band in sorted(seen_bands)
-    ]
-    ax.legend(handles=handles, title="band", fontsize=8, loc="upper right")
+    ax.legend(
+        title="target",
+        fontsize=7,
+        title_fontsize=8,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        markerscale=1.4,
+        framealpha=0.9,
+    )
 
     return _save_and_upload(
         fig,
