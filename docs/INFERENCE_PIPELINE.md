@@ -603,7 +603,7 @@ borders high → low; a stamp with no recoverable `fch1`/`foff` (legacy sidecar)
 | `stamp_gallery_{tag}.png` | Top-K stamps by detection statistic (`stamp_gallery_top_k`, default 12), each a 6-observation waterfall strip; overlap-offset copies collapsed first. Cadences pruned in this run (incl. across its in-process retries) render from the collector's pooled pixels (#302); cadences pruned by an earlier *process* (a relaunch-resume) degrade to blank columns. | The cadence layout scientists actually inspect: a real technosignature shows in ONs (rows 0/2/4) and vanishes in OFFs; the top of this gallery is virtually always bright RFI present in all six — that's expected. |
 | `preproc_funnel_{tag}.png` | Per-cadence bar funnel: raw hits → merged hits → stamps (incl. overlap copies) → snippets inferred, plus storage per cadence. Past 120 cadences the strongest (by raw hits) keep individual bars and the rest aggregate into one summary bar (#301 — the unbounded figure exceeded Agg's 2¹⁶-px canvas limit past 242 cadences and was silently lost). | Where the volume goes. A weak merge step (raw ≈ merged) means hits are spread out rather than comb-like; snippets ≪ stamps indicates load-time validity rejections. |
 | `confidence_distribution_{tag}.png` | P(true) histogram over all snippets inferred this pass (log-y), threshold line, per-cadence overlay when ≤ 10 cadences. | Mass should hug 0 with a thin bridge toward 1. Any mass just *below* threshold is worth manual inspection; a large mass above it usually means model/data mismatch (e.g. wrong config JSON) rather than a sky full of signals. |
-| `candidate_frequency_map_{tag}.png` | A dot plot: every candidate at its frequency along x (jittered y — the axis encodes nothing), **colored by target** with legend labels (top-18 targets by candidate count — tab20 minus its gray pair — + one gray aggregate entry; band is deliberately absent from the legend — x-position implies it), report-excluded ranges (#395) shaded. | The load-bearing read is one frequency carrying MANY COLORS (#394): the same frequency lighting up across many targets is the multi-target-coincidence signature of a terrestrial transmitter; a genuine technosignature has no multi-color company at its frequency. `utils/candidate_rfi_report.py` (#396) quantifies the same signal off-cluster. |
+| `candidate_frequency_map_{tag}.png` | A dot plot: every candidate at its frequency along x (jittered y — the axis encodes nothing), **colored by target** with legend labels (top-18 targets by candidate count — tab20 minus its gray pair — + one gray aggregate entry; band is deliberately absent from the legend — x-position implies it), report-excluded ranges (#395) shaded. | The load-bearing read is one frequency carrying MANY COLORS (#394): the same frequency lighting up across many targets is the multi-target-coincidence signature of a terrestrial transmitter; a genuine technosignature has no multi-color company at its frequency. [`utils/candidate_rfi_report.py`](#the-candidate-rfi-triage-report-utilscandidate_rfi_reportpy) (#396) quantifies the same signal off-cluster. |
 | `candidate_gallery_{tag}.png` + `candidate_{i}_{tag}.png` | Gallery of top candidates + up to `max_candidate_plots` (50) per-candidate figures: 6-panel waterfall, its frequency axis labeled with the MHz value at the left and right borders, annotated with confidence, frequency, target/session/band, and the latent bar chart; the gallery's column titles additionally carry the survey-OOD percentile (#397, when the reference cloud carries latents). Sourced from `inference_results`, so resumed cadences are included. Ordered by confidence desc, tie-broken by survey-OOD distance desc then MC spread asc (#397 — within a saturated P=1.000 tie, the candidate least like the survey background reviews first). Report-excluded candidates (#395) keep their saved figures but are dropped from the gallery and the Slack uploads. | The human veto stage. Check the ON/OFF pattern by eye, the frequency against known RFI allocations, and whether the latent vector resembles the true-class latents from training. |
 | `candidate_triage_{tag}.csv` | One row per candidate in review order: confidence, MC mean/spread, survey-OOD distance/percentile (vs this run's reference cloud), training-OOD distance/percentile (vs the training run's true-class features from the cluster-local `rf_eval_artifacts` joblib; `z_mean` variant only, gracefully skipped otherwise), and the report-exclusion flag. Not uploaded — Slack surfaces stay image-only. | The triage sheet (#397). OOD scores RANK review order and never gate candidacy — a genuine technosignature is itself OOD with respect to synthetic training data. High survey-OOD = unlike the surveyed sky background; high training-OOD = unlike the synthetic signal manifold. |
 | `candidate_uncertainty_{tag}.png` | Each candidate (red star) at x = final RF probability (MC mean), y = MC spread, over a hexbin density background of the reference cloud (the survey's pass-1 rejects), with the science threshold as a vertical line. | Population context is the whole point: "p = 0.97, spread = 0.05" is only interpretable against where the survey sits. The dangerous quadrant is **high p + high spread** — a mean that looks confident while draws swing — exactly what `p` alone cannot flag (see the interpretation table above). Candidates hugging the survey cloud are threshold noise. |
@@ -617,6 +617,50 @@ benchmark report, under the same `--no-benchmark-report` gate and with the same 
 It is skipped (never fatal) on the legacy `--test-files` path below, which has no catalog CSV
 to join against. See [`BENCHMARKING.md`](BENCHMARKING.md#the-per-band-inference-plot-utilsperband_reportpy)
 for the figure, the join, and its count guard.
+
+## The candidate RFI-triage report (`utils/candidate_rfi_report.py`)
+
+The figures above are the eyeball pass; `utils/candidate_rfi_report.py` (#396) asks the same
+review question numerically, and it is the review surface that also runs **off-cluster**. Like
+its sibling [`utils/perband_report.py`](BENCHMARKING.md#the-per-band-inference-plot-utilsperband_reportpy)
+it is standalone and dependency-light — stdlib `sqlite3` + `csv` + numpy, **no `aetherscan`
+imports** — and it opens the run's SQLite DB **read-only** (`mode=ro` URI), reading the tag's
+live candidates (`inference_results`, `prediction = 1`, `superseded = 0`) directly. Nothing about
+the pipeline is re-run, so it works equally well on the cluster or on a laptop against a DB
+pulled with `utils/fetch_run_outputs.sh`. It is never fired automatically.
+
+It prints the three RFI signatures worth checking before opening a single waterfall:
+
+- **Multi-target frequency coincidence** — frequency bins (`--coincidence-bin-mhz`, default
+  0.2 MHz) lit up by ≥ `--min-targets` (default 3) distinct targets. The sky does not put the same
+  narrowband signal on many independent pointings; a terrestrial transmitter does. This is the
+  numeric form of the "one frequency, many colors" read of `candidate_frequency_map_{tag}.png`,
+  and it catches transmitters that appear in no allocation table.
+- **Known-RFI allocation flags** — a built-in, deliberately coarse, easily extended table
+  (`KNOWN_RFI_BANDS`: GPS L1/L2/L5, GLONASS L1/L2, Iridium, each widened by a little
+  out-of-band spill) of the allocations that dominated past runs' false positives.
+- **Per-target concentration** — a handful of targets holding most of a run's candidates reads as
+  localized RFI or receiver artifacts rather than uniform detections.
+
+`--exclude-frequency-range START_MHZ END_MHZ` (repeatable) mirrors the pipeline's
+`--report-exclude-frequency-range` accounting (#395), so an off-cluster review sees the same
+original vs excluded vs reported split the run itself reported. Everything here **flags, never
+deletes**: no candidate is dropped and the DB is never written — a genuine technosignature
+re-observed at one target is, by construction, not multi-target-coincident, so the human stays
+the judge.
+
+```bash
+python utils/candidate_rfi_report.py --save-tag inf_20260807_011509
+python utils/candidate_rfi_report.py --save-tag inf_20260807_011509 \
+    --db-path /path/to/aetherscan.db --csv triage.csv \
+    --exclude-frequency-range 1616 1626.5
+```
+
+`--save-tag` is the run's **DB** tag (`{command}_{datetime}`), not the machine-scoped display tag
+that filenames carry; `--db-path` defaults to `{AETHERSCAN_OUTPUT_PATH}/db/aetherscan.db`, and
+`--csv` additionally writes the per-candidate flagged rows to disk. A tag with no live candidates
+prints a clean-run line and exits 0, so `set -e` wrappers can tell "no candidates" from "the
+report couldn't run".
 
 ## Legacy `--test-files` path
 
