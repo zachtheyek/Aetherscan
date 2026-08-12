@@ -114,7 +114,7 @@ dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]
 # still accepts protobuf>=3.20,<8 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x
 # and the numpy<2 ceiling; plotly is pure-Python; pandas backs the data layer (the NGC base
 # ships pandas, so requirements-container.txt omits it there).
-dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<7", "pandas>=2.3,<2.4"]
+dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<6.8", "pandas>=2.3,<2.4"]
 
 [tool.pytest.ini_options]
 # Make `import aetherscan` work without a PYTHONPATH=src prefix

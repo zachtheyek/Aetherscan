@@ -26,9 +26,11 @@
 #                               checkout; a .devN checkout resolves the newest published release
 #                               tag AT OR BELOW its own version via the GHCR API (#424), falling
 #                               back to `latest` when the registry is unreachable)
-#     AETHERSCAN_FORCE_REPULL   Set to 1 to delete a .sif the wrapper cannot verify (user-built
-#                               or manually pulled — no pull-provenance sidecar) and re-pull the
-#                               published image in its place (#424). Default: warn and keep it.
+#     AETHERSCAN_FORCE_REPULL   Set to 1 to re-pull the published image over a .sif the wrapper
+#                               cannot fully verify — a user-built/manually-pulled one (no
+#                               pull-provenance sidecar) or a pre-#424 ref-only sidecar (#424).
+#                               Default: warn and keep it. No effect on an image already
+#                               digest-verified against the registry.
 #     AETHERSCAN_DATA_PATH      Host data dir, bound 1:1
 #                               (default: /datax/scratch/zachy/data/aetherscan)
 #     AETHERSCAN_MODEL_PATH     Host models dir, bound 1:1
@@ -141,7 +143,7 @@ IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
 _ghcr_token() {  # $1 = repo path (owner/name); prints a token
     local token
     command -v curl >/dev/null 2>&1 || return 1
-    token=$(curl -fsS --max-time 10 "https://ghcr.io/token?scope=repository:$1:pull" 2>/dev/null \
+    token=$(curl -fsS --connect-timeout 3 --max-time 10 "https://ghcr.io/token?scope=repository:$1:pull" 2>/dev/null \
         | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p') || return 1
     [[ -n $token ]] || return 1
     printf '%s\n' "$token"
@@ -165,7 +167,7 @@ _ghcr_ceiling_tag() {  # $1 = repo path, $2 = pyproject version; prints the want
     fi
     major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
     token=$(_ghcr_token "$repo") || return 1
-    tags=$(curl -fsS --max-time 10 -H "Authorization: Bearer $token" \
+    tags=$(curl -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer $token" \
         "https://ghcr.io/v2/$repo/tags/list" 2>/dev/null \
         | tr ',[]' '\n' | sed -n 's/.*"\(v[0-9][0-9.]*\)".*/\1/p') || return 1
     while IFS= read -r t; do
@@ -192,7 +194,7 @@ _ghcr_ceiling_tag() {  # $1 = repo path, $2 = pyproject version; prints the want
 _ghcr_remote_digest() {  # $1 = repo path, $2 = tag; prints the manifest digest (sha256:…)
     local token digest
     token=$(_ghcr_token "$1") || return 1
-    digest=$(curl -fsSI --max-time 10 -H "Authorization: Bearer $token" \
+    digest=$(curl -fsSI --connect-timeout 3 --max-time 10 -H "Authorization: Bearer $token" \
         -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
         "https://ghcr.io/v2/$1/manifests/$2" 2>/dev/null \
         | awk 'tolower($1)=="docker-content-digest:"{print $2}' | tr -d '\r') || return 1
@@ -228,11 +230,29 @@ if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
             echo "Resolved image tag '$CEILING_TAG' (newest published release at or below" \
                  "this checkout's version $VER, #424)." >&2
         else
-            AETHERSCAN_IMAGE_TAG="latest"
-            if [[ $ceiling_rc -eq 2 ]]; then
-                echo "WARNING: no published release tag at or below this checkout's version" \
-                     "$VER exists — falling back to ':latest', which may be NEWER than this" \
-                     "checkout's code. Build from aetherscan.def for a version-true image." >&2
+            # Resolver unavailable/empty. Before surrendering to :latest, prefer a cached
+            # sidecar that already records a version-true vX.Y.Z ref for THIS repo: that
+            # image is known-ceilinged, and re-pulling :latest over it would reintroduce
+            # the drift class on e.g. a curl-less node (apptainer pulls fine without curl,
+            # so the resolver failing does not mean pulls would).
+            sidecar_prev_ref=$(head -n 1 "$SIF.pulled-tag" 2>/dev/null || true)
+            if [[ $sidecar_prev_ref == "$IMAGE_REPO":v[0-9]* ]]; then
+                AETHERSCAN_IMAGE_TAG=${sidecar_prev_ref#"$IMAGE_REPO":}
+                echo "NOTE: ceiling resolution unavailable — keeping the cached sidecar's" \
+                     "version-true tag '$AETHERSCAN_IMAGE_TAG' instead of ':latest' (#424)." >&2
+            else
+                AETHERSCAN_IMAGE_TAG="latest"
+                if [[ $ceiling_rc -eq 2 ]]; then
+                    echo "WARNING: no published release tag at or below this checkout's" \
+                         "version $VER exists — falling back to ':latest', which may be" \
+                         "NEWER than this checkout's code. Build from aetherscan.def for a" \
+                         "version-true image." >&2
+                elif [[ -n $GHCR_REPO_PATH ]]; then
+                    echo "WARNING: could not resolve this checkout's ceiling-bounded release" \
+                         "tag (no curl, or the GHCR tag API was unreachable) — falling back" \
+                         "to ':latest', which may be NEWER than this checkout's version" \
+                         "$VER (#424)." >&2
+                fi
             fi
         fi
     fi

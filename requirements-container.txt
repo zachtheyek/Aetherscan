@@ -56,4 +56,4 @@ setigen>=2.7,<2.8
 streamlit>=1.59.2,<1.60
 # 6.x removals (transforms API, pointcloud/heatmapgl, mapbox->MapLibre) don't touch
 # dashboard.py, which uses only plotly.express + graph_objects.
-plotly>=6.7,<7
+plotly>=6.7,<6.8

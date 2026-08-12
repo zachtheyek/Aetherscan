@@ -41,7 +41,7 @@ cd Aetherscan
 # so you normally build nothing. Build here only when the pull can't serve you — offline,
 # requirements-container.txt has moved past that release, non-x86_64, or a driver below the
 # CUDA 12.8 floor.
-singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
+# singularity build aetherscan-ngc25.02.sif aetherscan.def   # (or apptainer) only if the pull can't serve you
 
 # Launch tmux session
 # All subsequent commands should be ran in the top pane of the pipeline

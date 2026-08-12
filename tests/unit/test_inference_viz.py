@@ -884,6 +884,34 @@ class TestCandidateFrequencyMap:
         _assert_figure(viz.plot_candidate_frequency())
         assert captured["yscale"] == "log"
 
+    def test_log_scale_engages_on_deep_single_bin(
+        self, initialized_runtime, collector, monkeypatch
+    ):
+        # The depth backstop: a total count UNDER the threshold whose candidates pile into
+        # one bin (the #394 coincidence signature) must still flip to log — a linear axis
+        # would render that column as a solid bar and every other stack sub-pixel.
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        record = collector.records[0]
+        monkeypatch.setattr(viz, "_CANDIDATE_FREQ_LOG_Y_MAX_STACK", 4)
+        assert viz._CANDIDATE_FREQ_LOG_Y_THRESHOLD > 6  # the count trigger must NOT fire
+        self._write_candidates(
+            db,
+            record.npy_path,
+            [("T1", "L", 1620.0)] * 6,  # one bin, six deep
+        )
+        real_save = viz._save_and_upload
+        captured = {}
+
+        def _capturing_save(fig, filename, label):
+            captured["yscale"] = fig.axes[0].get_yscale()
+            return real_save(fig, filename, label)
+
+        monkeypatch.setattr(viz, "_save_and_upload", _capturing_save)
+        _assert_figure(viz.plot_candidate_frequency())
+        assert captured["yscale"] == "log"
+
     def test_skips_without_candidates(self, initialized_runtime):
         from aetherscan.inference_viz import plot_candidate_frequency  # noqa: PLC0415
 

@@ -1177,7 +1177,7 @@ cd Aetherscan
 # below its own version automatically (#424), so you normally build nothing — build once here
 # only if you'll run offline, requirements-container.txt has moved past that release, or the
 # published image can't serve your host.
-singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
+# singularity build aetherscan-ngc25.02.sif aetherscan.def   # (or apptainer) only if the pull can't serve you
 
 ./utils/start_tmux_session.sh
 

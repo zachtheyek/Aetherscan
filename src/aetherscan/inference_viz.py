@@ -1138,6 +1138,10 @@ _CANDIDATE_FREQ_BINS = 600
 # Candidate count past which the stack axis flips to log scale (#423, maintainer-decided):
 # catalog-scale runs stack thousands deep at RFI-heavy frequencies.
 _CANDIDATE_FREQ_LOG_Y_THRESHOLD = 10_000
+# Depth backstop for the same switch: a single bin a few hundred dots deep already
+# saturates the ~600-px axis into a solid bar (the #394 coincidence signature itself) even
+# when the TOTAL count sits under the threshold — so either trigger engages log-y.
+_CANDIDATE_FREQ_LOG_Y_MAX_STACK = 400
 
 
 def plot_candidate_frequency() -> str | None:
@@ -1245,14 +1249,14 @@ def plot_candidate_frequency() -> str | None:
         )
 
     tallest = max(next_level.values())
-    if len(rows) > _CANDIDATE_FREQ_LOG_Y_THRESHOLD:
+    if len(rows) > _CANDIDATE_FREQ_LOG_Y_THRESHOLD or tallest > _CANDIDATE_FREQ_LOG_Y_MAX_STACK:
         ax.set_yscale("log")
         ax.set_ylim(0.7, tallest * 1.6)
     else:
         ax.set_ylim(0, tallest * 1.08 + 1)
     ax.set_ylabel("candidates per bin (stacked dots)")
     ax.set_xlabel("frequency (MHz)")
-    ax.grid(True, axis="x", alpha=0.2)
+    ax.grid(True, axis="both", alpha=0.2)
     ax.legend(
         title="target",
         fontsize=7,

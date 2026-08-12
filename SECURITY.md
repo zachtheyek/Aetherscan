@@ -202,7 +202,7 @@ curl -s -H "Authorization: Bearer $TOKEN" https://ghcr.io/v2/zachtheyek/aethersc
 
 # 3. Manifest digest for a tag (read the Docker-Content-Digest response header)
 curl -sI -H "Authorization: Bearer $TOKEN" \
-  -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+  -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
   https://ghcr.io/v2/zachtheyek/aetherscan/manifests/v1.1.0 | grep -i docker-content-digest
 ```
 

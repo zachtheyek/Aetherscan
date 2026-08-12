@@ -110,7 +110,7 @@ compatibility promises; from `1.0.0` onward, these rules hold.
   `h5py`, `hdf5plugin`, `psutil`) — a pip install has no base image to lean on.
   Optional extras: `dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]` (the `pytest` floor is a
   security floor — GHSA-6w46-j5rx-g56g, tmpdir handling; dev/test-only) and
-  `dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<7", "pandas>=2.3,<2.4"]` —
+  `dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<6.8", "pandas>=2.3,<2.4"]` —
   `pip install aetherscan[dashboard]` pulls the stack for the packaged live dashboard
   ([`src/aetherscan/dashboard.py`](../src/aetherscan/dashboard.py)). Dependency *versions* follow
   [`SECURITY.md`](../SECURITY.md)'s selection policy, and the documented ceilings

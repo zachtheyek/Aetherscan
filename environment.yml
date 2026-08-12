@@ -79,4 +79,4 @@ dependencies:
       # requirements-container.txt; streamlit 1.59 coexists with TF 2.17 (protobuf 4.x)
       # and numpy<2. plotly is pure-Python.
       - streamlit>=1.59.2,<1.60
-      - plotly>=6.7,<7
+      - plotly>=6.7,<6.8
