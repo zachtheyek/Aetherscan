@@ -451,7 +451,7 @@ master's `requirements-container.txt` had already moved past v1.0.0's (notably t
 security bump), and pinning `:latest` to the backfilled image would have served dev checkouts a
 knowingly stale dependency set. Since v1.1.0's CD run, `:latest` exists and tracks the newest
 real release — though since [#424](https://github.com/zachtheyek/Aetherscan/issues/424) it is only
-the wrapper's offline fallback: a `.devN` checkout resolves the newest release tag **at or below
+the wrapper's last-resort fallback (after the cached sidecar's ceiling-compatible tag): a `.devN` checkout resolves the newest release tag **at or below
 its own version** from the GHCR tag API, and the `<sif>.pulled-tag` sidecar records the pulled ref
 *and* its manifest digest, so a retagged ref is detected, warned about, and re-pulled automatically
 — a `.devN` checkout no longer keeps a stale cached `.sif` as qualifying releases move. The failure
@@ -485,5 +485,5 @@ a cluster via `utils/run_container.sh`.
   `aetherscan.def` build instructions if the pull fails) — a convenience, not a contract change: a
   checkout of a release tag pulls that version's image, a `.devN` checkout resolves the newest
   published release at or below its own version
-  ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)), with `:latest` only as the
-  offline fallback.
+  ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)), with the cached sidecar's
+  ceiling-compatible tag, then `:latest`, as the fallbacks.
