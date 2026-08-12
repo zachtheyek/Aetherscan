@@ -373,7 +373,7 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 > versions). The fix-forward-only rule keeps that from happening — and since
 > [#424](https://github.com/zachtheyek/Aetherscan/issues/424) a dragged-back `:latest` would be
 > largely harmless to consumers anyway: `run_container.sh` resolves version tags under the
-> checkout's release ceiling and touches `:latest` only as the offline fallback.
+> checkout's release ceiling and touches `:latest` only as the last-resort fallback (after the cached sidecar's ceiling-compatible tag).
 
 ## Version bump with no weights or image change
 
@@ -442,7 +442,7 @@ moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaul
 publishing an older version never regresses `:latest`. Since
 [#424](https://github.com/zachtheyek/Aetherscan/issues/424) `run_container.sh` no longer leans on
 `:latest` for `.devN` checkouts — it resolves the newest release tag at or below the checkout's
-version via the GHCR tag API, keeping `:latest` only as the offline fallback — but the invariant is
+version via the GHCR tag API, keeping `:latest` only as the last-resort fallback (after the cached sidecar's ceiling-compatible tag) — but the invariant is
 still worth preserving. If you ever need to move it, pass `-f latest=true`.
 
 Historical note: between the v1.0.0 backfill and the v1.1.0 release there was **no** `:latest`

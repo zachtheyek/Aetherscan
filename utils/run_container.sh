@@ -25,7 +25,8 @@
 #     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version> on a release
 #                               checkout; a .devN checkout resolves the newest published release
 #                               tag AT OR BELOW its own version via the GHCR API (#424), falling
-#                               back to `latest` when the registry is unreachable)
+#                               back — when the registry is unreachable — to the cached
+#                               sidecar's ceiling-compatible tag, then `latest`)
 #     AETHERSCAN_FORCE_REPULL   Set to 1 to re-pull the published image over a .sif the wrapper
 #                               cannot fully verify — a user-built/manually-pulled one (no
 #                               pull-provenance sidecar) or a pre-#424 ref-only sidecar (#424).
@@ -112,16 +113,17 @@ fi
 # that release's image; a .devN checkout resolves the newest published release tag AT OR BELOW its
 # own version via the GHCR tag API (#424 — strictly below the .dev base: a 1.1.1.dev0 checkout
 # wants v1.1.0 even after v1.2.0 publishes, so a checkout never silently runs an image newer than
-# its own code), falling back to :latest when the registry/tooling is unavailable. A PULLED image
-# records its ref (repo:tag, line 1) and manifest digest (line 2, when obtainable) in
-# "$SIF.pulled-tag"; a later checkout wanting a different ref re-pulls, and a matching ref whose
-# REMOTE digest has moved (a retag — the #416 drift class) warns, deletes, and re-pulls
-# automatically. Both checks fail OPEN: an unreachable registry runs the cached image with a
-# warning, never blocks a run that has a cached image (a FIRST pull with no cached image
-# still needs the registry, by necessity). A user-BUILT .sif (no sidecar, or newer than its sidecar — see
-# the mtime note below) is never verified or clobbered by default: the wrapper warns that it
-# cannot vouch for it, and only AETHERSCAN_FORCE_REPULL=1 replaces it with the published image
-# (a Blackwell rebuild or edited-requirements build is legitimate and irreplaceable).
+# its own code). On resolver failure the cached sidecar's ceiling-compatible tag is preferred,
+# then :latest. A PULLED image records its ref (repo:tag, line 1) and manifest digest (line 2,
+# when obtainable) in "$SIF.pulled-tag"; a later checkout wanting a different ref re-pulls, and
+# a matching ref whose REMOTE digest has moved (a retag — the #416 drift class) warns and
+# re-pulls over it in place (atomic tmp -> mv; the cached image survives a failed pull). Both
+# checks fail OPEN: an unreachable registry runs the cached image with a warning, never blocks
+# a run that has a cached image (a FIRST pull with no cached image still needs the registry, by
+# necessity). A user-BUILT .sif (no sidecar, or newer than its sidecar — see the mtime note
+# below) is never verified or clobbered by default: the wrapper warns that it cannot vouch for
+# it, and only AETHERSCAN_FORCE_REPULL=1 replaces it with the published image (a Blackwell
+# rebuild or edited-requirements build is legitimate and irreplaceable).
 #
 # GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
 # If any of these hold, BUILD from aetherscan.def instead of pulling:
@@ -244,7 +246,9 @@ if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
         else
             # Resolver INFRA-failed (rc 1 only — an rc==2 registry answer means any
             # recorded tag is over the ceiling by construction and must fall through to
-            # the loud warning below). Before surrendering to :latest, prefer a cached
+            # the loud warning below; rc 1 also covers a non-GHCR AETHERSCAN_IMAGE, where
+            # the resolver never ran — preferring that sidecar's pinned tag over :latest
+            # is desirable there too, still ceiling-checked). Before surrendering to :latest, prefer a cached
             # sidecar whose recorded vX.Y.Z ref for THIS repo passes the ceiling check —
             # verified, not trusted: the sidecar records what an EARLIER state of this
             # tree resolved, and a version-backwards checkout (older branch, shared SIF=)
