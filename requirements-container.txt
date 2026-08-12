@@ -15,19 +15,27 @@ matplotlib>=3.9,<3.10
 
 # Aetherscan extras layered on top.
 astropy>=6.1,<7
-scikit-image>=0.24,<0.25
-joblib>=1.4,<2
-imageio>=2.34,<3
+# 0.26 needs Python >=3.11; 0.25.2 is the newest line supporting 3.10 (sole use:
+# downscale_local_mean).
+scikit-image>=0.25.2,<0.26
+# Minor-bounded to the proven-in-use lines per SECURITY.md (was major-bounded, which
+# floated to whatever minor was newest at install time).
+joblib>=1.5,<1.6
+imageio>=2.37,<2.38
 umap-learn>=0.5.6,<0.6
-shap>=0.46.0,<0.47
-slack-sdk>=3.31.0,<4
+# 0.50 needs Python >=3.11 AND numpy >=2; 0.49.x is upstream's last 3.10 line. We call
+# only stock TreeExplainer (never approximate= or the legacy bar plot), so the 0.47
+# deprecations don't apply.
+shap>=0.49.1,<0.50
+slack-sdk>=3.43,<3.44
 # Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684, set_key symlink following;
 # fixed in 1.2.2).
 python-dotenv>=1.2.2,<2
 # Model weight distribution via the HuggingFace Hub (upload after training, download for
-# inference). 1.22 per SECURITY.md's version policy: two minors below the latest stable
-# (1.24) at pin time; the client-side upload/download API is unchanged from 1.21.
-huggingface_hub>=1.22,<1.23
+# inference). 1.25 per SECURITY.md's version policy: two minors below the latest stable
+# (1.27) at pin time. hf_hub.py never passes allow_patterns/ignore_patterns, so the
+# 1.25.0 case-sensitivity change is moot; 1.23.0 fixed a 1.22 CLI enum regression.
+huggingface_hub>=1.25.1,<1.26
 # setuptools provides pkg_resources, which blimpy (transitive via setigen)
 # imports at module load. Recent pip / Python releases dropped setuptools
 # from the bootstrap, so we install it explicitly. Upper-bound at <81 because
@@ -35,13 +43,18 @@ huggingface_hub>=1.22,<1.23
 # once blimpy migrates off pkg_resources (upstream issue). Floor >=78.1.1 per
 # GHSA-5rjg-fvgr-3xxf (CVE-2025-47273, path traversal; fixed in 78.1.1).
 setuptools>=78.1.1,<81
-# Range covers the proven 2.6/2.7 line (2.7.0 in current use) and blocks a future
-# major-version break; keep in lockstep with environment.yml and pyproject.toml.
-setigen>=2.6,<3
+# Minor-bounded to the proven 2.7 line per SECURITY.md; keep in lockstep with
+# environment.yml and pyproject.toml.
+setigen>=2.7,<2.8
 # Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). streamlit 1.54
 # fixes GHSA-7p48-42j8-8846 (SSRF, <1.54.0) and GHSA-vqwp-45wm-r9r5 (cache hash collision, <1.53.1);
 # it still accepts protobuf>=3.20,<7 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x pin
 # and the numpy<2 ceiling (pyarrow/tornado/altair pulled transitively). plotly is pure-Python (no
 # numpy ABI coupling). pandas is already shipped by the NGC base, so it is not repinned here.
-streamlit>=1.54.0,<1.55
-plotly>=5.24,<6
+# 1.59.2 per the 2026-W33 check; constraints still hold (protobuf>=3.20,<8, numpy>=1.23,
+# pandas<4, py>=3.10). The use_container_width deprecation (removed after 2025-12-31)
+# is migrated in dashboard.py (width="stretch").
+streamlit>=1.59.2,<1.60
+# 6.x removals (transforms API, pointcloud/heatmapgl, mapbox->MapLibre) don't touch
+# dashboard.py, which uses only plotly.express + graph_objects.
+plotly>=6.7,<7

@@ -2,6 +2,19 @@
 # Note, manually run pre-commit hooks on all files with: `pre-commit run --all-files`
 repos:
   # Ruff - fast Python linter and formatter
+  #
+  # HELD on the 0.15 line (#419, 2026-W33): ruff 0.16 rewrites the default rule set
+  # (59 -> 413 rules enabled by default) and REMOVES 18 pycodestyle/pyflakes rules, so
+  # bumping it silently changes what the lint gate enforces and how the formatter lays
+  # out code — a repo-wide behavior change, not a routine patch. It is also younger than
+  # SECURITY.md's 6-month lag (conservative target is the 0.15 line, which this rev
+  # already leads). When ready to take 0.16, do it as its OWN single-theme PR:
+  #   1. bump this rev AND pyproject.toml's dev pin (`ruff>=0.15.22,<0.16`) together —
+  #      they are deliberately coupled so local ruff agrees with this CI gate;
+  #   2. review the new-default rule delta against pyproject's [tool.ruff] config and
+  #      pin explicit `select`/`ignore` entries where the new defaults are unwanted;
+  #   3. run `ruff check src/ tests/ --fix` + `ruff format` across the repo and review
+  #      the full diff before committing.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.22
     hooks:
