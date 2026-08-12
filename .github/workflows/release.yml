@@ -154,7 +154,7 @@ jobs:
           RELEASE_TAG: v${{ needs.guard.outputs.version }}
         run: |
           # Range mirrors requirements-container.txt
-          pip install "huggingface_hub>=1.21,<1.22"
+          pip install "huggingface_hub>=1.25.1,<1.26"
           python - <<'EOF'
           import os
           import sys

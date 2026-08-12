@@ -784,7 +784,7 @@ CUDA + from-source dependency on an experimental shap code path:
   build.
 - **Log-loss is broken on GPU.** The interventional `model_output="log_loss"` path silently returns
   raw-margin numbers (the GPU kernel drops the output-transform pointer — shap #4270/#3936/#1726,
-  unfixed as of 0.46.0) and fails the additivity axiom, so log-loss would have to stay on CPU anyway.
+  unfixed as of the 0.46 line; re-verify against the pinned 0.49.x before relying on the GPU path) and fails the additivity axiom, so log-loss would have to stay on CPU anyway.
 
 **To switch to GPU later** (if interaction runtime ever becomes the bottleneck): (1) cap the RF at
 `max_depth = 31` in `RandomForestConfig` and confirm val-AUC is unaffected with an A/B; (2) bake a

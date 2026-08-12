@@ -110,9 +110,10 @@ aetherscan-dashboard = "aetherscan.dashboard_cli:main"
 dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]
 # Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). Opt-in extra so a
 # bare `pip install aetherscan` stays lean; `pip install aetherscan[dashboard]` pulls the stack.
-# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.54
-# coexists with TF 2.17's protobuf 4.x and numpy<2, plotly is pure-Python, pandas backs the data
-# layer (the NGC base ships pandas, so requirements-container.txt omits it there).
+# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.59
+# still accepts protobuf>=3.20,<8 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x
+# and the numpy<2 ceiling; plotly is pure-Python; pandas backs the data layer (the NGC base
+# ships pandas, so requirements-container.txt omits it there).
 dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<7", "pandas>=2.3,<2.4"]
 
 [tool.pytest.ini_options]

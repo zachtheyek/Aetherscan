@@ -76,7 +76,7 @@ dependencies:
       # requirements-container.txt (see the rationale there).
       - huggingface_hub>=1.25.1,<1.26
       # Live monitoring dashboard (aetherscan/dashboard.py). Kept in lockstep with
-      # requirements-container.txt; streamlit 1.54 coexists with TF 2.17 (protobuf 4.x)
+      # requirements-container.txt; streamlit 1.59 coexists with TF 2.17 (protobuf 4.x)
       # and numpy<2. plotly is pure-Python.
       - streamlit>=1.59.2,<1.60
       - plotly>=6.7,<7

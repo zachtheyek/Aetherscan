@@ -304,7 +304,7 @@ def resolve_inference_artifacts(args: argparse.Namespace) -> None:
     Ensure the inference artifact trio (encoder/rf/config paths) is populated on `args`
     before validation runs, in resolution order: explicit local paths (highest) >
     --hf-revision > v{__version__} when running as an installed release (see
-    version_default_revision) > latest release tag on the HF repo.
+    version_default_revision) > ceiling-bounded newest release tag on the HF repo (#424).
 
     When none of the three paths were given, the resolved revision's artifacts are
     downloaded and their cache paths written onto `args` — exactly as if the user had passed

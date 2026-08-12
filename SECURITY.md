@@ -206,7 +206,7 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
   https://ghcr.io/v2/zachtheyek/aetherscan/manifests/v1.1.0 | grep -i docker-content-digest
 ```
 
-`utils/run_container.sh` uses exactly this recipe ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)) to resolve a `.devN` checkout's ceiling-bounded release tag and to digest-verify wrapper-pulled images against retags; every registry call in the wrapper fails open, so an unreachable registry warns instead of blocking a run.
+`utils/run_container.sh` uses exactly this recipe ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)) to resolve a `.devN` checkout's ceiling-bounded release tag and to digest-verify wrapper-pulled images against retags; every registry call in the wrapper fails open, so an unreachable registry warns instead of blocking any run that has a cached image (a first-ever pull with nothing cached still needs the registry).
 
 ### HuggingFace Hub artifact scan (ProtectAI)
 
