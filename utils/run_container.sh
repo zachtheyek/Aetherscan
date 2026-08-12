@@ -149,15 +149,13 @@ _ghcr_token() {  # $1 = repo path (owner/name); prints a token
     printf '%s\n' "$token"
 }
 
-_ghcr_ceiling_tag() {  # $1 = repo path, $2 = pyproject version; prints the wanted vX.Y.Z tag
-    # Highest published vX.Y.Z at or below the ceiling: inclusive for an exact release (or
-    # .post/+local, which FOLLOW their base per PEP 440), strictly below the base for a
-    # .dev/rc pre-release (1.1.1.dev0 precedes 1.1.1). Mirrors hf_hub.release_ceiling for
-    # the weight side. Returns 1 on infra failure (no curl / registry unreachable), 2 when
-    # the registry answered but no tag qualifies under the ceiling — callers distinguish
-    # the two so a reachable-but-empty result can warn about its fallback.
-    local repo=$1 ver=$2 inclusive major minor patch token tags t best_tag=""
-    local bM=-1 bm=-1 bp=-1 M m p keep
+_tag_within_ceiling() {  # $1 = vX.Y.Z tag, $2 = version string; 0 iff tag <= the ceiling
+    # THE boundary logic, in one place: inclusive for an exact release (or .post/+local,
+    # which FOLLOW their base per PEP 440), strictly below the base for a .dev/rc
+    # pre-release (1.1.1.dev0 precedes 1.1.1). Mirrors hf_hub.release_ceiling for the
+    # weight side. Shared by the resolver's candidate loop and the sidecar-preference
+    # fallback, so the inclusivity rules never fork.
+    local tag=$1 ver=$2 inclusive major minor patch M m p
     if [[ $ver =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(\.post[0-9]+)?(\+.*)?$ ]]; then
         inclusive=1
     elif [[ $ver =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
@@ -166,22 +164,36 @@ _ghcr_ceiling_tag() {  # $1 = repo path, $2 = pyproject version; prints the want
         return 1
     fi
     major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+    [[ $tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    M=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} p=${BASH_REMATCH[3]}
+    if ((M < major)); then return 0; fi
+    if ((M > major)); then return 1; fi
+    if ((m < minor)); then return 0; fi
+    if ((m > minor)); then return 1; fi
+    if ((p < patch)); then return 0; fi
+    if ((p > patch)); then return 1; fi
+    if ((inclusive == 1)); then return 0; fi
+    return 1
+}
+
+_ghcr_ceiling_tag() {  # $1 = repo path, $2 = pyproject version; prints the wanted vX.Y.Z tag
+    # Highest published vX.Y.Z at or below the ceiling (boundary semantics live in
+    # _tag_within_ceiling). Returns 1 on infra failure (no curl / registry unreachable), 2
+    # when the registry answered but no tag qualifies under the ceiling — callers
+    # distinguish the two so a reachable-but-empty result can warn about its fallback.
+    local repo=$1 ver=$2 token tags t best_tag=""
+    local bM=-1 bm=-1 bp=-1 M m p
+    # Unparseable version -> infra-style failure (rc 1) BEFORE any network round trip, so
+    # the caller's rc==2 "nothing qualifies" warning can't fire for a garbage version.
+    [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
     token=$(_ghcr_token "$repo") || return 1
     tags=$(curl -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer $token" \
         "https://ghcr.io/v2/$repo/tags/list" 2>/dev/null \
         | tr ',[]' '\n' | sed -n 's/.*"\(v[0-9][0-9.]*\)".*/\1/p') || return 1
     while IFS= read -r t; do
+        _tag_within_ceiling "$t" "$ver" || continue
         [[ $t =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
         M=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} p=${BASH_REMATCH[3]}
-        keep=0
-        if ((M < major)); then keep=1
-        elif ((M == major)); then
-            if ((m < minor)); then keep=1
-            elif ((m == minor)); then
-                if ((p < patch)) || { ((p == patch)) && ((inclusive == 1)); }; then keep=1; fi
-            fi
-        fi
-        ((keep == 1)) || continue
         if ((M > bM)) || { ((M == bM)) && ((m > bm)); } \
             || { ((M == bM)) && ((m == bm)) && ((p > bp)); }; then
             bM=$M bm=$m bp=$p best_tag="v$M.$m.$p"
@@ -230,16 +242,21 @@ if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
             echo "Resolved image tag '$CEILING_TAG' (newest published release at or below" \
                  "this checkout's version $VER, #424)." >&2
         else
-            # Resolver unavailable/empty. Before surrendering to :latest, prefer a cached
-            # sidecar that already records a version-true vX.Y.Z ref for THIS repo: that
-            # image is known-ceilinged, and re-pulling :latest over it would reintroduce
-            # the drift class on e.g. a curl-less node (apptainer pulls fine without curl,
-            # so the resolver failing does not mean pulls would).
+            # Resolver INFRA-failed (rc 1 only — an rc==2 registry answer means any
+            # recorded tag is over the ceiling by construction and must fall through to
+            # the loud warning below). Before surrendering to :latest, prefer a cached
+            # sidecar whose recorded vX.Y.Z ref for THIS repo passes the ceiling check —
+            # verified, not trusted: the sidecar records what an EARLIER state of this
+            # tree resolved, and a version-backwards checkout (older branch, shared SIF=)
+            # could carry an over-ceiling tag. The check is pure arithmetic, no network.
             sidecar_prev_ref=$(head -n 1 "$SIF.pulled-tag" 2>/dev/null || true)
-            if [[ $sidecar_prev_ref == "$IMAGE_REPO":v[0-9]* ]]; then
-                AETHERSCAN_IMAGE_TAG=${sidecar_prev_ref#"$IMAGE_REPO":}
+            sidecar_prev_tag=${sidecar_prev_ref#"$IMAGE_REPO":}
+            if [[ $ceiling_rc -eq 1 && $sidecar_prev_ref == "$IMAGE_REPO":v[0-9]* ]] \
+                && _tag_within_ceiling "$sidecar_prev_tag" "$VER"; then
+                AETHERSCAN_IMAGE_TAG=$sidecar_prev_tag
                 echo "NOTE: ceiling resolution unavailable — keeping the cached sidecar's" \
-                     "version-true tag '$AETHERSCAN_IMAGE_TAG' instead of ':latest' (#424)." >&2
+                     "ceiling-compatible tag '$AETHERSCAN_IMAGE_TAG' instead of ':latest'" \
+                     "(#424)." >&2
             else
                 AETHERSCAN_IMAGE_TAG="latest"
                 if [[ $ceiling_rc -eq 2 ]]; then

@@ -1150,8 +1150,10 @@ def plot_candidate_frequency() -> str | None:
     along x and each bin's candidates STACK bottom-up as dots, so column height honestly
     reads as candidates-per-bin — a histogram drawn with dots — COLORED BY TARGET with
     legend labels, report-excluded frequency ranges (#395) shaded. The y-axis flips to log
-    scale past _CANDIDATE_FREQ_LOG_Y_THRESHOLD candidates (catalog-scale runs stack
-    thousands deep at RFI frequencies). Band is deliberately absent from the legend:
+    scale past _CANDIDATE_FREQ_LOG_Y_THRESHOLD total candidates OR when any single bin
+    stacks past _CANDIDATE_FREQ_LOG_Y_MAX_STACK — the depth trigger is the one that fires
+    on #394-signature runs, where one coincidence bin outgrows the axis long before the
+    total does. Band is deliberately absent from the legend:
     x-position already implies it. The load-bearing read is one TALL, MULTI-COLOR column:
     the same frequency lighting up across many targets is the signature of a terrestrial
     transmitter (multi-target coincidence), whereas a genuine technosignature is a short
