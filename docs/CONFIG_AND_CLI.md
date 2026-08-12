@@ -84,8 +84,9 @@ their own equality test. One trap this design does **not** remove: a *new* field
 `InferenceConfig` defaults **into** the allowlist (it is `fields(InferenceConfig)` minus the
 exclude set) and — once mirrored into `to_dict` — into both fingerprints, so a new
 host-tuning knob on `InferenceConfig` must be added to the run_state denylists explicitly,
-exactly as `prune_stamps`/`inference_viz_scope` were. Only a field added to a
-non-allowlisted section (`manager`, `gpu`, `db`, …) is ignored by default.
+exactly as `prune_stamps` / `inference_viz_scope` / `report_exclude_frequency_ranges`
+(#395) were. Only a field added to a non-allowlisted section (`manager`, `gpu`, `db`, …)
+is ignored by default.
 
 ## The configuration singleton
 

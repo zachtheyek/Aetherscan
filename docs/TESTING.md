@@ -75,6 +75,8 @@ tests/
 │   ├── test_perband_report.py       # per-band plot: umbrella-vs-child span isolation, catalog
 │   │                                #   join + count-guard skip, per-band stats, non-empty PNG
 │   ├── test_candidate_figures.py    # TF-free candidate renderer: pool/serial parity, containment
+│   ├── test_candidate_triage.py     # report-time frequency exclusion + OOD scoring / review ordering
+│   ├── test_candidate_rfi_report.py # standalone RFI-triage report: coincidence, allocation flags, exclusion parity
 │   ├── test_dashboard.py            # dashboard pure data layer (DB-driven plot data)
 │   ├── test_dashboard_cli.py        # aetherscan-dashboard console entry: exec-argv builder + streamlit-missing guard
 │   ├── test_dashboard_launcher.py   # dashboard launcher argv builder + guard paths

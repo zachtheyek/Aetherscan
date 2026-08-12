@@ -118,6 +118,7 @@ src/aetherscan/
 ├── inference.py         # Inference orchestration, candidate detection
 ├── inference_viz.py     # End-of-run inference visualization suite
 ├── candidate_figures.py # Per-candidate figure renderer (TF-free; forkserver pool; called by inference_viz.py)
+├── candidate_triage.py  # Report-time frequency exclusion + OOD review ordering (TF-free; stdlib-only at import)
 ├── preprocessing.py     # Loading / downsampling / log-normalization + energy detection
 ├── pfb.py               # PFB static passband equalization (bandpass flattening)
 ├── data_generation.py   # Synthetic signal injection — batched memmap workers + background producer
@@ -128,6 +129,7 @@ src/aetherscan/
 ├── dashboard_cli.py     # Console entry point for manual dashboard runs (aetherscan-dashboard)
 ├── hf_hub.py            # HuggingFace Hub artifact upload/download
 ├── tag_guards.py        # Fail-early --save-tag dedup guards
+├── display_tag.py       # Machine-scoped {command}_{machine}_{datetime} for filenames + plot titles (stdlib-only; DB tag unchanged)
 ├── rf_metrics.py        # Pure RF eval-metric helper (persisted to training_stats by train.py)
 ├── shap_parallel.py     # RF SHAP process-pool wrapper (TF-free; called by train.py)
 ├── latent_variants.py   # Latent-representation variant catalogue + selection/calibration (TF-free; shared by train.py + inference.py)
@@ -137,10 +139,10 @@ src/aetherscan/
 ├── logger/              # Multi-handler logging + Slack integration
 ├── monitor/monitor.py   # Background resource monitoring (CPU, RAM, GPU)
 └── manager/manager.py   # Resource lifecycle management (pools, shared memory)
-utils/                   # benchmark_report.py, perband_report.py,
+utils/                   # benchmark_report.py, candidate_rfi_report.py,
                          # fetch_run_outputs.sh, find_optimal_configs.py,
                          # get_system_info.sh, hf_tag_release.py, kill_pipeline.sh,
-                         # print_cli_help.py, run_container.sh,
+                         # perband_report.py, print_cli_help.py, run_container.sh,
                          # start_tmux_session.sh, verify_train_test_files.py
 docs/                    # Full technical doc suite, one doc per pipeline surface —
                          # indexed in docs/README.md; start at docs/ARCHITECTURE.md
@@ -278,6 +280,7 @@ pre-commit run ruff --all-files
 **Runtime gotchas.**
 - **Bare-keras weight loads need `import aetherscan.models` first** — that import registers the custom `Sampling` layer; without it, Keras-2's deserializer degrades the unregistered custom to a bare string and `load_model` dies with a cryptic `'str' object is not callable`. The pipeline's own import path always does this; only hand-rolled snippets can miss it.
 - **First launch against an existing catalog-scale DB after a schema bump** can stall minutes to tens of minutes in migration (index builds + WAL headroom). Expected and logged — don't kill it.
+- **The #412 cache re-key is not backward-compatible.** Stamps are content-addressed at `{data_path}/cache/stamps/ed_<fingerprint12>/<sha12>.npy` (keyed on the ED config + the cadence's *ordered* h5 path list — the catalog name is no longer in the key), and the PFB response cache moved `{output_path}/cache/pfb/` to `{data_path}/cache/pfb/`. Pre-#412 trees are **orphaned in place** and should be deleted by hand, and a `--save-tag` started before #412 must **not** be resumed across the upgrade (resume/supersede key on `npy_path`). Migration note + re-keying recipe: `docs/INFERENCE_PIPELINE.md`.
 
 ---
 
