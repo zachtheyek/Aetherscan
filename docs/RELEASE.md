@@ -108,7 +108,9 @@ compatibility promises; from `1.0.0` onward, these rules hold.
   [`requirements-container.txt`](../requirements-container.txt)'s ranges **plus** the
   packages the NGC base image provides implicitly (`tensorflow[and-cuda]==2.17.*`, `tf_keras`,
   `h5py`, `hdf5plugin`, `psutil`) — a pip install has no base image to lean on.
-  Optional extras: `dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]` (the `pytest` floor is a
+  Optional extras:
+  `dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]`
+  (the `pytest` floor is a
   security floor — GHSA-6w46-j5rx-g56g, tmpdir handling; dev/test-only) and
   `dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<6.8", "pandas>=2.3,<2.4"]` —
   `pip install aetherscan[dashboard]` pulls the stack for the packaged live dashboard
@@ -373,7 +375,8 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 > versions). The fix-forward-only rule keeps that from happening — and since
 > [#424](https://github.com/zachtheyek/Aetherscan/issues/424) a dragged-back `:latest` would be
 > largely harmless to consumers anyway: `run_container.sh` resolves version tags under the
-> checkout's release ceiling and touches `:latest` only as the last-resort fallback (after the cached sidecar's ceiling-compatible tag).
+> checkout's release ceiling and touches `:latest` only as the last-resort fallback (after
+> the cached sidecar's ceiling-compatible tag).
 
 ## Version bump with no weights or image change
 
@@ -442,7 +445,8 @@ moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaul
 publishing an older version never regresses `:latest`. Since
 [#424](https://github.com/zachtheyek/Aetherscan/issues/424) `run_container.sh` no longer leans on
 `:latest` for `.devN` checkouts — it resolves the newest release tag at or below the checkout's
-version via the GHCR tag API, keeping `:latest` only as the last-resort fallback (after the cached sidecar's ceiling-compatible tag) — but the invariant is
+version via the GHCR tag API, keeping `:latest` only as the last-resort fallback (after the
+cached sidecar's ceiling-compatible tag) — but the invariant is
 still worth preserving. If you ever need to move it, pass `-f latest=true`.
 
 Historical note: between the v1.0.0 backfill and the v1.1.0 release there was **no** `:latest`
@@ -451,7 +455,8 @@ master's `requirements-container.txt` had already moved past v1.0.0's (notably t
 security bump), and pinning `:latest` to the backfilled image would have served dev checkouts a
 knowingly stale dependency set. Since v1.1.0's CD run, `:latest` exists and tracks the newest
 real release — though since [#424](https://github.com/zachtheyek/Aetherscan/issues/424) it is only
-the wrapper's last-resort fallback (after the cached sidecar's ceiling-compatible tag): a `.devN` checkout resolves the newest release tag **at or below
+the wrapper's last-resort fallback (after the cached sidecar's ceiling-compatible tag): a
+`.devN` checkout resolves the newest release tag **at or below
 its own version** from the GHCR tag API, and the `<sif>.pulled-tag` sidecar records the pulled ref
 *and* its manifest digest, so a retagged ref is detected, warned about, and re-pulled automatically
 — a `.devN` checkout no longer keeps a stale cached `.sif` as qualifying releases move. The failure
