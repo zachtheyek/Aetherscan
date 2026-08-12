@@ -61,6 +61,14 @@ GITHUB_URL = "https://github.com/zachtheyek/Aetherscan"
 # tags (the {command}_{datetime} run tags) never name it — a no-artifact inference download
 # requires a blessed release tag.
 _SEMVER_TAG_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+# The source checkout's pyproject.toml — the release-ceiling authority for source-tree /
+# container runs, whose installed __version__ is the "0.0.0.dev0" sentinel (#424). Module
+# constant so tests can monkeypatch it; absent on an installed wheel (whose __version__ is
+# real and used directly).
+_PYPROJECT_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "pyproject.toml",
+)
 
 
 def _hf_api():
@@ -119,16 +127,63 @@ def hf_tag_exists(repo_id: str, tag: str) -> bool:
     return tag in list_hf_tags(repo_id)
 
 
-def select_default_revision(tags: list[str]) -> str | None:
+def release_ceiling() -> tuple[tuple[int, int, int], bool] | None:
+    """
+    The local pipeline's release ceiling for artifact resolution (#424), as
+    ((major, minor, patch), inclusive) — release tags above it must never be auto-selected,
+    so a checkout never silently runs weights newer than its own code contract. `inclusive`
+    is False for pre-release versions: 1.1.1.dev0 precedes 1.1.1 (PEP 440), so a
+    1.1.1.dev0 checkout's ceiling admits releases strictly BELOW 1.1.1 (e.g. v1.1.0), while
+    an exact release admits its own tag. Sources, in precedence order: a non-sentinel
+    installed `__version__` (wheels and editable installs), else the source checkout's
+    pyproject.toml (source-tree/container runs report the "0.0.0.dev0" sentinel). Returns
+    None when neither yields a version — resolution then falls back to the unbounded
+    newest-release rule, matching pre-#424 behavior.
+    """
+    import aetherscan  # noqa: PLC0415  (late import so tests can monkeypatch __version__)
+
+    version_str = aetherscan.__version__
+    if version_str == "0.0.0.dev0":
+        # Source-tree / container run: no installed distribution — the checkout's
+        # pyproject.toml is the authority (absent for an installed wheel, whose real
+        # __version__ was already usable above).
+        try:
+            with open(_PYPROJECT_PATH) as f:
+                for line in f:
+                    m = re.match(r'^version\s*=\s*"([^"]+)"\s*$', line)
+                    if m:
+                        version_str = m.group(1)
+                        break
+                else:
+                    return None
+        except OSError:
+            return None
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", version_str)
+    if m is None:
+        return None
+    base = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    # Exact releases (and post/local variants, which FOLLOW their base release) admit their
+    # own tag; dev/rc pre-releases PRECEDE theirs and must exclude it.
+    inclusive = re.fullmatch(r"\d+\.\d+\.\d+(\.post\d+)?(\+.*)?", version_str) is not None
+    return base, inclusive
+
+
+def select_default_revision(
+    tags: list[str], ceiling: tuple[tuple[int, int, int], bool] | None = None
+) -> str | None:
     """
     Pick the default download revision from a repo's tag list: the highest semver vX.Y.Z
-    release tag, or None if the repo carries no release tag. Comparison is numeric
-    (v1.10.0 > v1.9.9); training tags (the {command}_{datetime} run tags) never win — a
-    no-artifact inference download requires a blessed release tag.
+    release tag AT OR BELOW the ceiling when one is given (#424 — strictly below for a
+    pre-release ceiling; see release_ceiling), or None if no release tag qualifies.
+    Comparison is numeric (v1.10.0 > v1.9.9); training tags (the {command}_{datetime} run
+    tags) never win — a no-artifact inference download requires a blessed release tag.
     """
     semver = [
         (tuple(int(g) for g in m.groups()), t) for t in tags if (m := _SEMVER_TAG_PATTERN.match(t))
     ]
+    if ceiling is not None:
+        base, inclusive = ceiling
+        semver = [s for s in semver if (s[0] <= base if inclusive else s[0] < base)]
     if semver:
         return max(semver)[1]
     return None
@@ -146,7 +201,7 @@ def version_default_revision() -> str | None:
     (_SEMVER_TAG_PATTERN, strict vX.Y.Z). The importlib.metadata fallback ("0.0.0.dev0" —
     source-tree/container runs), .dev pre-releases (e.g. "0.9.0.dev0" — a pip install of a
     between-releases tree), and rc/post/local versions all fail the match and fall through
-    to latest-release resolution instead. Deliberately NOT existence-checked: an installed
+    to ceiling-bounded newest-release resolution instead. Deliberately NOT existence-checked: an installed
     release whose weights tag is missing must fail the download loudly (the release
     runbook's blessing step was skipped) rather than silently pull some other version's
     weights.
@@ -164,8 +219,10 @@ def resolve_hf_revision(repo_id: str, revision: str | None) -> str:
     Resolve the HF revision inference should download from: an explicitly requested revision
     is returned as-is (existence is checked by the download itself); otherwise an installed
     release pins its own version's tag (version_default_revision — also download-checked);
-    otherwise the repo's tags are listed and select_default_revision picks the latest
-    release. Raises RuntimeError with guidance when nothing is resolvable.
+    otherwise the repo's tags are listed and select_default_revision picks the newest
+    release AT OR BELOW the local pipeline's release ceiling (#424 — identical rule in the
+    container, conda, and pip runtimes; a checkout never silently downloads weights newer
+    than its own code). Raises RuntimeError with guidance when nothing is resolvable.
     """
     if revision is not None:
         return revision
@@ -180,20 +237,29 @@ def resolve_hf_revision(repo_id: str, revision: str | None) -> str:
         tags = list_hf_tags(repo_id)
     except Exception as e:
         raise RuntimeError(
-            f"Could not list tags on HF repo '{repo_id}' to resolve the latest release: {e}. "
+            f"Could not list tags on HF repo '{repo_id}' to resolve a release: {e}. "
             f"Check that --hf-repo-id is correct, the repo is public (or HF_TOKEN grants "
             f"access), and this host can reach huggingface.co — or pin a revision with "
             f"--hf-revision / pass all three local artifact paths."
         ) from e
-    selected = select_default_revision(tags)
+    ceiling = release_ceiling()
+    selected = select_default_revision(tags, ceiling=ceiling)
     if selected is None:
+        bound_clause = (
+            f" at or below this pipeline's version ceiling "
+            f"(v{'.'.join(str(part) for part in ceiling[0])}"
+            f"{'' if ceiling[1] else ', exclusive'})"
+            if ceiling is not None
+            else ""
+        )
         raise RuntimeError(
-            f"No release tag (vX.Y.Z) found on HF repo "
+            f"No release tag (vX.Y.Z){bound_clause} found on HF repo "
             f"'{repo_id}' to download model artifacts from. Either pin a revision with "
             f"--hf-revision, point --hf-repo-id at a repo with released weights, or pass "
             f"all three local artifact paths (--encoder-path/--rf-path/--config-path)."
         )
-    logger.info(f"Resolved HF revision '{selected}' (latest release tag on {repo_id})")
+    bound_note = " at or below the local pipeline version" if ceiling is not None else ""
+    logger.info(f"Resolved HF revision '{selected}' (newest release tag on {repo_id}{bound_note})")
     return selected
 
 
@@ -425,7 +491,8 @@ The complete configuration is in `{HF_CONFIG_FILENAME}`.
 ## Usage
 
 Pin this training tag with `--hf-revision` to download exactly these weights (a bare no-artifact
-inference download resolves to the latest `vX.Y.Z` release tag instead, never a training tag):
+inference download resolves to the newest `vX.Y.Z` release tag at or below the local pipeline
+version instead, never a training tag):
 
 ```bash
 python -m aetherscan.main inference --hf-revision {tag} --inference-files <catalog.csv>

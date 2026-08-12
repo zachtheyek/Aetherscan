@@ -146,10 +146,14 @@ When downloading, the **revision** is chosen by `resolve_hf_revision` in precede
    fail the match — all fall through to step 3. This is deliberately **not** existence-checked:
    an installed release whose weights tag is missing must fail loudly (the release blessing
    step was skipped), never silently pull some other version.
-3. **Latest `vX.Y.Z` release tag** on the repo (`select_default_revision`; numeric comparison,
-   so `v1.10.0 > v1.9.9`). Training tags never name the default download — a no-artifact
-   inference download requires a blessed release tag. Raises `RuntimeError` with guidance when
-   nothing resolves.
+3. **Newest `vX.Y.Z` release tag at or below the local release ceiling** (#424;
+   `select_default_revision` bounded by `release_ceiling()` — the ceiling comes from a real
+   installed `__version__`, else the source checkout's `pyproject.toml`, with a `.dev`/`rc`
+   version excluding its own base per PEP 440 and `.post`/local including it). Numeric
+   comparison, so `v1.10.0 > v1.9.9`; training tags never name the default download — a
+   no-artifact inference download requires a blessed release tag. When no tag qualifies under
+   the ceiling, raises `RuntimeError` with guidance **naming the ceiling** — resolution never
+   silently takes a newer tag.
 
 Downloads go through `hf_hub_download` (revision-pinned, cached under `HF_HOME` /
 `~/.cache/huggingface`; repeated runs hit the cache); the public repo needs no token. Under the
