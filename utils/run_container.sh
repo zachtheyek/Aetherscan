@@ -193,7 +193,7 @@ _ghcr_remote_digest() {  # $1 = repo path, $2 = tag; prints the manifest digest 
     local token digest
     token=$(_ghcr_token "$1") || return 1
     digest=$(curl -fsSI --max-time 10 -H "Authorization: Bearer $token" \
-        -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+        -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
         "https://ghcr.io/v2/$1/manifests/$2" 2>/dev/null \
         | awk 'tolower($1)=="docker-content-digest:"{print $2}' | tr -d '\r') || return 1
     [[ $digest == sha256:* ]] || return 1
