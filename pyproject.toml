@@ -1,6 +1,6 @@
 # Packaging + release process: docs/RELEASE.md (version coupling, CD gates, runbook).
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.28,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -34,20 +34,23 @@ dependencies = [
     "scikit-learn>=1.5,<1.6",
     "matplotlib>=3.9,<3.10",
     "astropy>=6.1,<7",
-    "scikit-image>=0.24,<0.25",
-    "joblib>=1.4,<2",
-    "imageio>=2.34,<3",
+    # 0.26 needs Python >=3.11; 0.25.2 is the newest line supporting 3.10.
+    "scikit-image>=0.25.2,<0.26",
+    # Minor-bounded to the proven-in-use lines per SECURITY.md (was major-bounded).
+    "joblib>=1.5,<1.6",
+    "imageio>=2.37,<2.38",
     "umap-learn>=0.5.6,<0.6",
-    "shap>=0.46.0,<0.47",
-    "slack-sdk>=3.31.0,<4",
+    # 0.50 needs Python >=3.11 AND numpy >=2; 0.49.x is upstream's last 3.10 line.
+    "shap>=0.49.1,<0.50",
+    "slack-sdk>=3.43,<3.44",
     # Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684; fixed in 1.2.2).
     "python-dotenv>=1.2.2,<2",
-    "huggingface_hub>=1.22,<1.23",
+    "huggingface_hub>=1.25.1,<1.26",
     # setuptools provides pkg_resources, which blimpy (transitive via setigen) imports at
     # module load; <81 because setuptools 81 removed the vendored pkg_resources.
     # Floor >=78.1.1 per GHSA-5rjg-fvgr-3xxf (CVE-2025-47273; fixed in 78.1.1).
     "setuptools>=78.1.1,<81",
-    "setigen>=2.6,<3",
+    "setigen>=2.7,<2.8",
     # The NGC base image provides these implicitly (so requirements-container.txt omits
     # them); a pip install has no base image to lean on and must declare them. Ranges
     # mirror environment.yml's pins.
@@ -56,7 +59,7 @@ dependencies = [
     # the v1.0.0 .keras weights are Keras-2 format, so a bare pip install must pull it (#323).
     "tf_keras==2.17.*",
     "h5py>=3.11,<3.12",
-    "hdf5plugin",
+    "hdf5plugin>=7.0,<7.1",
     "psutil>=6.0,<6.1",
 ]
 license = "BSD-3-Clause"
@@ -80,9 +83,9 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Operating System :: Unix",
-    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",
-    # NOTE: the NGC 25.02 container runs CUDA 12.8, but the trove classifier list currently
-    # tops out at "12 :: 12.6" — the bare ":: 12" parent is the closest valid classifier
+    # NOTE: only the bare ":: 12" parent — no minor-version child matches both runtimes
+    # (the conda path resolves CUDA 12.3, the NGC 25.02 container runs 12.8, and the trove
+    # classifier list tops out at "12 :: 12.6"), so a specific child would be wrong for one.
     "Environment :: GPU :: NVIDIA CUDA :: 12",
     "License :: OSI Approved :: BSD License",
     "Intended Audience :: Science/Research",
@@ -102,13 +105,16 @@ Issues = "https://github.com/zachtheyek/Aetherscan/issues"
 aetherscan-dashboard = "aetherscan.dashboard_cli:main"
 
 [project.optional-dependencies]
-dev = ["ruff", "pre-commit", "pytest>=9.0.3"]
+# ruff is coupled to .pre-commit-config.yaml's hook rev so local `ruff check/format`
+# agrees with the CI gate — bump both together (see the 0.16 upgrade note there).
+dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]
 # Live monitoring dashboard (aetherscan/dashboard.py, auto-launched by main.py). Opt-in extra so a
 # bare `pip install aetherscan` stays lean; `pip install aetherscan[dashboard]` pulls the stack.
-# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.54
-# coexists with TF 2.17's protobuf 4.x and numpy<2, plotly is pure-Python, pandas backs the data
-# layer (the NGC base ships pandas, so requirements-container.txt omits it there).
-dashboard = ["streamlit>=1.54.0,<1.55", "plotly>=5.24,<6", "pandas>=2.0,<3"]
+# Ranges mirror requirements-container.txt / environment.yml (kept in lockstep); streamlit 1.59
+# still accepts protobuf>=3.20,<8 and numpy>=1.23, so it coexists with TF 2.17's protobuf 4.x
+# and the numpy<2 ceiling; plotly is pure-Python; pandas backs the data layer (the NGC base
+# ships pandas, so requirements-container.txt omits it there).
+dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<6.8", "pandas>=2.3,<2.4"]
 
 [tool.pytest.ini_options]
 # Make `import aetherscan` work without a PYTHONPATH=src prefix

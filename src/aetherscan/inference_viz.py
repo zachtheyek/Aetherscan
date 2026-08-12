@@ -1121,27 +1121,45 @@ def plot_confidence_distribution(records: list[CadenceVizRecord]) -> str | None:
     )
 
 
-# Distinct target colors for the dot plot: tab20 minus its gray pair (slots 14/15), which
-# would collide with the overflow aggregate's gray — color is the target encoding now, so
-# two legend entries must never share a color. The cap derives from the palette; everything
-# past it collapses into one gray aggregate entry.
+# Distinct target colors for the dot plot, DISTINCT HUES FIRST (#423): tab20's dark (even)
+# slots before its light (odd) slots — rank-adjacent targets get different hues instead of
+# dark/light variants of the same hue (a two-target run reads blue-vs-orange, not
+# blue-vs-pale-blue) — minus the gray pair (slots 14/15), which would collide with the
+# overflow aggregate's gray. Color is the target encoding, so two legend entries must never
+# share (or nearly share) a color. The cap derives from the palette; everything past it
+# collapses into one gray aggregate entry.
 _CANDIDATE_FREQ_PALETTE = [
-    color for i, color in enumerate(colormaps["tab20"].colors) if i not in (14, 15)
+    colormaps["tab20"].colors[i] for i in (*range(0, 20, 2), *range(1, 20, 2)) if i not in (14, 15)
 ]
 _CANDIDATE_FREQ_MAX_TARGETS = len(_CANDIDATE_FREQ_PALETTE)
+# The dot-histogram's x resolution: frequency bins across the observed range (~figure pixel
+# pitch at 12 in wide, 150 dpi).
+_CANDIDATE_FREQ_BINS = 600
+# Candidate count past which the stack axis flips to log scale (#423, maintainer-decided):
+# catalog-scale runs stack thousands deep at RFI-heavy frequencies.
+_CANDIDATE_FREQ_LOG_Y_THRESHOLD = 10_000
+# Depth backstop for the same switch: a single bin a few hundred dots deep already
+# saturates the ~600-px axis into a solid bar (the #394 coincidence signature itself) even
+# when the TOTAL count sits under the threshold — so either trigger engages log-y.
+_CANDIDATE_FREQ_LOG_Y_MAX_STACK = 400
 
 
 def plot_candidate_frequency() -> str | None:
     """
-    Candidate frequency map (#394): a dot plot — every candidate at its frequency along x
-    with deterministic vertical jitter (y carries no meaning), COLORED BY TARGET with legend
-    labels, report-excluded frequency ranges (#395) shaded. Band is deliberately absent from
-    the legend: x-position already implies it. The load-bearing read is one x-position
-    carrying MANY COLORS: the same frequency lighting up across many targets is the
-    signature of a terrestrial transmitter (multi-target coincidence), whereas a genuine
-    technosignature is a dot whose frequency has no multi-color company. In
-    inf_blpc3_20260807_011509 two target/bands held 49% of all candidates and several top
-    candidates sat in GPS/Iridium allocations — structure no other figure showed.
+    Candidate frequency map (#394, dot-histogram form since #423): frequencies are binned
+    along x and each bin's candidates STACK bottom-up as dots, so column height honestly
+    reads as candidates-per-bin — a histogram drawn with dots — COLORED BY TARGET with
+    legend labels, report-excluded frequency ranges (#395) shaded. The y-axis flips to log
+    scale past _CANDIDATE_FREQ_LOG_Y_THRESHOLD total candidates OR when any single bin
+    stacks past _CANDIDATE_FREQ_LOG_Y_MAX_STACK — the depth trigger is the one that fires
+    on #394-signature runs, where one coincidence bin outgrows the axis long before the
+    total does. Band is deliberately absent from the legend:
+    x-position already implies it. The load-bearing read is one TALL, MULTI-COLOR column:
+    the same frequency lighting up across many targets is the signature of a terrestrial
+    transmitter (multi-target coincidence), whereas a genuine technosignature is a short
+    single-color stack. In inf_blpc3_20260807_011509 two target/bands held 49% of all
+    candidates and several top candidates sat in GPS/Iridium allocations — structure no
+    other figure showed.
     """
     config = get_config()
     tag = config.checkpoint.save_tag
@@ -1174,22 +1192,42 @@ def plot_candidate_frequency() -> str | None:
     fig = Figure(figsize=(12, 4.5))
     ax = fig.subplots()
 
-    # One scatter per legend target, not one artist per point: candidate counts reach
-    # 10^4+ at catalog scale. y is a seeded uniform jitter — a strip to keep coincident
-    # frequencies from overplotting into one dot; the axis itself encodes nothing.
-    jitter_rng = np.random.default_rng(0)
-    points_by_target: dict[str, list[float]] = {}
-    for row in rows:
-        target = row.get("target") or "?"
-        key = target if target in color_by_target else overflow_label
-        points_by_target.setdefault(key, []).append(float(row["frequency_mhz"]))
-    for target in [*ordered_targets, *([overflow_label] if overflow else [])]:
-        xs = points_by_target.get(target)
+    # True (Wilkinson) dot plot (#423): bin frequencies along x, stack each bin's
+    # candidates bottom-up (bottom dot at y=1 so a log axis works), assembling every stack
+    # in legend order so a multi-target bin reads as contiguous color segments. One
+    # scatter artist per legend entry, not per point: counts reach 10^4+ at catalog scale.
+    freqs = np.array([float(r["frequency_mhz"]) for r in rows])
+    lo, hi = float(freqs.min()), float(freqs.max())
+    if lo == hi:
+        lo, hi = lo - 0.5, hi + 0.5  # degenerate single-frequency run: give the bin width
+    edges = np.linspace(lo, hi, _CANDIDATE_FREQ_BINS + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    bin_of = np.clip(np.searchsorted(edges, freqs, side="right") - 1, 0, _CANDIDATE_FREQ_BINS - 1)
+
+    legend_order = [*ordered_targets, *([overflow_label] if overflow else [])]
+    rank = {target: i for i, target in enumerate(legend_order)}
+    keys = [
+        (target if (target := (r.get("target") or "?")) in color_by_target else overflow_label)
+        for r in rows
+    ]
+    stack_order = sorted(range(len(rows)), key=lambda i: (int(bin_of[i]), rank[keys[i]]))
+    next_level: dict[int, int] = {}
+    xs_by_target: dict[str, list[float]] = {}
+    ys_by_target: dict[str, list[int]] = {}
+    for i in stack_order:
+        bin_index = int(bin_of[i])
+        level = next_level.get(bin_index, 0) + 1
+        next_level[bin_index] = level
+        xs_by_target.setdefault(keys[i], []).append(float(centers[bin_index]))
+        ys_by_target.setdefault(keys[i], []).append(level)
+
+    for target in legend_order:
+        xs = xs_by_target.get(target)
         if not xs:
             continue
         ax.scatter(
             xs,
-            jitter_rng.uniform(0.0, 1.0, size=len(xs)),
+            ys_by_target[target],
             s=16,
             alpha=0.55,
             color=color_by_target.get(target, "tab:gray"),
@@ -1212,10 +1250,15 @@ def plot_candidate_frequency() -> str | None:
             f"{len(rows):,} candidates"
         )
 
-    ax.set_yticks([])
-    ax.set_ylim(-0.05, 1.05)
+    tallest = max(next_level.values())
+    if len(rows) > _CANDIDATE_FREQ_LOG_Y_THRESHOLD or tallest > _CANDIDATE_FREQ_LOG_Y_MAX_STACK:
+        ax.set_yscale("log")
+        ax.set_ylim(0.7, tallest * 1.6)
+    else:
+        ax.set_ylim(0, tallest * 1.08 + 1)
+    ax.set_ylabel("candidates per bin (stacked dots)")
     ax.set_xlabel("frequency (MHz)")
-    ax.grid(True, axis="x", alpha=0.2)
+    ax.grid(True, axis="both", alpha=0.2)
     ax.legend(
         title="target",
         fontsize=7,

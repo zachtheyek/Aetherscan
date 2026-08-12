@@ -189,6 +189,25 @@ These targets are additionally bounded by the project's intentional version ceil
 2. **Medium severity**: Update in next minor release
 3. **Low severity**: Update in next major release or when convenient
 
+### Registry access for verification
+
+GHCR returns **401 to a bare `curl` even for public packages** — anonymous access still requires a pull-scope token from the token endpoint. To verify published image tags and digests by hand:
+
+```bash
+# 1. Anonymous pull-scope token (public package — no credentials involved)
+TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:zachtheyek/aetherscan:pull" | jq -r .token)
+
+# 2. List published tags
+curl -s -H "Authorization: Bearer $TOKEN" https://ghcr.io/v2/zachtheyek/aetherscan/tags/list
+
+# 3. Manifest digest for a tag (read the Docker-Content-Digest response header)
+curl -sI -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+  https://ghcr.io/v2/zachtheyek/aetherscan/manifests/v1.1.0 | grep -i docker-content-digest
+```
+
+`utils/run_container.sh` uses exactly this recipe ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)) to resolve a `.devN` checkout's ceiling-bounded release tag and to digest-verify wrapper-pulled images against retags; every registry call in the wrapper fails open, so an unreachable registry warns instead of blocking any run that has a cached image (a first-ever pull with nothing cached still needs the registry).
+
 ### HuggingFace Hub artifact scan (ProtectAI)
 
 HuggingFace runs [ProtectAI](https://protectai.com/)'s scanner over uploaded files and flags

@@ -37,11 +37,11 @@ cd Aetherscan
 
 # The image is acquired automatically on the first `utils/run_container.sh` run: it pulls the
 # prebuilt image from GHCR (ghcr.io/zachtheyek/aetherscan) and caches it as aetherscan-ngc25.02.sif.
-# That pull needs a published tag, and a fresh `master` clone resolves to `:latest`, which doesn't
-# exist until the next release ships — so for now you still build once, here. Drop this step once
-# you're on a release tag (or once the next release lands); keep it for a host the published image
-# can't serve — non-x86_64, driver below the CUDA 12.8 floor, local requirements-container.txt edits.
-singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
+# A fresh `master` clone resolves the newest published release at or below its own version (#424),
+# so you normally build nothing. Build here only when the pull can't serve you — offline,
+# requirements-container.txt has moved past that release, non-x86_64, or a driver below the
+# CUDA 12.8 floor.
+# singularity build aetherscan-ngc25.02.sif aetherscan.def   # (or apptainer) only if the pull can't serve you
 
 # Launch tmux session
 # All subsequent commands should be ran in the top pane of the pipeline
@@ -177,6 +177,7 @@ Aetherscan/
 │   ├── inference.py            # Inference orchestration
 │   ├── inference_viz.py        # Inference visualization suite
 │   ├── candidate_figures.py    # Per-candidate figure renderer (TF-free; forkserver pool; called by inference_viz.py)
+│   ├── candidate_triage.py     # Report-time frequency exclusion + OOD review ordering (TF-free)
 │   ├── preprocessing.py        # Data preprocessing + energy detection
 │   ├── pfb.py                  # PFB static passband equalization
 │   ├── data_generation.py      # Synthetic signal injection
@@ -187,6 +188,7 @@ Aetherscan/
 │   ├── dashboard_cli.py        # Console entry point for manual dashboard runs (aetherscan-dashboard)
 │   ├── hf_hub.py               # HuggingFace Hub artifact upload/download
 │   ├── tag_guards.py           # Fail-early --save-tag dedup guards
+│   ├── display_tag.py          # Machine-scoped display tag for filenames + plot titles (stdlib-only)
 │   ├── rf_metrics.py           # Pure RF eval-metric helper (persisted to training_stats via train.py)
 │   ├── shap_parallel.py        # RF SHAP process-pool wrapper (TF-free; called by train.py)
 │   ├── latent_variants.py      # Latent-representation variant catalogue + selection/calibration (TF-free)
@@ -219,6 +221,7 @@ Aetherscan/
 │                               #   see benchmarks/README.md + docs/BENCHMARKING.md)
 ├── utils/                      # Utility scripts
 │   ├── benchmark_report.py          # Render the stage-timing benchmark report
+│   ├── candidate_rfi_report.py      # Standalone read-only candidate RFI-triage report (reads the run DB)
 │   ├── fetch_run_outputs.sh         # rsync a run's outputs from a remote node
 │   ├── find_optimal_configs.py      # Per-host config helper
 │   ├── get_system_info.sh           # System info helper
@@ -263,6 +266,7 @@ Aetherscan/
 | `inference.py`            | Model inference, candidate detection                                   |
 | `inference_viz.py`        | End-of-run inference visualization suite                               |
 | `candidate_figures.py`    | Per-candidate figure rendering (TF-free; forkserver + empty preload; called by `inference_viz.py`) |
+| `candidate_triage.py`     | Report-time candidate triage: frequency-exclusion partitioning for tallies/Slack surfaces and Mahalanobis OOD scores for review ordering (TF-free; stdlib-only at import so `cli.py` can import its validator) |
 | `preprocessing.py`        | Data loading / downsampling / log-normalization + energy detection     |
 | `pfb.py`                  | Polyphase-filterbank static passband response (bandpass flattening)    |
 | `data_generation.py`      | Synthetic signal injection using setigen                               |
@@ -273,6 +277,7 @@ Aetherscan/
 | `dashboard_cli.py`        | `aetherscan-dashboard` console script; re-execs Streamlit for manual DB inspection |
 | `hf_hub.py`               | HuggingFace Hub artifact upload/download, version-coupled revisions    |
 | `tag_guards.py`           | Fail-early `--save-tag` dedup guards (local + HF collisions)           |
+| `display_tag.py`          | Derives the presentation-only `{command}_{machine}_{datetime}` display tag used for artifact filenames, plot titles and Slack messages (stdlib-only; the DB tag stays `{command}_{datetime}`) |
 | `rf_metrics.py`           | Pure RF eval-metric helper written to `training_stats` (`model_name='rf'`) |
 | `shap_parallel.py`        | Process-pool wrapper for RF SHAP passes (TF-free; forkserver + empty preload; called by `train.py`) |
 | `latent_variants.py`      | Latent-representation variant catalogue, selection metrics, probability calibrator (TF-free; shared by `train.py` and `inference.py`) |

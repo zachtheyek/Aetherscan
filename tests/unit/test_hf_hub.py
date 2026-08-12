@@ -25,6 +25,7 @@ from aetherscan.hf_hub import (
     _sanitize_config_for_upload,
     compute_rf_metrics,
     generate_model_card,
+    release_ceiling,
     resolve_hf_revision,
     resolve_inference_artifacts,
     select_default_revision,
@@ -167,6 +168,58 @@ class TestSelectDefaultRevision:
     def test_empty(self):
         assert select_default_revision([]) is None
 
+    def test_inclusive_ceiling_admits_own_tag(self):
+        # A release checkout's ceiling admits its own version and everything below (#424)
+        tags = ["v1.0.0", "v1.1.0", "v1.2.0"]
+        assert select_default_revision(tags, ceiling=((1, 1, 0), True)) == "v1.1.0"
+
+    def test_exclusive_ceiling_excludes_own_base(self):
+        # A .dev checkout PRECEDES its base version (PEP 440): 1.1.0.dev0 must not take v1.1.0
+        tags = ["v1.0.0", "v1.1.0", "v1.2.0"]
+        assert select_default_revision(tags, ceiling=((1, 1, 0), False)) == "v1.0.0"
+
+    def test_ceiling_with_no_qualifying_tag_returns_none(self):
+        assert select_default_revision(["v2.0.0"], ceiling=((1, 1, 0), True)) is None
+
+    def test_no_ceiling_keeps_unbounded_behavior(self):
+        assert select_default_revision(["v1.0.0", "v9.0.0"], ceiling=None) == "v9.0.0"
+
+
+class TestReleaseCeiling:
+    """release_ceiling (#424): ((major, minor, patch), inclusive) from the installed
+    __version__, else the source checkout's pyproject.toml when __version__ is the
+    source-tree sentinel; None when neither yields a version (fail-open to unbounded)."""
+
+    def test_installed_release_is_inclusive(self, monkeypatch):
+        _set_version(monkeypatch, "1.2.3")
+        assert release_ceiling() == ((1, 2, 3), True)
+
+    @pytest.mark.parametrize("version", ["1.1.1.dev0", "1.1.1rc1"])
+    def test_prereleases_are_exclusive(self, monkeypatch, version):
+        _set_version(monkeypatch, version)
+        assert release_ceiling() == ((1, 1, 1), False)
+
+    @pytest.mark.parametrize("version", ["1.0.0.post1", "1.0.0+local"])
+    def test_post_and_local_follow_their_base_and_stay_inclusive(self, monkeypatch, version):
+        _set_version(monkeypatch, version)
+        assert release_ceiling() == ((1, 0, 0), True)
+
+    def test_sentinel_reads_pyproject(self, monkeypatch, tmp_path):
+        _set_version(monkeypatch, "0.0.0.dev0")
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[project]\nname = "aetherscan"\nversion = "1.1.1.dev0"\n')
+        monkeypatch.setattr(hf_hub, "_PYPROJECT_PATH", str(pyproject))
+        assert release_ceiling() == ((1, 1, 1), False)
+
+    def test_sentinel_without_pyproject_returns_none(self, monkeypatch, tmp_path):
+        _set_version(monkeypatch, "0.0.0.dev0")
+        monkeypatch.setattr(hf_hub, "_PYPROJECT_PATH", str(tmp_path / "missing.toml"))
+        assert release_ceiling() is None
+
+    def test_unparseable_version_returns_none(self, monkeypatch):
+        _set_version(monkeypatch, "garbage")
+        assert release_ceiling() is None
+
 
 class TestVersionDefaultRevision:
     """The version-coupled default only activates for real installed releases (strict X.Y.Z);
@@ -229,6 +282,35 @@ class TestResolveHfRevision:
             hf_hub, "list_hf_tags", lambda repo_id: ["train_20260101_120000", "v0.2.0"]
         )
         assert resolve_hf_revision("ns/repo", None) == "v0.2.0"
+
+    def test_dev_checkout_bounded_below_its_base(self, monkeypatch):
+        # The #424 core case: a 1.1.1.dev0 checkout with v1.2.0 published must take v1.1.0
+        # (the newest release at or below its own code), never the newer v1.2.0.
+        _set_version(monkeypatch, "1.1.1.dev0")
+        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["v1.0.0", "v1.1.0", "v1.2.0"])
+        assert resolve_hf_revision("ns/repo", None) == "v1.1.0"
+
+    def test_dev_checkout_excludes_its_own_base_version(self, monkeypatch):
+        # 1.1.0.dev0 precedes 1.1.0 (PEP 440): its ceiling excludes v1.1.0 itself
+        _set_version(monkeypatch, "1.1.0.dev0")
+        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["v1.0.0", "v1.1.0"])
+        assert resolve_hf_revision("ns/repo", None) == "v1.0.0"
+
+    def test_sentinel_bounds_via_pyproject(self, monkeypatch, tmp_path):
+        # Source-tree/container runs (sentinel __version__) take the ceiling from the
+        # checkout's pyproject — the same bound as the run_container.sh image resolution.
+        _set_version(monkeypatch, "0.0.0.dev0")
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('version = "1.1.1.dev0"\n')
+        monkeypatch.setattr(hf_hub, "_PYPROJECT_PATH", str(pyproject))
+        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["v1.1.0", "v1.2.0", "v2.0.0"])
+        assert resolve_hf_revision("ns/repo", None) == "v1.1.0"
+
+    def test_only_tags_above_ceiling_raises_with_ceiling_in_message(self, monkeypatch):
+        _set_version(monkeypatch, "1.0.1.dev0")
+        monkeypatch.setattr(hf_hub, "list_hf_tags", lambda repo_id: ["v2.0.0"])
+        with pytest.raises(RuntimeError, match="ceiling"):
+            resolve_hf_revision("ns/repo", None)
 
     def test_no_resolvable_tag_raises_with_guidance(self, monkeypatch):
         _set_version(monkeypatch, "0.0.0.dev0")

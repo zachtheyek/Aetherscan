@@ -22,8 +22,16 @@
 #                               prints aetherscan.def build instructions and exits.
 #     AETHERSCAN_IMAGE          GHCR image repo to pull (when the .sif is absent, or a re-pull is
 #                               triggered) (default: ghcr.io/zachtheyek/aetherscan)
-#     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version>, or `latest`
-#                               on a .devN checkout that has no per-version image)
+#     AETHERSCAN_IMAGE_TAG      Image tag to pull (default: v<pyproject version> on a release
+#                               checkout; a .devN checkout resolves the newest published release
+#                               tag AT OR BELOW its own version via the GHCR API (#424), falling
+#                               back — when the registry is unreachable — to the cached
+#                               sidecar's ceiling-compatible tag, then `latest`)
+#     AETHERSCAN_FORCE_REPULL   Set to 1 to re-pull the published image over a .sif the wrapper
+#                               cannot fully verify — a user-built/manually-pulled one (no
+#                               pull-provenance sidecar) or a pre-#424 ref-only sidecar (#424).
+#                               Default: warn and keep it. No effect on an image already
+#                               digest-verified against the registry.
 #     AETHERSCAN_DATA_PATH      Host data dir, bound 1:1
 #                               (default: /datax/scratch/zachy/data/aetherscan)
 #     AETHERSCAN_MODEL_PATH     Host models dir, bound 1:1
@@ -102,16 +110,20 @@ fi
 #   3. Else fail loudly with build instructions.
 #
 # The pulled tag defaults to v<pyproject version>, so a checkout of a release tag (vX.Y.Z) pulls
-# that release's image; a .devN checkout has no per-version image and falls back to :latest. A
-# PULLED image records its full ref (repo:tag) in "$SIF.pulled-tag"; if a later checkout — or a
-# different AETHERSCAN_IMAGE — wants a different ref we re-pull instead of silently running the old
-# one. The trigger is a change in that REF string, so a release-tag checkout re-pulls on every bump
-# (digest-identical retag included), while a .devN checkout always wants the constant :latest and so
-# keeps whatever it first cached even as :latest moves — rm the .sif (and its sidecar) to pick that
-# up. A user-BUILT .sif is always used as-is: it has no sidecar at all, or — if built over a
-# previously pulled image — is newer than one (see the mtime note below). A MANUAL pull/build to
-# $SIF likewise writes no sidecar, so it too is kept across bumps — let run_container.sh do the
-# pulling if you want it to track the pinned ref.
+# that release's image; a .devN checkout resolves the newest published release tag AT OR BELOW its
+# own version via the GHCR tag API (#424 — strictly below the .dev base: a 1.1.1.dev0 checkout
+# wants v1.1.0 even after v1.2.0 publishes, so a checkout never silently runs an image newer than
+# its own code). On resolver failure the cached sidecar's ceiling-compatible tag is preferred,
+# then :latest. A PULLED image records its ref (repo:tag, line 1) and manifest digest (line 2,
+# when obtainable) in "$SIF.pulled-tag"; a later checkout wanting a different ref re-pulls, and
+# a matching ref whose REMOTE digest has moved (a retag — the #416 drift class) warns and
+# re-pulls over it in place (atomic tmp -> mv; the cached image survives a failed pull). Both
+# checks fail OPEN: an unreachable registry runs the cached image with a warning, never blocks
+# a run that has a cached image (a FIRST pull with no cached image still needs the registry, by
+# necessity). A user-BUILT .sif (no sidecar, or newer than its sidecar — see the mtime note
+# below) is never verified or clobbered by default: the wrapper warns that it cannot vouch for
+# it, and only AETHERSCAN_FORCE_REPULL=1 replaces it with the published image (a Blackwell
+# rebuild or edited-requirements build is legitimate and irreplaceable).
 #
 # GHCR-pull caveats — the published image is single-arch linux/amd64 on the pinned NGC base.
 # If any of these hold, BUILD from aetherscan.def instead of pulling:
@@ -125,36 +137,220 @@ fi
 #     — rm the local $SIF first, or point SIF= elsewhere, since a user-built .sif takes priority
 #     over any pull).
 IMAGE_REPO=${AETHERSCAN_IMAGE:-ghcr.io/zachtheyek/aetherscan}
+
+# --- GHCR helpers (#424). All fail CLOSED as functions (nonzero return) and every call site
+# treats that as "unknown" and fails OPEN — an offline node, a missing curl, or a non-GHCR
+# AETHERSCAN_IMAGE never blocks a run that has a cached image. Anonymous pull-scope token
+# per SECURITY.md's recipe.
+_ghcr_token() {  # $1 = repo path (owner/name); prints a token
+    local token
+    command -v curl >/dev/null 2>&1 || return 1
+    token=$(curl -fsS --connect-timeout 3 --max-time 10 "https://ghcr.io/token?scope=repository:$1:pull" 2>/dev/null \
+        | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p') || return 1
+    [[ -n $token ]] || return 1
+    printf '%s\n' "$token"
+}
+
+_tag_within_ceiling() {  # $1 = vX.Y.Z tag, $2 = version string; 0 iff tag <= the ceiling
+    # THE boundary logic, in one place: inclusive for an exact release (or .post/+local,
+    # which FOLLOW their base per PEP 440), strictly below the base for a .dev/rc
+    # pre-release (1.1.1.dev0 precedes 1.1.1). Mirrors hf_hub.release_ceiling for the
+    # weight side. Shared by the resolver's candidate loop and the sidecar-preference
+    # fallback, so the inclusivity rules never fork.
+    local tag=$1 ver=$2 inclusive major minor patch M m p
+    if [[ $ver =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(\.post[0-9]+)?(\+.*)?$ ]]; then
+        inclusive=1
+    elif [[ $ver =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        inclusive=0
+    else
+        return 1
+    fi
+    major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+    [[ $tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    M=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} p=${BASH_REMATCH[3]}
+    if ((M < major)); then return 0; fi
+    if ((M > major)); then return 1; fi
+    if ((m < minor)); then return 0; fi
+    if ((m > minor)); then return 1; fi
+    if ((p < patch)); then return 0; fi
+    if ((p > patch)); then return 1; fi
+    if ((inclusive == 1)); then return 0; fi
+    return 1
+}
+
+_ghcr_ceiling_tag() {  # $1 = repo path, $2 = pyproject version; prints the wanted vX.Y.Z tag
+    # Highest published vX.Y.Z at or below the ceiling (boundary semantics live in
+    # _tag_within_ceiling). Returns 1 on infra failure (no curl / registry unreachable), 2
+    # when the registry answered but no tag qualifies under the ceiling — callers
+    # distinguish the two so a reachable-but-empty result can warn about its fallback.
+    local repo=$1 ver=$2 token tags t best_tag=""
+    local bM=-1 bm=-1 bp=-1 M m p
+    # Unparseable version -> infra-style failure (rc 1) BEFORE any network round trip, so
+    # the caller's rc==2 "nothing qualifies" warning can't fire for a garbage version.
+    [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
+    token=$(_ghcr_token "$repo") || return 1
+    tags=$(curl -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer $token" \
+        "https://ghcr.io/v2/$repo/tags/list" 2>/dev/null \
+        | tr ',[]' '\n' | sed -n 's/.*"\(v[0-9][0-9.]*\)".*/\1/p') || return 1
+    while IFS= read -r t; do
+        _tag_within_ceiling "$t" "$ver" || continue
+        [[ $t =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
+        M=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} p=${BASH_REMATCH[3]}
+        if ((M > bM)) || { ((M == bM)) && ((m > bm)); } \
+            || { ((M == bM)) && ((m == bm)) && ((p > bp)); }; then
+            bM=$M bm=$m bp=$p best_tag="v$M.$m.$p"
+        fi
+    done <<<"$tags"
+    [[ -n $best_tag ]] || return 2  # registry answered; nothing qualifies under the ceiling
+    printf '%s\n' "$best_tag"
+}
+
+_ghcr_remote_digest() {  # $1 = repo path, $2 = tag; prints the manifest digest (sha256:…)
+    local token digest
+    token=$(_ghcr_token "$1") || return 1
+    digest=$(curl -fsSI --connect-timeout 3 --max-time 10 -H "Authorization: Bearer $token" \
+        -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+        "https://ghcr.io/v2/$1/manifests/$2" 2>/dev/null \
+        | awk 'tolower($1)=="docker-content-digest:"{print $2}' | tr -d '\r') || return 1
+    [[ $digest == sha256:* ]] || return 1
+    printf '%s\n' "$digest"
+}
+
+# ghcr.io only: a custom AETHERSCAN_IMAGE on another registry skips ceiling + digest checks.
+GHCR_REPO_PATH=""
+[[ $IMAGE_REPO == ghcr.io/* ]] && GHCR_REPO_PATH=${IMAGE_REPO#ghcr.io/}
+
 if [[ -z ${AETHERSCAN_IMAGE_TAG:-} ]]; then
     # First `version = "..."` line in pyproject.toml; awk (no pipe, portable GNU/BSD) so
     # `set -o pipefail` can't trip the wrapper. `|| true` (+ 2>/dev/null) so a missing file yields
-    # an empty VER (-> `latest`) rather than aborting the whole wrapper under `set -e`.
+    # an empty VER (-> fallback) rather than aborting the whole wrapper under `set -e`.
     VER=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO/pyproject.toml" 2>/dev/null || true)
     if [[ $VER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         AETHERSCAN_IMAGE_TAG="v$VER"
     else
-        AETHERSCAN_IMAGE_TAG="latest"
+        # .devN / unparseable checkout: resolve the ceiling-bounded release tag from the
+        # registry (#424); fall back to the historical :latest when that fails (offline,
+        # no curl, non-GHCR repo) — fail open, never block a run that has a cached image.
+        # A REACHABLE registry with no qualifying tag also falls back, but loudly: that
+        # :latest may exceed the ceiling, which the resolver otherwise guarantees against.
+        CEILING_TAG=""
+        ceiling_rc=1
+        if [[ -n $GHCR_REPO_PATH ]]; then
+            ceiling_rc=0
+            CEILING_TAG=$(_ghcr_ceiling_tag "$GHCR_REPO_PATH" "$VER") || ceiling_rc=$?
+        fi
+        if [[ -n $CEILING_TAG ]]; then
+            AETHERSCAN_IMAGE_TAG="$CEILING_TAG"
+            echo "Resolved image tag '$CEILING_TAG' (newest published release at or below" \
+                 "this checkout's version $VER, #424)." >&2
+        else
+            # Resolver INFRA-failed (rc 1 only — an rc==2 registry answer means any
+            # recorded tag is over the ceiling by construction and must fall through to
+            # the loud warning below; rc 1 also covers a non-GHCR AETHERSCAN_IMAGE, where
+            # the resolver never ran — preferring that sidecar's pinned tag over :latest
+            # is desirable there too, still ceiling-checked). Before surrendering to :latest, prefer a cached
+            # sidecar whose recorded vX.Y.Z ref for THIS repo passes the ceiling check —
+            # verified, not trusted: the sidecar records what an EARLIER state of this
+            # tree resolved, and a version-backwards checkout (older branch, shared SIF=)
+            # could carry an over-ceiling tag. The check is pure arithmetic, no network.
+            sidecar_prev_ref=$(head -n 1 "$SIF.pulled-tag" 2>/dev/null || true)
+            sidecar_prev_tag=${sidecar_prev_ref#"$IMAGE_REPO":}
+            if [[ $ceiling_rc -eq 1 && $sidecar_prev_ref == "$IMAGE_REPO":v[0-9]* ]] \
+                && _tag_within_ceiling "$sidecar_prev_tag" "$VER"; then
+                AETHERSCAN_IMAGE_TAG=$sidecar_prev_tag
+                echo "NOTE: ceiling resolution unavailable — keeping the cached sidecar's" \
+                     "ceiling-compatible tag '$AETHERSCAN_IMAGE_TAG' instead of ':latest'" \
+                     "(#424)." >&2
+            else
+                AETHERSCAN_IMAGE_TAG="latest"
+                if [[ $ceiling_rc -eq 2 ]]; then
+                    echo "WARNING: no published release tag at or below this checkout's" \
+                         "version $VER exists — falling back to ':latest', which may be" \
+                         "NEWER than this checkout's code. Build from aetherscan.def for a" \
+                         "version-true image." >&2
+                elif [[ -n $GHCR_REPO_PATH ]]; then
+                    echo "WARNING: could not resolve this checkout's ceiling-bounded release" \
+                         "tag (no curl, or the GHCR tag API was unreachable) — falling back" \
+                         "to ':latest', which may be NEWER than this checkout's version" \
+                         "$VER (#424)." >&2
+                fi
+            fi
+        fi
     fi
 fi
 IMAGE_REF="$IMAGE_REPO:$AETHERSCAN_IMAGE_TAG"
 
-# (Re)pull if there's no image, or the cached one was pulled for a different tag. A $SIF NEWER than
-# its sidecar was rebuilt locally over a previously pulled image — treat that as user-built
-# (priority 1) and never clobber it (mv preserves the pulled file's mtime; the sidecar is written
-# right after, so a pulled .sif is never newer than its sidecar, a local build always is).
+# (Re)pull if there's no image, the cached one was pulled for a different tag, or the remote
+# digest of the SAME ref has moved (#424 — a retag; the sidecar's line 2 records the digest at
+# pull time, older ref-only sidecars simply skip the digest check until their next pull). A $SIF
+# NEWER than its sidecar was rebuilt locally over a previously pulled image — treat that as
+# user-built (priority 1) and never clobber it silently (mv preserves the pulled file's mtime;
+# the sidecar is written right after, so a pulled .sif is never newer than its sidecar, a local
+# build always is). Sidecar-less / user-built images can't be verified: warn, and replace only
+# under AETHERSCAN_FORCE_REPULL=1.
 need_pull=0
+UNVERIFIED_SIF_WARNING=""
 if [[ ! -f "$SIF" ]]; then
     need_pull=1
-elif [[ -f "$SIF.pulled-tag" && ! "$SIF" -nt "$SIF.pulled-tag" \
-        && "$(cat "$SIF.pulled-tag" 2>/dev/null)" != "$IMAGE_REF" ]]; then
-    echo "Cached $SIF was pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null)' but this checkout wants" \
-         "'$IMAGE_REF' — re-pulling." >&2
-    need_pull=1
+elif [[ -f "$SIF.pulled-tag" && ! "$SIF" -nt "$SIF.pulled-tag" ]]; then
+    sidecar_ref=$(head -n 1 "$SIF.pulled-tag" 2>/dev/null || true)
+    if [[ "$sidecar_ref" != "$IMAGE_REF" ]]; then
+        echo "Cached $SIF was pulled for '$sidecar_ref' but this checkout wants" \
+             "'$IMAGE_REF' — re-pulling." >&2
+        need_pull=1
+    elif [[ -n $GHCR_REPO_PATH ]]; then
+        recorded_digest=$(sed -n '2p' "$SIF.pulled-tag" 2>/dev/null || true)
+        if [[ -z $recorded_digest ]]; then
+            # Pre-#424 ref-only sidecar: nothing to drift-check against. A dev checkout
+            # self-heals when its wanted ref changes; a pinned tag would keep this state
+            # forever, so offer the refresh path explicitly.
+            if [[ ${AETHERSCAN_FORCE_REPULL:-0} == 1 ]]; then
+                echo "AETHERSCAN_FORCE_REPULL=1: re-pulling $IMAGE_REF to refresh the" \
+                     "pre-#424 sidecar with a digest record." >&2
+                need_pull=1
+            else
+                echo "NOTE: $SIF.pulled-tag predates the digest record (#424) — remote-drift" \
+                     "checking is unavailable until the next pull. Set" \
+                     "AETHERSCAN_FORCE_REPULL=1 (or rm the .sif) to refresh it." >&2
+            fi
+        else
+            remote_digest=$(_ghcr_remote_digest "$GHCR_REPO_PATH" "$AETHERSCAN_IMAGE_TAG" || true)
+            if [[ -n $remote_digest && "$recorded_digest" != "$remote_digest" ]]; then
+                echo "WARNING: $IMAGE_REF has moved on the registry (recorded" \
+                     "$recorded_digest, remote $remote_digest) — re-pulling over the" \
+                     "cached $SIF (#424)." >&2
+                need_pull=1
+            fi
+        fi
+    fi
+else
+    # No sidecar, or $SIF newer than it: user-built or manually pulled — unverifiable.
+    if [[ ${AETHERSCAN_FORCE_REPULL:-0} == 1 ]]; then
+        # Deletion is deliberately DEFERRED to the pull's own atomic tmp -> mv publish:
+        # if the replacement pull fails (offline node, quota'd cache), the existing —
+        # possibly irreplaceable — local build survives and the run proceeds against it
+        # with the stale-image warning, instead of being destroyed with nothing to run.
+        echo "AETHERSCAN_FORCE_REPULL=1: replacing unverifiable $SIF with a fresh pull of" \
+             "$IMAGE_REF (the current image is kept if the pull fails)." >&2
+        need_pull=1
+    else
+        UNVERIFIED_SIF_WARNING="WARNING: $SIF has no pull provenance (user-built or manually\
+ pulled) — the wrapper cannot verify it against $IMAGE_REF. If it is not a deliberate local\
+ build, set AETHERSCAN_FORCE_REPULL=1 to replace it with the published image (#424)."
+        echo "$UNVERIFIED_SIF_WARNING" >&2
+    fi
 fi
 
 STALE_SIF_WARNING=""
 if [[ $need_pull -eq 1 ]]; then
     echo "Pulling docker://$IMAGE_REF -> $SIF ..." >&2
+    # Fetch the digest BEFORE pulling (#424): it records what we INTEND to pull, so a
+    # retag landing mid-pull shows up as drift on the next run instead of being masked —
+    # and the mv -> sidecar-write window below stays microseconds (no network I/O between
+    # them), preserving the mtime invariant the user-built detection rides on.
+    pulled_digest=""
+    [[ -n $GHCR_REPO_PATH ]] \
+        && pulled_digest=$(_ghcr_remote_digest "$GHCR_REPO_PATH" "$AETHERSCAN_IMAGE_TAG" || true)
     tmp="$SIF.pulling.$$"
     # Don't leave a multi-GB partial behind on Ctrl-C. INT/TERM exit explicitly: a trapped signal
     # does NOT terminate bash, so without the exit execution would resume in the failure branch
@@ -167,15 +363,23 @@ if [[ $need_pull -eq 1 ]]; then
     rm -f "$tmp"
     if "$RUNTIME" pull "$tmp" "docker://$IMAGE_REF" >&2; then
         mv -f "$tmp" "$SIF"
-        printf '%s\n' "$IMAGE_REF" >"$SIF.pulled-tag"
+        # Sidecar v2 (#424): ref on line 1 (back-compat — every reader takes head -n1),
+        # manifest digest on line 2 when the registry yielded one before the pull (enables
+        # the drift check above on later runs; a digest-less sidecar just skips that
+        # check). Written immediately after the mv — no network I/O between them.
+        if [[ -n $pulled_digest ]]; then
+            printf '%s\n%s\n' "$IMAGE_REF" "$pulled_digest" >"$SIF.pulled-tag"
+        else
+            printf '%s\n' "$IMAGE_REF" >"$SIF.pulled-tag"
+        fi
         trap - EXIT INT TERM
-        echo "Pulled and cached $SIF ($IMAGE_REF)." >&2
+        echo "Pulled and cached $SIF ($IMAGE_REF${pulled_digest:+ @ $pulled_digest})." >&2
     else
         trap - EXIT INT TERM
         rm -f "$tmp"
         if [[ -f "$SIF" ]]; then
             STALE_SIF_WARNING="WARNING: pull of docker://$IMAGE_REF failed; running against the cached\
- $SIF, which may be a different version (pulled for '$(cat "$SIF.pulled-tag" 2>/dev/null || echo unknown)')."
+ $SIF, which may be a different version (pulled for '$(head -n 1 "$SIF.pulled-tag" 2>/dev/null || echo unknown)')."
             echo "$STALE_SIF_WARNING" >&2
         else
             echo "Error: no local image at $SIF, and pulling docker://$IMAGE_REF failed." >&2
@@ -236,8 +440,10 @@ if [[ -n ${HF_HOME+x} ]]; then
     HF_ENV_ARGS+=(--env "HF_HOME=$HF_HOME")
 fi
 
-# Repeat the stale-image warning right before launch so it isn't buried far above the run in a log.
+# Repeat the stale/unverified-image warnings right before launch so they aren't buried far
+# above the run in a log.
 [[ -n $STALE_SIF_WARNING ]] && echo "$STALE_SIF_WARNING" >&2
+[[ -n $UNVERIFIED_SIF_WARNING ]] && echo "$UNVERIFIED_SIF_WARNING" >&2
 
 exec "$RUNTIME" exec --nv \
     "${BIND_ARGS[@]}" \

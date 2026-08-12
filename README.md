@@ -70,7 +70,8 @@ pip install aetherscan
 export AETHERSCAN_DATA_PATH=...  AETHERSCAN_MODEL_PATH=...  AETHERSCAN_OUTPUT_PATH=...
 
 # Bare inference (no --encoder-path/--rf-path/--config-path) resolves + downloads the release's
-# matching HF weights (revision v<installed version>):
+# matching HF weights (revision v<installed version>; a non-release install, e.g. a .devN
+# pre-release, instead takes the newest release tag at or below its own version — #424):
 python -m aetherscan.main inference --inference-files catalog.csv --save-tag inf
 ```
 
@@ -98,7 +99,7 @@ cd Aetherscan
 
 **2. Get the `.sif` image**
 
-`utils/run_container.sh` acquires the image on first use, in priority order: **(1)** use a local `aetherscan-ngc25.02.sif` if present; **(2)** else **pull the release-pinned image from GHCR** (`ghcr.io/zachtheyek/aetherscan:v<version>`, derived from `pyproject.toml`) and cache it as that `.sif`; **(3)** else fail loudly with build instructions. So on a release checkout you normally build nothing — the first `run_container.sh` call pulls and caches the image (the runtime converts the OCI image to its own native `.sif`, so the same published image works under both Apptainer and SingularityCE).
+`utils/run_container.sh` acquires the image on first use, in priority order: **(1)** use a local `aetherscan-ngc25.02.sif` if present; **(2)** else **pull the release-pinned image from GHCR** and cache it as that `.sif` — a release checkout pulls `ghcr.io/zachtheyek/aetherscan:v<version>` exactly (derived from `pyproject.toml`), while a `.devN` checkout resolves the **newest published release tag at or below its own version** via the anonymous GHCR tag API ([#424](https://github.com/zachtheyek/Aetherscan/issues/424); strictly below the `.dev` base, so a checkout never silently runs an image newer than its own code), falling back — when the registry/`curl` is unavailable or `AETHERSCAN_IMAGE` points off-GHCR — first to the cached sidecar's ceiling-compatible tag, then to `:latest` (fail-open, so a network failure never blocks a run that has a cached image); **(3)** else fail loudly with build instructions. So on a release checkout you normally build nothing — the first `run_container.sh` call pulls and caches the image (the runtime converts the OCI image to its own native `.sif`, so the same published image works under both Apptainer and SingularityCE).
 
 > [!NOTE]
 > **On a hardened HPC node, set `SINGULARITY_TMPDIR` / `SINGULARITY_CACHEDIR` (or the `APPTAINER_*` equivalents) to scratch _before_ the first pull** — whether that pull comes from `run_container.sh` or the manual commands below. The runtime unpacks the ~9 GB image through them exactly as a build does, so leaving them unset fills `TMPDIR`'s default `/tmp` (the staging area needs ~15 GB) and/or the blob cache under `$HOME` — either of which is likely to fail on a quota'd or hardened node. See [`docs/GPU_RUNTIME_GUIDE.md`](docs/GPU_RUNTIME_GUIDE.md#hardened-hpc-nodes).
@@ -111,16 +112,16 @@ apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:
 singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.1.0
 ```
 
-A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build and keeps it across version bumps. Let `run_container.sh` do the pulling if you want it to track the pinned ref (`repo:tag`, so both a version bump and an `AETHERSCAN_IMAGE` change trigger a re-pull) for you; otherwise `rm` the `.sif` when you bump versions.
+A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build: it is never verified or deleted by default — the wrapper warns that it cannot vouch for the image and keeps it across version bumps (set `AETHERSCAN_FORCE_REPULL=1` to replace it with a fresh pull of the published image — the existing image is kept if that pull fails — or `rm` the `.sif` yourself when you bump versions). Let `run_container.sh` do the pulling if you want provenance tracked for you: the sidecar records the pinned ref (`repo:tag`, so both a version bump and an `AETHERSCAN_IMAGE` change trigger a re-pull) plus the image's manifest digest, which is re-checked against the registry on every run — if the remote digest has moved (a retag), the wrapper warns and re-pulls over it automatically (atomic publish; the cached image survives a failed pull) ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)).
 
 **Build locally instead** — necessary when the prebuilt image doesn't fit the host:
 
 - **non-x86_64 host** (e.g. aarch64 Grace/GH200): the published image is `linux/amd64` only;
 - **host driver below the base's CUDA 12.8 floor** (Blackwell <570 / Ampere <550): a pull succeeds but the container won't see the GPUs — upgrade the driver, or build;
 - **you edited `requirements-container.txt` or rebuilt TF from source** locally: a pull fetches the *released* image, not your variant;
-- **no matching published tag exists yet** — e.g. a `master`/`.devN` clone before the next release moves `:latest` (the pull has nothing to fetch, so the wrapper prints these build instructions and exits).
+- **no published image fits your checkout** — a `master`/`.devN` clone resolves the newest published release **at or below its own version** ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)), so it pulls a *released* image, never a master build: if `requirements-container.txt` has moved since that release, or no release qualifies at all (the pull has nothing to fetch, so the wrapper prints these build instructions and exits), build locally.
 
-A local build placed over the default `.sif` path is safe: `run_container.sh` caches pulled images with a `<sif>.pulled-tag` sidecar and detects a locally-built `.sif` by mtime, so your build is kept and never overwritten by a pull — even across version bumps.
+A local build placed over the default `.sif` path is safe: `run_container.sh` caches pulled images with a `<sif>.pulled-tag` sidecar and detects a locally-built `.sif` by mtime, so your build is kept and never overwritten by a pull — even across version bumps. The wrapper does warn that it cannot vouch for an image it didn't pull; only setting `AETHERSCAN_FORCE_REPULL=1` replaces it with a fresh pull of the published image (your build is kept if that pull fails) ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)).
 
 The same [`aetherscan.def`](aetherscan.def) recipe builds with either runtime. Build on the cluster you intend to run on so the resulting `.sif` is produced by that cluster's native runtime:
 
@@ -263,6 +264,8 @@ PYTHONPATH=src python -m aetherscan.main {train|inference} \
 ```
 
 `PYTHONPATH=src` makes the `aetherscan` package importable from `src/` without a `pip install -e .` step. No inline `KEY=VALUE` prefix is needed for Slack credentials — the `.env` auto-load runs before any worker process is spawned, so `os.environ` inheritance to multiprocess pools is automatic.
+
+Bare inference (no `--encoder-path`/`--rf-path`/`--config-path`) resolves HF weights on this path exactly as the container and pip runtimes do: it downloads the newest published release tag at or below the checkout's `pyproject.toml` version ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)); `--hf-revision` or the three local artifact paths override.
 
 See the [Usage Examples](#usage-examples) section below for further ways to invoke the Aetherscan pipeline.
 
@@ -1137,9 +1140,11 @@ options:
                         HuggingFace revision (tag, branch, or commit hash) to
                         pin the model download to when no local artifact paths
                         are given (default: v{package version} when running as
-                        an installed release, else the repo's latest release
-                        tag — highest semver vX.Y.Z tag; a release tag is
-                        required for a no-artifact download)
+                        an installed release, else the newest semver vX.Y.Z
+                        release tag at or below the local pipeline version — a
+                        checkout never silently downloads weights newer than
+                        its own code; a release tag is required for a no-
+                        artifact download)
   --save-tag SAVE_TAG   Run label prefix: one of test, train, inf, bench. The
                         datetime is appended automatically at runtime (e.g.
                         inf_20260101_120000). Defaults to the subcommand
@@ -1168,10 +1173,11 @@ git clone https://github.com/zachtheyek/Aetherscan.git
 cd Aetherscan
 
 # The first `utils/run_container.sh` run pulls the prebuilt image from GHCR and caches it as
-# aetherscan-ngc25.02.sif. A fresh `master` clone resolves to `:latest`, which doesn't exist until
-# the next release ships — so build once now (this is also the fallback for a host the published
-# image can't serve). Drop this step on a release-tag checkout.
-singularity build aetherscan-ngc25.02.sif aetherscan.def   # or: apptainer build ...
+# aetherscan-ngc25.02.sif. A fresh `master` clone resolves the newest published release at or
+# below its own version automatically (#424), so you normally build nothing — build once here
+# only if you'll run offline, requirements-container.txt has moved past that release, or the
+# published image can't serve your host.
+# singularity build aetherscan-ngc25.02.sif aetherscan.def   # (or apptainer) only if the pull can't serve you
 
 ./utils/start_tmux_session.sh
 

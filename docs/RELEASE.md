@@ -101,16 +101,18 @@ compatibility promises; from `1.0.0` onward, these rules hold.
 
 ## Packaging
 
-- **Build system**: hatchling (`[build-system] requires = ["hatchling"]` in
+- **Build system**: hatchling (`[build-system] requires = ["hatchling>=1.28,<2"]` in
   [`pyproject.toml`](../pyproject.toml)), wheel target `src/aetherscan`.
   `requires-python = ">=3.10,<3.13"`.
 - **Dependencies**: `[project].dependencies` mirrors
   [`requirements-container.txt`](../requirements-container.txt)'s ranges **plus** the
   packages the NGC base image provides implicitly (`tensorflow[and-cuda]==2.17.*`, `tf_keras`,
   `h5py`, `hdf5plugin`, `psutil`) — a pip install has no base image to lean on.
-  Optional extras: `dev = ["ruff", "pre-commit", "pytest>=9.0.3"]` (the `pytest` floor is a
+  Optional extras:
+  `dev = ["ruff>=0.15.22,<0.16", "pre-commit>=4.5,<5", "pytest>=9.0.3,<9.1"]`
+  (the `pytest` floor is a
   security floor — GHSA-6w46-j5rx-g56g, tmpdir handling; dev/test-only) and
-  `dashboard = ["streamlit>=1.54.0,<1.55", "plotly>=5.24,<6", "pandas>=2.0,<3"]` —
+  `dashboard = ["streamlit>=1.59.2,<1.60", "plotly>=6.7,<6.8", "pandas>=2.3,<2.4"]` —
   `pip install aetherscan[dashboard]` pulls the stack for the packaged live dashboard
   ([`src/aetherscan/dashboard.py`](../src/aetherscan/dashboard.py)). Dependency *versions* follow
   [`SECURITY.md`](../SECURITY.md)'s selection policy, and the documented ceilings
@@ -134,9 +136,14 @@ Inference resolves models in this precedence order:
 3. **`v{__version__}`** — when running as an installed release, the package's own version is
    the default revision. This is the line that makes `pip install aetherscan==1.0.0` +
    bare inference pull exactly the `v1.0.0` weights.
-4. **Latest `v*` semver tag** on the HF repo. Training tags never name the default download —
-   a no-artifact inference download requires a blessed release tag.
-5. Otherwise: error with guidance.
+4. **Newest `v*` semver tag at or below the pipeline's release ceiling** on the HF repo
+   ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)). The ceiling comes from a real
+   installed `__version__`, else the source checkout's `pyproject.toml`; a `.dev`/`rc` version
+   excludes its own base per PEP 440, `.post`/local include it. Training tags never name the
+   default download — a no-artifact inference download requires a blessed release tag — and a
+   tag *above* the ceiling is never auto-selected, so a checkout never silently downloads
+   weights newer than its own code.
+5. Otherwise: error with guidance (naming the ceiling, when one bounded the search).
 
 Downloads happen **lazily at first inference**, never at import time (an import-time network
 download would be hostile), revision-pinned and cached under the standard HF cache
@@ -365,7 +372,11 @@ the assistant can drive; **CD** = automatic. Each step gates the next; do not re
 > from `master`, never on a maintenance branch — note that an out-of-order tag push (tagging an
 > older line *after* a newer one shipped) would also drag GHCR `:latest` backward onto the older
 > image, since `:latest` is a mutable pointer whoever pushed last owns (unlike PyPI, which orders
-> versions). The fix-forward-only rule keeps that from happening.
+> versions). The fix-forward-only rule keeps that from happening — and since
+> [#424](https://github.com/zachtheyek/Aetherscan/issues/424) a dragged-back `:latest` would be
+> largely harmless to consumers anyway: `run_container.sh` resolves version tags under the
+> checkout's release ceiling and touches `:latest` only as the last-resort fallback (after
+> the cached sidecar's ceiling-compatible tag).
 
 ## Version bump with no weights or image change
 
@@ -431,21 +442,28 @@ gh run watch "$(gh run list --workflow=publish-image.yml --limit 1 --json databa
 
 The `:latest` tag tracks the **newest** release: a real release (`workflow_call` from `release.yml`)
 moves `:latest`, but a backfill dispatch does **not** (its `latest` input defaults to `false`) — so
-publishing an older version never regresses `:latest`, which `run_container.sh` pulls for `.devN`
-checkouts. If you ever need to move it, pass `-f latest=true`.
+publishing an older version never regresses `:latest`. Since
+[#424](https://github.com/zachtheyek/Aetherscan/issues/424) `run_container.sh` no longer leans on
+`:latest` for `.devN` checkouts — it resolves the newest release tag at or below the checkout's
+version via the GHCR tag API, keeping `:latest` only as the last-resort fallback (after the
+cached sidecar's ceiling-compatible tag) — but the invariant is
+still worth preserving. If you ever need to move it, pass `-f latest=true`.
 
 Historical note: between the v1.0.0 backfill and the v1.1.0 release there was **no** `:latest`
 at all, so `.devN`/`master` checkouts had to build from `aetherscan.def` — deliberate, because
 master's `requirements-container.txt` had already moved past v1.0.0's (notably the `streamlit`
 security bump), and pinning `:latest` to the backfilled image would have served dev checkouts a
 knowingly stale dependency set. Since v1.1.0's CD run, `:latest` exists and tracks the newest
-real release. Note the failure mode changed **kind** with it: in the no-`:latest` window a dev
-checkout failed *hard* (the pull found nothing; the wrapper printed build instructions and
-exited), whereas now a dev checkout whose `requirements-container.txt` has moved past the last
-release **still pulls the released `:latest`, silently stale** — the wrapper never inspects
-requirements drift, so building from `aetherscan.def` in that state is on the user (and a
-`.devN` checkout keeps whatever `.sif` it first cached even as `:latest` moves — see the
-`<sif>.pulled-tag` sidecar logic in `run_container.sh`).
+real release — though since [#424](https://github.com/zachtheyek/Aetherscan/issues/424) it is only
+the wrapper's last-resort fallback (after the cached sidecar's ceiling-compatible tag): a
+`.devN` checkout resolves the newest release tag **at or below
+its own version** from the GHCR tag API, and the `<sif>.pulled-tag` sidecar records the pulled ref
+*and* its manifest digest, so a retagged ref is detected, warned about, and re-pulled automatically
+— a `.devN` checkout no longer keeps a stale cached `.sif` as qualifying releases move. The failure
+mode that remains is requirements drift: a dev checkout whose `requirements-container.txt` has
+moved past the release it resolves still pulls that **released** image, silently stale — the
+wrapper never inspects requirements drift, so building from `aetherscan.def` in that state is on
+the user.
 
 Verify: `docker buildx imagetools inspect ghcr.io/zachtheyek/aetherscan:v1.0.0`, or just pull it on
 a cluster via `utils/run_container.sh`.
@@ -470,4 +488,7 @@ a cluster via `utils/run_container.sh`.
   (`__version__` reads `0.0.0.dev0`, explicit model paths keep working). The **container** path now
   pulls the release-pinned image from GHCR when no local `.sif` is present (or prints
   `aetherscan.def` build instructions if the pull fails) — a convenience, not a contract change: a
-  checkout of a release tag pulls that version's image, a `.devN` checkout falls back to `:latest`.
+  checkout of a release tag pulls that version's image, a `.devN` checkout resolves the newest
+  published release at or below its own version
+  ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)), with the cached sidecar's
+  ceiling-compatible tag, then `:latest`, as the fallbacks.

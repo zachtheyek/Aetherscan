@@ -28,13 +28,15 @@ dependencies:
   - numpy>=1.26,<2.0
   - scipy>=1.13,<1.14
   - scikit-learn>=1.5,<1.6
-  - scikit-image>=0.24,<0.25
+  # 0.26 needs Python >=3.11; 0.25.2 is the newest line supporting 3.10.
+  - scikit-image>=0.25.2,<0.26
   - astropy>=6.1,<7
   - matplotlib>=3.9,<3.10
-  - joblib>=1.4,<2
+  # Minor-bounded to the proven-in-use line per SECURITY.md (was major-bounded).
+  - joblib>=1.5,<1.6
   # pandas backs the dashboard's data layer (aetherscan/dashboard.py). The NGC base image
   # ships it, so requirements-container.txt omits it; conda must provide it here.
-  - pandas>=2.0,<3
+  - pandas>=2.3,<2.4
   # setuptools provides pkg_resources, which blimpy (transitive via setigen)
   # imports at module load. Recent pip / Python releases dropped setuptools
   # from the bootstrap, so we install it explicitly. Upper-bound at <81 because
@@ -45,7 +47,7 @@ dependencies:
   # Conda-only deps (the NGC base image already ships h5py / psutil / pytest
   # so requirements-container.txt doesn't pin them).
   - h5py=3.11.*
-  - hdf5plugin
+  - hdf5plugin>=7.0,<7.1
   - psutil=6.0.*
   # Security floor: pytest >=9.0.3 fixes GHSA-6w46-j5rx-g56g (tmpdir handling); dev/test-only.
   - pytest>=9.0.3,<9.1
@@ -61,19 +63,20 @@ dependencies:
       # its base image (so requirements-container.txt omits it), but conda/pip has no base.
       - tf_keras==2.17.*
       # Range mirrors requirements-container.txt (see the rationale there).
-      - setigen>=2.6,<3
-      - imageio>=2.34,<3
+      - setigen>=2.7,<2.8
+      - imageio>=2.37,<2.38
       - umap-learn>=0.5.6,<0.6
-      - shap>=0.46.0,<0.47
-      - slack-sdk>=3.31.0,<4
+      # 0.50 needs Python >=3.11 AND numpy >=2; 0.49.x is upstream's last 3.10 line.
+      - shap>=0.49.1,<0.50
+      - slack-sdk>=3.43,<3.44
       # Floor >=1.2.2 per GHSA-mf9w-mj56-hr94 (CVE-2026-28684, set_key symlink
       # following; fixed in 1.2.2).
       - python-dotenv>=1.2.2,<2
       # Model weight distribution via the HuggingFace Hub — pin range mirrors
       # requirements-container.txt (see the rationale there).
-      - huggingface_hub>=1.22,<1.23
+      - huggingface_hub>=1.25.1,<1.26
       # Live monitoring dashboard (aetherscan/dashboard.py). Kept in lockstep with
-      # requirements-container.txt; streamlit 1.54 coexists with TF 2.17 (protobuf 4.x)
+      # requirements-container.txt; streamlit 1.59 coexists with TF 2.17 (protobuf 4.x)
       # and numpy<2. plotly is pure-Python.
-      - streamlit>=1.54.0,<1.55
-      - plotly>=5.24,<6
+      - streamlit>=1.59.2,<1.60
+      - plotly>=6.7,<6.8

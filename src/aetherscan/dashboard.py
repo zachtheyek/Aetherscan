@@ -453,7 +453,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                     sub["step"] = range(len(sub))
                     fig = px.line(sub, x="step", y="value", color="split", title=kind)
                     fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
         # --- RF eval metrics ---------------------------------------------------
         with tabs[1]:
@@ -501,14 +501,14 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                             margin={"l": 10, "r": 10, "t": 10, "b": 10},
                             coloraxis_showscale=False,
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                 acc = rf[rf["stat_name"].str.startswith("val_accuracy_")].copy()
                 if not acc.empty:
                     acc["subtype"] = acc["stat_name"].str.replace("val_accuracy_", "", regex=False)
                     fig = px.bar(acc, x="subtype", y="value", title="Per-sub-type val accuracy")
                     fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                 curve = rf[rf["stat_name"] == "ensemble_val_accuracy"].sort_values("epoch_number")
                 if curve.empty:
@@ -523,7 +523,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                         xaxis_title="number of trees",
                         yaxis_title="val accuracy",
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                 quant = rf[rf["stat_name"].str.startswith("val_proba_q")].copy()
                 if not quant.empty:
@@ -537,7 +537,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                         title="Val P(true) quantiles",
                     )
                     fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 st.caption(
                     "Richer RF figures (SHAP suite, decision boundary, calibration) live under "
                     "All plots (PNG)."
@@ -564,7 +564,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                     markers=True,
                 )
                 fig.update_layout(height=260, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 st.subheader("Injected-signal / intensity stat distributions")
                 stat = st.selectbox("stat_name", sorted(inj["stat_name"].unique()))
@@ -574,7 +574,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                     sub, x="value", color=color, barmode="overlay", nbins=60, title=stat
                 )
                 fig.update_layout(height=300, margin={"l": 10, "r": 10, "t": 40, "b": 10})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         # --- Latent scatter (live PCA of the latest snapshot) ------------------
         with tabs[3]:
@@ -590,7 +590,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 )
                 fig = px.scatter(df, x="pc1", y="pc2", color="signal_type", opacity=0.7)
                 fig.update_layout(height=520, margin={"l": 10, "r": 10, "t": 10, "b": 10})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.caption(
                     "Cheap PCA projection; the pipeline's saved UMAP animation is under All plots."
                 )
@@ -614,7 +614,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                         xaxis_title="minutes",
                         yaxis_title="%",
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
         # --- Stage timeline ----------------------------------------------------
         with tabs[5]:
@@ -647,7 +647,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                     margin={"l": 10, "r": 10, "t": 20, "b": 10},
                     barmode="overlay",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         # --- Inference candidates ---------------------------------------------
         with tabs[6]:
@@ -661,7 +661,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 if not cands.empty:
                     fig = px.histogram(cands, x="confidence", nbins=40)
                     fig.update_layout(height=240, margin={"l": 10, "r": 10, "t": 10, "b": 10})
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                     for dim in ("target", "band"):
                         if cands[dim].notna().any():
                             counts = cands[dim].value_counts().reset_index()
@@ -672,10 +672,10 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                             fig.update_layout(
                                 height=240, margin={"l": 10, "r": 10, "t": 40, "b": 10}
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width="stretch")
             if not cadences.empty:
                 st.subheader("Per-cadence manifest")
-                st.dataframe(cadences, use_container_width=True)
+                st.dataframe(cadences, width="stretch")
 
         # --- All plots (PNG gallery) ------------------------------------------
         with tabs[7]:
@@ -687,7 +687,7 @@ def render(args: argparse.Namespace) -> None:  # pragma: no cover - requires Str
                 cols = st.columns(2)
                 for i, art in enumerate(pngs):
                     with cols[i % 2]:
-                        st.image(art["path"], caption=art["rel"], use_container_width=True)
+                        st.image(art["path"], caption=art["rel"], width="stretch")
 
     finally:
         conn.close()

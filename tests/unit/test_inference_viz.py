@@ -746,10 +746,11 @@ class TestSuiteEntryPoint:
 
 
 class TestCandidateFrequencyMap:
-    """#394: candidate frequency map — a dot plot of candidates along frequency (jittered y,
-    no y encoding), colored by TARGET with legend labels (band stays out of the legend —
-    x-position implies it), report-excluded ranges shaded; skips gracefully with no
-    candidates."""
+    """#394/#423: candidate frequency map — a true dot-histogram (frequencies binned along
+    x, each bin's candidates stacked bottom-up so column height = candidates-per-bin, log-y
+    past the catalog-scale threshold), colored by TARGET with legend labels (band stays out
+    of the legend — x-position implies it), report-excluded ranges shaded; skips gracefully
+    with no candidates."""
 
     def _write_candidates(self, db, npy_path, specs):
         for idx, (target, band, freq) in enumerate(specs):
@@ -818,6 +819,98 @@ class TestCandidateFrequencyMap:
         assert any("more targets" in label for label in captured["labels"])
         # Band must not be a legend dimension: no bare band-letter labels
         assert not any(label.split(" ")[0] in {"L", "S", "C", "X"} for label in captured["labels"])
+
+    def test_stacks_count_per_bin(self, initialized_runtime, collector, monkeypatch):
+        # The #423 contract: coincident frequencies stack 1..k bottom-up (column height =
+        # per-bin count), stacks assemble in legend order (heaviest target's dots at the
+        # bottom), lone frequencies sit at y=1, and the axis stays linear below the
+        # log-scale threshold.
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        record = collector.records[0]
+        self._write_candidates(
+            db,
+            record.npy_path,
+            [
+                ("T1", "L", 1620.0),
+                ("T1", "L", 1620.0),
+                ("T2", "L", 1620.0),
+                ("T2", "C", 8438.0),
+            ],
+        )
+        real_save = viz._save_and_upload
+        captured = {}
+
+        def _capturing_save(fig, filename, label):
+            ax = fig.axes[0]
+            captured["yscale"] = ax.get_yscale()
+            captured["offsets"] = {
+                artist.get_label(): artist.get_offsets().tolist() for artist in ax.collections
+            }
+            return real_save(fig, filename, label)
+
+        monkeypatch.setattr(viz, "_save_and_upload", _capturing_save)
+        _assert_figure(viz.plot_candidate_frequency())
+
+        assert captured["yscale"] == "linear"
+        ys_by_label = {
+            label: sorted(y for _, y in offsets) for label, offsets in captured["offsets"].items()
+        }
+        # T1 (heaviest, legend rank 0) fills the shared bin's bottom: y = 1, 2
+        assert ys_by_label["T1 (2)"] == [1.0, 2.0]
+        # T2's coincident dot stacks on top (y = 3); its lone 8438 MHz dot sits at y = 1
+        assert ys_by_label["T2 (2)"] == [1.0, 3.0]
+
+    def test_log_scale_engages_past_threshold(self, initialized_runtime, collector, monkeypatch):
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        record = collector.records[0]
+        monkeypatch.setattr(viz, "_CANDIDATE_FREQ_LOG_Y_THRESHOLD", 3)
+        self._write_candidates(
+            db,
+            record.npy_path,
+            [("T1", "L", 1620.0 + i * 0.001) for i in range(5)],
+        )
+        real_save = viz._save_and_upload
+        captured = {}
+
+        def _capturing_save(fig, filename, label):
+            captured["yscale"] = fig.axes[0].get_yscale()
+            return real_save(fig, filename, label)
+
+        monkeypatch.setattr(viz, "_save_and_upload", _capturing_save)
+        _assert_figure(viz.plot_candidate_frequency())
+        assert captured["yscale"] == "log"
+
+    def test_log_scale_engages_on_deep_single_bin(
+        self, initialized_runtime, collector, monkeypatch
+    ):
+        # The depth backstop: a total count UNDER the threshold whose candidates pile into
+        # one bin (the #394 coincidence signature) must still flip to log — a linear axis
+        # would render that column as a solid bar and every other stack sub-pixel.
+        import aetherscan.inference_viz as viz  # noqa: PLC0415
+
+        db = initialized_runtime
+        record = collector.records[0]
+        monkeypatch.setattr(viz, "_CANDIDATE_FREQ_LOG_Y_MAX_STACK", 4)
+        assert viz._CANDIDATE_FREQ_LOG_Y_THRESHOLD > 6  # the count trigger must NOT fire
+        self._write_candidates(
+            db,
+            record.npy_path,
+            [("T1", "L", 1620.0)] * 6,  # one bin, six deep
+        )
+        real_save = viz._save_and_upload
+        captured = {}
+
+        def _capturing_save(fig, filename, label):
+            captured["yscale"] = fig.axes[0].get_yscale()
+            return real_save(fig, filename, label)
+
+        monkeypatch.setattr(viz, "_save_and_upload", _capturing_save)
+        _assert_figure(viz.plot_candidate_frequency())
+        assert captured["yscale"] == "log"
 
     def test_skips_without_candidates(self, initialized_runtime):
         from aetherscan.inference_viz import plot_candidate_frequency  # noqa: PLC0415

@@ -149,7 +149,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0'
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           # The diffs come from `gh pr diff` (GitHub API).
           # We also run utils/print_cli_help.py (contract (a) below) off the checked-out tree,
@@ -165,7 +165,7 @@ jobs:
       # local run regardless of whatever default python the runner image happens to ship.
       - name: Set up Python
         if: steps.guard.outputs.already_filed != 'true' && steps.window.outputs.count != '0'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
