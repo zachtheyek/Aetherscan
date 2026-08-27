@@ -56,7 +56,7 @@ Aetherscan supports two install paths off the same source tree — the **NGC con
 > There are no plans to support non-Nvidia GPUs
 
 > [!NOTE]
-> The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`; the inference RAM peak is refreshed from the #406 depth-4 grid run on the same subset) — via the always-on resource instrumentation (`system_resources` DB rows). The v1.2.0 weights' own training run (tag `train_20260806_063117`, same 6× A4000 host at the 50-round default) re-measured inside the same envelope — peak ~262 GB system RAM / ~4.8 GB per-GPU VRAM — so the stated figures carry forward unchanged. They characterize full-scale runs; small runs need substantially less.
+> The figures above are measured from the v1.0.0 release runs — training on 6× RTX A4000 (16 GB) + 503 GB RAM (tag `train_20260729_152426`) and inference on 5× RTX PRO 6000 (96 GB) + 503 GB RAM over a 350-cadence `/datag` catalog subset (tag `inf_20260731_182011`; the inference RAM peak is refreshed from the #406 depth-4 grid run on the same subset) — via the always-on resource instrumentation (`system_resources` DB rows). The v1.2.0 weights' own training run (tag `train_20260806_063117`, same 6× A4000 host at the 50-round default) re-measured a hair above the recorded training peak (~262 GB vs ~260 GB system RAM) and well inside the ≥288 GB floor, with per-GPU VRAM (~4.8 GB) below the documented ~6 GB — so the stated requirements carry forward unchanged. They characterize full-scale runs; small runs need substantially less.
 
 ### Install From PyPI (pip)
 
