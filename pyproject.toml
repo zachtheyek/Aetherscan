@@ -77,7 +77,8 @@ keywords = [
 classifiers = [
     # Revisit in every release PR per docs/RELEASE.md. v1.0.0 ships blessed release weights +
     # a stable CLI/config contract, so: Production/Stable. Re-affirmed for v1.1.0 (same
-    # weights re-blessed, contract intact).
+    # weights re-blessed, contract intact). Re-affirmed for v1.2.0 (same shape: same weights
+    # re-blessed, contract intact).
     "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
