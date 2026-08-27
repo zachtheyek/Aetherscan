@@ -107,9 +107,10 @@ cd Aetherscan
 To pre-pull explicitly (optional):
 
 ```bash
-# Apptainer (Ampere) or SingularityCE (Blackwell) — either converts the OCI image to a native .sif
-apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.1.0
-singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:v1.1.0
+# Apptainer (Ampere) or SingularityCE (Blackwell) — either converts the OCI image to a native .sif;
+# substitute your checkout's release version (the `version` in pyproject.toml) for vX.Y.Z
+apptainer   pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:vX.Y.Z
+singularity pull aetherscan-ngc25.02.sif docker://ghcr.io/zachtheyek/aetherscan:vX.Y.Z
 ```
 
 A **manual** pull (or build) writes no `<sif>.pulled-tag` sidecar, so the wrapper treats the result like a local build: it is never verified or deleted by default — the wrapper warns that it cannot vouch for the image and keeps it across version bumps (set `AETHERSCAN_FORCE_REPULL=1` to replace it with a fresh pull of the published image — the existing image is kept if that pull fails — or `rm` the `.sif` yourself when you bump versions). Let `run_container.sh` do the pulling if you want provenance tracked for you: the sidecar records the pinned ref (`repo:tag`, so both a version bump and an `AETHERSCAN_IMAGE` change trigger a re-pull) plus the image's manifest digest, which is re-checked against the registry on every run — if the remote digest has moved (a retag), the wrapper warns and re-pulls over it automatically (atomic publish; the cached image survives a failed pull) ([#424](https://github.com/zachtheyek/Aetherscan/issues/424)).
