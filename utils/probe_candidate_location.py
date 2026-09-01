@@ -491,10 +491,9 @@ def _proposal_scan_bounds(
     stamp_width)``; the union over ``o ∈ {-overlap, 0, +overlap}`` puts every candidate hit in
     ``(L + half - stamp_width - overlap, L + half + overlap]`` (exclusive low, inclusive high;
     the low edge matches the extraction width, one bin wider than ``L - half`` at odd widths).
-    A hit in the
-    envelope is NECESSARY but not sufficient — the per-offset mask in _max_k2_for_proposal
-    additionally applies production's in-bounds placement test. These bounds are what the CSV
-    reports as ed_proposal_scan_{lo_exclusive,hi_inclusive}.
+    A hit in the envelope is NECESSARY but not sufficient — the per-offset mask in
+    _max_k2_for_proposal additionally applies production's in-bounds placement test. These
+    bounds are what the CSV reports as ed_proposal_scan_{lo_exclusive,hi_inclusive}.
     """
     half = stamp_width // 2
     return (
@@ -623,9 +622,16 @@ def _prepare_location(
     scan_lo, scan_hi = _proposal_scan_bounds(
         absolute_bin, config.inference.stamp_width, overlap_bins
     )
+    # The channel list serves BOTH scans (the proposal mask over (scan_lo, scan_hi] and the
+    # in-stamp max over [stamp_start, stamp_end)), so its range is the union of the two —
+    # structural rather than leaning on overlap_bins >= 1 to keep the stamp inside the
+    # envelope; at every default-config run it is the identical list.
     scan_channels = [
         channel
-        for channel in range(max(scan_lo + 1, 0) // coarse_width, scan_hi // coarse_width + 1)
+        for channel in range(
+            max(min(scan_lo + 1, stamp_start), 0) // coarse_width,
+            max(scan_hi, stamp_end - 1) // coarse_width + 1,
+        )
         if 0 <= channel < complete_coarse_channels
     ]
     on_max_k2 = []

@@ -317,10 +317,11 @@ class TestProposalScan:
         assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 100, [0], 10_000))
 
     def test_isfinite_mask_selects_only_finite_windows(self):
-        # Both windows covering and in bounds; only one finite — the mask must pick it
-        # rather than letting np.max propagate the nan.
-        k2 = np.array([np.nan, 5.0], dtype=np.float64)
-        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 100, [0], 10_000) == 5.0
+        # Window starts 100 and 200 are BOTH covering ((50, 250] for L=150, width 200) and
+        # in bounds (>= half = 100); one is nan — the mask must pick the finite 5.0 rather
+        # than letting np.max propagate the nan.
+        k2 = np.array([0.0, np.nan, 5.0], dtype=np.float64)
+        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, 150, 200, [0], 10_000) == 5.0
 
     def test_envelope_low_edge_matches_extraction_width(self):
         # Odd width: the envelope's exclusive low bound must admit the lowest hit whose
