@@ -56,6 +56,9 @@ class ProbeResult:
     ed_max_k2: float
     ed_would_propose: bool
     normalized_stamp: Any
+    proposal_max_k2: float = float("nan")
+    proposal_scan_lo_exclusive: int = -1
+    proposal_scan_hi_inclusive: int = -1
     status: str = "ok"
     error: str = ""
     raw_rf_probability: float = float("nan")
@@ -576,8 +579,9 @@ def _prepare_location(
     )
     # The PROPOSAL question scans every hit position whose production stamp — center or
     # ±overlap offset when overlap_search is on — would cover the requested location:
-    # "no" is sound (any covering center must sit in this interval and beat the threshold);
-    # "yes" remains an upper bound only w.r.t. dedup absorption, which is not replayed.
+    # "no" is sound given the same bandpass method (any covering center must sit in this
+    # interval and beat the threshold); "yes" remains an upper bound w.r.t. dedup absorption
+    # and, on clamped edge rows, out-of-bounds placements production drops — neither replayed.
     # ed_max_k2 (the displayed number) stays the IN-STAMP max — that is what the waterfall
     # panel shows.
     overlap_bins = (
@@ -660,6 +664,9 @@ def _prepare_location(
         on_max_k2=on_max_k2,
         ed_max_k2=ed_max_k2,
         ed_would_propose=ed_would_propose,
+        proposal_max_k2=proposal_max_k2,
+        proposal_scan_lo_exclusive=scan_lo,
+        proposal_scan_hi_inclusive=scan_hi,
         normalized_stamp=normalized_stamp,
     )
 
@@ -940,6 +947,8 @@ def _format_number(value: float) -> str:
 
 
 def _print_table(results: list[ProbeResult], config: Any) -> None:
+    if not results:
+        return
     rows = []
     for result in results:
         if result.status != "ok":
@@ -1063,6 +1072,9 @@ def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
         "on2_max_k2": result.on_max_k2[1],
         "on3_max_k2": result.on_max_k2[2],
         "ed_max_k2": result.ed_max_k2,
+        "ed_proposal_max_k2": result.proposal_max_k2,
+        "ed_proposal_scan_lo_exclusive": result.proposal_scan_lo_exclusive,
+        "ed_proposal_scan_hi_inclusive": result.proposal_scan_hi_inclusive,
         "stat_threshold": config.inference.stat_threshold,
         "ed_would_propose": result.ed_would_propose,
         "bandpass_method_used": context.bandpass_method,
@@ -1180,8 +1192,9 @@ def _run(args: argparse.Namespace) -> None:
     print(
         "ED column semantics: 'max k^2' is the in-stamp maximum (what the waterfall shows); "
         "'ED proposes' scans every hit position whose production stamp — center or ±overlap "
-        "offset — would cover the location, so a NO is sound; a YES is an upper bound only "
-        "w.r.t. dedup absorption, which is not replayed"
+        "offset — would cover the location, so a NO is sound (given the same bandpass method "
+        "as the run); a YES is an upper bound w.r.t. dedup absorption (and, on clamped edge "
+        "rows, out-of-bounds placements production drops), neither replayed"
     )
     print(
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="

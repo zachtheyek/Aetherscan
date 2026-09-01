@@ -190,6 +190,10 @@ class TestCsvRowContract:
         for key in ("stamp_clamped", "ed_would_propose", "screen_pass", "mc_pass"):
             assert row[key] == ""
         assert row["mc_scoring_mode"] == ""
+        # The proposal diagnostics ride along as honest sentinels, not blanks.
+        assert math.isnan(row["ed_proposal_max_k2"])
+        assert row["ed_proposal_scan_lo_exclusive"] == -1
+        assert row["ed_proposal_scan_hi_inclusive"] == -1
 
     def test_partial_row_keeps_computed_ed_fields(self):
         result = probe.ProbeResult(
@@ -235,12 +239,19 @@ class TestCsvRowContract:
             normalized_stamp=None,
             screen_pass=True,
             mc_pass=False,
+            proposal_max_k2=3100.0,
+            proposal_scan_lo_exclusive=1234 - 2048 - 2048,
+            proposal_scan_hi_inclusive=1234 + 2048 + 2048,
         )
         row = probe._csv_row(result, self._context())
         assert row["ed_would_propose"] is True
         assert row["screen_pass"] is True
         assert row["mc_pass"] is False
         assert row["mc_scoring_mode"] == "production pass-2"
+        # The verdict's driving number and its scan interval are in the artifact itself.
+        assert row["ed_proposal_max_k2"] == 3100.0
+        assert row["ed_proposal_scan_lo_exclusive"] == 1234 - 2048 - 2048
+        assert row["ed_proposal_scan_hi_inclusive"] == 1234 + 2048 + 2048
 
     @staticmethod
     def _context():
