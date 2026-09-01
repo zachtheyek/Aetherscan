@@ -74,6 +74,8 @@ tests/
 │   ├── test_display_tag.py          # display_tag derivation: {command}_{machine}_{datetime} from the DB tag, pure/TF-free
 │   ├── test_perband_report.py       # per-band plot: umbrella-vs-child span isolation, catalog
 │   │                                #   join + count-guard skip, per-band stats, non-empty PNG
+│   ├── test_probe_candidate_location.py # cascade location probe: frequency->bin under both foff
+│   │                                #   signs, stamp clamping, ED window predicate, CSV row contract
 │   ├── test_candidate_figures.py    # TF-free candidate renderer: pool/serial parity, containment
 │   ├── test_candidate_triage.py     # report-time frequency exclusion + OOD scoring / review ordering
 │   ├── test_candidate_rfi_report.py # standalone RFI-triage report: coincidence, allocation flags, exclusion parity
