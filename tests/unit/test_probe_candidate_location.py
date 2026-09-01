@@ -197,3 +197,74 @@ class TestCsvRowContract:
         assert row["error"] == "boom"
         assert row["requested_frequency_mhz"] == 7499.0
         assert math.isnan(row["mc_mean"])
+        # Sentinel rows (no bins computed) blank every boolean and the scoring mode —
+        # a default False must never be aggregatable as a real verdict.
+        for key in ("stamp_clamped", "ed_would_propose", "screen_pass", "mc_pass"):
+            assert row[key] == ""
+        assert row["mc_scoring_mode"] == ""
+
+    def test_partial_row_keeps_computed_ed_fields(self):
+        result = probe.ProbeResult(
+            requested_frequency_mhz=1400.0,
+            resolved_frequency_mhz=1400.0,
+            frequency_offset_hz=0.0,
+            absolute_bin=1234,
+            coarse_channel=1,
+            bin_in_coarse=234,
+            stamp_start_bin=0,
+            stamp_end_bin=4096,
+            stamp_clamped=True,
+            on_max_k2=[3000.0, 2500.0, 2900.0],
+            ed_max_k2=3000.0,
+            ed_would_propose=True,
+            normalized_stamp=None,
+            status="error",
+            error="stamp failed the production validity filter",
+        )
+        row = probe._csv_row(result, self._context())
+        # Stamp-stage failures keep the diagnostics that DID run...
+        assert row["ed_would_propose"] is True
+        assert row["stamp_clamped"] is True
+        assert row["ed_max_k2"] == 3000.0
+        # ...and blank only the gates that never ran.
+        assert row["screen_pass"] == ""
+        assert row["mc_pass"] == ""
+
+    def test_ok_row_keeps_real_booleans(self):
+        result = probe.ProbeResult(
+            requested_frequency_mhz=1400.0,
+            resolved_frequency_mhz=1400.0,
+            frequency_offset_hz=0.0,
+            absolute_bin=1234,
+            coarse_channel=1,
+            bin_in_coarse=234,
+            stamp_start_bin=0,
+            stamp_end_bin=4096,
+            stamp_clamped=False,
+            on_max_k2=[3000.0, 2500.0, 2900.0],
+            ed_max_k2=3000.0,
+            ed_would_propose=True,
+            normalized_stamp=None,
+            screen_pass=True,
+            mc_pass=False,
+        )
+        row = probe._csv_row(result, self._context())
+        assert row["ed_would_propose"] is True
+        assert row["screen_pass"] is True
+        assert row["mc_pass"] is False
+        assert row["mc_scoring_mode"] == "production pass-2"
+
+    @staticmethod
+    def _context():
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                inference=SimpleNamespace(
+                    stat_threshold=2048.0,
+                    screening_threshold=0.5,
+                    classification_threshold=0.99,
+                    mc_draws=32,
+                ),
+                rf=SimpleNamespace(latent_variant="z_mean"),
+            ),
+            bandpass_method="pfb",
+        )

@@ -155,9 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Cadence-level MC SeedSequence sub-key. Each location is further sub-keyed by its "
-            "absolute frequency bin (the non-zero trailing key also means the default does NOT "
-            "alias catalog cadence 0's stream), so a location's draws are reproducible "
-            "regardless of batch composition"
+            "absolute frequency bin, so a location's draws are reproducible regardless of "
+            "batch composition (a non-zero bin also keeps the default off catalog cadence 0's "
+            "stream)"
         ),
     )
     parser.add_argument(
@@ -573,11 +573,19 @@ def _prepare_location(context: ProbeContext, frequency_mhz: float) -> ProbeResul
         math.isfinite(ed_max_k2) and ed_max_k2 > config.inference.stat_threshold
     )
 
-    raw_stamp = _extract_raw_stamp(context, stamp_start, stamp_end)
-    normalized_stamp = _normalize_stamp(raw_stamp, config)
-    if not np.isfinite(normalized_stamp).all():
-        raise ValueError("Normalized stamp contains non-finite values")
+    # Stamp extraction/normalization failures keep the bin + ED diagnostics already
+    # computed above — exactly the row shape the where-did-it-drop-out use case needs.
+    status, error, normalized_stamp = "ok", "", None
+    try:
+        raw_stamp = _extract_raw_stamp(context, stamp_start, stamp_end)
+        normalized_stamp = _normalize_stamp(raw_stamp, config)
+        if not np.isfinite(normalized_stamp).all():
+            raise ValueError("Normalized stamp contains non-finite values")
+    except Exception as exc:
+        status, error, normalized_stamp = "error", str(exc), None
     return ProbeResult(
+        status=status,
+        error=error,
         requested_frequency_mhz=frequency_mhz,
         resolved_frequency_mhz=resolved_frequency,
         frequency_offset_hz=offset_hz,
@@ -711,28 +719,33 @@ def _score_locations(
         derive_rng,
     )
 
-    cadence_batch = np.stack([result.normalized_stamp for result in results])
-    # NOTE: reuses inference.py:709-839 wholesale: the same bucketed batch geometry,
-    # cadence-start padding, strategy dispatch, and deterministic z_mean/z_log_var outputs.
-    z_mean, z_log_var = assets.encoder_runner._distributed_encode(cadence_batch)
-    expected_shape = (
-        len(results) * config.data.num_observations,
-        config.beta_vae.latent_dim,
-    )
-    if z_mean.shape != expected_shape or z_log_var.shape != expected_shape:
-        raise ValueError(
-            f"Encoder returned z_mean={z_mean.shape}, z_log_var={z_log_var.shape}; "
-            f"expected {expected_shape}"
-        )
-
     num_observations = config.data.num_observations
     latent_dim = config.beta_vae.latent_dim
     variant = config.rf.latent_variant
     active_dims = config.rf.active_dims
-    # NOTE: reuses inference.py:545-563 exactly: float32 obs-major flattening, saved latent
-    # variant features, raw forest probability, then the persisted calibrator when active.
-    mean_flat = prepare_latent_features(z_mean, num_observations, dtype=np.float32)
-    logvar_flat = prepare_latent_features(z_log_var, num_observations, dtype=np.float32)
+    expected_shape = (num_observations, latent_dim)
+
+    # NOTE: each location is encoded ALONE — always one bucket-16 step padded from the
+    # location itself (inference.py:709-839 owns the geometry either way), so encoder
+    # latents, and with them every downstream score, are independent of what else was
+    # probed in the same invocation. A production catalog run batches whole cadences
+    # instead; per-location encoding is this tool's reproducibility contract.
+    mean_rows, logvar_rows = [], []
+    for result in results:
+        z_mean, z_log_var = assets.encoder_runner._distributed_encode(
+            np.stack([result.normalized_stamp])
+        )
+        if z_mean.shape != expected_shape or z_log_var.shape != expected_shape:
+            raise ValueError(
+                f"Encoder returned z_mean={z_mean.shape}, z_log_var={z_log_var.shape}; "
+                f"expected {expected_shape}"
+            )
+        # NOTE: reuses inference.py:545-563 exactly: float32 obs-major flattening into one
+        # feature row per cadence.
+        mean_rows.append(prepare_latent_features(z_mean, num_observations, dtype=np.float32))
+        logvar_rows.append(prepare_latent_features(z_log_var, num_observations, dtype=np.float32))
+    mean_flat = np.concatenate(mean_rows, axis=0)
+    logvar_flat = np.concatenate(logvar_rows, axis=0)
     deterministic_features = build_variant_features(
         variant,
         mean_flat,
@@ -741,6 +754,8 @@ def _score_locations(
         latent_dim,
         active_dims,
     )
+    # predict_proba scores rows independently (inference.py's MC-helper docstring pins
+    # this), so batching the forest call is composition-safe.
     raw_probabilities = assets.rf_model.model.predict_proba(deterministic_features)[:, 1]
     screening_probabilities = apply_probability_calibrator(
         assets.calibrator,
@@ -866,13 +881,14 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
     rows = []
     for result in results:
         if result.status != "ok":
+            has_bins = result.absolute_bin >= 0
             rows.append(
                 [
                     f"{result.requested_frequency_mhz:.9f}",
-                    "ERROR",
-                    "-",
-                    "-",
-                    "-",
+                    str(result.absolute_bin) if has_bins else "ERROR",
+                    f"{result.coarse_channel}:{result.bin_in_coarse}" if has_bins else "-",
+                    _format_number(result.ed_max_k2),
+                    ("yes" if result.ed_would_propose else "no") if has_bins else "-",
                     "-",
                     "-",
                     "-",
@@ -925,10 +941,17 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
     print()
     for result in results:
         if result.status != "ok":
-            print(
-                f"VERDICT {result.requested_frequency_mhz:.9f} MHz: "
-                f"preprocessing failed — {result.error}"
-            )
+            if result.absolute_bin >= 0:
+                ed_part = "would" if result.ed_would_propose else "would not"
+                print(
+                    f"VERDICT {result.requested_frequency_mhz:.9f} MHz: ED {ed_part} propose "
+                    f"this location; stamp stage failed — {result.error}"
+                )
+            else:
+                print(
+                    f"VERDICT {result.requested_frequency_mhz:.9f} MHz: "
+                    f"preprocessing failed — {result.error}"
+                )
             continue
         if not result.ed_would_propose:
             prefix = "ED would not propose this location; forced scoring says: "
@@ -993,10 +1016,14 @@ def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
         "plot_path": result.plot_path,
     }
     if result.status != "ok":
-        # Booleans have no honest value for a never-scored row — blank beats a default False
-        # that an aggregation would count as a real verdict.
-        for key in ("stamp_clamped", "ed_would_propose", "screen_pass", "mc_pass"):
-            row[key] = ""
+        # Booleans have no honest value where the stage never ran — blank beats a default
+        # False an aggregation would count as a real verdict. Stamp-stage failures KEEP the
+        # bin/ED fields they actually computed (absolute_bin >= 0 marks that shape).
+        row["screen_pass"] = ""
+        row["mc_pass"] = ""
+        if result.absolute_bin < 0:
+            row["stamp_clamped"] = ""
+            row["ed_would_propose"] = ""
     return row
 
 
@@ -1090,11 +1117,10 @@ def _run(args: argparse.Namespace) -> None:
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="
         f"{config.inference.mc_draws}, MC SeedSequence root={config.reproducibility.seed}, "
         f"stream=STREAM_INFERENCE_MC, cadence_key={args.cadence_seed_key}, plus a per-location "
-        "sub-key of the absolute frequency bin (MC draws are batch-composition independent — a "
-        "documented delta from production's per-cadence draw blocks; encoder latents stay "
-        "bit-exact only within one padding bucket, so very large probe batches can shift "
-        "low-order bits); pass-1 rejects get a forced diagnostic MC pass production would "
-        "never run"
+        "sub-key of the absolute frequency bin; each location is also ENCODED alone, so the "
+        "whole cascade is batch-composition independent (a documented delta from production's "
+        "per-cadence batching and draw blocks); pass-1 rejects get a forced diagnostic MC pass "
+        "production would never run"
     )
     print()
     _print_table(results, config)

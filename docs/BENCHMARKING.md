@@ -217,6 +217,33 @@ they disagree — so a resumed run (fewer fresh preprocess spans than catalog ca
 non-default grouping degrades to no plot rather than a misleading one. The legacy `--test-files`
 path (no catalog CSV) is skipped for the same reason.
 
+## The cascade location probe (`utils/probe_candidate_location.py`)
+
+A standalone diagnostic (container/source path — it drives the real preprocessing helpers and
+the encoder, so it needs the TF stack; `--help` alone is stdlib-only) that answers the question
+catalog runs deliberately don't persist: **where does a specific (cadence, frequency) location
+land at every stage of the scoring cascade?** Given six ordered `--h5-files` (or a `--catalog`
+plus exact `--target`/`--band`[/`--session`/`--cadence-id`] group resolution) and one or more
+`--frequency-mhz` values — with the standard `--encoder-path`/`--rf-path`/`--config-path` trio —
+it reports, per location: the max k² statistic vs the ED threshold ("would energy detection
+propose this?", a window-start upper bound; dedup/overlap placement is not replayed), the
+production-preprocessed stamp, the pass-1 screening probability, the deterministic RF score, and
+the seeded MC mean ± std vs the science threshold, with per-location verdict lines, optional
+`--csv`, and optional `--plot-dir` six-panel waterfalls. Built for benchmark comparisons
+(scoring published turboSETI event locations; localizing the stage at which a non-recovered
+candidate from a prior search drops out) — see [#436](https://github.com/zachtheyek/Aetherscan/issues/436).
+
+Read-only by contract: no DB rows, manifests, or caches are touched (a missing/mismatched PFB
+response falls back to spline with a warning instead of being generated). **Documented deltas
+from a production catalog run** — the reason probe numbers can differ in the low digits from a
+recorded candidate's: each location is encoded *and* MC-scored alone (production batches whole
+cadences and draws one MC noise block per cadence, so scores there depend on batch composition;
+the probe's per-location seeding — root `--seed`, `--cadence-seed-key`, then the location's
+absolute frequency bin — is reproducible under any invocation); screen-rejected locations get a
+forced diagnostic MC pass production would never run; edge stamps clamp instead of being
+skipped; and `apply_saved_config` never layers the saved run's `reproducibility` section, so
+pass the run's `--seed` explicitly to mirror it.
+
 ## Standalone benchmarks (`benchmarks/`)
 
 Small standalone scripts that time individual pipeline kernels in isolation, so a change to
