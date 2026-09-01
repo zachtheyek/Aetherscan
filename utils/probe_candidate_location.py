@@ -501,13 +501,31 @@ def _max_k2_for_proposal(
     coarse_channel: int,
     coarse_width: int,
     step_size: int,
-    lo_exclusive: int,
-    hi_inclusive: int,
+    absolute_bin: int,
+    stamp_width: int,
+    offsets: list[int],
+    nchans: int,
 ) -> float:
+    """Max k² over hit positions with at least one IN-BOUNDS production placement covering L.
+
+    Production places a stamp per offset o at ``[h + o - half, h + o + half)`` and drops any
+    placement failing ``start >= 0 and end <= nchans`` (mirrors preprocessing's placement +
+    bounds test). A hit proposes the location iff SOME offset both covers L and stays in
+    bounds — modelling the bounds here removes the out-of-bounds term from the YES caveat at
+    every config, and can only strengthen the NO.
+    """
     import numpy as np  # noqa: PLC0415
 
+    half = stamp_width // 2
     window_starts = coarse_channel * coarse_width + np.arange(len(k2)) * step_size
-    covering = (window_starts > lo_exclusive) & (window_starts <= hi_inclusive) & np.isfinite(k2)
+    covering = np.zeros(len(k2), dtype=bool)
+    for offset in offsets:
+        covers = (window_starts > absolute_bin - half - offset) & (
+            window_starts <= absolute_bin + half - offset
+        )
+        in_bounds = (window_starts >= half - offset) & (window_starts <= nchans - half - offset)
+        covering |= covers & in_bounds
+    covering &= np.isfinite(k2)
     if not np.any(covering):
         return float("nan")
     return float(np.max(k2[covering]))
@@ -579,9 +597,9 @@ def _prepare_location(
     )
     # The PROPOSAL question scans every hit position whose production stamp — center or
     # ±overlap offset when overlap_search is on — would cover the requested location:
-    # "no" is sound given the same bandpass method (any covering center must sit in this
-    # interval and beat the threshold); "yes" remains an upper bound w.r.t. dedup absorption
-    # and, on clamped edge rows, out-of-bounds placements production drops — neither replayed.
+    # "no" is sound given the same bandpass method (any covering, in-bounds center must beat
+    # the threshold — the mask models production's placement bounds test); "yes" remains an
+    # upper bound w.r.t. dedup absorption alone, which is not replayed.
     # ed_max_k2 (the displayed number) stays the IN-STAMP max — that is what the waterfall
     # panel shows.
     overlap_bins = (
@@ -589,6 +607,9 @@ def _prepare_location(
         if config.inference.overlap_search
         else 0
     )
+    placement_offsets = [-overlap_bins, 0, overlap_bins] if overlap_bins else [0]
+    # The envelope interval is what the CSV reports; the per-offset mask above is finer
+    # (it also applies production's in-bounds placement test).
     scan_lo, scan_hi = _proposal_scan_bounds(
         absolute_bin, config.inference.stamp_width, overlap_bins
     )
@@ -619,8 +640,10 @@ def _prepare_location(
                     channel,
                     coarse_width,
                     config.inference.detection_step_size,
-                    scan_lo,
-                    scan_hi,
+                    absolute_bin,
+                    config.inference.stamp_width,
+                    placement_offsets,
+                    context.axis.nchans,
                 )
             )
         finite = [value for value in stamp_maxima if math.isfinite(value)]
@@ -1108,6 +1131,8 @@ def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
 
 
 def _write_csv(path: str, results: list[ProbeResult], context: ProbeContext) -> None:
+    if not results:
+        return
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     rows = [_csv_row(result, context) for result in results]
@@ -1192,9 +1217,9 @@ def _run(args: argparse.Namespace) -> None:
     print(
         "ED column semantics: 'max k^2' is the in-stamp maximum (what the waterfall shows); "
         "'ED proposes' scans every hit position whose production stamp — center or ±overlap "
-        "offset — would cover the location, so a NO is sound (given the same bandpass method "
-        "as the run); a YES is an upper bound w.r.t. dedup absorption (and, on clamped edge "
-        "rows, out-of-bounds placements production drops), neither replayed"
+        "offset, in bounds — would cover the location, so a NO is sound (given the same "
+        "bandpass method as the run); a YES is an upper bound w.r.t. dedup absorption alone, "
+        "which is not replayed"
     )
     print(
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="

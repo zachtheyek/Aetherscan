@@ -226,10 +226,10 @@ land at every stage of the scoring cascade?** Given six ordered `--h5-files` (or
 plus exact `--target`/`--band`[/`--session`/`--cadence-id`] group resolution) and one or more
 `--frequency-mhz` values — with the standard `--encoder-path`/`--rf-path`/`--config-path` trio —
 it reports, per location: the in-stamp max k² statistic plus a proposal verdict ("would energy
-detection propose this?") scanned over every hit position whose production stamp — center or
-±overlap offset — would cover the location, so a *no* is sound (given the run's bandpass method) while a
-*yes* is an upper bound w.r.t. dedup absorption and edge-clamped out-of-bounds placements
-(neither replayed), the
+detection propose this?") scanned over every hit position with at least one in-bounds
+production placement — center or ±overlap offset — covering the location, so a *no* is sound
+(given the run's bandpass method) while a *yes* is an upper bound w.r.t. dedup absorption
+alone (not replayed), the
 production-preprocessed stamp, the pass-1 screening probability, the deterministic RF score, and
 the seeded MC mean ± std vs the science threshold, with per-location verdict lines, optional
 `--csv`, and optional `--plot-dir` six-panel waterfalls. Built for benchmark comparisons

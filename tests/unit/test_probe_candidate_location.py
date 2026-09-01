@@ -2,9 +2,11 @@
 
 Covers the pure, TF-free helpers where index arithmetic could silently drift from
 production: frequency->bin resolution under both foff signs, stamp-bound clamping,
-the ED window-start-in-stamp predicate (which must match preprocessing's hit
-indexing), catalog-key normalization, CLI validation, and the CSV row contract.
-Stdlib + numpy only — every heavy import in the tool is deferred past parsing."""
+the in-stamp window predicate, the proposal scan (half-openness, overlap offsets,
+and production's in-bounds placement test), catalog-key normalization, CLI
+validation, the CSV row contract (ok / partial / sentinel shapes incl. the
+proposal diagnostics), and the rendered table/VERDICT output. Stdlib + numpy only
+— every heavy import in the tool is deferred past parsing."""
 
 from __future__ import annotations
 
@@ -212,12 +214,18 @@ class TestCsvRowContract:
             normalized_stamp=None,
             status="error",
             error="stamp failed the production validity filter",
+            proposal_max_k2=3050.0,
+            proposal_scan_lo_exclusive=1234 - 2048 - 2048,
+            proposal_scan_hi_inclusive=1234 + 2048 + 2048,
         )
         row = probe._csv_row(result, self._context())
         # Stamp-stage failures keep the diagnostics that DID run...
         assert row["ed_would_propose"] is True
         assert row["stamp_clamped"] is True
         assert row["ed_max_k2"] == 3000.0
+        assert row["ed_proposal_max_k2"] == 3050.0
+        assert row["ed_proposal_scan_lo_exclusive"] == 1234 - 2048 - 2048
+        assert row["ed_proposal_scan_hi_inclusive"] == 1234 + 2048 + 2048
         # ...and blank only the gates that never ran.
         assert row["screen_pass"] == ""
         assert row["mc_pass"] == ""
@@ -279,16 +287,33 @@ class TestProposalScan:
         assert (lo, hi) == (10_000 - 2048, 10_000 + 2048)
 
     def test_half_openness_matches_production_coverage(self):
-        # Window starts 0, 100, 200; interval (100, 200]: the low edge is excluded,
-        # the high edge included — production's half-open stamp coverage direction.
-        k2 = np.array([9.0, 5.0, 7.0], dtype=np.float64)
-        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 200) == 7.0
-        # Interval (-1, 100] picks up the first two windows only.
-        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, -1, 100) == 9.0
+        # nchans huge so bounds don't bite; no overlap. Coverage for L is (L-half, L+half]:
+        # a hit exactly at L-half yields stamp [L-2*half, L), which does NOT cover L.
+        k2 = np.array([9.0, 5.0, 7.0], dtype=np.float64)  # window starts 0, 100, 200
+        half = 50
+        value = probe._max_k2_for_proposal(k2, 0, 1000, 100, 150, 2 * half, [0], 10_000)
+        # (100, 200] -> windows 200 only? no: starts 100 excluded? start 100 == L-half -> excluded;
+        # start 200 == L+half -> included.
+        assert value == 7.0
+
+    def test_out_of_bounds_placement_is_dropped(self):
+        # Reviewer counterexample (M=0): L=2500, half=2048, hit at window start 1000.
+        # Its only placement [ -1048, 3048 ) covers L but starts < 0 -> production drops it,
+        # so the probe must NOT count it.
+        k2 = np.array([np.inf if s == 1000 else np.nan for s in range(0, 3100, 100)])
+        k2 = np.where(np.isinf(k2), 9999.0, k2)
+        value = probe._max_k2_for_proposal(k2, 0, 1_000_000, 100, 2500, 4096, [0], 1_000_000)
+        assert math.isnan(value)
+        # The same hit WITH overlap offsets gains an in-bounds covering placement
+        # (o=+2048 -> start = 1000 + 2048 - 2048 = 1000 >= 0, covers 2500) and counts.
+        value = probe._max_k2_for_proposal(
+            k2, 0, 1_000_000, 100, 2500, 4096, [-2048, 0, 2048], 1_000_000
+        )
+        assert value == 9999.0
 
     def test_no_finite_windows_returns_nan(self):
         k2 = np.array([np.nan], dtype=np.float64)
-        assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, -1, 2000))
+        assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, 500, 100, [0], 10_000))
 
 
 class TestPrintTable:
