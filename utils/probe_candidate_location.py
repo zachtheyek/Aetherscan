@@ -3,6 +3,16 @@
 
 Heavy scientific imports happen only after argument parsing, so ``--help`` works in a
 stdlib-only environment. The probe is read-only except for explicitly requested plots and CSV.
+
+Example (container path, explicit artifacts — the cluster-standard trio):
+
+    ./utils/run_container.sh python utils/probe_candidate_location.py \\
+        --catalog /path/to/catalog.csv --target NGC1172 --band C \\
+        --frequency-mhz 4026.4159 7499.0 \\
+        --encoder-path /path/to/vae_encoder_<tag>.keras \\
+        --rf-path /path/to/random_forest_<tag>.joblib \\
+        --config-path /path/to/config_<tag>.json \\
+        --csv probe_results.csv --plot-dir probe_plots
 """
 
 from __future__ import annotations
@@ -17,8 +27,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-PROBE_CADENCE_SEED_KEY = 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,8 @@ class ProbeResult:
     ed_max_k2: float
     ed_would_propose: bool
     normalized_stamp: Any
+    status: str = "ok"
+    error: str = ""
     raw_rf_probability: float = float("nan")
     screening_probability: float = float("nan")
     screen_pass: bool = False
@@ -130,6 +140,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Override the saved inference Monte Carlo draw count",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help=(
+            "Root seed for the MC draws. apply_saved_config deliberately does NOT layer the "
+            "saved run's reproducibility section (#303 allowlist), so without this flag the "
+            "probe uses the process-default seed — pass the run's --seed to mirror it"
+        ),
+    )
+    parser.add_argument(
+        "--cadence-seed-key",
+        type=int,
+        default=0,
+        help=(
+            "Cadence-level MC SeedSequence sub-key. NOTE: SeedSequence treats a trailing 0 as "
+            "identity (inference.py's MC seeding notes), so the default aliases catalog cadence "
+            "0's stream; ad-hoc probes additionally sub-key each location by its absolute "
+            "frequency bin, so probe results are reproducible regardless of batch composition"
+        ),
+    )
+    parser.add_argument(
+        "--traceback",
+        action="store_true",
+        help="Print full tracebacks instead of one-line ERROR summaries",
+    )
     return parser
 
 
@@ -142,6 +177,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--target/--band/--session/--cadence-id are only valid with --catalog")
     if args.mc_draws is not None and args.mc_draws < 1:
         parser.error(f"--mc-draws must be a positive integer, got {args.mc_draws}")
+    if args.seed is not None and args.seed < 0:
+        parser.error(f"--seed must be >= 0, got {args.seed}")
+    if args.cadence_seed_key < 0:
+        parser.error(f"--cadence-seed-key must be >= 0, got {args.cadence_seed_key}")
     non_finite = [value for value in args.frequency_mhz if not math.isfinite(value)]
     if non_finite:
         parser.error(f"--frequency-mhz values must be finite, got {non_finite}")
@@ -161,11 +200,10 @@ def _load_config(args: argparse.Namespace) -> Any:
     config = init_config()
     # NOTE: reuses cli.py:1147-1214, including the #303 result-field allowlist layering.
     apply_saved_config(args.config_path)
-    config.inference.encoder_path = args.encoder_path
-    config.inference.rf_path = args.rf_path
-    config.inference.config_path = args.config_path
     if args.mc_draws is not None:
         config.inference.mc_draws = args.mc_draws
+    if args.seed is not None:
+        config.reproducibility.seed = args.seed
 
     if config.data.num_observations != 6 or config.data.time_bins != 16:
         raise ValueError(
@@ -199,7 +237,7 @@ def _load_config(args: argparse.Namespace) -> Any:
 def _catalog_key_map(group: Any, group_by_cols: list[str]) -> dict[str, str]:
     return {
         str(column).strip().lower(): str(value)
-        for column, value in zip(group_by_cols, group.key, strict=False)
+        for column, value in zip(group_by_cols, group.key, strict=True)
     }
 
 
@@ -503,19 +541,32 @@ def _prepare_location(context: ProbeContext, frequency_mhz: float) -> ProbeResul
         config.inference.stamp_width,
         context.axis.nchans,
     )
+    # Scan every complete coarse channel the stamp window overlaps, not just the target
+    # frequency's own channel — a stamp within stamp_width // 2 of a channel boundary can
+    # carry ED-visible power from the neighbor. Dedup/overlap placement is still not
+    # replayed (documented simplification: this verdict is an upper bound on proposal).
+    overlapped_channels = [
+        channel
+        for channel in range(stamp_start // coarse_width, (stamp_end - 1) // coarse_width + 1)
+        if channel < complete_coarse_channels
+    ]
     on_max_k2 = []
     for observation in (0, 2, 4):
-        k2 = _energy_k2(context, context.h5_paths[observation], coarse_channel)
-        on_max_k2.append(
-            _max_k2_in_stamp(
-                k2,
-                coarse_channel,
-                coarse_width,
-                config.inference.detection_step_size,
-                stamp_start,
-                stamp_end,
+        channel_maxima = []
+        for channel in overlapped_channels:
+            k2 = _energy_k2(context, context.h5_paths[observation], channel)
+            channel_maxima.append(
+                _max_k2_in_stamp(
+                    k2,
+                    channel,
+                    coarse_width,
+                    config.inference.detection_step_size,
+                    stamp_start,
+                    stamp_end,
+                )
             )
-        )
+        finite = [value for value in channel_maxima if math.isfinite(value)]
+        on_max_k2.append(max(finite, default=float("nan")))
     finite_maxima = [value for value in on_max_k2 if math.isfinite(value)]
     ed_max_k2 = max(finite_maxima, default=float("nan"))
     ed_would_propose = bool(
@@ -644,7 +695,9 @@ def _load_scoring_assets(args: argparse.Namespace, config: Any) -> ScoringAssets
     )
 
 
-def _score_locations(results: list[ProbeResult], assets: ScoringAssets, config: Any) -> None:
+def _score_locations(
+    results: list[ProbeResult], assets: ScoringAssets, config: Any, cadence_seed_key: int
+) -> None:
     import numpy as np  # noqa: PLC0415
 
     from aetherscan.inference import _batched_mc_scores  # noqa: PLC0415
@@ -698,35 +751,35 @@ def _score_locations(results: list[ProbeResult], assets: ScoringAssets, config: 
     mc_means = np.full(len(results), np.nan, dtype=np.float32)
     mc_stds = np.full(len(results), np.nan, dtype=np.float32)
 
-    def score_indices(indices: Any) -> None:
-        if not len(indices):
-            return
-        # There is no catalog-run cadence index for an ad-hoc probe. Use the production
-        # SeedSequence layout with a fixed documented cadence key and the runtime root seed.
+    # NOTE: deliberate delta from production MC seeding, twice over. (1) There is no
+    # catalog cadence index for an ad-hoc probe, so the cadence-level sub-key comes from
+    # --cadence-seed-key. (2) Production draws one noise block per cadence submatrix, so a
+    # snippet's epsilons depend on its position in the batch; a diagnostic tool must not
+    # change its answer for a location because a second location was probed alongside it,
+    # so each location is scored ALONE with an extra sub-key of its absolute frequency bin
+    # — reproducible under any batch composition. Screen rejects get the same forced
+    # diagnostic pass; production stops before MC for them.
+    for index, result in enumerate(results):
         mc_rng = derive_rng(
             config.reproducibility.seed,
             STREAM_INFERENCE_MC,
-            PROBE_CADENCE_SEED_KEY,
+            cadence_seed_key,
+            result.absolute_bin,
         )
         draw_scores = _batched_mc_scores(
             assets.rf_model,
             assets.calibrator,
             variant,
-            mean_flat[indices],
-            logvar_flat[indices],
+            mean_flat[index : index + 1],
+            logvar_flat[index : index + 1],
             num_observations,
             latent_dim,
             active_dims,
             config.inference.mc_draws,
             mc_rng,
         )
-        mc_means[indices] = draw_scores.mean(axis=0)
-        mc_stds[indices] = draw_scores.std(axis=0)
-
-    # Survivors are scored together exactly as inference.py:572-600. Rejects get a separate
-    # forced diagnostic pass from the same documented seed; production never MC-scores them.
-    score_indices(np.nonzero(survivors)[0])
-    score_indices(np.nonzero(~survivors)[0])
+        mc_means[index] = draw_scores.mean(axis=0)[0]
+        mc_stds[index] = draw_scores.std(axis=0)[0]
 
     for index, result in enumerate(results):
         result.raw_rf_probability = float(raw_probabilities[index])
@@ -753,10 +806,13 @@ def _write_plot(
     # Six small multiples use one scale and one sequential map. The target is the only accent.
     fig, panels = plt.subplots(6, 1, figsize=(10, 10), sharex=True, sharey=True)
     factor = (result.stamp_end_bin - result.stamp_start_bin) // result.normalized_stamp.shape[-1]
-    downsampled_centers = result.stamp_start_bin + (
-        np.arange(result.normalized_stamp.shape[-1]) * factor + (factor - 1) / 2
+    # imshow's extent wants pixel EDGES; downsampled pixel i spans raw bins
+    # [start + i*factor, start + (i+1)*factor), so the edges sit half a raw bin outside
+    # the first/last bin centers.
+    edge_bins = result.stamp_start_bin + np.array(
+        [-0.5, result.normalized_stamp.shape[-1] * factor - 0.5]
     )
-    frequencies = axis.fch1 + axis.foff * downsampled_centers
+    frequencies = axis.fch1 + axis.foff * edge_bins
     image = None
     for observation, panel in enumerate(panels):
         image = panel.imshow(
@@ -809,9 +865,29 @@ def _format_number(value: float) -> str:
 def _print_table(results: list[ProbeResult], config: Any) -> None:
     rows = []
     for result in results:
+        if result.status != "ok":
+            rows.append(
+                [
+                    f"{result.requested_frequency_mhz:.9f}",
+                    "ERROR",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                ]
+            )
+            continue
+        frequency_cell = f"{result.requested_frequency_mhz:.9f}"
+        if result.stamp_clamped:
+            frequency_cell += " (clamped)"
         rows.append(
             [
-                f"{result.requested_frequency_mhz:.9f}",
+                frequency_cell,
                 str(result.absolute_bin),
                 f"{result.coarse_channel}:{result.bin_in_coarse}",
                 _format_number(result.ed_max_k2),
@@ -848,10 +924,18 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
 
     print()
     for result in results:
+        if result.status != "ok":
+            print(
+                f"VERDICT {result.requested_frequency_mhz:.9f} MHz: "
+                f"preprocessing failed — {result.error}"
+            )
+            continue
         if not result.ed_would_propose:
             prefix = "ED would not propose this location; forced scoring says: "
         else:
             prefix = "ED would propose this location; scoring says: "
+        if result.stamp_clamped:
+            prefix = "[stamp clamped off-center at a band edge] " + prefix
         if not result.screen_pass:
             cascade = (
                 f"FAIL screen P>{config.inference.screening_threshold:g}; production stops "
@@ -873,6 +957,8 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
 def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
     config = context.config
     return {
+        "status": result.status,
+        "error": result.error,
         "requested_frequency_mhz": result.requested_frequency_mhz,
         "resolved_frequency_mhz": result.resolved_frequency_mhz,
         "frequency_offset_hz": result.frequency_offset_hz,
@@ -933,13 +1019,46 @@ def _run(args: argparse.Namespace) -> None:
         bandpass_flatten=bandpass_flatten,
         bandpass_method=bandpass_method,
     )
-    results = [_prepare_location(context, frequency) for frequency in args.frequency_mhz]
+    # One bad location must not abort a batch over a published event table — capture the
+    # failure per frequency and keep going; error rows carry the reason in table and CSV.
+    results = []
+    for frequency in args.frequency_mhz:
+        try:
+            results.append(_prepare_location(context, frequency))
+        except Exception as exc:
+            if args.traceback:
+                import traceback  # noqa: PLC0415
+
+                traceback.print_exc()
+            results.append(
+                ProbeResult(
+                    requested_frequency_mhz=frequency,
+                    resolved_frequency_mhz=float("nan"),
+                    frequency_offset_hz=float("nan"),
+                    absolute_bin=-1,
+                    coarse_channel=-1,
+                    bin_in_coarse=-1,
+                    stamp_start_bin=-1,
+                    stamp_end_bin=-1,
+                    stamp_clamped=False,
+                    on_max_k2=[float("nan")] * 3,
+                    ed_max_k2=float("nan"),
+                    ed_would_propose=False,
+                    normalized_stamp=None,
+                    status="error",
+                    error=str(exc),
+                )
+            )
+    scorable = [result for result in results if result.status == "ok"]
+    if not scorable:
+        raise ValueError("Every requested frequency failed preprocessing; nothing to score")
 
     assets = _load_scoring_assets(args, config)
-    _score_locations(results, assets, config)
+    _score_locations(scorable, assets, config, args.cadence_seed_key)
     if args.plot_dir:
         for index, result in enumerate(results, start=1):
-            _write_plot(result, index, args.plot_dir, axis)
+            if result.status == "ok":
+                _write_plot(result, index, args.plot_dir, axis)
     if args.csv:
         _write_csv(args.csv, results, context)
 
@@ -957,8 +1076,10 @@ def _run(args: argparse.Namespace) -> None:
     print(
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="
         f"{config.inference.mc_draws}, MC SeedSequence root={config.reproducibility.seed}, "
-        f"stream=STREAM_INFERENCE_MC, cadence_key={PROBE_CADENCE_SEED_KEY}; pass-1 rejects "
-        "use a separate forced diagnostic pass from that seed"
+        f"stream=STREAM_INFERENCE_MC, cadence_key={args.cadence_seed_key}, plus a per-location "
+        "sub-key of the absolute frequency bin (batch-composition independent — a documented "
+        "delta from production's per-cadence draw blocks); pass-1 rejects get a forced "
+        "diagnostic MC pass production would never run"
     )
     print()
     _print_table(results, config)
@@ -979,7 +1100,11 @@ def main() -> int:
         print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        if args.traceback:
+            import traceback  # noqa: PLC0415
+
+            traceback.print_exc()
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0
 
