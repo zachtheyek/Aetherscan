@@ -142,7 +142,8 @@ src/aetherscan/
 utils/                   # benchmark_report.py, candidate_rfi_report.py,
                          # fetch_run_outputs.sh, find_optimal_configs.py,
                          # get_system_info.sh, hf_tag_release.py, kill_pipeline.sh,
-                         # perband_report.py, print_cli_help.py, run_container.sh,
+                         # perband_report.py, print_cli_help.py,
+                         # probe_candidate_location.py, run_container.sh,
                          # start_tmux_session.sh, verify_train_test_files.py
 docs/                    # Full technical doc suite, one doc per pipeline surface —
                          # indexed in docs/README.md; start at docs/ARCHITECTURE.md

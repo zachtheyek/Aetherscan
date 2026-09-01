@@ -522,7 +522,9 @@ def _normalize_stamp(raw_stamp: Any, config: Any) -> Any:
     return normalized[0]
 
 
-def _prepare_location(context: ProbeContext, frequency_mhz: float) -> ProbeResult:
+def _prepare_location(
+    context: ProbeContext, frequency_mhz: float, show_traceback: bool = False
+) -> ProbeResult:
     import numpy as np  # noqa: PLC0415
 
     config = context.config
@@ -582,7 +584,11 @@ def _prepare_location(context: ProbeContext, frequency_mhz: float) -> ProbeResul
         if not np.isfinite(normalized_stamp).all():
             raise ValueError("Normalized stamp contains non-finite values")
     except Exception as exc:
-        status, error, normalized_stamp = "error", str(exc), None
+        if show_traceback:
+            import traceback  # noqa: PLC0415
+
+            traceback.print_exc()
+        status, error, normalized_stamp = "error", f"{type(exc).__name__}: {exc}", None
     return ProbeResult(
         status=status,
         error=error,
@@ -882,9 +888,12 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
     for result in results:
         if result.status != "ok":
             has_bins = result.absolute_bin >= 0
+            frequency_cell = f"{result.requested_frequency_mhz:.9f}"
+            if result.stamp_clamped:
+                frequency_cell += " (clamped)"
             rows.append(
                 [
-                    f"{result.requested_frequency_mhz:.9f}",
+                    frequency_cell,
                     str(result.absolute_bin) if has_bins else "ERROR",
                     f"{result.coarse_channel}:{result.bin_in_coarse}" if has_bins else "-",
                     _format_number(result.ed_max_k2),
@@ -943,9 +952,12 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
         if result.status != "ok":
             if result.absolute_bin >= 0:
                 ed_part = "would" if result.ed_would_propose else "would not"
+                clamp_part = (
+                    "[stamp clamped off-center at a band edge] " if result.stamp_clamped else ""
+                )
                 print(
-                    f"VERDICT {result.requested_frequency_mhz:.9f} MHz: ED {ed_part} propose "
-                    f"this location; stamp stage failed — {result.error}"
+                    f"VERDICT {result.requested_frequency_mhz:.9f} MHz: {clamp_part}ED {ed_part} "
+                    f"propose this location; stamp stage failed — {result.error}"
                 )
             else:
                 print(
@@ -1061,7 +1073,7 @@ def _run(args: argparse.Namespace) -> None:
     results = []
     for frequency in args.frequency_mhz:
         try:
-            results.append(_prepare_location(context, frequency))
+            results.append(_prepare_location(context, frequency, show_traceback=args.traceback))
         except Exception as exc:
             if args.traceback:
                 import traceback  # noqa: PLC0415
@@ -1083,7 +1095,7 @@ def _run(args: argparse.Namespace) -> None:
                     ed_would_propose=False,
                     normalized_stamp=None,
                     status="error",
-                    error=str(exc),
+                    error=f"{type(exc).__name__}: {exc}",
                 )
             )
     scorable = [result for result in results if result.status == "ok"]
@@ -1110,8 +1122,9 @@ def _run(args: argparse.Namespace) -> None:
     )
     print(
         "ED column semantics: max k^2 over detection windows STARTING inside the stamp "
-        "(production's hit-placement convention) — an upper bound on proposal; dedup/overlap "
-        "placement is not replayed"
+        "(production's hit-placement convention) — an upper bound w.r.t. dedup/overlap "
+        "placement, which is not replayed, and off by one window in either direction at the "
+        "stamp edges"
     )
     print(
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="

@@ -180,19 +180,7 @@ class TestCsvRowContract:
             error="boom",
         )
 
-        context = SimpleNamespace(
-            config=SimpleNamespace(
-                inference=SimpleNamespace(
-                    stat_threshold=2048.0,
-                    screening_threshold=0.5,
-                    classification_threshold=0.99,
-                    mc_draws=32,
-                ),
-                rf=SimpleNamespace(latent_variant="z_mean"),
-            ),
-            bandpass_method="pfb",
-        )
-        row = probe._csv_row(result, context)
+        row = probe._csv_row(result, self._context())
         assert row["status"] == "error"
         assert row["error"] == "boom"
         assert row["requested_frequency_mhz"] == 7499.0
