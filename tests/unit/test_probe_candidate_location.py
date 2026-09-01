@@ -83,17 +83,22 @@ class TestStampBounds:
 class TestMaxK2InStamp:
     def test_window_start_predicate_matches_hit_indexing(self):
         # Coarse channel 2, width 1000, step 100: window j starts at 2000 + 100*j —
-        # the same arithmetic preprocessing uses to place hits. Stamp [2150, 2350)
-        # covers window starts 2200 and 2300 only.
+        # the same arithmetic preprocessing uses to place hits. Bounds (2150, 2350]
+        # cover window starts 2200 and 2300 only.
         k2 = np.array([1.0, 2.0, 9.0, 4.0, 5.0], dtype=np.float64)
         value = probe._max_k2_in_stamp(k2, 2, 1000, 100, 2150, 2350)
         assert value == 9.0
 
-    def test_stamp_boundary_is_half_open(self):
+    def test_boundaries_match_production_stamp_coverage(self):
+        # Production places hit h's stamp at [h - half, h + half), so location L is covered
+        # iff L - half < h <= L + half: the low edge (== stamp_start) is EXCLUDED, because
+        # that hit's stamp ends exactly at L, and the high edge (== stamp_end) is INCLUDED,
+        # because that hit's stamp starts exactly at L.
         k2 = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-        # Stamp end exactly at a window start excludes it.
-        value = probe._max_k2_in_stamp(k2, 0, 1000, 100, 0, 100)
-        assert value == 1.0
+        # Window starts 0, 100, 200; bounds (0, 100] select the start at 100 alone.
+        assert probe._max_k2_in_stamp(k2, 0, 1000, 100, 0, 100) == 2.0
+        # Bounds (100, 200] select the start at 200 alone.
+        assert probe._max_k2_in_stamp(k2, 0, 1000, 100, 100, 200) == 3.0
 
     def test_no_finite_windows_returns_nan(self):
         k2 = np.array([np.nan, np.nan], dtype=np.float64)
@@ -161,8 +166,27 @@ class TestCatalogKeyMap:
 
 
 class TestCsvRowContract:
-    def test_error_row_serializes_without_scores(self):
-        result = probe.ProbeResult(
+    _BOOLEAN_COLUMNS = ("stamp_clamped", "ed_would_propose", "screen_pass", "mc_pass")
+
+    @staticmethod
+    def _context():
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                inference=SimpleNamespace(
+                    stat_threshold=2048.0,
+                    screening_threshold=0.5,
+                    classification_threshold=0.99,
+                    mc_draws=32,
+                ),
+                rf=SimpleNamespace(latent_variant="z_mean"),
+            ),
+            bandpass_method="pfb",
+        )
+
+    @staticmethod
+    def _error_result():
+        # Exactly the shape _run builds when _prepare_location raises.
+        return probe.ProbeResult(
             requested_frequency_mhz=7499.0,
             resolved_frequency_mhz=float("nan"),
             frequency_offset_hz=float("nan"),
@@ -180,20 +204,35 @@ class TestCsvRowContract:
             error="boom",
         )
 
-        context = SimpleNamespace(
-            config=SimpleNamespace(
-                inference=SimpleNamespace(
-                    stat_threshold=2048.0,
-                    screening_threshold=0.5,
-                    classification_threshold=0.99,
-                    mc_draws=32,
-                ),
-                rf=SimpleNamespace(latent_variant="z_mean"),
-            ),
-            bandpass_method="pfb",
-        )
-        row = probe._csv_row(result, context)
+    def test_error_row_serializes_without_scores(self):
+        row = probe._csv_row(self._error_result(), self._context())
         assert row["status"] == "error"
         assert row["error"] == "boom"
         assert row["requested_frequency_mhz"] == 7499.0
         assert math.isnan(row["mc_mean"])
+
+    def test_error_row_blanks_uncomputed_booleans(self):
+        # A dataclass-default False would read downstream as a genuine negative, so an
+        # unevaluated row must carry blanks in every boolean column and in the MC mode.
+        row = probe._csv_row(self._error_result(), self._context())
+        for column in self._BOOLEAN_COLUMNS:
+            assert row[column] == "", column
+        assert row["mc_scoring_mode"] == ""
+
+    def test_ok_row_keeps_booleans_and_mc_mode(self):
+        result = self._error_result()
+        result.status = "ok"
+        result.error = ""
+        result.screen_pass = True
+        result.mc_pass = True
+        row = probe._csv_row(result, self._context())
+        for column in self._BOOLEAN_COLUMNS:
+            assert isinstance(row[column], bool), column
+        assert row["mc_scoring_mode"] == "production pass-2"
+
+    def test_ok_row_labels_forced_diagnostic_mc(self):
+        result = self._error_result()
+        result.status = "ok"
+        result.error = ""
+        row = probe._csv_row(result, self._context())
+        assert row["mc_scoring_mode"] == "forced diagnostic"

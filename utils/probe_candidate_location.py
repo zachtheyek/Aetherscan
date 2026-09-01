@@ -4,6 +4,11 @@
 Heavy scientific imports happen only after argument parsing, so ``--help`` works in a
 stdlib-only environment. The probe is read-only except for explicitly requested plots and CSV.
 
+A location that fails preprocessing does not abort the run: it becomes an error row carrying
+its own reason (blank rather than ``False`` in the CSV's boolean columns, so an unevaluated row
+cannot be mistaken for a negative). If no location survives, the table and CSV are still
+written and the exit status is 1.
+
 Example (container path, explicit artifacts — the cluster-standard trio):
 
     ./utils/run_container.sh python utils/probe_candidate_location.py \\
@@ -154,16 +159,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Cadence-level MC SeedSequence sub-key. NOTE: SeedSequence treats a trailing 0 as "
-            "identity (inference.py's MC seeding notes), so the default aliases catalog cadence "
-            "0's stream; ad-hoc probes additionally sub-key each location by its absolute "
-            "frequency bin, so probe results are reproducible regardless of batch composition"
+            "Cadence-level MC SeedSequence sub-key. NOTE: the probe appends a per-location "
+            "sub-key (the absolute frequency bin), so unlike production's (stream, cadence) key "
+            "the default 0 here does NOT alias catalog cadence 0's stream; SeedSequence's "
+            "trailing-zero identity (inference.py's MC seeding notes) only bites at absolute "
+            "bin 0, which collapses onto the bare keyless stream"
         ),
     )
     parser.add_argument(
         "--traceback",
         action="store_true",
-        help="Print full tracebacks instead of one-line ERROR summaries",
+        help="Print full tracebacks in addition to the one-line ERROR summaries",
     )
     return parser
 
@@ -470,13 +476,24 @@ def _max_k2_in_stamp(
     stamp_start: int,
     stamp_end: int,
 ) -> float:
+    """Max k^2 over the ED windows whose hit would yield a stamp covering this location.
+
+    Production places hit ``h``'s stamp at ``[h - half, h + half)``
+    (preprocessing.py:2253-2261), so location ``L`` is covered iff ``L - half < h <= L + half``
+    — the same width as the stamp itself, but half-open on the opposite side. Unclamped,
+    ``stamp_start = L - half`` and ``stamp_end = L + half``, so ``(stamp_start, stamp_end]`` is
+    exactly that predicate; at a clamped edge the interval keeps its width but is no longer
+    centered on ``L`` (see ``stamp_clamped``). Both boundaries are reachable at the defaults:
+    hit indices are ``channel_start + j * step_size`` and ``half`` is a multiple of the default
+    step, so ``L`` on the window grid lands a window start on each edge.
+    """
     import numpy as np  # noqa: PLC0415
 
     window_starts = coarse_channel * coarse_width + np.arange(len(k2)) * step_size
-    in_stamp = (window_starts >= stamp_start) & (window_starts < stamp_end) & np.isfinite(k2)
-    if not np.any(in_stamp):
+    covering = (window_starts > stamp_start) & (window_starts <= stamp_end) & np.isfinite(k2)
+    if not np.any(covering):
         return float("nan")
-    return float(np.max(k2[in_stamp]))
+    return float(np.max(k2[covering]))
 
 
 def _extract_raw_stamp(context: ProbeContext, start: int, end: int) -> Any:
@@ -541,14 +558,23 @@ def _prepare_location(context: ProbeContext, frequency_mhz: float) -> ProbeResul
         config.inference.stamp_width,
         context.axis.nchans,
     )
-    # Scan every complete coarse channel the stamp window overlaps, not just the target
-    # frequency's own channel — a stamp within stamp_width // 2 of a channel boundary can
-    # carry ED-visible power from the neighbor. Dedup/overlap placement is still not
-    # replayed (documented simplification: this verdict is an upper bound on proposal).
+    # ed_would_propose answers "would some ED hit have produced a stamp covering this
+    # location", not "did production actually extract one": _deduplicate_hits
+    # (preprocessing.py:2832-2854) can absorb a covering hit into a representative whose own
+    # stamp misses the location, and overlap_search (preprocessing.py:2246-2262) can add
+    # coverage the other way. Neither is replayed here, so the flag is an upper bound on
+    # proposal. At a clamped edge the scanned interval is no longer centered on the requested
+    # location — and production skips out-of-bounds stamps outright, so it would have
+    # extracted nothing there at all.
+    #
+    # Scan every complete coarse channel that can host a covering window, not just the target
+    # frequency's own channel: with stamp_width=4096 a hit up to 2048 bins away still covers
+    # this location, and that hit can live in the neighboring channel. The upper bound is
+    # stamp_end's own channel (inclusive) because stamp_end is a covering hit index.
     overlapped_channels = [
         channel
-        for channel in range(stamp_start // coarse_width, (stamp_end - 1) // coarse_width + 1)
-        if channel < complete_coarse_channels
+        for channel in range(stamp_start // coarse_width, stamp_end // coarse_width + 1)
+        if 0 <= channel < complete_coarse_channels
     ]
     on_max_k2 = []
     for observation in (0, 2, 4):
@@ -756,9 +782,19 @@ def _score_locations(
     # --cadence-seed-key. (2) Production draws one noise block per cadence submatrix, so a
     # snippet's epsilons depend on its position in the batch; a diagnostic tool must not
     # change its answer for a location because a second location was probed alongside it,
-    # so each location is scored ALONE with an extra sub-key of its absolute frequency bin
-    # — reproducible under any batch composition. Screen rejects get the same forced
-    # diagnostic pass; production stops before MC for them.
+    # so each location is scored ALONE with an extra sub-key of its absolute frequency bin.
+    # That makes the MC layer batch-composition independent and nothing more:
+    # _batched_mc_scores (inference.py:98-105) documents that predict_proba consumes no numpy
+    # RNG and scores rows independently, so with a per-row rng the draws are the only
+    # batch-dependent term and it is gone. The latents feeding them are NOT independent —
+    # _distributed_encode buckets its final step on n_samples (_encode_bucket,
+    # inference.py:693-707, floor 16) and its docstring warns that a batch-shape change can
+    # flip cuDNN algorithm selection and move kept-row latents in the low bits. On this
+    # probe's single-replica strategy <= 16 locations all trace one bucket-16 step; probing
+    # 17+ at once crosses to bucket 32, so a location's latents can differ in the low bits
+    # from the same location probed in a smaller batch (enough, at a straddling tree split,
+    # to flip an RF probability). Screen rejects get the same forced diagnostic pass;
+    # production stops before MC for them.
     for index, result in enumerate(results):
         mc_rng = derive_rng(
             config.reproducibility.seed,
@@ -956,6 +992,12 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
 
 def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
     config = context.config
+    # An error row's numeric fields are self-announcing (nan floats, -1 index sentinels), but
+    # a boolean that was never computed would serialize as a plain False and read downstream
+    # as a genuine negative — df[df.mc_pass] or (~df.ed_would_propose).sum() would silently
+    # count failed locations. Emit blanks instead, so an error row is unusable by construction
+    # rather than plausibly wrong.
+    ok = result.status == "ok"
     return {
         "status": result.status,
         "error": result.error,
@@ -967,25 +1009,27 @@ def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
         "bin_in_coarse": result.bin_in_coarse,
         "stamp_start_bin": result.stamp_start_bin,
         "stamp_end_bin_exclusive": result.stamp_end_bin,
-        "stamp_clamped": result.stamp_clamped,
+        "stamp_clamped": result.stamp_clamped if ok else "",
         "on1_max_k2": result.on_max_k2[0],
         "on2_max_k2": result.on_max_k2[1],
         "on3_max_k2": result.on_max_k2[2],
         "ed_max_k2": result.ed_max_k2,
         "stat_threshold": config.inference.stat_threshold,
-        "ed_would_propose": result.ed_would_propose,
+        "ed_would_propose": result.ed_would_propose if ok else "",
         "bandpass_method_used": context.bandpass_method,
         "latent_variant": config.rf.latent_variant,
         "raw_rf_probability": result.raw_rf_probability,
         "screening_probability": result.screening_probability,
         "screening_threshold": config.inference.screening_threshold,
-        "screen_pass": result.screen_pass,
+        "screen_pass": result.screen_pass if ok else "",
         "mc_mean": result.mc_mean,
         "mc_std": result.mc_std,
         "mc_draws": config.inference.mc_draws,
-        "mc_scoring_mode": "production pass-2" if result.screen_pass else "forced diagnostic",
+        "mc_scoring_mode": ("production pass-2" if result.screen_pass else "forced diagnostic")
+        if ok
+        else "",
         "classification_threshold": config.inference.classification_threshold,
-        "mc_pass": result.mc_pass,
+        "mc_pass": result.mc_pass if ok else "",
         "plot_path": result.plot_path,
     }
 
@@ -1000,7 +1044,7 @@ def _write_csv(path: str, results: list[ProbeResult], context: ProbeContext) -> 
         writer.writerows(rows)
 
 
-def _run(args: argparse.Namespace) -> None:
+def _run(args: argparse.Namespace) -> int:
     config = _load_config(args)
     h5_paths = list(args.h5_files) if args.h5_files else _resolve_catalog(args, config)
     if len(h5_paths) != 6:
@@ -1050,11 +1094,19 @@ def _run(args: argparse.Namespace) -> None:
                 )
             )
     scorable = [result for result in results if result.status == "ok"]
-    if not scorable:
-        raise ValueError("Every requested frequency failed preprocessing; nothing to score")
-
-    assets = _load_scoring_assets(args, config)
-    _score_locations(scorable, assets, config, args.cadence_seed_key)
+    if scorable:
+        assets = _load_scoring_assets(args, config)
+        _score_locations(scorable, assets, config, args.cadence_seed_key)
+    else:
+        # Every location failing is exactly the case where the per-location reasons matter
+        # most (they are what tells you the cadence selection is wrong), so this is not fatal:
+        # report the table and the CSV, skip the model load nothing can consume, and let the
+        # non-zero exit status carry the failure.
+        print(
+            "WARNING: every requested frequency failed preprocessing; reporting per-location "
+            "reasons without scoring",
+            file=sys.stderr,
+        )
     if args.plot_dir:
         for index, result in enumerate(results, start=1):
             if result.status == "ok":
@@ -1073,20 +1125,27 @@ def _run(args: argparse.Namespace) -> None:
         f"{config.inference.detection_step_size}, stat_threshold="
         f"{config.inference.stat_threshold:g}"
     )
-    print(
-        f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="
-        f"{config.inference.mc_draws}, MC SeedSequence root={config.reproducibility.seed}, "
-        f"stream=STREAM_INFERENCE_MC, cadence_key={args.cadence_seed_key}, plus a per-location "
-        "sub-key of the absolute frequency bin (batch-composition independent — a documented "
-        "delta from production's per-cadence draw blocks); pass-1 rejects get a forced "
-        "diagnostic MC pass production would never run"
-    )
+    if scorable:
+        print(
+            f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="
+            f"{config.inference.mc_draws}, MC SeedSequence root={config.reproducibility.seed}, "
+            f"stream=STREAM_INFERENCE_MC, cadence_key={args.cadence_seed_key}, plus a "
+            "per-location sub-key of the absolute frequency bin, so the MC DRAWS are "
+            "batch-composition independent (a documented delta from production's per-cadence "
+            "draw blocks); the encode step's bucket geometry still depends on how many "
+            "locations are probed (>16 crosses a bucket boundary; low-bit only, see "
+            "_distributed_encode); pass-1 rejects get a forced diagnostic MC pass production "
+            "would never run"
+        )
+    else:
+        print("Scoring: skipped — no location survived preprocessing")
     print()
     _print_table(results, config)
     if args.csv:
         print(f"CSV: {args.csv}")
     if args.plot_dir:
         print(f"Plots: {args.plot_dir}")
+    return 0 if scorable else 1
 
 
 def main() -> int:
@@ -1095,7 +1154,7 @@ def main() -> int:
     _validate_args(parser, args)
     _make_src_importable()
     try:
-        _run(args)
+        return _run(args)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
