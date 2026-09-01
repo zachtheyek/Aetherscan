@@ -310,10 +310,25 @@ class TestProposalScan:
         assert value == 9999.0
 
     def test_no_finite_windows_returns_nan(self):
-        # Window start 100 is covering AND in bounds for L=100 (half=50) — only the nan
-        # filter can return nan here, so this pins the isfinite mask itself.
+        # Window start 100 is covering AND in bounds for L=100 (half=50); with every k2 nan
+        # this pins the early-return branch (np.max would propagate nan the same way, so the
+        # isfinite mask itself is pinned by the mixed-set test below).
         k2 = np.array([np.nan, np.nan], dtype=np.float64)
         assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 100, [0], 10_000))
+
+    def test_isfinite_mask_selects_only_finite_windows(self):
+        # Both windows covering and in bounds; only one finite — the mask must pick it
+        # rather than letting np.max propagate the nan.
+        k2 = np.array([np.nan, 5.0], dtype=np.float64)
+        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 100, [0], 10_000) == 5.0
+
+    def test_envelope_low_edge_matches_extraction_width(self):
+        # Odd width: the envelope's exclusive low bound must admit the lowest hit whose
+        # o=+overlap placement covers L — L + half - stamp_width - overlap, one bin below
+        # the naive L - half - overlap.
+        lo, hi = probe._proposal_scan_bounds(100_000, 4097, 2048)
+        assert lo == 100_000 + 2048 - 4097 - 2048
+        assert hi == 100_000 + 2048 + 2048
 
 
 class TestPrintTable:

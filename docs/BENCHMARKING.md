@@ -225,13 +225,12 @@ catalog runs deliberately don't persist: **where does a specific (cadence, frequ
 land at every stage of the scoring cascade?** Given six ordered `--h5-files` (or a `--catalog`
 plus exact `--target`/`--band`[/`--session`/`--cadence-id`] group resolution) and one or more
 `--frequency-mhz` values — with the standard `--encoder-path`/`--rf-path`/`--config-path` trio —
-it reports, per location: the in-stamp max k² statistic plus a proposal verdict ("would
-energy detection propose this?") scanned over every hit position with at least one in-bounds
-production placement — center or ±overlap offset — covering the location, so a *no* is
-sound (given the run's bandpass method) while a *yes* is an upper bound w.r.t. dedup
-absorption alone, which is not replayed (the CSV's `ed_proposal_scan_*` columns report the
-scan *envelope*; near a band edge the effective mask is finer, since out-of-bounds
-placements are excluded per offset), the
+it reports, per location: the in-stamp max k² statistic plus a proposal verdict ("would energy
+detection propose this?") scanned over every hit position with at least one in-bounds production
+placement — center or ±overlap offset — covering the location, so a *no* is sound (given the run's
+bandpass method) while a *yes* is an upper bound w.r.t. dedup absorption alone, which is not
+replayed (the CSV's `ed_proposal_scan_*` columns report the scan *envelope*; near a band edge the
+effective mask is finer, since out-of-bounds placements are excluded per offset), the
 production-preprocessed stamp, the pass-1 screening probability, the deterministic RF score, and
 the seeded MC mean ± std vs the science threshold, with per-location verdict lines, optional
 `--csv`, and optional `--plot-dir` six-panel waterfalls. Built for benchmark comparisons
