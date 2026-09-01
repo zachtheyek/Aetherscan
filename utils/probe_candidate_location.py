@@ -154,16 +154,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Cadence-level MC SeedSequence sub-key. NOTE: SeedSequence treats a trailing 0 as "
-            "identity (inference.py's MC seeding notes), so the default aliases catalog cadence "
-            "0's stream; ad-hoc probes additionally sub-key each location by its absolute "
-            "frequency bin, so probe results are reproducible regardless of batch composition"
+            "Cadence-level MC SeedSequence sub-key. Each location is further sub-keyed by its "
+            "absolute frequency bin (the non-zero trailing key also means the default does NOT "
+            "alias catalog cadence 0's stream), so a location's draws are reproducible "
+            "regardless of batch composition"
         ),
     )
     parser.add_argument(
         "--traceback",
         action="store_true",
-        help="Print full tracebacks instead of one-line ERROR summaries",
+        help="Print full tracebacks in addition to the one-line ERROR summaries",
     )
     return parser
 
@@ -956,7 +956,7 @@ def _print_table(results: list[ProbeResult], config: Any) -> None:
 
 def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
     config = context.config
-    return {
+    row = {
         "status": result.status,
         "error": result.error,
         "requested_frequency_mhz": result.requested_frequency_mhz,
@@ -983,11 +983,21 @@ def _csv_row(result: ProbeResult, context: ProbeContext) -> dict[str, Any]:
         "mc_mean": result.mc_mean,
         "mc_std": result.mc_std,
         "mc_draws": config.inference.mc_draws,
-        "mc_scoring_mode": "production pass-2" if result.screen_pass else "forced diagnostic",
+        "mc_scoring_mode": (
+            ""
+            if result.status != "ok"
+            else ("production pass-2" if result.screen_pass else "forced diagnostic")
+        ),
         "classification_threshold": config.inference.classification_threshold,
         "mc_pass": result.mc_pass,
         "plot_path": result.plot_path,
     }
+    if result.status != "ok":
+        # Booleans have no honest value for a never-scored row — blank beats a default False
+        # that an aggregation would count as a real verdict.
+        for key in ("stamp_clamped", "ed_would_propose", "screen_pass", "mc_pass"):
+            row[key] = ""
+    return row
 
 
 def _write_csv(path: str, results: list[ProbeResult], context: ProbeContext) -> None:
@@ -1050,12 +1060,10 @@ def _run(args: argparse.Namespace) -> None:
                 )
             )
     scorable = [result for result in results if result.status == "ok"]
-    if not scorable:
-        raise ValueError("Every requested frequency failed preprocessing; nothing to score")
-
-    assets = _load_scoring_assets(args, config)
-    _score_locations(scorable, assets, config, args.cadence_seed_key)
-    if args.plot_dir:
+    if scorable:
+        assets = _load_scoring_assets(args, config)
+        _score_locations(scorable, assets, config, args.cadence_seed_key)
+    if args.plot_dir and scorable:
         for index, result in enumerate(results, start=1):
             if result.status == "ok":
                 _write_plot(result, index, args.plot_dir, axis)
@@ -1074,19 +1082,28 @@ def _run(args: argparse.Namespace) -> None:
         f"{config.inference.stat_threshold:g}"
     )
     print(
+        "ED column semantics: max k^2 over detection windows STARTING inside the stamp "
+        "(production's hit-placement convention) — an upper bound on proposal; dedup/overlap "
+        "placement is not replayed"
+    )
+    print(
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="
         f"{config.inference.mc_draws}, MC SeedSequence root={config.reproducibility.seed}, "
         f"stream=STREAM_INFERENCE_MC, cadence_key={args.cadence_seed_key}, plus a per-location "
-        "sub-key of the absolute frequency bin (batch-composition independent — a documented "
-        "delta from production's per-cadence draw blocks); pass-1 rejects get a forced "
-        "diagnostic MC pass production would never run"
+        "sub-key of the absolute frequency bin (MC draws are batch-composition independent — a "
+        "documented delta from production's per-cadence draw blocks; encoder latents stay "
+        "bit-exact only within one padding bucket, so very large probe batches can shift "
+        "low-order bits); pass-1 rejects get a forced diagnostic MC pass production would "
+        "never run"
     )
     print()
     _print_table(results, config)
     if args.csv:
         print(f"CSV: {args.csv}")
-    if args.plot_dir:
+    if args.plot_dir and scorable:
         print(f"Plots: {args.plot_dir}")
+    if not scorable:
+        raise ValueError("Every requested frequency failed preprocessing; see the error rows above")
 
 
 def main() -> int:
