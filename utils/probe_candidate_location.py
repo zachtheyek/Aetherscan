@@ -485,12 +485,14 @@ def _max_k2_in_stamp(
 def _proposal_scan_bounds(
     absolute_bin: int, stamp_width: int, overlap_bins: int
 ) -> tuple[int, int]:
-    """Hit positions whose production stamp (center or ±overlap offset) covers the location.
+    """The scan ENVELOPE: hit positions that could place a covering stamp, bounds ignored.
 
-    A stamp centered at hit ``h`` covers ``[h - half, h + half)``; overlap search also places
-    stamps at ``h ± overlap_bins``. So a covering stamp exists iff a super-threshold hit sits
-    in ``(L - half - overlap, L + half + overlap]`` — exclusive low, inclusive high, matching
-    production's half-open coverage.
+    A stamp placed for hit ``h`` at offset ``o`` covers ``[h + o - half, h + o - half +
+    stamp_width)``; the union over ``o ∈ {-overlap, 0, +overlap}`` puts every candidate hit in
+    ``(L - half - overlap, L + half + overlap]`` (exclusive low, inclusive high). A hit in the
+    envelope is NECESSARY but not sufficient — the per-offset mask in _max_k2_for_proposal
+    additionally applies production's in-bounds placement test. These bounds are what the CSV
+    reports as ed_proposal_scan_{lo_exclusive,hi_inclusive}.
     """
     half = stamp_width // 2
     return absolute_bin - half - overlap_bins, absolute_bin + half + overlap_bins
@@ -520,7 +522,10 @@ def _max_k2_for_proposal(
     window_starts = coarse_channel * coarse_width + np.arange(len(k2)) * step_size
     covering = np.zeros(len(k2), dtype=bool)
     for offset in offsets:
-        covers = (window_starts > absolute_bin - half - offset) & (
+        # Production extracts [start, start + stamp_width) with start = h + o - half, so
+        # coverage of L is h in (L + half - stamp_width - o, L + half - o] — identical to
+        # (L - half - o, L + half - o] at even widths, one bin wider at odd ones.
+        covers = (window_starts > absolute_bin + half - stamp_width - offset) & (
             window_starts <= absolute_bin + half - offset
         )
         in_bounds = (window_starts >= half - offset) & (window_starts <= nchans - half - offset)

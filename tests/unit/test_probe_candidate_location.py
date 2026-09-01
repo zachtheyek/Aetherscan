@@ -292,16 +292,14 @@ class TestProposalScan:
         k2 = np.array([9.0, 5.0, 7.0], dtype=np.float64)  # window starts 0, 100, 200
         half = 50
         value = probe._max_k2_for_proposal(k2, 0, 1000, 100, 150, 2 * half, [0], 10_000)
-        # (100, 200] -> windows 200 only? no: starts 100 excluded? start 100 == L-half -> excluded;
-        # start 200 == L+half -> included.
+        # Coverage is (100, 200]: start 100 == L-half is excluded, start 200 == L+half included.
         assert value == 7.0
 
     def test_out_of_bounds_placement_is_dropped(self):
         # Reviewer counterexample (M=0): L=2500, half=2048, hit at window start 1000.
         # Its only placement [ -1048, 3048 ) covers L but starts < 0 -> production drops it,
         # so the probe must NOT count it.
-        k2 = np.array([np.inf if s == 1000 else np.nan for s in range(0, 3100, 100)])
-        k2 = np.where(np.isinf(k2), 9999.0, k2)
+        k2 = np.where(np.arange(31) == 10, 9999.0, np.nan)  # window starts 0..3000 step 100
         value = probe._max_k2_for_proposal(k2, 0, 1_000_000, 100, 2500, 4096, [0], 1_000_000)
         assert math.isnan(value)
         # The same hit WITH overlap offsets gains an in-bounds covering placement
@@ -312,8 +310,10 @@ class TestProposalScan:
         assert value == 9999.0
 
     def test_no_finite_windows_returns_nan(self):
-        k2 = np.array([np.nan], dtype=np.float64)
-        assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, 500, 100, [0], 10_000))
+        # Window start 100 is covering AND in bounds for L=100 (half=50) — only the nan
+        # filter can return nan here, so this pins the isfinite mask itself.
+        k2 = np.array([np.nan, np.nan], dtype=np.float64)
+        assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 100, [0], 10_000))
 
 
 class TestPrintTable:
