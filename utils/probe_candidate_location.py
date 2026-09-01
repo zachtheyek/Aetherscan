@@ -479,6 +479,37 @@ def _max_k2_in_stamp(
     return float(np.max(k2[in_stamp]))
 
 
+def _proposal_scan_bounds(
+    absolute_bin: int, stamp_width: int, overlap_bins: int
+) -> tuple[int, int]:
+    """Hit positions whose production stamp (center or ±overlap offset) covers the location.
+
+    A stamp centered at hit ``h`` covers ``[h - half, h + half)``; overlap search also places
+    stamps at ``h ± overlap_bins``. So a covering stamp exists iff a super-threshold hit sits
+    in ``(L - half - overlap, L + half + overlap]`` — exclusive low, inclusive high, matching
+    production's half-open coverage.
+    """
+    half = stamp_width // 2
+    return absolute_bin - half - overlap_bins, absolute_bin + half + overlap_bins
+
+
+def _max_k2_for_proposal(
+    k2: Any,
+    coarse_channel: int,
+    coarse_width: int,
+    step_size: int,
+    lo_exclusive: int,
+    hi_inclusive: int,
+) -> float:
+    import numpy as np  # noqa: PLC0415
+
+    window_starts = coarse_channel * coarse_width + np.arange(len(k2)) * step_size
+    covering = (window_starts > lo_exclusive) & (window_starts <= hi_inclusive) & np.isfinite(k2)
+    if not np.any(covering):
+        return float("nan")
+    return float(np.max(k2[covering]))
+
+
 def _extract_raw_stamp(context: ProbeContext, start: int, end: int) -> Any:
     import h5py  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
@@ -543,21 +574,32 @@ def _prepare_location(
         config.inference.stamp_width,
         context.axis.nchans,
     )
-    # Scan every complete coarse channel the stamp window overlaps, not just the target
-    # frequency's own channel — a stamp within stamp_width // 2 of a channel boundary can
-    # carry ED-visible power from the neighbor. Dedup/overlap placement is still not
-    # replayed (documented simplification: this verdict is an upper bound on proposal).
-    overlapped_channels = [
+    # The PROPOSAL question scans every hit position whose production stamp — center or
+    # ±overlap offset when overlap_search is on — would cover the requested location:
+    # "no" is sound (any covering center must sit in this interval and beat the threshold);
+    # "yes" remains an upper bound only w.r.t. dedup absorption, which is not replayed.
+    # ed_max_k2 (the displayed number) stays the IN-STAMP max — that is what the waterfall
+    # panel shows.
+    overlap_bins = (
+        int(config.inference.overlap_fraction * config.inference.stamp_width)
+        if config.inference.overlap_search
+        else 0
+    )
+    scan_lo, scan_hi = _proposal_scan_bounds(
+        absolute_bin, config.inference.stamp_width, overlap_bins
+    )
+    scan_channels = [
         channel
-        for channel in range(stamp_start // coarse_width, (stamp_end - 1) // coarse_width + 1)
-        if channel < complete_coarse_channels
+        for channel in range(max(scan_lo, 0) // coarse_width, scan_hi // coarse_width + 1)
+        if 0 <= channel < complete_coarse_channels
     ]
     on_max_k2 = []
+    proposal_maxima = []
     for observation in (0, 2, 4):
-        channel_maxima = []
-        for channel in overlapped_channels:
+        stamp_maxima, cover_maxima = [], []
+        for channel in scan_channels:
             k2 = _energy_k2(context, context.h5_paths[observation], channel)
-            channel_maxima.append(
+            stamp_maxima.append(
                 _max_k2_in_stamp(
                     k2,
                     channel,
@@ -567,12 +609,26 @@ def _prepare_location(
                     stamp_end,
                 )
             )
-        finite = [value for value in channel_maxima if math.isfinite(value)]
+            cover_maxima.append(
+                _max_k2_for_proposal(
+                    k2,
+                    channel,
+                    coarse_width,
+                    config.inference.detection_step_size,
+                    scan_lo,
+                    scan_hi,
+                )
+            )
+        finite = [value for value in stamp_maxima if math.isfinite(value)]
         on_max_k2.append(max(finite, default=float("nan")))
+        finite_cover = [value for value in cover_maxima if math.isfinite(value)]
+        proposal_maxima.append(max(finite_cover, default=float("nan")))
     finite_maxima = [value for value in on_max_k2 if math.isfinite(value)]
     ed_max_k2 = max(finite_maxima, default=float("nan"))
+    finite_proposal = [value for value in proposal_maxima if math.isfinite(value)]
+    proposal_max_k2 = max(finite_proposal, default=float("nan"))
     ed_would_propose = bool(
-        math.isfinite(ed_max_k2) and ed_max_k2 > config.inference.stat_threshold
+        math.isfinite(proposal_max_k2) and proposal_max_k2 > config.inference.stat_threshold
     )
 
     # Stamp extraction/normalization failures keep the bin + ED diagnostics already
@@ -1118,13 +1174,14 @@ def _run(args: argparse.Namespace) -> None:
         f"{config.inference.stamp_width}, downsample_factor={config.data.downsample_factor}, "
         f"ED window/step={config.inference.detection_window_size}/"
         f"{config.inference.detection_step_size}, stat_threshold="
-        f"{config.inference.stat_threshold:g}"
+        f"{config.inference.stat_threshold:g}, overlap_search="
+        f"{config.inference.overlap_search} (fraction {config.inference.overlap_fraction:g})"
     )
     print(
-        "ED column semantics: max k^2 over detection windows STARTING inside the stamp "
-        "(production's hit-placement convention) — an upper bound w.r.t. dedup/overlap "
-        "placement, which is not replayed, and off by one window in either direction at the "
-        "stamp edges"
+        "ED column semantics: 'max k^2' is the in-stamp maximum (what the waterfall shows); "
+        "'ED proposes' scans every hit position whose production stamp — center or ±overlap "
+        "offset — would cover the location, so a NO is sound; a YES is an upper bound only "
+        "w.r.t. dedup absorption, which is not replayed"
     )
     print(
         f"Scoring: latent_variant={config.rf.latent_variant}, mc_draws="

@@ -225,8 +225,10 @@ catalog runs deliberately don't persist: **where does a specific (cadence, frequ
 land at every stage of the scoring cascade?** Given six ordered `--h5-files` (or a `--catalog`
 plus exact `--target`/`--band`[/`--session`/`--cadence-id`] group resolution) and one or more
 `--frequency-mhz` values — with the standard `--encoder-path`/`--rf-path`/`--config-path` trio —
-it reports, per location: the max k² statistic vs the ED threshold ("would energy detection
-propose this?", a window-start upper bound; dedup/overlap placement is not replayed), the
+it reports, per location: the in-stamp max k² statistic plus a proposal verdict ("would energy
+detection propose this?") scanned over every hit position whose production stamp — center or
+±overlap offset — would cover the location, so a *no* is sound while a *yes* is an upper bound
+only w.r.t. dedup absorption (not replayed), the
 production-preprocessed stamp, the pass-1 screening probability, the deterministic RF score, and
 the seeded MC mean ± std vs the science threshold, with per-location verdict lines, optional
 `--csv`, and optional `--plot-dir` six-panel waterfalls. Built for benchmark comparisons
@@ -241,8 +243,11 @@ cadences and draws one MC noise block per cadence, so scores there depend on bat
 the probe's per-location seeding — root `--seed`, `--cadence-seed-key`, then the location's
 absolute frequency bin — is reproducible under any invocation); screen-rejected locations get a
 forced diagnostic MC pass production would never run; edge stamps clamp instead of being
-skipped; and `apply_saved_config` never layers the saved run's `reproducibility` section, so
-pass the run's `--seed` explicitly to mirror it.
+skipped; the probe centers the stamp on the *requested frequency* while production centers on
+the merged hit (±overlap offsets) — a shifted stamp is a different encoder input, which is why
+probe RF/MC numbers can differ in the low digits from a recorded candidate's; and
+`apply_saved_config` never layers the saved run's `reproducibility` section, so pass the run's
+`--seed` explicitly to mirror it.
 
 ## Standalone benchmarks (`benchmarks/`)
 

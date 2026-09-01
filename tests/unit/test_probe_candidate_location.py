@@ -256,3 +256,92 @@ class TestCsvRowContract:
             ),
             bandpass_method="pfb",
         )
+
+
+class TestProposalScan:
+    def test_bounds_widen_by_overlap(self):
+        lo, hi = probe._proposal_scan_bounds(10_000, 4096, 2048)
+        assert (lo, hi) == (10_000 - 2048 - 2048, 10_000 + 2048 + 2048)
+
+    def test_bounds_without_overlap(self):
+        lo, hi = probe._proposal_scan_bounds(10_000, 4096, 0)
+        assert (lo, hi) == (10_000 - 2048, 10_000 + 2048)
+
+    def test_half_openness_matches_production_coverage(self):
+        # Window starts 0, 100, 200; interval (100, 200]: the low edge is excluded,
+        # the high edge included — production's half-open stamp coverage direction.
+        k2 = np.array([9.0, 5.0, 7.0], dtype=np.float64)
+        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, 100, 200) == 7.0
+        # Interval (-1, 100] picks up the first two windows only.
+        assert probe._max_k2_for_proposal(k2, 0, 1000, 100, -1, 100) == 9.0
+
+    def test_no_finite_windows_returns_nan(self):
+        k2 = np.array([np.nan], dtype=np.float64)
+        assert math.isnan(probe._max_k2_for_proposal(k2, 0, 1000, 100, -1, 2000))
+
+
+class TestPrintTable:
+    @staticmethod
+    def _config():
+        return SimpleNamespace(
+            inference=SimpleNamespace(
+                stat_threshold=2048.0,
+                screening_threshold=0.5,
+                classification_threshold=0.99,
+                mc_draws=32,
+            ),
+            rf=SimpleNamespace(latent_variant="z_mean"),
+        )
+
+    @staticmethod
+    def _result(**overrides):
+        base = {
+            "requested_frequency_mhz": 1400.0,
+            "resolved_frequency_mhz": 1400.0,
+            "frequency_offset_hz": 0.0,
+            "absolute_bin": 1234,
+            "coarse_channel": 1,
+            "bin_in_coarse": 234,
+            "stamp_start_bin": 0,
+            "stamp_end_bin": 4096,
+            "stamp_clamped": False,
+            "on_max_k2": [3000.0, 2500.0, 2900.0],
+            "ed_max_k2": 3000.0,
+            "ed_would_propose": True,
+            "normalized_stamp": None,
+        }
+        base.update(overrides)
+        return probe.ProbeResult(**base)
+
+    def test_clamp_marker_on_ok_row(self, capsys):
+        result = self._result(stamp_clamped=True, screen_pass=True, mc_mean=0.995, mc_pass=True)
+        probe._print_table([result], self._config())
+        out = capsys.readouterr().out
+        assert "(clamped)" in out
+        assert "[stamp clamped off-center at a band edge]" in out
+        assert "candidate" in out
+
+    def test_clamp_marker_on_partial_row(self, capsys):
+        result = self._result(
+            stamp_clamped=True,
+            status="error",
+            error="ValueError: stamp failed the production validity filter",
+        )
+        probe._print_table([result], self._config())
+        out = capsys.readouterr().out
+        assert "(clamped)" in out
+        assert "stamp stage failed" in out
+        assert "ED would propose" in out
+
+    def test_sentinel_row_verdict(self, capsys):
+        result = self._result(
+            absolute_bin=-1,
+            coarse_channel=-1,
+            bin_in_coarse=-1,
+            status="error",
+            error="ValueError: outside the h5 bin-center range",
+        )
+        probe._print_table([result], self._config())
+        out = capsys.readouterr().out
+        assert "preprocessing failed" in out
+        assert "ERROR" in out
